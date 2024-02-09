@@ -31,12 +31,14 @@ jobs:
             --no-fail-fast          \
             --success-output final  \
             --final-status-level skip
+        shell: bash
 
       - name: doctests
         run: |
           cargo test --doc  \
             --all-features  \
             --locked
+        shell: bash
 
   check-powerset:
     runs-on: ubuntu-latest
