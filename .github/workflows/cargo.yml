@@ -35,7 +35,6 @@ jobs:
       - name: doctests
         run: |
           cargo test --doc  \
-            --all-targets   \
             --all-features  \
             --locked
 
