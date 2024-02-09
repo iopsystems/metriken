@@ -1,12 +1,8 @@
 
 [workspace]
+resolver = "2"
 members = [
     "metriken",
     "metriken-core",
     "metriken-derive"
 ]
-
-[workspace.dependencies]
-metriken        = { path = "metriken" }
-metriken-core   = { path = "metriken-core" }
-metriken-derive = { path = "metriken-derive" }

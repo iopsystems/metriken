@@ -23,5 +23,5 @@ parking_lot = "0.12"
 phf = { version = "0.11", features = ["macros"] }
 
 [dev-dependencies]
-metriken = { workspace = true }
+metriken = { version = "0.5", path = "../metriken" }
 

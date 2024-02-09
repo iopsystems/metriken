@@ -9,8 +9,8 @@ homepage = "https://github.com/pelikan-io/rustcommon"
 repository = "https://github.com/pelikan-io/rustcommon"
 
 [dependencies]
-metriken-core   = { workspace = true, version = "0.1" }
-metriken-derive = { workspace = true, version = "=0.5.1" }
+metriken-core   = { version = "0.1",    path = "../metriken-core" }
+metriken-derive = { version = "=0.5.1", path = "../metriken-derive" }
 
 histogram = "0.9.0"
 once_cell = "1.14.0"
