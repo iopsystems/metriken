@@ -2,9 +2,10 @@
 // Licensed under the Apache License, Version 2.0
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use std::fmt::{Display, Formatter, Result};
+
 use proc_macro2::TokenStream;
 use quote::ToTokens;
-use std::fmt::{Display, Formatter, Result};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Ident, Token};

@@ -1,9 +1,9 @@
-use crate::{Metric, Value};
-use parking_lot::RwLock;
-
 use std::sync::OnceLock;
 
 pub use histogram::{Bucket, Config, Error, Snapshot};
+use parking_lot::RwLock;
+
+use crate::{Metric, Value};
 
 /// A histogram that uses free-running atomic counters to track the distribution
 /// of values. They are only useful for recording values and producing
