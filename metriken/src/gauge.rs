@@ -2,9 +2,10 @@
 // Licensed under the Apache License, Version 2.0
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use crate::{Metric, Value};
 use std::any::Any;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+use crate::{Metric, Value};
 
 /// A gauge. Indicates the current value of some host parameter.
 ///

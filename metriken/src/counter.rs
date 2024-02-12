@@ -2,9 +2,10 @@
 // Licensed under the Apache License, Version 2.0
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use crate::{Metric, Value};
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::{Metric, Value};
 
 /// A counter. Can be incremented or added to.
 ///

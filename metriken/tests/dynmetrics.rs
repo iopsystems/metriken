@@ -2,11 +2,11 @@
 // Licensed under the Apache License, Version 2.0
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use parking_lot::{Mutex, MutexGuard};
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
 
 use metriken::*;
+use parking_lot::{Mutex, MutexGuard};
 
 // All tests manipulate global state. Need a mutex to ensure test execution
 // doesn't overlap.

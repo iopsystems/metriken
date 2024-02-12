@@ -2,10 +2,12 @@
 // Licensed under the Apache License, Version 2.0
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use crate::Metric;
-use once_cell::sync::OnceCell;
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
+
+use once_cell::sync::OnceCell;
+
+use crate::Metric;
 
 // Note: This implementation is mostly copied from the Lazy implementation
 //       within once_cell. It only adds the `get` option to try to access
