@@ -29,10 +29,13 @@ mod formatter;
 mod metadata;
 mod metrics;
 mod null;
+mod provide;
+mod wrapper;
 
 pub use crate::formatter::{default_formatter, Format};
 pub use crate::metadata::{Metadata, MetadataIter};
 pub use crate::metrics::{metrics, DynMetricsIter, Metrics, MetricsIter};
+pub use crate::provide::{request_ref, request_value, Request};
 
 /// Global interface to a metric.
 ///
@@ -59,6 +62,16 @@ pub trait Metric: Send + Sync + 'static {
     /// [`Value`] then return [`Value::Other`] and metric consumers can use
     /// [`as_any`](crate::Metric::as_any) to specifically handle your metric.
     fn value(&self) -> Option<Value>;
+
+    /// Provides type based access to context.
+    ///
+    /// This can be used in conjunction with [`Request::provide_value`] and
+    /// [`Request::provide_ref`] to extract references to member variables from
+    /// `dyn Metric` trait objects.
+    fn provide<'a>(&'a self, request: &mut Request<'a>) {
+        // Silence the unused variable warning.
+        let _ = request;
+    }
 }
 
 /// The value of a metric.
@@ -127,6 +140,22 @@ impl MetricEntry {
         let a = self.metric() as *const _ as *const ();
         let b = metric as *const _ as *const ();
         a == b
+    }
+
+    /// Request a value of type `T` from metric.
+    pub fn request_value<T>(&self) -> Option<T>
+    where
+        T: 'static,
+    {
+        crate::request_value(self.metric())
+    }
+
+    /// Request a reference of type `T` from metric.
+    pub fn request_ref<T>(&self) -> Option<&T>
+    where
+        T: ?Sized + 'static,
+    {
+        crate::request_ref(self.metric())
     }
 }
 
