@@ -19,7 +19,7 @@ use parking_lot::{const_rwlock, RwLock, RwLockReadGuard};
 use crate::null::NullMetric;
 use crate::provide::ProviderMap;
 use crate::wrapper::FormattingFn;
-use crate::{default_formatter, Format, Metadata, Metric, MetricEntry};
+use crate::{Format, Metadata, Metric, MetricEntry};
 
 pub(crate) struct DynMetricsRegistry {
     metrics: BTreeMap<usize, MetricEntry>,
@@ -65,7 +65,6 @@ pub struct MetricBuilder {
     desc: Option<Cow<'static, str>>,
     provider: ProviderMap,
     metadata: HashMap<String, String>,
-    formatter: fn(&MetricEntry, Format) -> String,
 }
 
 impl MetricBuilder {
@@ -76,7 +75,6 @@ impl MetricBuilder {
             desc: None,
             provider: ProviderMap::new(),
             metadata: HashMap::new(),
-            formatter: default_formatter,
         }
     }
 
@@ -105,30 +103,13 @@ impl MetricBuilder {
     }
 
     /// Convert this builder directly into a [`MetricEntry`].
-    ///
-    /// This method is generally not what you want. Use [`take_entry`] and
-    /// [`build_pinned`] instead.
-    ///
-    /// [`take_entry`]: MetricBuilder::take_entry
-    /// [`build_pinned`]: MetricBuilder::build_pinned
-    pub fn into_entry(mut self) -> MetricEntry {
-        self.take_entry()
-    }
-
-    /// Create a [`MetricEntry`] by taking config values out of this builder.
-    pub fn take_entry(&mut self) -> MetricEntry {
-        MetricEntry {
-            metric: &NullMetric,
-            name: std::mem::take(&mut self.name),
-            description: std::mem::take(&mut self.desc),
-        }
+    pub fn into_entry(self) -> MetricEntry {
+        self.build_pinned(NullMetric).1
     }
 
     /// Build a [`DynBoxedMetric`] for use with this builder.
-    pub fn build<T: Metric>(mut self, metric: T) -> DynBoxedMetric<T> {
-        let entry = self.take_entry();
-        let metric = self.build_pinned(metric);
-
+    pub fn build<T: Metric>(self, metric: T) -> DynBoxedMetric<T> {
+        let (metric, entry) = self.build_pinned(metric);
         DynBoxedMetric::from_pinned(metric, entry)
     }
 
@@ -138,11 +119,17 @@ impl MetricBuilder {
     /// order to extract the [`MetricEntry`] for this metric first.
     ///
     /// [`take_entry`]: MetricBuilder::take_entry
-    pub fn build_pinned<T: Metric>(mut self, metric: T) -> DynPinnedMetric<T> {
+    pub fn build_pinned<T: Metric>(mut self, metric: T) -> (DynPinnedMetric<T>, MetricEntry) {
         self.provider.insert(Metadata::new(self.metadata));
-        self.provider.insert(FormattingFn(self.formatter));
 
-        DynPinnedMetric::new_v2(metric, std::mem::take(&mut self.provider))
+        let metric = DynPinnedMetric::new_v2(metric, self.provider);
+        let entry = MetricEntry {
+            metric: &NullMetric,
+            name: self.name,
+            description: self.desc,
+        };
+
+        (metric, entry)
     }
 }
 
