@@ -105,6 +105,12 @@ impl MetricBuilder {
     }
 
     /// Convert this builder directly into a [`MetricEntry`].
+    ///
+    /// This method is generally not what you want. Use [`take_entry`] and
+    /// [`build_pinned`] instead.
+    ///
+    /// [`take_entry`]: MetricBuilder::take_entry
+    /// [`build_pinned`]: MetricBuilder::build_pinned
     pub fn into_entry(mut self) -> MetricEntry {
         self.take_entry()
     }
@@ -219,6 +225,7 @@ impl<M: Metric> DynPinnedMetric<M> {
     /// This does not register the metric. To do that call [`register`].
     ///
     /// [`register`]: self::DynPinnedMetric::register
+    #[deprecated = "DynPinnedMetric::new misses some metadata fields. Use MetricBuilder::build_pinned instead."]
     pub fn new(metric: M) -> Self {
         Self::new_v2(metric, ProviderMap::new())
     }
@@ -292,10 +299,9 @@ pub struct DynBoxedMetric<M: Metric> {
 impl<M: Metric> DynBoxedMetric<M> {
     /// Create a new dynamic metric using the provided metric type with the
     /// provided `name`.
+    #[deprecated = "DynBoxedMetric::new loses some metadata fields. Use MetricBuilder::build_pinned instead."]
     pub fn new(metric: M, entry: MetricEntry) -> Self {
-        let this = Self::unregistered(metric);
-        this.register(entry);
-        this
+        Self::from_pinned(DynPinnedMetric::new_v2(metric, ProviderMap::new()), entry)
     }
 
     fn from_pinned(metric: DynPinnedMetric<M>, entry: MetricEntry) -> Self {
@@ -303,13 +309,6 @@ impl<M: Metric> DynBoxedMetric<M> {
         let this = Self { metric };
         this.register(entry);
         this
-    }
-
-    /// Create a new dynamic metric without registering it.
-    fn unregistered(metric: M) -> Self {
-        Self {
-            metric: Box::pin(DynPinnedMetric::new(metric)),
-        }
     }
 
     /// Register this metric in the global list of dynamic metrics with `name`.
