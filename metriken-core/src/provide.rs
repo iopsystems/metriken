@@ -2,6 +2,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use crate::Metric;
 
@@ -255,6 +256,10 @@ impl ProviderMap {
         TypeId::of::<tags::Ref<T>>()
     }
 }
+
+// Needed so that DynBoxedMetric and DynPinnedMetric both implement these.
+impl UnwindSafe for ProviderMap {}
+impl RefUnwindSafe for ProviderMap {}
 
 pub(crate) trait Provide: Any + Send + Sync + 'static {
     fn provide<'a>(&'a self, request: &mut Request<'a>);
