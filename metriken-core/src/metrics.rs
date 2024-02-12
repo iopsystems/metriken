@@ -11,7 +11,7 @@ use crate::MetricEntry;
 ///
 /// Names within metrics are not guaranteed to be unique and no aggregation of
 /// metrics with the same name is done.
-/// 
+///
 /// [`dynmetrics`]: crate::dynmetrics
 pub fn metrics() -> Metrics {
     Metrics {
