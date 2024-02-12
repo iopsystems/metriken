@@ -68,6 +68,9 @@ pub trait Metric: Send + Sync + 'static {
     /// This can be used in conjunction with [`Request::provide_value`] and
     /// [`Request::provide_ref`] to extract references to member variables from
     /// `dyn Metric` trait objects.
+    ///
+    /// If you want to read provided types from a metric see
+    /// [`MetricEntry::request_value`] and [`MetricEntry::request_ref`].
     fn provide<'a>(&'a self, request: &mut Request<'a>) {
         // Silence the unused variable warning.
         let _ = request;
@@ -97,8 +100,6 @@ pub struct MetricEntry {
     metric: *const dyn Metric,
     name: Cow<'static, str>,
     description: Option<Cow<'static, str>>,
-    metadata: Metadata,
-    formatter: fn(&Self, Format) -> String,
 }
 
 impl MetricEntry {
@@ -119,12 +120,18 @@ impl MetricEntry {
 
     /// Access the [`Metadata`] associated with this metrics entry.
     pub fn metadata(&self) -> &Metadata {
-        &self.metadata
+        static EMPTY: Metadata = Metadata::default_const();
+        self.request_ref::<Metadata>().unwrap_or(&EMPTY)
     }
 
     /// Format the metric into a string with the given format.
     pub fn formatted(&self, format: Format) -> String {
-        (self.formatter)(self, format)
+        let formatter = self
+            .request_value::<crate::wrapper::FormattingFn>()
+            .map(|func| func.0)
+            .unwrap_or(crate::default_formatter);
+
+        formatter(self, format)
     }
 
     /// Checks whether `metric` is the metric for this entry.
@@ -142,7 +149,12 @@ impl MetricEntry {
         a == b
     }
 
-    /// Request a value of type `T` from metric.
+    /// Request a value of type `T` from the metric.
+    ///
+    /// This will succeed if the metric's [`provide`] implementation called
+    /// [`Request::provide_value`] with a value of type `T`.
+    ///
+    /// [`provide`]: Metric::provide
     pub fn request_value<T>(&self) -> Option<T>
     where
         T: 'static,
@@ -150,7 +162,12 @@ impl MetricEntry {
         crate::request_value(self.metric())
     }
 
-    /// Request a reference of type `T` from metric.
+    /// Request a reference of type `T` from the metric.
+    ///
+    /// This will succeed if the metric's [`provide`] implementation called
+    /// [`Request::provide_ref`] with a value of type `T`.
+    ///
+    /// [`provide`]: Metric::provide
     pub fn request_ref<T>(&self) -> Option<&T>
     where
         T: ?Sized + 'static,
@@ -188,6 +205,8 @@ pub mod export {
     pub extern crate linkme;
     pub extern crate phf;
 
+    pub use crate::wrapper::*;
+
     #[linkme::distributed_slice]
     pub static METRICS: [crate::MetricEntry] = [..];
 
@@ -195,8 +214,6 @@ pub mod export {
         metric: &'static dyn Metric,
         name: &'static str,
         description: Option<&'static str>,
-        metadata: &'static phf::Map<&'static str, &'static str>,
-        formatter: fn(&crate::MetricEntry, crate::Format) -> String,
     ) -> crate::MetricEntry {
         use std::borrow::Cow;
 
@@ -207,9 +224,11 @@ pub mod export {
                 Some(desc) => Some(Cow::Borrowed(desc)),
                 None => None,
             },
-            metadata: Metadata::new_static(metadata),
-            formatter,
         }
+    }
+
+    pub const fn metadata(metadata: &'static phf::Map<&'static str, &'static str>) -> Metadata {
+        Metadata::new_static(metadata)
     }
 }
 
@@ -226,17 +245,28 @@ macro_rules! declare_metric_v1 {
         const _: () = {
             use $crate::export::phf;
 
-            static __METADATA: $crate::export::phf::Map<&'static str, &'static str> =
+            static __METADATA_MAP: $crate::export::phf::Map<&'static str, &'static str> =
                 $crate::export::phf::phf_map! { $( $key => $value, )* };
+            static __METADATA: $crate::Metadata = $crate::export::metadata(&__METADATA_MAP);
+
+            // We use this to inject some provided values into metric itself
+            // without having to use up extra memory storing anything.
+            struct MetricProvider;
+
+            impl $crate::export::InjectedProvider for MetricProvider {
+                fn provide(request: &mut $crate::Request<'_>) {
+                    request
+                        .provide_ref(&__METADATA)
+                        .provide_value($crate::export::FormattingFn($formatter));
+                }
+            }
 
             #[$crate::export::linkme::distributed_slice($crate::export::METRICS)]
             #[linkme(crate = $crate::export::linkme)]
             static __ENTRY: $crate::MetricEntry = $crate::export::entry_v1(
-                &$metric,
+                $crate::export::MetricWrapper::<_, MetricProvider>::from_ref(&$metric),
                 $name,
                 $description,
-                &__METADATA,
-                $formatter
             );
         };
     }

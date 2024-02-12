@@ -1,6 +1,7 @@
 //! This module is a copy of a subset of the APIs available in `core::error`.
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 
 use crate::Metric;
 
@@ -31,8 +32,8 @@ where
 
 /// `Request` supports generic, type-driven access to data.
 ///
-/// This struct is based off the unstable `error_generic_member_access` feature
-/// in std.
+/// This type is based on the unstable request type in [`std::error`] and it
+/// works in pretty much the exact same way.
 #[repr(transparent)]
 pub struct Request<'a>(dyn Erased<'a>);
 
@@ -226,5 +227,41 @@ impl<'a> dyn Erased<'a> + 'a {
         } else {
             None
         }
+    }
+}
+
+/// A dynamic map for types which can be provided.
+///
+/// This is used by the `dynmetrics` module.
+#[derive(Default)]
+pub(crate) struct ProviderMap(HashMap<TypeId, Box<dyn Provide>>);
+
+impl ProviderMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert<T: Provide>(&mut self, value: T) {
+        self.0.insert(Self::typeid_for::<T>(), Box::new(value));
+    }
+
+    pub fn provide<'a>(&'a self, request: &mut Request<'a>) {
+        if let Some(element) = self.0.get(&request.0.tag_id()) {
+            element.provide(request);
+        }
+    }
+
+    fn typeid_for<T: Provide>() -> TypeId {
+        TypeId::of::<tags::Ref<T>>()
+    }
+}
+
+pub(crate) trait Provide: Any + Send + Sync + 'static {
+    fn provide<'a>(&'a self, request: &mut Request<'a>);
+}
+
+impl<T: Any + Send + Sync> Provide for T {
+    fn provide<'a>(&'a self, request: &mut Request<'a>) {
+        request.provide_ref(self);
     }
 }
