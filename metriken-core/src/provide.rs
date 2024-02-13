@@ -190,6 +190,9 @@ impl<'a, I: tags::Type<'a>> TaggedOption<'a, I> {
 /// Represents a type-erased but identifiable object.
 ///
 /// This trait is exclusively implemented by the `TaggedOption` type.
+///
+/// # Safety
+/// The `TypeId` returned by `tag_id` _must_ be the type id of the tagged type.
 unsafe trait Erased<'a>: 'a {
     /// The `TypeId` of the erased type.
     fn tag_id(&self) -> TypeId;
