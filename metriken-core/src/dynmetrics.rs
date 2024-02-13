@@ -15,11 +15,11 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::pin::Pin;
 
-use crate::null::NullMetric;
-use crate::{default_formatter, Format, Metadata, Metric, MetricEntry};
-
 // We use parking_lot here since it avoids lock poisioning
 use parking_lot::{const_rwlock, RwLock, RwLockReadGuard};
+
+use crate::null::NullMetric;
+use crate::{default_formatter, Format, Metadata, Metric, MetricEntry};
 
 pub(crate) struct DynMetricsRegistry {
     metrics: BTreeMap<usize, MetricEntry>,

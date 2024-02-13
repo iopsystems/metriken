@@ -81,6 +81,7 @@ pub use metriken_core::{
     default_formatter, dynmetrics, metrics, DynMetricsIter, Format, Metadata, MetadataIter, Metric,
     MetricEntry, Metrics, MetricsIter, Value,
 };
+pub use metriken_derive::metric;
 
 pub use crate::counter::Counter;
 #[doc(inline)]
@@ -88,8 +89,6 @@ pub use crate::dynmetrics::{DynBoxedMetric, DynPinnedMetric, MetricBuilder};
 pub use crate::gauge::Gauge;
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};
 pub use crate::lazy::Lazy;
-
-pub use metriken_derive::metric;
 
 /// A counter holds a unsigned 64bit monotonically non-decreasing value. The
 /// counter behavior is to wrap on overflow.

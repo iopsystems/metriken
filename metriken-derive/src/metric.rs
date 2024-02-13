@@ -5,13 +5,14 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
-use crate::args::{ArgName, Metadata, MetadataEntry, SingleArg, SingleArgExt};
 use proc_macro2::{Span, TokenStream};
 use proc_macro_crate::FoundCrate;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{parse_quote, Expr, Ident, ItemStatic, Path, Token};
+
+use crate::args::{ArgName, Metadata, MetadataEntry, SingleArg, SingleArgExt};
 
 /// All arguments to the metric attribute macro
 ///
