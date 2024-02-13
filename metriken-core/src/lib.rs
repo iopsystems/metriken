@@ -2,7 +2,7 @@
 //!
 //! You should usually be using the [`metriken`] crate instead. This crate
 //! contains the core distributed slice used by [`metriken`] so that multiple
-//! major versions of [`metriken`]` can coexist.
+//! major versions of [`metriken`] can coexist.
 //!
 //! [`metriken`]: https://docs.rs/metriken
 

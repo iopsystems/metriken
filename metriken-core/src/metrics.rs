@@ -6,11 +6,13 @@ use parking_lot::RwLockReadGuard;
 use crate::dynmetrics::DynMetricsRegistry;
 use crate::MetricEntry;
 
-/// The list of all metrics registered via the either [`metric`] attribute or by
+/// The list of all metrics registered via the either `#[metric]` attribute or by
 /// using the types within the [`dynmetrics`] module.
 ///
 /// Names within metrics are not guaranteed to be unique and no aggregation of
 /// metrics with the same name is done.
+///
+/// [`dynmetrics`]: crate::dynmetrics
 pub fn metrics() -> Metrics {
     Metrics {
         dyn_metrics: crate::dynmetrics::get_registry(),
