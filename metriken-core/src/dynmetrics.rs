@@ -10,8 +10,6 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::marker::PhantomPinned;
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::pin::Pin;
 
@@ -19,7 +17,9 @@ use std::pin::Pin;
 use parking_lot::{const_rwlock, RwLock, RwLockReadGuard};
 
 use crate::null::NullMetric;
-use crate::{default_formatter, Format, Metadata, Metric, MetricEntry};
+use crate::provide::ProviderMap;
+use crate::wrapper::FormattingFn;
+use crate::{Format, Metadata, Metric, MetricEntry};
 
 pub(crate) struct DynMetricsRegistry {
     metrics: BTreeMap<usize, MetricEntry>,
@@ -63,8 +63,8 @@ pub(crate) fn get_registry() -> RwLockReadGuard<'static, DynMetricsRegistry> {
 pub struct MetricBuilder {
     name: Cow<'static, str>,
     desc: Option<Cow<'static, str>>,
+    provider: ProviderMap,
     metadata: HashMap<String, String>,
-    formatter: fn(&MetricEntry, Format) -> String,
 }
 
 impl MetricBuilder {
@@ -73,8 +73,8 @@ impl MetricBuilder {
         Self {
             name: name.into(),
             desc: None,
+            provider: ProviderMap::new(),
             metadata: HashMap::new(),
-            formatter: default_formatter,
         }
     }
 
@@ -90,25 +90,46 @@ impl MetricBuilder {
         self
     }
 
-    pub fn formatter(mut self, formatter: fn(&MetricEntry, Format) -> String) -> Self {
-        self.formatter = formatter;
+    pub fn formatter(self, formatter: fn(&MetricEntry, Format) -> String) -> Self {
+        self.provide(FormattingFn(formatter))
+    }
+
+    /// Add provided type data to this metric.
+    ///
+    /// These can then be accessed via [`MetricEntry::request_ref`].
+    pub fn provide<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.provider.insert(value);
         self
     }
 
     /// Convert this builder directly into a [`MetricEntry`].
     pub fn into_entry(self) -> MetricEntry {
-        MetricEntry {
-            metric: &NullMetric,
-            name: self.name,
-            description: self.desc,
-            metadata: Metadata::new(self.metadata),
-            formatter: self.formatter,
-        }
+        self.build_pinned(NullMetric).1
     }
 
     /// Build a [`DynBoxedMetric`] for use with this builder.
     pub fn build<T: Metric>(self, metric: T) -> DynBoxedMetric<T> {
-        DynBoxedMetric::new(metric, self.into_entry())
+        let (metric, entry) = self.build_pinned(metric);
+        DynBoxedMetric::from_pinned(metric, entry)
+    }
+
+    /// Build a [`DynPinnedMetric`] for use with this builder.
+    ///
+    /// In order to register it you will likely want to call [`take_entry`] in
+    /// order to extract the [`MetricEntry`] for this metric first.
+    ///
+    /// [`take_entry`]: MetricBuilder::take_entry
+    pub fn build_pinned<T: Metric>(mut self, metric: T) -> (DynPinnedMetric<T>, MetricEntry) {
+        self.provider.insert(Metadata::new(self.metadata));
+
+        let metric = DynPinnedMetric::new_v2(metric, self.provider);
+        let entry = MetricEntry {
+            metric: &NullMetric,
+            name: self.name,
+            description: self.desc,
+        };
+
+        (metric, entry)
     }
 }
 
@@ -135,35 +156,28 @@ pub(crate) fn unregister(metric: *const dyn Metric) {
     REGISTRY.write().unregister(metric);
 }
 
-/// Ensures that the metric `M` has a unique address.
-///
-/// The correctness of the registry depends on each dynamic address having a
-/// unique address. However, we don't want to unconditionally add padding to
-/// all metrics. The way to work around this is to union M with a type of size
-/// 1. That way, if M is a zero-sized type then the storage will have a size
-/// of 1 but otherwise it has the size of M.
-union PinnedMetricStorage<M> {
-    metric: ManuallyDrop<M>,
-    _padding: u8,
+/// A metric combined with a set of dynamic providers.
+struct ProviderMetric<M> {
+    metric: M,
+    provider: ProviderMap,
 }
 
-impl<M> PinnedMetricStorage<M> {
-    fn new(metric: M) -> Self {
-        Self {
-            metric: ManuallyDrop::new(metric),
-        }
+impl<M: Metric> Metric for ProviderMetric<M> {
+    fn is_enabled(&self) -> bool {
+        self.metric.is_enabled()
     }
 
-    #[inline]
-    fn metric(&self) -> &M {
-        // Safety: nothing ever accesses _padding
-        unsafe { &self.metric }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.metric.as_any()
     }
-}
 
-impl<M> Drop for PinnedMetricStorage<M> {
-    fn drop(&mut self) {
-        unsafe { ManuallyDrop::drop(&mut self.metric) }
+    fn value(&self) -> Option<crate::Value> {
+        self.metric.value()
+    }
+
+    fn provide<'a>(&'a self, request: &mut crate::Request<'a>) {
+        self.provider.provide(request);
+        self.metric.provide(request);
     }
 }
 
@@ -189,10 +203,7 @@ impl<M> Drop for PinnedMetricStorage<M> {
 ///
 /// [`register`]: crate::dynmetrics::DynPinnedMetric::register
 pub struct DynPinnedMetric<M: Metric> {
-    storage: PinnedMetricStorage<M>,
-    // This type relies on Pin's guarantees for correctness. Allowing it to be unpinned would cause
-    // errors.
-    _marker: PhantomPinned,
+    metric: ProviderMetric<M>,
 }
 
 impl<M: Metric> DynPinnedMetric<M> {
@@ -201,10 +212,14 @@ impl<M: Metric> DynPinnedMetric<M> {
     /// This does not register the metric. To do that call [`register`].
     ///
     /// [`register`]: self::DynPinnedMetric::register
+    #[deprecated = "DynPinnedMetric::new misses some metadata fields. Use MetricBuilder::build_pinned instead."]
     pub fn new(metric: M) -> Self {
+        Self::new_v2(metric, ProviderMap::new())
+    }
+
+    fn new_v2(metric: M, provider: ProviderMap) -> Self {
         Self {
-            storage: PinnedMetricStorage::new(metric),
-            _marker: PhantomPinned,
+            metric: ProviderMetric { metric, provider },
         }
     }
 
@@ -213,7 +228,7 @@ impl<M: Metric> DynPinnedMetric<M> {
     /// Calling this multiple times will result in the same metric being
     /// registered multiple times under potentially different names.
     pub fn register(self: Pin<&Self>, mut entry: MetricEntry) {
-        entry.metric = self.storage.metric();
+        entry.metric = &self.metric;
 
         // SAFETY:
         // To prove that this is safe we need to list out a few guarantees/requirements:
@@ -237,7 +252,7 @@ impl<M: Metric> DynPinnedMetric<M> {
 impl<M: Metric> Drop for DynPinnedMetric<M> {
     fn drop(&mut self) {
         // If this metric has not been registered then nothing will be removed.
-        unregister(self.storage.metric());
+        unregister(&self.metric);
     }
 }
 
@@ -246,7 +261,7 @@ impl<M: Metric> Deref for DynPinnedMetric<M> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.storage.metric()
+        &self.metric.metric
     }
 }
 
@@ -271,17 +286,16 @@ pub struct DynBoxedMetric<M: Metric> {
 impl<M: Metric> DynBoxedMetric<M> {
     /// Create a new dynamic metric using the provided metric type with the
     /// provided `name`.
+    #[deprecated = "DynBoxedMetric::new loses some metadata fields. Use MetricBuilder::build_pinned instead."]
     pub fn new(metric: M, entry: MetricEntry) -> Self {
-        let this = Self::unregistered(metric);
-        this.register(entry);
-        this
+        Self::from_pinned(DynPinnedMetric::new_v2(metric, ProviderMap::new()), entry)
     }
 
-    /// Create a new dynamic metric without registering it.
-    fn unregistered(metric: M) -> Self {
-        Self {
-            metric: Box::pin(DynPinnedMetric::new(metric)),
-        }
+    fn from_pinned(metric: DynPinnedMetric<M>, entry: MetricEntry) -> Self {
+        let metric = Box::pin(metric);
+        let this = Self { metric };
+        this.register(entry);
+        this
     }
 
     /// Register this metric in the global list of dynamic metrics with `name`.
