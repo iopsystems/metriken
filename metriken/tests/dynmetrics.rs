@@ -59,8 +59,7 @@ fn pinned_scope() {
     let _guard = TestGuard::new();
 
     {
-        let (metric, entry) = MetricBuilder::new("pinned_scope")
-            .build_pinned(Counter::new());
+        let (metric, entry) = MetricBuilder::new("pinned_scope").build_pinned(Counter::new());
 
         let metric = unsafe { Pin::new_unchecked(&metric) };
         metric.register(entry);
@@ -75,7 +74,9 @@ fn pinned_dup_register() {
     let _guard = TestGuard::new();
 
     {
-        let metric = MetricBuilder::new("pinned_dup").build_pinned(Counter::new()).0;
+        let metric = MetricBuilder::new("pinned_dup")
+            .build_pinned(Counter::new())
+            .0;
         let metric = unsafe { Pin::new_unchecked(&metric) };
         metric.register(MetricBuilder::new("pinned_dup_1").into_entry());
         metric.register(MetricBuilder::new("pinned_dup_2").into_entry());
