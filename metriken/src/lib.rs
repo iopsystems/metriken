@@ -66,6 +66,8 @@
 //! Behind the scenes, this crate uses the [`linkme`] crate to create a
 //! distributed slice containing a [`MetricEntry`] instance for each metric that
 //! is registered via the [`metric`] attribute.
+//!
+//! [`linkme`]: https://docs.rs/linkme
 
 mod counter;
 mod gauge;
