@@ -7,6 +7,9 @@ authors = [
     "Sean Lynch <sean@iop.systems>",
 ]
 license = "MIT OR Apache-2.0"
+description = "Exposition for metriken metrics"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
 chrono = "0.4.34"
