@@ -1,11 +1,10 @@
-use std::any::Any;
+use metriken::{AtomicHistogram, MetricEntry, RwLockHistogram, Value};
 
-use crate::*;
+use crate::Snapshot;
 
 /// Produces a snapshot of metric readings.
 pub struct Snapshotter {
-    kind_filter: fn(Option<&dyn Any>) -> bool,
-    name_filter: fn(&str) -> bool,
+    filter: fn(&MetricEntry) -> bool,
 }
 
 /// Used to build a new `Snapshotter`.
@@ -27,28 +26,17 @@ impl SnapshotterBuilder {
     }
 
     /// Allow a user-supplied filtering function to be applied based on the
-    /// metric name. The function is given the metric name and must return true
-    /// for any metric that should be included in the snapshot.
-    pub fn name_filter(mut self, filter: fn(&str) -> bool) -> Self {
-        self.snapshotter.name_filter = filter;
-        self
-    }
-
-    /// Allow a user-supplied filtering function to be applied. The function is
-    /// given the metric as an `Any` and must return true for any metric that
-    /// should be included in the snapshot.
-    pub fn kind_filter(mut self, filter: fn(Option<&dyn std::any::Any>) -> bool) -> Self {
-        self.snapshotter.kind_filter = filter;
+    /// metric entry. The function must return true for any metric that should
+    /// be included in the snapshot.
+    pub fn filter(mut self, filter: fn(&MetricEntry) -> bool) -> Self {
+        self.snapshotter.filter = filter;
         self
     }
 }
 
 impl Default for Snapshotter {
     fn default() -> Self {
-        Self {
-            kind_filter: |_| true,
-            name_filter: |_| true,
-        }
+        Self { filter: |_| true }
     }
 }
 
@@ -59,11 +47,7 @@ impl Snapshotter {
 
         // iterate through the metrics and build-up the snapshot
         for metric in &metriken::metrics() {
-            if !(self.name_filter)(metric.name()) {
-                continue;
-            }
-
-            if !(self.kind_filter)(metric.as_any()) {
+            if !(self.filter)(metric) {
                 continue;
             }
 
