@@ -1,5 +1,6 @@
 use crate::*;
 
+/// Produces a snapshot of metric readings.
 pub struct Snapshotter {
     counters: bool,
     gauges: bool,
@@ -8,35 +9,51 @@ pub struct Snapshotter {
     filter: fn(&str) -> bool,
 }
 
+/// Used to build a new `Snapshotter`.
+#[derive(Default)]
 pub struct SnapshotterBuilder {
     snapshotter: Snapshotter,
 }
 
 impl SnapshotterBuilder {
+    /// Construct a new builder. By default, all metric types are enabled and no
+    /// filtering is applied.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume the builder and return a `Snapshotter`.
     pub fn build(self) -> Snapshotter {
         self.snapshotter
     }
 
+    /// Allow disabling the inclusion of counter metrics from the snapshot.
     pub fn counters(mut self, included: bool) -> Self {
         self.snapshotter.counters = included;
         self
     }
 
+    /// Allow disabling the inclusion of gauge metrics from the snapshot.
     pub fn gauges(mut self, included: bool) -> Self {
         self.snapshotter.gauges = included;
         self
     }
 
+    /// Allow disabling the inclusion of `AtomicHistogram`s from the snapshot.
     pub fn atomic_histograms(mut self, included: bool) -> Self {
         self.snapshotter.atomic_histograms = included;
         self
     }
 
+    /// Allow disabling the inclusion of `RwLockHistogram`s from the snapshot.
     pub fn rwlock_histograms(mut self, included: bool) -> Self {
         self.snapshotter.rwlock_histograms = included;
         self
     }
 
+    /// Allow a user-supplied filtering function to be applied. The function is
+    /// given the metric name and must return true for any metric that should
+    /// be included in the snapshot.
     pub fn filter(mut self, filter: fn(&str) -> bool) -> Self {
         self.snapshotter.filter = filter;
         self
@@ -56,6 +73,7 @@ impl Default for Snapshotter {
 }
 
 impl Snapshotter {
+    /// Produce a new snapshot.
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = Snapshot::new();
 
