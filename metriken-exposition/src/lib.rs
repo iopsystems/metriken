@@ -1,3 +1,8 @@
+//! Exposition of Metriken metrics
+//!
+//! Provides a standardized struct for a snapshot of the metric readings as well
+//! as a way of producing the snapshots.
+
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};

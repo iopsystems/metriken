@@ -1,13 +1,18 @@
 use crate::*;
 
+// TODO(bmartin): derive Debug for Snapshot once the histogram snapshot has its
+// own debug impl.
+
 /// Contains a snapshot of metric readings.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone)]
+#[non_exhaustive]
 pub struct Snapshot {
-    datetime: DateTime<Utc>,
-    systemtime: SystemTime,
-    pub(crate) counters: Vec<(String, u64)>,
-    pub(crate) gauges: Vec<(String, i64)>,
-    pub(crate) histograms: Vec<(String, HistogramSnapshot)>,
+    pub datetime: DateTime<Utc>,
+    pub systemtime: SystemTime,
+    pub counters: Vec<(String, u64)>,
+    pub gauges: Vec<(String, i64)>,
+    pub histograms: Vec<(String, HistogramSnapshot)>,
 }
 
 impl Snapshot {

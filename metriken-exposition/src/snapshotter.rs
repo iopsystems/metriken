@@ -113,8 +113,7 @@ impl Snapshotter {
                                 .histograms
                                 .push((metric.formatted(metriken::Format::Simple), histogram));
                         }
-                    }
-                    if let Some(histogram) = other.downcast_ref::<RwLockHistogram>() {
+                    } else if let Some(histogram) = other.downcast_ref::<RwLockHistogram>() {
                         if !self.rwlock_histograms {
                             continue;
                         }
