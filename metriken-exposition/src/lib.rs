@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 pub use histogram::Snapshot as HistogramSnapshot;

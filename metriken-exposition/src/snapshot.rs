@@ -4,7 +4,7 @@ use crate::*;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Snapshot {
     datetime: DateTime<Utc>,
-    unix_ns: u64,
+    systemtime: SystemTime,
     pub(crate) counters: Vec<(String, u64)>,
     pub(crate) gauges: Vec<(String, i64)>,
     pub(crate) histograms: Vec<(String, HistogramSnapshot)>,
@@ -16,10 +16,9 @@ impl Snapshot {
         self.datetime
     }
 
-    /// The number of whole nanoseconds since the UNIX epoch when the snapshot
-    /// was created.
-    pub fn unix_ns(&self) -> u64 {
-        self.unix_ns
+    /// The system time when the snapshot was created.
+    pub fn systemtime(&self) -> SystemTime {
+        self.systemtime
     }
 
     /// A view into the counters for this snapshot.
@@ -40,16 +39,12 @@ impl Snapshot {
 
 impl Snapshot {
     pub(crate) fn new() -> Self {
-        let datetime: DateTime<Utc> = Utc::now();
-
-        let unix_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let now = SystemTime::now();
+        let datetime = DateTime::<Utc>::from(now);
 
         Self {
             datetime,
-            unix_ns,
+            systemtime: now,
             counters: Vec::new(),
             gauges: Vec::new(),
             histograms: Vec::new(),
