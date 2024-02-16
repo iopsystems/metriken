@@ -1,4 +1,5 @@
 use std::any::Any;
+
 use crate::*;
 
 /// Produces a snapshot of metric readings.
@@ -62,7 +63,7 @@ impl Snapshotter {
                 continue;
             }
 
-            if ! (self.kind_filter)(metric.as_any()) {
+            if !(self.kind_filter)(metric.as_any()) {
                 continue;
             }
 
