@@ -34,8 +34,8 @@ impl SnapshotterBuilder {
     }
 
     /// Allow a user-supplied filtering function to be applied. The function is
-    /// given the metric name and must return true for any metric that should
-    /// be included in the snapshot.
+    /// given the metric as an `Any` and must return true for any metric that
+    /// should be included in the snapshot.
     pub fn kind_filter(mut self, filter: fn(Option<&dyn std::any::Any>) -> bool) -> Self {
         self.snapshotter.kind_filter = filter;
         self
