@@ -5,4 +5,4 @@ members = [
     "metriken",
     "metriken-core",
     "metriken-derive"
-]
+, "metriken-exposition"]

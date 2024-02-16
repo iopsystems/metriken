@@ -1,0 +1,18 @@
+[package]
+name = "metriken-exposition"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+    "Sean Lynch <sean@iop.systems>",
+]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chrono = "0.4.34"
+histogram = "0.9.1"
+metriken = { version = "0.5.1", path = "../metriken" }
+serde = { version = "1.0.196", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
