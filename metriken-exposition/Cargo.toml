@@ -1,6 +1,6 @@
 [package]
 name = "metriken-exposition"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -15,7 +15,11 @@ repository = "https://github.com/iopsystems/metriken"
 chrono = "0.4.34"
 histogram = "0.9.1"
 metriken = { version = "0.5.1", path = "../metriken" }
+rmp-serde = { version = "1.1.2", optional = true }
 serde = { version = "1.0.196", features = ["derive"], optional = true }
+serde_json = { version = "1.0.114", optional = true }
 
 [features]
 serde = ["dep:serde", "chrono/serde", "histogram/serde"]
+json = ["dep:serde", "dep:serde_json"]
+msgpack = ["dep:serde", "dep:rmp-serde"]
