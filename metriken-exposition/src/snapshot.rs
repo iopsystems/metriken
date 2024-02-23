@@ -1,6 +1,10 @@
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "msgpack")]
+use rmp_serde::encode::Error as SerializeMsgpackError;
+#[cfg(feature = "json")]
+use serde_json::Error as JsonError;
 
 use crate::HistogramSnapshot;
 
@@ -58,5 +62,23 @@ impl Snapshot {
             gauges: Vec::new(),
             histograms: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "json")]
+    pub fn to_json<T>(val: &T) -> Result<Vec<u8>, JsonError>
+    where
+        T: serde::Serialize + ?Sized,
+    {
+        let mut res = serde_json::to_vec(val)?;
+        res.push(b'\n');
+        Ok(res)
+    }
+
+    #[cfg(feature = "msgpack")]
+    pub fn to_msgpack<T>(val: &T) -> Result<Vec<u8>, SerializeMsgpackError>
+    where
+        T: serde::Serialize + ?Sized,
+    {
+        rmp_serde::encode::to_vec(val)
     }
 }
