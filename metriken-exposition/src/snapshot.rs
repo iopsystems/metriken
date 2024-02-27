@@ -1,6 +1,7 @@
+#[cfg(feature = "parquet")]
+use std::collections::HashMap;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
 #[cfg(feature = "msgpack")]
 use rmp_serde::encode::Error as SerializeMsgpackError;
 #[cfg(feature = "json")]
@@ -16,17 +17,28 @@ use crate::HistogramSnapshot;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct Snapshot {
-    pub datetime: DateTime<Utc>,
     pub systemtime: SystemTime,
     pub counters: Vec<(String, u64)>,
     pub gauges: Vec<(String, i64)>,
     pub histograms: Vec<(String, HistogramSnapshot)>,
 }
 
+#[cfg(feature = "parquet")]
+pub(crate) struct HashedSnapshot {
+    pub(crate) ts: u64,
+    pub(crate) counters: HashMap<String, u64>,
+    pub(crate) gauges: HashMap<String, i64>,
+    pub(crate) histograms: HashMap<String, HistogramSnapshot>,
+}
+
 impl Snapshot {
-    /// The UTC datetime when the snapshot was created.
-    pub fn datetime(&self) -> DateTime<Utc> {
-        self.datetime
+    pub(crate) fn new() -> Self {
+        Self {
+            systemtime: SystemTime::now(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        }
     }
 
     /// The system time when the snapshot was created.
@@ -48,21 +60,6 @@ impl Snapshot {
     pub fn histograms(&self) -> &[(String, HistogramSnapshot)] {
         &self.histograms
     }
-}
-
-impl Snapshot {
-    pub(crate) fn new() -> Self {
-        let now = SystemTime::now();
-        let datetime = DateTime::<Utc>::from(now);
-
-        Self {
-            datetime,
-            systemtime: now,
-            counters: Vec::new(),
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-        }
-    }
 
     #[cfg(feature = "json")]
     pub fn to_json<T>(val: &T) -> Result<Vec<u8>, JsonError>
@@ -80,5 +77,39 @@ impl Snapshot {
         T: serde::Serialize + ?Sized,
     {
         rmp_serde::encode::to_vec(val)
+    }
+}
+
+#[cfg(feature = "parquet")]
+impl From<Snapshot> for HashedSnapshot {
+    fn from(snapshot: Snapshot) -> Self {
+        let mut counters: HashMap<String, u64> = HashMap::new();
+        let mut gauges: HashMap<String, i64> = HashMap::new();
+        let mut histograms: HashMap<String, HistogramSnapshot> = HashMap::new();
+
+        let ts: u64 = snapshot
+            .systemtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("System Clock is earlier than 1970; needs reset")
+            .as_nanos() as u64;
+
+        for counter in snapshot.counters {
+            counters.insert(counter.0, counter.1);
+        }
+
+        for gauge in snapshot.gauges {
+            gauges.insert(gauge.0, gauge.1);
+        }
+
+        for h in snapshot.histograms {
+            histograms.insert(h.0, h.1);
+        }
+
+        Self {
+            ts,
+            counters,
+            gauges,
+            histograms,
+        }
     }
 }
