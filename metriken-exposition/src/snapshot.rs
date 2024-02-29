@@ -83,27 +83,16 @@ impl Snapshot {
 #[cfg(feature = "parquet")]
 impl From<Snapshot> for HashedSnapshot {
     fn from(snapshot: Snapshot) -> Self {
-        let mut counters: HashMap<String, u64> = HashMap::new();
-        let mut gauges: HashMap<String, i64> = HashMap::new();
-        let mut histograms: HashMap<String, HistogramSnapshot> = HashMap::new();
-
         let ts: u64 = snapshot
             .systemtime
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("System Clock is earlier than 1970; needs reset")
             .as_nanos() as u64;
 
-        for counter in snapshot.counters {
-            counters.insert(counter.0, counter.1);
-        }
-
-        for gauge in snapshot.gauges {
-            gauges.insert(gauge.0, gauge.1);
-        }
-
-        for h in snapshot.histograms {
-            histograms.insert(h.0, h.1);
-        }
+        let counters: HashMap<String, u64> = HashMap::from_iter(snapshot.counters);
+        let gauges: HashMap<String, i64> = HashMap::from_iter(snapshot.gauges);
+        let histograms: HashMap<String, HistogramSnapshot> =
+            HashMap::from_iter(snapshot.histograms);
 
         Self {
             ts,

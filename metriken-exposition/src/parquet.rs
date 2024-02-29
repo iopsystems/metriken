@@ -13,32 +13,61 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use parquet::format::FileMetaData;
 
-pub struct ParquetWriter {
-    /// File handle for output parquet file
-    file: Option<File>,
-    writer: Option<ArrowWriter<File>>,
-    properties: WriterProperties,
-
+/// Options for `ParquetWriter` controlling the output parquet file.
+pub struct ParquetOptions {
+    /// Supported compression types are None or Zstd at specified level
+    compression: Compression,
     /// Number of rows cached in memory before being written as a `RecordBatch`
     max_batch_size: usize,
-
-    /// Schema and columnar data for timestamps
-    tses: Vec<u64>,
-
-    /// Schema and columnar data for counters
-    counters: BTreeMap<String, Vec<Option<u64>>>,
-
-    /// Schema and columnar data for gauges
-    gauges: BTreeMap<String, Vec<Option<i64>>>,
-
-    /// Schema and columnar data for histograms
-    histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
-
-    /// Schema generated for the parquet file after finalizing metadata
-    schema: Arc<Schema>,
 }
 
-/// Convert metrics snapshot data into parquet
+impl ParquetOptions {
+    pub fn builder() -> ParquetOptionsBuilder {
+        ParquetOptionsBuilder::default()
+    }
+
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
+}
+
+impl Default for ParquetOptions {
+    fn default() -> Self {
+        Self {
+            compression: Compression::UNCOMPRESSED,
+            max_batch_size: 1024 * 1024,
+        }
+    }
+}
+
+/// Used to build `ParquetOptions`.
+#[derive(Default)]
+pub struct ParquetOptionsBuilder {
+    options: ParquetOptions,
+}
+
+impl ParquetOptionsBuilder {
+    pub fn build(self) -> ParquetOptions {
+        self.options
+    }
+
+    pub fn compression_level(mut self, level: i32) -> Result<Self, ParquetError> {
+        let compression = Compression::ZSTD(ZstdLevel::try_new(level)?);
+        self.options.compression = compression;
+        Ok(self)
+    }
+
+    pub fn max_batch_size(mut self, batch_size: usize) -> Self {
+        self.options.max_batch_size = batch_size;
+        self
+    }
+}
+
+/// Converts metrics snapshot data into parquet
 ///
 /// Parquet files need the entire schema to be known prior to starting to
 /// write any data and all the columns to be of the same length. Missing
@@ -57,38 +86,40 @@ pub struct ParquetWriter {
 /// b) We process batches of snapshots extracing the row-centric data and
 ///    converting it to a columnar form while filling in `None` values for
 ///    metrics which are missing in specific snapshots.
+pub struct ParquetWriter {
+    /// File handle for output parquet file
+    file: Option<File>,
+    writer: Option<ArrowWriter<File>>,
+    options: ParquetOptions,
+
+    /// Schema and columnar data for timestamps
+    timestamps: Vec<u64>,
+
+    /// Schema and columnar data for counters
+    counters: BTreeMap<String, Vec<Option<u64>>>,
+
+    /// Schema and columnar data for gauges
+    gauges: BTreeMap<String, Vec<Option<i64>>>,
+
+    /// Schema and columnar data for histograms
+    histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+
+    /// Schema generated for the parquet file after finalizing metadata
+    schema: Arc<Schema>,
+}
+
 impl ParquetWriter {
-    const DEFAULT_MAX_BATCH_SIZE: usize = 1024 * 1024;
-
-    pub fn try_new(file: File, compression: bool) -> Result<Self, ParquetError> {
-        Self::try_new_with_max_batch_size(file, Self::DEFAULT_MAX_BATCH_SIZE, compression)
-    }
-
-    pub fn try_new_with_max_batch_size(
-        file: File,
-        max_batch_size: usize,
-        compression: bool,
-    ) -> Result<Self, ParquetError> {
-        let props = match compression {
-            false => WriterProperties::builder()
-                .set_compression(Compression::UNCOMPRESSED)
-                .build(),
-            true => WriterProperties::builder()
-                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-                .build(),
-        };
-
-        Ok(ParquetWriter {
+    pub fn new(file: File, options: ParquetOptions) -> Self {
+        ParquetWriter {
             file: Some(file),
             writer: None,
-            properties: props,
-            max_batch_size,
-            tses: Vec::new(),
+            options,
+            timestamps: Vec::new(),
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             histograms: BTreeMap::new(),
             schema: Arc::new(Schema::empty()),
-        })
+        }
     }
 
     /// Process and store metadata for all metrics seen in the snapshot.
@@ -166,10 +197,13 @@ impl ParquetWriter {
         self.schema = Arc::new(Schema::new(fields));
 
         let file = std::mem::take(&mut self.file).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(self.options.compression())
+            .build();
         self.writer = Some(ArrowWriter::try_new(
             file,
             self.schema.clone(),
-            Some(self.properties.clone()),
+            Some(props),
         )?);
 
         Ok(())
@@ -187,7 +221,7 @@ impl ParquetWriter {
         let mut hs: HashedSnapshot = HashedSnapshot::from(snapshot);
 
         // Aggregate timestamps into a column
-        self.tses.push(hs.ts);
+        self.timestamps.push(hs.ts);
 
         // Aggregate metrics in the existing columns. Since `remove` returns
         // `None` if a metric in the schema does not exist in the snapshot gaps
@@ -205,7 +239,7 @@ impl ParquetWriter {
         }
 
         // Check and flush if the max batch size of rows have been processed
-        if self.tses.len() == self.max_batch_size {
+        if self.timestamps.len() == self.options.max_batch_size() {
             let batch = self.snapshots_to_recordbatch()?;
             let writer = self.writer.as_mut().unwrap();
             writer.write(&batch)?;
@@ -229,7 +263,9 @@ impl ParquetWriter {
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
 
         // Move existing timestamp array into an arrow array and clear
-        columns.push(Arc::new(UInt64Array::from(std::mem::take(&mut self.tses))));
+        columns.push(Arc::new(UInt64Array::from(std::mem::take(
+            &mut self.timestamps,
+        ))));
 
         // One column per-counter with a similar swap-and-clear of the vector
         for (_, val) in self.counters.iter_mut() {

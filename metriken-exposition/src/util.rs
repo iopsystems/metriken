@@ -1,13 +1,15 @@
 use std::fs::File;
 use std::io::{BufRead, Seek};
+use std::path::Path;
 
 use crate::snapshot::Snapshot;
-use crate::ParquetWriter;
+use crate::{ParquetOptions, ParquetWriter};
 use parquet::errors::ParquetError;
 
-pub fn msgpack_to_parquet(input: String, output: String) -> Result<i64, ParquetError> {
+pub fn msgpack_to_parquet(input: &Path, output: String) -> Result<i64, ParquetError> {
     let mut reader = std::io::BufReader::new(File::open(input)?);
-    let mut writer = ParquetWriter::try_new(File::create(output)?, true)?;
+    let options = ParquetOptions::builder().compression_level(3)?.build();
+    let mut writer = ParquetWriter::new(File::create(output)?, options);
 
     // First pass to build the schema
     while !reader.fill_buf().unwrap().is_empty() {

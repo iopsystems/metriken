@@ -13,6 +13,6 @@ mod snapshotter;
 pub mod util;
 
 #[cfg(feature = "parquet")]
-pub use parquet::ParquetWriter;
+pub use parquet::{ParquetOptions, ParquetWriter};
 pub use snapshot::Snapshot;
 pub use snapshotter::{Snapshotter, SnapshotterBuilder};
