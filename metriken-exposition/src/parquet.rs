@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::snapshot::{HashedSnapshot, Snapshot};
-use crate::HistogramSnapshot;
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::error::ArrowError;
@@ -12,6 +11,9 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use parquet::format::FileMetaData;
+
+use crate::snapshot::{HashedSnapshot, Snapshot};
+use crate::HistogramSnapshot;
 
 /// Options for `ParquetWriter` controlling the output parquet file.
 pub struct ParquetOptions {
@@ -86,50 +88,27 @@ impl ParquetOptionsBuilder {
 /// b) We process batches of snapshots extracing the row-centric data and
 ///    converting it to a columnar form while filling in `None` values for
 ///    metrics which are missing in specific snapshots.
-pub struct ParquetWriter {
-    /// File handle for output parquet file
-    file: Option<File>,
-    writer: Option<ArrowWriter<File>>,
-    options: ParquetOptions,
-
-    /// Schema and columnar data for timestamps
-    timestamps: Vec<u64>,
-
-    /// Schema and columnar data for counters
+///
+/// The `ParquetSchema` is responsible for generating the schema and for
+/// building a `ParquetWriter` which actually writes the parquet file.
+#[derive(Default)]
+pub struct ParquetSchema {
     counters: BTreeMap<String, Vec<Option<u64>>>,
-
-    /// Schema and columnar data for gauges
     gauges: BTreeMap<String, Vec<Option<i64>>>,
-
-    /// Schema and columnar data for histograms
     histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
-
-    /// Schema generated for the parquet file after finalizing metadata
-    schema: Arc<Schema>,
 }
 
-impl ParquetWriter {
-    pub fn new(file: File, options: ParquetOptions) -> Self {
-        ParquetWriter {
-            file: Some(file),
-            writer: None,
-            options,
-            timestamps: Vec::new(),
+impl ParquetSchema {
+    pub fn new() -> Self {
+        ParquetSchema {
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             histograms: BTreeMap::new(),
-            schema: Arc::new(Schema::empty()),
         }
     }
 
     /// Process and store metadata for all metrics seen in the snapshot.
-    pub fn process_snapshot_schema(&mut self, snapshot: Snapshot) -> Result<(), ParquetError> {
-        if self.writer.is_some() {
-            return Err(ParquetError::General(
-                "Schema already finalized".to_string(),
-            ));
-        }
-
+    pub fn push(&mut self, snapshot: Snapshot) {
         let (counters, gauges, histograms) =
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
@@ -144,18 +123,13 @@ impl ParquetWriter {
         for h in histograms {
             self.histograms.entry(h.0).or_default();
         }
-
-        Ok(())
     }
 
-    /// Create a schema from the union of saved metrics metadata.
-    pub fn finalize_schema(&mut self) -> Result<(), ParquetError> {
-        if self.writer.is_some() {
-            return Err(ParquetError::General(
-                "Schema already finalized".to_string(),
-            ));
-        }
-
+    pub fn finalize(
+        self,
+        path: &Path,
+        options: ParquetOptions,
+    ) -> Result<ParquetWriter, ParquetError> {
         let mut fields: Vec<Field> = Vec::with_capacity(
             1 + self.counters.len() + self.gauges.len() + (self.histograms.len() * 3),
         );
@@ -194,30 +168,50 @@ impl ParquetWriter {
             ));
         }
 
-        self.schema = Arc::new(Schema::new(fields));
-
-        let file = std::mem::take(&mut self.file).unwrap();
+        let schema = Arc::new(Schema::new(fields));
+        let file = File::create(path)?;
         let props = WriterProperties::builder()
-            .set_compression(self.options.compression())
+            .set_compression(options.compression())
             .build();
-        self.writer = Some(ArrowWriter::try_new(
-            file,
-            self.schema.clone(),
-            Some(props),
-        )?);
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-        Ok(())
+        Ok(ParquetWriter {
+            writer,
+            options,
+            schema,
+            timestamps: Vec::new(),
+            counters: self.counters,
+            gauges: self.gauges,
+            histograms: self.histograms,
+        })
     }
+}
 
+pub struct ParquetWriter {
+    /// Writer, options, and schema of the parquet file
+    writer: ArrowWriter<File>,
+    options: ParquetOptions,
+    schema: Arc<Schema>,
+
+    /// Columnar data for timestamps
+    timestamps: Vec<u64>,
+
+    /// Schema-ordered columnar data for counters
+    counters: BTreeMap<String, Vec<Option<u64>>>,
+
+    /// Schema-ordered columnar data for gauges
+    gauges: BTreeMap<String, Vec<Option<i64>>>,
+
+    /// Schema-ordered columnar data for histograms
+    histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+}
+
+impl ParquetWriter {
     /// Process individual snapshots of metrics and store them in a columnar
-    /// representation. Fill in the gaps for missing data, i.e., missing
-    /// or dynamic metrics with `None` so that all columns have the same length.
-    /// Writes out batches of the aggregated columns once they reach a certain size.
-    pub fn process_snapshot(&mut self, snapshot: Snapshot) -> Result<(), ParquetError> {
-        if self.writer.is_none() {
-            return Err(ParquetError::General("Schema not finalized".to_string()));
-        }
-
+    /// representation. Fill in the gaps for missing data, i.e., missing or
+    /// dynamic metrics with `None` so that all columns have the same length.
+    /// Writes out batches of aggregated columns once they reach a certain size.
+    pub fn push(&mut self, snapshot: Snapshot) -> Result<(), ParquetError> {
         let mut hs: HashedSnapshot = HashedSnapshot::from(snapshot);
 
         // Aggregate timestamps into a column
@@ -241,24 +235,20 @@ impl ParquetWriter {
         // Check and flush if the max batch size of rows have been processed
         if self.timestamps.len() == self.options.max_batch_size() {
             let batch = self.snapshots_to_recordbatch()?;
-            let writer = self.writer.as_mut().unwrap();
-            writer.write(&batch)?;
+            self.writer.write(&batch)?;
         }
 
         Ok(())
     }
 
-    pub fn finalize(&mut self) -> Result<FileMetaData, ParquetError> {
-        if self.writer.is_none() {
-            return Err(ParquetError::General("Schema not finalized".to_string()));
-        }
-
+    /// Finish writing any buffered metrics and the parquet footer.
+    pub fn finalize(mut self) -> Result<FileMetaData, ParquetError> {
         let batch = self.snapshots_to_recordbatch()?;
-        let mut writer = std::mem::take(&mut self.writer).unwrap();
-        writer.write(&batch)?;
-        writer.close()
+        self.writer.write(&batch)?;
+        self.writer.close()
     }
 
+    /// Convert buffered metrics to a parquet `RecordBatch`.
     fn snapshots_to_recordbatch(&mut self) -> Result<RecordBatch, ArrowError> {
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
 
