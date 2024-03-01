@@ -23,16 +23,19 @@ pub struct ParquetOptions {
 }
 
 impl ParquetOptions {
-    pub fn builder() -> ParquetOptionsBuilder {
-        ParquetOptionsBuilder::default()
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn compression(&self) -> Compression {
-        self.compression
+    pub fn compression_level(mut self, level: i32) -> Result<Self, ParquetError> {
+        let compression = Compression::ZSTD(ZstdLevel::try_new(level)?);
+        self.compression = compression;
+        Ok(self)
     }
 
-    pub fn max_batch_size(&self) -> usize {
-        self.max_batch_size
+    pub fn max_batch_size(mut self, batch_size: usize) -> Self {
+        self.max_batch_size = batch_size;
+        self
     }
 }
 
@@ -42,29 +45,6 @@ impl Default for ParquetOptions {
             compression: Compression::UNCOMPRESSED,
             max_batch_size: 1024 * 1024,
         }
-    }
-}
-
-/// Used to build `ParquetOptions`.
-#[derive(Default)]
-pub struct ParquetOptionsBuilder {
-    options: ParquetOptions,
-}
-
-impl ParquetOptionsBuilder {
-    pub fn build(self) -> ParquetOptions {
-        self.options
-    }
-
-    pub fn compression_level(mut self, level: i32) -> Result<Self, ParquetError> {
-        let compression = Compression::ZSTD(ZstdLevel::try_new(level)?);
-        self.options.compression = compression;
-        Ok(self)
-    }
-
-    pub fn max_batch_size(mut self, batch_size: usize) -> Self {
-        self.options.max_batch_size = batch_size;
-        self
     }
 }
 
@@ -170,7 +150,7 @@ impl ParquetSchema {
 
         let schema = Arc::new(Schema::new(fields));
         let props = WriterProperties::builder()
-            .set_compression(options.compression())
+            .set_compression(options.compression)
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
@@ -232,7 +212,7 @@ impl<W: Write + Send> ParquetWriter<W> {
         }
 
         // Check and flush if the max batch size of rows have been processed
-        if self.timestamps.len() == self.options.max_batch_size() {
+        if self.timestamps.len() == self.options.max_batch_size {
             let batch = self.snapshots_to_recordbatch()?;
             self.writer.write(&batch)?;
         }
