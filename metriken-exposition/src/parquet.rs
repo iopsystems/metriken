@@ -15,6 +15,7 @@ use crate::snapshot::{HashedSnapshot, Snapshot};
 use crate::HistogramSnapshot;
 
 /// Options for `ParquetWriter` controlling the output parquet file.
+#[derive(Clone, Debug)]
 pub struct ParquetOptions {
     /// Supported compression types are None or Zstd at specified level
     compression: Compression,
