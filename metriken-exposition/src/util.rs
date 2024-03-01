@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, Seek};
+use std::io::{BufRead, BufReader, Seek};
 use std::path::Path;
 
 use parquet::errors::ParquetError;
@@ -8,8 +8,7 @@ use crate::snapshot::Snapshot;
 use crate::{ParquetOptions, ParquetSchema};
 
 pub fn msgpack_to_parquet(input: &Path, output: &Path) -> Result<i64, ParquetError> {
-    let mut reader = std::io::BufReader::new(File::open(input)?);
-    let options = ParquetOptions::builder().compression_level(3)?.build();
+    let mut reader = BufReader::new(File::open(input)?);
     let mut schema = ParquetSchema::new();
 
     // First pass to build the schema
@@ -18,7 +17,10 @@ pub fn msgpack_to_parquet(input: &Path, output: &Path) -> Result<i64, ParquetErr
             rmp_serde::from_read(&mut reader).map_err(|x| ParquetError::External(Box::new(x)))?;
         schema.push(s);
     }
-    let mut writer = schema.finalize(output, options)?;
+    let mut writer = schema.finalize(
+        File::create(output)?,
+        ParquetOptions::builder().compression_level(3)?.build(),
+    )?;
 
     // Rewind file pointer and second pass for the actual metrics
     reader.rewind().unwrap();

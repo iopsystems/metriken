@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::path::Path;
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow::array::*;
@@ -128,9 +127,9 @@ impl ParquetSchema {
     /// Finalize the schema and build a `ParquetWriter`.
     pub fn finalize(
         self,
-        path: &Path,
+        writer: impl Write + Send,
         options: ParquetOptions,
-    ) -> Result<ParquetWriter, ParquetError> {
+    ) -> Result<ParquetWriter<impl Write + Send>, ParquetError> {
         let mut fields: Vec<Field> = Vec::with_capacity(
             1 + self.counters.len() + self.gauges.len() + (self.histograms.len() * 3),
         );
@@ -170,14 +169,13 @@ impl ParquetSchema {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let file = File::create(path)?;
         let props = WriterProperties::builder()
             .set_compression(options.compression())
             .build();
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
         Ok(ParquetWriter {
-            writer,
+            writer: arrow_writer,
             options,
             schema,
             timestamps: Vec::new(),
@@ -188,9 +186,9 @@ impl ParquetSchema {
     }
 }
 
-pub struct ParquetWriter {
+pub struct ParquetWriter<W: Write + Send> {
     /// Writer, options, and schema of the parquet file
-    writer: ArrowWriter<File>,
+    writer: ArrowWriter<W>,
     options: ParquetOptions,
     schema: Arc<Schema>,
 
@@ -207,7 +205,7 @@ pub struct ParquetWriter {
     histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
 }
 
-impl ParquetWriter {
+impl<W: Write + Send> ParquetWriter<W> {
     /// Process individual snapshots of metrics and store them in a columnar
     /// representation. Fill in the gaps for missing data, i.e., missing or
     /// dynamic metrics with `None` so that all columns have the same length.
