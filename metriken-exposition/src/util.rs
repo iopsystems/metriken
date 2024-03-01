@@ -7,6 +7,8 @@ use parquet::errors::ParquetError;
 use crate::snapshot::Snapshot;
 use crate::{ParquetOptions, ParquetSchema};
 
+/// Converts a file with metrics in msgpack format to a parquet file.
+/// If successful, returns the number of rows written out to the parquet file.
 pub fn msgpack_to_parquet<P: AsRef<Path>>(input: P, output: P) -> Result<i64, ParquetError> {
     let mut reader = BufReader::new(File::open(input)?);
     let mut schema = ParquetSchema::new();
