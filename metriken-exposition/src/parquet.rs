@@ -125,6 +125,7 @@ impl ParquetSchema {
         }
     }
 
+    /// Finalize the schema and build a `ParquetWriter`.
     pub fn finalize(
         self,
         path: &Path,
