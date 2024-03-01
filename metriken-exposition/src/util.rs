@@ -7,7 +7,7 @@ use parquet::errors::ParquetError;
 use crate::snapshot::Snapshot;
 use crate::{ParquetOptions, ParquetSchema};
 
-pub fn msgpack_to_parquet(input: &Path, output: &Path) -> Result<i64, ParquetError> {
+pub fn msgpack_to_parquet<P: AsRef<Path>>(input: P, output: P) -> Result<i64, ParquetError> {
     let mut reader = BufReader::new(File::open(input)?);
     let mut schema = ParquetSchema::new();
 
