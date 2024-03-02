@@ -12,9 +12,11 @@ homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
+arrow = { version = "50.0.0", optional = true }
 chrono = "0.4.34"
 histogram = "0.9.1"
 metriken = { version = "0.5.1", path = "../metriken" }
+parquet = { version = "50.0.0", optional = true }
 rmp-serde = { version = "1.1.2", optional = true }
 serde = { version = "1.0.196", features = ["derive"], optional = true }
 serde_json = { version = "1.0.114", optional = true }
@@ -23,3 +25,4 @@ serde_json = { version = "1.0.114", optional = true }
 serde = ["dep:serde", "chrono/serde", "histogram/serde"]
 json = ["dep:serde", "dep:serde_json"]
 msgpack = ["dep:serde", "dep:rmp-serde"]
+parquet = ["dep:arrow", "dep:parquet"]
