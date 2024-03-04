@@ -139,17 +139,17 @@ impl ParquetSchema {
         // add one column per-summary percentile.
         for h in self.histograms.keys() {
             fields.push(Field::new(
-                format!("{}_grouping_power", h),
+                format!("{}:grouping_power", h),
                 DataType::UInt8,
                 true,
             ));
             fields.push(Field::new(
-                format!("{}_max_config_power", h),
+                format!("{}:max_config_power", h),
                 DataType::UInt8,
                 true,
             ));
             fields.push(Field::new(
-                format!("{}_buckets", h),
+                format!("{}:buckets", h),
                 DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
                 true,
             ));
@@ -157,7 +157,7 @@ impl ParquetSchema {
             if let Some(ref x) = self.summary_percentiles {
                 for percentile in x {
                     fields.push(Field::new(
-                        format!("{}_p{}", h, percentile),
+                        format!("{}:p{}", h, percentile),
                         DataType::UInt64,
                         true,
                     ));
