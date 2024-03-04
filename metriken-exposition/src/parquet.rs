@@ -71,19 +71,23 @@ impl Default for ParquetOptions {
 ///
 /// The `ParquetSchema` is responsible for generating the schema and for
 /// building a `ParquetWriter` which actually writes the parquet file.
+/// The `ParquetSchema` optionally accepts a list of percentiles which is
+/// tracks as summary statistics for every histogram encountered.
 #[derive(Default)]
 pub struct ParquetSchema {
     counters: BTreeMap<String, Vec<Option<u64>>>,
     gauges: BTreeMap<String, Vec<Option<i64>>>,
     histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+    summary_percentiles: Option<Vec<f64>>,
 }
 
 impl ParquetSchema {
-    pub fn new() -> Self {
+    pub fn new(percentiles: Option<Vec<f64>>) -> Self {
         ParquetSchema {
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             histograms: BTreeMap::new(),
+            summary_percentiles: percentiles,
         }
     }
 
@@ -128,9 +132,11 @@ impl ParquetSchema {
             fields.push(Field::new(gauge.clone(), DataType::Int64, true));
         }
 
-        // Create three column fields per-snapshot: two for configuration data
-        // around histogram size and one for the actual buckets. The latter
-        // is a nested list type where each list element is an array of `u64`s.
+        // Create at least three column fields per-snapshot: two for
+        // configuration data around histogram size and one for the actual
+        // buckets. The latter is a nested list type where each list element
+        // is an array of `u64`s. If summary percentiles are also desired,
+        // add one column per-summary percentile.
         for h in self.histograms.keys() {
             fields.push(Field::new(
                 format!("{}_grouping_power", h),
@@ -147,6 +153,16 @@ impl ParquetSchema {
                 DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
                 true,
             ));
+
+            if let Some(ref x) = self.summary_percentiles {
+                for percentile in x {
+                    fields.push(Field::new(
+                        format!("{}_p{}", h, percentile),
+                        DataType::UInt64,
+                        true,
+                    ));
+                }
+            }
         }
 
         let schema = Arc::new(Schema::new(fields));
@@ -163,6 +179,7 @@ impl ParquetSchema {
             counters: self.counters,
             gauges: self.gauges,
             histograms: self.histograms,
+            summary_percentiles: self.summary_percentiles,
         })
     }
 }
@@ -184,6 +201,9 @@ pub struct ParquetWriter<W: Write + Send> {
 
     /// Schema-ordered columnar data for histograms
     histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+
+    /// Summary percentiles to store for histograms
+    summary_percentiles: Option<Vec<f64>>,
 }
 
 impl<W: Write + Send> ParquetWriter<W> {
@@ -249,8 +269,9 @@ impl<W: Write + Send> ParquetWriter<W> {
             columns.push(Arc::new(Int64Array::from(col)));
         }
 
-        // Three columns per-histogram: two for configuration (the grouping
-        // power and the max capacity power), and one for the buckets.
+        // At least three columns per-histogram: two for configuration (the
+        // grouping power and the max capacity power), and one for the buckets.
+        // If summary percentiles are desired, add one column per-summary.
         for (_, val) in self.histograms.iter_mut() {
             let hists = std::mem::take(val);
 
@@ -258,8 +279,21 @@ impl<W: Write + Send> ParquetWriter<W> {
             let mut maxes: Vec<Option<u8>> = Vec::with_capacity(hists.len());
             let mut buckets = ListBuilder::new(UInt64Builder::new());
 
+            // Store one column per-summary percentile, with one-row per-histogram
+            let mut summaries: Vec<Vec<Option<u64>>> = match self.summary_percentiles {
+                None => Vec::new(),
+                Some(ref x) => {
+                    let mut outer = Vec::with_capacity(x.len());
+                    for _ in 0..x.len() {
+                        outer.push(Vec::with_capacity(hists.len()));
+                    }
+                    outer
+                }
+            };
+
             for h in hists {
                 if let Some(x) = h {
+                    // Columnize histogram configs and buckets
                     gps.push(Some(x.config().grouping_power()));
                     maxes.push(Some(x.config().max_value_power()));
                     buckets.append_value(
@@ -267,15 +301,38 @@ impl<W: Write + Send> ParquetWriter<W> {
                             .map(|x| Some(x.count()))
                             .collect::<Vec<Option<u64>>>(),
                     );
+
+                    // Columnize histogram summary percentiles
+                    if let Some(ref percentiles) = self.summary_percentiles {
+                        for (idx, percentile) in percentiles.iter().enumerate() {
+                            let v = x.percentile(*percentile).map(|x| x.end()).ok();
+                            summaries[idx].push(v);
+                        }
+                    }
                 } else {
+                    // Histogram missing; store `None` for config, bucket, and
+                    // summary percentiles
                     gps.push(None);
                     maxes.push(None);
                     buckets.append_null();
+
+                    if let Some(ref percentiles) = self.summary_percentiles {
+                        for (idx, _) in percentiles.iter().enumerate() {
+                            summaries[idx].push(None);
+                        }
+                    }
                 }
             }
             columns.push(Arc::new(UInt8Array::from(gps)));
             columns.push(Arc::new(UInt8Array::from(maxes)));
             columns.push(Arc::new(buckets.finish()));
+
+            if !summaries.is_empty() {
+                for mut col in summaries {
+                    let v = std::mem::take(&mut col);
+                    columns.push(Arc::new(UInt64Array::from(v)));
+                }
+            }
         }
 
         RecordBatch::try_new(self.schema.clone(), columns)

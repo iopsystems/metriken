@@ -9,12 +9,15 @@ use crate::{ParquetOptions, ParquetSchema};
 
 /// Converts a file with metrics in msgpack format to a parquet file.
 /// If successful, returns the number of rows written out to the parquet file.
+/// Optionally accepts a list of percentiles to store summary statistics for
+/// in the parquet file.
 pub fn msgpack_to_parquet(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
+    percentiles: Option<Vec<f64>>,
 ) -> Result<i64, ParquetError> {
     let mut reader = BufReader::new(File::open(input)?);
-    let mut schema = ParquetSchema::new();
+    let mut schema = ParquetSchema::new(percentiles);
 
     // First pass to build the schema
     while !reader.fill_buf().unwrap().is_empty() {
