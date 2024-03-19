@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -120,16 +120,29 @@ impl ParquetSchema {
         );
 
         // Create one column for the timestamp
-        fields.push(Field::new("timestamp", DataType::UInt64, false));
+        fields.push(
+            Field::new("timestamp", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "metric_type".to_owned(),
+                "timestamp".to_owned(),
+            )])),
+        );
 
         // Create one column field per-counter
+        let counter_metadata = HashMap::from([("metric_type".to_owned(), "counter".to_owned())]);
         for counter in self.counters.keys() {
-            fields.push(Field::new(counter.clone(), DataType::UInt64, true));
+            fields.push(
+                Field::new(counter.clone(), DataType::UInt64, true)
+                    .with_metadata(counter_metadata.clone()),
+            );
         }
 
         // Create one column field per-gauge
+        let gauge_metadata = HashMap::from([("metric_type".to_owned(), "gauge".to_owned())]);
         for gauge in self.gauges.keys() {
-            fields.push(Field::new(gauge.clone(), DataType::Int64, true));
+            fields.push(
+                Field::new(gauge.clone(), DataType::Int64, true)
+                    .with_metadata(gauge_metadata.clone()),
+            );
         }
 
         // Create at least three column fields per-snapshot: two for
@@ -137,30 +150,31 @@ impl ParquetSchema {
         // buckets. The latter is a nested list type where each list element
         // is an array of `u64`s. If summary percentiles are also desired,
         // add one column per-summary percentile.
+        let hist_metadata = HashMap::from([("metric_type".to_owned(), "histogram".to_owned())]);
         for h in self.histograms.keys() {
-            fields.push(Field::new(
-                format!("{}:grouping_power", h),
-                DataType::UInt8,
-                true,
-            ));
-            fields.push(Field::new(
-                format!("{}:max_config_power", h),
-                DataType::UInt8,
-                true,
-            ));
-            fields.push(Field::new(
-                format!("{}:buckets", h),
-                DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
-                true,
-            ));
+            fields.push(
+                Field::new(format!("{}:grouping_power", h), DataType::UInt8, true)
+                    .with_metadata(hist_metadata.clone()),
+            );
+            fields.push(
+                Field::new(format!("{}:max_config_power", h), DataType::UInt8, true)
+                    .with_metadata(hist_metadata.clone()),
+            );
+            fields.push(
+                Field::new(
+                    format!("{}:buckets", h),
+                    DataType::new_list(DataType::UInt64, true),
+                    true,
+                )
+                .with_metadata(hist_metadata.clone()),
+            );
 
             if let Some(ref x) = self.summary_percentiles {
                 for percentile in x {
-                    fields.push(Field::new(
-                        format!("{}:p{}", h, percentile),
-                        DataType::UInt64,
-                        true,
-                    ));
+                    fields.push(
+                        Field::new(format!("{}:p{}", h, percentile), DataType::UInt64, true)
+                            .with_metadata(hist_metadata.clone()),
+                    );
                 }
             }
         }
