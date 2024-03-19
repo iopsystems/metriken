@@ -5,13 +5,15 @@
 
 pub use histogram::Snapshot as HistogramSnapshot;
 
+#[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
+mod convert;
 #[cfg(feature = "parquet")]
 mod parquet;
 mod snapshot;
 mod snapshotter;
-#[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
-pub mod util;
 
+#[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
+pub use convert::MsgpackToParquet;
 #[cfg(feature = "parquet")]
 pub use parquet::{ParquetOptions, ParquetSchema, ParquetWriter};
 pub use snapshot::Snapshot;
