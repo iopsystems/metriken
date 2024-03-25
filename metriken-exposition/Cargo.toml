@@ -1,6 +1,6 @@
 [package]
 name = "metriken-exposition"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -26,3 +26,4 @@ serde = ["dep:serde", "chrono/serde", "histogram/serde"]
 json = ["dep:serde", "dep:serde_json"]
 msgpack = ["dep:serde", "dep:rmp-serde"]
 parquet = ["dep:arrow", "dep:parquet"]
+parquet-conversion = ["serde", "msgpack", "parquet"]
