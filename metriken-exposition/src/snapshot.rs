@@ -1,4 +1,3 @@
-#[cfg(feature = "parquet")]
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -18,6 +17,7 @@ use crate::HistogramSnapshot;
 #[non_exhaustive]
 pub struct Snapshot {
     pub systemtime: SystemTime,
+    pub metadata: HashMap<String, String>,
     pub counters: Vec<(String, u64)>,
     pub gauges: Vec<(String, i64)>,
     pub histograms: Vec<(String, HistogramSnapshot)>,
@@ -35,6 +35,7 @@ impl Snapshot {
     pub(crate) fn new() -> Self {
         Self {
             systemtime: SystemTime::now(),
+            metadata: HashMap::new(),
             counters: Vec::new(),
             gauges: Vec::new(),
             histograms: Vec::new(),
@@ -44,6 +45,11 @@ impl Snapshot {
     /// The system time when the snapshot was created.
     pub fn systemtime(&self) -> SystemTime {
         self.systemtime
+    }
+
+    /// Fetch the value for a snapshot metadata key.
+    pub fn get_metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(|x| x.as_str())
     }
 
     /// A view into the counters for this snapshot.

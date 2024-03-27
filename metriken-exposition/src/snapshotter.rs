@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use metriken::{AtomicHistogram, MetricEntry, RwLockHistogram, Value};
 
 use crate::Snapshot;
@@ -5,6 +7,7 @@ use crate::Snapshot;
 /// Produces a snapshot of metric readings.
 pub struct Snapshotter {
     filter: fn(&MetricEntry) -> bool,
+    metadata: HashMap<String, String>,
 }
 
 /// Used to build a new `Snapshotter`.
@@ -32,11 +35,20 @@ impl SnapshotterBuilder {
         self.snapshotter.filter = filter;
         self
     }
+
+    /// Add a key-value pair to the metadata.
+    pub fn metadata(mut self, key: String, value: String) -> Self {
+        self.snapshotter.metadata.insert(key, value);
+        self
+    }
 }
 
 impl Default for Snapshotter {
     fn default() -> Self {
-        Self { filter: |_| true }
+        Self {
+            filter: |_| true,
+            metadata: HashMap::new(),
+        }
     }
 }
 
@@ -44,6 +56,7 @@ impl Snapshotter {
     /// Produce a new snapshot.
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = Snapshot::new();
+        snapshot.metadata = self.metadata.clone();
 
         // iterate through the metrics and build-up the snapshot
         for metric in &metriken::metrics() {
