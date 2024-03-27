@@ -17,7 +17,10 @@ use crate::HistogramSnapshot;
 #[non_exhaustive]
 pub struct Snapshot {
     pub systemtime: SystemTime,
+
+    #[cfg_attr(feature = "serde", serde(default))]
     pub metadata: HashMap<String, String>,
+
     pub counters: Vec<(String, u64)>,
     pub gauges: Vec<(String, i64)>,
     pub histograms: Vec<(String, HistogramSnapshot)>,
