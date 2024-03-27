@@ -117,7 +117,7 @@ impl ParquetSchema {
 
     /// Finalize the schema and build a `ParquetWriter`.
     pub fn finalize(
-        mut self,
+        self,
         writer: impl Write + Send,
         options: ParquetOptions,
     ) -> Result<ParquetWriter<impl Write + Send>, ParquetError> {
