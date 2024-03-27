@@ -190,7 +190,7 @@ impl ParquetSchema {
         } else {
             Some(
                 self.metadata
-                    .drain()
+                    .into_iter()
                     .map(|(key, value)| KeyValue {
                         key,
                         value: Some(value),
