@@ -143,10 +143,8 @@ impl ParquetSchema {
             let mut metadata = metadata.take().unwrap_or(HashMap::new());
             metadata.insert("metric_type".to_string(), "counter".to_string());
 
-            fields.push(
-                Field::new(counter.clone(), DataType::UInt64, true)
-                    .with_metadata(metadata),
-            );
+            fields
+                .push(Field::new(counter.clone(), DataType::UInt64, true).with_metadata(metadata));
         }
 
         // Create one column field per-gauge
@@ -155,10 +153,7 @@ impl ParquetSchema {
             let mut metadata = metadata.take().unwrap_or(HashMap::new());
             metadata.insert("metric_type".to_string(), "gauge".to_string());
 
-            fields.push(
-                Field::new(gauge.clone(), DataType::Int64, true)
-                    .with_metadata(metadata),
-            );
+            fields.push(Field::new(gauge.clone(), DataType::Int64, true).with_metadata(metadata));
         }
 
         // Create at least three column fields per-snapshot: two for
@@ -219,17 +214,23 @@ impl ParquetSchema {
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
-        let counters = self.counters.into_keys().map(|k| {
-            (k, Vec::with_capacity(self.rows))
-        }).collect();
+        let counters = self
+            .counters
+            .into_keys()
+            .map(|k| (k, Vec::with_capacity(self.rows)))
+            .collect();
 
-        let gauges = self.gauges.into_keys().map(|k| {
-            (k, Vec::with_capacity(self.rows))
-        }).collect();
+        let gauges = self
+            .gauges
+            .into_keys()
+            .map(|k| (k, Vec::with_capacity(self.rows)))
+            .collect();
 
-        let histograms = self.histograms.into_keys().map(|k| {
-            (k, Vec::with_capacity(self.rows))
-        }).collect();
+        let histograms = self
+            .histograms
+            .into_keys()
+            .map(|k| (k, Vec::with_capacity(self.rows)))
+            .collect();
 
         Ok(ParquetWriter {
             writer: arrow_writer,
