@@ -99,15 +99,15 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters.entry(counter.0).or_default();
+            self.counters.entry(counter.name).or_default();
         }
 
         for gauge in gauges {
-            self.gauges.entry(gauge.0).or_default();
+            self.gauges.entry(gauge.name).or_default();
         }
 
         for h in histograms {
-            self.histograms.entry(h.0).or_default();
+            self.histograms.entry(h.name).or_default();
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
@@ -256,15 +256,15 @@ impl<W: Write + Send> ParquetWriter<W> {
         // `None` if a metric in the schema does not exist in the snapshot gaps
         // are automatically filled without additional handling.
         for (key, v) in self.counters.iter_mut() {
-            v.push(hs.counters.remove(key));
+            v.push(hs.counters.remove(key).map(|v| v.value));
         }
 
         for (key, v) in self.gauges.iter_mut() {
-            v.push(hs.gauges.remove(key));
+            v.push(hs.gauges.remove(key).map(|v| v.value));
         }
 
         for (key, v) in self.histograms.iter_mut() {
-            v.push(hs.histograms.remove(key));
+            v.push(hs.histograms.remove(key).map(|v| v.value));
         }
 
         // Check and flush if the max batch size of rows have been processed
