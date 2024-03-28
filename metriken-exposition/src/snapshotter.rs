@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use metriken::{AtomicHistogram, MetricEntry, RwLockHistogram, Value};
 
+use crate::snapshot::{Counter, Gauge, Histogram};
 use crate::Snapshot;
 
 /// Produces a snapshot of metric readings.
@@ -66,28 +67,56 @@ impl Snapshotter {
 
             match metric.value() {
                 Some(Value::Counter(value)) => {
-                    snapshot
-                        .counters
-                        .push((metric.formatted(metriken::Format::Simple), value));
+                    let counter = Counter {
+                        name: metric.formatted(metriken::Format::Simple),
+                        value,
+                        metadata: HashMap::from_iter(
+                            metric
+                                .metadata()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v.to_string())),
+                        ),
+                    };
+
+                    snapshot.counters.push(counter);
                 }
                 Some(Value::Gauge(value)) => {
-                    snapshot
-                        .gauges
-                        .push((metric.formatted(metriken::Format::Simple), value));
+                    let gauge = Gauge {
+                        name: metric.formatted(metriken::Format::Simple),
+                        value,
+                        metadata: HashMap::from_iter(
+                            metric
+                                .metadata()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v.to_string())),
+                        ),
+                    };
+
+                    snapshot.gauges.push(gauge);
                 }
                 Some(Value::Other(other)) => {
-                    if let Some(histogram) = other.downcast_ref::<AtomicHistogram>() {
-                        if let Some(histogram) = histogram.snapshot() {
-                            snapshot
-                                .histograms
-                                .push((metric.formatted(metriken::Format::Simple), histogram));
-                        }
+                    let histogram = if let Some(histogram) = other.downcast_ref::<AtomicHistogram>()
+                    {
+                        histogram.snapshot()
                     } else if let Some(histogram) = other.downcast_ref::<RwLockHistogram>() {
-                        if let Some(histogram) = histogram.snapshot() {
-                            snapshot
-                                .histograms
-                                .push((metric.formatted(metriken::Format::Simple), histogram));
-                        }
+                        histogram.snapshot()
+                    } else {
+                        None
+                    };
+
+                    if let Some(histogram) = histogram {
+                        let histogram = Histogram {
+                            name: metric.formatted(metriken::Format::Simple),
+                            value: histogram,
+                            metadata: HashMap::from_iter(
+                                metric
+                                    .metadata()
+                                    .into_iter()
+                                    .map(|(k, v)| (k.to_string(), v.to_string())),
+                            ),
+                        };
+
+                        snapshot.histograms.push(histogram);
                     }
                 }
                 _ => continue,
