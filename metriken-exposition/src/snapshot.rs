@@ -11,6 +11,33 @@ use crate::HistogramSnapshot;
 // TODO(bmartin): derive Debug for Snapshot once the histogram snapshot has its
 // own debug impl.
 
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct Counter {
+    pub name: String,
+    pub value: u64,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct Gauge {
+    pub name: String,
+    pub value: i64,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct Histogram {
+    pub name: String,
+    pub value: HistogramSnapshot,
+    pub metadata: HashMap<String, String>,
+}
+
 /// Contains a snapshot of metric readings.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone)]
@@ -21,17 +48,17 @@ pub struct Snapshot {
     #[cfg_attr(feature = "serde", serde(default))]
     pub metadata: HashMap<String, String>,
 
-    pub counters: Vec<(String, u64)>,
-    pub gauges: Vec<(String, i64)>,
-    pub histograms: Vec<(String, HistogramSnapshot)>,
+    pub counters: Vec<Counter>,
+    pub gauges: Vec<Gauge>,
+    pub histograms: Vec<Histogram>,
 }
 
 #[cfg(feature = "parquet")]
 pub(crate) struct HashedSnapshot {
     pub(crate) ts: u64,
-    pub(crate) counters: HashMap<String, u64>,
-    pub(crate) gauges: HashMap<String, i64>,
-    pub(crate) histograms: HashMap<String, HistogramSnapshot>,
+    pub(crate) counters: HashMap<String, Counter>,
+    pub(crate) gauges: HashMap<String, Gauge>,
+    pub(crate) histograms: HashMap<String, Histogram>,
 }
 
 impl Snapshot {
@@ -56,17 +83,17 @@ impl Snapshot {
     }
 
     /// A view into the counters for this snapshot.
-    pub fn counters(&self) -> &[(String, u64)] {
+    pub fn counters(&self) -> &[Counter] {
         &self.counters
     }
 
     /// A view into the gauges for this snapshot.
-    pub fn gauges(&self) -> &[(String, i64)] {
+    pub fn gauges(&self) -> &[Gauge] {
         &self.gauges
     }
 
     /// A view into the histograms for this snapshot.
-    pub fn histograms(&self) -> &[(String, HistogramSnapshot)] {
+    pub fn histograms(&self) -> &[Histogram] {
         &self.histograms
     }
 
@@ -98,10 +125,12 @@ impl From<Snapshot> for HashedSnapshot {
             .expect("System Clock is earlier than 1970; needs reset")
             .as_nanos() as u64;
 
-        let counters: HashMap<String, u64> = HashMap::from_iter(snapshot.counters);
-        let gauges: HashMap<String, i64> = HashMap::from_iter(snapshot.gauges);
-        let histograms: HashMap<String, HistogramSnapshot> =
-            HashMap::from_iter(snapshot.histograms);
+        let counters: HashMap<String, Counter> =
+            HashMap::from_iter(snapshot.counters.into_iter().map(|v| (v.name.clone(), v)));
+        let gauges: HashMap<String, Gauge> =
+            HashMap::from_iter(snapshot.gauges.into_iter().map(|v| (v.name.clone(), v)));
+        let histograms: HashMap<String, Histogram> =
+            HashMap::from_iter(snapshot.histograms.into_iter().map(|v| (v.name.clone(), v)));
 
         Self {
             ts,
