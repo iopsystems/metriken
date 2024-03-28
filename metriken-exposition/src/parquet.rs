@@ -75,11 +75,12 @@ impl Default for ParquetOptions {
 /// tracks as summary statistics for every histogram encountered.
 #[derive(Default)]
 pub struct ParquetSchema {
-    counters: BTreeMap<String, Vec<Option<u64>>>,
-    gauges: BTreeMap<String, Vec<Option<i64>>>,
-    histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+    counters: BTreeMap<String, Option<HashMap<String, String>>>,
+    gauges: BTreeMap<String, Option<HashMap<String, String>>>,
+    histograms: BTreeMap<String, Option<HashMap<String, String>>>,
     summary_percentiles: Option<Vec<f64>>,
     metadata: HashMap<String, String>,
+    rows: usize,
 }
 
 impl ParquetSchema {
@@ -90,6 +91,7 @@ impl ParquetSchema {
             histograms: BTreeMap::new(),
             summary_percentiles: percentiles,
             metadata: HashMap::new(),
+            rows: 0,
         }
     }
 
@@ -113,11 +115,13 @@ impl ParquetSchema {
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
             self.metadata = snapshot.metadata;
         }
+
+        self.rows += 1;
     }
 
     /// Finalize the schema and build a `ParquetWriter`.
     pub fn finalize(
-        self,
+        mut self,
         writer: impl Write + Send,
         options: ParquetOptions,
     ) -> Result<ParquetWriter<impl Write + Send>, ParquetError> {
@@ -134,20 +138,26 @@ impl ParquetSchema {
         );
 
         // Create one column field per-counter
-        let counter_metadata = HashMap::from([("metric_type".to_owned(), "counter".to_owned())]);
-        for counter in self.counters.keys() {
+        for (counter, metadata) in self.counters.iter_mut() {
+            // merge metric annoations into the metric metadata
+            let mut metadata = metadata.take().unwrap_or(HashMap::new());
+            metadata.insert("metric_type".to_string(), "counter".to_string());
+
             fields.push(
                 Field::new(counter.clone(), DataType::UInt64, true)
-                    .with_metadata(counter_metadata.clone()),
+                    .with_metadata(metadata),
             );
         }
 
         // Create one column field per-gauge
-        let gauge_metadata = HashMap::from([("metric_type".to_owned(), "gauge".to_owned())]);
-        for gauge in self.gauges.keys() {
+        for (gauge, metadata) in self.gauges.iter_mut() {
+            // merge metric annoations into the metric metadata
+            let mut metadata = metadata.take().unwrap_or(HashMap::new());
+            metadata.insert("metric_type".to_string(), "gauge".to_string());
+
             fields.push(
                 Field::new(gauge.clone(), DataType::Int64, true)
-                    .with_metadata(gauge_metadata.clone()),
+                    .with_metadata(metadata),
             );
         }
 
@@ -156,15 +166,18 @@ impl ParquetSchema {
         // buckets. The latter is a nested list type where each list element
         // is an array of `u64`s. If summary percentiles are also desired,
         // add one column per-summary percentile.
-        let hist_metadata = HashMap::from([("metric_type".to_owned(), "histogram".to_owned())]);
-        for h in self.histograms.keys() {
+        for (h, metadata) in self.histograms.iter_mut() {
+            // merge metric annoations into the metric metadata
+            let mut metadata = metadata.take().unwrap_or(HashMap::new());
+            metadata.insert("metric_type".to_string(), "histogram".to_string());
+
             fields.push(
                 Field::new(format!("{}:grouping_power", h), DataType::UInt8, true)
-                    .with_metadata(hist_metadata.clone()),
+                    .with_metadata(metadata.clone()),
             );
             fields.push(
                 Field::new(format!("{}:max_config_power", h), DataType::UInt8, true)
-                    .with_metadata(hist_metadata.clone()),
+                    .with_metadata(metadata.clone()),
             );
             fields.push(
                 Field::new(
@@ -172,14 +185,14 @@ impl ParquetSchema {
                     DataType::new_list(DataType::UInt64, true),
                     true,
                 )
-                .with_metadata(hist_metadata.clone()),
+                .with_metadata(metadata.clone()),
             );
 
             if let Some(ref x) = self.summary_percentiles {
                 for percentile in x {
                     fields.push(
                         Field::new(format!("{}:p{}", h, percentile), DataType::UInt64, true)
-                            .with_metadata(hist_metadata.clone()),
+                            .with_metadata(metadata.clone()),
                     );
                 }
             }
@@ -206,14 +219,26 @@ impl ParquetSchema {
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
+        let counters = self.counters.into_keys().map(|k| {
+            (k, Vec::with_capacity(self.rows))
+        }).collect();
+
+        let gauges = self.gauges.into_keys().map(|k| {
+            (k, Vec::with_capacity(self.rows))
+        }).collect();
+
+        let histograms = self.histograms.into_keys().map(|k| {
+            (k, Vec::with_capacity(self.rows))
+        }).collect();
+
         Ok(ParquetWriter {
             writer: arrow_writer,
             options,
             schema,
             timestamps: Vec::new(),
-            counters: self.counters,
-            gauges: self.gauges,
-            histograms: self.histograms,
+            counters,
+            gauges,
+            histograms,
             summary_percentiles: self.summary_percentiles,
         })
     }
