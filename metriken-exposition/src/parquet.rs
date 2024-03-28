@@ -9,7 +9,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use parquet::format::FileMetaData;
+use parquet::format::{FileMetaData, KeyValue};
 
 use crate::snapshot::{HashedSnapshot, Snapshot};
 use crate::HistogramSnapshot;
@@ -79,6 +79,7 @@ pub struct ParquetSchema {
     gauges: BTreeMap<String, Vec<Option<i64>>>,
     histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
     summary_percentiles: Option<Vec<f64>>,
+    metadata: HashMap<String, String>,
 }
 
 impl ParquetSchema {
@@ -88,6 +89,7 @@ impl ParquetSchema {
             gauges: BTreeMap::new(),
             histograms: BTreeMap::new(),
             summary_percentiles: percentiles,
+            metadata: HashMap::new(),
         }
     }
 
@@ -106,6 +108,10 @@ impl ParquetSchema {
 
         for h in histograms {
             self.histograms.entry(h.0).or_default();
+        }
+
+        if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
+            self.metadata = snapshot.metadata;
         }
     }
 
@@ -179,9 +185,24 @@ impl ParquetSchema {
             }
         }
 
+        let metadata: Option<Vec<KeyValue>> = if self.metadata.is_empty() {
+            None
+        } else {
+            Some(
+                self.metadata
+                    .into_iter()
+                    .map(|(key, value)| KeyValue {
+                        key,
+                        value: Some(value),
+                    })
+                    .collect(),
+            )
+        };
+
         let schema = Arc::new(Schema::new(fields));
         let props = WriterProperties::builder()
             .set_compression(options.compression)
+            .set_key_value_metadata(metadata)
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
