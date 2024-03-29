@@ -101,7 +101,9 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters.entry(counter.name).or_insert(counter.metadata);
+            self.counters
+                .entry(counter.name)
+                .or_insert(counter.metadata);
         }
 
         for gauge in gauges {
@@ -109,7 +111,9 @@ impl ParquetSchema {
         }
 
         for histogram in histograms {
-            self.histograms.entry(histogram.name).or_insert(histogram.metadata);
+            self.histograms
+                .entry(histogram.name)
+                .or_insert(histogram.metadata);
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
@@ -183,8 +187,12 @@ impl ParquetSchema {
                     .with_metadata(metadata.clone()),
             );
             fields.push(
-                Field::new(format!("{histogram}:max_config_power"), DataType::UInt8, true)
-                    .with_metadata(metadata.clone()),
+                Field::new(
+                    format!("{histogram}:max_config_power"),
+                    DataType::UInt8,
+                    true,
+                )
+                .with_metadata(metadata.clone()),
             );
             fields.push(
                 Field::new(
