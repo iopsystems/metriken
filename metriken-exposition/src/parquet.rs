@@ -101,15 +101,15 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters.entry(counter.name).or_default();
+            self.counters.entry(counter.name).or_insert(Some(counter.metadata));
         }
 
         for gauge in gauges {
-            self.gauges.entry(gauge.name).or_default();
+            self.gauges.entry(gauge.name).or_insert(Some(gauge.metadata));
         }
 
-        for h in histograms {
-            self.histograms.entry(h.name).or_default();
+        for histogram in histograms {
+            self.histograms.entry(histogram.name).or_insert(Some(histogram.metadata));
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
