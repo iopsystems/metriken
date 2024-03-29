@@ -152,7 +152,7 @@ impl ParquetSchema {
             fields
                 .push(Field::new(counter.clone(), DataType::UInt64, true).with_metadata(metadata));
 
-            // push the counter name into the counters vec
+            // initialize storage for the counter values
             counters.insert(counter, Vec::with_capacity(self.rows));
         }
 
@@ -166,7 +166,7 @@ impl ParquetSchema {
             // add column to schema
             fields.push(Field::new(gauge.clone(), DataType::Int64, true).with_metadata(metadata));
 
-            // push the gauge name into the gauges vec
+            // initialize storage for the gauge values
             gauges.insert(gauge, Vec::with_capacity(self.rows));
         }
 
@@ -212,7 +212,7 @@ impl ParquetSchema {
                 }
             }
 
-            // push the histogram name into the histograms vec
+            // initialize storage for the histogram values
             histograms.insert(histogram, Vec::with_capacity(self.rows));
         }
 
