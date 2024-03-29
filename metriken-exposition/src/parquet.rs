@@ -75,11 +75,12 @@ impl Default for ParquetOptions {
 /// tracks as summary statistics for every histogram encountered.
 #[derive(Default)]
 pub struct ParquetSchema {
-    counters: BTreeMap<String, Vec<Option<u64>>>,
-    gauges: BTreeMap<String, Vec<Option<i64>>>,
-    histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+    counters: BTreeMap<String, HashMap<String, String>>,
+    gauges: BTreeMap<String, HashMap<String, String>>,
+    histograms: BTreeMap<String, HashMap<String, String>>,
     summary_percentiles: Option<Vec<f64>>,
     metadata: HashMap<String, String>,
+    rows: usize,
 }
 
 impl ParquetSchema {
@@ -90,6 +91,7 @@ impl ParquetSchema {
             histograms: BTreeMap::new(),
             summary_percentiles: percentiles,
             metadata: HashMap::new(),
+            rows: 0,
         }
     }
 
@@ -99,20 +101,26 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters.entry(counter.name).or_default();
+            self.counters
+                .entry(counter.name)
+                .or_insert(counter.metadata);
         }
 
         for gauge in gauges {
-            self.gauges.entry(gauge.name).or_default();
+            self.gauges.entry(gauge.name).or_insert(gauge.metadata);
         }
 
-        for h in histograms {
-            self.histograms.entry(h.name).or_default();
+        for histogram in histograms {
+            self.histograms
+                .entry(histogram.name)
+                .or_insert(histogram.metadata);
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
             self.metadata = snapshot.metadata;
         }
+
+        self.rows += 1;
     }
 
     /// Finalize the schema and build a `ParquetWriter`.
@@ -133,56 +141,79 @@ impl ParquetSchema {
             )])),
         );
 
+        let mut counters = BTreeMap::new();
+
         // Create one column field per-counter
-        let counter_metadata = HashMap::from([("metric_type".to_owned(), "counter".to_owned())]);
-        for counter in self.counters.keys() {
-            fields.push(
-                Field::new(counter.clone(), DataType::UInt64, true)
-                    .with_metadata(counter_metadata.clone()),
-            );
+        for (counter, mut metadata) in self.counters.into_iter() {
+            // merge metric annoations into the metric metadata
+            metadata.insert("metric_type".to_string(), "counter".to_string());
+
+            // add column to schema
+            fields
+                .push(Field::new(counter.clone(), DataType::UInt64, true).with_metadata(metadata));
+
+            // initialize storage for the counter values
+            counters.insert(counter, Vec::with_capacity(self.rows));
         }
 
+        let mut gauges = BTreeMap::new();
+
         // Create one column field per-gauge
-        let gauge_metadata = HashMap::from([("metric_type".to_owned(), "gauge".to_owned())]);
-        for gauge in self.gauges.keys() {
-            fields.push(
-                Field::new(gauge.clone(), DataType::Int64, true)
-                    .with_metadata(gauge_metadata.clone()),
-            );
+        for (gauge, mut metadata) in self.gauges.into_iter() {
+            // merge metric annoations into the metric metadata
+            metadata.insert("metric_type".to_string(), "gauge".to_string());
+
+            // add column to schema
+            fields.push(Field::new(gauge.clone(), DataType::Int64, true).with_metadata(metadata));
+
+            // initialize storage for the gauge values
+            gauges.insert(gauge, Vec::with_capacity(self.rows));
         }
+
+        let mut histograms = BTreeMap::new();
 
         // Create at least three column fields per-snapshot: two for
         // configuration data around histogram size and one for the actual
         // buckets. The latter is a nested list type where each list element
         // is an array of `u64`s. If summary percentiles are also desired,
         // add one column per-summary percentile.
-        let hist_metadata = HashMap::from([("metric_type".to_owned(), "histogram".to_owned())]);
-        for h in self.histograms.keys() {
+        for (histogram, mut metadata) in self.histograms.into_iter() {
+            // merge metric annoations into the metric metadata
+            metadata.insert("metric_type".to_string(), "histogram".to_string());
+
+            // add columns to the schema
             fields.push(
-                Field::new(format!("{}:grouping_power", h), DataType::UInt8, true)
-                    .with_metadata(hist_metadata.clone()),
-            );
-            fields.push(
-                Field::new(format!("{}:max_config_power", h), DataType::UInt8, true)
-                    .with_metadata(hist_metadata.clone()),
+                Field::new(format!("{histogram}:grouping_power"), DataType::UInt8, true)
+                    .with_metadata(metadata.clone()),
             );
             fields.push(
                 Field::new(
-                    format!("{}:buckets", h),
+                    format!("{histogram}:max_config_power"),
+                    DataType::UInt8,
+                    true,
+                )
+                .with_metadata(metadata.clone()),
+            );
+            fields.push(
+                Field::new(
+                    format!("{histogram}:buckets"),
                     DataType::new_list(DataType::UInt64, true),
                     true,
                 )
-                .with_metadata(hist_metadata.clone()),
+                .with_metadata(metadata.clone()),
             );
 
             if let Some(ref x) = self.summary_percentiles {
                 for percentile in x {
                     fields.push(
-                        Field::new(format!("{}:p{}", h, percentile), DataType::UInt64, true)
-                            .with_metadata(hist_metadata.clone()),
+                        Field::new(format!("{histogram}:p{percentile}"), DataType::UInt64, true)
+                            .with_metadata(metadata.clone()),
                     );
                 }
             }
+
+            // initialize storage for the histogram values
+            histograms.insert(histogram, Vec::with_capacity(self.rows));
         }
 
         let metadata: Option<Vec<KeyValue>> = if self.metadata.is_empty() {
@@ -211,9 +242,9 @@ impl ParquetSchema {
             options,
             schema,
             timestamps: Vec::new(),
-            counters: self.counters,
-            gauges: self.gauges,
-            histograms: self.histograms,
+            counters,
+            gauges,
+            histograms,
             summary_percentiles: self.summary_percentiles,
         })
     }
