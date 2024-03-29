@@ -153,7 +153,7 @@ impl ParquetSchema {
                 .push(Field::new(counter.clone(), DataType::UInt64, true).with_metadata(metadata));
 
             // push the counter name into the counters vec
-            counters.push(counter.clone());
+            counters.push(counter);
         }
 
         let mut gauges = Vec::with_capacity(self.gauges.len());
