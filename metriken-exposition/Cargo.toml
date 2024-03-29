@@ -22,6 +22,7 @@ serde = { version = "1.0.196", features = ["derive"], optional = true }
 serde_json = { version = "1.0.114", optional = true }
 
 [features]
+default = ["parquet"]
 serde = ["dep:serde", "chrono/serde", "histogram/serde"]
 json = ["dep:serde", "dep:serde_json"]
 msgpack = ["dep:serde", "dep:rmp-serde"]

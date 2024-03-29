@@ -75,9 +75,9 @@ impl Default for ParquetOptions {
 /// tracks as summary statistics for every histogram encountered.
 #[derive(Default)]
 pub struct ParquetSchema {
-    counters: BTreeMap<String, Option<HashMap<String, String>>>,
-    gauges: BTreeMap<String, Option<HashMap<String, String>>>,
-    histograms: BTreeMap<String, Option<HashMap<String, String>>>,
+    counters: BTreeMap<String, HashMap<String, String>>,
+    gauges: BTreeMap<String, HashMap<String, String>>,
+    histograms: BTreeMap<String, HashMap<String, String>>,
     summary_percentiles: Option<Vec<f64>>,
     metadata: HashMap<String, String>,
     rows: usize,
@@ -101,15 +101,15 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters.entry(counter.name).or_insert(Some(counter.metadata));
+            self.counters.entry(counter.name).or_insert(counter.metadata);
         }
 
         for gauge in gauges {
-            self.gauges.entry(gauge.name).or_insert(Some(gauge.metadata));
+            self.gauges.entry(gauge.name).or_insert(gauge.metadata);
         }
 
         for histogram in histograms {
-            self.histograms.entry(histogram.name).or_insert(Some(histogram.metadata));
+            self.histograms.entry(histogram.name).or_insert(histogram.metadata);
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
@@ -121,7 +121,7 @@ impl ParquetSchema {
 
     /// Finalize the schema and build a `ParquetWriter`.
     pub fn finalize(
-        mut self,
+        self,
         writer: impl Write + Send,
         options: ParquetOptions,
     ) -> Result<ParquetWriter<impl Write + Send>, ParquetError> {
@@ -137,46 +137,58 @@ impl ParquetSchema {
             )])),
         );
 
+        let mut counters = Vec::with_capacity(self.counters.len());
+
         // Create one column field per-counter
-        for (counter, metadata) in self.counters.iter_mut() {
+        for (counter, mut metadata) in self.counters.into_iter() {
             // merge metric annoations into the metric metadata
-            let mut metadata = metadata.take().unwrap_or(HashMap::new());
             metadata.insert("metric_type".to_string(), "counter".to_string());
 
+            // add column to schema
             fields
                 .push(Field::new(counter.clone(), DataType::UInt64, true).with_metadata(metadata));
+
+            // push the counter name into the counters vec
+            counters.push(counter.clone());
         }
+
+        let mut gauges = Vec::with_capacity(self.gauges.len());
 
         // Create one column field per-gauge
-        for (gauge, metadata) in self.gauges.iter_mut() {
+        for (gauge, mut metadata) in self.gauges.into_iter() {
             // merge metric annoations into the metric metadata
-            let mut metadata = metadata.take().unwrap_or(HashMap::new());
             metadata.insert("metric_type".to_string(), "gauge".to_string());
 
+            // add column to schema
             fields.push(Field::new(gauge.clone(), DataType::Int64, true).with_metadata(metadata));
+
+            // push the gauge name into the gauges vec
+            gauges.push(gauge);
         }
+
+        let mut histograms = Vec::with_capacity(self.histograms.len());
 
         // Create at least three column fields per-snapshot: two for
         // configuration data around histogram size and one for the actual
         // buckets. The latter is a nested list type where each list element
         // is an array of `u64`s. If summary percentiles are also desired,
         // add one column per-summary percentile.
-        for (h, metadata) in self.histograms.iter_mut() {
+        for (histogram, mut metadata) in self.histograms.into_iter() {
             // merge metric annoations into the metric metadata
-            let mut metadata = metadata.take().unwrap_or(HashMap::new());
             metadata.insert("metric_type".to_string(), "histogram".to_string());
 
+            // add columns to the schema
             fields.push(
-                Field::new(format!("{}:grouping_power", h), DataType::UInt8, true)
+                Field::new(format!("{histogram}:grouping_power"), DataType::UInt8, true)
                     .with_metadata(metadata.clone()),
             );
             fields.push(
-                Field::new(format!("{}:max_config_power", h), DataType::UInt8, true)
+                Field::new(format!("{histogram}:max_config_power"), DataType::UInt8, true)
                     .with_metadata(metadata.clone()),
             );
             fields.push(
                 Field::new(
-                    format!("{}:buckets", h),
+                    format!("{histogram}:buckets"),
                     DataType::new_list(DataType::UInt64, true),
                     true,
                 )
@@ -186,11 +198,14 @@ impl ParquetSchema {
             if let Some(ref x) = self.summary_percentiles {
                 for percentile in x {
                     fields.push(
-                        Field::new(format!("{}:p{}", h, percentile), DataType::UInt64, true)
+                        Field::new(format!("{histogram}:p{percentile}"), DataType::UInt64, true)
                             .with_metadata(metadata.clone()),
                     );
                 }
             }
+
+            // push the histogram name into the histograms vec
+            histograms.push(histogram);
         }
 
         let metadata: Option<Vec<KeyValue>> = if self.metadata.is_empty() {
@@ -214,22 +229,19 @@ impl ParquetSchema {
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
-        let counters = self
-            .counters
-            .into_keys()
-            .map(|k| (k, Vec::with_capacity(self.rows)))
+        let counters = counters
+            .into_iter()
+            .map(|v| (v, Vec::with_capacity(self.rows)))
             .collect();
 
-        let gauges = self
-            .gauges
-            .into_keys()
-            .map(|k| (k, Vec::with_capacity(self.rows)))
+        let gauges = gauges
+            .into_iter()
+            .map(|v| (v, Vec::with_capacity(self.rows)))
             .collect();
 
-        let histograms = self
-            .histograms
-            .into_keys()
-            .map(|k| (k, Vec::with_capacity(self.rows)))
+        let histograms = histograms
+            .into_iter()
+            .map(|v| (v, Vec::with_capacity(self.rows)))
             .collect();
 
         Ok(ParquetWriter {
