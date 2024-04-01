@@ -105,15 +105,27 @@ impl Snapshotter {
                     };
 
                     if let Some(histogram) = histogram {
+                        let mut metadata = HashMap::from_iter(
+                            metric
+                                .metadata()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v.to_string())),
+                        );
+
+                        // Store configuration parameters as metadata
+                        metadata.insert(
+                            "grouping_power".to_string(),
+                            histogram.config().grouping_power().to_string(),
+                        );
+                        metadata.insert(
+                            "max_value_power".to_string(),
+                            histogram.config().max_value_power().to_string(),
+                        );
+
                         let histogram = Histogram {
                             name: metric.formatted(metriken::Format::Simple),
                             value: histogram,
-                            metadata: HashMap::from_iter(
-                                metric
-                                    .metadata()
-                                    .into_iter()
-                                    .map(|(k, v)| (k.to_string(), v.to_string())),
-                            ),
+                            metadata,
                         };
 
                         snapshot.histograms.push(histogram);

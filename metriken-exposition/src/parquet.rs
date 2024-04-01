@@ -172,28 +172,14 @@ impl ParquetSchema {
 
         let mut histograms = BTreeMap::new();
 
-        // Create at least three column fields per-snapshot: two for
-        // configuration data around histogram size and one for the actual
-        // buckets. The latter is a nested list type where each list element
-        // is an array of `u64`s. If summary percentiles are also desired,
-        // add one column per-summary percentile.
+        // Create columns for the snapshot: the buckets are stored as a
+        // nested list type where each list element is an array of `u64`s.
+        // The histogram configuration parameters are part of the metadata.
+        // If summary percentiles are desired, add a column per-percentile.
         for (histogram, mut metadata) in self.histograms.into_iter() {
             // merge metric annoations into the metric metadata
             metadata.insert("metric_type".to_string(), "histogram".to_string());
 
-            // add columns to the schema
-            fields.push(
-                Field::new(format!("{histogram}:grouping_power"), DataType::UInt8, true)
-                    .with_metadata(metadata.clone()),
-            );
-            fields.push(
-                Field::new(
-                    format!("{histogram}:max_config_power"),
-                    DataType::UInt8,
-                    true,
-                )
-                .with_metadata(metadata.clone()),
-            );
             fields.push(
                 Field::new(
                     format!("{histogram}:buckets"),
@@ -340,9 +326,6 @@ impl<W: Write + Send> ParquetWriter<W> {
         // If summary percentiles are desired, add one column per-summary.
         for (_, val) in self.histograms.iter_mut() {
             let hists = std::mem::take(val);
-
-            let mut gps: Vec<Option<u8>> = Vec::with_capacity(hists.len());
-            let mut maxes: Vec<Option<u8>> = Vec::with_capacity(hists.len());
             let mut buckets = ListBuilder::new(UInt64Builder::new());
 
             // Store one column per-summary percentile, with one-row per-histogram
@@ -359,9 +342,6 @@ impl<W: Write + Send> ParquetWriter<W> {
 
             for h in hists {
                 if let Some(x) = h {
-                    // Columnize histogram configs and buckets
-                    gps.push(Some(x.config().grouping_power()));
-                    maxes.push(Some(x.config().max_value_power()));
                     buckets.append_value(
                         x.into_iter()
                             .map(|x| Some(x.count()))
@@ -376,10 +356,7 @@ impl<W: Write + Send> ParquetWriter<W> {
                         }
                     }
                 } else {
-                    // Histogram missing; store `None` for config, bucket, and
-                    // summary percentiles
-                    gps.push(None);
-                    maxes.push(None);
+                    // Histogram missing; store `None` for buckets and summaries
                     buckets.append_null();
 
                     if let Some(ref percentiles) = self.summary_percentiles {
@@ -389,8 +366,6 @@ impl<W: Write + Send> ParquetWriter<W> {
                     }
                 }
             }
-            columns.push(Arc::new(UInt8Array::from(gps)));
-            columns.push(Arc::new(UInt8Array::from(maxes)));
             columns.push(Arc::new(buckets.finish()));
 
             if !summaries.is_empty() {
