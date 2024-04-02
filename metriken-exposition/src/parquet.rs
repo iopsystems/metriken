@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::error::ArrowError;
+use histogram::Histogram;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
@@ -12,7 +13,6 @@ use parquet::file::properties::WriterProperties;
 use parquet::format::{FileMetaData, KeyValue};
 
 use crate::snapshot::{HashedSnapshot, Snapshot};
-use crate::HistogramSnapshot;
 
 /// Options for `ParquetWriter` controlling the output parquet file.
 #[derive(Clone, Debug)]
@@ -252,7 +252,7 @@ pub struct ParquetWriter<W: Write + Send> {
     gauges: BTreeMap<String, Vec<Option<i64>>>,
 
     /// Schema-ordered columnar data for histograms
-    histograms: BTreeMap<String, Vec<Option<HistogramSnapshot>>>,
+    histograms: BTreeMap<String, Vec<Option<Histogram>>>,
 
     /// Summary percentiles to store for histograms
     summary_percentiles: Option<Vec<f64>>,
