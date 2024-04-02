@@ -97,9 +97,9 @@ impl Snapshotter {
                 Some(Value::Other(other)) => {
                     let histogram = if let Some(histogram) = other.downcast_ref::<AtomicHistogram>()
                     {
-                        histogram.snapshot()
+                        histogram.load()
                     } else if let Some(histogram) = other.downcast_ref::<RwLockHistogram>() {
-                        histogram.snapshot()
+                        histogram.load()
                     } else {
                         None
                     };

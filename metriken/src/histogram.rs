@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-pub use histogram::{Bucket, Config, Error, Snapshot};
+pub use histogram::{Bucket, Config, Error, Histogram};
 use parking_lot::RwLock;
 
 use crate::{Metric, Value};
@@ -48,9 +48,10 @@ impl AtomicHistogram {
         self.config
     }
 
-    /// Create a new snapshot from the histogram.
-    pub fn snapshot(&self) -> Option<Snapshot> {
-        self.inner.get().map(|h| h.snapshot())
+    /// Loads and returns the histogram. Returns `None` if the histogram has
+    /// never been incremented.
+    pub fn load(&self) -> Option<Histogram> {
+        self.inner.get().map(|h| h.load())
     }
 
     fn get_or_init(&self) -> &::histogram::AtomicHistogram {
@@ -121,9 +122,10 @@ impl RwLockHistogram {
         self.config
     }
 
-    /// Create a new snapshot from the histogram.
-    pub fn snapshot(&self) -> Option<Snapshot> {
-        self.inner.get().map(|h| h.read().snapshot())
+    /// Loads and returns the histogram. Returns `None` if the histogram has
+    /// never been incremented.
+    pub fn load(&self) -> Option<Histogram> {
+        self.inner.get().map(|h| h.read().clone())
     }
 
     fn get_or_init(&self) -> &RwLock<::histogram::Histogram> {

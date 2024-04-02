@@ -3,8 +3,6 @@
 //! Provides a standardized struct for a snapshot of the metric readings as well
 //! as a way of producing the snapshots.
 
-pub use histogram::Snapshot as HistogramSnapshot;
-
 #[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
 mod convert;
 #[cfg(feature = "parquet")]

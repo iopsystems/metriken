@@ -494,9 +494,9 @@ checksum = "2c6201b9ff9fd90a5a3bac2e56a830d0caa509576f0e503818ee82c181b3437a"
 
 [[package]]
 name = "histogram"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b634390eb8a63662e127836d4e2f26d7ae930600d4e05ee0fd85a009eeb1175"
+checksum = "f4d3bddd75a32b17e75762f128ffc7a33158b933b6eb27424da9be4a58f30eb9"
 dependencies = [
  "serde",
  "thiserror",
@@ -700,7 +700,7 @@ checksum = "523dc4f511e55ab87b694dc30d0f820d60906ef06413f93d4d7a1385599cc149"
 
 [[package]]
 name = "metriken"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "histogram",
  "metriken-core",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "chrono",
