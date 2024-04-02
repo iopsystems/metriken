@@ -6,8 +6,6 @@ use rmp_serde::encode::Error as SerializeMsgpackError;
 #[cfg(feature = "json")]
 use serde_json::Error as JsonError;
 
-use crate::HistogramSnapshot;
-
 // TODO(bmartin): derive Debug for Snapshot once the histogram snapshot has its
 // own debug impl.
 
@@ -34,7 +32,7 @@ pub struct Gauge {
 #[non_exhaustive]
 pub struct Histogram {
     pub name: String,
-    pub value: HistogramSnapshot,
+    pub value: histogram::Histogram,
     pub metadata: HashMap<String, String>,
 }
 
