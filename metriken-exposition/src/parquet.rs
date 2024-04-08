@@ -14,6 +14,9 @@ use parquet::format::{FileMetaData, KeyValue};
 
 use crate::snapshot::{HashedSnapshot, Snapshot};
 
+const DEFAULT_COMPRESSION: Compression = Compression::UNCOMPRESSED;
+const DEFAULT_MAX_BATCH_SIZE: usize = 1024 * 1024;
+
 /// Options for `ParquetWriter` controlling the output parquet file.
 #[derive(Clone, Debug)]
 pub struct ParquetOptions {
@@ -24,16 +27,23 @@ pub struct ParquetOptions {
 }
 
 impl ParquetOptions {
+    /// Create a new set of `ParquetOption` with the default values
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the compression level for the parquet file. The default is no
+    /// compression. Set the compression level to a corresponding zstd level to
+    /// enable compression.
     pub fn compression_level(mut self, level: i32) -> Result<Self, ParquetError> {
         let compression = Compression::ZSTD(ZstdLevel::try_new(level)?);
         self.compression = compression;
         Ok(self)
     }
 
+    /// Sets the number of rows to be cache in memory before being written as a
+    /// `RecordBatch`. Large values have better performance at the cost of
+    /// additional memory usage. The default is ~1M rows (2^20).
     pub fn max_batch_size(mut self, batch_size: usize) -> Self {
         self.max_batch_size = batch_size;
         self
@@ -43,8 +53,8 @@ impl ParquetOptions {
 impl Default for ParquetOptions {
     fn default() -> Self {
         Self {
-            compression: Compression::UNCOMPRESSED,
-            max_batch_size: 1024 * 1024,
+            compression: DEFAULT_COMPRESSION,
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
         }
     }
 }

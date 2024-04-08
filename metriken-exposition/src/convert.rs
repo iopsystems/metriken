@@ -7,27 +7,32 @@ use parquet::errors::ParquetError;
 use crate::snapshot::Snapshot;
 use crate::{ParquetOptions, ParquetSchema};
 
+/// A struct for converting msgpack'd metriken snapshots into a parquet file.
 #[derive(Clone, Debug)]
 pub struct MsgpackToParquet {
-    compression_level: i32,
+    parquet_options: ParquetOptions,
 }
 
 impl Default for MsgpackToParquet {
     fn default() -> Self {
         Self {
-            compression_level: 3,
+            parquet_options: ParquetOptions::new().compression_level(3).unwrap()
         }
     }
 }
 
 impl MsgpackToParquet {
+    /// Returns a new `MsgpackToParquet` converter that uses the default
+    /// conversion options.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn compression_level(mut self, level: i32) -> Self {
-        self.compression_level = level;
-        self
+    /// Create a `MsgpackToParquet` converted from the provided parquet options.
+    pub fn with_options(options: ParquetOptions) -> Self {
+        Self {
+            parquet_options: options,
+        }
     }
 
     /// Converts a file with metrics in msgpack format to a parquet file.
@@ -62,7 +67,7 @@ impl MsgpackToParquet {
         }
         let mut writer = schema.finalize(
             writer,
-            ParquetOptions::new().compression_level(self.compression_level)?,
+            self.parquet_options,
         )?;
 
         // Rewind file pointer and second pass for the actual metrics
