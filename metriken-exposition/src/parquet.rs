@@ -7,15 +7,44 @@ use arrow::datatypes::*;
 use arrow::error::ArrowError;
 use histogram::Histogram;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use parquet::format::{FileMetaData, KeyValue};
 
 use crate::snapshot::{HashedSnapshot, Snapshot};
 
-const DEFAULT_COMPRESSION: Compression = Compression::UNCOMPRESSED;
 const DEFAULT_MAX_BATCH_SIZE: usize = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct Compression {
+    inner: ParquetCompression,
+}
+
+impl Compression {
+    /// This returns a variant that indicates that no compression will be
+    /// preformed.
+    pub fn none() -> Self {
+        Self {
+            inner: ParquetCompression::UNCOMPRESSED,
+        }
+    }
+
+    /// Takes a zstd compression level and returns a variant that means that the
+    /// parquet will be compressed with zstd at the specified level. Returns an
+    /// error if the level is not a valid zstd compression level.
+    pub fn zstd(level: i32) -> Result<Self, ParquetError> {
+        Ok(Self {
+            inner: ParquetCompression::ZSTD(ZstdLevel::try_new(level)?)
+        })
+    }
+}
+
+impl Default for Compression {
+    fn default() -> Self {
+        Self::zstd(3).unwrap()
+    }
+}
 
 /// Options for `ParquetWriter` controlling the output parquet file.
 #[derive(Clone, Debug)]
@@ -35,10 +64,9 @@ impl ParquetOptions {
     /// Sets the compression level for the parquet file. The default is no
     /// compression. Set the compression level to a corresponding zstd level to
     /// enable compression.
-    pub fn compression_level(mut self, level: i32) -> Result<Self, ParquetError> {
-        let compression = Compression::ZSTD(ZstdLevel::try_new(level)?);
+    pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
-        Ok(self)
+        self
     }
 
     /// Sets the number of rows to be cache in memory before being written as a
@@ -53,7 +81,7 @@ impl ParquetOptions {
 impl Default for ParquetOptions {
     fn default() -> Self {
         Self {
-            compression: DEFAULT_COMPRESSION,
+            compression: Default::default(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
         }
     }
@@ -228,7 +256,7 @@ impl ParquetSchema {
 
         let schema = Arc::new(Schema::new(fields));
         let props = WriterProperties::builder()
-            .set_compression(options.compression)
+            .set_compression(options.compression.inner)
             .set_key_value_metadata(metadata)
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;

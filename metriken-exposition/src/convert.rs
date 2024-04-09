@@ -8,17 +8,9 @@ use crate::snapshot::Snapshot;
 use crate::{ParquetOptions, ParquetSchema};
 
 /// A struct for converting msgpack'd metriken snapshots into a parquet file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MsgpackToParquet {
     parquet_options: ParquetOptions,
-}
-
-impl Default for MsgpackToParquet {
-    fn default() -> Self {
-        Self {
-            parquet_options: ParquetOptions::new().compression_level(3).unwrap(),
-        }
-    }
 }
 
 impl MsgpackToParquet {
