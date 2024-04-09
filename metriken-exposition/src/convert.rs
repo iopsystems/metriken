@@ -16,7 +16,7 @@ pub struct MsgpackToParquet {
 impl Default for MsgpackToParquet {
     fn default() -> Self {
         Self {
-            parquet_options: ParquetOptions::new().compression_level(3).unwrap()
+            parquet_options: ParquetOptions::new().compression_level(3).unwrap(),
         }
     }
 }
@@ -65,10 +65,7 @@ impl MsgpackToParquet {
                 .map_err(|x| ParquetError::External(Box::new(x)))?;
             schema.push(s);
         }
-        let mut writer = schema.finalize(
-            writer,
-            self.parquet_options,
-        )?;
+        let mut writer = schema.finalize(writer, self.parquet_options)?;
 
         // Rewind file pointer and second pass for the actual metrics
         reader.rewind().unwrap();
