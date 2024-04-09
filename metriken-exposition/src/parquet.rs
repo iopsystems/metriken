@@ -35,7 +35,7 @@ impl Compression {
     /// error if the level is not a valid zstd compression level.
     pub fn zstd(level: i32) -> Result<Self, ParquetError> {
         Ok(Self {
-            inner: ParquetCompression::ZSTD(ZstdLevel::try_new(level)?)
+            inner: ParquetCompression::ZSTD(ZstdLevel::try_new(level)?),
         })
     }
 }
