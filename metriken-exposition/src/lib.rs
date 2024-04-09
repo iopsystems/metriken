@@ -13,6 +13,6 @@ mod snapshotter;
 #[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
 pub use convert::MsgpackToParquet;
 #[cfg(feature = "parquet")]
-pub use parquet::{ParquetOptions, ParquetSchema, ParquetWriter};
+pub use parquet::{ParquetCompression, ParquetOptions, ParquetSchema, ParquetWriter};
 pub use snapshot::{Counter, Gauge, Histogram, Snapshot};
 pub use snapshotter::{Snapshotter, SnapshotterBuilder};

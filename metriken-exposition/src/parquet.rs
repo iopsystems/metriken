@@ -7,7 +7,7 @@ use arrow::datatypes::*;
 use arrow::error::ArrowError;
 use histogram::Histogram;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use parquet::format::{FileMetaData, KeyValue};
@@ -17,16 +17,16 @@ use crate::snapshot::{HashedSnapshot, Snapshot};
 const DEFAULT_MAX_BATCH_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
-pub struct Compression {
-    inner: ParquetCompression,
+pub struct ParquetCompression {
+    inner: Compression,
 }
 
-impl Compression {
+impl ParquetCompression {
     /// This returns a variant that indicates that no compression will be
     /// preformed.
     pub fn none() -> Self {
         Self {
-            inner: ParquetCompression::UNCOMPRESSED,
+            inner: Compression::UNCOMPRESSED,
         }
     }
 
@@ -35,12 +35,12 @@ impl Compression {
     /// error if the level is not a valid zstd compression level.
     pub fn zstd(level: i32) -> Result<Self, ParquetError> {
         Ok(Self {
-            inner: ParquetCompression::ZSTD(ZstdLevel::try_new(level)?),
+            inner: Compression::ZSTD(ZstdLevel::try_new(level)?),
         })
     }
 }
 
-impl Default for Compression {
+impl Default for ParquetCompression {
     fn default() -> Self {
         Self::zstd(3).unwrap()
     }
@@ -50,7 +50,7 @@ impl Default for Compression {
 #[derive(Clone, Debug)]
 pub struct ParquetOptions {
     /// Supported compression types are None or Zstd at specified level
-    compression: Compression,
+    compression: ParquetCompression,
     /// Number of rows cached in memory before being written as a `RecordBatch`
     max_batch_size: usize,
 }
@@ -64,7 +64,7 @@ impl ParquetOptions {
     /// Sets the compression level for the parquet file. The default is no
     /// compression. Set the compression level to a corresponding zstd level to
     /// enable compression.
-    pub fn compression(mut self, compression: Compression) -> Self {
+    pub fn compression(mut self, compression: ParquetCompression) -> Self {
         self.compression = compression;
         self
     }
