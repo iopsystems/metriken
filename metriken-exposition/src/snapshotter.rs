@@ -79,7 +79,9 @@ impl Snapshotter {
                     };
 
                     if let Some(description) = metric.description().map(|v| v.to_string()) {
-                        counter.metadata.insert("description".to_string(), description);
+                        counter
+                            .metadata
+                            .insert("description".to_string(), description);
                     }
 
                     snapshot.counters.push(counter);
@@ -97,7 +99,9 @@ impl Snapshotter {
                     };
 
                     if let Some(description) = metric.description().map(|v| v.to_string()) {
-                        gauge.metadata.insert("description".to_string(), description);
+                        gauge
+                            .metadata
+                            .insert("description".to_string(), description);
                     }
 
                     snapshot.gauges.push(gauge);
