@@ -9,13 +9,11 @@ use serde_json::Error as JsonError;
 // TODO(bmartin): derive Debug for Snapshot once the histogram snapshot has its
 // own debug impl.
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct Counter {
     pub name: String,
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub description: Option<String>,
     pub value: u64,
     pub metadata: HashMap<String, String>,
 }
@@ -25,8 +23,6 @@ pub struct Counter {
 #[non_exhaustive]
 pub struct Gauge {
     pub name: String,
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub description: Option<String>,
     pub value: i64,
     pub metadata: HashMap<String, String>,
 }
@@ -36,8 +32,6 @@ pub struct Gauge {
 #[non_exhaustive]
 pub struct Histogram {
     pub name: String,
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub description: Option<String>,
     pub value: histogram::Histogram,
     pub metadata: HashMap<String, String>,
 }
