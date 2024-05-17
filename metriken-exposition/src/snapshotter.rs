@@ -67,9 +67,8 @@ impl Snapshotter {
 
             match metric.value() {
                 Some(Value::Counter(value)) => {
-                    let counter = Counter {
+                    let mut counter = Counter {
                         name: metric.formatted(metriken::Format::Simple),
-                        description: metric.description().map(|v| v.to_string()),
                         value,
                         metadata: HashMap::from_iter(
                             metric
@@ -79,12 +78,15 @@ impl Snapshotter {
                         ),
                     };
 
+                    if let Some(description) = metric.description().map(|v| v.to_string()) {
+                        counter.metadata.insert("description".to_string(), description);
+                    }
+
                     snapshot.counters.push(counter);
                 }
                 Some(Value::Gauge(value)) => {
-                    let gauge = Gauge {
+                    let mut gauge = Gauge {
                         name: metric.formatted(metriken::Format::Simple),
-                        description: metric.description().map(|v| v.to_string()),
                         value,
                         metadata: HashMap::from_iter(
                             metric
@@ -93,6 +95,10 @@ impl Snapshotter {
                                 .map(|(k, v)| (k.to_string(), v.to_string())),
                         ),
                     };
+
+                    if let Some(description) = metric.description().map(|v| v.to_string()) {
+                        gauge.metadata.insert("description".to_string(), description);
+                    }
 
                     snapshot.gauges.push(gauge);
                 }
@@ -124,9 +130,12 @@ impl Snapshotter {
                             histogram.config().max_value_power().to_string(),
                         );
 
+                        if let Some(description) = metric.description().map(|v| v.to_string()) {
+                            metadata.insert("description".to_string(), description);
+                        }
+
                         let histogram = Histogram {
                             name: metric.formatted(metriken::Format::Simple),
-                            description: metric.description().map(|v| v.to_string()),
                             value: histogram,
                             metadata,
                         };
