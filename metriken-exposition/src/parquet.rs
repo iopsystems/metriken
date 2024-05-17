@@ -156,19 +156,33 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters
-                .entry(counter.name)
-                .or_insert(counter.metadata);
+            let mut metadata = counter.metadata;
+
+            if let Some(description) = counter.description {
+                metadata.insert("description".to_string(), description);
+            }
+
+            self.counters.entry(counter.name).or_insert(metadata);
         }
 
         for gauge in gauges {
-            self.gauges.entry(gauge.name).or_insert(gauge.metadata);
+            let mut metadata = gauge.metadata;
+
+            if let Some(description) = gauge.description {
+                metadata.insert("description".to_string(), description);
+            }
+
+            self.gauges.entry(gauge.name).or_insert(metadata);
         }
 
         for histogram in histograms {
-            self.histograms
-                .entry(histogram.name)
-                .or_insert(histogram.metadata);
+            let mut metadata = histogram.metadata;
+
+            if let Some(description) = histogram.description {
+                metadata.insert("description".to_string(), description);
+            }
+
+            self.histograms.entry(histogram.name).or_insert(metadata);
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {

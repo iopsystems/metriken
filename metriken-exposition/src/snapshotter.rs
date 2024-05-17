@@ -69,6 +69,7 @@ impl Snapshotter {
                 Some(Value::Counter(value)) => {
                     let counter = Counter {
                         name: metric.formatted(metriken::Format::Simple),
+                        description: metric.description().map(|v| v.to_string()),
                         value,
                         metadata: HashMap::from_iter(
                             metric
@@ -83,6 +84,7 @@ impl Snapshotter {
                 Some(Value::Gauge(value)) => {
                     let gauge = Gauge {
                         name: metric.formatted(metriken::Format::Simple),
+                        description: metric.description().map(|v| v.to_string()),
                         value,
                         metadata: HashMap::from_iter(
                             metric
@@ -124,6 +126,7 @@ impl Snapshotter {
 
                         let histogram = Histogram {
                             name: metric.formatted(metriken::Format::Simple),
+                            description: metric.description().map(|v| v.to_string()),
                             value: histogram,
                             metadata,
                         };
