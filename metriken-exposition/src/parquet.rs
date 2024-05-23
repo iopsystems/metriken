@@ -46,11 +46,19 @@ impl Default for ParquetCompression {
     }
 }
 
-/// Storage representation for histograms within the parquet file.
+/// Representation type for histograms within the parquet file.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ParquetHistogramStorage {
+pub enum ParquetHistogramType {
     Standard,
     Sparse,
+}
+
+/// Storage mechanism for histograms: List's are limited to 2^31 entries, while
+/// LargeList's can accommodate upto 2^61 entries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParquetHistogramStorage {
+    List,
+    LargeList,
 }
 
 /// Options for `ParquetWriter` controlling the output parquet file.
@@ -61,7 +69,9 @@ pub struct ParquetOptions {
     /// Number of rows cached in memory before being written as a `RecordBatch`
     max_batch_size: usize,
     /// Type of representation used to store histograms
-    histogram: ParquetHistogramStorage,
+    histogram: ParquetHistogramType,
+    // Storage mechanism for histogram nested lists
+    histogram_storage: ParquetHistogramStorage,
 }
 
 impl ParquetOptions {
@@ -86,10 +96,17 @@ impl ParquetOptions {
         self
     }
 
-    /// Sets the storage type for histogram data: standard or sparse. The
+    /// Sets the representation type for histogram data: standard or sparse. The
     /// default is the standard (dense) histogram.
-    pub fn histogram(mut self, histogram: ParquetHistogramStorage) -> Self {
+    pub fn histogram(mut self, histogram: ParquetHistogramType) -> Self {
         self.histogram = histogram;
+        self
+    }
+
+    /// Sets the storage type for histogram lists: regular lists or large lists.
+    /// The default is large lists.
+    pub fn histogram_storage(mut self, storage: ParquetHistogramStorage) -> Self {
+        self.histogram_storage = storage;
         self
     }
 }
@@ -99,7 +116,8 @@ impl Default for ParquetOptions {
         Self {
             compression: Default::default(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
-            histogram: ParquetHistogramStorage::Standard,
+            histogram: ParquetHistogramType::Standard,
+            histogram_storage: ParquetHistogramStorage::LargeList,
         }
     }
 }
@@ -133,20 +151,25 @@ pub struct ParquetSchema {
     counters: BTreeMap<String, HashMap<String, String>>,
     gauges: BTreeMap<String, HashMap<String, String>>,
     histograms: BTreeMap<String, HashMap<String, String>>,
-    summary_percentiles: Option<Vec<f64>>,
     metadata: HashMap<String, String>,
     rows: usize,
 }
 
 impl ParquetSchema {
-    pub fn new(percentiles: Option<Vec<f64>>) -> Self {
+    pub fn new() -> Self {
         ParquetSchema {
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             histograms: BTreeMap::new(),
-            summary_percentiles: percentiles,
             metadata: HashMap::new(),
             rows: 0,
+        }
+    }
+
+    fn get_list_type(histogram_storage: ParquetHistogramStorage, inner: DataType) -> DataType {
+        match histogram_storage {
+            ParquetHistogramStorage::List => DataType::new_list(inner, true),
+            ParquetHistogramStorage::LargeList => DataType::new_large_list(inner, true),
         }
     }
 
@@ -230,34 +253,33 @@ impl ParquetSchema {
         // Create columns for the snapshot: the buckets are stored as a
         // nested list type where each list element is an array of `u64`s.
         // The histogram configuration parameters are part of the metadata.
-        // If summary percentiles are desired, add a column per-percentile.
         // If the histogram is stored in its standard representation, the
         // buckets are stored in a single column, while in its sparse
         // representation, the non-zero bucket indices and counts are stored
         // in separate columns.
         for (histogram, mut metadata) in self.histograms.into_iter() {
             match options.histogram {
-                ParquetHistogramStorage::Standard => {
+                ParquetHistogramType::Standard => {
                     // merge metric annotations into the metric metadata
                     metadata.insert("metric_type".to_string(), "histogram".to_string());
 
                     fields.push(
                         Field::new(
                             format!("{histogram}:buckets"),
-                            DataType::new_list(DataType::UInt64, true),
+                            Self::get_list_type(options.histogram_storage, DataType::UInt64),
                             true,
                         )
                         .with_metadata(metadata.clone()),
                     );
                 }
-                ParquetHistogramStorage::Sparse => {
+                ParquetHistogramType::Sparse => {
                     // merge metric annotations into the metric metadata
                     metadata.insert("metric_type".to_string(), "sparse histogram".to_string());
 
                     fields.push(
                         Field::new(
                             format!("{histogram}:bucket_index"),
-                            DataType::new_list(DataType::UInt64, true),
+                            Self::get_list_type(options.histogram_storage, DataType::UInt64),
                             true,
                         )
                         .with_metadata(metadata.clone()),
@@ -265,22 +287,13 @@ impl ParquetSchema {
                     fields.push(
                         Field::new(
                             format!("{histogram}:bucket_count"),
-                            DataType::new_list(DataType::UInt64, true),
+                            Self::get_list_type(options.histogram_storage, DataType::UInt64),
                             true,
                         )
                         .with_metadata(metadata.clone()),
                     );
                 }
             };
-
-            if let Some(ref x) = self.summary_percentiles {
-                for percentile in x {
-                    fields.push(
-                        Field::new(format!("{histogram}:p{percentile}"), DataType::UInt64, true)
-                            .with_metadata(metadata.clone()),
-                    );
-                }
-            }
 
             // initialize storage for the histogram values
             histograms.insert(histogram, Vec::with_capacity(self.rows));
@@ -315,7 +328,6 @@ impl ParquetSchema {
             counters,
             gauges,
             histograms,
-            summary_percentiles: self.summary_percentiles,
         })
     }
 }
@@ -337,9 +349,6 @@ pub struct ParquetWriter<W: Write + Send> {
 
     /// Schema-ordered columnar data for histograms
     histograms: BTreeMap<String, Vec<Option<Histogram>>>,
-
-    /// Summary percentiles to store for histograms
-    summary_percentiles: Option<Vec<f64>>,
 }
 
 impl<W: Write + Send> ParquetWriter<W> {
@@ -386,6 +395,16 @@ impl<W: Write + Send> ParquetWriter<W> {
 
     /// Convert buffered metrics to a parquet `RecordBatch`.
     fn snapshots_to_recordbatch(&mut self) -> Result<RecordBatch, ArrowError> {
+        match self.options.histogram_storage {
+            ParquetHistogramStorage::List => self.convert_batch_generic::<i32>(),
+            ParquetHistogramStorage::LargeList => self.convert_batch_generic::<i64>(),
+        }
+    }
+
+    /// Generic function to convert buffered metrics to a parquet `RecordBatch`.
+    /// The `OffsetSizeTrait`, which is either an i32 or i64, determines whether
+    /// the nested lists in the batch are stored as a `List` or a `LargeList`.
+    fn convert_batch_generic<O: OffsetSizeTrait>(&mut self) -> Result<RecordBatch, ArrowError> {
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
 
         // Move existing timestamp array into an arrow array and clear
@@ -408,38 +427,27 @@ impl<W: Write + Send> ParquetWriter<W> {
         // One column, per-histogram, for the buckets if the histogram is
         // stored in its standard representation; two columns for buckets
         // per-histogram if it is stored in its sparse representation.
-        // If summary percentiles are desired, add one column per-summary.
         for (_, val) in self.histograms.iter_mut() {
             let hists = std::mem::take(val);
             let mut buckets = match self.options.histogram {
-                ParquetHistogramStorage::Standard => vec![ListBuilder::new(UInt64Builder::new())],
-                ParquetHistogramStorage::Sparse => vec![
-                    ListBuilder::new(UInt64Builder::new()),
-                    ListBuilder::new(UInt64Builder::new()),
-                ],
-            };
-
-            // Store one column per-summary percentile, with one-row per-histogram
-            let mut summaries: Vec<Vec<Option<u64>>> = match self.summary_percentiles {
-                None => Vec::new(),
-                Some(ref x) => {
-                    let mut outer = Vec::with_capacity(x.len());
-                    for _ in 0..x.len() {
-                        outer.push(Vec::with_capacity(hists.len()));
-                    }
-                    outer
+                ParquetHistogramType::Standard => {
+                    vec![GenericListBuilder::<O, _>::new(UInt64Builder::new())]
                 }
+                ParquetHistogramType::Sparse => vec![
+                    GenericListBuilder::<O, _>::new(UInt64Builder::new()),
+                    GenericListBuilder::<O, _>::new(UInt64Builder::new()),
+                ],
             };
 
             for h in hists {
                 if let Some(x) = h {
                     match self.options.histogram {
-                        ParquetHistogramStorage::Standard => buckets[0].append_value(
+                        ParquetHistogramType::Standard => buckets[0].append_value(
                             x.into_iter()
                                 .map(|x| Some(x.count()))
                                 .collect::<Vec<Option<u64>>>(),
                         ),
-                        ParquetHistogramStorage::Sparse => {
+                        ParquetHistogramType::Sparse => {
                             let sparse = histogram::SparseHistogram::from(&x);
                             buckets[0].append_value(
                                 sparse
@@ -457,38 +465,17 @@ impl<W: Write + Send> ParquetWriter<W> {
                             );
                         }
                     };
-
-                    // Columnize histogram summary percentiles
-                    if let Some(ref percentiles) = self.summary_percentiles {
-                        for (idx, percentile) in percentiles.iter().enumerate() {
-                            let v = x.percentile(*percentile).map(|x| x.end()).ok();
-                            summaries[idx].push(v);
-                        }
-                    }
                 } else {
-                    // Histogram missing; store `None` for buckets and summaries
+                    // Histogram missing; store `None` for buckets
                     buckets[0].append_null();
-                    if self.options.histogram == ParquetHistogramStorage::Sparse {
+                    if self.options.histogram == ParquetHistogramType::Sparse {
                         buckets[1].append_null();
-                    }
-
-                    if let Some(ref percentiles) = self.summary_percentiles {
-                        for (idx, _) in percentiles.iter().enumerate() {
-                            summaries[idx].push(None);
-                        }
                     }
                 }
             }
             columns.push(Arc::new(buckets[0].finish()));
-            if self.options.histogram == ParquetHistogramStorage::Sparse {
+            if self.options.histogram == ParquetHistogramType::Sparse {
                 columns.push(Arc::new(buckets[1].finish()));
-            }
-
-            if !summaries.is_empty() {
-                for mut col in summaries {
-                    let v = std::mem::take(&mut col);
-                    columns.push(Arc::new(UInt64Array::from(v)));
-                }
             }
         }
 
