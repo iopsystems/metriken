@@ -133,18 +133,16 @@ pub struct ParquetSchema {
     counters: BTreeMap<String, HashMap<String, String>>,
     gauges: BTreeMap<String, HashMap<String, String>>,
     histograms: BTreeMap<String, HashMap<String, String>>,
-    summary_percentiles: Option<Vec<f64>>,
     metadata: HashMap<String, String>,
     rows: usize,
 }
 
 impl ParquetSchema {
-    pub fn new(percentiles: Option<Vec<f64>>) -> Self {
+    pub fn new() -> Self {
         ParquetSchema {
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             histograms: BTreeMap::new(),
-            summary_percentiles: percentiles,
             metadata: HashMap::new(),
             rows: 0,
         }
@@ -230,7 +228,6 @@ impl ParquetSchema {
         // Create columns for the snapshot: the buckets are stored as a
         // nested list type where each list element is an array of `u64`s.
         // The histogram configuration parameters are part of the metadata.
-        // If summary percentiles are desired, add a column per-percentile.
         // If the histogram is stored in its standard representation, the
         // buckets are stored in a single column, while in its sparse
         // representation, the non-zero bucket indices and counts are stored
@@ -273,15 +270,6 @@ impl ParquetSchema {
                 }
             };
 
-            if let Some(ref x) = self.summary_percentiles {
-                for percentile in x {
-                    fields.push(
-                        Field::new(format!("{histogram}:p{percentile}"), DataType::UInt64, true)
-                            .with_metadata(metadata.clone()),
-                    );
-                }
-            }
-
             // initialize storage for the histogram values
             histograms.insert(histogram, Vec::with_capacity(self.rows));
         }
@@ -315,7 +303,6 @@ impl ParquetSchema {
             counters,
             gauges,
             histograms,
-            summary_percentiles: self.summary_percentiles,
         })
     }
 }
@@ -337,9 +324,6 @@ pub struct ParquetWriter<W: Write + Send> {
 
     /// Schema-ordered columnar data for histograms
     histograms: BTreeMap<String, Vec<Option<Histogram>>>,
-
-    /// Summary percentiles to store for histograms
-    summary_percentiles: Option<Vec<f64>>,
 }
 
 impl<W: Write + Send> ParquetWriter<W> {
@@ -408,7 +392,6 @@ impl<W: Write + Send> ParquetWriter<W> {
         // One column, per-histogram, for the buckets if the histogram is
         // stored in its standard representation; two columns for buckets
         // per-histogram if it is stored in its sparse representation.
-        // If summary percentiles are desired, add one column per-summary.
         for (_, val) in self.histograms.iter_mut() {
             let hists = std::mem::take(val);
             let mut buckets = match self.options.histogram {
@@ -417,18 +400,6 @@ impl<W: Write + Send> ParquetWriter<W> {
                     ListBuilder::new(UInt64Builder::new()),
                     ListBuilder::new(UInt64Builder::new()),
                 ],
-            };
-
-            // Store one column per-summary percentile, with one-row per-histogram
-            let mut summaries: Vec<Vec<Option<u64>>> = match self.summary_percentiles {
-                None => Vec::new(),
-                Some(ref x) => {
-                    let mut outer = Vec::with_capacity(x.len());
-                    for _ in 0..x.len() {
-                        outer.push(Vec::with_capacity(hists.len()));
-                    }
-                    outer
-                }
             };
 
             for h in hists {
@@ -457,38 +428,17 @@ impl<W: Write + Send> ParquetWriter<W> {
                             );
                         }
                     };
-
-                    // Columnize histogram summary percentiles
-                    if let Some(ref percentiles) = self.summary_percentiles {
-                        for (idx, percentile) in percentiles.iter().enumerate() {
-                            let v = x.percentile(*percentile).map(|x| x.end()).ok();
-                            summaries[idx].push(v);
-                        }
-                    }
                 } else {
                     // Histogram missing; store `None` for buckets and summaries
                     buckets[0].append_null();
                     if self.options.histogram == ParquetHistogramStorage::Sparse {
                         buckets[1].append_null();
                     }
-
-                    if let Some(ref percentiles) = self.summary_percentiles {
-                        for (idx, _) in percentiles.iter().enumerate() {
-                            summaries[idx].push(None);
-                        }
-                    }
                 }
             }
             columns.push(Arc::new(buckets[0].finish()));
             if self.options.histogram == ParquetHistogramStorage::Sparse {
                 columns.push(Arc::new(buckets[1].finish()));
-            }
-
-            if !summaries.is_empty() {
-                for mut col in summaries {
-                    let v = std::mem::take(&mut col);
-                    columns.push(Arc::new(UInt64Array::from(v)));
-                }
             }
         }
 

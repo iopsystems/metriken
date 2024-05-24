@@ -49,7 +49,7 @@ impl MsgpackToParquet {
         writer: impl Write + Send,
     ) -> Result<i64, ParquetError> {
         let mut reader = BufReader::new(reader);
-        let mut schema = ParquetSchema::new(None);
+        let mut schema = ParquetSchema::new();
 
         // First pass to build the schema
         while !reader.fill_buf().unwrap().is_empty() {
