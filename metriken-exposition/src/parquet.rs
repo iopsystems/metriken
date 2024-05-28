@@ -71,7 +71,7 @@ impl ParquetOptions {
     /// Sets the compression level for the parquet file. The default is no
     /// compression. Set the compression level to a corresponding zstd level to
     /// enable compression.
-    pub fn with_compression(mut self, compression: ParquetCompression) -> Self {
+    pub fn set_compression(mut self, compression: ParquetCompression) -> Self {
         self.compression = compression;
         self
     }
@@ -79,14 +79,14 @@ impl ParquetOptions {
     /// Sets the number of rows to be cache in memory before being written as a
     /// `RecordBatch`. Large values have better performance at the cost of
     /// additional memory usage. The default is ~1M rows (2^20).
-    pub fn with_max_batch_size(mut self, batch_size: usize) -> Self {
+    pub fn set_max_batch_size(mut self, batch_size: usize) -> Self {
         self.max_batch_size = batch_size;
         self
     }
 
     /// Sets the type for histogram data: standard or sparse. The default is
     /// the standard (dense) histogram.
-    pub fn with_histogram_type(mut self, histogram: ParquetHistogramType) -> Self {
+    pub fn set_histogram_type(mut self, histogram: ParquetHistogramType) -> Self {
         self.histogram_type = histogram;
         self
     }
@@ -247,7 +247,7 @@ impl ParquetSchema {
                 }
                 ParquetHistogramType::Sparse => {
                     // merge metric annotations into the metric metadata
-                    metadata.insert("metric_type".to_string(), "sparse histogram".to_string());
+                    metadata.insert("metric_type".to_string(), "sparse_histogram".to_string());
 
                     fields.push(
                         Field::new(
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn test_row_groups() {
         let snapshots = build_snapshots();
-        let tmpfile = write_parquet(snapshots, ParquetOptions::new().with_max_batch_size(1));
+        let tmpfile = write_parquet(snapshots, ParquetOptions::new().set_max_batch_size(1));
         let builder = ParquetRecordBatchReaderBuilder::try_new(tmpfile).unwrap();
 
         // Check row groups
@@ -547,7 +547,7 @@ mod tests {
         let snapshots = build_snapshots();
         let tmpfile = write_parquet(
             snapshots,
-            ParquetOptions::new().with_histogram_type(ParquetHistogramType::Sparse),
+            ParquetOptions::new().set_histogram_type(ParquetHistogramType::Sparse),
         );
         let builder = ParquetRecordBatchReaderBuilder::try_new(tmpfile).unwrap();
 
