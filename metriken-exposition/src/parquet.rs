@@ -479,7 +479,7 @@ mod tests {
             .finalize(tmpfile.try_clone().unwrap(), options)
             .unwrap();
         for s in &snapshots {
-            let _ = writer.push(s.clone()).unwrap();
+            let _ = writer.push(s.clone());
         }
         let _ = writer.finalize();
 
