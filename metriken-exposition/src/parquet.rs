@@ -12,6 +12,19 @@ use parquet::format::{FileMetaData, KeyValue};
 
 use crate::snapshot::{HashedSnapshot, Snapshot};
 
+/// The batch size (or maximum row group size) is the number of rows that
+/// the `ArrowWriter` caches in memory before attempting to write them to
+/// the file as a single row group. The size of the row group represents
+/// a trade-off on a few axes: larger row groups have better compression,
+/// but also a larger memory footprint during creation. Operations on a
+/// parquet file can also be parallelized per-row group, so too few row
+/// groups limit the number of cores that can operate on the file.
+///
+/// The general recommendation is to have at least as many row groups
+/// as cores and benchmarks from DuckDB show that the value of larger
+/// row groups starts tapering after 50-100K (though this is dependent
+/// on the workload). The default for the `ArrowWriter` is 1M, which is
+/// too large for histograms, so pick a more conservative default.
 const DEFAULT_MAX_BATCH_SIZE: usize = 50_000;
 
 #[derive(Clone, Debug)]
@@ -71,7 +84,7 @@ impl ParquetOptions {
     /// Sets the compression level for the parquet file. The default is no
     /// compression. Set the compression level to a corresponding zstd level to
     /// enable compression.
-    pub fn set_compression(mut self, compression: ParquetCompression) -> Self {
+    pub fn compression(mut self, compression: ParquetCompression) -> Self {
         self.compression = compression;
         self
     }
@@ -79,14 +92,14 @@ impl ParquetOptions {
     /// Sets the number of rows to be cache in memory before being written as a
     /// `RecordBatch`. Large values have better performance at the cost of
     /// additional memory usage. The default is ~1M rows (2^20).
-    pub fn set_max_batch_size(mut self, batch_size: usize) -> Self {
+    pub fn max_batch_size(mut self, batch_size: usize) -> Self {
         self.max_batch_size = batch_size;
         self
     }
 
     /// Sets the type for histogram data: standard or sparse. The default is
     /// the standard (dense) histogram.
-    pub fn set_histogram_type(mut self, histogram: ParquetHistogramType) -> Self {
+    pub fn histogram_type(mut self, histogram: ParquetHistogramType) -> Self {
         self.histogram_type = histogram;
         self
     }
@@ -500,7 +513,7 @@ mod tests {
     #[test]
     fn test_row_groups() {
         let snapshots = build_snapshots();
-        let tmpfile = write_parquet(snapshots, ParquetOptions::new().set_max_batch_size(1));
+        let tmpfile = write_parquet(snapshots, ParquetOptions::new().max_batch_size(1));
         let builder = ParquetRecordBatchReaderBuilder::try_new(tmpfile).unwrap();
 
         // Check row groups
@@ -547,7 +560,7 @@ mod tests {
         let snapshots = build_snapshots();
         let tmpfile = write_parquet(
             snapshots,
-            ParquetOptions::new().set_histogram_type(ParquetHistogramType::Sparse),
+            ParquetOptions::new().histogram_type(ParquetHistogramType::Sparse),
         );
         let builder = ParquetRecordBatchReaderBuilder::try_new(tmpfile).unwrap();
 
