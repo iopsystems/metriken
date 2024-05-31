@@ -14,7 +14,7 @@ mod snapshotter;
 pub use convert::MsgpackToParquet;
 #[cfg(feature = "parquet")]
 pub use parquet::{
-    ParquetCompression, ParquetHistogramStorage, ParquetOptions, ParquetSchema, ParquetWriter,
+    ParquetCompression, ParquetHistogramType, ParquetOptions, ParquetSchema, ParquetWriter,
 };
 pub use snapshot::{Counter, Gauge, Histogram, Snapshot};
 pub use snapshotter::{Snapshotter, SnapshotterBuilder};

@@ -21,6 +21,9 @@ rmp-serde = { version = "1.1.2", optional = true }
 serde = { version = "1.0.196", features = ["derive"], optional = true }
 serde_json = { version = "1.0.114", optional = true }
 
+[dev-dependencies]
+tempfile = "3.10.1"
+
 [features]
 serde = ["dep:serde", "chrono/serde", "histogram/serde"]
 json = ["dep:serde", "dep:serde_json"]
