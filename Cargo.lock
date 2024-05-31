@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "chrono",
