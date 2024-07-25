@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::Path;
@@ -11,6 +12,7 @@ use crate::{ParquetOptions, ParquetSchema};
 #[derive(Clone, Debug, Default)]
 pub struct MsgpackToParquet {
     parquet_options: ParquetOptions,
+    metadata: HashMap<String, String>,
 }
 
 impl MsgpackToParquet {
@@ -24,7 +26,14 @@ impl MsgpackToParquet {
     pub fn with_options(options: ParquetOptions) -> Self {
         Self {
             parquet_options: options,
+            metadata: HashMap::new(),
         }
+    }
+
+    /// Add a key-value pair to the metadata.
+    pub fn metadata(mut self, key: String, value: String) -> Self {
+        self.metadata.insert(key, value);
+        self
     }
 
     /// Converts a file with metrics in msgpack format to a parquet file.
@@ -57,7 +66,7 @@ impl MsgpackToParquet {
                 .map_err(|x| ParquetError::External(Box::new(x)))?;
             schema.push(s);
         }
-        let mut writer = schema.finalize(writer, self.parquet_options)?;
+        let mut writer = schema.finalize(writer, self.parquet_options, Some(self.metadata))?;
 
         // Rewind file pointer and second pass for the actual metrics
         reader.rewind().unwrap();

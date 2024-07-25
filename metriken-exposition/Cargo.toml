@@ -1,6 +1,6 @@
 [package]
 name = "metriken-exposition"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -12,11 +12,11 @@ homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
-arrow = { version = "51.0.0", optional = true }
+arrow = { version = "52.2.0", optional = true }
 chrono = "0.4.34"
 histogram = "0.11.0"
 metriken = { version = "0.7.0", path = "../metriken" }
-parquet = { version = "51.0.0", optional = true }
+parquet = { version = "52.2.0", optional = true }
 rmp-serde = { version = "1.1.2", optional = true }
 serde = { version = "1.0.196", features = ["derive"], optional = true }
 serde_json = { version = "1.0.114", optional = true }
@@ -25,6 +25,7 @@ serde_json = { version = "1.0.114", optional = true }
 tempfile = "3.10.1"
 
 [features]
+default = ["parquet-conversion"]
 serde = ["dep:serde", "chrono/serde", "histogram/serde"]
 json = ["dep:serde", "dep:serde_json"]
 msgpack = ["dep:serde", "dep:rmp-serde"]
