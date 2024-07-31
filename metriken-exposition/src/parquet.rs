@@ -189,9 +189,10 @@ impl ParquetSchema {
 
     /// Finalize the schema and build a `ParquetWriter`.
     pub fn finalize(
-        self,
+        mut self,
         writer: impl Write + Send,
         options: ParquetOptions,
+        metadata: Option<HashMap<String, String>>,
     ) -> Result<ParquetWriter<impl Write + Send>, ParquetError> {
         let mut fields: Vec<Field> = Vec::with_capacity(
             1 + self.counters.len() + self.gauges.len() + (self.histograms.len() * 3),
@@ -285,7 +286,9 @@ impl ParquetSchema {
             histograms.push(histogram);
         }
 
-        let metadata: Option<Vec<KeyValue>> = if self.metadata.is_empty() {
+        // Merge metadata and convert to vector format
+        self.metadata.extend(metadata.unwrap_or_default());
+        let schema_metadata: Option<Vec<KeyValue>> = if self.metadata.is_empty() {
             None
         } else {
             Some(
@@ -302,7 +305,7 @@ impl ParquetSchema {
         let schema = Arc::new(Schema::new(fields));
         let props = WriterProperties::builder()
             .set_compression(options.compression.inner)
-            .set_key_value_metadata(metadata)
+            .set_key_value_metadata(schema_metadata)
             .set_max_row_group_size(options.max_batch_size)
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
@@ -489,7 +492,7 @@ mod tests {
 
         let mut tmpfile = tempfile::tempfile().unwrap();
         let mut writer = schema
-            .finalize(tmpfile.try_clone().unwrap(), options)
+            .finalize(tmpfile.try_clone().unwrap(), options, None)
             .unwrap();
         for s in &snapshots {
             let _ = writer.push(s.clone());
