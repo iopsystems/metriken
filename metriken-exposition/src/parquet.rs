@@ -200,10 +200,10 @@ impl ParquetSchema {
 
         // Create one column for the timestamp
         fields.push(
-            Field::new("timestamp", DataType::UInt64, false).with_metadata(HashMap::from([(
-                "metric_type".to_owned(),
-                "timestamp".to_owned(),
-            )])),
+            Field::new("timestamp", DataType::UInt64, false).with_metadata(HashMap::from([
+                ("metric_type".to_owned(), "timestamp".to_owned()),
+                ("unit".to_owned(), "nanoseconds".to_owned()),
+            ])),
         );
 
         let mut counters = Vec::with_capacity(self.counters.len());
