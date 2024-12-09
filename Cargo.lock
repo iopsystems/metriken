@@ -746,7 +746,6 @@ name = "metriken-core"
 version = "0.1.2"
 dependencies = [
  "linkme",
- "metriken",
  "parking_lot",
  "phf",
 ]
