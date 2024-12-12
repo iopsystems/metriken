@@ -195,10 +195,25 @@ impl<M: Metric> Metric for ProviderMetric<M> {
 ///
 /// # Example
 /// ```
-/// # use metriken::*;
+/// # use metriken_core::*;
+/// # use metriken_core::dynmetrics::*;
 /// # use std::pin::pin;
-/// let my_dyn_metric = pin!(DynPinnedMetric::new(Counter::new()));
-/// my_dyn_metric.as_ref().register(MetricBuilder::new("a.dynamic.counter").into_entry());
+/// # use std::any::Any;
+/// #
+/// # struct Counter;
+/// # impl Counter {
+/// #   fn new() -> Self { Self }
+/// # }
+/// # impl Metric for Counter {
+/// #   fn as_any(&self) -> Option<&dyn Any> { None }
+/// #   fn value(&self) -> Option<Value> { None }
+/// # }
+/// #
+/// let (metric, entry) = MetricBuilder::new("a.dynamic.counter")
+///     .build_pinned(Counter::new());
+/// let metric = std::pin::pin!(metric);
+///
+/// metric.as_ref().register(entry);
 /// ```
 ///
 /// [`register`]: crate::dynmetrics::DynPinnedMetric::register
@@ -274,7 +289,20 @@ impl<M: Metric> Deref for DynPinnedMetric<M> {
 ///
 /// # Example
 /// ```
-/// # use metriken::*;
+/// # use std::any::Any;
+/// # use metriken_core::*;
+/// # use metriken_core::dynmetrics::*;
+/// #
+/// # struct Gauge;
+/// # impl Gauge {
+/// #   fn new() -> Self { Self }
+/// #   fn increment(&self) {}
+/// # }
+/// # impl Metric for Gauge {
+/// #   fn as_any(&self) -> Option<&dyn Any> { None }
+/// #   fn value(&self) -> Option<Value> { None }
+/// # }
+/// #
 /// let my_gauge = MetricBuilder::new("my.dynamic.gauge").build(Gauge::new());
 ///
 /// my_gauge.increment();
