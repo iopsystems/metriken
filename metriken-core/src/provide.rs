@@ -251,12 +251,16 @@ impl ProviderMap {
 
     pub fn provide<'a>(&'a self, request: &mut Request<'a>) {
         if let Some(element) = self.0.get(&request.0.tag_id()) {
-            element.provide(request);
+            Self::provide_dyn(&**element, request);
         }
     }
 
     fn typeid_for<T: Provide>() -> TypeId {
-        TypeId::of::<tags::Ref<T>>()
+        TypeId::of::<tags::Ref<tags::MaybeSizedValue<T>>>()
+    }
+
+    fn provide_dyn<'a>(provider: &'a dyn Provide, request: &mut Request<'a>) {
+        provider.provide(request);
     }
 }
 
@@ -270,6 +274,43 @@ pub(crate) trait Provide: Any + Send + Sync + 'static {
 
 impl<T: Any + Send + Sync> Provide for T {
     fn provide<'a>(&'a self, request: &mut Request<'a>) {
-        request.provide_ref(self);
+        request.provide_ref::<T>(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Metadata;
+
+    struct ProviderMetric(ProviderMap);
+
+    impl Metric for ProviderMetric {
+        fn is_enabled(&self) -> bool {
+            false
+        }
+
+        fn as_any(&self) -> Option<&dyn Any> {
+            None
+        }
+
+        fn value(&self) -> Option<crate::Value> {
+            None
+        }
+
+        fn provide<'a>(&'a self, request: &mut Request<'a>) {
+            self.0.provide(request)
+        }
+    }
+
+    #[test]
+    fn insert_into_provider_map() {
+        let mut map = ProviderMap::new();
+        map.insert(Metadata::default_const());
+
+        let metric = ProviderMetric(map);
+        let value = request_ref::<Metadata>(&metric);
+
+        assert!(value.is_some());
     }
 }

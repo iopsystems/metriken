@@ -99,3 +99,21 @@ fn multi_metric() {
     drop(m2);
     assert_eq!(metrics().dynamic_metrics().len(), 0);
 }
+
+#[test]
+fn read_metadata() {
+    let _guard = TestGuard::new();
+
+    let _metric = MetricBuilder::new("metric1")
+        .metadata("foo", "b")
+        .metadata("bar", "c")
+        .build(Counter::new());
+
+    let metrics = metrics();
+    assert_eq!(metrics.dynamic_metrics().len(), 1);
+    let entry = metrics.dynamic_metrics().next().unwrap();
+
+    assert_eq!(entry.name(), "metric1");
+    assert_eq!(entry.metadata().get("foo"), Some("b"));
+    assert_eq!(entry.metadata().get("bar"), Some("c"));
+}
