@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.1.3
+### Fixed
+- Fixed missing metric metadata on dynamic metrics.
+
 ## 0.1.2
 ### Added
 - Add `Metric::provide` method and `request_[ref|value]` APIs.
