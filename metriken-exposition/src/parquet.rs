@@ -10,7 +10,7 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use parquet::format::{FileMetaData, KeyValue};
 
-use crate::snapshot::{HashedSnapshot, Snapshot};
+use crate::snapshot::{canonicalize_metric_name, HashedSnapshot, Snapshot};
 
 /// The batch size (or maximum row group size) is the number of rows that
 /// the `ArrowWriter` caches in memory before attempting to write them to
@@ -165,19 +165,18 @@ impl ParquetSchema {
             (snapshot.counters, snapshot.gauges, snapshot.histograms);
 
         for counter in counters {
-            self.counters
-                .entry(counter.name)
-                .or_insert(counter.metadata);
+            let name = canonicalize_metric_name(&counter.name, &counter.metadata);
+            self.counters.entry(name).or_insert(counter.metadata);
         }
 
         for gauge in gauges {
-            self.gauges.entry(gauge.name).or_insert(gauge.metadata);
+            let name = canonicalize_metric_name(&gauge.name, &gauge.metadata);
+            self.gauges.entry(name).or_insert(gauge.metadata);
         }
 
         for histogram in histograms {
-            self.histograms
-                .entry(histogram.name)
-                .or_insert(histogram.metadata);
+            let name = canonicalize_metric_name(&histogram.name, &histogram.metadata);
+            self.histograms.entry(name).or_insert(histogram.metadata);
         }
 
         if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
