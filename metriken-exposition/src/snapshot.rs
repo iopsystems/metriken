@@ -59,38 +59,37 @@ pub(crate) fn canonicalize_metric_name(
     snapshot_name: &str,
     metadata: &HashMap<String, String>,
 ) -> String {
-    // Check for Rezolus v4 snapshot, if so return the name as-is
-    if snapshot_name.contains("/")
-        && snapshot_name
-            .chars()
-            .next()
-            .map(|x| x.is_ascii_digit())
-            .is_some_and(|x| !x)
-    {
-        return snapshot_name.to_string();
-    }
-
-    // Rezolus v5 snapshot: append all the metadata, except few known keys,
-    // to the name to ensure a unique name.
-    let ordered = ["name", "op", "state"];
-    let mut ignore: HashSet<&str> = ["metric", "unit", "grouping_power", "max_value_power"].into();
-    ignore.extend(ordered);
-
+    // If the metric key doesn't exist, it is old-style data and return as-is.
     let Some(name) = metadata.get("metric") else {
         return snapshot_name.to_string();
     };
+
+    // Separate keys into key's with a specific desired ordering and keys to be
+    // ignored. We are indifferent to the ordering of keys in neither of these buckets.
+    let ordered = ["name", "op", "state", "direction"];
+    let mut ignore: HashSet<&str> =
+        ["metric", "unit", "grouping_power", "max_value_power", "id"].into();
+    ignore.extend(ordered);
+
     let mut unique_name = name.to_string();
 
+    // Append name, op, state, and direction in specified order
     for k in ordered {
         if let Some(v) = metadata.get(k) {
             unique_name = unique_name + "/" + v;
         }
     }
 
+    // Append remaining keys in any order to ensure uniqueness
     for (k, v) in metadata {
         if ignore.contains(k.as_str()) {
             continue;
         }
+        unique_name = unique_name + "/" + v;
+    }
+
+    // Append "id", if it exists, to the very end
+    if let Some(v) = metadata.get("id") {
         unique_name = unique_name + "/" + v;
     }
 
