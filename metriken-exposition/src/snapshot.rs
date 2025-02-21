@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 #[cfg(feature = "msgpack")]
@@ -64,6 +64,11 @@ pub(crate) fn canonicalize_metric_name(
         return snapshot_name.to_string();
     };
 
+    let metadata: BTreeMap<&str, &str> = metadata
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
     // Separate keys into key's with a specific desired ordering and keys to be
     // ignored. We are indifferent to the ordering of keys in neither of these buckets.
     let ordered = ["name", "op", "state", "direction"];
@@ -75,14 +80,14 @@ pub(crate) fn canonicalize_metric_name(
 
     // Append name, op, state, and direction in specified order
     for k in ordered {
-        if let Some(v) = metadata.get(k) {
-            unique_name = unique_name + "/" + v;
+        if let Some(v) = metadata.get(&k) {
+            unique_name = unique_name + "/" + *v;
         }
     }
 
     // Append remaining keys in any order to ensure uniqueness
-    for (k, v) in metadata {
-        if ignore.contains(k.as_str()) {
+    for (k, v) in &metadata {
+        if ignore.contains(*k) {
             continue;
         }
         unique_name = unique_name + "/" + v;
