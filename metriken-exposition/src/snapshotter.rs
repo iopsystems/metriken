@@ -1,9 +1,9 @@
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 use metriken::{AtomicHistogram, MetricEntry, RwLockHistogram, Value};
 
-use crate::snapshot::{Counter, Gauge, Histogram};
-use crate::Snapshot;
+use crate::snapshot::{Counter, Gauge, Histogram, Snapshot, SnapshotV1};
 
 /// Produces a snapshot of metric readings.
 pub struct Snapshotter {
@@ -56,8 +56,10 @@ impl Default for Snapshotter {
 impl Snapshotter {
     /// Produce a new snapshot.
     pub fn snapshot(&self) -> Snapshot {
-        let mut snapshot = Snapshot::new();
-        snapshot.metadata = self.metadata.clone();
+        let ts = SystemTime::now();
+        let mut counters: Vec<Counter> = Vec::new();
+        let mut gauges: Vec<Gauge> = Vec::new();
+        let mut histograms: Vec<Histogram> = Vec::new();
 
         // iterate through the metrics and build-up the snapshot
         for metric in &metriken::metrics() {
@@ -84,7 +86,7 @@ impl Snapshotter {
                             .insert("description".to_string(), description);
                     }
 
-                    snapshot.counters.push(counter);
+                    counters.push(counter);
                 }
                 Some(Value::Gauge(value)) => {
                     let mut gauge = Gauge {
@@ -104,7 +106,7 @@ impl Snapshotter {
                             .insert("description".to_string(), description);
                     }
 
-                    snapshot.gauges.push(gauge);
+                    gauges.push(gauge);
                 }
                 Some(Value::Other(other)) => {
                     let histogram = if let Some(histogram) = other.downcast_ref::<AtomicHistogram>()
@@ -144,13 +146,19 @@ impl Snapshotter {
                             metadata,
                         };
 
-                        snapshot.histograms.push(histogram);
+                        histograms.push(histogram);
                     }
                 }
                 _ => continue,
             }
         }
 
-        snapshot
+        Snapshot::V1(SnapshotV1 {
+            systemtime: ts,
+            metadata: self.metadata.clone(),
+            counters,
+            gauges,
+            histograms,
+        })
     }
 }
