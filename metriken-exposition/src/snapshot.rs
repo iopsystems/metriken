@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "msgpack")]
 use rmp_serde::encode::Error as SerializeMsgpackError;
@@ -31,9 +31,9 @@ pub struct Histogram {
 }
 
 /// Contains a snapshot of metric readings.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
-pub struct Snapshot {
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SnapshotV1 {
     pub systemtime: SystemTime,
 
     #[cfg_attr(feature = "serde", serde(default))]
@@ -44,9 +44,33 @@ pub struct Snapshot {
     pub histograms: Vec<Histogram>,
 }
 
+/// Contains a snapshot of metric readings.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SnapshotV2 {
+    pub systemtime: SystemTime,
+    pub duration: Duration,
+
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub metadata: HashMap<String, String>,
+
+    pub counters: Vec<Counter>,
+    pub gauges: Vec<Gauge>,
+    pub histograms: Vec<Histogram>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(untagged))]
+pub enum Snapshot {
+    V1(SnapshotV1),
+    V2(SnapshotV2),
+}
+
 #[cfg(feature = "parquet")]
 pub(crate) struct HashedSnapshot {
     pub(crate) ts: u64,
+    pub(crate) duration: Option<u64>,
     pub(crate) counters: HashMap<String, Counter>,
     pub(crate) gauges: HashMap<String, Gauge>,
     pub(crate) histograms: HashMap<String, Histogram>,
@@ -102,39 +126,46 @@ pub(crate) fn canonicalize_metric_name(
 }
 
 impl Snapshot {
-    pub(crate) fn new() -> Self {
-        Self {
-            systemtime: SystemTime::now(),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: Vec::new(),
-            histograms: Vec::new(),
+    pub(crate) fn systemtime(&self) -> SystemTime {
+        match self {
+            Snapshot::V1(s) => s.systemtime,
+            Snapshot::V2(s) => s.systemtime,
         }
     }
 
-    /// The system time when the snapshot was created.
-    pub fn systemtime(&self) -> SystemTime {
-        self.systemtime
+    pub(crate) fn duration(&self) -> Option<Duration> {
+        match self {
+            Snapshot::V1(_) => None,
+            Snapshot::V2(s) => Some(s.duration),
+        }
     }
 
-    /// Fetch the value for a snapshot metadata key.
-    pub fn get_metadata(&self, key: &str) -> Option<&str> {
-        self.metadata.get(key).map(|x| x.as_str())
+    pub(crate) fn metadata(&mut self) -> HashMap<String, String> {
+        match self {
+            Snapshot::V1(s) => std::mem::take(&mut s.metadata),
+            Snapshot::V2(s) => std::mem::take(&mut s.metadata),
+        }
     }
 
-    /// A view into the counters for this snapshot.
-    pub fn counters(&self) -> &[Counter] {
-        &self.counters
+    pub(crate) fn counters(&mut self) -> Vec<Counter> {
+        match self {
+            Snapshot::V1(s) => std::mem::take(&mut s.counters),
+            Snapshot::V2(s) => std::mem::take(&mut s.counters),
+        }
     }
 
-    /// A view into the gauges for this snapshot.
-    pub fn gauges(&self) -> &[Gauge] {
-        &self.gauges
+    pub(crate) fn gauges(&mut self) -> Vec<Gauge> {
+        match self {
+            Snapshot::V1(s) => std::mem::take(&mut s.gauges),
+            Snapshot::V2(s) => std::mem::take(&mut s.gauges),
+        }
     }
 
-    /// A view into the histograms for this snapshot.
-    pub fn histograms(&self) -> &[Histogram] {
-        &self.histograms
+    pub(crate) fn histograms(&mut self) -> Vec<Histogram> {
+        match self {
+            Snapshot::V1(s) => std::mem::take(&mut s.histograms),
+            Snapshot::V2(s) => std::mem::take(&mut s.histograms),
+        }
     }
 
     #[cfg(feature = "json")]
@@ -158,34 +189,37 @@ impl Snapshot {
 
 #[cfg(feature = "parquet")]
 impl From<Snapshot> for HashedSnapshot {
-    fn from(snapshot: Snapshot) -> Self {
+    fn from(mut snapshot: Snapshot) -> Self {
         let ts: u64 = snapshot
-            .systemtime
+            .systemtime()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("System Clock is earlier than 1970; needs reset")
             .as_nanos() as u64;
 
+        let duration: Option<u64> = snapshot.duration().map(|x| x.as_nanos() as u64);
+
         let counters: HashMap<String, Counter> = HashMap::from_iter(
             snapshot
-                .counters
+                .counters()
                 .into_iter()
                 .map(|v| (canonicalize_metric_name(&v.name, &v.metadata), v)),
         );
         let gauges: HashMap<String, Gauge> = HashMap::from_iter(
             snapshot
-                .gauges
+                .gauges()
                 .into_iter()
                 .map(|v| (canonicalize_metric_name(&v.name, &v.metadata), v)),
         );
         let histograms: HashMap<String, Histogram> = HashMap::from_iter(
             snapshot
-                .histograms
+                .histograms()
                 .into_iter()
                 .map(|v| (canonicalize_metric_name(&v.name, &v.metadata), v)),
         );
 
         Self {
             ts,
+            duration,
             counters,
             gauges,
             histograms,

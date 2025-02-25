@@ -160,9 +160,12 @@ impl ParquetSchema {
     }
 
     /// Process and store metadata for all metrics seen in the snapshot.
-    pub fn push(&mut self, snapshot: Snapshot) {
-        let (counters, gauges, histograms) =
-            (snapshot.counters, snapshot.gauges, snapshot.histograms);
+    pub fn push(&mut self, mut snapshot: Snapshot) {
+        let (counters, gauges, histograms) = (
+            snapshot.counters(),
+            snapshot.gauges(),
+            snapshot.histograms(),
+        );
 
         for counter in counters {
             let name = canonicalize_metric_name(&counter.name, &counter.metadata);
@@ -179,8 +182,9 @@ impl ParquetSchema {
             self.histograms.entry(name).or_insert(histogram.metadata);
         }
 
-        if self.metadata.is_empty() && !snapshot.metadata.is_empty() {
-            self.metadata = snapshot.metadata;
+        let snap_metadata = snapshot.metadata();
+        if self.metadata.is_empty() && !snap_metadata.is_empty() {
+            self.metadata = snap_metadata;
         }
 
         self.rows += 1;
@@ -194,12 +198,19 @@ impl ParquetSchema {
         metadata: Option<HashMap<String, String>>,
     ) -> Result<ParquetWriter<impl Write + Send>, ParquetError> {
         let mut fields: Vec<Field> = Vec::with_capacity(
-            1 + self.counters.len() + self.gauges.len() + (self.histograms.len() * 3),
+            2 + self.counters.len() + self.gauges.len() + (self.histograms.len() * 3),
         );
 
-        // Create one column for the timestamp
+        // Create columns for the timestamp and duration of taking the snapshot
         fields.push(
             Field::new("timestamp", DataType::UInt64, false).with_metadata(HashMap::from([
+                ("metric_type".to_owned(), "timestamp".to_owned()),
+                ("unit".to_owned(), "nanoseconds".to_owned()),
+            ])),
+        );
+
+        fields.push(
+            Field::new("duration", DataType::UInt64, true).with_metadata(HashMap::from([
                 ("metric_type".to_owned(), "timestamp".to_owned()),
                 ("unit".to_owned(), "nanoseconds".to_owned()),
             ])),
@@ -343,8 +354,9 @@ impl<W: Write + Send> ParquetWriter<W> {
 
         let mut hs: HashedSnapshot = HashedSnapshot::from(snapshot);
 
-        // Create a single element column for the timestamp
+        // Create a single element column for the timestamp and duration
         columns.push(Arc::new(UInt64Array::from(vec![hs.ts])));
+        columns.push(Arc::new(UInt64Array::from(vec![hs.duration])));
 
         // Create single element columns for metrics. Since `remove` returns
         // `None` if a metric in the schema does not exist in the snapshot gaps
@@ -432,53 +444,105 @@ mod tests {
     use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use arrow::array::*;
     use metriken::histogram::Histogram as H2Histogram;
+    use snapshot::{SnapshotV1, SnapshotV2};
 
     use crate::*;
 
-    fn build_snapshots() -> Vec<Snapshot> {
-        let h1 = H2Histogram::from_buckets(1, 3, vec![0, 1, 1, 0, 0, 0]).unwrap();
-        let s1 = Snapshot {
-            systemtime: SystemTime::now(),
-            metadata: HashMap::new(),
-            counters: vec![Counter {
+    #[allow(clippy::type_complexity)]
+    fn build_metrics() -> (Vec<Vec<Counter>>, Vec<Vec<Gauge>>, Vec<Vec<Histogram>>) {
+        let counters: Vec<Vec<Counter>> = vec![
+            vec![Counter {
                 name: "counter".to_string(),
                 value: 100,
                 metadata: HashMap::new(),
             }],
-            gauges: vec![Gauge {
-                name: "gauge".to_string(),
-                value: 16,
-                metadata: HashMap::new(),
-            }],
-            histograms: vec![Histogram {
-                name: "histogram".to_string(),
-                value: h1,
-                metadata: HashMap::new(),
-            }],
-        };
-
-        let h2 = H2Histogram::from_buckets(1, 3, vec![0, 1, 1, 0, 1, 0]).unwrap();
-        let s2 = Snapshot {
-            systemtime: SystemTime::now()
-                .checked_add(Duration::from_secs(600))
-                .unwrap(),
-            metadata: HashMap::new(),
-            counters: vec![Counter {
+            vec![Counter {
                 name: "counter".to_string(),
                 value: 121,
                 metadata: HashMap::new(),
             }],
-            gauges: vec![Gauge {
+        ];
+
+        let gauges: Vec<Vec<Gauge>> = vec![
+            vec![Gauge {
+                name: "gauge".to_string(),
+                value: 16,
+                metadata: HashMap::new(),
+            }],
+            vec![Gauge {
                 name: "gauge".to_string(),
                 value: 6,
                 metadata: HashMap::new(),
             }],
-            histograms: vec![Histogram {
+        ];
+
+        let h1 = H2Histogram::from_buckets(1, 3, vec![0, 1, 1, 0, 0, 0]).unwrap();
+        let h2 = H2Histogram::from_buckets(1, 3, vec![0, 1, 1, 0, 1, 0]).unwrap();
+
+        let histograms: Vec<Vec<Histogram>> = vec![
+            vec![Histogram {
+                name: "histogram".to_string(),
+                value: h1,
+                metadata: HashMap::new(),
+            }],
+            vec![Histogram {
                 name: "histogram".to_string(),
                 value: h2,
                 metadata: HashMap::new(),
             }],
-        };
+        ];
+
+        (counters, gauges, histograms)
+    }
+
+    fn build_snapshots_v1() -> Vec<Snapshot> {
+        let (mut counters, mut gauges, mut histograms) = build_metrics();
+
+        let ts1 = SystemTime::now();
+        let ts2 = ts1.checked_add(Duration::from_secs(60)).unwrap();
+
+        let s2 = Snapshot::V1(SnapshotV1 {
+            systemtime: ts2,
+            metadata: HashMap::new(),
+            counters: counters.remove(1),
+            gauges: gauges.remove(1),
+            histograms: histograms.remove(1),
+        });
+
+        let s1 = Snapshot::V1(SnapshotV1 {
+            systemtime: ts1,
+            metadata: HashMap::new(),
+            counters: counters.remove(0),
+            gauges: gauges.remove(0),
+            histograms: histograms.remove(0),
+        });
+
+        vec![s1, s2]
+    }
+
+    fn build_snapshots_v2() -> Vec<Snapshot> {
+        let (mut counters, mut gauges, mut histograms) = build_metrics();
+
+        let ts1 = SystemTime::now();
+        let ts2 = ts1.checked_add(Duration::from_secs(60)).unwrap();
+
+        let s2 = Snapshot::V2(SnapshotV2 {
+            systemtime: ts2,
+            duration: Duration::from_nanos(1024),
+            metadata: HashMap::new(),
+            counters: counters.remove(1),
+            gauges: gauges.remove(1),
+            histograms: histograms.remove(1),
+        });
+
+        let s1 = Snapshot::V2(SnapshotV2 {
+            systemtime: ts1,
+            duration: Duration::from_nanos(8192),
+            metadata: HashMap::new(),
+            counters: counters.remove(0),
+            gauges: gauges.remove(0),
+            histograms: histograms.remove(0),
+        });
 
         vec![s1, s2]
     }
@@ -496,7 +560,7 @@ mod tests {
         for s in &snapshots {
             let _ = writer.push(s.clone());
         }
-        let _ = writer.finalize();
+        let _ = writer.finalize().unwrap();
 
         let _ = tmpfile.rewind();
         tmpfile
@@ -512,9 +576,12 @@ mod tests {
         assert_eq!(v.values(), vals);
     }
 
-    #[test]
-    fn test_row_groups() {
-        let snapshots = build_snapshots();
+    fn validate_u64_null_array(col: ArrayRef) {
+        let v = col.as_any().downcast_ref::<array::UInt64Array>().unwrap();
+        v.iter().for_each(|x| assert!(x.is_none()));
+    }
+
+    fn test_row_groups(snapshots: Vec<Snapshot>) {
         let tmpfile = write_parquet(snapshots, ParquetOptions::new().max_batch_size(1));
         let builder = ParquetRecordBatchReaderBuilder::try_new(tmpfile).unwrap();
 
@@ -525,8 +592,16 @@ mod tests {
     }
 
     #[test]
-    fn test_default() {
-        let snapshots = build_snapshots();
+    fn test_row_groups_v1() {
+        test_row_groups(build_snapshots_v1());
+    }
+
+    #[test]
+    fn test_row_groups_v2() {
+        test_row_groups(build_snapshots_v2());
+    }
+
+    fn test_default(snapshots: Vec<Snapshot>, is_v2: bool) {
         let tmpfile = write_parquet(snapshots, ParquetOptions::new());
         let builder = ParquetRecordBatchReaderBuilder::try_new(tmpfile).unwrap();
 
@@ -536,20 +611,32 @@ mod tests {
 
         // Check schema
         let fields: Vec<&String> = builder.schema().fields().iter().map(|x| x.name()).collect();
-        let expected = vec!["timestamp", "counter", "gauge", "histogram:buckets"];
+        let expected = vec![
+            "timestamp",
+            "duration",
+            "counter",
+            "gauge",
+            "histogram:buckets",
+        ];
         assert_eq!(fields.len(), expected.len());
         assert_eq!(fields, expected);
 
         // Check data
         let batch = builder.build().unwrap().next().unwrap().unwrap();
-        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.num_columns(), 5);
         assert_eq!(batch.num_rows(), 2);
 
-        validate_u64_array(batch.column(1).clone(), &[100, 121]);
-        validate_i64_array(batch.column(2).clone(), &[16, 6]);
+        if is_v2 {
+            validate_u64_array(batch.column(1).clone(), &[8192, 1024]);
+        } else {
+            validate_u64_null_array(batch.column(1).clone());
+        }
+
+        validate_u64_array(batch.column(2).clone(), &[100, 121]);
+        validate_i64_array(batch.column(3).clone(), &[16, 6]);
 
         let histograms = batch
-            .column(3)
+            .column(4)
             .as_any()
             .downcast_ref::<array::ListArray>()
             .unwrap();
@@ -558,8 +645,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse() {
-        let snapshots = build_snapshots();
+    fn test_default_v1() {
+        test_default(build_snapshots_v1(), false);
+    }
+
+    #[test]
+    fn test_default_v2() {
+        test_default(build_snapshots_v2(), true);
+    }
+
+    fn test_sparse(snapshots: Vec<Snapshot>, is_v2: bool) {
         let tmpfile = write_parquet(
             snapshots,
             ParquetOptions::new().histogram_type(ParquetHistogramType::Sparse),
@@ -574,6 +669,7 @@ mod tests {
         let fields: Vec<&String> = builder.schema().fields().iter().map(|x| x.name()).collect();
         let expected = vec![
             "timestamp",
+            "duration",
             "counter",
             "gauge",
             "histogram:bucket_indices",
@@ -584,14 +680,20 @@ mod tests {
 
         // Check data
         let batch = builder.build().unwrap().next().unwrap().unwrap();
-        assert_eq!(batch.num_columns(), 5);
+        assert_eq!(batch.num_columns(), 6);
         assert_eq!(batch.num_rows(), 2);
 
-        validate_u64_array(batch.column(1).clone(), &[100, 121]);
-        validate_i64_array(batch.column(2).clone(), &[16, 6]);
+        if is_v2 {
+            validate_u64_array(batch.column(1).clone(), &[8192, 1024]);
+        } else {
+            validate_u64_null_array(batch.column(1).clone());
+        }
+
+        validate_u64_array(batch.column(2).clone(), &[100, 121]);
+        validate_i64_array(batch.column(3).clone(), &[16, 6]);
 
         let indices = batch
-            .column(3)
+            .column(4)
             .as_any()
             .downcast_ref::<array::ListArray>()
             .unwrap();
@@ -599,11 +701,21 @@ mod tests {
         validate_u64_array(indices.value(1), &[1, 2, 4]);
 
         let counts = batch
-            .column(4)
+            .column(5)
             .as_any()
             .downcast_ref::<array::ListArray>()
             .unwrap();
         validate_u64_array(counts.value(0), &[1, 1]);
         validate_u64_array(counts.value(1), &[1, 1, 1]);
+    }
+
+    #[test]
+    fn test_sparse_v1() {
+        test_sparse(build_snapshots_v1(), false);
+    }
+
+    #[test]
+    fn test_sparse_v2() {
+        test_default(build_snapshots_v2(), true);
     }
 }
