@@ -448,6 +448,7 @@ mod tests {
 
     use crate::*;
 
+    #[allow(clippy::type_complexity)]
     fn build_metrics() -> (Vec<Vec<Counter>>, Vec<Vec<Gauge>>, Vec<Vec<Histogram>>) {
         let counters: Vec<Vec<Counter>> = vec![
             vec![Counter {
