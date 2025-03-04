@@ -211,7 +211,7 @@ impl ParquetSchema {
 
         fields.push(
             Field::new("duration", DataType::UInt64, true).with_metadata(HashMap::from([
-                ("metric_type".to_owned(), "timestamp".to_owned()),
+                ("metric_type".to_owned(), "duration".to_owned()),
                 ("unit".to_owned(), "nanoseconds".to_owned()),
             ])),
         );
