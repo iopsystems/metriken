@@ -126,42 +126,42 @@ pub(crate) fn canonicalize_metric_name(
 }
 
 impl Snapshot {
-    pub(crate) fn systemtime(&self) -> SystemTime {
+    pub fn systemtime(&self) -> SystemTime {
         match self {
             Snapshot::V1(s) => s.systemtime,
             Snapshot::V2(s) => s.systemtime,
         }
     }
 
-    pub(crate) fn duration(&self) -> Option<Duration> {
+    pub fn duration(&self) -> Option<Duration> {
         match self {
             Snapshot::V1(_) => None,
             Snapshot::V2(s) => Some(s.duration),
         }
     }
 
-    pub(crate) fn metadata(&mut self) -> HashMap<String, String> {
+    pub fn metadata(&mut self) -> HashMap<String, String> {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.metadata),
             Snapshot::V2(s) => std::mem::take(&mut s.metadata),
         }
     }
 
-    pub(crate) fn counters(&mut self) -> Vec<Counter> {
+    pub fn counters(&mut self) -> Vec<Counter> {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.counters),
             Snapshot::V2(s) => std::mem::take(&mut s.counters),
         }
     }
 
-    pub(crate) fn gauges(&mut self) -> Vec<Gauge> {
+    pub fn gauges(&mut self) -> Vec<Gauge> {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.gauges),
             Snapshot::V2(s) => std::mem::take(&mut s.gauges),
         }
     }
 
-    pub(crate) fn histograms(&mut self) -> Vec<Histogram> {
+    pub fn histograms(&mut self) -> Vec<Histogram> {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.histograms),
             Snapshot::V2(s) => std::mem::take(&mut s.histograms),
