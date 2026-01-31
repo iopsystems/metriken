@@ -94,48 +94,17 @@ impl QueryEngine {
 
     /// Get the time range (min, max) of all data in seconds
     pub fn get_time_range(&self) -> (f64, f64) {
-        let mut min_time = f64::INFINITY;
-        let mut max_time = f64::NEG_INFINITY;
-
-        // Try a few known metrics to get the time range
-        let known_metrics = [
-            "cpu_cores",
-            "memory_total",
-            "syscall",
-            "network_bytes",
-            "cpu_usage",
-        ];
-        for metric_name in &known_metrics {
-            if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
-                let sum_series = collection.filtered_sum(&Labels::default());
-                for (&timestamp_ns, _) in sum_series.inner.iter() {
-                    let timestamp_s = timestamp_ns as f64 / 1e9;
-                    min_time = min_time.min(timestamp_s);
-                    max_time = max_time.max(timestamp_s);
-                }
-            }
-
-            if let Some(collection) = self.tsdb.counters(metric_name, Labels::default()) {
-                let rate_collection = collection.filtered_rate(&Labels::default());
-                let sum_series = rate_collection.sum();
-                for (&timestamp_ns, _) in sum_series.inner.iter() {
-                    let timestamp_s = timestamp_ns as f64 / 1e9;
-                    min_time = min_time.min(timestamp_s);
-                    max_time = max_time.max(timestamp_s);
-                }
-            }
-        }
-
-        if min_time == f64::INFINITY {
-            // No data found, return a reasonable default
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
-            (now - 3600.0, now) // 1 hour ago to now
-        } else {
-            (min_time, max_time)
-        }
+        self.tsdb
+            .time_range()
+            .map(|(min_ns, max_ns)| (min_ns as f64 / 1e9, max_ns as f64 / 1e9))
+            .unwrap_or_else(|| {
+                // No data found, return a reasonable default
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                (now - 3600.0, now) // 1 hour ago to now
+            })
     }
 
     /// Execute a simple query - for now, just basic metric access and irate() function

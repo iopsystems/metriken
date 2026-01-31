@@ -19,6 +19,21 @@ impl HistogramCollection {
         self.inner.iter()
     }
 
+    /// Returns the time bounds (min, max) in nanoseconds across all series, or None if empty.
+    pub fn time_bounds(&self) -> Option<(u64, u64)> {
+        let mut min_time: Option<u64> = None;
+        let mut max_time: Option<u64> = None;
+
+        for series in self.inner.values() {
+            if let Some((series_min, series_max)) = series.time_bounds() {
+                min_time = Some(min_time.map_or(series_min, |m| m.min(series_min)));
+                max_time = Some(max_time.map_or(series_max, |m| m.max(series_max)));
+            }
+        }
+
+        min_time.zip(max_time)
+    }
+
     pub fn filter(&self, labels: &Labels) -> Self {
         let mut result = Self::default();
 

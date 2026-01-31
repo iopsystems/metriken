@@ -30,6 +30,13 @@ impl HistogramSeries {
         self.inner.insert(timestamp, value);
     }
 
+    /// Returns the time bounds (min, max) in nanoseconds, or None if empty.
+    pub fn time_bounds(&self) -> Option<(u64, u64)> {
+        let min = *self.inner.keys().next()?;
+        let max = *self.inner.keys().next_back()?;
+        Some((min, max))
+    }
+
     pub fn percentiles(&self, percentiles: &[f64]) -> Option<Vec<UntypedSeries>> {
         if self.is_empty() {
             return None;
