@@ -1,0 +1,30 @@
+[package]
+name = "metriken-query"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+]
+license = "MIT OR Apache-2.0"
+description = "PromQL query engine and TSDB for metriken parquet files"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
+
+[dependencies]
+arrow = "56.1.0"
+histogram = "0.11.0"
+parquet = "56.1.0"
+promql-parser = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+
+# Optional HTTP API dependencies
+axum = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+http = ["axum"]
