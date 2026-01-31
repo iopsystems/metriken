@@ -578,6 +578,78 @@ impl QueryEngine {
                         .to_string(),
                 ))
             }
+            "scalar" => {
+                // scalar() converts a single-element vector to a scalar.
+                // If the vector has 0 or more than 1 element, returns NaN.
+                if let Some(first_arg) = call.args.args.first() {
+                    let inner_result = self.evaluate_expr(first_arg, start, end, step)?;
+
+                    match inner_result {
+                        QueryResult::Vector { result: samples } => {
+                            if samples.len() == 1 {
+                                Ok(QueryResult::Scalar {
+                                    result: samples[0].value,
+                                })
+                            } else {
+                                // More than one element or empty - return NaN
+                                Ok(QueryResult::Scalar {
+                                    result: (start, f64::NAN),
+                                })
+                            }
+                        }
+                        QueryResult::Matrix { result: samples } => {
+                            // For matrix results, we need to return the scalar at each timestamp
+                            // If there's exactly one series, convert it
+                            if samples.len() == 1 && !samples[0].values.is_empty() {
+                                // Return the last value as a scalar
+                                let last_value = samples[0].values.last().unwrap();
+                                Ok(QueryResult::Scalar {
+                                    result: *last_value,
+                                })
+                            } else {
+                                Ok(QueryResult::Scalar {
+                                    result: (start, f64::NAN),
+                                })
+                            }
+                        }
+                        QueryResult::Scalar { result } => {
+                            // Already a scalar, return as-is
+                            Ok(QueryResult::Scalar { result })
+                        }
+                        QueryResult::HistogramHeatmap { .. } => Ok(QueryResult::Scalar {
+                            result: (start, f64::NAN),
+                        }),
+                    }
+                } else {
+                    Err(QueryError::ParseError(
+                        "scalar requires 1 argument".to_string(),
+                    ))
+                }
+            }
+            "vector" => {
+                // vector(s) converts a scalar s to a vector with a single element
+                if let Some(first_arg) = call.args.args.first() {
+                    let inner_result = self.evaluate_expr(first_arg, start, end, step)?;
+
+                    match inner_result {
+                        QueryResult::Scalar { result } => {
+                            let mut metric = HashMap::new();
+                            metric.insert("__name__".to_string(), "".to_string());
+                            Ok(QueryResult::Vector {
+                                result: vec![Sample {
+                                    metric,
+                                    value: result,
+                                }],
+                            })
+                        }
+                        other => Ok(other), // Already a vector/matrix, return as-is
+                    }
+                } else {
+                    Err(QueryError::ParseError(
+                        "vector requires 1 argument".to_string(),
+                    ))
+                }
+            }
             _ => Err(QueryError::Unsupported(format!(
                 "Function {} not yet supported",
                 call.func.name
