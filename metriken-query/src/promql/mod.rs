@@ -848,6 +848,10 @@ impl QueryEngine {
                     let right_sample = if left_labels.is_empty() && right_samples.len() == 1 {
                         // Special case: if left has no labels and right has only one series, use it
                         right_samples.first()
+                    } else if right_samples.len() == 1 {
+                        // If right has only one series, use it regardless of labels
+                        // (common case for single-metric operations)
+                        right_samples.first()
                     } else {
                         // Match by labels
                         let matched = right_by_labels.get(&left_labels).copied();
@@ -857,17 +861,23 @@ impl QueryEngine {
                     if let Some(right_sample) = right_sample {
                         let mut result_values = Vec::new();
 
-                        // Create a map of right values by timestamp
+                        // Create a map of right values by timestamp (rounded to milliseconds
+                        // to handle f64 precision loss when converting ns -> sec -> ns)
                         let right_map: HashMap<u64, f64> = right_sample
                             .values
                             .iter()
-                            .map(|(ts, val)| ((*ts * 1e9) as u64, *val))
+                            .map(|(ts, val)| {
+                                // Round to milliseconds to avoid precision issues
+                                let ts_ms = (*ts * 1e3).round() as u64;
+                                (ts_ms, *val)
+                            })
                             .collect();
 
                         for (left_ts, left_val) in &left_sample.values {
-                            let ts_ns = (*left_ts * 1e9) as u64;
+                            // Round to milliseconds to match
+                            let ts_ms = (*left_ts * 1e3).round() as u64;
 
-                            if let Some(&right_val) = right_map.get(&ts_ns) {
+                            if let Some(&right_val) = right_map.get(&ts_ms) {
                                 let op_str = op.to_string();
                                 let result_val = match op_str.as_str() {
                                     "+" => left_val + right_val,
@@ -1091,6 +1101,10 @@ impl QueryEngine {
                 Err(QueryError::Unsupported(
                     "Direct matrix selector not supported".to_string(),
                 ))
+            }
+            Expr::Paren(paren) => {
+                // Parenthesized expression - just evaluate the inner expression
+                self.evaluate_expr(&paren.expr, start, end, step)
             }
             _ => Err(QueryError::Unsupported(format!(
                 "Unsupported expression type: {:?}",
