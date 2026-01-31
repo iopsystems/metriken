@@ -5,5 +5,6 @@ members = [
     "metriken",
     "metriken-core",
     "metriken-derive",
-    "metriken-exposition"
+    "metriken-exposition",
+    "metriken-query"
 ]
