@@ -289,6 +289,35 @@ impl Tsdb {
         self.sampling_interval_ms as f64 / 1000.0
     }
 
+    /// Returns the time range (min, max) in nanoseconds across all data, or None if empty.
+    pub fn time_range(&self) -> Option<(u64, u64)> {
+        let mut min_time: Option<u64> = None;
+        let mut max_time: Option<u64> = None;
+
+        for collection in self.counters.values() {
+            if let Some((coll_min, coll_max)) = collection.time_bounds() {
+                min_time = Some(min_time.map_or(coll_min, |m| m.min(coll_min)));
+                max_time = Some(max_time.map_or(coll_max, |m| m.max(coll_max)));
+            }
+        }
+
+        for collection in self.gauges.values() {
+            if let Some((coll_min, coll_max)) = collection.time_bounds() {
+                min_time = Some(min_time.map_or(coll_min, |m| m.min(coll_min)));
+                max_time = Some(max_time.map_or(coll_max, |m| m.max(coll_max)));
+            }
+        }
+
+        for collection in self.histograms.values() {
+            if let Some((coll_min, coll_max)) = collection.time_bounds() {
+                min_time = Some(min_time.map_or(coll_min, |m| m.min(coll_min)));
+                max_time = Some(max_time.map_or(coll_max, |m| m.max(coll_max)));
+            }
+        }
+
+        min_time.zip(max_time)
+    }
+
     // data source
     pub fn source(&self) -> &str {
         &self.source
