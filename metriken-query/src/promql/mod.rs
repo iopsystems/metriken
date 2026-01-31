@@ -1092,6 +1092,10 @@ impl QueryEngine {
                     "Direct matrix selector not supported".to_string(),
                 ))
             }
+            Expr::Paren(paren) => {
+                // Parenthesized expression - just evaluate the inner expression
+                self.evaluate_expr(&paren.expr, start, end, step)
+            }
             _ => Err(QueryError::Unsupported(format!(
                 "Unsupported expression type: {:?}",
                 expr
