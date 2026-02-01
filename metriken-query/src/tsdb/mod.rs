@@ -61,10 +61,10 @@ impl Tsdb {
             .unwrap_or(1000);
         data.sampling_interval_ms = interval;
 
-        data.source = match metadata.get("source").map(|v| v.as_str()) {
-            Some("rezolus") => "Rezolus".to_string(),
-            _ => "unknown".to_string(),
-        };
+        data.source = metadata
+            .get("source")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
 
         data.version = match metadata.get("version").map(|v| v.as_str()) {
             Some(s) => s.to_string(),
