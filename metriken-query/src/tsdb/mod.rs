@@ -124,7 +124,13 @@ impl Tsdb {
                 let name = if let Some(n) = meta.get("metric").cloned() {
                     n
                 } else {
-                    field.name().to_string()
+                    let col_name = field.name();
+                    // Strip :buckets suffix from histogram column names
+                    // (e.g., "request_latency:buckets" -> "request_latency")
+                    col_name
+                        .strip_suffix(":buckets")
+                        .unwrap_or(col_name)
+                        .to_string()
                 };
 
                 let grouping_power: Option<Result<u8, ParseIntError>> =
