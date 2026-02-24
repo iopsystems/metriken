@@ -124,7 +124,7 @@ impl Tsdb {
                 let name = if let Some(n) = meta.get("metric").cloned() {
                     n
                 } else {
-                    continue;
+                    field.name().to_string()
                 };
 
                 let grouping_power: Option<Result<u8, ParseIntError>> =
