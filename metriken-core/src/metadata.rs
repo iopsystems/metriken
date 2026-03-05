@@ -64,7 +64,7 @@ impl Metadata {
     }
 
     /// Return an iterator over the entries of this `Metadata`.
-    pub fn iter(&self) -> MetadataIter {
+    pub fn iter(&self) -> MetadataIter<'_> {
         MetadataIter(match &self.0 {
             Impl::Static(map) => IterImpl::Static(map.entries()),
             Impl::Dynamic(map) => IterImpl::Dynamic(map.iter()),

@@ -1,6 +1,7 @@
+use std::sync::Arc;
+
 use crate::promql::{QueryEngine, QueryError};
 use crate::tsdb::Tsdb;
-use std::sync::Arc;
 
 fn create_test_tsdb() -> Tsdb {
     Tsdb::default()
@@ -125,8 +126,8 @@ fn test_metric_selector_parsing() {
     let tsdb = Arc::new(create_test_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // Test that parse_metric_selector works correctly (we can't call it directly due to visibility)
-    // but we can test it indirectly through query parsing
+    // Test that parse_metric_selector works correctly (we can't call it directly
+    // due to visibility) but we can test it indirectly through query parsing
 
     // This should not panic during parsing
     let _result = engine.query("metric_name{label1=\"value1\",label2=\"value2\"}", None);

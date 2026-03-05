@@ -94,7 +94,8 @@ pub(crate) fn canonicalize_metric_name(
         .collect();
 
     // Separate keys into key's with a specific desired ordering and keys to be
-    // ignored. We are indifferent to the ordering of keys in neither of these buckets.
+    // ignored. We are indifferent to the ordering of keys in neither of these
+    // buckets.
     let ordered = ["name", "op", "state", "direction"];
     let mut ignore: HashSet<&str> =
         ["metric", "unit", "grouping_power", "max_value_power", "id"].into();

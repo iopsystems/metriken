@@ -1,5 +1,6 @@
-use super::*;
 use std::collections::hash_map::Entry;
+
+use super::*;
 
 mod counter;
 mod gauge;

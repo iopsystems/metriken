@@ -51,7 +51,7 @@ where
         self.metric.as_any()
     }
 
-    fn value(&self) -> Option<crate::Value> {
+    fn value(&self) -> Option<crate::Value<'_>> {
         self.metric.value()
     }
 

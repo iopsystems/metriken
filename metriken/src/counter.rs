@@ -70,7 +70,7 @@ impl Metric for Counter {
         Some(self)
     }
 
-    fn value(&self) -> Option<Value> {
+    fn value(&self) -> Option<Value<'_>> {
         Some(Value::Counter(self.value()))
     }
 }

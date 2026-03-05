@@ -44,11 +44,11 @@ impl Metrics {
     }
 
     /// A list containing all metrics that were dynamically registered.
-    pub fn dynamic_metrics(&self) -> DynMetricsIter {
+    pub fn dynamic_metrics(&self) -> DynMetricsIter<'_> {
         DynMetricsIter(self.dyn_metrics.metrics().values())
     }
 
-    pub fn iter(&self) -> MetricsIter {
+    pub fn iter(&self) -> MetricsIter<'_> {
         self.into_iter()
     }
 }

@@ -171,7 +171,7 @@ impl<M: Metric> Metric for ProviderMetric<M> {
         self.metric.as_any()
     }
 
-    fn value(&self) -> Option<crate::Value> {
+    fn value(&self) -> Option<crate::Value<'_>> {
         self.metric.value()
     }
 
