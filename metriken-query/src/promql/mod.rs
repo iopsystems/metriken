@@ -494,6 +494,99 @@ impl QueryEngine {
                     ))
                 }
             }
+            "idelta" => {
+                // idelta takes a range vector and returns the difference between
+                // the last two samples. It operates on gauge metrics.
+                if let Some(first_arg) = call.args.args.first() {
+                    if let Expr::MatrixSelector(selector) = &**first_arg {
+                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
+                            QueryError::ParseError("Matrix selector missing name".to_string())
+                        })?;
+
+                        let mut filter_labels = Labels::default();
+                        for matcher in &selector.vs.matchers.matchers {
+                            if matcher.op.to_string() == "=" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), matcher.value.clone());
+                            }
+                        }
+
+                        let range_ns = selector.range.as_nanos() as u64;
+
+                        if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
+                            let start_ns = (start * 1e9) as u64;
+                            let end_ns = (end * 1e9) as u64;
+                            let step_ns = (step * 1e9) as u64;
+                            let mut result_samples = Vec::new();
+
+                            for (labels, series) in collection.iter() {
+                                if !filter_labels.inner.is_empty()
+                                    && !labels.matches(&filter_labels)
+                                {
+                                    continue;
+                                }
+
+                                let untyped = series.untyped();
+                                let mut idelta_values = Vec::new();
+                                let mut current = start_ns;
+
+                                while current <= end_ns {
+                                    let window_start = current.saturating_sub(range_ns);
+
+                                    // Get the last two samples in the window
+                                    let last_two: Vec<(u64, f64)> = untyped
+                                        .inner
+                                        .range(window_start..=current)
+                                        .rev()
+                                        .take(2)
+                                        .map(|(ts, val)| (*ts, *val))
+                                        .collect();
+
+                                    if last_two.len() == 2 {
+                                        // last_two[0] is the latest, last_two[1] is second-to-last
+                                        let delta = last_two[0].1 - last_two[1].1;
+                                        idelta_values.push((current as f64 / 1e9, delta));
+                                    }
+
+                                    current += step_ns;
+                                }
+
+                                if !idelta_values.is_empty() {
+                                    let mut metric_labels = HashMap::new();
+                                    metric_labels
+                                        .insert("__name__".to_string(), metric_name.to_string());
+                                    for (key, value) in labels.inner.iter() {
+                                        metric_labels.insert(key.clone(), value.clone());
+                                    }
+                                    result_samples.push(MatrixSample {
+                                        metric: metric_labels,
+                                        values: idelta_values,
+                                    });
+                                }
+                            }
+
+                            if result_samples.is_empty() {
+                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                            }
+
+                            Ok(QueryResult::Matrix {
+                                result: result_samples,
+                            })
+                        } else {
+                            Err(QueryError::MetricNotFound(metric_name.to_string()))
+                        }
+                    } else {
+                        Err(QueryError::ParseError(
+                            "idelta requires matrix selector argument".to_string(),
+                        ))
+                    }
+                } else {
+                    Err(QueryError::ParseError(
+                        "idelta requires an argument".to_string(),
+                    ))
+                }
+            }
             "histogram_quantile" => {
                 // histogram_quantile(quantile, histogram)
                 if call.args.args.len() >= 2 {
@@ -668,132 +761,103 @@ impl QueryEngine {
         let op_str = agg.op.to_string();
 
         match op_str.as_str() {
-            "sum" => {
-                // Evaluate the inner expression first
+            "sum" | "avg" | "min" | "max" | "count" => {
                 let inner = self.evaluate_expr(&agg.expr, start, end, step)?;
 
-                // Check if there's a grouping modifier
-                if let Some(modifier) = &agg.modifier {
-                    // Handle "sum by (labels)" grouping
-                    // The modifier is an enum that can be Include (for "by") or Exclude (for "without")
-                    match inner {
-                        QueryResult::Matrix { result: samples } => {
-                            // Group samples by the specified labels
-                            // Use BTreeMap as key since HashMap doesn't implement Hash
-                            let mut grouped: HashMap<BTreeMap<String, String>, Vec<&MatrixSample>> =
-                                HashMap::new();
+                match inner {
+                    QueryResult::Matrix { result: samples } => {
+                        if samples.is_empty() {
+                            return Ok(QueryResult::Matrix { result: vec![] });
+                        }
 
-                            for sample in &samples {
-                                let mut group_key = BTreeMap::new();
+                        // Group samples by labels (or all into one group if no modifier)
+                        let mut grouped: HashMap<BTreeMap<String, String>, Vec<&MatrixSample>> =
+                            HashMap::new();
 
-                                // Check what kind of modifier we have
+                        for sample in &samples {
+                            let group_key = if let Some(modifier) = &agg.modifier {
+                                let mut key = BTreeMap::new();
                                 match modifier {
                                     parser::LabelModifier::Include(labels) => {
-                                        // "sum by (labels)" - keep only specified labels
                                         for label_name in &labels.labels {
                                             if let Some(value) = sample.metric.get(label_name) {
-                                                group_key.insert(label_name.clone(), value.clone());
+                                                key.insert(label_name.clone(), value.clone());
                                             }
                                         }
                                     }
                                     parser::LabelModifier::Exclude(labels) => {
-                                        // "sum without (labels)" - keep all labels except specified
-                                        for (key, value) in &sample.metric {
-                                            if !labels.labels.contains(key) && key != "__name__" {
-                                                group_key.insert(key.clone(), value.clone());
+                                        for (k, v) in &sample.metric {
+                                            if !labels.labels.contains(k) && k != "__name__" {
+                                                key.insert(k.clone(), v.clone());
                                             }
                                         }
                                     }
                                 }
+                                key
+                            } else {
+                                BTreeMap::new()
+                            };
 
-                                grouped.entry(group_key).or_default().push(sample);
-                            }
-
-                            // Now aggregate each group
-                            let mut result_samples = Vec::new();
-
-                            for (group_labels, group_samples) in grouped {
-                                // Collect all timestamps and sum values
-                                let mut timestamp_map: BTreeMap<u64, f64> = BTreeMap::new();
-                                let mut sample_count_map: BTreeMap<u64, usize> = BTreeMap::new();
-
-                                for sample in group_samples {
-                                    for (ts, val) in &sample.values {
-                                        let ts_key = (*ts * 1e9) as u64;
-                                        *timestamp_map.entry(ts_key).or_insert(0.0) += val;
-                                        *sample_count_map.entry(ts_key).or_insert(0) += 1;
-                                    }
-                                }
-
-                                // Convert back to vector
-                                let result_values: Vec<(f64, f64)> = timestamp_map
-                                    .into_iter()
-                                    .map(|(ts_ns, val)| (ts_ns as f64 / 1e9, val))
-                                    .collect();
-
-                                if !result_values.is_empty() {
-                                    // Convert BTreeMap back to HashMap for the result
-                                    let mut metric_map = HashMap::new();
-                                    for (k, v) in group_labels {
-                                        metric_map.insert(k, v);
-                                    }
-
-                                    result_samples.push(MatrixSample {
-                                        metric: metric_map,
-                                        values: result_values,
-                                    });
-                                }
-                            }
-
-                            Ok(QueryResult::Matrix {
-                                result: result_samples,
-                            })
+                            grouped.entry(group_key).or_default().push(sample);
                         }
-                        _ => Ok(inner),
-                    }
-                } else {
-                    // Simple sum without grouping - aggregate all series
-                    match inner {
-                        QueryResult::Matrix { result: samples } => {
-                            // Sum all time series together
-                            if samples.is_empty() {
-                                return Ok(QueryResult::Matrix { result: vec![] });
-                            }
 
-                            // Collect all timestamps
-                            let mut timestamp_map: std::collections::BTreeMap<u64, f64> =
-                                std::collections::BTreeMap::new();
+                        // Reduce each group
+                        let mut result_samples = Vec::new();
 
-                            for sample in &samples {
+                        for (group_labels, group_samples) in grouped {
+                            let mut sum_map: BTreeMap<u64, f64> = BTreeMap::new();
+                            let mut count_map: BTreeMap<u64, usize> = BTreeMap::new();
+                            let mut min_map: BTreeMap<u64, f64> = BTreeMap::new();
+                            let mut max_map: BTreeMap<u64, f64> = BTreeMap::new();
+
+                            for sample in &group_samples {
                                 for (ts, val) in &sample.values {
                                     let ts_key = (*ts * 1e9) as u64;
-                                    *timestamp_map.entry(ts_key).or_insert(0.0) += val;
+                                    *sum_map.entry(ts_key).or_insert(0.0) += val;
+                                    *count_map.entry(ts_key).or_insert(0) += 1;
+                                    min_map
+                                        .entry(ts_key)
+                                        .and_modify(|v| *v = v.min(*val))
+                                        .or_insert(*val);
+                                    max_map
+                                        .entry(ts_key)
+                                        .and_modify(|v| *v = v.max(*val))
+                                        .or_insert(*val);
                                 }
                             }
 
-                            // Convert back to vector
-                            let result_values: Vec<(f64, f64)> = timestamp_map
-                                .into_iter()
-                                .map(|(ts_ns, val)| (ts_ns as f64 / 1e9, val))
+                            let result_values: Vec<(f64, f64)> = sum_map
+                                .keys()
+                                .map(|ts_key| {
+                                    let ts = *ts_key as f64 / 1e9;
+                                    let val = match op_str.as_str() {
+                                        "sum" => sum_map[ts_key],
+                                        "avg" => sum_map[ts_key] / count_map[ts_key] as f64,
+                                        "min" => min_map[ts_key],
+                                        "max" => max_map[ts_key],
+                                        "count" => count_map[ts_key] as f64,
+                                        _ => unreachable!(),
+                                    };
+                                    (ts, val)
+                                })
                                 .collect();
 
-                            Ok(QueryResult::Matrix {
-                                result: vec![MatrixSample {
-                                    metric: HashMap::new(),
+                            if !result_values.is_empty() {
+                                let metric_map: HashMap<String, String> =
+                                    group_labels.into_iter().collect();
+                                result_samples.push(MatrixSample {
+                                    metric: metric_map,
                                     values: result_values,
-                                }],
-                            })
+                                });
+                            }
                         }
-                        _ => Ok(inner),
+
+                        Ok(QueryResult::Matrix {
+                            result: result_samples,
+                        })
                     }
+                    _ => Ok(inner),
                 }
-            }
-            "avg" | "min" | "max" | "count" => {
-                // For other aggregations, fall back to legacy for now
-                Err(QueryError::Unsupported(format!(
-                    "Aggregation {} not yet fully implemented",
-                    op_str
-                )))
             }
             _ => Err(QueryError::Unsupported(format!(
                 "Unknown aggregation: {}",
