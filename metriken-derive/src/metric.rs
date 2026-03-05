@@ -160,7 +160,7 @@ pub(crate) fn metric(
         })
         .collect();
 
-    item.expr = Box::new(parse_quote! {{
+    *item.expr = parse_quote! {{
         #private::declare_metric_v1! {
             metric: #static_name,
             name: #name,
@@ -170,7 +170,7 @@ pub(crate) fn metric(
         };
 
         #static_expr
-    }});
+    }};
 
     Ok(quote! { #item })
 }

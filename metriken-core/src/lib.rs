@@ -61,7 +61,7 @@ pub trait Metric: Send + Sync + 'static {
     /// If your metric's value does not correspond to one of the variants of
     /// [`Value`] then return [`Value::Other`] and metric consumers can use
     /// [`as_any`](crate::Metric::as_any) to specifically handle your metric.
-    fn value(&self) -> Option<Value>;
+    fn value(&self) -> Option<Value<'_>>;
 
     /// Provides type based access to context.
     ///

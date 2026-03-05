@@ -93,7 +93,7 @@ impl Metric for Gauge {
         Some(self)
     }
 
-    fn value(&self) -> Option<Value> {
+    fn value(&self) -> Option<Value<'_>> {
         Some(Value::Gauge(self.value()))
     }
 }
