@@ -19,7 +19,8 @@ impl GaugeCollection {
         self.inner.iter()
     }
 
-    /// Returns the time bounds (min, max) in nanoseconds across all series, or None if empty.
+    /// Returns the time bounds (min, max) in nanoseconds across all series, or
+    /// None if empty.
     pub fn time_bounds(&self) -> Option<(u64, u64)> {
         let mut min_time: Option<u64> = None;
         let mut max_time: Option<u64> = None;
@@ -34,7 +35,8 @@ impl GaugeCollection {
         min_time.zip(max_time)
     }
 
-    /// Old filter method that clones - kept for compatibility but should be avoided
+    /// Old filter method that clones - kept for compatibility but should be
+    /// avoided
     pub fn filter(&self, labels: &Labels) -> Self {
         let mut result = Self::default();
 

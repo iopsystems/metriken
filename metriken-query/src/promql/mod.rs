@@ -1,7 +1,9 @@
-use promql_parser::parser::{self, token::TokenType, Expr};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+use promql_parser::parser::token::TokenType;
+use promql_parser::parser::{self, Expr};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::tsdb::{GaugeSeries, Labels, Tsdb, UntypedCollection};
@@ -50,7 +52,8 @@ pub struct MatrixSample {
 pub struct HistogramHeatmapResult {
     /// Timestamps in seconds
     pub timestamps: Vec<f64>,
-    /// Bucket boundaries (latency values in the histogram's unit, e.g., nanoseconds)
+    /// Bucket boundaries (latency values in the histogram's unit, e.g.,
+    /// nanoseconds)
     pub bucket_bounds: Vec<u64>,
     /// Heatmap data as [time_index, bucket_index, count]
     pub data: Vec<(usize, usize, f64)>,
@@ -107,7 +110,8 @@ impl QueryEngine {
             })
     }
 
-    /// Execute a simple query - for now, just basic metric access and irate() function
+    /// Execute a simple query - for now, just basic metric access and irate()
+    /// function
     pub fn query(&self, query_str: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
         // For now, handle very simple cases manually
         // TODO: Replace with proper PromQL parser once we fix the API issues
@@ -121,7 +125,8 @@ impl QueryEngine {
         }
     }
 
-    /// Handle simple irate() queries like irate(cpu_cycles[5m]) or irate(network_bytes{direction="transmit"}[5m])
+    /// Handle simple irate() queries like irate(cpu_cycles[5m]) or
+    /// irate(network_bytes{direction="transmit"}[5m])
     fn handle_simple_rate(
         &self,
         query: &str,
@@ -242,7 +247,8 @@ impl QueryEngine {
         )))
     }
 
-    /// Parse a metric selector like "metric_name{label1=\"value1\",label2=\"value2\"}"
+    /// Parse a metric selector like
+    /// "metric_name{label1=\"value1\",label2=\"value2\"}"
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
         if let Some(brace_pos) = selector.find('{') {
             let metric_name = selector[..brace_pos].trim().to_string();
@@ -370,12 +376,15 @@ impl QueryEngine {
                         // Return rate calculation for all series (not summed)
                         if let Some(collection) = self.tsdb.counters(metric_name, Labels::default())
                         {
-                            // If we have a filter, use filtered_rate; otherwise get rates for all series
-                            let rate_collection = if filter_labels.inner.is_empty() {
-                                collection.rate() // Get rates for all series
-                            } else {
-                                collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
-                            };
+                            // If we have a filter, use filtered_rate; otherwise get rates for all
+                            // series
+                            let rate_collection =
+                                if filter_labels.inner.is_empty() {
+                                    collection.rate() // Get rates for all
+                                                      // series
+                                } else {
+                                    collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
+                                };
 
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
@@ -433,7 +442,8 @@ impl QueryEngine {
                 }
             }
             "deriv" => {
-                // deriv expects a gauge range vector and calculates derivative using linear regression
+                // deriv expects a gauge range vector and calculates derivative using linear
+                // regression
                 if let Some(first_arg) = call.args.args.first() {
                     if let Expr::MatrixSelector(selector) = &**first_arg {
                         let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
@@ -1288,8 +1298,9 @@ impl QueryEngine {
         Ok(result_samples)
     }
 
-    /// Handle histogram_percentiles(percentiles_array, histogram_metric) queries
-    /// Example: histogram_percentiles([0.5, 0.9, 0.99, 0.999], tcp_packet_latency)
+    /// Handle histogram_percentiles(percentiles_array, histogram_metric)
+    /// queries Example: histogram_percentiles([0.5, 0.9, 0.99, 0.999],
+    /// tcp_packet_latency)
     fn handle_histogram_percentiles(
         &self,
         query_str: &str,

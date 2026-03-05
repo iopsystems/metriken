@@ -1,13 +1,13 @@
-use super::*;
-use axum::{
-    extract::{Query, State},
-    http::StatusCode,
-    response::Json,
-    routing::get,
-    Router,
-};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::Json;
+use axum::routing::get;
+use axum::Router;
+use serde::{Deserialize, Serialize};
+
+use super::*;
 
 #[derive(Debug, Deserialize)]
 pub struct QueryParams {

@@ -1,20 +1,17 @@
-use arrow::array::Int64Array;
-use arrow::array::ListArray;
-use arrow::array::UInt64Array;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::error::Error;
+use std::fs::File;
+use std::num::ParseIntError;
+use std::ops::*;
+use std::path::Path;
+
+use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
 use histogram::Histogram;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use serde::Serialize;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::error::Error;
-use std::fs::File;
-use std::num::ParseIntError;
-use std::ops::*;
-use std::path::Path;
 
 mod collection;
 mod heatmap;
@@ -295,7 +292,8 @@ impl Tsdb {
         self.sampling_interval_ms as f64 / 1000.0
     }
 
-    /// Returns the time range (min, max) in nanoseconds across all data, or None if empty.
+    /// Returns the time range (min, max) in nanoseconds across all data, or
+    /// None if empty.
     pub fn time_range(&self) -> Option<(u64, u64)> {
         let mut min_time: Option<u64> = None;
         let mut max_time: Option<u64> = None;
