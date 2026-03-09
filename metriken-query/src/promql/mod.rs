@@ -609,6 +609,13 @@ impl QueryEngine {
                         }
                     };
 
+                    if !(0.0..=1.0).contains(&quantile) {
+                        return Err(QueryError::ParseError(format!(
+                            "histogram_quantile quantile must be between 0.0 and 1.0, got {}",
+                            quantile
+                        )));
+                    }
+
                     // Second argument should be a vector selector (histogram metric)
                     let metric_name = match &*call.args.args[1] {
                         Expr::VectorSelector(selector) => {
@@ -1333,6 +1340,15 @@ impl QueryEngine {
             return Err(QueryError::ParseError(
                 "Percentiles array cannot be empty".to_string(),
             ));
+        }
+
+        for &p in &percentiles {
+            if !(0.0..=1.0).contains(&p) {
+                return Err(QueryError::ParseError(format!(
+                    "histogram_percentiles values must be between 0.0 and 1.0, got {}",
+                    p
+                )));
+            }
         }
 
         // Extract the metric selector (everything after the array and comma)
