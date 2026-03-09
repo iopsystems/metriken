@@ -378,13 +378,12 @@ impl QueryEngine {
                         {
                             // If we have a filter, use filtered_rate; otherwise get rates for all
                             // series
-                            let rate_collection =
-                                if filter_labels.inner.is_empty() {
-                                    collection.rate() // Get rates for all
-                                                      // series
-                                } else {
-                                    collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
-                                };
+                            let rate_collection = if filter_labels.inner.is_empty() {
+                                collection.rate() // Get rates for all
+                                                  // series
+                            } else {
+                                collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
+                            };
 
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
@@ -609,6 +608,13 @@ impl QueryEngine {
                             ))
                         }
                     };
+
+                    if !(0.0..=1.0).contains(&quantile) {
+                        return Err(QueryError::ParseError(format!(
+                            "histogram_quantile quantile must be between 0.0 and 1.0, got {}",
+                            quantile
+                        )));
+                    }
 
                     // Second argument should be a vector selector (histogram metric)
                     let metric_name = match &*call.args.args[1] {
@@ -1334,6 +1340,15 @@ impl QueryEngine {
             return Err(QueryError::ParseError(
                 "Percentiles array cannot be empty".to_string(),
             ));
+        }
+
+        for &p in &percentiles {
+            if !(0.0..=1.0).contains(&p) {
+                return Err(QueryError::ParseError(format!(
+                    "histogram_percentiles values must be between 0.0 and 1.0, got {}",
+                    p
+                )));
+            }
         }
 
         // Extract the metric selector (everything after the array and comma)
