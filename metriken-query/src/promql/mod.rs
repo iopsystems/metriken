@@ -378,13 +378,12 @@ impl QueryEngine {
                         {
                             // If we have a filter, use filtered_rate; otherwise get rates for all
                             // series
-                            let rate_collection =
-                                if filter_labels.inner.is_empty() {
-                                    collection.rate() // Get rates for all
-                                                      // series
-                                } else {
-                                    collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
-                                };
+                            let rate_collection = if filter_labels.inner.is_empty() {
+                                collection.rate() // Get rates for all
+                                                  // series
+                            } else {
+                                collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
+                            };
 
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
