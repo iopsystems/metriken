@@ -1,7 +1,7 @@
 use super::*;
 
 /// Represents a collection of gauge timeseries keyed on label sets.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct GaugeCollection {
     inner: HashMap<Labels, GaugeSeries>,
 }

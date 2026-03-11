@@ -1102,6 +1102,7 @@ dependencies = [
  "arrow",
  "axum",
  "histogram",
+ "metriken-exposition",
  "parquet",
  "promql-parser",
  "serde",

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use promql_parser::parser::token::TokenType;
@@ -81,12 +82,16 @@ pub enum QueryResult {
 }
 
 /// The PromQL query engine
-pub struct QueryEngine {
-    tsdb: Arc<Tsdb>,
+///
+/// Generic over the TSDB handle type. The default (`Arc<Tsdb>`) covers the
+/// common owned case (MCP, tests, file-backed viewer). Pass `&Tsdb` (or any
+/// other `Deref<Target = Tsdb>`) for zero-copy borrowed access.
+pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
+    tsdb: T,
 }
 
-impl QueryEngine {
-    pub fn new(tsdb: Arc<Tsdb>) -> Self {
+impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
+    pub fn new(tsdb: T) -> Self {
         Self { tsdb }
     }
 
@@ -1481,12 +1486,16 @@ impl QueryEngine {
 
                 let mut min_value = f64::MAX;
                 let mut max_value = f64::MIN;
+                let mut min_bucket_idx = usize::MAX;
+                let mut max_bucket_idx = 0usize;
 
                 for (time_idx, bucket_idx, count) in heatmap_data.data.iter() {
                     if let Some(&new_time_idx) = time_index_map.get(time_idx) {
                         filtered_data.push((new_time_idx, *bucket_idx, *count));
                         min_value = min_value.min(*count);
                         max_value = max_value.max(*count);
+                        min_bucket_idx = min_bucket_idx.min(*bucket_idx);
+                        max_bucket_idx = max_bucket_idx.max(*bucket_idx);
                     }
                 }
 
@@ -1497,11 +1506,26 @@ impl QueryEngine {
                     max_value = 0.0;
                 }
 
+                // Trim bucket_bounds and remap bucket indices to the active range
+                let (trimmed_bounds, trimmed_data) = if !filtered_data.is_empty()
+                    && max_bucket_idx < heatmap_data.bucket_bounds.len()
+                {
+                    let bounds =
+                        heatmap_data.bucket_bounds[min_bucket_idx..=max_bucket_idx].to_vec();
+                    let data = filtered_data
+                        .into_iter()
+                        .map(|(t, b, c)| (t, b - min_bucket_idx, c))
+                        .collect();
+                    (bounds, data)
+                } else {
+                    (heatmap_data.bucket_bounds, filtered_data)
+                };
+
                 return Ok(QueryResult::HistogramHeatmap {
                     result: HistogramHeatmapResult {
                         timestamps: filtered_timestamps,
-                        bucket_bounds: heatmap_data.bucket_bounds,
-                        data: filtered_data,
+                        bucket_bounds: trimmed_bounds,
+                        data: trimmed_data,
                         min_value,
                         max_value,
                     },

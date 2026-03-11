@@ -51,7 +51,13 @@ impl HistogramSeries {
         let mut result = vec![UntypedSeries::default(); percentiles.len()];
 
         for (time, curr) in self.inner.iter().skip(1) {
-            let delta = curr.wrapping_sub(prev).unwrap();
+            let delta = match curr.wrapping_sub(prev) {
+                Ok(d) => d,
+                Err(_) => {
+                    prev = curr;
+                    continue;
+                }
+            };
 
             if let Ok(Some(percentiles)) = delta.percentiles(&pct_100) {
                 for (id, (_, bucket)) in percentiles.iter().enumerate() {
@@ -83,7 +89,13 @@ impl HistogramSeries {
         let mut bucket_bounds_set = false;
 
         for (time, curr) in self.inner.iter().skip(1) {
-            let delta = curr.wrapping_sub(prev).unwrap();
+            let delta = match curr.wrapping_sub(prev) {
+                Ok(d) => d,
+                Err(_) => {
+                    prev = curr;
+                    continue;
+                }
+            };
             let time_index = result.timestamps.len();
 
             // Store timestamp in seconds
@@ -133,7 +145,10 @@ impl Add<&HistogramSeries> for HistogramSeries {
 
         for (time, histogram) in other.inner.iter() {
             if let Some(h) = result.inner.get_mut(time) {
-                *h = h.wrapping_add(histogram).expect("histogram mismatch");
+                if let Ok(sum) = h.wrapping_add(histogram) {
+                    *h = sum;
+                }
+                // Skip mismatched histograms rather than panicking
             } else {
                 result.inner.insert(*time, histogram.clone());
             }
