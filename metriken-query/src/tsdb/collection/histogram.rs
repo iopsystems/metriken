@@ -1,7 +1,7 @@
 use super::*;
 
 /// Represents a collection of histogram timeseries keyed on label sets.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HistogramCollection {
     inner: HashMap<Labels, HistogramSeries>,
 }

@@ -23,7 +23,7 @@ pub use heatmap::Heatmap;
 pub use labels::Labels;
 pub use series::*;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Tsdb {
     sampling_interval_ms: u64,
     source: String,
@@ -229,6 +229,79 @@ impl Tsdb {
         }
 
         Ok(data)
+    }
+
+    pub fn set_sampling_interval_ms(&mut self, ms: u64) {
+        self.sampling_interval_ms = ms;
+    }
+
+    pub fn set_source(&mut self, source: String) {
+        self.source = source;
+    }
+
+    pub fn set_version(&mut self, version: String) {
+        self.version = version;
+    }
+
+    pub fn set_filename(&mut self, filename: String) {
+        self.filename = filename;
+    }
+
+    /// Ingest a snapshot from a running agent, inserting all metrics into the
+    /// TSDB.
+    pub fn ingest(&mut self, mut snapshot: metriken_exposition::Snapshot) {
+        let ts = snapshot
+            .systemtime()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock is earlier than 1970")
+            .as_nanos() as u64;
+
+        for counter in snapshot.counters() {
+            let (name, labels) = Self::extract_name_labels(&counter.metadata);
+            self.counters
+                .entry(name)
+                .or_default()
+                .entry(labels)
+                .or_default()
+                .insert(ts, counter.value);
+        }
+
+        for gauge in snapshot.gauges() {
+            let (name, labels) = Self::extract_name_labels(&gauge.metadata);
+            self.gauges
+                .entry(name)
+                .or_default()
+                .entry(labels)
+                .or_default()
+                .insert(ts, gauge.value);
+        }
+
+        for histogram in snapshot.histograms() {
+            let (name, labels) = Self::extract_name_labels(&histogram.metadata);
+            self.histograms
+                .entry(name)
+                .or_default()
+                .entry(labels)
+                .or_default()
+                .insert(ts, histogram.value);
+        }
+    }
+
+    /// Extract the metric name and labels from snapshot metric metadata.
+    fn extract_name_labels(metadata: &HashMap<String, String>) -> (String, Labels) {
+        let name = metadata.get("metric").cloned().unwrap_or_default();
+
+        let mut labels = Labels::default();
+        for (k, v) in metadata {
+            match k.as_str() {
+                "metric" | "unit" | "grouping_power" | "max_value_power" => continue,
+                _ => {
+                    labels.inner.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        (name, labels)
     }
 
     pub fn counters(&self, name: &str, labels: impl Into<Labels>) -> Option<CounterCollection> {

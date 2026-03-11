@@ -1,6 +1,6 @@
 [package]
 name = "metriken-query"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -13,6 +13,7 @@ repository = "https://github.com/iopsystems/metriken"
 [dependencies]
 arrow = "56.1.0"
 histogram = "0.11.0"
+metriken-exposition = { path = "../metriken-exposition", default-features = false }
 parquet = "56.1.0"
 promql-parser = "0.4"
 serde = { version = "1.0", features = ["derive"] }

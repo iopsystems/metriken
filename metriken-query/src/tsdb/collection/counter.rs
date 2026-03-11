@@ -1,7 +1,7 @@
 use super::*;
 
 /// Represents a collection of counter timeseries keyed on label sets.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CounterCollection {
     inner: HashMap<Labels, CounterSeries>,
 }

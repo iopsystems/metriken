@@ -1097,11 +1097,12 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "axum",
  "histogram",
+ "metriken-exposition",
  "parquet",
  "promql-parser",
  "serde",
