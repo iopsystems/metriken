@@ -61,64 +61,45 @@ impl Snapshotter {
         let mut gauges: Vec<Gauge> = Vec::new();
         let mut histograms: Vec<Histogram> = Vec::new();
 
-        // iterate through the metrics and build-up the snapshot
-        // Use numeric IDs as column names to avoid collisions and PromQL
-        // parsing issues. The base metric name is stored in the "metric"
-        // metadata key for Tsdb indexing and PromQL querying.
+        // Iterate through metrics using numeric IDs as column names to avoid
+        // collisions between same-name metrics with different labels. The base
+        // metric name is stored in the "metric" metadata key for Tsdb/PromQL
+        // indexing.
         for (metric_id, metric) in metriken::metrics().iter().enumerate() {
             if !(self.filter)(metric) {
                 continue;
             }
             let column_name = format!("{metric_id}");
 
+            // Build metadata from user-defined labels + metric base name
+            let build_metadata = |metric: &MetricEntry| -> HashMap<String, String> {
+                let mut metadata = HashMap::from_iter(
+                    metric
+                        .metadata()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string())),
+                );
+                metadata.insert("metric".to_string(), metric.name().replace('/', "_"));
+                if let Some(description) = metric.description().map(|v| v.to_string()) {
+                    metadata.insert("description".to_string(), description);
+                }
+                metadata
+            };
+
             match metric.value() {
                 Some(Value::Counter(value)) => {
-                    let mut counter = Counter {
+                    counters.push(Counter {
                         name: column_name.clone(),
                         value,
-                        metadata: HashMap::from_iter(
-                            metric
-                                .metadata()
-                                .into_iter()
-                                .map(|(k, v)| (k.to_string(), v.to_string())),
-                        ),
-                    };
-
-                    counter
-                        .metadata
-                        .insert("metric".to_string(), metric.name().replace('/', "_"));
-
-                    if let Some(description) = metric.description().map(|v| v.to_string()) {
-                        counter
-                            .metadata
-                            .insert("description".to_string(), description);
-                    }
-
-                    counters.push(counter);
+                        metadata: build_metadata(metric),
+                    });
                 }
                 Some(Value::Gauge(value)) => {
-                    let mut gauge = Gauge {
+                    gauges.push(Gauge {
                         name: column_name.clone(),
                         value,
-                        metadata: HashMap::from_iter(
-                            metric
-                                .metadata()
-                                .into_iter()
-                                .map(|(k, v)| (k.to_string(), v.to_string())),
-                        ),
-                    };
-
-                    gauge
-                        .metadata
-                        .insert("metric".to_string(), metric.name().replace('/', "_"));
-
-                    if let Some(description) = metric.description().map(|v| v.to_string()) {
-                        gauge
-                            .metadata
-                            .insert("description".to_string(), description);
-                    }
-
-                    gauges.push(gauge);
+                        metadata: build_metadata(metric),
+                    });
                 }
                 Some(Value::Other(other)) => {
                     let histogram = if let Some(histogram) = other.downcast_ref::<AtomicHistogram>()
@@ -131,16 +112,7 @@ impl Snapshotter {
                     };
 
                     if let Some(histogram) = histogram {
-                        let mut metadata = HashMap::from_iter(
-                            metric
-                                .metadata()
-                                .into_iter()
-                                .map(|(k, v)| (k.to_string(), v.to_string())),
-                        );
-
-                        metadata.insert("metric".to_string(), metric.name().replace('/', "_"));
-
-                        // Store configuration parameters as metadata
+                        let mut metadata = build_metadata(metric);
                         metadata.insert(
                             "grouping_power".to_string(),
                             histogram.config().grouping_power().to_string(),
@@ -150,17 +122,11 @@ impl Snapshotter {
                             histogram.config().max_value_power().to_string(),
                         );
 
-                        if let Some(description) = metric.description().map(|v| v.to_string()) {
-                            metadata.insert("description".to_string(), description);
-                        }
-
-                        let histogram = Histogram {
+                        histograms.push(Histogram {
                             name: column_name.clone(),
                             value: histogram,
                             metadata,
-                        };
-
-                        histograms.push(histogram);
+                        });
                     }
                 }
                 _ => continue,
