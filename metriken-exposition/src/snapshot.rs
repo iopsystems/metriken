@@ -97,8 +97,16 @@ pub(crate) fn canonicalize_metric_name(
     // ignored. We are indifferent to the ordering of keys in neither of these
     // buckets.
     let ordered = ["name", "op", "state", "direction"];
-    let mut ignore: HashSet<&str> =
-        ["metric", "unit", "grouping_power", "max_value_power", "id"].into();
+    let mut ignore: HashSet<&str> = [
+        "metric",
+        "metric_type",
+        "unit",
+        "description",
+        "grouping_power",
+        "max_value_power",
+        "id",
+    ]
+    .into();
     ignore.extend(ordered);
 
     let mut unique_name = name.to_string();
@@ -106,7 +114,7 @@ pub(crate) fn canonicalize_metric_name(
     // Append name, op, state, and direction in specified order
     for k in ordered {
         if let Some(v) = metadata.get(&k) {
-            unique_name = unique_name + "/" + *v;
+            unique_name = unique_name + "_" + *v;
         }
     }
 
@@ -115,12 +123,12 @@ pub(crate) fn canonicalize_metric_name(
         if ignore.contains(*k) {
             continue;
         }
-        unique_name = unique_name + "/" + v;
+        unique_name = unique_name + "_" + v;
     }
 
     // Append "id", if it exists, to the very end
     if let Some(v) = metadata.get("id") {
-        unique_name = unique_name + "/" + v;
+        unique_name = unique_name + "_" + v;
     }
 
     unique_name
