@@ -62,15 +62,19 @@ impl Snapshotter {
         let mut histograms: Vec<Histogram> = Vec::new();
 
         // iterate through the metrics and build-up the snapshot
-        for metric in &metriken::metrics() {
+        // Use numeric IDs as column names to avoid collisions and PromQL
+        // parsing issues. The base metric name is stored in the "metric"
+        // metadata key for Tsdb indexing and PromQL querying.
+        for (metric_id, metric) in metriken::metrics().iter().enumerate() {
             if !(self.filter)(metric) {
                 continue;
             }
+            let column_name = format!("{metric_id}");
 
             match metric.value() {
                 Some(Value::Counter(value)) => {
                     let mut counter = Counter {
-                        name: metric.formatted(metriken::Format::Simple),
+                        name: column_name.clone(),
                         value,
                         metadata: HashMap::from_iter(
                             metric
@@ -79,6 +83,10 @@ impl Snapshotter {
                                 .map(|(k, v)| (k.to_string(), v.to_string())),
                         ),
                     };
+
+                    counter
+                        .metadata
+                        .insert("metric".to_string(), metric.name().replace('/', "_"));
 
                     if let Some(description) = metric.description().map(|v| v.to_string()) {
                         counter
@@ -90,7 +98,7 @@ impl Snapshotter {
                 }
                 Some(Value::Gauge(value)) => {
                     let mut gauge = Gauge {
-                        name: metric.formatted(metriken::Format::Simple),
+                        name: column_name.clone(),
                         value,
                         metadata: HashMap::from_iter(
                             metric
@@ -99,6 +107,10 @@ impl Snapshotter {
                                 .map(|(k, v)| (k.to_string(), v.to_string())),
                         ),
                     };
+
+                    gauge
+                        .metadata
+                        .insert("metric".to_string(), metric.name().replace('/', "_"));
 
                     if let Some(description) = metric.description().map(|v| v.to_string()) {
                         gauge
@@ -126,6 +138,8 @@ impl Snapshotter {
                                 .map(|(k, v)| (k.to_string(), v.to_string())),
                         );
 
+                        metadata.insert("metric".to_string(), metric.name().replace('/', "_"));
+
                         // Store configuration parameters as metadata
                         metadata.insert(
                             "grouping_power".to_string(),
@@ -141,7 +155,7 @@ impl Snapshotter {
                         }
 
                         let histogram = Histogram {
-                            name: metric.formatted(metriken::Format::Simple),
+                            name: column_name.clone(),
                             value: histogram,
                             metadata,
                         };
