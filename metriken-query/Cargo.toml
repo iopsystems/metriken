@@ -12,7 +12,7 @@ repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
 arrow = "56.1.0"
-histogram = { git = "https://github.com/iopsystems/histogram" }
+histogram = "1.0.0"
 metriken-exposition = { version = "0.14.0", path = "../metriken-exposition", default-features = false }
 parquet = "56.1.0"
 promql-parser = "0.4"

@@ -42,10 +42,6 @@ impl HistogramSeries {
             return None;
         }
 
-        // Convert from fractional (0.0–1.0) to percentage (0.0–100.0) scale
-        // expected by the histogram crate.
-        let pct_100: Vec<f64> = percentiles.iter().map(|p| p * 100.0).collect();
-
         let (_, mut prev) = self.inner.first_key_value().unwrap();
 
         let mut result = vec![UntypedSeries::default(); percentiles.len()];
@@ -59,8 +55,8 @@ impl HistogramSeries {
                 }
             };
 
-            if let Ok(Some(percentiles)) = delta.percentiles(&pct_100) {
-                for (id, (_, bucket)) in percentiles.iter().enumerate() {
+            if let Ok(Some(pct_results)) = delta.percentiles(percentiles) {
+                for (id, (_, bucket)) in pct_results.iter().enumerate() {
                     result[id].inner.insert(*time, bucket.end() as f64);
                 }
             }
