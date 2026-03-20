@@ -396,6 +396,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         // Extract label matchers from the selector
                         let mut filter_labels = Labels::default();
                         for matcher in &selector.vs.matchers.matchers {
+                            // Skip the implicit __name__ matcher added by the parser
+                            if matcher.name == "__name__" {
+                                continue;
+                            }
                             let op = matcher.op.to_string();
                             if op == "=" || op == "=~" {
                                 filter_labels
@@ -487,6 +491,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         // Extract label matchers
                         let mut filter_labels = Labels::default();
                         for matcher in &selector.vs.matchers.matchers {
+                            // Skip the implicit __name__ matcher added by the parser
+                            if matcher.name == "__name__" {
+                                continue;
+                            }
                             let op = matcher.op.to_string();
                             if op == "=" || op == "=~" {
                                 filter_labels
@@ -554,6 +562,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                         let mut filter_labels = Labels::default();
                         for matcher in &selector.vs.matchers.matchers {
+                            // Skip the implicit __name__ matcher added by the parser
+                            if matcher.name == "__name__" {
+                                continue;
+                            }
                             let op = matcher.op.to_string();
                             if op == "=" || op == "=~" {
                                 filter_labels
@@ -1140,6 +1152,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 // Extract label matchers from the selector
                 let mut filter_labels = Labels::default();
                 for matcher in &selector.matchers.matchers {
+                    // Skip the implicit __name__ matcher added by the parser
+                    if matcher.name == "__name__" {
+                        continue;
+                    }
                     let op = matcher.op.to_string();
                     if op == "=" || op == "=~" {
                         filter_labels
