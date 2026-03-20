@@ -261,11 +261,29 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
             let mut labels = Labels::default();
             for part in labels_part.split(',') {
-                let kv: Vec<&str> = part.split('=').collect();
-                if kv.len() == 2 {
-                    let key = kv[0].trim().to_string();
-                    let value = kv[1].trim().trim_matches('"').to_string();
-                    labels.inner.insert(key, value);
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+
+                // Parse operator: check for !=, !~, =~, then = (order matters)
+                let (key, value, negate) = if let Some(pos) = part.find("!=") {
+                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
+                } else if let Some(pos) = part.find("!~") {
+                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
+                } else if let Some(pos) = part.find("=~") {
+                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), false)
+                } else if let Some(pos) = part.find('=') {
+                    (&part[..pos], part[pos + 1..].trim().trim_matches('"'), false)
+                } else {
+                    continue;
+                };
+
+                let key = key.trim().to_string();
+                if negate {
+                    labels.inner.insert(key, format!("!{value}"));
+                } else {
+                    labels.inner.insert(key, value.to_string());
                 }
             }
             Ok((metric_name, labels))
@@ -370,11 +388,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         // Extract label matchers from the selector
                         let mut filter_labels = Labels::default();
                         for matcher in &selector.vs.matchers.matchers {
-                            // Only handle equality matchers for now
-                            if matcher.op.to_string() == "=" {
+                            let op = matcher.op.to_string();
+                            if op == "=" || op == "=~" {
                                 filter_labels
                                     .inner
                                     .insert(matcher.name.clone(), matcher.value.clone());
+                            } else if op == "!=" || op == "!~" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), format!("!{}", matcher.value));
                             }
                         }
 
@@ -457,10 +479,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         // Extract label matchers
                         let mut filter_labels = Labels::default();
                         for matcher in &selector.vs.matchers.matchers {
-                            if matcher.op.to_string() == "=" {
+                            let op = matcher.op.to_string();
+                            if op == "=" || op == "=~" {
                                 filter_labels
                                     .inner
                                     .insert(matcher.name.clone(), matcher.value.clone());
+                            } else if op == "!=" || op == "!~" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), format!("!{}", matcher.value));
                             }
                         }
 
@@ -519,10 +546,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                         let mut filter_labels = Labels::default();
                         for matcher in &selector.vs.matchers.matchers {
-                            if matcher.op.to_string() == "=" {
+                            let op = matcher.op.to_string();
+                            if op == "=" || op == "=~" {
                                 filter_labels
                                     .inner
                                     .insert(matcher.name.clone(), matcher.value.clone());
+                            } else if op == "!=" || op == "!~" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), format!("!{}", matcher.value));
                             }
                         }
 
@@ -1100,11 +1132,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 // Extract label matchers from the selector
                 let mut filter_labels = Labels::default();
                 for matcher in &selector.matchers.matchers {
-                    // Only handle equality matchers for now
-                    if matcher.op.to_string() == "=" {
+                    let op = matcher.op.to_string();
+                    if op == "=" || op == "=~" {
                         filter_labels
                             .inner
                             .insert(matcher.name.clone(), matcher.value.clone());
+                    } else if op == "!=" || op == "!~" {
+                        filter_labels
+                            .inner
+                            .insert(matcher.name.clone(), format!("!{}", matcher.value));
                     }
                 }
 
