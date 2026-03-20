@@ -272,9 +272,17 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 } else if let Some(pos) = part.find("!~") {
                     (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
                 } else if let Some(pos) = part.find("=~") {
-                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), false)
+                    (
+                        &part[..pos],
+                        part[pos + 2..].trim().trim_matches('"'),
+                        false,
+                    )
                 } else if let Some(pos) = part.find('=') {
-                    (&part[..pos], part[pos + 1..].trim().trim_matches('"'), false)
+                    (
+                        &part[..pos],
+                        part[pos + 1..].trim().trim_matches('"'),
+                        false,
+                    )
                 } else {
                     continue;
                 };
