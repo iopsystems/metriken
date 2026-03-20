@@ -715,9 +715,8 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "histogram"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099d45a031296a7a40e01137b56c0c552f2a545568ef6058e47d674046def0db"
+version = "1.0.0-alpha.0"
+source = "git+https://github.com/iopsystems/histogram#06625bf146bfb5476df08b6a98067ddf81f3a732"
 dependencies = [
  "serde",
  "thiserror",
@@ -1089,7 +1088,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "metriken"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "histogram",
  "metriken-core",
@@ -1120,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "arrow",
  "chrono",

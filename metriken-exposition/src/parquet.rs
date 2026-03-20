@@ -387,8 +387,9 @@ impl<W: Write + Send> ParquetWriter<W> {
                     }
                     ParquetHistogramType::Sparse => {
                         let sparse = histogram::SparseHistogram::from(&hist);
-                        columns.push(Self::listu64_entry_from_vec(sparse.index));
-                        columns.push(Self::listu64_entry_from_slice(sparse.count.as_slice()));
+                        let index: Vec<usize> = sparse.index().iter().map(|&i| i as usize).collect();
+                        columns.push(Self::listu64_entry_from_vec(index));
+                        columns.push(Self::listu64_entry_from_slice(sparse.count()));
                     }
                 };
             } else {
