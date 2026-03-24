@@ -1,10 +1,74 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use crate::promql::{QueryEngine, QueryError};
+use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::tsdb::Tsdb;
 
 fn create_test_tsdb() -> Tsdb {
     Tsdb::default()
+}
+
+/// Create a TSDB with cgroup_cpu_usage counter data for testing label filtering.
+/// Creates 3 cgroups with different counter values across 3 time steps.
+fn create_cgroup_tsdb() -> Tsdb {
+    use metriken_exposition::{Counter, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    let cgroups = [
+        ("/system.slice/foo.service", 100u64),
+        ("/system.slice/bar.service", 200u64),
+        ("/system.slice/baz.service", 300u64),
+    ];
+
+    for step in 0..3 {
+        let time = base_time + Duration::from_secs(step);
+        let mut counters = Vec::new();
+
+        for (name, base_val) in &cgroups {
+            let mut metadata = HashMap::new();
+            metadata.insert("name".to_string(), name.to_string());
+            metadata.insert("state".to_string(), "user".to_string());
+            metadata.insert("metric".to_string(), "cgroup_cpu_usage".to_string());
+            counters.push(Counter {
+                name: "cgroup_cpu_usage".to_string(),
+                value: base_val + step * 100,
+                metadata,
+            });
+        }
+
+        let snapshot = Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters,
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        });
+
+        tsdb.ingest(snapshot);
+    }
+
+    tsdb
+}
+
+fn count_matrix_series(result: &QueryResult) -> usize {
+    match result {
+        QueryResult::Matrix { result } => result.len(),
+        _ => 0,
+    }
+}
+
+fn get_matrix_series_names(result: &QueryResult) -> Vec<String> {
+    match result {
+        QueryResult::Matrix { result } => result
+            .iter()
+            .filter_map(|s| s.metric.get("name").cloned())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[test]
@@ -157,4 +221,146 @@ fn test_histogram_quantile_parsing() {
         Err(QueryError::MetricNotFound(_)) => {}
         _ => panic!("Expected MetricNotFound error for empty TSDB"),
     }
+}
+
+// -- Label filtering tests with actual data --
+
+#[test]
+fn test_exact_match_filters_correctly() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"irate(cgroup_cpu_usage{name="/system.slice/foo.service"}[5s])"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let names = get_matrix_series_names(&result);
+    assert_eq!(names.len(), 1, "exact match should return 1 series");
+    assert_eq!(names[0], "/system.slice/foo.service");
+}
+
+#[test]
+fn test_regex_match_filters_correctly() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"irate(cgroup_cpu_usage{name=~"/system.slice/foo.service"}[5s])"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let names = get_matrix_series_names(&result);
+    assert_eq!(names.len(), 1, "=~ match should return 1 series");
+    assert_eq!(names[0], "/system.slice/foo.service");
+}
+
+#[test]
+fn test_regex_alternation_filters_correctly() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"irate(cgroup_cpu_usage{name=~"(/system.slice/foo.service|/system.slice/bar.service)"}[5s])"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let names = get_matrix_series_names(&result);
+    assert_eq!(names.len(), 2, "=~ alternation should return 2 series");
+    assert!(names.contains(&"/system.slice/foo.service".to_string()));
+    assert!(names.contains(&"/system.slice/bar.service".to_string()));
+}
+
+#[test]
+fn test_negative_exact_match_excludes() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"irate(cgroup_cpu_usage{name!="/system.slice/foo.service"}[5s])"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let names = get_matrix_series_names(&result);
+    assert_eq!(names.len(), 2, "!= should exclude 1 of 3 series");
+    assert!(!names.contains(&"/system.slice/foo.service".to_string()));
+    assert!(names.contains(&"/system.slice/bar.service".to_string()));
+    assert!(names.contains(&"/system.slice/baz.service".to_string()));
+}
+
+#[test]
+fn test_negative_regex_excludes() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"irate(cgroup_cpu_usage{name!~"(/system.slice/foo.service|/system.slice/bar.service)"}[5s])"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let names = get_matrix_series_names(&result);
+    assert_eq!(names.len(), 1, "!~ should exclude 2 of 3 series");
+    assert_eq!(names[0], "/system.slice/baz.service");
+}
+
+#[test]
+fn test_sum_by_name_with_regex_match() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"sum by (name) (irate(cgroup_cpu_usage{name=~"(/system.slice/foo.service|/system.slice/bar.service)"}[5s]))"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let names = get_matrix_series_names(&result);
+    assert_eq!(names.len(), 2, "sum by (name) with =~ should return 2 series");
+    assert!(names.contains(&"/system.slice/foo.service".to_string()));
+    assert!(names.contains(&"/system.slice/bar.service".to_string()));
+}
+
+#[test]
+fn test_sum_with_negative_match_excludes() {
+    let tsdb = Arc::new(create_cgroup_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let total = engine
+        .query_range(r#"sum(irate(cgroup_cpu_usage[5s]))"#, 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let excluded = engine
+        .query_range(
+            r#"sum(irate(cgroup_cpu_usage{name!="/system.slice/foo.service"}[5s]))"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    assert_eq!(count_matrix_series(&total), 1);
+    assert_eq!(count_matrix_series(&excluded), 1);
 }
