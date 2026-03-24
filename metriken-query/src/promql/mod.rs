@@ -401,10 +401,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 continue;
                             }
                             let op = matcher.op.to_string();
-                            if op == "=" || op == "=~" {
+                            if op == "=" {
                                 filter_labels
                                     .inner
                                     .insert(matcher.name.clone(), matcher.value.clone());
+                            } else if op == "=~" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), format!("~{}", matcher.value));
                             } else if op == "!=" || op == "!~" {
                                 filter_labels
                                     .inner
@@ -496,10 +500,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 continue;
                             }
                             let op = matcher.op.to_string();
-                            if op == "=" || op == "=~" {
+                            if op == "=" {
                                 filter_labels
                                     .inner
                                     .insert(matcher.name.clone(), matcher.value.clone());
+                            } else if op == "=~" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), format!("~{}", matcher.value));
                             } else if op == "!=" || op == "!~" {
                                 filter_labels
                                     .inner
@@ -567,10 +575,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 continue;
                             }
                             let op = matcher.op.to_string();
-                            if op == "=" || op == "=~" {
+                            if op == "=" {
                                 filter_labels
                                     .inner
                                     .insert(matcher.name.clone(), matcher.value.clone());
+                            } else if op == "=~" {
+                                filter_labels
+                                    .inner
+                                    .insert(matcher.name.clone(), format!("~{}", matcher.value));
                             } else if op == "!=" || op == "!~" {
                                 filter_labels
                                     .inner
@@ -1157,10 +1169,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         continue;
                     }
                     let op = matcher.op.to_string();
-                    if op == "=" || op == "=~" {
+                    if op == "=" {
                         filter_labels
                             .inner
                             .insert(matcher.name.clone(), matcher.value.clone());
+                    } else if op == "=~" {
+                        // Prefix with ~ so Labels::matches knows this is a regex pattern
+                        filter_labels
+                            .inner
+                            .insert(matcher.name.clone(), format!("~{}", matcher.value));
                     } else if op == "!=" || op == "!~" {
                         filter_labels
                             .inner

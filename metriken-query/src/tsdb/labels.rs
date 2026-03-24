@@ -5,92 +5,53 @@ pub struct Labels {
     pub inner: BTreeMap<String, String>,
 }
 
+/// Check if a value matches a pattern.
+/// Supports: alternation with `|`, optional parens `(a|b)`, escaped dots `\.`.
+fn match_pattern(value: &str, pattern: &str) -> bool {
+    if pattern.contains('|') {
+        let inner = if pattern.starts_with('(') && pattern.ends_with(')') {
+            &pattern[1..pattern.len() - 1]
+        } else {
+            pattern
+        };
+        inner.split('|').any(|option| {
+            if option.contains("\\.") {
+                value == option.replace("\\.", ".")
+            } else {
+                value == option
+            }
+        })
+    } else if pattern.contains("\\.") {
+        value == pattern.replace("\\.", ".")
+    } else {
+        value == pattern
+    }
+}
+
 impl Labels {
     pub fn matches(&self, other: &Labels) -> bool {
         for (label, value) in other.inner.iter() {
             // Check if it's a negative match pattern
             if let Some(pattern) = value.strip_prefix('!') {
-                // Remove the '!' prefix
-
-                // For negative patterns, check if label exists and DOESN'T match
+                // Negative match (from != or !~ operator)
                 if let Some(v) = self.inner.get(label) {
-                    // Check if the value matches the negative pattern
-                    if pattern.contains('|') {
-                        // Simple alternation pattern - check if v matches any of the options
-                        let inner_pattern = if pattern.starts_with('(') && pattern.ends_with(')') {
-                            &pattern[1..pattern.len() - 1]
-                        } else {
-                            pattern
-                        };
-
-                        // Split on | and check if v matches any option
-                        let matches_any = inner_pattern.split('|').any(|option| {
-                            // Handle escaped dots in the pattern
-                            if option.contains("\\.") {
-                                // Replace \. with . for literal matching
-                                let unescaped = option.replace("\\.", ".");
-                                v == &unescaped
-                            } else {
-                                v == option
-                            }
-                        });
-                        if matches_any {
-                            // If it matches the negative pattern, exclude this series
-                            return false;
-                        }
-                    } else {
-                        // Simple negative match - might have escaped dots
-                        let matches = if pattern.contains("\\.") {
-                            // Replace \. with . for literal matching
-                            let unescaped = pattern.replace("\\.", ".");
-                            v == &unescaped
-                        } else {
-                            v == pattern
-                        };
-                        if matches {
-                            return false;
-                        }
+                    if match_pattern(v, pattern) {
+                        return false;
                     }
                 }
                 // If label doesn't exist, it passes the negative filter
+            } else if let Some(pattern) = value.strip_prefix('~') {
+                // Regex positive match (from =~ operator, marked with ~ prefix)
+                let Some(v) = self.inner.get(label) else {
+                    return false;
+                };
+                if !match_pattern(v, pattern) {
+                    return false;
+                }
             } else if let Some(v) = self.inner.get(label) {
-                // Regular positive match
-                // Check if the value looks like a simple regex alternation pattern
-                // Format: (option1|option2|option3) or option1|option2|option3
-                if value.contains('|') {
-                    // Simple alternation pattern - check if v matches any of the options
-                    let pattern = if value.starts_with('(') && value.ends_with(')') {
-                        &value[1..value.len() - 1]
-                    } else {
-                        value
-                    };
-
-                    // Split on | and check if v matches any option
-                    let matches_any = pattern.split('|').any(|option| {
-                        // Handle escaped dots in the pattern
-                        if option.contains("\\.") {
-                            // Replace \. with . for literal matching
-                            let unescaped = option.replace("\\.", ".");
-                            v == &unescaped
-                        } else {
-                            v == option
-                        }
-                    });
-                    if !matches_any {
-                        return false;
-                    }
-                } else {
-                    // Single value match - might have escaped dots
-                    let matches = if value.contains("\\.") {
-                        // Replace \. with . for literal matching
-                        let unescaped = value.replace("\\.", ".");
-                        v == &unescaped
-                    } else {
-                        v == value
-                    };
-                    if !matches {
-                        return false;
-                    }
+                // Exact positive match (from = operator)
+                if !match_pattern(v, value) {
+                    return false;
                 }
             } else {
                 // Label doesn't exist but was required (positive match)
