@@ -338,7 +338,11 @@ fn test_sum_by_name_with_regex_match() {
         .unwrap();
 
     let names = get_matrix_series_names(&result);
-    assert_eq!(names.len(), 2, "sum by (name) with =~ should return 2 series");
+    assert_eq!(
+        names.len(),
+        2,
+        "sum by (name) with =~ should return 2 series"
+    );
     assert!(names.contains(&"/system.slice/foo.service".to_string()));
     assert!(names.contains(&"/system.slice/bar.service".to_string()));
 }
