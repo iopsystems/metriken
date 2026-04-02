@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
-use std::fs::File;
 use std::num::ParseIntError;
 use std::ops::*;
 use std::path::Path;
 
 use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
+use bytes::Bytes;
 use histogram::Histogram;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::FileReader;
@@ -29,6 +29,7 @@ pub struct Tsdb {
     source: String,
     version: String,
     filename: String,
+    file_metadata: HashMap<String, String>,
     counters: HashMap<String, CounterCollection>,
     gauges: HashMap<String, GaugeCollection>,
     histograms: HashMap<String, HistogramCollection>,
@@ -36,10 +37,21 @@ pub struct Tsdb {
 
 impl Tsdb {
     pub fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
+        let raw = std::fs::read(path)?;
+        let filename = path
+            .file_name()
+            .map(|v| v.to_str().unwrap_or("unknown"))
+            .unwrap_or("unknown")
+            .to_string();
+        let mut data = Self::load_from_bytes(Bytes::from(raw))?;
+        data.filename = filename;
+        Ok(data)
+    }
+
+    pub fn load_from_bytes(bytes: Bytes) -> Result<Self, Box<dyn Error>> {
         let mut data = Tsdb::default();
 
-        let file = File::open(path)?;
-        let reader = SerializedFileReader::new(file).unwrap();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
         let parquet_metadata = reader.metadata();
         let key_value_metadata = parquet_metadata
             .file_metadata()
@@ -68,14 +80,9 @@ impl Tsdb {
             _ => "unknown".to_string(),
         };
 
-        data.filename = path
-            .file_name()
-            .map(|v| v.to_str().unwrap_or("unknown"))
-            .unwrap_or("unknown")
-            .to_string();
+        data.file_metadata = metadata;
 
-        let file = File::open(path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
         let reader = builder.build()?;
 
         for batch in reader.into_iter().flatten() {
@@ -249,6 +256,7 @@ impl Tsdb {
 
     /// Ingest a snapshot from a running agent, inserting all metrics into the
     /// TSDB.
+    #[cfg(feature = "ingest")]
     pub fn ingest(&mut self, mut snapshot: metriken_exposition::Snapshot) {
         let ts = snapshot
             .systemtime()
@@ -288,6 +296,7 @@ impl Tsdb {
     }
 
     /// Extract the metric name and labels from snapshot metric metadata.
+    #[cfg(feature = "ingest")]
     fn extract_name_labels(metadata: &HashMap<String, String>) -> (String, Labels) {
         let name = metadata.get("metric").cloned().unwrap_or_default();
 
@@ -407,6 +416,10 @@ impl Tsdb {
 
     pub fn filename(&self) -> &str {
         &self.filename
+    }
+
+    pub fn file_metadata(&self) -> &HashMap<String, String> {
+        &self.file_metadata
     }
 
     // Get all counter metric names
