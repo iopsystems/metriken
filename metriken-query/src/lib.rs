@@ -25,5 +25,6 @@
 pub mod promql;
 pub mod tsdb;
 
+pub use bytes::Bytes;
 pub use promql::{QueryEngine, QueryError, QueryResult};
 pub use tsdb::Tsdb;
