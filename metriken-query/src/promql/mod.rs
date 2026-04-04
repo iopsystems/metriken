@@ -706,6 +706,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         let summed_series = collection.sum();
 
                         // Calculate the percentile
+                        #[allow(deprecated)]
                         if let Some(percentile_series) = summed_series.percentiles(&[quantile]) {
                             if let Some(series) = percentile_series.first() {
                                 let start_ns = (start * 1e9) as u64;
@@ -1453,6 +1454,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             let summed_series = collection.sum();
 
             // Calculate all percentiles
+            #[allow(deprecated)]
             if let Some(percentile_series_vec) = summed_series.percentiles(&percentiles) {
                 let start_ns = (start * 1e9) as u64;
                 let end_ns = (end * 1e9) as u64;

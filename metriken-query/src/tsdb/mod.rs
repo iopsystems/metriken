@@ -355,7 +355,8 @@ impl Tsdb {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, deprecated)]
+    #[deprecated(since = "0.8.0", note = "Use quantiles() instead")]
     pub fn percentiles(
         &self,
         metric: &str,

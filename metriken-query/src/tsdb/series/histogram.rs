@@ -39,6 +39,8 @@ impl HistogramSeries {
         Some((min, max))
     }
 
+    #[deprecated(since = "0.8.0", note = "Use quantiles() instead")]
+    #[allow(deprecated)]
     pub fn percentiles(&self, percentiles: &[f64]) -> Option<Vec<UntypedSeries>> {
         if self.is_empty() {
             return None;
