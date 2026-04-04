@@ -1,3 +1,5 @@
+use ::histogram::{Quantile, SampleQuantiles};
+
 use super::*;
 
 /// Represents a series of histogram readings.
@@ -58,6 +60,48 @@ impl HistogramSeries {
             if let Ok(Some(pct_results)) = delta.percentiles(percentiles) {
                 for (id, (_, bucket)) in pct_results.iter().enumerate() {
                     result[id].inner.insert(*time, bucket.end() as f64);
+                }
+            }
+
+            prev = curr;
+        }
+
+        Some(result)
+    }
+
+    /// Compute quantile time series using the [`SampleQuantiles`] trait.
+    ///
+    /// Returns a `BTreeMap` keyed by [`Quantile`] value, where each entry
+    /// is an [`UntypedSeries`] containing (timestamp, bucket_end) pairs.
+    /// This provides richer metadata than [`percentiles()`](Self::percentiles)
+    /// and allows keyed lookup by quantile value.
+    pub fn quantiles(&self, quantiles: &[f64]) -> Option<BTreeMap<Quantile, UntypedSeries>> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let (_, mut prev) = self.inner.first_key_value().unwrap();
+
+        let mut result: BTreeMap<Quantile, UntypedSeries> = quantiles
+            .iter()
+            .filter_map(|&q| Quantile::try_from(q).ok())
+            .map(|q| (q, UntypedSeries::default()))
+            .collect();
+
+        for (time, curr) in self.inner.iter().skip(1) {
+            let delta = match curr.wrapping_sub(prev) {
+                Ok(d) => d,
+                Err(_) => {
+                    prev = curr;
+                    continue;
+                }
+            };
+
+            if let Ok(Some(qr)) = delta.quantiles(quantiles) {
+                for (quantile, bucket) in qr.entries() {
+                    if let Some(series) = result.get_mut(quantile) {
+                        series.inner.insert(*time, bucket.end() as f64);
+                    }
                 }
             }
 

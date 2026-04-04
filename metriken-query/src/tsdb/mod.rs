@@ -369,6 +369,20 @@ impl Tsdb {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn quantiles(
+        &self,
+        metric: &str,
+        labels: impl Into<Labels>,
+        quantiles: &[f64],
+    ) -> Option<BTreeMap<histogram::Quantile, UntypedSeries>> {
+        if let Some(collection) = self.histograms(metric, labels) {
+            collection.sum().quantiles(quantiles)
+        } else {
+            None
+        }
+    }
+
     // sampling interval in seconds
     pub fn interval(&self) -> f64 {
         self.sampling_interval_ms as f64 / 1000.0
