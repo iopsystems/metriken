@@ -1618,8 +1618,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     if !values.is_empty() {
                         let mut metric_labels = HashMap::new();
                         metric_labels.insert("__name__".to_string(), metric_name.to_string());
-                        metric_labels
-                            .insert("quantile".to_string(), quantiles[idx].to_string());
+                        metric_labels.insert("quantile".to_string(), quantiles[idx].to_string());
 
                         result_samples.push(MatrixSample {
                             metric: metric_labels,
@@ -1731,10 +1730,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         time_index_map.insert(old_idx, new_idx);
                         filtered_timestamps.push(*ts);
                         filtered_total_counts.push(heatmap_data.total_counts[old_idx]);
-                        filtered_min_upperbounds
-                            .push(heatmap_data.min_bucket_upperbounds[old_idx]);
-                        filtered_max_upperbounds
-                            .push(heatmap_data.max_bucket_upperbounds[old_idx]);
+                        filtered_min_upperbounds.push(heatmap_data.min_bucket_upperbounds[old_idx]);
+                        filtered_max_upperbounds.push(heatmap_data.max_bucket_upperbounds[old_idx]);
                     }
                 }
 
