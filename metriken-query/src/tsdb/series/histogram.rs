@@ -21,6 +21,12 @@ pub struct HistogramHeatmapData {
     pub min_value: f64,
     /// Maximum count value (for color scaling)
     pub max_value: f64,
+    /// Total observation count per timestamp (for percentage display)
+    pub total_counts: Vec<f64>,
+    /// Min non-zero bucket upper bound per timestamp
+    pub min_bucket_upperbounds: Vec<f64>,
+    /// Max non-zero bucket upper bound per timestamp
+    pub max_bucket_upperbounds: Vec<f64>,
 }
 
 impl HistogramSeries {
@@ -135,6 +141,10 @@ impl HistogramSeries {
             result.timestamps.push(*time as f64 / 1_000_000_000.0);
 
             // Iterate over buckets and collect counts
+            let mut ts_total_count: u64 = 0;
+            let mut ts_min_bucket_end: Option<u64> = None;
+            let mut ts_max_bucket_end: Option<u64> = None;
+
             for (bucket_index, bucket) in delta.iter().enumerate() {
                 let count = bucket.count();
 
@@ -144,6 +154,12 @@ impl HistogramSeries {
                     result.data.push((time_index, bucket_index, count_f64));
                     min_value = min_value.min(count_f64);
                     max_value = max_value.max(count_f64);
+
+                    ts_total_count += count;
+                    if ts_min_bucket_end.is_none() {
+                        ts_min_bucket_end = Some(bucket.end());
+                    }
+                    ts_max_bucket_end = Some(bucket.end());
                 }
 
                 // Collect bucket boundaries once
@@ -151,6 +167,14 @@ impl HistogramSeries {
                     result.bucket_bounds.push(bucket.end());
                 }
             }
+
+            result.total_counts.push(ts_total_count as f64);
+            result
+                .min_bucket_upperbounds
+                .push(ts_min_bucket_end.unwrap_or(0) as f64);
+            result
+                .max_bucket_upperbounds
+                .push(ts_max_bucket_end.unwrap_or(0) as f64);
 
             bucket_bounds_set = true;
             prev = curr;

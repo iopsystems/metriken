@@ -46,6 +46,15 @@ pub struct Sample {
 pub struct MatrixSample {
     pub metric: HashMap<String, String>,
     pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
+    /// Per-timestamp total observation count (present only for histogram_quantiles results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_counts: Option<Vec<(f64, f64)>>,
+    /// Per-timestamp min bucket upper bound (present only for histogram_quantiles results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bucket_upperbounds: Option<Vec<(f64, f64)>>,
+    /// Per-timestamp max bucket upper bound (present only for histogram_quantiles results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bucket_upperbounds: Option<Vec<(f64, f64)>>,
 }
 
 /// Histogram heatmap data for visualization
@@ -62,6 +71,15 @@ pub struct HistogramHeatmapResult {
     pub min_value: f64,
     /// Maximum count value (for color scaling)
     pub max_value: f64,
+    /// Total observation count per timestamp index (for percentage display)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_counts: Option<Vec<f64>>,
+    /// Min non-zero bucket upper bound per timestamp index
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bucket_upperbounds: Option<Vec<f64>>,
+    /// Max non-zero bucket upper bound per timestamp index
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bucket_upperbounds: Option<Vec<f64>>,
 }
 
 /// Result of a PromQL query
@@ -455,6 +473,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                     result_samples.push(MatrixSample {
                                         metric: metric_labels,
                                         values,
+                                        total_counts: None,
+                                        min_bucket_upperbounds: None,
+                                        max_bucket_upperbounds: None,
                                     });
                                 }
                             }
@@ -640,6 +661,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                     result_samples.push(MatrixSample {
                                         metric: metric_labels,
                                         values: idelta_values,
+                                        total_counts: None,
+                                        min_bucket_upperbounds: None,
+                                        max_bucket_upperbounds: None,
                                     });
                                 }
                             }
@@ -729,6 +753,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                         result: vec![MatrixSample {
                                             metric: metric_labels,
                                             values,
+                                            total_counts: None,
+                                            min_bucket_upperbounds: None,
+                                            max_bucket_upperbounds: None,
                                         }],
                                     });
                                 }
@@ -934,6 +961,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 result_samples.push(MatrixSample {
                                     metric: metric_map,
                                     values: result_values,
+                                    total_counts: None,
+                                    min_bucket_upperbounds: None,
+                                    max_bucket_upperbounds: None,
                                 });
                             }
                         }
@@ -1055,6 +1085,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             result_samples.push(MatrixSample {
                                 metric: left_sample.metric.clone(),
                                 values: result_values,
+                                total_counts: None,
+                                min_bucket_upperbounds: None,
+                                max_bucket_upperbounds: None,
                             });
                         }
                     }
@@ -1229,6 +1262,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             result_samples.push(MatrixSample {
                                 metric: metric_labels,
                                 values,
+                                total_counts: None,
+                                min_bucket_upperbounds: None,
+                                max_bucket_upperbounds: None,
                             });
                         }
                     }
@@ -1328,6 +1364,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 result_samples.push(MatrixSample {
                     metric: metric_labels,
                     values: deriv_values,
+                    total_counts: None,
+                    min_bucket_upperbounds: None,
+                    max_bucket_upperbounds: None,
                 });
             }
         }
@@ -1380,6 +1419,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 result_samples.push(MatrixSample {
                     metric: metric_labels,
                     values: deriv_values,
+                    total_counts: None,
+                    min_bucket_upperbounds: None,
+                    max_bucket_upperbounds: None,
                 });
             }
         }
@@ -1477,6 +1519,138 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         result_samples.push(MatrixSample {
                             metric: metric_labels,
                             values,
+                            total_counts: None,
+                            min_bucket_upperbounds: None,
+                            max_bucket_upperbounds: None,
+                        });
+                    }
+                }
+
+                if !result_samples.is_empty() {
+                    return Ok(QueryResult::Matrix {
+                        result: result_samples,
+                    });
+                }
+            }
+
+            Err(QueryError::MetricNotFound(format!(
+                "No histogram data found for {}",
+                metric_name
+            )))
+        } else {
+            Err(QueryError::MetricNotFound(metric_name.to_string()))
+        }
+    }
+
+    /// Handle histogram_quantiles(quantiles_array, histogram_metric) queries.
+    ///
+    /// Like `histogram_percentiles` but uses the new `QuantilesResult` API and
+    /// enriches each `MatrixSample` with `total_counts`, `min_bucket_upperbounds`,
+    /// and `max_bucket_upperbounds`.
+    ///
+    /// Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999], scheduler_runqueue_latency)`
+    fn handle_histogram_quantiles(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+    ) -> Result<QueryResult, QueryError> {
+        let inner = &query_str["histogram_quantiles(".len()..query_str.len() - 1];
+
+        // Find the array portion [...]
+        let array_start = inner.find('[').ok_or_else(|| {
+            QueryError::ParseError(
+                "histogram_quantiles first argument must be an array of quantiles".to_string(),
+            )
+        })?;
+        let array_end = inner.find(']').ok_or_else(|| {
+            QueryError::ParseError("Missing closing bracket in quantiles array".to_string())
+        })?;
+
+        // Parse the quantiles array
+        let array_str = &inner[array_start + 1..array_end];
+        let quantiles: Vec<f64> = array_str
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                QueryError::ParseError(format!("Failed to parse quantile value: {}", e))
+            })?;
+
+        if quantiles.is_empty() {
+            return Err(QueryError::ParseError(
+                "Quantiles array cannot be empty".to_string(),
+            ));
+        }
+
+        for &q in &quantiles {
+            if !(0.0..=1.0).contains(&q) {
+                return Err(QueryError::ParseError(format!(
+                    "histogram_quantiles values must be between 0.0 and 1.0, got {}",
+                    q
+                )));
+            }
+        }
+
+        // Extract the metric selector (everything after the array and comma)
+        let after_array = &inner[array_end + 1..].trim();
+        let metric_selector = after_array
+            .strip_prefix(',')
+            .map(|s| s.trim())
+            .ok_or_else(|| {
+                QueryError::ParseError(
+                    "histogram_quantiles requires a metric name as second argument".to_string(),
+                )
+            })?;
+
+        // Parse the metric selector to extract name and labels
+        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        // Get the histogram data with label filtering
+        if let Some(collection) = self.tsdb.histograms(&metric_name, labels) {
+            let summed_series = collection.sum();
+
+            // Use the new quantiles() API which returns BTreeMap<u64, QuantilesResult>
+            if let Some(quantile_map) = summed_series.quantiles(&quantiles) {
+                let start_ns = (start * 1e9) as u64;
+                let end_ns = (end * 1e9) as u64;
+
+                // Build Quantile keys for lookup
+                let quantile_keys: Vec<histogram::Quantile> = quantiles
+                    .iter()
+                    .filter_map(|&q| histogram::Quantile::new(q).ok())
+                    .collect();
+
+                let mut result_samples = Vec::new();
+
+                for (idx, q_key) in quantile_keys.iter().enumerate() {
+                    let mut values = Vec::new();
+                    let mut total_counts = Vec::new();
+                    let mut min_upperbounds = Vec::new();
+                    let mut max_upperbounds = Vec::new();
+
+                    for (ts, qr) in quantile_map.range(start_ns..=end_ns) {
+                        let ts_sec = *ts as f64 / 1e9;
+                        if let Some(bucket) = qr.get(q_key) {
+                            values.push((ts_sec, bucket.end() as f64));
+                            total_counts.push((ts_sec, qr.total_count() as f64));
+                            min_upperbounds.push((ts_sec, qr.min().end() as f64));
+                            max_upperbounds.push((ts_sec, qr.max().end() as f64));
+                        }
+                    }
+
+                    if !values.is_empty() {
+                        let mut metric_labels = HashMap::new();
+                        metric_labels.insert("__name__".to_string(), metric_name.to_string());
+                        metric_labels
+                            .insert("quantile".to_string(), quantiles[idx].to_string());
+
+                        result_samples.push(MatrixSample {
+                            metric: metric_labels,
+                            values,
+                            total_counts: Some(total_counts),
+                            min_bucket_upperbounds: Some(min_upperbounds),
+                            max_bucket_upperbounds: Some(max_upperbounds),
                         });
                     }
                 }
@@ -1552,6 +1726,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                 // Filter data to the requested time range
                 let mut filtered_timestamps = Vec::new();
+                let mut filtered_total_counts = Vec::new();
+                let mut filtered_min_upperbounds = Vec::new();
+                let mut filtered_max_upperbounds = Vec::new();
                 let mut filtered_data = Vec::new();
                 let mut time_index_map = std::collections::HashMap::new();
 
@@ -1560,6 +1737,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         let new_idx = filtered_timestamps.len();
                         time_index_map.insert(old_idx, new_idx);
                         filtered_timestamps.push(*ts);
+                        filtered_total_counts.push(heatmap_data.total_counts[old_idx]);
+                        filtered_min_upperbounds
+                            .push(heatmap_data.min_bucket_upperbounds[old_idx]);
+                        filtered_max_upperbounds
+                            .push(heatmap_data.max_bucket_upperbounds[old_idx]);
                     }
                 }
 
@@ -1607,6 +1789,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         data: trimmed_data,
                         min_value,
                         max_value,
+                        total_counts: Some(filtered_total_counts),
+                        min_bucket_upperbounds: Some(filtered_min_upperbounds),
+                        max_bucket_upperbounds: Some(filtered_max_upperbounds),
                     },
                 });
             }
@@ -1627,8 +1812,12 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        // Handle histogram_percentiles specially since it uses array literal syntax
-        // that may not be parsed correctly by the standard PromQL parser
+        // Handle histogram_quantiles (preferred) and histogram_percentiles (deprecated)
+        // specially since they use array literal syntax that may not be parsed
+        // correctly by the standard PromQL parser
+        if query_str.starts_with("histogram_quantiles(") && query_str.ends_with(")") {
+            return self.handle_histogram_quantiles(query_str, start, end);
+        }
         if query_str.starts_with("histogram_percentiles(") && query_str.ends_with(")") {
             return self.handle_histogram_percentiles(query_str, start, end);
         }
