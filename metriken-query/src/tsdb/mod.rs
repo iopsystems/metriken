@@ -376,7 +376,7 @@ impl Tsdb {
         metric: &str,
         labels: impl Into<Labels>,
         quantiles: &[f64],
-    ) -> Option<BTreeMap<histogram::Quantile, UntypedSeries>> {
+    ) -> Option<BTreeMap<u64, histogram::QuantilesResult>> {
         if let Some(collection) = self.histograms(metric, labels) {
             collection.sum().quantiles(quantiles)
         } else {
