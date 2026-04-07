@@ -5,14 +5,14 @@ edition = "2021"
 authors = ["Brian Martin <brian@iop.systems>", "Sean Lynch <sean@iop.systems>"]
 license = "Apache-2.0"
 description = "A fast and lightweight metrics library"
-homepage = "https://github.com/pelikan-io/rustcommon"
-repository = "https://github.com/pelikan-io/rustcommon"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
 metriken-core   = { version = "0.1",    path = "../metriken-core" }
 metriken-derive = { version = "=0.5.1", path = "../metriken-derive" }
 
-histogram = "1.0.0"
+histogram = "1.1.0"
 once_cell = "1.14.0"
 parking_lot = "0.12.1"
 

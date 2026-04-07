@@ -8,8 +8,8 @@ authors = [
 ]
 license = "Apache-2.0"
 description = "A fast and lightweight metrics library"
-homepage = "https://github.com/pelikan-io/rustcommon"
-repository = "https://github.com/pelikan-io/rustcommon"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
 
 # Metrics are linked in metriken by using a linkme array.
 #
