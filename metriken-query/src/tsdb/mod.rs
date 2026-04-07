@@ -355,7 +355,8 @@ impl Tsdb {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, deprecated)]
+    #[deprecated(since = "0.8.0", note = "Use quantiles() instead")]
     pub fn percentiles(
         &self,
         metric: &str,
@@ -364,6 +365,20 @@ impl Tsdb {
     ) -> Option<Vec<UntypedSeries>> {
         if let Some(collection) = self.histograms(metric, labels) {
             collection.sum().percentiles(percentiles)
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn quantiles(
+        &self,
+        metric: &str,
+        labels: impl Into<Labels>,
+        quantiles: &[f64],
+    ) -> Option<BTreeMap<u64, histogram::QuantilesResult>> {
+        if let Some(collection) = self.histograms(metric, labels) {
+            collection.sum().quantiles(quantiles)
         } else {
             None
         }

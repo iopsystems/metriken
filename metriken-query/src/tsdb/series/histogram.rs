@@ -1,3 +1,5 @@
+use ::histogram::{QuantilesResult, SampleQuantiles};
+
 use super::*;
 
 /// Represents a series of histogram readings.
@@ -37,6 +39,8 @@ impl HistogramSeries {
         Some((min, max))
     }
 
+    #[deprecated(since = "0.8.0", note = "Use quantiles() instead")]
+    #[allow(deprecated)]
     pub fn percentiles(&self, percentiles: &[f64]) -> Option<Vec<UntypedSeries>> {
         if self.is_empty() {
             return None;
@@ -59,6 +63,39 @@ impl HistogramSeries {
                 for (id, (_, bucket)) in pct_results.iter().enumerate() {
                     result[id].inner.insert(*time, bucket.end() as f64);
                 }
+            }
+
+            prev = curr;
+        }
+
+        Some(result)
+    }
+
+    /// Compute quantile time series using the [`SampleQuantiles`] trait.
+    ///
+    /// Returns a `BTreeMap` keyed by timestamp, where each entry is a
+    /// [`QuantilesResult`] containing the full quantile query result
+    /// (quantile-to-bucket mappings, total count, min/max buckets) for
+    /// the delta histogram at that point in time.
+    pub fn quantiles(&self, quantiles: &[f64]) -> Option<BTreeMap<u64, QuantilesResult>> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let (_, mut prev) = self.inner.first_key_value().unwrap();
+        let mut result = BTreeMap::new();
+
+        for (time, curr) in self.inner.iter().skip(1) {
+            let delta = match curr.wrapping_sub(prev) {
+                Ok(d) => d,
+                Err(_) => {
+                    prev = curr;
+                    continue;
+                }
+            };
+
+            if let Ok(Some(qr)) = delta.quantiles(quantiles) {
+                result.insert(*time, qr);
             }
 
             prev = curr;
