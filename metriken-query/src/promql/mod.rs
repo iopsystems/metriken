@@ -46,15 +46,6 @@ pub struct Sample {
 pub struct MatrixSample {
     pub metric: HashMap<String, String>,
     pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
-    /// Per-timestamp total observation count (present only for histogram_quantiles results).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_counts: Option<Vec<(f64, f64)>>,
-    /// Per-timestamp min bucket upper bound (present only for histogram_quantiles results).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_bucket_upperbounds: Option<Vec<(f64, f64)>>,
-    /// Per-timestamp max bucket upper bound (present only for histogram_quantiles results).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_bucket_upperbounds: Option<Vec<(f64, f64)>>,
 }
 
 /// Histogram heatmap data for visualization
@@ -473,9 +464,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                     result_samples.push(MatrixSample {
                                         metric: metric_labels,
                                         values,
-                                        total_counts: None,
-                                        min_bucket_upperbounds: None,
-                                        max_bucket_upperbounds: None,
                                     });
                                 }
                             }
@@ -661,9 +649,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                     result_samples.push(MatrixSample {
                                         metric: metric_labels,
                                         values: idelta_values,
-                                        total_counts: None,
-                                        min_bucket_upperbounds: None,
-                                        max_bucket_upperbounds: None,
                                     });
                                 }
                             }
@@ -753,9 +738,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                         result: vec![MatrixSample {
                                             metric: metric_labels,
                                             values,
-                                            total_counts: None,
-                                            min_bucket_upperbounds: None,
-                                            max_bucket_upperbounds: None,
                                         }],
                                     });
                                 }
@@ -961,9 +943,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 result_samples.push(MatrixSample {
                                     metric: metric_map,
                                     values: result_values,
-                                    total_counts: None,
-                                    min_bucket_upperbounds: None,
-                                    max_bucket_upperbounds: None,
                                 });
                             }
                         }
@@ -1085,9 +1064,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             result_samples.push(MatrixSample {
                                 metric: left_sample.metric.clone(),
                                 values: result_values,
-                                total_counts: None,
-                                min_bucket_upperbounds: None,
-                                max_bucket_upperbounds: None,
                             });
                         }
                     }
@@ -1262,9 +1238,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             result_samples.push(MatrixSample {
                                 metric: metric_labels,
                                 values,
-                                total_counts: None,
-                                min_bucket_upperbounds: None,
-                                max_bucket_upperbounds: None,
                             });
                         }
                     }
@@ -1364,9 +1337,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 result_samples.push(MatrixSample {
                     metric: metric_labels,
                     values: deriv_values,
-                    total_counts: None,
-                    min_bucket_upperbounds: None,
-                    max_bucket_upperbounds: None,
                 });
             }
         }
@@ -1419,9 +1389,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 result_samples.push(MatrixSample {
                     metric: metric_labels,
                     values: deriv_values,
-                    total_counts: None,
-                    min_bucket_upperbounds: None,
-                    max_bucket_upperbounds: None,
                 });
             }
         }
@@ -1525,9 +1492,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         result_samples.push(MatrixSample {
                             metric: metric_labels,
                             values,
-                            total_counts: None,
-                            min_bucket_upperbounds: None,
-                            max_bucket_upperbounds: None,
                         });
                     }
                 }
@@ -1629,21 +1593,27 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                 let mut result_samples = Vec::new();
 
-                for (idx, q_key) in quantile_keys.iter().enumerate() {
-                    let mut values = Vec::new();
-                    let mut total_counts = Vec::new();
-                    let mut min_upperbounds = Vec::new();
-                    let mut max_upperbounds = Vec::new();
+                // Collect per-timestamp metadata (shared across all quantiles)
+                let mut total_count_values = Vec::new();
+                let mut min_upperbound_values = Vec::new();
+                let mut max_upperbound_values = Vec::new();
 
-                    for (ts, qr) in quantile_map.range(start_ns..=end_ns) {
-                        let ts_sec = *ts as f64 / 1e9;
-                        if let Some(bucket) = qr.get(q_key) {
-                            values.push((ts_sec, bucket.end() as f64));
-                            total_counts.push((ts_sec, qr.total_count() as f64));
-                            min_upperbounds.push((ts_sec, qr.min().end() as f64));
-                            max_upperbounds.push((ts_sec, qr.max().end() as f64));
-                        }
-                    }
+                for (ts, qr) in quantile_map.range(start_ns..=end_ns) {
+                    let ts_sec = *ts as f64 / 1e9;
+                    total_count_values.push((ts_sec, qr.total_count() as f64));
+                    min_upperbound_values.push((ts_sec, qr.min().end() as f64));
+                    max_upperbound_values.push((ts_sec, qr.max().end() as f64));
+                }
+
+                // Emit one series per requested quantile
+                for (idx, q_key) in quantile_keys.iter().enumerate() {
+                    let values: Vec<(f64, f64)> = quantile_map
+                        .range(start_ns..=end_ns)
+                        .filter_map(|(ts, qr)| {
+                            qr.get(q_key)
+                                .map(|bucket| (*ts as f64 / 1e9, bucket.end() as f64))
+                        })
+                        .collect();
 
                     if !values.is_empty() {
                         let mut metric_labels = HashMap::new();
@@ -1654,9 +1624,26 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         result_samples.push(MatrixSample {
                             metric: metric_labels,
                             values,
-                            total_counts: Some(total_counts),
-                            min_bucket_upperbounds: Some(min_upperbounds),
-                            max_bucket_upperbounds: Some(max_upperbounds),
+                        });
+                    }
+                }
+
+                // Emit metadata as independent time series for statistical analysis
+                let meta_series = [
+                    ("total_count", &total_count_values),
+                    ("min_bucket_upperbound", &min_upperbound_values),
+                    ("max_bucket_upperbound", &max_upperbound_values),
+                ];
+
+                for (stat_name, values) in &meta_series {
+                    if !values.is_empty() {
+                        let mut metric_labels = HashMap::new();
+                        metric_labels.insert("__name__".to_string(), metric_name.to_string());
+                        metric_labels.insert("stat".to_string(), stat_name.to_string());
+
+                        result_samples.push(MatrixSample {
+                            metric: metric_labels,
+                            values: values.to_vec(),
                         });
                     }
                 }
