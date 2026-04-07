@@ -1512,13 +1512,16 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle histogram_quantiles(quantiles_array, histogram_metric) queries.
+    /// Handle histogram_quantiles(quantiles_array, histogram_metric[, filtered]) queries.
     ///
-    /// Like `histogram_percentiles` but uses the new `QuantilesResult` API and
-    /// enriches each `MatrixSample` with `total_counts`, `min_bucket_upperbounds`,
-    /// and `max_bucket_upperbounds`.
+    /// Uses the `QuantilesResult` API to compute quantile time series.
+    ///
+    /// When the optional `filtered` flag is present, data points are suppressed
+    /// for quantiles whose `total_count` is too low for the quantile to be
+    /// meaningfully distinct from a lower one.
     ///
     /// Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999], scheduler_runqueue_latency)`
+    /// Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999], metric, filtered)`
     fn handle_histogram_quantiles(
         &self,
         query_str: &str,
@@ -1564,7 +1567,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
         // Extract the metric selector (everything after the array and comma)
         let after_array = &inner[array_end + 1..].trim();
-        let metric_selector = after_array
+        let after_comma = after_array
             .strip_prefix(',')
             .map(|s| s.trim())
             .ok_or_else(|| {
@@ -1572,6 +1575,16 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     "histogram_quantiles requires a metric name as second argument".to_string(),
                 )
             })?;
+
+        // Check for optional trailing ", filtered" flag
+        let (metric_selector, filtered) =
+            if let Some(pos) = after_comma.rfind(", filtered") {
+                (&after_comma[..pos], true)
+            } else if let Some(pos) = after_comma.rfind(",filtered") {
+                (&after_comma[..pos], true)
+            } else {
+                (after_comma, false)
+            };
 
         // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
@@ -1593,23 +1606,35 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                 let mut result_samples = Vec::new();
 
-                // Collect per-timestamp metadata (shared across all quantiles)
-                let mut total_count_values = Vec::new();
-                let mut min_upperbound_values = Vec::new();
-                let mut max_upperbound_values = Vec::new();
-
-                for (ts, qr) in quantile_map.range(start_ns..=end_ns) {
-                    let ts_sec = *ts as f64 / 1e9;
-                    total_count_values.push((ts_sec, qr.total_count() as f64));
-                    min_upperbound_values.push((ts_sec, qr.min().end() as f64));
-                    max_upperbound_values.push((ts_sec, qr.max().end() as f64));
-                }
+                // When filtered, compute minimum sample thresholds per quantile.
+                // Quantile q[i] is non-unique when total_count < ceil(1/(1-q[i-1])).
+                // The lowest quantile always needs >= 2 samples.
+                let thresholds: Vec<u64> = if filtered {
+                    quantiles
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            if i == 0 {
+                                2
+                            } else {
+                                (1.0 / (1.0 - quantiles[i - 1])).ceil() as u64
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 // Emit one series per requested quantile
                 for (idx, q_key) in quantile_keys.iter().enumerate() {
                     let values: Vec<(f64, f64)> = quantile_map
                         .range(start_ns..=end_ns)
                         .filter_map(|(ts, qr)| {
+                            // When filtered, suppress data points where sample
+                            // count is too low for this quantile to be unique.
+                            if filtered && (qr.total_count() as u64) < thresholds[idx] {
+                                return None;
+                            }
                             qr.get(q_key)
                                 .map(|bucket| (*ts as f64 / 1e9, bucket.end() as f64))
                         })
@@ -1623,26 +1648,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         result_samples.push(MatrixSample {
                             metric: metric_labels,
                             values,
-                        });
-                    }
-                }
-
-                // Emit metadata as independent time series for statistical analysis
-                let meta_series = [
-                    ("total_count", &total_count_values),
-                    ("min_bucket_upperbound", &min_upperbound_values),
-                    ("max_bucket_upperbound", &max_upperbound_values),
-                ];
-
-                for (stat_name, values) in &meta_series {
-                    if !values.is_empty() {
-                        let mut metric_labels = HashMap::new();
-                        metric_labels.insert("__name__".to_string(), metric_name.to_string());
-                        metric_labels.insert("stat".to_string(), stat_name.to_string());
-
-                        result_samples.push(MatrixSample {
-                            metric: metric_labels,
-                            values: values.to_vec(),
                         });
                     }
                 }
