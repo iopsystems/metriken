@@ -1432,6 +1432,12 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     /// Handle histogram_percentiles(percentiles_array, histogram_metric)
     /// queries Example: histogram_percentiles([0.5, 0.9, 0.99, 0.999],
     /// tcp_packet_latency)
+    ///
+    /// Deprecated: use `histogram_quantiles()` instead, which returns enriched
+    /// metadata (total_counts, min/max bucket upper bounds) via the
+    /// `QuantilesResult` API.
+    #[deprecated(note = "Use handle_histogram_quantiles instead")]
+    #[allow(deprecated)]
     fn handle_histogram_percentiles(
         &self,
         query_str: &str,
@@ -1819,6 +1825,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_quantiles(query_str, start, end);
         }
         if query_str.starts_with("histogram_percentiles(") && query_str.ends_with(")") {
+            #[allow(deprecated)]
             return self.handle_histogram_percentiles(query_str, start, end);
         }
 
