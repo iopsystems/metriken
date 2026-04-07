@@ -1512,16 +1512,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle histogram_quantiles(quantiles_array, histogram_metric[, filtered]) queries.
+    /// Handle histogram_quantiles(quantiles_array, histogram_metric) queries.
     ///
     /// Uses the `QuantilesResult` API to compute quantile time series.
     ///
-    /// When the optional `filtered` flag is present, data points are suppressed
-    /// for quantiles whose `total_count` is too low for the quantile to be
-    /// meaningfully distinct from a lower one.
-    ///
     /// Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999], scheduler_runqueue_latency)`
-    /// Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999], metric, filtered)`
     fn handle_histogram_quantiles(
         &self,
         query_str: &str,
@@ -1567,7 +1562,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
         // Extract the metric selector (everything after the array and comma)
         let after_array = &inner[array_end + 1..].trim();
-        let after_comma = after_array
+        let metric_selector = after_array
             .strip_prefix(',')
             .map(|s| s.trim())
             .ok_or_else(|| {
@@ -1575,16 +1570,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     "histogram_quantiles requires a metric name as second argument".to_string(),
                 )
             })?;
-
-        // Check for optional trailing ", filtered" flag
-        let (metric_selector, filtered) =
-            if let Some(pos) = after_comma.rfind(", filtered") {
-                (&after_comma[..pos], true)
-            } else if let Some(pos) = after_comma.rfind(",filtered") {
-                (&after_comma[..pos], true)
-            } else {
-                (after_comma, false)
-            };
 
         // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
@@ -1606,35 +1591,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                 let mut result_samples = Vec::new();
 
-                // When filtered, compute minimum sample thresholds per quantile.
-                // Quantile q[i] is non-unique when total_count < ceil(1/(1-q[i-1])).
-                // The lowest quantile always needs >= 2 samples.
-                let thresholds: Vec<u64> = if filtered {
-                    quantiles
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| {
-                            if i == 0 {
-                                2
-                            } else {
-                                (1.0 / (1.0 - quantiles[i - 1])).ceil() as u64
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
                 // Emit one series per requested quantile
                 for (idx, q_key) in quantile_keys.iter().enumerate() {
                     let values: Vec<(f64, f64)> = quantile_map
                         .range(start_ns..=end_ns)
                         .filter_map(|(ts, qr)| {
-                            // When filtered, suppress data points where sample
-                            // count is too low for this quantile to be unique.
-                            if filtered && (qr.total_count() as u64) < thresholds[idx] {
-                                return None;
-                            }
                             qr.get(q_key)
                                 .map(|bucket| (*ts as f64 / 1e9, bucket.end() as f64))
                         })
@@ -1655,6 +1616,58 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 if !result_samples.is_empty() {
                     return Ok(QueryResult::Matrix {
                         result: result_samples,
+                    });
+                }
+            }
+
+            Err(QueryError::MetricNotFound(format!(
+                "No histogram data found for {}",
+                metric_name
+            )))
+        } else {
+            Err(QueryError::MetricNotFound(metric_name.to_string()))
+        }
+    }
+
+    /// Handle histogram_total_count(histogram_metric) queries.
+    ///
+    /// Returns the total sample count per timestamp as a single time series.
+    /// This is used by the frontend for threshold-based quantile filtering.
+    ///
+    /// Example: `histogram_total_count(scheduler_runqueue_latency)`
+    fn handle_histogram_total_count(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+    ) -> Result<QueryResult, QueryError> {
+        let inner = &query_str["histogram_total_count(".len()..query_str.len() - 1];
+        let metric_selector = inner.trim();
+
+        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        if let Some(collection) = self.tsdb.histograms(&metric_name, labels) {
+            let summed_series = collection.sum();
+
+            // Use a single quantile just to get QuantilesResult per timestamp
+            if let Some(quantile_map) = summed_series.quantiles(&[0.5]) {
+                let start_ns = (start * 1e9) as u64;
+                let end_ns = (end * 1e9) as u64;
+
+                let values: Vec<(f64, f64)> = quantile_map
+                    .range(start_ns..=end_ns)
+                    .map(|(ts, qr)| (*ts as f64 / 1e9, qr.total_count() as f64))
+                    .collect();
+
+                if !values.is_empty() {
+                    let mut metric_labels = HashMap::new();
+                    metric_labels.insert("__name__".to_string(), metric_name.to_string());
+
+                    return Ok(QueryResult::Matrix {
+                        result: vec![MatrixSample {
+                            metric: metric_labels,
+                            values,
+                        }],
                     });
                 }
             }
@@ -1821,6 +1834,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // Handle histogram_heatmap specially
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self.handle_histogram_heatmap(query_str, start, end);
+        }
+
+        // Handle histogram_total_count specially
+        if query_str.starts_with("histogram_total_count(") && query_str.ends_with(")") {
+            return self.handle_histogram_total_count(query_str, start, end);
         }
 
         // Parse the query into an AST
