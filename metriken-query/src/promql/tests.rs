@@ -750,3 +750,77 @@ fn test_vector_selector_preserves_all_points_when_step_equals_interval() {
         all_values[0].len()
     );
 }
+
+/// Create a TSDB with two gauge metrics for binary expression testing.
+/// "mem_total" = 1000 at every timestamp, "mem_available" = 800, 700, 600, 500, 400
+/// at t=1000..1004.
+fn create_two_gauge_tsdb() -> Tsdb {
+    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    for step in 0u64..5 {
+        let time = base_time + Duration::from_secs(step);
+        let mut meta_total = HashMap::new();
+        meta_total.insert("metric".to_string(), "mem_total".to_string());
+        let mut meta_avail = HashMap::new();
+        meta_avail.insert("metric".to_string(), "mem_available".to_string());
+
+        let snapshot = Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: vec![
+                Gauge {
+                    name: "mem_total".to_string(),
+                    value: 1000,
+                    metadata: meta_total,
+                },
+                Gauge {
+                    name: "mem_available".to_string(),
+                    value: 800 - (step as i64 * 100),
+                    metadata: meta_avail,
+                },
+            ],
+            histograms: Vec::new(),
+        });
+        tsdb.ingest(snapshot);
+    }
+
+    tsdb
+}
+
+#[test]
+fn test_compound_gauge_expression_respects_step() {
+    let tsdb = Arc::new(create_two_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // mem_total = 1000 at all timestamps
+    // mem_available: t=1000:800, t=1001:700, t=1002:600, t=1003:500, t=1004:400
+    // mem_total - mem_available: 200, 300, 400, 500, 600
+    // With step=2.0, should get 3 points at t=1000, 1002, 1004
+    let result = engine
+        .query_range("mem_total - mem_available", 1000.0, 1004.0, 2.0)
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1, "should have 1 result series");
+    assert_eq!(
+        all_values[0].len(),
+        3,
+        "Expected 3 step-aligned points, got {}",
+        all_values[0].len()
+    );
+
+    // Verify timestamps and values
+    assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
+    assert!((all_values[0][0].1 - 200.0).abs() < 1e-6); // 1000 - 800
+
+    assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
+    assert!((all_values[0][1].1 - 400.0).abs() < 1e-6); // 1000 - 600
+
+    assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
+    assert!((all_values[0][2].1 - 600.0).abs() < 1e-6); // 1000 - 400
+}
