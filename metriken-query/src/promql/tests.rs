@@ -698,3 +698,178 @@ fn test_rate_parse_error_without_range() {
     let result = engine.query_range("rate(test_counter)", 0.0, 3600.0, 60.0);
     assert!(result.is_err());
 }
+
+#[test]
+fn test_vector_selector_respects_coarse_step() {
+    let tsdb = Arc::new(create_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
+    // With step=2.0, should produce 3 points at t=1000, 1002, 1004
+    let result = engine
+        .query_range("test_gauge", 1000.0, 1004.0, 2.0)
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1);
+    assert_eq!(
+        all_values[0].len(),
+        3,
+        "Expected 3 step-aligned points, got {}",
+        all_values[0].len()
+    );
+
+    // Timestamps should be step-aligned
+    assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
+    assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
+    assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
+
+    // Values at those timestamps
+    assert!((all_values[0][0].1 - 10.0).abs() < 1e-6);
+    assert!((all_values[0][1].1 - 30.0).abs() < 1e-6);
+    assert!((all_values[0][2].1 - 50.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_vector_selector_preserves_all_points_when_step_equals_interval() {
+    let tsdb = Arc::new(create_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
+    // With step=1.0 (same as native interval), should return all 5 points
+    let result = engine
+        .query_range("test_gauge", 1000.0, 1004.0, 1.0)
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1);
+    assert_eq!(
+        all_values[0].len(),
+        5,
+        "Expected all 5 raw points, got {}",
+        all_values[0].len()
+    );
+}
+
+/// Create a TSDB with three gauge metrics for binary expression testing.
+/// "mem_total" = 1000 at every timestamp
+/// "mem_available" = 800, 700, 600, 500, 400 at t=1000..1004
+/// "mem_reserved" = 50 at every timestamp
+fn create_three_gauge_tsdb() -> Tsdb {
+    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    for step in 0u64..5 {
+        let time = base_time + Duration::from_secs(step);
+        let mut meta_total = HashMap::new();
+        meta_total.insert("metric".to_string(), "mem_total".to_string());
+        let mut meta_avail = HashMap::new();
+        meta_avail.insert("metric".to_string(), "mem_available".to_string());
+        let mut meta_reserved = HashMap::new();
+        meta_reserved.insert("metric".to_string(), "mem_reserved".to_string());
+
+        let snapshot = Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: vec![
+                Gauge {
+                    name: "mem_total".to_string(),
+                    value: 1000,
+                    metadata: meta_total,
+                },
+                Gauge {
+                    name: "mem_available".to_string(),
+                    value: 800 - (step as i64 * 100),
+                    metadata: meta_avail,
+                },
+                Gauge {
+                    name: "mem_reserved".to_string(),
+                    value: 50,
+                    metadata: meta_reserved,
+                },
+            ],
+            histograms: Vec::new(),
+        });
+        tsdb.ingest(snapshot);
+    }
+
+    tsdb
+}
+
+#[test]
+fn test_compound_gauge_expression_respects_step() {
+    let tsdb = Arc::new(create_three_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // mem_total = 1000 at all timestamps
+    // mem_available: t=1000:800, t=1001:700, t=1002:600, t=1003:500, t=1004:400
+    // mem_total - mem_available: 200, 300, 400, 500, 600
+    // With step=2.0, should get 3 points at t=1000, 1002, 1004
+    let result = engine
+        .query_range("mem_total - mem_available", 1000.0, 1004.0, 2.0)
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1, "should have 1 result series");
+    assert_eq!(
+        all_values[0].len(),
+        3,
+        "Expected 3 step-aligned points, got {}",
+        all_values[0].len()
+    );
+
+    // Verify timestamps and values
+    assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
+    assert!((all_values[0][0].1 - 200.0).abs() < 1e-6); // 1000 - 800
+
+    assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
+    assert!((all_values[0][1].1 - 400.0).abs() < 1e-6); // 1000 - 600
+
+    assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
+    assert!((all_values[0][2].1 - 600.0).abs() < 1e-6); // 1000 - 400
+}
+
+#[test]
+fn test_triple_gauge_expression_respects_step() {
+    let tsdb = Arc::new(create_three_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // mem_total = 1000, mem_available = {800,700,600,500,400}, mem_reserved = 50
+    // (mem_total - mem_available) - mem_reserved => (a - b) - c
+    //   t=1000: (1000 - 800) - 50 = 150
+    //   t=1001: (1000 - 700) - 50 = 250
+    //   t=1002: (1000 - 600) - 50 = 350
+    //   t=1003: (1000 - 500) - 50 = 450
+    //   t=1004: (1000 - 400) - 50 = 550
+    // With step=2.0, expect 3 points at t=1000, 1002, 1004
+    let result = engine
+        .query_range(
+            "mem_total - mem_available - mem_reserved",
+            1000.0,
+            1004.0,
+            2.0,
+        )
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1, "should have 1 result series");
+    assert_eq!(
+        all_values[0].len(),
+        3,
+        "Expected 3 step-aligned points, got {}",
+        all_values[0].len()
+    );
+
+    assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
+    assert!((all_values[0][0].1 - 150.0).abs() < 1e-6); // (1000-800)-50
+
+    assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
+    assert!((all_values[0][1].1 - 350.0).abs() < 1e-6); // (1000-600)-50
+
+    assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
+    assert!((all_values[0][2].1 - 550.0).abs() < 1e-6); // (1000-400)-50
+}
