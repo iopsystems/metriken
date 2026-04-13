@@ -632,11 +632,7 @@ fn test_avg_over_time_basic() {
     assert_eq!(all_values[0].len(), 1);
 
     let avg = all_values[0][0].1;
-    assert!(
-        (avg - 20.0).abs() < 1e-6,
-        "Expected avg 20.0, got {}",
-        avg
-    );
+    assert!((avg - 20.0).abs() < 1e-6, "Expected avg 20.0, got {}", avg);
 }
 
 #[test]
@@ -652,11 +648,7 @@ fn test_avg_over_time_full_window() {
     let all_values = get_matrix_values(&result);
     assert_eq!(all_values.len(), 1);
     let avg = all_values[0][0].1;
-    assert!(
-        (avg - 30.0).abs() < 1e-6,
-        "Expected avg 30.0, got {}",
-        avg
-    );
+    assert!((avg - 30.0).abs() < 1e-6, "Expected avg 30.0, got {}", avg);
 }
 
 #[test]

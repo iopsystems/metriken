@@ -456,12 +456,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        let filter_labels =
-                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
                         let range_ns = selector.range.as_nanos() as u64;
 
-                        if let Some(collection) =
-                            self.tsdb.counters(metric_name, Labels::default())
+                        if let Some(collection) = self.tsdb.counters(metric_name, Labels::default())
                         {
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
@@ -480,8 +478,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                                 while current <= end_ns {
                                     let window_start = current.saturating_sub(range_ns);
-                                    if let Some(rate) =
-                                        series.windowed_rate(window_start, current)
+                                    if let Some(rate) = series.windowed_rate(window_start, current)
                                     {
                                         rate_values.push((current as f64 / 1e9, rate));
                                     }
@@ -531,12 +528,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        let filter_labels =
-                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
                         let range_ns = selector.range.as_nanos() as u64;
 
-                        if let Some(collection) =
-                            self.tsdb.counters(metric_name, Labels::default())
+                        if let Some(collection) = self.tsdb.counters(metric_name, Labels::default())
                         {
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
@@ -555,8 +550,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                                 while current <= end_ns {
                                     let window_start = current.saturating_sub(range_ns);
-                                    if let Some(rate) =
-                                        series.windowed_irate(window_start, current)
+                                    if let Some(rate) = series.windowed_irate(window_start, current)
                                     {
                                         irate_values.push((current as f64 / 1e9, rate));
                                     }
@@ -607,8 +601,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        let filter_labels =
-                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
 
                         // Try gauges first (deriv typically used on gauges or rates)
                         let result_samples = if let Some(collection) =
@@ -663,8 +656,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        let filter_labels =
-                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
 
                         let range_ns = selector.range.as_nanos() as u64;
 
@@ -914,13 +906,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        let filter_labels =
-                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
                         let range_ns = selector.range.as_nanos() as u64;
 
-                        if let Some(collection) =
-                            self.tsdb.gauges(metric_name, Labels::default())
-                        {
+                        if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
                             let step_ns = (step * 1e9) as u64;
