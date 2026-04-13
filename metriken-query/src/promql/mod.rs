@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::sync::Arc;
 
+use promql_parser::label::Matcher;
 use promql_parser::parser::token::TokenType;
 use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,31 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
         Some(i) => (&s[..i], Some(s[i + 1..].trim())),
         None => (s, None),
     }
+}
+
+/// Extract label filter from parsed PromQL matchers, skipping `__name__`.
+fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
+    let mut filter_labels = Labels::default();
+    for matcher in matchers {
+        if matcher.name == "__name__" {
+            continue;
+        }
+        let op = matcher.op.to_string();
+        if op == "=" {
+            filter_labels
+                .inner
+                .insert(matcher.name.clone(), matcher.value.clone());
+        } else if op == "=~" {
+            filter_labels
+                .inner
+                .insert(matcher.name.clone(), format!("~{}", matcher.value));
+        } else if op == "!=" || op == "!~" {
+            filter_labels
+                .inner
+                .insert(matcher.name.clone(), format!("!{}", matcher.value));
+        }
+    }
+    filter_labels
 }
 
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
@@ -422,81 +448,60 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         step: f64,
     ) -> Result<QueryResult, QueryError> {
         match call.func.name {
-            "irate" | "rate" => {
-                // Both irate and rate expect a matrix selector
+            "rate" => {
+                // rate(metric[duration]) - windowed average per-second rate
                 if let Some(first_arg) = call.args.args.first() {
                     if let Expr::MatrixSelector(selector) = &**first_arg {
                         let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        // Extract label matchers from the selector
-                        let mut filter_labels = Labels::default();
-                        for matcher in &selector.vs.matchers.matchers {
-                            // Skip the implicit __name__ matcher added by the parser
-                            if matcher.name == "__name__" {
-                                continue;
-                            }
-                            let op = matcher.op.to_string();
-                            if op == "=" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), matcher.value.clone());
-                            } else if op == "=~" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), format!("~{}", matcher.value));
-                            } else if op == "!=" || op == "!~" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), format!("!{}", matcher.value));
-                            }
-                        }
+                        let filter_labels =
+                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let range_ns = selector.range.as_nanos() as u64;
 
-                        // Return rate calculation for all series (not summed)
-                        if let Some(collection) = self.tsdb.counters(metric_name, Labels::default())
+                        if let Some(collection) =
+                            self.tsdb.counters(metric_name, Labels::default())
                         {
-                            // If we have a filter, use filtered_rate; otherwise get rates for all
-                            // series
-                            let rate_collection = if filter_labels.inner.is_empty() {
-                                collection.rate() // Get rates for all
-                                                  // series
-                            } else {
-                                collection.filtered_rate(&filter_labels) // Only calculate rates for matching series
-                            };
-
                             let start_ns = (start * 1e9) as u64;
                             let end_ns = (end * 1e9) as u64;
-
+                            let step_ns = (step * 1e9) as u64;
                             let mut result_samples = Vec::new();
 
-                            // Iterate through all individual series (already filtered)
-                            for (labels, series) in rate_collection.iter() {
-                                let values: Vec<(f64, f64)> = series
-                                    .inner
-                                    .range(start_ns..=end_ns)
-                                    .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                                    .collect();
+                            for (labels, series) in collection.iter() {
+                                if !filter_labels.inner.is_empty()
+                                    && !labels.matches(&filter_labels)
+                                {
+                                    continue;
+                                }
 
-                                if !values.is_empty() {
-                                    // Build metric labels including the series labels
+                                let mut rate_values = Vec::new();
+                                let mut current = start_ns;
+
+                                while current <= end_ns {
+                                    let window_start = current.saturating_sub(range_ns);
+                                    if let Some(rate) =
+                                        series.windowed_rate(window_start, current)
+                                    {
+                                        rate_values.push((current as f64 / 1e9, rate));
+                                    }
+                                    current += step_ns;
+                                }
+
+                                if !rate_values.is_empty() {
                                     let mut metric_labels = HashMap::new();
                                     metric_labels
                                         .insert("__name__".to_string(), metric_name.to_string());
-
-                                    // Add all labels from this series
                                     for (key, value) in labels.inner.iter() {
                                         metric_labels.insert(key.clone(), value.clone());
                                     }
-
                                     result_samples.push(MatrixSample {
                                         metric: metric_labels,
-                                        values,
+                                        values: rate_values,
                                     });
                                 }
                             }
 
-                            // If no individual series, return empty result
                             if result_samples.is_empty() {
                                 return Err(QueryError::MetricNotFound(metric_name.to_string()));
                             }
@@ -508,16 +513,89 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             Err(QueryError::MetricNotFound(metric_name.to_string()))
                         }
                     } else {
-                        Err(QueryError::ParseError(format!(
-                            "{} requires matrix selector argument",
-                            call.func.name
-                        )))
+                        Err(QueryError::ParseError(
+                            "rate requires matrix selector argument".to_string(),
+                        ))
                     }
                 } else {
-                    Err(QueryError::ParseError(format!(
-                        "{} requires an argument",
-                        call.func.name
-                    )))
+                    Err(QueryError::ParseError(
+                        "rate requires an argument".to_string(),
+                    ))
+                }
+            }
+            "irate" => {
+                // irate(metric[duration]) - windowed instantaneous per-second rate
+                if let Some(first_arg) = call.args.args.first() {
+                    if let Expr::MatrixSelector(selector) = &**first_arg {
+                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
+                            QueryError::ParseError("Matrix selector missing name".to_string())
+                        })?;
+
+                        let filter_labels =
+                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let range_ns = selector.range.as_nanos() as u64;
+
+                        if let Some(collection) =
+                            self.tsdb.counters(metric_name, Labels::default())
+                        {
+                            let start_ns = (start * 1e9) as u64;
+                            let end_ns = (end * 1e9) as u64;
+                            let step_ns = (step * 1e9) as u64;
+                            let mut result_samples = Vec::new();
+
+                            for (labels, series) in collection.iter() {
+                                if !filter_labels.inner.is_empty()
+                                    && !labels.matches(&filter_labels)
+                                {
+                                    continue;
+                                }
+
+                                let mut irate_values = Vec::new();
+                                let mut current = start_ns;
+
+                                while current <= end_ns {
+                                    let window_start = current.saturating_sub(range_ns);
+                                    if let Some(rate) =
+                                        series.windowed_irate(window_start, current)
+                                    {
+                                        irate_values.push((current as f64 / 1e9, rate));
+                                    }
+                                    current += step_ns;
+                                }
+
+                                if !irate_values.is_empty() {
+                                    let mut metric_labels = HashMap::new();
+                                    metric_labels
+                                        .insert("__name__".to_string(), metric_name.to_string());
+                                    for (key, value) in labels.inner.iter() {
+                                        metric_labels.insert(key.clone(), value.clone());
+                                    }
+                                    result_samples.push(MatrixSample {
+                                        metric: metric_labels,
+                                        values: irate_values,
+                                    });
+                                }
+                            }
+
+                            if result_samples.is_empty() {
+                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                            }
+
+                            Ok(QueryResult::Matrix {
+                                result: result_samples,
+                            })
+                        } else {
+                            Err(QueryError::MetricNotFound(metric_name.to_string()))
+                        }
+                    } else {
+                        Err(QueryError::ParseError(
+                            "irate requires matrix selector argument".to_string(),
+                        ))
+                    }
+                } else {
+                    Err(QueryError::ParseError(
+                        "irate requires an argument".to_string(),
+                    ))
                 }
             }
             "deriv" => {
@@ -529,28 +607,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        // Extract label matchers
-                        let mut filter_labels = Labels::default();
-                        for matcher in &selector.vs.matchers.matchers {
-                            // Skip the implicit __name__ matcher added by the parser
-                            if matcher.name == "__name__" {
-                                continue;
-                            }
-                            let op = matcher.op.to_string();
-                            if op == "=" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), matcher.value.clone());
-                            } else if op == "=~" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), format!("~{}", matcher.value));
-                            } else if op == "!=" || op == "!~" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), format!("!{}", matcher.value));
-                            }
-                        }
+                        let filter_labels =
+                            extract_filter_labels(&selector.vs.matchers.matchers);
 
                         // Try gauges first (deriv typically used on gauges or rates)
                         let result_samples = if let Some(collection) =
@@ -605,27 +663,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             QueryError::ParseError("Matrix selector missing name".to_string())
                         })?;
 
-                        let mut filter_labels = Labels::default();
-                        for matcher in &selector.vs.matchers.matchers {
-                            // Skip the implicit __name__ matcher added by the parser
-                            if matcher.name == "__name__" {
-                                continue;
-                            }
-                            let op = matcher.op.to_string();
-                            if op == "=" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), matcher.value.clone());
-                            } else if op == "=~" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), format!("~{}", matcher.value));
-                            } else if op == "!=" || op == "!~" {
-                                filter_labels
-                                    .inner
-                                    .insert(matcher.name.clone(), format!("!{}", matcher.value));
-                            }
-                        }
+                        let filter_labels =
+                            extract_filter_labels(&selector.vs.matchers.matchers);
 
                         let range_ns = selector.range.as_nanos() as u64;
 
@@ -864,6 +903,89 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 } else {
                     Err(QueryError::ParseError(
                         "vector requires 1 argument".to_string(),
+                    ))
+                }
+            }
+            "avg_over_time" => {
+                // avg_over_time(metric[duration]) - average value over each window
+                if let Some(first_arg) = call.args.args.first() {
+                    if let Expr::MatrixSelector(selector) = &**first_arg {
+                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
+                            QueryError::ParseError("Matrix selector missing name".to_string())
+                        })?;
+
+                        let filter_labels =
+                            extract_filter_labels(&selector.vs.matchers.matchers);
+                        let range_ns = selector.range.as_nanos() as u64;
+
+                        if let Some(collection) =
+                            self.tsdb.gauges(metric_name, Labels::default())
+                        {
+                            let start_ns = (start * 1e9) as u64;
+                            let end_ns = (end * 1e9) as u64;
+                            let step_ns = (step * 1e9) as u64;
+                            let mut result_samples = Vec::new();
+
+                            for (labels, series) in collection.iter() {
+                                if !filter_labels.inner.is_empty()
+                                    && !labels.matches(&filter_labels)
+                                {
+                                    continue;
+                                }
+
+                                let untyped = series.untyped();
+                                let mut avg_values = Vec::new();
+                                let mut current = start_ns;
+
+                                while current <= end_ns {
+                                    let window_start = current.saturating_sub(range_ns);
+                                    let samples: Vec<f64> = untyped
+                                        .inner
+                                        .range(window_start..=current)
+                                        .map(|(_, v)| *v)
+                                        .collect();
+
+                                    if !samples.is_empty() {
+                                        let sum: f64 = samples.iter().sum();
+                                        let avg = sum / samples.len() as f64;
+                                        avg_values.push((current as f64 / 1e9, avg));
+                                    }
+
+                                    current += step_ns;
+                                }
+
+                                if !avg_values.is_empty() {
+                                    let mut metric_labels = HashMap::new();
+                                    metric_labels
+                                        .insert("__name__".to_string(), metric_name.to_string());
+                                    for (key, value) in labels.inner.iter() {
+                                        metric_labels.insert(key.clone(), value.clone());
+                                    }
+                                    result_samples.push(MatrixSample {
+                                        metric: metric_labels,
+                                        values: avg_values,
+                                    });
+                                }
+                            }
+
+                            if result_samples.is_empty() {
+                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                            }
+
+                            Ok(QueryResult::Matrix {
+                                result: result_samples,
+                            })
+                        } else {
+                            Err(QueryError::MetricNotFound(metric_name.to_string()))
+                        }
+                    } else {
+                        Err(QueryError::ParseError(
+                            "avg_over_time requires matrix selector argument".to_string(),
+                        ))
+                    }
+                } else {
+                    Err(QueryError::ParseError(
+                        "avg_over_time requires an argument".to_string(),
                     ))
                 }
             }
@@ -1200,29 +1322,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     QueryError::ParseError("Vector selector missing name".to_string())
                 })?;
 
-                // Extract label matchers from the selector
-                let mut filter_labels = Labels::default();
-                for matcher in &selector.matchers.matchers {
-                    // Skip the implicit __name__ matcher added by the parser
-                    if matcher.name == "__name__" {
-                        continue;
-                    }
-                    let op = matcher.op.to_string();
-                    if op == "=" {
-                        filter_labels
-                            .inner
-                            .insert(matcher.name.clone(), matcher.value.clone());
-                    } else if op == "=~" {
-                        // Prefix with ~ so Labels::matches knows this is a regex pattern
-                        filter_labels
-                            .inner
-                            .insert(matcher.name.clone(), format!("~{}", matcher.value));
-                    } else if op == "!=" || op == "!~" {
-                        filter_labels
-                            .inner
-                            .insert(matcher.name.clone(), format!("!{}", matcher.value));
-                    }
-                }
+                let filter_labels = extract_filter_labels(&selector.matchers.matchers);
 
                 // Handle simple metric selection - return all series with their labels
                 // Check for gauges first
