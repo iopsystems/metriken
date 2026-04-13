@@ -37,20 +37,34 @@ impl HistogramSeries {
         Some((min, max))
     }
 
-    pub fn percentiles(&self, percentiles: &[f64]) -> Option<Vec<UntypedSeries>> {
+    pub fn percentiles(
+        &self,
+        percentiles: &[f64],
+        stride_ns: Option<u64>,
+    ) -> Option<Vec<UntypedSeries>> {
         if self.is_empty() {
             return None;
         }
 
-        let (_, mut prev) = self.inner.first_key_value().unwrap();
+        let (&first_time, first_hist) = self.inner.first_key_value().unwrap();
+        let mut prev = first_hist;
+        let mut prev_time = first_time;
 
         let mut result = vec![UntypedSeries::default(); percentiles.len()];
 
         for (time, curr) in self.inner.iter().skip(1) {
+            // With a stride, skip snapshots until we've covered the stride window.
+            if let Some(stride) = stride_ns {
+                if *time - prev_time < stride {
+                    continue;
+                }
+            }
+
             let delta = match curr.wrapping_sub(prev) {
                 Ok(d) => d,
                 Err(_) => {
                     prev = curr;
+                    prev_time = *time;
                     continue;
                 }
             };
@@ -62,6 +76,7 @@ impl HistogramSeries {
             }
 
             prev = curr;
+            prev_time = *time;
         }
 
         Some(result)
@@ -69,7 +84,7 @@ impl HistogramSeries {
 
     /// Returns bucket data suitable for rendering as a heatmap.
     /// Y-axis is bucket index (latency range), X-axis is time, color is count.
-    pub fn heatmap(&self) -> Option<HistogramHeatmapData> {
+    pub fn heatmap(&self, stride_ns: Option<u64>) -> Option<HistogramHeatmapData> {
         if self.inner.len() < 2 {
             return None;
         }
@@ -78,17 +93,27 @@ impl HistogramSeries {
         let mut min_value = f64::MAX;
         let mut max_value = f64::MIN;
 
-        let (_, mut prev) = self.inner.first_key_value().unwrap();
+        let (&first_time, first_hist) = self.inner.first_key_value().unwrap();
+        let mut prev = first_hist;
+        let mut prev_time = first_time;
 
         // Collect bucket boundaries from the first histogram
         // (all histograms in the series should have the same config)
         let mut bucket_bounds_set = false;
 
         for (time, curr) in self.inner.iter().skip(1) {
+            // With a stride, skip snapshots until we've covered the stride window.
+            if let Some(stride) = stride_ns {
+                if *time - prev_time < stride {
+                    continue;
+                }
+            }
+
             let delta = match curr.wrapping_sub(prev) {
                 Ok(d) => d,
                 Err(_) => {
                     prev = curr;
+                    prev_time = *time;
                     continue;
                 }
             };
@@ -117,6 +142,7 @@ impl HistogramSeries {
 
             bucket_bounds_set = true;
             prev = curr;
+            prev_time = *time;
         }
 
         // Handle edge cases
