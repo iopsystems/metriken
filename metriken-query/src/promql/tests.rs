@@ -698,3 +698,55 @@ fn test_rate_parse_error_without_range() {
     let result = engine.query_range("rate(test_counter)", 0.0, 3600.0, 60.0);
     assert!(result.is_err());
 }
+
+#[test]
+fn test_vector_selector_respects_coarse_step() {
+    let tsdb = Arc::new(create_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
+    // With step=2.0, should produce 3 points at t=1000, 1002, 1004
+    let result = engine
+        .query_range("test_gauge", 1000.0, 1004.0, 2.0)
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1);
+    assert_eq!(
+        all_values[0].len(),
+        3,
+        "Expected 3 step-aligned points, got {}",
+        all_values[0].len()
+    );
+
+    // Timestamps should be step-aligned
+    assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
+    assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
+    assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
+
+    // Values at those timestamps
+    assert!((all_values[0][0].1 - 10.0).abs() < 1e-6);
+    assert!((all_values[0][1].1 - 30.0).abs() < 1e-6);
+    assert!((all_values[0][2].1 - 50.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_vector_selector_preserves_all_points_when_step_equals_interval() {
+    let tsdb = Arc::new(create_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
+    // With step=1.0 (same as native interval), should return all 5 points
+    let result = engine
+        .query_range("test_gauge", 1000.0, 1004.0, 1.0)
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1);
+    assert_eq!(
+        all_values[0].len(),
+        5,
+        "Expected all 5 raw points, got {}",
+        all_values[0].len()
+    );
+}

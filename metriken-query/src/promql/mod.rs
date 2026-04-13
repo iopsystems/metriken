@@ -1328,6 +1328,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                     let start_ns = (start * 1e9) as u64;
                     let end_ns = (end * 1e9) as u64;
+                    let step_ns = (step * 1e9) as u64;
+                    let interval_ns = (self.tsdb.interval() * 1e9) as u64;
 
                     let mut result_samples = Vec::new();
 
@@ -1338,11 +1340,29 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             continue;
                         }
                         let untyped = series.untyped();
-                        let values: Vec<(f64, f64)> = untyped
-                            .inner
-                            .range(start_ns..=end_ns)
-                            .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                            .collect();
+                        let values: Vec<(f64, f64)> = if step_ns > interval_ns {
+                            // Step is coarser than native interval:
+                            // evaluate at step-aligned timestamps
+                            let mut vals = Vec::new();
+                            let mut current = start_ns;
+                            while current <= end_ns {
+                                if let Some((&ts, &val)) =
+                                    untyped.inner.range(..=current).next_back()
+                                {
+                                    if current - ts <= step_ns {
+                                        vals.push((current as f64 / 1e9, val));
+                                    }
+                                }
+                                current += step_ns;
+                            }
+                            vals
+                        } else {
+                            untyped
+                                .inner
+                                .range(start_ns..=end_ns)
+                                .map(|(ts, val)| (*ts as f64 / 1e9, *val))
+                                .collect()
+                        };
 
                         if !values.is_empty() {
                             let mut metric_labels = HashMap::new();
