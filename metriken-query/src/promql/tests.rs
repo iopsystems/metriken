@@ -751,10 +751,11 @@ fn test_vector_selector_preserves_all_points_when_step_equals_interval() {
     );
 }
 
-/// Create a TSDB with two gauge metrics for binary expression testing.
-/// "mem_total" = 1000 at every timestamp, "mem_available" = 800, 700, 600, 500, 400
-/// at t=1000..1004.
-fn create_two_gauge_tsdb() -> Tsdb {
+/// Create a TSDB with three gauge metrics for binary expression testing.
+/// "mem_total" = 1000 at every timestamp
+/// "mem_available" = 800, 700, 600, 500, 400 at t=1000..1004
+/// "mem_reserved" = 50 at every timestamp
+fn create_three_gauge_tsdb() -> Tsdb {
     use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
 
     let mut tsdb = Tsdb::default();
@@ -766,6 +767,8 @@ fn create_two_gauge_tsdb() -> Tsdb {
         meta_total.insert("metric".to_string(), "mem_total".to_string());
         let mut meta_avail = HashMap::new();
         meta_avail.insert("metric".to_string(), "mem_available".to_string());
+        let mut meta_reserved = HashMap::new();
+        meta_reserved.insert("metric".to_string(), "mem_reserved".to_string());
 
         let snapshot = Snapshot::V2(SnapshotV2 {
             systemtime: time,
@@ -783,6 +786,11 @@ fn create_two_gauge_tsdb() -> Tsdb {
                     value: 800 - (step as i64 * 100),
                     metadata: meta_avail,
                 },
+                Gauge {
+                    name: "mem_reserved".to_string(),
+                    value: 50,
+                    metadata: meta_reserved,
+                },
             ],
             histograms: Vec::new(),
         });
@@ -794,7 +802,7 @@ fn create_two_gauge_tsdb() -> Tsdb {
 
 #[test]
 fn test_compound_gauge_expression_respects_step() {
-    let tsdb = Arc::new(create_two_gauge_tsdb());
+    let tsdb = Arc::new(create_three_gauge_tsdb());
     let engine = QueryEngine::new(tsdb);
 
     // mem_total = 1000 at all timestamps
@@ -823,4 +831,45 @@ fn test_compound_gauge_expression_respects_step() {
 
     assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
     assert!((all_values[0][2].1 - 600.0).abs() < 1e-6); // 1000 - 400
+}
+
+#[test]
+fn test_triple_gauge_expression_respects_step() {
+    let tsdb = Arc::new(create_three_gauge_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    // mem_total = 1000, mem_available = {800,700,600,500,400}, mem_reserved = 50
+    // (mem_total - mem_available) - mem_reserved => (a - b) - c
+    //   t=1000: (1000 - 800) - 50 = 150
+    //   t=1001: (1000 - 700) - 50 = 250
+    //   t=1002: (1000 - 600) - 50 = 350
+    //   t=1003: (1000 - 500) - 50 = 450
+    //   t=1004: (1000 - 400) - 50 = 550
+    // With step=2.0, expect 3 points at t=1000, 1002, 1004
+    let result = engine
+        .query_range(
+            "mem_total - mem_available - mem_reserved",
+            1000.0,
+            1004.0,
+            2.0,
+        )
+        .unwrap();
+
+    let all_values = get_matrix_values(&result);
+    assert_eq!(all_values.len(), 1, "should have 1 result series");
+    assert_eq!(
+        all_values[0].len(),
+        3,
+        "Expected 3 step-aligned points, got {}",
+        all_values[0].len()
+    );
+
+    assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
+    assert!((all_values[0][0].1 - 150.0).abs() < 1e-6); // (1000-800)-50
+
+    assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
+    assert!((all_values[0][1].1 - 350.0).abs() < 1e-6); // (1000-600)-50
+
+    assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
+    assert!((all_values[0][2].1 - 550.0).abs() < 1e-6); // (1000-400)-50
 }
