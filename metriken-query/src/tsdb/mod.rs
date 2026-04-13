@@ -363,7 +363,7 @@ impl Tsdb {
         percentiles: &[f64],
     ) -> Option<Vec<UntypedSeries>> {
         if let Some(collection) = self.histograms(metric, labels) {
-            collection.sum().percentiles(percentiles)
+            collection.sum().percentiles(percentiles, None)
         } else {
             None
         }

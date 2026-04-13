@@ -90,6 +90,43 @@ pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
     tsdb: T,
 }
 
+/// Try to parse an optional stride (in seconds) from the trailing argument.
+/// Input like `"metric, 15"` returns `("metric", Some(15_000_000_000))`.
+/// Input like `"metric"` returns `("metric", None)`.
+fn parse_optional_stride(s: &str) -> Result<(&str, Option<u64>), QueryError> {
+    let (before, after) = split_last_top_level_comma(s);
+    if let Some(tail) = after {
+        if let Ok(secs) = tail.parse::<f64>() {
+            if secs <= 0.0 {
+                return Err(QueryError::ParseError(
+                    "stride must be a positive number of seconds".to_string(),
+                ));
+            }
+            return Ok((before.trim(), Some((secs * 1_000_000_000.0) as u64)));
+        }
+    }
+    Ok((s, None))
+}
+
+/// Split a string at the last comma that is not inside `{}` braces.
+/// Returns `(before, Some(after))` if found, or `(whole_string, None)`.
+fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
+    let mut brace_depth = 0i32;
+    let mut last_comma = None;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' => brace_depth += 1,
+            '}' => brace_depth -= 1,
+            ',' if brace_depth == 0 => last_comma = Some(i),
+            _ => {}
+        }
+    }
+    match last_comma {
+        Some(i) => (&s[..i], Some(s[i + 1..].trim())),
+        None => (s, None),
+    }
+}
+
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     pub fn new(tsdb: T) -> Self {
         Self { tsdb }
@@ -706,7 +743,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         let summed_series = collection.sum();
 
                         // Calculate the percentile
-                        if let Some(percentile_series) = summed_series.percentiles(&[quantile]) {
+                        if let Some(percentile_series) = summed_series.percentiles(&[quantile], None) {
                             if let Some(series) = percentile_series.first() {
                                 let start_ns = (start * 1e9) as u64;
                                 let end_ns = (end * 1e9) as u64;
@@ -1435,7 +1472,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
         // Extract the metric selector (everything after the array and comma)
         let after_array = &inner[array_end + 1..].trim();
-        let metric_selector = after_array
+        let remaining = after_array
             .strip_prefix(',')
             .map(|s| s.trim())
             .ok_or_else(|| {
@@ -1443,6 +1480,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     "histogram_percentiles requires a metric name as second argument".to_string(),
                 )
             })?;
+
+        // Split off an optional trailing stride parameter (e.g. ", 15")
+        let (metric_selector, stride_ns) = parse_optional_stride(remaining)?;
 
         // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
@@ -1453,7 +1493,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             let summed_series = collection.sum();
 
             // Calculate all percentiles
-            if let Some(percentile_series_vec) = summed_series.percentiles(&percentiles) {
+            if let Some(percentile_series_vec) = summed_series.percentiles(&percentiles, stride_ns) {
                 let start_ns = (start * 1e9) as u64;
                 let end_ns = (end * 1e9) as u64;
 
@@ -1531,9 +1571,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
-        // Extract the metric selector from histogram_heatmap(metric_selector)
+        // Extract the metric selector from histogram_heatmap(metric_selector[, stride])
         let inner = &query_str["histogram_heatmap(".len()..query_str.len() - 1];
-        let metric_selector = inner.trim();
+        let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
 
         // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
@@ -1544,7 +1584,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             let summed_series = collection.sum();
 
             // Get heatmap data
-            if let Some(heatmap_data) = summed_series.heatmap() {
+            if let Some(heatmap_data) = summed_series.heatmap(stride_ns) {
                 let start_sec = start;
                 let end_sec = end;
 
