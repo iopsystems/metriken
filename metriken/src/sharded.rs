@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const CACHE_LINE: usize = 128;
+const CACHE_LINE: usize = 64;
 const NUM_SHARDS: usize = 64;
 
 thread_local! {
@@ -30,7 +30,7 @@ fn shard_index() -> usize {
     })
 }
 
-#[repr(C, align(128))]
+#[repr(C, align(64))]
 struct Shard {
     value: AtomicU64,
     _pad: [u8; CACHE_LINE - 8],
