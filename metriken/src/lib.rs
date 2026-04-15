@@ -93,7 +93,7 @@ pub use crate::gauge::Gauge;
 pub use crate::group::{CounterGroup, GaugeGroup, HistogramGroup};
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};
 pub use crate::lazy::Lazy;
-pub use crate::sharded::{set_thread_shard, ShardedCounter};
+pub use crate::sharded::{set_thread_shard, ShardedCounterGroup};
 
 /// A counter holds a unsigned 64bit monotonically non-decreasing value. The
 /// counter behavior is to wrap on overflow.
