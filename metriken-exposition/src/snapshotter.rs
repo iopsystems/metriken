@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use metriken::{AtomicHistogram, MetricEntry, RwLockHistogram, Value};
+use metriken::{MetricEntry, Value};
 
 use crate::snapshot::{Counter, Gauge, Histogram, Snapshot, SnapshotV1};
 
@@ -101,17 +101,8 @@ impl Snapshotter {
                         metadata: build_metadata(metric),
                     });
                 }
-                Some(Value::Other(other)) => {
-                    let histogram = if let Some(histogram) = other.downcast_ref::<AtomicHistogram>()
-                    {
-                        histogram.load()
-                    } else if let Some(histogram) = other.downcast_ref::<RwLockHistogram>() {
-                        histogram.load()
-                    } else {
-                        None
-                    };
-
-                    if let Some(histogram) = histogram {
+                Some(Value::Histogram(h)) => {
+                    if let Some(histogram) = h.load() {
                         let mut metadata = build_metadata(metric);
                         metadata.insert(
                             "grouping_power".to_string(),
@@ -127,6 +118,62 @@ impl Snapshotter {
                             value: histogram,
                             metadata,
                         });
+                    }
+                }
+                Some(Value::CounterGroup(g)) => {
+                    let base_metadata = build_metadata(metric);
+                    if let Some(values) = g.load_counters() {
+                        for (idx, &value) in values.iter().enumerate() {
+                            let mut metadata = base_metadata.clone();
+                            if let Some(entry_meta) = g.load_metadata(idx) {
+                                metadata.extend(entry_meta);
+                            }
+                            counters.push(Counter {
+                                name: format!("{column_name}x{idx}"),
+                                value,
+                                metadata,
+                            });
+                        }
+                    }
+                }
+                Some(Value::GaugeGroup(g)) => {
+                    let base_metadata = build_metadata(metric);
+                    if let Some(values) = g.load_gauges() {
+                        for (idx, &value) in values.iter().enumerate() {
+                            let mut metadata = base_metadata.clone();
+                            if let Some(entry_meta) = g.load_metadata(idx) {
+                                metadata.extend(entry_meta);
+                            }
+                            gauges.push(Gauge {
+                                name: format!("{column_name}x{idx}"),
+                                value,
+                                metadata,
+                            });
+                        }
+                    }
+                }
+                Some(Value::HistogramGroup(g)) => {
+                    let base_metadata = build_metadata(metric);
+                    if let Some(hists) = g.load_all_histograms() {
+                        for (idx, histogram) in hists.into_iter().enumerate() {
+                            let mut metadata = base_metadata.clone();
+                            if let Some(entry_meta) = g.load_metadata(idx) {
+                                metadata.extend(entry_meta);
+                            }
+                            metadata.insert(
+                                "grouping_power".to_string(),
+                                histogram.config().grouping_power().to_string(),
+                            );
+                            metadata.insert(
+                                "max_value_power".to_string(),
+                                histogram.config().max_value_power().to_string(),
+                            );
+                            histograms.push(Histogram {
+                                name: format!("{column_name}x{idx}"),
+                                value: histogram,
+                                metadata,
+                            });
+                        }
                     }
                 }
                 _ => continue,

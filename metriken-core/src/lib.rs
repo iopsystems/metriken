@@ -30,12 +30,16 @@ mod metadata;
 mod metrics;
 mod null;
 mod provide;
+mod traits;
 mod wrapper;
 
 pub use crate::formatter::{default_formatter, Format};
 pub use crate::metadata::{Metadata, MetadataIter};
 pub use crate::metrics::{metrics, DynMetricsIter, Metrics, MetricsIter};
 pub use crate::provide::{request_ref, request_value, Request};
+pub use crate::traits::{
+    CounterGroupMetric, GaugeGroupMetric, HistogramGroupMetric, HistogramMetric,
+};
 
 /// Global interface to a metric.
 ///
@@ -87,6 +91,18 @@ pub enum Value<'a> {
 
     /// A gauge value.
     Gauge(i64),
+
+    /// A histogram metric that can produce snapshots.
+    Histogram(&'a dyn HistogramMetric),
+
+    /// A group of counter metrics with per-entry metadata.
+    CounterGroup(&'a dyn CounterGroupMetric),
+
+    /// A group of gauge metrics with per-entry metadata.
+    GaugeGroup(&'a dyn GaugeGroupMetric),
+
+    /// A group of histogram metrics with per-entry metadata.
+    HistogramGroup(&'a dyn HistogramGroupMetric),
 
     /// The value of the metric could not be represented using the other `Value`
     /// variants.

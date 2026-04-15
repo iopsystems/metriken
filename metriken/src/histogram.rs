@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 pub use histogram::{Bucket, Config, Error, Histogram};
 use parking_lot::RwLock;
 
-use crate::{Metric, Value};
+use crate::{HistogramMetric, Metric, Value};
 
 /// A histogram that uses free-running atomic counters to track the distribution
 /// of values. They are only useful for recording values and producing
@@ -60,13 +60,23 @@ impl AtomicHistogram {
     }
 }
 
+impl HistogramMetric for AtomicHistogram {
+    fn config(&self) -> Config {
+        self.config
+    }
+
+    fn load(&self) -> Option<Histogram> {
+        self.load()
+    }
+}
+
 impl Metric for AtomicHistogram {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 
     fn value(&self) -> Option<Value<'_>> {
-        Some(Value::Other(self))
+        Some(Value::Histogram(self))
     }
 }
 
@@ -134,12 +144,22 @@ impl RwLockHistogram {
     }
 }
 
+impl HistogramMetric for RwLockHistogram {
+    fn config(&self) -> Config {
+        self.config
+    }
+
+    fn load(&self) -> Option<Histogram> {
+        self.load()
+    }
+}
+
 impl Metric for RwLockHistogram {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 
     fn value(&self) -> Option<Value<'_>> {
-        Some(Value::Other(self))
+        Some(Value::Histogram(self))
     }
 }
