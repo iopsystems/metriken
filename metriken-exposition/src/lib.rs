@@ -7,6 +7,7 @@
 mod convert;
 #[cfg(feature = "parquet")]
 mod parquet;
+mod prometheus;
 mod snapshot;
 mod snapshotter;
 
@@ -16,5 +17,6 @@ pub use convert::MsgpackToParquet;
 pub use parquet::{
     ParquetCompression, ParquetHistogramType, ParquetOptions, ParquetSchema, ParquetWriter,
 };
+pub use prometheus::{prometheus_text, PrometheusOptions};
 pub use snapshot::{Counter, Gauge, Histogram, Snapshot, SnapshotV1, SnapshotV2};
 pub use snapshotter::{Snapshotter, SnapshotterBuilder};

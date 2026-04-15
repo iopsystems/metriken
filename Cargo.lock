@@ -1112,6 +1112,7 @@ dependencies = [
 name = "metriken-core"
 version = "0.1.3"
 dependencies = [
+ "histogram",
  "linkme",
  "parking_lot",
  "phf",
