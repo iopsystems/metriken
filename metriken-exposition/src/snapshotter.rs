@@ -122,12 +122,10 @@ impl Snapshotter {
                 }
                 Some(Value::CounterGroup(g)) => {
                     let base_metadata = build_metadata(metric);
-                    if let Some(values) = g.load_counters() {
-                        for (idx, &value) in values.iter().enumerate() {
+                    for (idx, entry_meta) in g.metadata_snapshot() {
+                        if let Some(value) = g.counter_value(idx) {
                             let mut metadata = base_metadata.clone();
-                            if let Some(entry_meta) = g.load_metadata(idx) {
-                                metadata.extend(entry_meta);
-                            }
+                            metadata.extend(entry_meta);
                             counters.push(Counter {
                                 name: format!("{column_name}x{idx}"),
                                 value,
@@ -138,12 +136,10 @@ impl Snapshotter {
                 }
                 Some(Value::GaugeGroup(g)) => {
                     let base_metadata = build_metadata(metric);
-                    if let Some(values) = g.load_gauges() {
-                        for (idx, &value) in values.iter().enumerate() {
+                    for (idx, entry_meta) in g.metadata_snapshot() {
+                        if let Some(value) = g.gauge_value(idx) {
                             let mut metadata = base_metadata.clone();
-                            if let Some(entry_meta) = g.load_metadata(idx) {
-                                metadata.extend(entry_meta);
-                            }
+                            metadata.extend(entry_meta);
                             gauges.push(Gauge {
                                 name: format!("{column_name}x{idx}"),
                                 value,
@@ -154,12 +150,10 @@ impl Snapshotter {
                 }
                 Some(Value::HistogramGroup(g)) => {
                     let base_metadata = build_metadata(metric);
-                    if let Some(hists) = g.load_all_histograms() {
-                        for (idx, histogram) in hists.into_iter().enumerate() {
+                    for (idx, entry_meta) in g.metadata_snapshot() {
+                        if let Some(histogram) = g.load_histogram(idx) {
                             let mut metadata = base_metadata.clone();
-                            if let Some(entry_meta) = g.load_metadata(idx) {
-                                metadata.extend(entry_meta);
-                            }
+                            metadata.extend(entry_meta);
                             metadata.insert(
                                 "grouping_power".to_string(),
                                 histogram.config().grouping_power().to_string(),

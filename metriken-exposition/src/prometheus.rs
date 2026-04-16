@@ -69,42 +69,51 @@ pub fn prometheus_text(options: &PrometheusOptions) -> String {
             }
             Some(Value::CounterGroup(g)) => {
                 let base_metadata = entry_metadata(metric);
-                if let Some(values) = g.load_counters() {
-                    let mut first = true;
-                    for (idx, &value) in values.iter().enumerate() {
-                        let labels = merge_labels(&base_metadata, g.load_metadata(idx));
-                        if first {
-                            write_type_help(&mut output, &name, "counter", metric, options);
-                            first = false;
+                let active = g.metadata_snapshot();
+                if !active.is_empty() {
+                    write_type_help(&mut output, &name, "counter", metric, options);
+                    for (idx, entry_meta) in active {
+                        if let Some(value) = g.counter_value(idx) {
+                            let labels = merge_labels(&base_metadata, Some(entry_meta));
+                            write_metric_line(
+                                &mut output,
+                                &name,
+                                Some(&labels),
+                                &value.to_string(),
+                            );
                         }
-                        write_metric_line(&mut output, &name, Some(&labels), &value.to_string());
                     }
                 }
             }
             Some(Value::GaugeGroup(g)) => {
                 let base_metadata = entry_metadata(metric);
-                if let Some(values) = g.load_gauges() {
-                    let mut first = true;
-                    for (idx, &value) in values.iter().enumerate() {
-                        let labels = merge_labels(&base_metadata, g.load_metadata(idx));
-                        if first {
-                            write_type_help(&mut output, &name, "gauge", metric, options);
-                            first = false;
+                let active = g.metadata_snapshot();
+                if !active.is_empty() {
+                    write_type_help(&mut output, &name, "gauge", metric, options);
+                    for (idx, entry_meta) in active {
+                        if let Some(value) = g.gauge_value(idx) {
+                            let labels = merge_labels(&base_metadata, Some(entry_meta));
+                            write_metric_line(
+                                &mut output,
+                                &name,
+                                Some(&labels),
+                                &value.to_string(),
+                            );
                         }
-                        write_metric_line(&mut output, &name, Some(&labels), &value.to_string());
                     }
                 }
             }
             Some(Value::HistogramGroup(g)) => {
                 let base_metadata = entry_metadata(metric);
-                if let Some(hists) = g.load_all_histograms() {
-                    for (idx, snapshot) in hists.iter().enumerate() {
-                        let labels = merge_labels(&base_metadata, g.load_metadata(idx));
+                let active = g.metadata_snapshot();
+                for (idx, entry_meta) in active {
+                    if let Some(snapshot) = g.load_histogram(idx) {
+                        let labels = merge_labels(&base_metadata, Some(entry_meta));
                         write_histogram(
                             &mut output,
                             &name,
                             Some(&labels),
-                            snapshot,
+                            &snapshot,
                             metric,
                             options,
                         );
