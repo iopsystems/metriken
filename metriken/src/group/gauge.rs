@@ -2,15 +2,31 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 
-use parking_lot::RwLock;
-
 use super::metadata::GroupMetadata;
 use crate::{GaugeGroupMetric, Metric, Value};
+
+enum Backing {
+    Owned(Vec<AtomicI64>),
+    External(&'static [AtomicI64]),
+}
+
+impl Backing {
+    fn as_slice(&self) -> &[AtomicI64] {
+        match self {
+            Backing::Owned(v) => v,
+            Backing::External(s) => s,
+        }
+    }
+}
 
 /// A group of gauges backed by a dense array with sparse metadata.
 ///
 /// The value array is allocated lazily on first access and is always dense.
 /// Metadata is stored sparsely.
+///
+/// An external backing store can be attached via
+/// [`attach_external`](GaugeGroup::attach_external) before any values are
+/// written.
 ///
 /// # Example
 /// ```
@@ -27,7 +43,7 @@ use crate::{GaugeGroupMetric, Metric, Value};
 /// assert_eq!(CPU_FREQ.value(0), Some(3600));
 /// ```
 pub struct GaugeGroup {
-    values: OnceLock<RwLock<Vec<AtomicI64>>>,
+    values: OnceLock<Backing>,
     metadata: GroupMetadata,
     entries: usize,
 }
@@ -47,14 +63,29 @@ impl GaugeGroup {
         self.entries
     }
 
-    fn get_or_init(&self) -> &RwLock<Vec<AtomicI64>> {
-        self.values.get_or_init(|| {
-            let mut v = Vec::with_capacity(self.entries);
-            for _ in 0..self.entries {
-                v.push(AtomicI64::new(0));
-            }
-            RwLock::new(v)
-        })
+    /// Attach an external slice as the backing store for gauge values.
+    ///
+    /// This must be called before any values are written. If the internal
+    /// backing has already been initialized, this is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the slice remains valid and properly
+    /// aligned for the lifetime of this `GaugeGroup`.
+    pub unsafe fn attach_external(&self, slice: &'static [AtomicI64]) {
+        let _ = self.values.set(Backing::External(slice));
+    }
+
+    fn get_or_init(&self) -> &[AtomicI64] {
+        self.values
+            .get_or_init(|| {
+                let mut v = Vec::with_capacity(self.entries);
+                for _ in 0..self.entries {
+                    v.push(AtomicI64::new(0));
+                }
+                Backing::Owned(v)
+            })
+            .as_slice()
     }
 
     /// Increment the gauge at `idx` by 1.
@@ -81,8 +112,7 @@ impl GaugeGroup {
         if idx >= self.entries {
             return false;
         }
-        let inner = self.get_or_init().read();
-        inner[idx].fetch_add(value, Ordering::Relaxed);
+        self.get_or_init()[idx].fetch_add(value, Ordering::Relaxed);
         true
     }
 
@@ -94,8 +124,7 @@ impl GaugeGroup {
         if idx >= self.entries {
             return false;
         }
-        let inner = self.get_or_init().read();
-        inner[idx].fetch_sub(value, Ordering::Relaxed);
+        self.get_or_init()[idx].fetch_sub(value, Ordering::Relaxed);
         true
     }
 
@@ -106,8 +135,7 @@ impl GaugeGroup {
         if idx >= self.entries {
             return false;
         }
-        let inner = self.get_or_init().read();
-        inner[idx].store(value, Ordering::Relaxed);
+        self.get_or_init()[idx].store(value, Ordering::Relaxed);
         true
     }
 
@@ -121,16 +149,19 @@ impl GaugeGroup {
         }
         self.values
             .get()
-            .map(|v| v.read()[idx].load(Ordering::Relaxed))
+            .map(|b| b.as_slice()[idx].load(Ordering::Relaxed))
     }
 
     /// Load all gauge values as a snapshot.
     ///
     /// Returns `None` if the group hasn't been initialized yet.
     pub fn load(&self) -> Option<Vec<i64>> {
-        self.values
-            .get()
-            .map(|v| v.read().iter().map(|a| a.load(Ordering::Relaxed)).collect())
+        self.values.get().map(|b| {
+            b.as_slice()
+                .iter()
+                .map(|a| a.load(Ordering::Relaxed))
+                .collect()
+        })
     }
 
     /// Set metadata for the entry at `idx`.
@@ -240,5 +271,23 @@ mod tests {
 
         let snap = GROUP.load().unwrap();
         assert_eq!(snap, vec![10, -20, 30]);
+    }
+
+    #[test]
+    fn attach_external_backing() {
+        static EXTERNAL: [AtomicI64; 3] =
+            [AtomicI64::new(100), AtomicI64::new(-50), AtomicI64::new(0)];
+        static GROUP: GaugeGroup = GaugeGroup::new(3);
+
+        unsafe {
+            GROUP.attach_external(&EXTERNAL);
+        }
+
+        assert_eq!(GROUP.value(0), Some(100));
+        assert_eq!(GROUP.value(1), Some(-50));
+
+        GROUP.set(2, 42);
+        assert_eq!(GROUP.value(2), Some(42));
+        assert_eq!(EXTERNAL[2].load(Ordering::Relaxed), 42);
     }
 }
