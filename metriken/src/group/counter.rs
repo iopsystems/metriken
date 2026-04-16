@@ -2,10 +2,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use parking_lot::RwLock;
-
 use super::metadata::GroupMetadata;
 use crate::{CounterGroupMetric, Metric, Value};
+
+enum Backing {
+    Owned(Vec<AtomicU64>),
+    External(&'static [AtomicU64]),
+}
+
+impl Backing {
+    fn as_slice(&self) -> &[AtomicU64] {
+        match self {
+            Backing::Owned(v) => v,
+            Backing::External(s) => s,
+        }
+    }
+}
 
 /// A group of counters backed by a dense array with sparse metadata.
 ///
@@ -13,9 +25,9 @@ use crate::{CounterGroupMetric, Metric, Value};
 /// (every index from 0..entries has a slot). Metadata is stored sparsely —
 /// only indices with explicitly attached metadata consume memory for it.
 ///
-/// This is the right choice for per-CPU, per-cgroup, or per-operation
-/// counters where the index is meaningful (e.g., CPU ID, cgroup index,
-/// enum variant).
+/// An external backing store (e.g., a BPF mmap region) can be attached via
+/// [`attach_external`](CounterGroup::attach_external) before any values are
+/// written. This enables zero-copy reads from memory-mapped regions.
 ///
 /// # Example
 /// ```
@@ -34,7 +46,7 @@ use crate::{CounterGroupMetric, Metric, Value};
 /// assert_eq!(REQUESTS.value(1), Some(5));
 /// ```
 pub struct CounterGroup {
-    values: OnceLock<RwLock<Vec<AtomicU64>>>,
+    values: OnceLock<Backing>,
     metadata: GroupMetadata,
     entries: usize,
 }
@@ -54,14 +66,35 @@ impl CounterGroup {
         self.entries
     }
 
-    fn get_or_init(&self) -> &RwLock<Vec<AtomicU64>> {
-        self.values.get_or_init(|| {
-            let mut v = Vec::with_capacity(self.entries);
-            for _ in 0..self.entries {
-                v.push(AtomicU64::new(0));
-            }
-            RwLock::new(v)
-        })
+    /// Attach an external slice as the backing store for counter values.
+    ///
+    /// This must be called before any values are written (via `increment`,
+    /// `add`, or `set`). If the internal backing has already been initialized,
+    /// this is a no-op.
+    ///
+    /// The slice must have at least `entries` elements. This is intended for
+    /// memory-mapped regions (e.g., BPF maps) that live for the process
+    /// lifetime.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the slice remains valid and properly
+    /// aligned for the lifetime of this `CounterGroup` (typically `'static`
+    /// for BPF map mmaps).
+    pub unsafe fn attach_external(&self, slice: &'static [AtomicU64]) {
+        let _ = self.values.set(Backing::External(slice));
+    }
+
+    fn get_or_init(&self) -> &[AtomicU64] {
+        self.values
+            .get_or_init(|| {
+                let mut v = Vec::with_capacity(self.entries);
+                for _ in 0..self.entries {
+                    v.push(AtomicU64::new(0));
+                }
+                Backing::Owned(v)
+            })
+            .as_slice()
     }
 
     /// Increment the counter at `idx` by 1.
@@ -80,8 +113,7 @@ impl CounterGroup {
         if idx >= self.entries {
             return false;
         }
-        let inner = self.get_or_init().read();
-        inner[idx].fetch_add(value, Ordering::Relaxed);
+        self.get_or_init()[idx].fetch_add(value, Ordering::Relaxed);
         true
     }
 
@@ -92,8 +124,7 @@ impl CounterGroup {
         if idx >= self.entries {
             return false;
         }
-        let inner = self.get_or_init().read();
-        inner[idx].store(value, Ordering::Relaxed);
+        self.get_or_init()[idx].store(value, Ordering::Relaxed);
         true
     }
 
@@ -107,16 +138,19 @@ impl CounterGroup {
         }
         self.values
             .get()
-            .map(|v| v.read()[idx].load(Ordering::Relaxed))
+            .map(|b| b.as_slice()[idx].load(Ordering::Relaxed))
     }
 
     /// Load all counter values as a snapshot.
     ///
     /// Returns `None` if the group hasn't been initialized yet.
     pub fn load(&self) -> Option<Vec<u64>> {
-        self.values
-            .get()
-            .map(|v| v.read().iter().map(|a| a.load(Ordering::Relaxed)).collect())
+        self.values.get().map(|b| {
+            b.as_slice()
+                .iter()
+                .map(|a| a.load(Ordering::Relaxed))
+                .collect()
+        })
     }
 
     /// Set metadata for the entry at `idx`.
@@ -239,5 +273,47 @@ mod tests {
 
         let value = Metric::value(&GROUP);
         assert!(matches!(value, Some(Value::CounterGroup(_))));
+    }
+
+    #[test]
+    fn attach_external_backing() {
+        static EXTERNAL: [AtomicU64; 4] = [
+            AtomicU64::new(100),
+            AtomicU64::new(200),
+            AtomicU64::new(0),
+            AtomicU64::new(400),
+        ];
+        static GROUP: CounterGroup = CounterGroup::new(4);
+
+        unsafe {
+            GROUP.attach_external(&EXTERNAL);
+        }
+
+        assert_eq!(GROUP.value(0), Some(100));
+        assert_eq!(GROUP.value(1), Some(200));
+        assert_eq!(GROUP.value(3), Some(400));
+
+        // Writes go to the external backing
+        GROUP.add(0, 1);
+        assert_eq!(GROUP.value(0), Some(101));
+        assert_eq!(EXTERNAL[0].load(Ordering::Relaxed), 101);
+    }
+
+    #[test]
+    fn attach_external_after_init_is_noop() {
+        static GROUP: CounterGroup = CounterGroup::new(2);
+        static EXTERNAL: [AtomicU64; 2] = [AtomicU64::new(99), AtomicU64::new(99)];
+
+        // Initialize internal backing first
+        GROUP.increment(0);
+        assert_eq!(GROUP.value(0), Some(1));
+
+        // attach_external is a no-op since already initialized
+        unsafe {
+            GROUP.attach_external(&EXTERNAL);
+        }
+
+        // Still using internal backing
+        assert_eq!(GROUP.value(0), Some(1));
     }
 }
