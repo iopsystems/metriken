@@ -1,6 +1,6 @@
 [package]
 name = "metriken"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Brian Martin <brian@iop.systems>", "Sean Lynch <sean@iop.systems>"]
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ homepage = "https://github.com/pelikan-io/rustcommon"
 repository = "https://github.com/pelikan-io/rustcommon"
 
 [dependencies]
-metriken-core   = { version = "0.1",    path = "../metriken-core" }
+metriken-core   = { version = "0.2",    path = "../metriken-core" }
 metriken-derive = { version = "=0.5.1", path = "../metriken-derive" }
 
 histogram = "1.0.0"
