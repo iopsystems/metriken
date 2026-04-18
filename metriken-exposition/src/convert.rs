@@ -77,6 +77,6 @@ impl MsgpackToParquet {
         }
         let metadata = writer.finalize()?;
 
-        Ok(metadata.num_rows)
+        Ok(metadata.file_metadata().num_rows())
     }
 }

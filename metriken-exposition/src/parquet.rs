@@ -7,8 +7,8 @@ use arrow::datatypes::*;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
+use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
-use parquet::format::{FileMetaData, KeyValue};
 
 use crate::snapshot::{HashedSnapshot, Snapshot};
 
@@ -319,7 +319,7 @@ impl ParquetSchema {
         let props = WriterProperties::builder()
             .set_compression(options.compression.inner)
             .set_key_value_metadata(schema_metadata)
-            .set_max_row_group_size(options.max_batch_size)
+            .set_max_row_group_row_count(Some(options.max_batch_size))
             .build();
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
@@ -409,7 +409,7 @@ impl<W: Write + Send> ParquetWriter<W> {
     }
 
     /// Finish writing any buffered metrics and the parquet footer.
-    pub fn finalize(self) -> Result<FileMetaData, ParquetError> {
+    pub fn finalize(self) -> Result<ParquetMetaData, ParquetError> {
         self.writer.close()
     }
 

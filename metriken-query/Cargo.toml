@@ -11,12 +11,12 @@ homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
-arrow = "56.1.0"
+arrow = "58.1.0"
 bytes = "1"
-histogram = "1.0.0"
+histogram = "1.1.0"
 metriken-exposition = { version = "0.15.0", path = "../metriken-exposition", default-features = false, optional = true }
-parquet = { version = "56.1.0", default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
-promql-parser = "0.4"
+parquet = { version = "58.1.0", default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
+promql-parser = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
