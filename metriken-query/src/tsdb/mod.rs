@@ -169,7 +169,13 @@ impl Tsdb {
                 let mut labels = Labels::default();
 
                 for (k, v) in meta.iter() {
-                    labels.inner.insert(k.to_string(), v.to_string());
+                    match k.as_str() {
+                        // Internal metadata — not user-facing labels
+                        "metric" | "metric_type" | "unit" => continue,
+                        _ => {
+                            labels.inner.insert(k.to_string(), v.to_string());
+                        }
+                    }
                 }
 
                 let column = batch.column(id);
