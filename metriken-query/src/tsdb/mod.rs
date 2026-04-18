@@ -23,6 +23,17 @@ pub use heatmap::Heatmap;
 pub use labels::Labels;
 pub use series::*;
 
+/// Snap a nanosecond timestamp to the nearest multiple of `interval_ns`.
+/// Returns the timestamp unchanged when `interval_ns` is zero (i.e. unknown).
+#[allow(clippy::manual_checked_ops)]
+fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
+    if interval_ns > 0 {
+        ((ts + interval_ns / 2) / interval_ns) * interval_ns
+    } else {
+        ts
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Tsdb {
     sampling_interval_ms: u64,
@@ -106,9 +117,21 @@ impl Tsdb {
                         .downcast_ref::<UInt64Array>()
                         .expect("Failed to downcast");
 
+                    let interval_ns = data.sampling_interval_ms * 1_000_000;
+
                     for (id, value) in values.iter().enumerate() {
                         if let Some(v) = value {
-                            timestamps.insert(id, v);
+                            // Snap timestamps to the nearest multiple of the
+                            // sampling interval.  Different samplers may fire
+                            // at slightly different wall-clock times within
+                            // the same collection cycle, so their raw
+                            // timestamps can diverge by microseconds.
+                            // Aligning here ensures that binary operations
+                            // between metrics from different samplers (e.g.
+                            // `irate(cpu_usage) / cpu_cores`) find matching
+                            // timestamps.
+                            let snapped = snap_timestamp(v, interval_ns);
+                            timestamps.insert(id, snapped);
                         }
                     }
 
@@ -258,11 +281,17 @@ impl Tsdb {
     /// TSDB.
     #[cfg(feature = "ingest")]
     pub fn ingest(&mut self, mut snapshot: metriken_exposition::Snapshot) {
-        let ts = snapshot
+        let raw_ts = snapshot
             .systemtime()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .expect("system clock is earlier than 1970")
             .as_nanos() as u64;
+
+        // Snap to the nearest sampling interval boundary so that metrics
+        // from different samplers within the same collection cycle share
+        // an identical timestamp.
+        let interval_ns = self.sampling_interval_ms * 1_000_000;
+        let ts = snap_timestamp(raw_ts, interval_ns);
 
         for counter in snapshot.counters() {
             let (name, labels) = Self::extract_name_labels(&counter.metadata);
