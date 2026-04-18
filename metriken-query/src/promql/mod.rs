@@ -1330,28 +1330,25 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             continue;
                         }
                         let untyped = series.untyped();
-                        let values: Vec<(f64, f64)> = if step_ns > interval_ns {
-                            // Step is coarser than native interval:
-                            // evaluate at step-aligned timestamps
+                        // Always evaluate at step-aligned timestamps so
+                        // gauge results can participate in binary operations
+                        // with other step-aligned series (e.g. irate
+                        // results).
+                        let staleness = step_ns.max(interval_ns);
+                        let values: Vec<(f64, f64)> = {
                             let mut vals = Vec::new();
                             let mut current = start_ns;
                             while current <= end_ns {
                                 if let Some((&ts, &val)) =
                                     untyped.inner.range(..=current).next_back()
                                 {
-                                    if current - ts <= step_ns {
+                                    if current - ts <= staleness {
                                         vals.push((current as f64 / 1e9, val));
                                     }
                                 }
                                 current += step_ns;
                             }
                             vals
-                        } else {
-                            untyped
-                                .inner
-                                .range(start_ns..=end_ns)
-                                .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                                .collect()
                         };
 
                         if !values.is_empty() {
