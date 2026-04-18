@@ -1316,16 +1316,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 // Handle simple metric selection - return all series with their labels
                 // Check for gauges first
                 if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
-                    // Special case for cpu_cores - return as scalar
-                    if metric_name == "cpu_cores" {
-                        let sum_series = collection.filtered_sum(&Labels::default());
-                        if let Some((_ts, value)) = sum_series.inner.iter().next() {
-                            return Ok(QueryResult::Scalar {
-                                result: (start, *value),
-                            });
-                        }
-                    }
-
                     let start_ns = (start * 1e9) as u64;
                     let end_ns = (end * 1e9) as u64;
                     let step_ns = (step * 1e9) as u64;
