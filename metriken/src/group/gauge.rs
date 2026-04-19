@@ -81,7 +81,7 @@ impl GaugeGroup {
             .get_or_init(|| {
                 let mut v = Vec::with_capacity(self.entries);
                 for _ in 0..self.entries {
-                    v.push(AtomicI64::new(0));
+                    v.push(AtomicI64::new(i64::MIN));
                 }
                 Backing::Owned(v)
             })
