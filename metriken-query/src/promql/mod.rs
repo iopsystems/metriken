@@ -153,6 +153,47 @@ fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
+/// Build the label set used to match two series in a binary operation, honoring
+/// any `on(...)` / `ignoring(...)` modifier attached to the binary expression.
+///
+/// When no modifier is supplied the match key is the full label set with the
+/// reserved `__name__` label dropped (this is the historical behavior). With
+/// `on(labels)` only the listed labels participate in matching; with
+/// `ignoring(labels)` every label except the listed ones (and `__name__`)
+/// participates. This lets operators combine series with otherwise mismatched
+/// label sets — e.g. `tx_bytes / ignoring(direction) link_bandwidth` where the
+/// tx/rx series carries a `direction` label that the bandwidth series does not.
+fn match_key(
+    metric: &HashMap<String, String>,
+    matching: Option<&parser::LabelModifier>,
+) -> BTreeMap<String, String> {
+    let mut key = BTreeMap::new();
+    match matching {
+        Some(parser::LabelModifier::Include(labels)) => {
+            for label_name in &labels.labels {
+                if let Some(value) = metric.get(label_name) {
+                    key.insert(label_name.clone(), value.clone());
+                }
+            }
+        }
+        Some(parser::LabelModifier::Exclude(labels)) => {
+            for (k, v) in metric {
+                if k != "__name__" && !labels.labels.contains(k) {
+                    key.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        None => {
+            for (k, v) in metric {
+                if k != "__name__" {
+                    key.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    key
+}
+
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     pub fn new(tsdb: T) -> Self {
         Self { tsdb }
@@ -1107,6 +1148,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         op: &TokenType,
         left: QueryResult,
         right: QueryResult,
+        modifier: Option<&parser::BinModifier>,
     ) -> Result<QueryResult, QueryError> {
         match (left, right) {
             // Both sides are matrices (time series)
@@ -1119,42 +1161,29 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 },
             ) => {
                 let mut result_samples = Vec::new();
+                let matching = modifier.and_then(|m| m.matching.as_ref());
 
-                // Build a map of right samples by their label set for efficient matching
+                // Build a map of right samples by their matching label set
                 let mut right_by_labels: HashMap<BTreeMap<String, String>, &MatrixSample> =
                     HashMap::new();
                 for right_sample in &right_samples {
-                    // Extract labels (excluding __name__)
-                    let mut labels = BTreeMap::new();
-                    for (k, v) in &right_sample.metric {
-                        if k != "__name__" {
-                            labels.insert(k.clone(), v.clone());
-                        }
-                    }
+                    let labels = match_key(&right_sample.metric, matching);
                     right_by_labels.insert(labels, right_sample);
                 }
 
                 for left_sample in &left_samples {
-                    // Extract labels from left sample (excluding __name__)
-                    let mut left_labels = BTreeMap::new();
-                    for (k, v) in &left_sample.metric {
-                        if k != "__name__" {
-                            left_labels.insert(k.clone(), v.clone());
-                        }
-                    }
+                    let left_labels = match_key(&left_sample.metric, matching);
 
                     // Find matching right sample by labels
-                    let right_sample = if left_labels.is_empty() && right_samples.len() == 1 {
-                        // Special case: if left has no labels and right has only one series, use it
-                        right_samples.first()
-                    } else if right_samples.len() == 1 {
-                        // If right has only one series, use it regardless of labels
-                        // (common case for single-metric operations)
+                    let right_sample = if let Some(matched) = right_by_labels.get(&left_labels) {
+                        Some(*matched)
+                    } else if matching.is_none() && right_samples.len() == 1 {
+                        // No explicit matcher and right has a single series: fall back to it.
+                        // This preserves the common case of combining a vector with a
+                        // single-series metric or aggregate without specifying matchers.
                         right_samples.first()
                     } else {
-                        // Match by labels
-                        let matched = right_by_labels.get(&left_labels).copied();
-                        matched
+                        None
                     };
 
                     if let Some(right_sample) = right_sample {
@@ -1302,8 +1331,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 let left = self.evaluate_expr(&binary.lhs, start, end, step)?;
                 let right = self.evaluate_expr(&binary.rhs, start, end, step)?;
 
-                // Apply the binary operation
-                self.apply_binary_op(&binary.op, left, right)
+                // Apply the binary operation, honoring any on()/ignoring() modifier
+                self.apply_binary_op(&binary.op, left, right, binary.modifier.as_ref())
             }
             Expr::VectorSelector(selector) => {
                 // Handle simple metric selection

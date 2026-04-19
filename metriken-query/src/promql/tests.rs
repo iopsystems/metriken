@@ -873,3 +873,144 @@ fn test_triple_gauge_expression_respects_step() {
     assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
     assert!((all_values[0][2].1 - 550.0).abs() < 1e-6); // (1000-400)-50
 }
+
+/// Build a TSDB modeling a duplex link: per-direction traffic counters and a
+/// per-interface bandwidth gauge. Traffic carries a `direction` label that the
+/// bandwidth series does not, so combining them requires on()/ignoring().
+///
+///   tx_bytes{iface="eth0", direction="tx"} = 100 at each step
+///   tx_bytes{iface="eth1", direction="tx"} = 200 at each step
+///   link_bandwidth{iface="eth0"} = 1000 at each step
+///   link_bandwidth{iface="eth1"} = 2000 at each step
+fn create_duplex_tsdb() -> Tsdb {
+    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    for step in 0u64..3 {
+        let time = base_time + Duration::from_secs(step);
+        let mut gauges = Vec::new();
+
+        for (iface, tx_val) in [("eth0", 100i64), ("eth1", 200i64)] {
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), "tx_bytes".to_string());
+            meta.insert("iface".to_string(), iface.to_string());
+            meta.insert("direction".to_string(), "tx".to_string());
+            gauges.push(Gauge {
+                name: "tx_bytes".to_string(),
+                value: tx_val,
+                metadata: meta,
+            });
+        }
+
+        for (iface, bw) in [("eth0", 1000i64), ("eth1", 2000i64)] {
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), "link_bandwidth".to_string());
+            meta.insert("iface".to_string(), iface.to_string());
+            gauges.push(Gauge {
+                name: "link_bandwidth".to_string(),
+                value: bw,
+                metadata: meta,
+            });
+        }
+
+        let snapshot = Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges,
+            histograms: Vec::new(),
+        });
+        tsdb.ingest(snapshot);
+    }
+
+    tsdb
+}
+
+fn series_for_iface(result: &QueryResult, iface: &str) -> Option<Vec<(f64, f64)>> {
+    match result {
+        QueryResult::Matrix { result } => result
+            .iter()
+            .find(|s| s.metric.get("iface").map(|v| v.as_str()) == Some(iface))
+            .map(|s| s.values.clone()),
+        _ => None,
+    }
+}
+
+#[test]
+fn test_ignoring_matches_mismatched_labels() {
+    // tx_bytes has {iface, direction}; link_bandwidth has only {iface}. With
+    // ignoring(direction) the series are matched pairwise by iface, giving
+    // tx_bytes / link_bandwidth per interface.
+    let tsdb = Arc::new(create_duplex_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            "tx_bytes / ignoring(direction, metric) link_bandwidth",
+            1000.0,
+            1002.0,
+            1.0,
+        )
+        .unwrap();
+
+    assert_eq!(
+        count_matrix_series(&result),
+        2,
+        "expected one series per iface"
+    );
+
+    let eth0 = series_for_iface(&result, "eth0").expect("eth0 series");
+    let eth1 = series_for_iface(&result, "eth1").expect("eth1 series");
+
+    assert_eq!(eth0.len(), 3);
+    for (_, v) in &eth0 {
+        assert!((v - 0.1).abs() < 1e-9, "eth0: 100/1000 = 0.1, got {v}");
+    }
+
+    assert_eq!(eth1.len(), 3);
+    for (_, v) in &eth1 {
+        assert!((v - 0.1).abs() < 1e-9, "eth1: 200/2000 = 0.1, got {v}");
+    }
+}
+
+#[test]
+fn test_on_matches_shared_labels() {
+    // Same shape as ignoring(), but expressed with on(iface).
+    let tsdb = Arc::new(create_duplex_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("tx_bytes / on(iface) link_bandwidth", 1000.0, 1002.0, 1.0)
+        .unwrap();
+
+    assert_eq!(count_matrix_series(&result), 2);
+
+    let eth0 = series_for_iface(&result, "eth0").expect("eth0 series");
+    let eth1 = series_for_iface(&result, "eth1").expect("eth1 series");
+
+    for (_, v) in &eth0 {
+        assert!((v - 0.1).abs() < 1e-9);
+    }
+    for (_, v) in &eth1 {
+        assert!((v - 0.1).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn test_mismatched_labels_without_modifier_do_not_match() {
+    // Without a matching modifier, and with multiple series on both sides,
+    // mismatched label sets produce no pairings — confirming that ignoring()
+    // is doing real work in the tests above rather than being papered over
+    // by the single-series fallback.
+    let tsdb = Arc::new(create_duplex_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("tx_bytes / link_bandwidth", 1000.0, 1002.0, 1.0)
+        .unwrap();
+
+    assert_eq!(count_matrix_series(&result), 0);
+}
