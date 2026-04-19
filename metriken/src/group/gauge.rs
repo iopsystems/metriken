@@ -106,17 +106,34 @@ impl GaugeGroup {
 
     /// Add `value` to the gauge at `idx`.
     ///
+    /// If the entry has not been initialized yet, it is treated as `0` before
+    /// the addition.
+    ///
     /// Returns `false` if `idx` is out of bounds.
     #[inline]
     pub fn add(&self, idx: usize, value: i64) -> bool {
         if idx >= self.entries {
             return false;
         }
-        self.get_or_init()[idx].fetch_add(value, Ordering::Relaxed);
-        true
+        let atomic = &self.get_or_init()[idx];
+        let mut current = atomic.load(Ordering::Relaxed);
+        loop {
+            let new = if current == i64::MIN {
+                value
+            } else {
+                current.wrapping_add(value)
+            };
+            match atomic.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Subtract `value` from the gauge at `idx`.
+    ///
+    /// If the entry has not been initialized yet, it is treated as `0` before
+    /// the subtraction.
     ///
     /// Returns `false` if `idx` is out of bounds.
     #[inline]
@@ -124,8 +141,19 @@ impl GaugeGroup {
         if idx >= self.entries {
             return false;
         }
-        self.get_or_init()[idx].fetch_sub(value, Ordering::Relaxed);
-        true
+        let atomic = &self.get_or_init()[idx];
+        let mut current = atomic.load(Ordering::Relaxed);
+        loop {
+            let new = if current == i64::MIN {
+                value.wrapping_neg()
+            } else {
+                current.wrapping_sub(value)
+            };
+            match atomic.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Set the gauge at `idx` to `value`.
@@ -141,15 +169,16 @@ impl GaugeGroup {
 
     /// Load the current value of the gauge at `idx`.
     ///
-    /// Returns `None` if `idx` is out of bounds or values haven't been
-    /// initialized.
+    /// Returns `None` if `idx` is out of bounds, values haven't been
+    /// initialized, or the entry has not been written to yet.
     pub fn value(&self, idx: usize) -> Option<i64> {
         if idx >= self.entries {
             return None;
         }
-        self.values
-            .get()
-            .map(|b| b.as_slice()[idx].load(Ordering::Relaxed))
+        self.values.get().and_then(|b| {
+            let v = b.as_slice()[idx].load(Ordering::Relaxed);
+            (v != i64::MIN).then_some(v)
+        })
     }
 
     /// Load all gauge values as a snapshot.
