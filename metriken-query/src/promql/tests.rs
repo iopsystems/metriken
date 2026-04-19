@@ -956,7 +956,11 @@ fn test_ignoring_matches_mismatched_labels() {
         )
         .unwrap();
 
-    assert_eq!(count_matrix_series(&result), 2, "expected one series per iface");
+    assert_eq!(
+        count_matrix_series(&result),
+        2,
+        "expected one series per iface"
+    );
 
     let eth0 = series_for_iface(&result, "eth0").expect("eth0 series");
     let eth1 = series_for_iface(&result, "eth1").expect("eth1 series");
@@ -979,12 +983,7 @@ fn test_on_matches_shared_labels() {
     let engine = QueryEngine::new(tsdb);
 
     let result = engine
-        .query_range(
-            "tx_bytes / on(iface) link_bandwidth",
-            1000.0,
-            1002.0,
-            1.0,
-        )
+        .query_range("tx_bytes / on(iface) link_bandwidth", 1000.0, 1002.0, 1.0)
         .unwrap();
 
     assert_eq!(count_matrix_series(&result), 2);
