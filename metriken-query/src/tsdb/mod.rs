@@ -7,7 +7,7 @@ use std::path::Path;
 use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
-use histogram::Histogram;
+use histogram::{CumulativeROHistogram, Histogram};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
@@ -252,7 +252,14 @@ impl Tsdb {
                                             max_value_power,
                                             buckets,
                                         ) {
-                                            series.insert(*ts, h);
+                                            // Histograms are only read back for
+                                            // analytical queries here, so drop
+                                            // the dense representation as soon
+                                            // as it is loaded.
+                                            series.insert(
+                                                *ts,
+                                                CumulativeROHistogram::from(&h),
+                                            );
                                         }
                                     }
                                 }
@@ -326,7 +333,7 @@ impl Tsdb {
                 .or_default()
                 .entry(labels)
                 .or_default()
-                .insert(ts, histogram.value);
+                .insert(ts, CumulativeROHistogram::from(&histogram.value));
         }
     }
 
