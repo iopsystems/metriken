@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "arrow",
  "axum",

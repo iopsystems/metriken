@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.9.5
+
+- Store histograms in the TSDB as `CumulativeROHistogram`, which only retains
+  non-zero buckets in columnar form. This substantially reduces memory usage
+  for sparse distributions and lets quantile queries run as a binary search on
+  the cumulative counts. Delta and sum between two `CumulativeROHistogram`s
+  are computed via a shared `combine()` helper.
+
 ### metriken-query 0.9.4
 
 - Support PromQL `on(...)` and `ignoring(...)` label-matching modifiers on
