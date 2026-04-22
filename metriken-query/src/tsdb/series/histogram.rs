@@ -246,7 +246,10 @@ where
 }
 
 /// Delta between two snapshots: `curr - prev` per bucket (wrapping).
-fn delta(prev: &CumulativeROHistogram, curr: &CumulativeROHistogram) -> Option<CumulativeROHistogram> {
+fn delta(
+    prev: &CumulativeROHistogram,
+    curr: &CumulativeROHistogram,
+) -> Option<CumulativeROHistogram> {
     combine(prev, curr, |p, c| c.wrapping_sub(p))
 }
 

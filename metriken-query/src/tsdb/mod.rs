@@ -256,10 +256,7 @@ impl Tsdb {
                                             // analytical queries here, so drop
                                             // the dense representation as soon
                                             // as it is loaded.
-                                            series.insert(
-                                                *ts,
-                                                CumulativeROHistogram::from(&h),
-                                            );
+                                            series.insert(*ts, CumulativeROHistogram::from(&h));
                                         }
                                     }
                                 }
