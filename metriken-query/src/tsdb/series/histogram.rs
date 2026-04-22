@@ -1,9 +1,19 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use ::histogram::{CumulativeROHistogram, Histogram, Quantile, SampleQuantiles};
+
 use super::*;
 
 /// Represents a series of histogram readings.
+///
+/// Histograms are stored as [`CumulativeROHistogram`]s, a read-only cumulative
+/// form that keeps only non-zero buckets in columnar form. This is
+/// substantially smaller than the dense [`Histogram`] representation when the
+/// underlying distribution is sparse, and the cumulative layout keeps quantile
+/// queries cheap.
 #[derive(Default, Clone)]
 pub struct HistogramSeries {
-    inner: BTreeMap<u64, Histogram>,
+    inner: BTreeMap<u64, CumulativeROHistogram>,
 }
 
 /// Data for rendering a histogram as a latency heatmap
@@ -26,7 +36,7 @@ impl HistogramSeries {
         self.inner.is_empty()
     }
 
-    pub fn insert(&mut self, timestamp: u64, value: Histogram) {
+    pub fn insert(&mut self, timestamp: u64, value: CumulativeROHistogram) {
         self.inner.insert(timestamp, value);
     }
 
@@ -60,18 +70,22 @@ impl HistogramSeries {
                 }
             }
 
-            let delta = match curr.wrapping_sub(prev) {
-                Ok(d) => d,
-                Err(_) => {
+            let delta = match delta(prev, curr) {
+                Some(d) => d,
+                None => {
                     prev = curr;
                     prev_time = *time;
                     continue;
                 }
             };
 
-            if let Ok(Some(pct_results)) = delta.percentiles(percentiles) {
-                for (id, (_, bucket)) in pct_results.iter().enumerate() {
-                    result[id].inner.insert(*time, bucket.end() as f64);
+            if let Ok(Some(q_results)) = delta.quantiles(percentiles) {
+                for (id, q) in percentiles.iter().enumerate() {
+                    if let Ok(quantile) = Quantile::new(*q) {
+                        if let Some(bucket) = q_results.get(&quantile) {
+                            result[id].inner.insert(*time, bucket.end() as f64);
+                        }
+                    }
                 }
             }
 
@@ -97,9 +111,16 @@ impl HistogramSeries {
         let mut prev = first_hist;
         let mut prev_time = first_time;
 
-        // Collect bucket boundaries from the first histogram
-        // (all histograms in the series should have the same config)
-        let mut bucket_bounds_set = false;
+        // Bucket boundaries come from the histogram config, which is identical
+        // across the series.  Collect them once from an empty Histogram with
+        // the same configuration so the Y-axis covers every bucket (not only
+        // the non-zero ones we actually observe).
+        let config = first_hist.config();
+        if let Ok(empty) = Histogram::new(config.grouping_power(), config.max_value_power()) {
+            result.bucket_bounds = empty.iter().map(|b| b.end()).collect();
+        } else {
+            return None;
+        }
 
         for (time, curr) in self.inner.iter().skip(1) {
             // With a stride, skip snapshots until we've covered the stride window.
@@ -109,9 +130,9 @@ impl HistogramSeries {
                 }
             }
 
-            let delta = match curr.wrapping_sub(prev) {
-                Ok(d) => d,
-                Err(_) => {
+            let delta = match delta(prev, curr) {
+                Some(d) => d,
+                None => {
                     prev = curr;
                     prev_time = *time;
                     continue;
@@ -122,25 +143,16 @@ impl HistogramSeries {
             // Store timestamp in seconds
             result.timestamps.push(*time as f64 / 1_000_000_000.0);
 
-            // Iterate over buckets and collect counts
-            for (bucket_index, bucket) in delta.iter().enumerate() {
-                let count = bucket.count();
-
-                // Only include non-zero buckets to save space
-                if count > 0 {
-                    let count_f64 = count as f64;
-                    result.data.push((time_index, bucket_index, count_f64));
-                    min_value = min_value.min(count_f64);
-                    max_value = max_value.max(count_f64);
-                }
-
-                // Collect bucket boundaries once
-                if !bucket_bounds_set {
-                    result.bucket_bounds.push(bucket.end());
-                }
+            // Emit only the non-zero buckets of the delta — CumulativeRO only
+            // stores those, so this is also a zero-copy walk.
+            for (i, bucket) in delta.iter().enumerate() {
+                let bucket_index = delta.index()[i] as usize;
+                let count_f64 = bucket.count() as f64;
+                result.data.push((time_index, bucket_index, count_f64));
+                min_value = min_value.min(count_f64);
+                max_value = max_value.max(count_f64);
             }
 
-            bucket_bounds_set = true;
             prev = curr;
             prev_time = *time;
         }
@@ -167,7 +179,7 @@ impl Add<&HistogramSeries> for HistogramSeries {
 
         for (time, histogram) in other.inner.iter() {
             if let Some(h) = result.inner.get_mut(time) {
-                if let Ok(sum) = h.wrapping_add(histogram) {
+                if let Some(sum) = wrapping_add(h, histogram) {
                     *h = sum;
                 }
                 // Skip mismatched histograms rather than panicking
@@ -178,4 +190,74 @@ impl Add<&HistogramSeries> for HistogramSeries {
 
         result
     }
+}
+
+/// Decompose a `CumulativeROHistogram` into `bucket_index -> individual_count`.
+fn individual_counts(h: &CumulativeROHistogram) -> BTreeMap<u32, u64> {
+    let index = h.index();
+    let count = h.count();
+    let mut out = BTreeMap::new();
+    let mut prev = 0u64;
+    for (i, &idx) in index.iter().enumerate() {
+        let c = count[i];
+        out.insert(idx, c - prev);
+        prev = c;
+    }
+    out
+}
+
+/// Combine two decomposed histograms with a per-bucket binary operator and
+/// rebuild a `CumulativeROHistogram`.  Returns `None` if the configs differ.
+fn combine<F>(
+    prev: &CumulativeROHistogram,
+    curr: &CumulativeROHistogram,
+    op: F,
+) -> Option<CumulativeROHistogram>
+where
+    F: Fn(u64, u64) -> u64,
+{
+    if prev.config() != curr.config() {
+        return None;
+    }
+
+    let p = individual_counts(prev);
+    let c = individual_counts(curr);
+
+    let mut indices: BTreeSet<u32> = BTreeSet::new();
+    indices.extend(p.keys().copied());
+    indices.extend(c.keys().copied());
+
+    let mut index = Vec::new();
+    let mut count = Vec::new();
+    let mut running: u64 = 0;
+
+    for idx in indices {
+        let pv = p.get(&idx).copied().unwrap_or(0);
+        let cv = c.get(&idx).copied().unwrap_or(0);
+        let d = op(pv, cv);
+        if d > 0 {
+            running = running.wrapping_add(d);
+            index.push(idx);
+            count.push(running);
+        }
+    }
+
+    CumulativeROHistogram::from_parts(prev.config(), index, count).ok()
+}
+
+/// Delta between two snapshots: `curr - prev` per bucket (wrapping).
+fn delta(
+    prev: &CumulativeROHistogram,
+    curr: &CumulativeROHistogram,
+) -> Option<CumulativeROHistogram> {
+    combine(prev, curr, |p, c| c.wrapping_sub(p))
+}
+
+/// Merge (sum) two snapshots bucket-wise.  Used when summing series at the
+/// same timestamp across label sets.
+fn wrapping_add(
+    a: &CumulativeROHistogram,
+    b: &CumulativeROHistogram,
+) -> Option<CumulativeROHistogram> {
+    combine(a, b, |x, y| x.wrapping_add(y))
 }
