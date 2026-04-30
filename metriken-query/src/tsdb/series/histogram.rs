@@ -1,58 +1,54 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use ::histogram::{Config, CumulativeROHistogram, CumulativeROHistogram32, Histogram, Quantile};
 
 use super::*;
 
-/// Represents a series of histogram readings.
+/// Represents a series of histogram readings stored in a flat CSR layout.
 ///
-/// Each entry is a per-period delta in `BucketsDelta` form: parallel
-/// `Vec<u32>`s of sorted non-zero bucket indices and the corresponding
-/// running cumulative counts across only those buckets.  The single
-/// `histogram::Config` is hoisted out to the series — every snapshot in a
-/// series shares the same configuration, so storing it per-snapshot was
-/// pure overhead.
+/// Bucket data for every snapshot in the series is concatenated into a
+/// single `indices` / `counts` pair of buffers.  `offsets[i]` marks where
+/// snapshot `i`'s range begins; the range ends at `offsets[i+1]` (or
+/// `indices.len()` for the last snapshot).  Per-snapshot fixed overhead
+/// is **12 B** (8 B timestamp + 4 B offset) — down from 56 B in the
+/// per-snapshot Vec layout, and 88 B in the pre-hoist layout.
 ///
-/// Per-snapshot footprint is now 56 B (was 88 B): two `Vec<u32>` headers
-/// plus a `u64` timestamp.  See
-/// `docs/histogram-series-memory-optimization-plan.md` for the next-step
-/// CSR flattening that drops this further to 12 B per snapshot.
+/// `Config` is held once at the series level — every snapshot shares it,
+/// so per-snapshot storage was redundant.
 ///
+/// Each snapshot's bucket data is the per-period delta between the
+/// previous raw cumulative snapshot and the snapshot at this timestamp:
+/// sorted ascending non-zero bucket indices, with `counts` being the
+/// running cumulative (prefix sum) across only those non-zero buckets.
 /// Per-period deltas comfortably fit in `u32` for any realistic sampling
 /// interval, which halves the stored count footprint vs `u64`.
-/// Pre-differencing on load also removes the per-pair `delta()` work from
-/// the hot query paths.
 ///
-/// Entries are kept as a sorted `Vec<(timestamp_ns, BucketsDelta)>` ordered
-/// by timestamp.  Insertion is O(1) at the end (the load-time pattern) and
-/// falls back to a binary-search insert otherwise.
-///
-/// Stride-window queries anchor at the first stored delta's timestamp.  The
-/// very first raw snapshot is dropped (no predecessor, no delta) so for
-/// regularly-sampled inputs every stride bin is shifted by one sampling
-/// interval relative to the original cumulative-form behavior — equivalent to
-/// rendering a null at the leading edge of the time axis.
+/// Stride-window queries anchor at the first stored delta's timestamp.
+/// The very first raw snapshot is dropped (no predecessor, no delta) so
+/// for regularly-sampled inputs every stride bin is shifted by one
+/// sampling interval relative to the original cumulative-form behavior —
+/// equivalent to rendering a null at the leading edge of the time axis.
 #[derive(Default, Clone)]
 pub struct HistogramSeries {
     config: Option<Config>,
-    inner: Vec<(u64, BucketsDelta)>,
+    /// Sorted ascending timestamps; `timestamps[i]` is snapshot `i`'s ts.
+    timestamps: Vec<u64>,
+    /// Start index into `indices`/`counts` for each snapshot.  Snapshot
+    /// `i` covers `offsets[i] .. offsets.get(i+1).unwrap_or(indices.len())`.
+    offsets: Vec<u32>,
+    /// Concatenation of every snapshot's non-zero bucket indices.
+    indices: Vec<u32>,
+    /// Concatenation of every snapshot's running-cumulative counts (one
+    /// per index).  Each snapshot's slice is locally a prefix sum,
+    /// independent of any other snapshot's slice.
+    counts: Vec<u32>,
 }
 
-/// Per-snapshot delta payload: sorted ascending non-zero bucket indices and
-/// the matching running cumulative counts (prefix sum) for those buckets.
-#[derive(Default, Clone)]
-pub(crate) struct BucketsDelta {
-    index: Vec<u32>,
-    count: Vec<u32>,
-}
-
-impl BucketsDelta {
-    fn from_hist(h: &CumulativeROHistogram32) -> Self {
-        Self {
-            index: h.index().to_vec(),
-            count: h.count().to_vec(),
-        }
-    }
+/// Borrowed view into a single snapshot's bucket data.
+struct DeltaView<'a> {
+    index: &'a [u32],
+    count: &'a [u32],
 }
 
 /// Data for rendering a histogram as a latency heatmap
@@ -72,7 +68,85 @@ pub struct HistogramHeatmapData {
 
 impl HistogramSeries {
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.timestamps.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.timestamps.len()
+    }
+
+    /// Range into `indices`/`counts` for snapshot `i`.
+    fn snapshot_range(&self, i: usize) -> Range<usize> {
+        let start = self.offsets[i] as usize;
+        let end = self
+            .offsets
+            .get(i + 1)
+            .copied()
+            .map(|v| v as usize)
+            .unwrap_or(self.indices.len());
+        start..end
+    }
+
+    /// Borrowed view of snapshot `i`'s bucket data.
+    fn delta_at(&self, i: usize) -> DeltaView<'_> {
+        let r = self.snapshot_range(i);
+        DeltaView {
+            index: &self.indices[r.clone()],
+            count: &self.counts[r],
+        }
+    }
+
+    /// Append a snapshot's bucket data at the end of the flat buffers.
+    fn push_snapshot(&mut self, ts: u64, idx: &[u32], cnt: &[u32]) {
+        self.timestamps.push(ts);
+        self.offsets.push(self.indices.len() as u32);
+        self.indices.extend_from_slice(idx);
+        self.counts.extend_from_slice(cnt);
+    }
+
+    /// Replace the last snapshot's bucket data in place.  Used when an
+    /// `insert` collides with the most recent timestamp.
+    fn replace_last_snapshot(&mut self, idx: &[u32], cnt: &[u32]) {
+        let last = self.timestamps.len() - 1;
+        let r = self.snapshot_range(last);
+        self.indices.splice(r.clone(), idx.iter().copied());
+        self.counts.splice(r, cnt.iter().copied());
+    }
+
+    /// Replace the bucket data at snapshot `i` in place.
+    fn replace_snapshot(&mut self, i: usize, idx: &[u32], cnt: &[u32]) {
+        let r = self.snapshot_range(i);
+        let old_len = r.end - r.start;
+        let new_len = idx.len();
+        self.indices.splice(r.clone(), idx.iter().copied());
+        self.counts.splice(r, cnt.iter().copied());
+        if new_len != old_len {
+            let delta = new_len as i64 - old_len as i64;
+            for off in &mut self.offsets[i + 1..] {
+                *off = (*off as i64 + delta) as u32;
+            }
+        }
+    }
+
+    /// Insert a new snapshot at position `i`.
+    fn insert_snapshot(&mut self, i: usize, ts: u64, idx: &[u32], cnt: &[u32]) {
+        let off = if i < self.offsets.len() {
+            self.offsets[i] as usize
+        } else {
+            self.indices.len()
+        };
+        self.timestamps.insert(i, ts);
+        self.offsets.insert(i, off as u32);
+        self.indices
+            .splice(off..off, idx.iter().copied())
+            .for_each(drop);
+        self.counts
+            .splice(off..off, cnt.iter().copied())
+            .for_each(drop);
+        let inserted_len = idx.len() as u32;
+        for o in &mut self.offsets[i + 1..] {
+            *o += inserted_len;
+        }
     }
 
     pub fn insert(&mut self, timestamp: u64, value: CumulativeROHistogram32) {
@@ -85,31 +159,32 @@ impl HistogramSeries {
             _ => {}
         }
 
-        let delta = BucketsDelta::from_hist(&value);
+        let idx = value.index();
+        let cnt = value.count();
 
-        if let Some((last_ts, _)) = self.inner.last() {
-            if timestamp > *last_ts {
-                self.inner.push((timestamp, delta));
+        if let Some(&last_ts) = self.timestamps.last() {
+            if timestamp > last_ts {
+                self.push_snapshot(timestamp, idx, cnt);
                 return;
             }
-            if timestamp == *last_ts {
-                self.inner.last_mut().unwrap().1 = delta;
+            if timestamp == last_ts {
+                self.replace_last_snapshot(idx, cnt);
                 return;
             }
         } else {
-            self.inner.push((timestamp, delta));
+            self.push_snapshot(timestamp, idx, cnt);
             return;
         }
-        match self.inner.binary_search_by_key(&timestamp, |(t, _)| *t) {
-            Ok(idx) => self.inner[idx].1 = delta,
-            Err(idx) => self.inner.insert(idx, (timestamp, delta)),
+        match self.timestamps.binary_search(&timestamp) {
+            Ok(pos) => self.replace_snapshot(pos, idx, cnt),
+            Err(pos) => self.insert_snapshot(pos, timestamp, idx, cnt),
         }
     }
 
     /// Returns the time bounds (min, max) in nanoseconds, or None if empty.
     pub fn time_bounds(&self) -> Option<(u64, u64)> {
-        let min = self.inner.first()?.0;
-        let max = self.inner.last()?.0;
+        let min = *self.timestamps.first()?;
+        let max = *self.timestamps.last()?;
         Some((min, max))
     }
 
@@ -118,13 +193,19 @@ impl HistogramSeries {
     /// previous raw snapshot and the snapshot at this timestamp; an empty
     /// histogram (`is_empty()` true) means no events occurred in the
     /// interval, or the delta could not be represented.
+    ///
+    /// Each yielded snapshot materializes two small `Vec<u32>` clones so
+    /// the histogram crate's owned APIs continue to work unchanged.  When
+    /// upstream gains a slice-based / borrowed quantile API the
+    /// materialization can drop entirely.
     pub fn iter(&self) -> impl Iterator<Item = (u64, CumulativeROHistogram32)> + '_ {
         let config = self.config;
-        self.inner.iter().filter_map(move |(t, delta)| {
+        (0..self.len()).filter_map(move |i| {
             let cfg = config?;
-            CumulativeROHistogram32::from_parts(cfg, delta.index.clone(), delta.count.clone())
+            let view = self.delta_at(i);
+            CumulativeROHistogram32::from_parts(cfg, view.index.to_vec(), view.count.to_vec())
                 .ok()
-                .map(|h| (*t, h))
+                .map(|h| (self.timestamps[i], h))
         })
     }
 
@@ -157,7 +238,7 @@ impl HistogramSeries {
     /// Returns bucket data suitable for rendering as a heatmap.
     /// Y-axis is bucket index (latency range), X-axis is time, color is count.
     pub fn heatmap(&self, stride_ns: Option<u64>) -> Option<HistogramHeatmapData> {
-        if self.inner.is_empty() {
+        if self.is_empty() {
             return None;
         }
 
@@ -226,16 +307,17 @@ impl HistogramSeries {
             None => return Box::new(std::iter::empty()),
         };
         match stride_ns {
-            None => Box::new(self.inner.iter().filter_map(move |(t, delta)| {
+            None => Box::new((0..self.len()).filter_map(move |i| {
+                let view = self.delta_at(i);
                 CumulativeROHistogram32::from_parts(
                     config,
-                    delta.index.clone(),
-                    delta.count.clone(),
+                    view.index.to_vec(),
+                    view.count.to_vec(),
                 )
                 .ok()
-                .map(|h| (*t, h))
+                .map(|h| (self.timestamps[i], h))
             })),
-            Some(stride) => Box::new(StrideIter::new(self.inner.iter(), stride, config)),
+            Some(stride) => Box::new(StrideIter::new(self, stride, config)),
         }
     }
 }
@@ -243,8 +325,9 @@ impl HistogramSeries {
 /// Sums consecutive per-period deltas until at least `stride` nanoseconds have
 /// elapsed since the last emitted bin, then yields the accumulated delta
 /// histogram timestamped at the last snapshot in the window.
-struct StrideIter<'a, I: Iterator<Item = &'a (u64, BucketsDelta)>> {
-    iter: I,
+struct StrideIter<'a> {
+    series: &'a HistogramSeries,
+    cursor: usize,
     stride: u64,
     last_emit: Option<u64>,
     accum: BTreeMap<u32, u64>,
@@ -252,10 +335,11 @@ struct StrideIter<'a, I: Iterator<Item = &'a (u64, BucketsDelta)>> {
     config: Config,
 }
 
-impl<'a, I: Iterator<Item = &'a (u64, BucketsDelta)>> StrideIter<'a, I> {
-    fn new(iter: I, stride: u64, config: Config) -> Self {
+impl<'a> StrideIter<'a> {
+    fn new(series: &'a HistogramSeries, stride: u64, config: Config) -> Self {
         Self {
-            iter,
+            series,
+            cursor: 0,
             stride,
             last_emit: None,
             accum: BTreeMap::new(),
@@ -290,29 +374,30 @@ impl<'a, I: Iterator<Item = &'a (u64, BucketsDelta)>> StrideIter<'a, I> {
     }
 }
 
-impl<'a, I: Iterator<Item = &'a (u64, BucketsDelta)>> Iterator for StrideIter<'a, I> {
+impl Iterator for StrideIter<'_> {
     type Item = (u64, CumulativeROHistogram32);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (time, delta) = match self.iter.next() {
-                Some(pair) => (pair.0, &pair.1),
-                None => {
-                    // Drain any final partial accumulator.
-                    if !self.accum.is_empty() {
-                        if let Some(emit) = self.flush() {
-                            return Some(emit);
-                        }
+            if self.cursor >= self.series.len() {
+                // Drain any final partial accumulator.
+                if !self.accum.is_empty() {
+                    if let Some(emit) = self.flush() {
+                        return Some(emit);
                     }
-                    return None;
                 }
-            };
+                return None;
+            }
+            let i = self.cursor;
+            self.cursor += 1;
+            let time = self.series.timestamps[i];
+            let view = self.series.delta_at(i);
 
             // Walk the delta's individual bucket counts (decompose the running
             // cumulative on the fly) into the accumulator.
             let mut prev = 0u32;
-            for (i, &idx) in delta.index.iter().enumerate() {
-                let cumu = delta.count[i];
+            for (k, &idx) in view.index.iter().enumerate() {
+                let cumu = view.count[k];
                 let individual = cumu - prev;
                 prev = cumu;
                 if individual > 0 {
@@ -357,45 +442,55 @@ impl Add<&HistogramSeries> for HistogramSeries {
             _ => return self,
         };
 
-        let a = &self.inner;
-        let b = &other.inner;
-        let mut out = Vec::with_capacity(a.len() + b.len());
-        let (mut i, mut j) = (0, 0);
-        while i < a.len() && j < b.len() {
-            match a[i].0.cmp(&b[j].0) {
+        let mut out = HistogramSeries {
+            config,
+            ..HistogramSeries::default()
+        };
+
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < self.len() && j < other.len() {
+            match self.timestamps[i].cmp(&other.timestamps[j]) {
                 std::cmp::Ordering::Less => {
-                    out.push(a[i].clone());
+                    let v = self.delta_at(i);
+                    out.push_snapshot(self.timestamps[i], v.index, v.count);
                     i += 1;
                 }
                 std::cmp::Ordering::Greater => {
-                    out.push(b[j].clone());
+                    let v = other.delta_at(j);
+                    out.push_snapshot(other.timestamps[j], v.index, v.count);
                     j += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    let merged = combine_slices(
-                        &a[i].1.index,
-                        &a[i].1.count,
-                        &b[j].1.index,
-                        &b[j].1.count,
-                        |x, y| x.wrapping_add(y),
-                    );
-                    out.push((a[i].0, merged));
+                    let a = self.delta_at(i);
+                    let b = other.delta_at(j);
+                    let (idx, cnt) = combine_slices(a.index, a.count, b.index, b.count, |x, y| {
+                        x.wrapping_add(y)
+                    });
+                    out.push_snapshot(self.timestamps[i], &idx, &cnt);
                     i += 1;
                     j += 1;
                 }
             }
         }
-        out.extend_from_slice(&a[i..]);
-        out.extend_from_slice(&b[j..]);
+        while i < self.len() {
+            let v = self.delta_at(i);
+            out.push_snapshot(self.timestamps[i], v.index, v.count);
+            i += 1;
+        }
+        while j < other.len() {
+            let v = other.delta_at(j);
+            out.push_snapshot(other.timestamps[j], v.index, v.count);
+            j += 1;
+        }
 
-        HistogramSeries { config, inner: out }
+        out
     }
 }
 
 /// Two-pointer merge over two already-sorted index/count pairs.  Decomposes
 /// each side's running cumulative into per-bucket individual counts on the
-/// fly, applies `op`, and rebuilds an output `BucketsDelta` whose `count`
-/// is the running cumulative across the merged bucket set.
+/// fly, applies `op`, and rebuilds an output `(index, count)` pair whose
+/// `count` is the running cumulative across the merged bucket set.
 ///
 /// O(N + M); replaces the previous BTreeMap/BTreeSet two-pass implementation.
 fn combine_slices(
@@ -404,7 +499,7 @@ fn combine_slices(
     b_idx: &[u32],
     b_cnt: &[u32],
     op: impl Fn(u32, u32) -> u32,
-) -> BucketsDelta {
+) -> (Vec<u32>, Vec<u32>) {
     let mut out_index = Vec::with_capacity(a_idx.len() + b_idx.len());
     let mut out_count = Vec::with_capacity(a_idx.len() + b_idx.len());
     let mut running: u32 = 0;
@@ -475,10 +570,7 @@ fn combine_slices(
         j += 1;
     }
 
-    BucketsDelta {
-        index: out_index,
-        count: out_count,
-    }
+    (out_index, out_count)
 }
 
 /// Compute the per-period delta between two consecutive cumulative-since-start
@@ -706,5 +798,33 @@ mod tests {
             .map(|(_, h)| h.clone())
             .unwrap();
         assert_eq!(merged_2k.total_count(), 11);
+    }
+
+    #[test]
+    fn out_of_order_insert_shifts_offsets_correctly() {
+        // Insert at end, then in the middle; verify the iteration order
+        // stays sorted and bucket payloads round-trip.
+        let c = cfg();
+        let s_prev = build_cumu(c, &[(0, 0)]);
+        let mut series = HistogramSeries::default();
+        series.insert(
+            1_000,
+            delta_to_32_or_empty(&s_prev, &build_cumu(c, &[(10, 1)])),
+        );
+        series.insert(
+            3_000,
+            delta_to_32_or_empty(&s_prev, &build_cumu(c, &[(10, 2), (20, 5)])),
+        );
+        series.insert(
+            2_000,
+            delta_to_32_or_empty(&s_prev, &build_cumu(c, &[(20, 3)])),
+        );
+
+        let entries: Vec<(u64, CumulativeROHistogram32)> = series.iter().collect();
+        let times: Vec<u64> = entries.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![1_000, 2_000, 3_000]);
+        assert_eq!(entries[0].1.total_count(), 1);
+        assert_eq!(entries[1].1.total_count(), 3);
+        assert_eq!(entries[2].1.total_count(), 7);
     }
 }
