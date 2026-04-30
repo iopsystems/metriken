@@ -257,12 +257,21 @@ buffers — fragmented allocations that jemalloc holds onto as scratch.
 * `live` reads `stats::allocated`; `resident` reads `stats::resident`
   after `epoch::advance()` flushes counters.
 
+## Already-landed slice-based quantile path
+
+`histogram = "1.3.1"` ships `CumulativeROHistogram32Ref<'a>` with
+`from_parts_unchecked(config, &[u32], &[u32])`, `quantiles`, `iter`,
+`iter_with_quantiles`, and a `SampleQuantiles` impl.
+`HistogramSeries::iter()` returns
+`(u64, CumulativeROHistogram32Ref<'_>)` borrowing into the series'
+flat buffers, and `percentiles()` / `heatmap()` dispatch through a
+`DeltaSnapshot::{Borrowed, Owned}` enum so the no-stride query path
+is zero-alloc.  Stride windows still materialize once per emitted
+bin (the accumulator sums across snapshots into a fresh buffer —
+nothing borrowable).
+
 ## Out of scope but worth flagging for follow-ups
 
-* **Slice-based quantile API in `iopsystems/histogram`** — would let
-  `percentiles()` / `heatmap()` skip the per-snapshot
-  `from_parts(config, idx.to_vec(), cnt.to_vec())` materialization.
-  Filed for upstream.
 * **Single-row-group writer-side parquet layout** — costs nothing on
   the writer for files of this size (≤ 17 MiB) and lets the loader
   drop its row-counter-across-batches arithmetic.  Not strictly
