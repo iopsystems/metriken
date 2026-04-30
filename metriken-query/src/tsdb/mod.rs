@@ -21,8 +21,8 @@ mod series;
 pub use collection::*;
 pub use heatmap::Heatmap;
 pub use labels::Labels;
-use series::delta_to_32;
 pub use series::*;
+use series::{delta_to_32_or_empty, empty_delta_32};
 
 /// Snap a nanosecond timestamp to the nearest multiple of `interval_ns`.
 /// Returns the timestamp unchanged when `interval_ns` is zero (i.e. unknown).
@@ -250,40 +250,64 @@ impl Tsdb {
                             // anchor for the next delta.
                             let mut prev: Option<CumulativeROHistogram> = None;
 
+                            // Cache the column's Config so we can record an
+                            // explicit empty delta at any timestamp where a
+                            // non-empty delta isn't available (null parquet
+                            // row, decode failure, reset, overflow).  This
+                            // keeps the stored series' timestamp axis in
+                            // lockstep with the column it came from.
+                            let column_config =
+                                ::histogram::Config::new(grouping_power, max_value_power).ok();
+
                             for (id, value) in list_array.iter().enumerate() {
                                 let ts = match timestamps.get(&id) {
                                     Some(ts) => *ts,
                                     None => continue,
                                 };
-                                let list_value = match value {
-                                    Some(v) => v,
-                                    None => continue,
-                                };
 
-                                let data = list_value
-                                    .as_any()
-                                    .downcast_ref::<UInt64Array>()
-                                    .expect("Failed to downcast to UInt64Array");
+                                // Decode this row's cumulative.  `None`
+                                // means the writer left the row unfilled;
+                                // `Err` means the bucket buffer doesn't
+                                // match the configured shape.  In both
+                                // cases we still want to mark `ts` with an
+                                // empty delta (assuming we already have a
+                                // baseline `prev`), and we don't update
+                                // `prev` so the next valid row deltas
+                                // against the last good cumulative.
+                                let curr = value.and_then(|list_value| {
+                                    let data = list_value
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .expect("Failed to downcast to UInt64Array");
+                                    let buckets: Vec<u64> = data.iter().flatten().collect();
+                                    Histogram::from_buckets(
+                                        grouping_power,
+                                        max_value_power,
+                                        buckets,
+                                    )
+                                    .ok()
+                                    .map(|h| CumulativeROHistogram::from(&h))
+                                });
 
-                                let buckets: Vec<u64> = data.iter().flatten().collect();
-
-                                let h = match Histogram::from_buckets(
-                                    grouping_power,
-                                    max_value_power,
-                                    buckets,
-                                ) {
-                                    Ok(h) => h,
-                                    Err(_) => continue,
-                                };
-
-                                let curr = CumulativeROHistogram::from(&h);
-
-                                if let Some(prev_cumu) = &prev {
-                                    if let Some(d) = delta_to_32(prev_cumu, &curr) {
-                                        series.insert(ts, d);
+                                match (&prev, &curr) {
+                                    (Some(prev_cumu), Some(curr_cumu)) => {
+                                        series
+                                            .insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
                                     }
+                                    (Some(_), None) => {
+                                        if let Some(cfg) = column_config {
+                                            series.insert(ts, empty_delta_32(cfg));
+                                        }
+                                    }
+                                    // First row, or no prev yet: nothing to
+                                    // delta against.  Drop this point but
+                                    // capture it as the new baseline if we
+                                    // decoded it.
+                                    _ => {}
                                 }
-                                prev = Some(curr);
+                                if curr.is_some() {
+                                    prev = curr;
+                                }
                             }
                         }
                     }
@@ -354,14 +378,13 @@ impl Tsdb {
             let prev_for_metric = self.prev_histograms.entry(name.clone()).or_default();
 
             if let Some(prev) = prev_for_metric.get(&labels) {
-                if let Some(d) = delta_to_32(prev, &curr) {
-                    self.histograms
-                        .entry(name.clone())
-                        .or_default()
-                        .entry(labels.clone())
-                        .or_default()
-                        .insert(ts, d);
-                }
+                let d = delta_to_32_or_empty(prev, &curr);
+                self.histograms
+                    .entry(name.clone())
+                    .or_default()
+                    .entry(labels.clone())
+                    .or_default()
+                    .insert(ts, d);
             }
 
             prev_for_metric.insert(labels, curr);
@@ -538,5 +561,90 @@ impl Tsdb {
                 .map(|(labels, _)| labels.clone())
                 .collect()
         })
+    }
+}
+
+#[cfg(all(test, feature = "ingest"))]
+mod ingest_tests {
+    use std::time::{Duration, SystemTime};
+
+    use histogram::Histogram;
+    use metriken_exposition::{Histogram as SnapHistogram, Snapshot, SnapshotV2};
+
+    use super::*;
+
+    fn snapshot_at(ts_secs: u64, hist: Histogram, name: &str) -> Snapshot {
+        let systemtime = SystemTime::UNIX_EPOCH + Duration::from_secs(ts_secs);
+        let mut metadata = HashMap::new();
+        metadata.insert("metric".to_string(), name.to_string());
+        Snapshot::V2(SnapshotV2 {
+            systemtime,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms: vec![SnapHistogram {
+                name: name.to_string(),
+                value: hist,
+                metadata,
+            }],
+        })
+    }
+
+    /// End-to-end check that the ingest path preserves every observed
+    /// snapshot's timestamp, even when the per-period delta is empty (no
+    /// events) or unrepresentable (counter reset).  Without explicit empties
+    /// the offset-aligned lookup pattern would silently shift entries onto
+    /// the wrong timestamps.
+    #[test]
+    fn ingest_preserves_timestamps_for_empty_and_reset_deltas() {
+        let mut tsdb = Tsdb {
+            sampling_interval_ms: 1000,
+            ..Tsdb::default()
+        };
+
+        // Construct four snapshots of one histogram metric.  Bucket index 10
+        // grows: 0 → 5 → 5 (no events) → 8 → 1 (reset).
+        let snapshots: Vec<(u64, &[u32])> = vec![
+            (1, &[]),                               // first cumulative — no delta produced
+            (2, &[10, 10, 10, 10, 10]),             // 5 events bucket 10 (vs s1)
+            (3, &[10, 10, 10, 10, 10]),             // identical → empty delta
+            (4, &[10, 10, 10, 10, 10, 10, 10, 10]), // +3 events vs s3
+            (5, &[10]),                             // reset (cumu went down) → empty delta
+        ];
+
+        for (ts, samples) in &snapshots {
+            let mut h = Histogram::new(4, 16).unwrap();
+            for v in *samples {
+                h.increment(*v as u64).unwrap();
+            }
+            tsdb.ingest(snapshot_at(*ts, h, "lat"));
+        }
+
+        let collection = tsdb
+            .histograms("lat", Labels::default())
+            .expect("histogram series exists");
+        let (_, series) = collection.iter().next().expect("one labelset");
+
+        // s1 produces no delta; s2..s5 each produce one.  4 entries expected.
+        let times: Vec<u64> = series.iter().map(|(t, _)| *t).collect();
+        let expected: Vec<u64> = vec![2_000_000_000, 3_000_000_000, 4_000_000_000, 5_000_000_000];
+        assert_eq!(
+            times, expected,
+            "every observed snapshot timestamp must be present"
+        );
+
+        // Spot-check empties: s2->s3 had no new events, s4->s5 reset.
+        let entry = |ts: u64| {
+            series
+                .iter()
+                .find(|(t, _)| *t == ts)
+                .map(|(_, h)| h)
+                .unwrap()
+        };
+        assert!(entry(3_000_000_000).is_empty(), "no-event delta is empty");
+        assert!(entry(5_000_000_000).is_empty(), "reset delta is empty");
+        assert!(!entry(2_000_000_000).is_empty());
+        assert!(!entry(4_000_000_000).is_empty());
     }
 }

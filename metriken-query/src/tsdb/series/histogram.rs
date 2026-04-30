@@ -76,6 +76,15 @@ impl HistogramSeries {
         Some((min, max))
     }
 
+    /// Iterate the stored per-period delta histograms in timestamp order.
+    /// Each entry's `CumulativeROHistogram32` is the delta between the
+    /// previous raw snapshot and the snapshot at this timestamp; an empty
+    /// histogram (`is_empty()` true) means no events occurred in the
+    /// interval, or the delta could not be represented.
+    pub fn iter(&self) -> std::slice::Iter<'_, (u64, CumulativeROHistogram32)> {
+        self.inner.iter()
+    }
+
     pub fn percentiles(
         &self,
         percentiles: &[f64],
@@ -446,4 +455,138 @@ fn u64_individual_counts(h: &CumulativeROHistogram) -> BTreeMap<u32, u64> {
         prev = c;
     }
     out
+}
+
+/// Build an empty delta histogram for the given config.  Used by the loader
+/// and ingest path to record an explicit empty entry at a timestamp where a
+/// non-empty delta could not be produced (overflow, reset, config mismatch,
+/// or a null parquet row), so that offset-based lookups remain aligned with
+/// the shared timestamp axis.
+pub(crate) fn empty_delta_32(config: ::histogram::Config) -> CumulativeROHistogram32 {
+    CumulativeROHistogram32::from_parts(config, Vec::new(), Vec::new())
+        .expect("empty index/count vectors always validate")
+}
+
+/// Like [`delta_to_32`] but never drops the timestamp: when the delta cannot
+/// be represented (config mismatch, u32 overflow, counter reset producing
+/// wrap-around) the result is an empty histogram with `prev`'s config.  The
+/// caller can still distinguish "no events" (empty delta) from "lots of
+/// events" via `total_count()`, but every observed snapshot pair produces a
+/// stored entry.
+pub(crate) fn delta_to_32_or_empty(
+    prev: &CumulativeROHistogram,
+    curr: &CumulativeROHistogram,
+) -> CumulativeROHistogram32 {
+    delta_to_32(prev, curr).unwrap_or_else(|| empty_delta_32(prev.config()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::histogram::{Config, Histogram};
+
+    /// Build a `CumulativeROHistogram` (u64) from an `(index, count)` pair —
+    /// indices are bucket positions, counts are total events in each bucket.
+    fn build_cumu(cfg: Config, events: &[(u32, u64)]) -> CumulativeROHistogram {
+        let mut h = Histogram::with_config(&cfg);
+        let raw = h.as_mut_slice();
+        for &(idx, count) in events {
+            raw[idx as usize] = count;
+        }
+        CumulativeROHistogram::from(&h)
+    }
+
+    fn cfg() -> Config {
+        Config::new(4, 16).expect("valid config")
+    }
+
+    #[test]
+    fn delta_of_identical_snapshots_is_empty() {
+        let c = cfg();
+        let prev = build_cumu(c, &[(10, 5), (20, 3)]);
+        let curr = build_cumu(c, &[(10, 5), (20, 3)]);
+        let d = delta_to_32(&prev, &curr).expect("identical snapshots produce a delta");
+        assert!(d.is_empty(), "delta of identical snapshots should be empty");
+        assert_eq!(d.total_count(), 0);
+    }
+
+    #[test]
+    fn delta_of_strictly_increasing_snapshots_is_nonempty() {
+        let c = cfg();
+        let prev = build_cumu(c, &[(10, 5), (20, 3)]);
+        let curr = build_cumu(c, &[(10, 7), (20, 4), (30, 1)]);
+        let d = delta_to_32(&prev, &curr).expect("delta should compute");
+        assert!(!d.is_empty());
+        assert_eq!(d.total_count(), 4); // (7-5) + (4-3) + (1-0)
+    }
+
+    #[test]
+    fn delta_to_32_or_empty_falls_back_on_reset() {
+        // Counter reset: curr is strictly less than prev.  delta_to_32
+        // returns None (overflow on wrapping_sub); _or_empty must still
+        // produce an empty histogram so the caller can record the
+        // timestamp.
+        let c = cfg();
+        let prev = build_cumu(c, &[(10, 1_000_000), (20, 500_000)]);
+        let curr = build_cumu(c, &[(10, 100), (20, 50)]);
+        assert!(
+            delta_to_32(&prev, &curr).is_none(),
+            "reset should overflow u32"
+        );
+        let d = delta_to_32_or_empty(&prev, &curr);
+        assert!(d.is_empty(), "reset must produce an explicit empty");
+        assert_eq!(d.config(), c);
+    }
+
+    #[test]
+    fn series_preserves_every_timestamp_across_empty_and_reset_deltas() {
+        // Three transitions: identical (empty), normal, reset (empty).
+        // After loading, the series must have 3 entries — one per
+        // observed snapshot pair — even though two of them are empty.
+        let c = cfg();
+        let s1 = build_cumu(c, &[(10, 5), (20, 3)]);
+        let s2 = build_cumu(c, &[(10, 5), (20, 3)]); // identical, no events
+        let s3 = build_cumu(c, &[(10, 8), (20, 4)]); // +3 in bucket 10, +1 in bucket 20
+        let s4 = build_cumu(c, &[(10, 1), (20, 0)]); // counter reset
+
+        let mut series = HistogramSeries::default();
+        series.insert(2_000_000_000, delta_to_32_or_empty(&s1, &s2));
+        series.insert(3_000_000_000, delta_to_32_or_empty(&s2, &s3));
+        series.insert(4_000_000_000, delta_to_32_or_empty(&s3, &s4));
+
+        assert_eq!(series.inner.len(), 3, "every timestamp must be preserved");
+
+        let entry_at = |ts: u64| {
+            series
+                .inner
+                .iter()
+                .find(|(t, _)| *t == ts)
+                .expect("ts present")
+        };
+        let (_, e2) = entry_at(2_000_000_000);
+        assert!(e2.is_empty(), "no-events delta must be explicit empty");
+
+        let (_, e3) = entry_at(3_000_000_000);
+        assert!(!e3.is_empty());
+        assert_eq!(e3.total_count(), 4);
+
+        let (_, e4) = entry_at(4_000_000_000);
+        assert!(e4.is_empty(), "reset delta must be explicit empty");
+    }
+
+    #[test]
+    fn time_bounds_cover_empty_entries() {
+        // Empty deltas still occupy timestamps and must show up in
+        // time_bounds() — otherwise consumers that align time axes by
+        // bounds would clip them off.
+        let c = cfg();
+        let s1 = build_cumu(c, &[(10, 5)]);
+        let s2 = build_cumu(c, &[(10, 5)]);
+
+        let mut series = HistogramSeries::default();
+        series.insert(1_000_000_000, delta_to_32_or_empty(&s1, &s2));
+        series.insert(5_000_000_000, delta_to_32_or_empty(&s1, &s2));
+
+        assert_eq!(series.time_bounds(), Some((1_000_000_000, 5_000_000_000)));
+    }
 }
