@@ -282,11 +282,6 @@ impl Tsdb {
                                     if let Some(d) = delta_to_32(prev_cumu, &curr) {
                                         series.insert(ts, d);
                                     }
-                                } else {
-                                    // First snapshot: anchor stride windows at
-                                    // its timestamp even though it produces no
-                                    // delta.
-                                    series.set_anchor_time(ts);
                                 }
                                 prev = Some(curr);
                             }
@@ -367,15 +362,6 @@ impl Tsdb {
                         .or_default()
                         .insert(ts, d);
                 }
-            } else {
-                // First snapshot for this series — anchor stride windows at
-                // its timestamp even though it produces no stored delta.
-                self.histograms
-                    .entry(name.clone())
-                    .or_default()
-                    .entry(labels.clone())
-                    .or_default()
-                    .set_anchor_time(ts);
             }
 
             prev_for_metric.insert(labels, curr);

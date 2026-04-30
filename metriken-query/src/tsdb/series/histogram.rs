@@ -18,14 +18,15 @@ use super::*;
 /// Entries are kept as a sorted `Vec<(timestamp_ns, delta)>` ordered by
 /// timestamp.  Insertion is O(1) at the end (the load-time pattern) and falls
 /// back to a binary-search insert otherwise.
+///
+/// Stride-window queries anchor at the first stored delta's timestamp.  The
+/// very first raw snapshot is dropped (no predecessor, no delta) so for
+/// regularly-sampled inputs every stride bin is shifted by one sampling
+/// interval relative to the original cumulative-form behavior — equivalent to
+/// rendering a null at the leading edge of the time axis.
 #[derive(Default, Clone)]
 pub struct HistogramSeries {
     inner: Vec<(u64, CumulativeROHistogram32)>,
-    /// Timestamp of the very first cumulative snapshot observed for this
-    /// series.  That snapshot has no predecessor and so produces no stored
-    /// delta, but its timestamp anchors stride-window emission so that
-    /// stride bins line up with the original (cumulative-form) behavior.
-    anchor_time: Option<u64>,
 }
 
 /// Data for rendering a histogram as a latency heatmap
@@ -65,16 +66,6 @@ impl HistogramSeries {
         match self.inner.binary_search_by_key(&timestamp, |(t, _)| *t) {
             Ok(idx) => self.inner[idx].1 = value,
             Err(idx) => self.inner.insert(idx, (timestamp, value)),
-        }
-    }
-
-    /// Record the timestamp of the very first raw cumulative snapshot
-    /// observed for this series (which itself produces no stored delta).
-    /// Used to anchor stride windows correctly.  Subsequent calls are
-    /// ignored — the anchor is the earliest snapshot.
-    pub(crate) fn set_anchor_time(&mut self, ts: u64) {
-        if self.anchor_time.is_none_or(|prev| ts < prev) {
-            self.anchor_time = Some(ts);
         }
     }
 
@@ -179,7 +170,7 @@ impl HistogramSeries {
     ) -> Box<dyn Iterator<Item = (u64, CumulativeROHistogram32)> + 'a> {
         match stride_ns {
             None => Box::new(self.inner.iter().map(|(t, h)| (*t, h.clone()))),
-            Some(stride) => Box::new(StrideIter::new(self.inner.iter(), stride, self.anchor_time)),
+            Some(stride) => Box::new(StrideIter::new(self.inner.iter(), stride)),
         }
     }
 }
@@ -197,11 +188,11 @@ struct StrideIter<'a, I: Iterator<Item = &'a (u64, CumulativeROHistogram32)>> {
 }
 
 impl<'a, I: Iterator<Item = &'a (u64, CumulativeROHistogram32)>> StrideIter<'a, I> {
-    fn new(iter: I, stride: u64, anchor: Option<u64>) -> Self {
+    fn new(iter: I, stride: u64) -> Self {
         Self {
             iter,
             stride,
-            last_emit: anchor,
+            last_emit: None,
             accum: BTreeMap::new(),
             accum_config: None,
             accum_end_time: 0,
@@ -279,7 +270,13 @@ impl<'a, I: Iterator<Item = &'a (u64, CumulativeROHistogram32)>> Iterator for St
             }
             self.accum_end_time = time;
 
-            // Anchor at the first observed delta if no caller-supplied anchor.
+            // Anchor at the first observed delta — the first raw cumulative
+            // snapshot has no predecessor and so produced no stored delta,
+            // which means the first stride bin is implicitly dropped.  For
+            // regularly-sampled series each remaining bin is shifted by one
+            // sampling interval relative to a hypothetical anchor at the
+            // first raw snapshot, which is invisible at typical render
+            // resolutions.
             let last = match self.last_emit {
                 Some(t) => t,
                 None => {
@@ -329,16 +326,7 @@ impl Add<&HistogramSeries> for HistogramSeries {
         out.extend_from_slice(&a[i..]);
         out.extend_from_slice(&b[j..]);
 
-        let anchor_time = match (self.anchor_time, other.anchor_time) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (Some(x), None) | (None, Some(x)) => Some(x),
-            (None, None) => None,
-        };
-
-        HistogramSeries {
-            inner: out,
-            anchor_time,
-        }
+        HistogramSeries { inner: out }
     }
 }
 
