@@ -24,6 +24,27 @@ pub use labels::Labels;
 pub use series::*;
 use series::{delta_to_32_or_empty, empty_delta_32};
 
+/// Target `grouping_power` for in-memory histogram storage.  Histograms whose
+/// source `grouping_power` is greater than this are auto-downsampled at load
+/// time to coarsen the bucket grid by `2^(src - target)` (e.g. 7 → 5 collapses
+/// every 4 adjacent buckets into 1).  This is a memory-vs-precision trade:
+/// relative error rises from `2^-src` to `2^-target` (≈3.13% at target=5),
+/// while the per-snapshot non-zero bucket count typically falls by the same
+/// factor on dense workloads — exactly the case where the sparse cumulative
+/// representation otherwise does the least.
+const TARGET_GROUPING_POWER: u8 = 5;
+
+/// If `h.config().grouping_power() > TARGET_GROUPING_POWER`, return `h`
+/// downsampled to that target.  Otherwise return `h` unchanged.  Falls back
+/// to the original histogram if downsample fails for any reason.
+fn maybe_downsample(h: Histogram) -> Histogram {
+    if h.config().grouping_power() > TARGET_GROUPING_POWER {
+        h.downsample(TARGET_GROUPING_POWER).unwrap_or(h)
+    } else {
+        h
+    }
+}
+
 /// Snap a nanosecond timestamp to the nearest multiple of `interval_ns`.
 /// Returns the timestamp unchanged when `interval_ns` is zero (i.e. unknown).
 #[allow(clippy::manual_checked_ops)]
@@ -250,14 +271,20 @@ impl Tsdb {
                             // anchor for the next delta.
                             let mut prev: Option<CumulativeROHistogram> = None;
 
-                            // Cache the column's Config so we can record an
-                            // explicit empty delta at any timestamp where a
-                            // non-empty delta isn't available (null parquet
-                            // row, decode failure, reset, overflow).  This
-                            // keeps the stored series' timestamp axis in
-                            // lockstep with the column it came from.
+                            // Cache the column's effective Config so we can
+                            // record an explicit empty delta at any timestamp
+                            // where a non-empty delta isn't available (null
+                            // parquet row, decode failure, reset, overflow).
+                            // The effective grouping_power is the minimum of
+                            // the column's source grouping_power and our
+                            // in-memory target — auto-downsample shrinks
+                            // dense histograms but never up-samples sparse
+                            // ones.
+                            let effective_grouping_power =
+                                grouping_power.min(TARGET_GROUPING_POWER);
                             let column_config =
-                                ::histogram::Config::new(grouping_power, max_value_power).ok();
+                                ::histogram::Config::new(effective_grouping_power, max_value_power)
+                                    .ok();
 
                             for (id, value) in list_array.iter().enumerate() {
                                 let ts = match timestamps.get(&id) {
@@ -286,7 +313,7 @@ impl Tsdb {
                                         buckets,
                                     )
                                     .ok()
-                                    .map(|h| CumulativeROHistogram::from(&h))
+                                    .map(|h| CumulativeROHistogram::from(&maybe_downsample(h)))
                                 });
 
                                 match (&prev, &curr) {
@@ -373,7 +400,7 @@ impl Tsdb {
 
         for histogram in snapshot.histograms() {
             let (name, labels) = Self::extract_name_labels(&histogram.metadata);
-            let curr = CumulativeROHistogram::from(&histogram.value);
+            let curr = CumulativeROHistogram::from(&maybe_downsample(histogram.value));
 
             let prev_for_metric = self.prev_histograms.entry(name.clone()).or_default();
 
