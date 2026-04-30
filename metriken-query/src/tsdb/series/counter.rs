@@ -1,28 +1,54 @@
 use super::*;
 
-/// Represents a series of counter readings.
+/// Represents a series of counter readings, stored as a sorted
+/// `Vec<(timestamp_ns, value)>` ordered by timestamp.  Insertion is O(1) at
+/// the end (the load-time pattern) and falls back to binary-search insert for
+/// out-of-order writes.
 #[derive(Default, Clone)]
 pub struct CounterSeries {
-    inner: BTreeMap<u64, u64>,
+    inner: Vec<(u64, u64)>,
 }
 
 impl CounterSeries {
     pub fn insert(&mut self, timestamp: u64, value: u64) {
-        self.inner.insert(timestamp, value);
+        if let Some(&(last_ts, _)) = self.inner.last() {
+            if timestamp > last_ts {
+                self.inner.push((timestamp, value));
+                return;
+            }
+            if timestamp == last_ts {
+                self.inner.last_mut().unwrap().1 = value;
+                return;
+            }
+        } else {
+            self.inner.push((timestamp, value));
+            return;
+        }
+        match self.inner.binary_search_by_key(&timestamp, |&(t, _)| t) {
+            Ok(idx) => self.inner[idx].1 = value,
+            Err(idx) => self.inner.insert(idx, (timestamp, value)),
+        }
     }
 
     /// Returns the time bounds (min, max) in nanoseconds, or None if empty.
     pub fn time_bounds(&self) -> Option<(u64, u64)> {
-        let min = *self.inner.keys().next()?;
-        let max = *self.inner.keys().next_back()?;
-        Some((min, max))
+        let first = self.inner.first()?.0;
+        let last = self.inner.last()?.0;
+        Some((first, last))
+    }
+
+    /// Slice covering all samples whose timestamp falls in `[start, end]`.
+    fn range_window(&self, start: u64, end: u64) -> &[(u64, u64)] {
+        let lo = self.inner.partition_point(|&(t, _)| t < start);
+        let hi = self.inner.partition_point(|&(t, _)| t <= end);
+        &self.inner[lo..hi]
     }
 
     pub fn rate(&self) -> UntypedSeries {
-        let mut rates = UntypedSeries::default();
+        let mut rates: Vec<(u64, f64)> = Vec::with_capacity(self.inner.len().saturating_sub(1));
         let mut prev: Option<(u64, u64)> = None;
 
-        for (ts, value) in self.inner.iter() {
+        for &(ts, value) in self.inner.iter() {
             if let Some((prev_ts, prev_v)) = prev {
                 let delta = value.wrapping_sub(prev_v);
 
@@ -31,14 +57,14 @@ impl CounterSeries {
 
                     let rate = delta as f64 / (duration as f64 / 1000000000.0);
 
-                    rates.inner.insert(*ts, rate);
+                    rates.push((ts, rate));
                 }
             }
 
-            prev = Some((*ts, *value));
+            prev = Some((ts, value));
         }
 
-        rates
+        UntypedSeries::from_sorted(rates)
     }
 
     /// PromQL `rate()`: average per-second rate of increase over a window.
@@ -47,11 +73,7 @@ impl CounterSeries {
     /// accumulates counter increases (handling resets), and divides by the
     /// total time span between first and last sample.
     pub fn windowed_rate(&self, window_start: u64, window_end: u64) -> Option<f64> {
-        let samples: Vec<(u64, u64)> = self
-            .inner
-            .range(window_start..=window_end)
-            .map(|(ts, v)| (*ts, *v))
-            .collect();
+        let samples = self.range_window(window_start, window_end);
 
         if samples.len() < 2 {
             return None;
@@ -83,21 +105,14 @@ impl CounterSeries {
     /// PromQL `irate()`: instantaneous per-second rate from the last two
     /// samples in the window.
     pub fn windowed_irate(&self, window_start: u64, window_end: u64) -> Option<f64> {
-        let last_two: Vec<(u64, u64)> = self
-            .inner
-            .range(window_start..=window_end)
-            .rev()
-            .take(2)
-            .map(|(ts, v)| (*ts, *v))
-            .collect();
+        let samples = self.range_window(window_start, window_end);
 
-        if last_two.len() < 2 {
+        if samples.len() < 2 {
             return None;
         }
 
-        // last_two[0] is the latest, last_two[1] is second-to-last
-        let (ts_cur, val_cur) = last_two[0];
-        let (ts_prev, val_prev) = last_two[1];
+        let (ts_cur, val_cur) = samples[samples.len() - 1];
+        let (ts_prev, val_prev) = samples[samples.len() - 2];
 
         let delta = if val_cur >= val_prev {
             (val_cur - val_prev) as f64

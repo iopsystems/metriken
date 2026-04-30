@@ -8,7 +8,7 @@ use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tsdb::{GaugeSeries, Labels, Tsdb, UntypedCollection};
+use crate::tsdb::{GaugeSeries, Labels, Tsdb, UntypedCollection, UntypedSeries};
 
 #[cfg(feature = "http")]
 mod api;
@@ -27,7 +27,6 @@ pub enum QueryError {
     #[error("Evaluation error: {0}")]
     EvaluationError(String),
 
-    #[allow(dead_code)]
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
 
@@ -260,9 +259,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     let mut result_samples = Vec::new();
 
                     for (series_labels, series) in rate_collection.iter() {
-                        if let Some((timestamp, value)) =
-                            self.get_value_at_time(&series.inner, time)
-                        {
+                        if let Some((timestamp, value)) = self.get_value_at_time(series, time) {
                             let mut metric_labels = HashMap::new();
                             metric_labels.insert("__name__".to_string(), metric_name.to_string());
 
@@ -286,9 +283,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 } else {
                     // Labels specified, sum matching series
                     let sum_series = rate_collection.sum();
-                    if let Some((timestamp, value)) =
-                        self.get_value_at_time(&sum_series.inner, time)
-                    {
+                    if let Some((timestamp, value)) = self.get_value_at_time(&sum_series, time) {
                         let mut metric_labels = HashMap::new();
                         metric_labels.insert("__name__".to_string(), metric_name.to_string());
 
@@ -406,11 +401,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     }
 
     /// Get a value at a specific time from a time series
-    fn get_value_at_time(
-        &self,
-        series: &BTreeMap<u64, f64>,
-        time: Option<f64>,
-    ) -> Option<(f64, f64)> {
+    fn get_value_at_time(&self, series: &UntypedSeries, time: Option<f64>) -> Option<(f64, f64)> {
         if series.is_empty() {
             return None;
         }
@@ -419,14 +410,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             (t * 1e9) as u64
         } else {
             // Use the latest value
-            *series.keys().next_back()?
+            series.last()?.0
         };
 
-        // Find the closest value
-        if let Some((ts, val)) = series.range(..=target_ns).next_back() {
-            Some((*ts as f64 / 1e9, *val))
-        } else if let Some((ts, val)) = series.iter().next() {
-            Some((*ts as f64 / 1e9, *val))
+        // Find the closest value at or before target, falling back to the
+        // first sample if target precedes the series.
+        if let Some((ts, val)) = series.last_at_or_before(target_ns) {
+            Some((ts as f64 / 1e9, val))
+        } else if let Some((ts, val)) = series.first() {
+            Some((ts as f64 / 1e9, val))
         } else {
             None
         }
@@ -444,7 +436,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // Try gauges first
         if let Some(collection) = self.tsdb.gauges(&metric_name, labels.clone()) {
             let sum_series = collection.filtered_sum(&labels);
-            if let Some((timestamp, value)) = self.get_value_at_time(&sum_series.inner, time) {
+            if let Some((timestamp, value)) = self.get_value_at_time(&sum_series, time) {
                 let mut metric_labels = HashMap::new();
                 metric_labels.insert("__name__".to_string(), metric_name.to_string());
 
@@ -457,23 +449,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             }
         }
 
-        // Try counters
-        if let Some(collection) = self.tsdb.counters(&metric_name, labels.clone()) {
-            // Return raw counter values
-            let _filtered = collection.filter(&labels);
-
-            // For now, just return a placeholder
-            let mut metric_labels = HashMap::new();
-            metric_labels.insert("__name__".to_string(), metric_name.to_string());
-
-            return Ok(QueryResult::Vector {
-                result: vec![Sample {
-                    metric: metric_labels,
-                    value: (time.unwrap_or(0.0), 0.0), // Placeholder
-                }],
-            });
-        }
-
+        // Counter instant-vector queries are not yet supported here — the
+        // PromQL semantics require `rate()` / `irate()` to be meaningful, and
+        // those go through `handle_function_call`.  Falling through to
+        // MetricNotFound matches what other unsupported instant-vector cases
+        // do.
         Err(QueryError::MetricNotFound(format!(
             "Metric not found: {metric_name}"
         )))
@@ -723,11 +703,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                                     // Get the last two samples in the window
                                     let last_two: Vec<(u64, f64)> = untyped
-                                        .inner
-                                        .range(window_start..=current)
+                                        .range(window_start, current)
+                                        .iter()
                                         .rev()
                                         .take(2)
-                                        .map(|(ts, val)| (*ts, *val))
+                                        .copied()
                                         .collect();
 
                                     if last_two.len() == 2 {
@@ -823,8 +803,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 let end_ns = (end * 1e9) as u64;
 
                                 let values: Vec<(f64, f64)> = series
-                                    .inner
-                                    .range(start_ns..=end_ns)
+                                    .range(start_ns, end_ns)
+                                    .iter()
                                     .map(|(ts, val)| (*ts as f64 / 1e9, *val))
                                     .collect();
 
@@ -970,8 +950,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                 while current <= end_ns {
                                     let window_start = current.saturating_sub(range_ns);
                                     let samples: Vec<f64> = untyped
-                                        .inner
-                                        .range(window_start..=current)
+                                        .range(window_start, current)
+                                        .iter()
                                         .map(|(_, v)| *v)
                                         .collect();
 
@@ -1368,9 +1348,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                             let mut vals = Vec::new();
                             let mut current = start_ns;
                             while current <= end_ns {
-                                if let Some((&ts, &val)) =
-                                    untyped.inner.range(..=current).next_back()
-                                {
+                                if let Some((ts, val)) = untyped.last_at_or_before(current) {
                                     if current - ts <= staleness {
                                         vals.push((current as f64 / 1e9, val));
                                     }
@@ -1469,8 +1447,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 let window_end = current + step_ns;
 
                 let points: Vec<(f64, f64)> = untyped
-                    .inner
-                    .range(window_start..=window_end)
+                    .range(window_start, window_end)
+                    .iter()
                     .map(|(ts, val)| (*ts as f64 / 1e9, *val))
                     .collect();
 
@@ -1521,8 +1499,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 let window_end = current + step_ns;
 
                 let points: Vec<(f64, f64)> = series
-                    .inner
-                    .range(window_start..=window_end)
+                    .range(window_start, window_end)
+                    .iter()
                     .map(|(ts, val)| (*ts as f64 / 1e9, *val))
                     .collect();
 
@@ -1629,8 +1607,8 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
                 for (idx, series) in percentile_series_vec.iter().enumerate() {
                     let values: Vec<(f64, f64)> = series
-                        .inner
-                        .range(start_ns..=end_ns)
+                        .range(start_ns, end_ns)
+                        .iter()
                         .map(|(ts, val)| (*ts as f64 / 1e9, *val))
                         .collect();
 
