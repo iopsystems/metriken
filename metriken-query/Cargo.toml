@@ -1,9 +1,10 @@
 [package]
 name = "metriken-query"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
+    "Yao Yue <yao@iop.systems>",
 ]
 license = "MIT OR Apache-2.0"
 description = "PromQL query engine and TSDB for metriken parquet files"
