@@ -356,10 +356,7 @@ impl Tsdb {
             let (name, labels) = Self::extract_name_labels(&histogram.metadata);
             let curr = CumulativeROHistogram::from(&histogram.value);
 
-            let prev_for_metric = self
-                .prev_histograms
-                .entry(name.clone())
-                .or_default();
+            let prev_for_metric = self.prev_histograms.entry(name.clone()).or_default();
 
             if let Some(prev) = prev_for_metric.get(&labels) {
                 if let Some(d) = delta_to_32(prev, &curr) {

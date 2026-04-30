@@ -159,11 +159,7 @@ impl HistogramSeries {
     ) -> Box<dyn Iterator<Item = (u64, CumulativeROHistogram32)> + 'a> {
         match stride_ns {
             None => Box::new(self.inner.iter().map(|(t, h)| (*t, h.clone()))),
-            Some(stride) => Box::new(StrideIter::new(
-                self.inner.iter(),
-                stride,
-                self.anchor_time,
-            )),
+            Some(stride) => Box::new(StrideIter::new(self.inner.iter(), stride, self.anchor_time)),
         }
     }
 }
@@ -219,7 +215,9 @@ impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> StrideIter<
     }
 }
 
-impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> Iterator for StrideIter<'a, I> {
+impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> Iterator
+    for StrideIter<'a, I>
+{
     type Item = (u64, CumulativeROHistogram32);
 
     fn next(&mut self) -> Option<Self::Item> {
