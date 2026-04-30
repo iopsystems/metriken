@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use ::histogram::{Config, CumulativeROHistogram, CumulativeROHistogram32, Histogram, Quantile};
+use ::histogram::{
+    Config, CumulativeROHistogram, CumulativeROHistogram32, CumulativeROHistogram32Ref, Histogram,
+    Quantile, QuantilesResult,
+};
 
 use super::*;
 
@@ -189,23 +192,21 @@ impl HistogramSeries {
     }
 
     /// Iterate the stored per-period delta histograms in timestamp order.
-    /// Each entry's `CumulativeROHistogram32` is the delta between the
-    /// previous raw snapshot and the snapshot at this timestamp; an empty
-    /// histogram (`is_empty()` true) means no events occurred in the
-    /// interval, or the delta could not be represented.
+    /// Each entry is a borrowed `CumulativeROHistogram32Ref` over the
+    /// series' flat buffers — zero allocation per snapshot.
     ///
-    /// Each yielded snapshot materializes two small `Vec<u32>` clones so
-    /// the histogram crate's owned APIs continue to work unchanged.  When
-    /// upstream gains a slice-based / borrowed quantile API the
-    /// materialization can drop entirely.
-    pub fn iter(&self) -> impl Iterator<Item = (u64, CumulativeROHistogram32)> + '_ {
+    /// An empty `Ref` (`is_empty()` true) means no events occurred in the
+    /// interval, or the delta could not be represented.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, CumulativeROHistogram32Ref<'_>)> + '_ {
         let config = self.config;
         (0..self.len()).filter_map(move |i| {
             let cfg = config?;
             let view = self.delta_at(i);
-            CumulativeROHistogram32::from_parts(cfg, view.index.to_vec(), view.count.to_vec())
-                .ok()
-                .map(|h| (self.timestamps[i], h))
+            // The slices were validated when each snapshot was inserted
+            // (via `from_parts` on the Owned hist) so `from_parts_unchecked`
+            // is sound here and avoids a re-validation walk.
+            let r = CumulativeROHistogram32Ref::from_parts_unchecked(cfg, view.index, view.count);
+            Some((self.timestamps[i], r))
         })
     }
 
@@ -221,7 +222,11 @@ impl HistogramSeries {
         let mut result = vec![UntypedSeries::default(); percentiles.len()];
 
         for (time, delta) in self.iter_strided(stride_ns) {
-            if let Ok(Some(q_results)) = delta.quantiles(percentiles) {
+            let q_result: Result<Option<QuantilesResult>, _> = match &delta {
+                DeltaSnapshot::Borrowed(r) => r.quantiles(percentiles),
+                DeltaSnapshot::Owned(o) => o.quantiles(percentiles),
+            };
+            if let Ok(Some(q_results)) = q_result {
                 for (id, q) in percentiles.iter().enumerate() {
                     if let Ok(quantile) = Quantile::new(*q) {
                         if let Some(bucket) = q_results.get(&quantile) {
@@ -266,8 +271,12 @@ impl HistogramSeries {
 
             // Emit only the non-zero buckets of the delta — CumulativeRO only
             // stores those, so this is also a zero-copy walk.
-            for (i, bucket) in delta.iter().enumerate() {
-                let bucket_index = delta.index()[i] as usize;
+            let (idx_slice, buckets) = match &delta {
+                DeltaSnapshot::Borrowed(r) => (r.index(), r.iter()),
+                DeltaSnapshot::Owned(o) => (o.index(), o.iter()),
+            };
+            for (i, bucket) in buckets.enumerate() {
+                let bucket_index = idx_slice[i] as usize;
                 let count_f64 = bucket.count() as f64;
                 result.data.push((time_index, bucket_index, count_f64));
                 min_value = min_value.min(count_f64);
@@ -294,32 +303,40 @@ impl HistogramSeries {
     }
 
     /// Iterate the stored per-period deltas, optionally bucketing them into
-    /// stride windows.  Without a stride each entry is yielded individually;
+    /// stride windows.  Without a stride each entry is yielded individually
+    /// as a borrowed `Ref` over the series' flat buffers (zero allocation);
     /// with a stride, deltas are summed across windows of `stride_ns`
-    /// nanoseconds and yielded once per window (timestamped at the latest
-    /// snapshot in the window).
+    /// nanoseconds and yielded as `Owned` (the accumulator must materialize
+    /// fresh `Vec<u32>`s on flush).
     fn iter_strided<'a>(
         &'a self,
         stride_ns: Option<u64>,
-    ) -> Box<dyn Iterator<Item = (u64, CumulativeROHistogram32)> + 'a> {
+    ) -> Box<dyn Iterator<Item = (u64, DeltaSnapshot<'a>)> + 'a> {
         let config = match self.config {
             Some(cfg) => cfg,
             None => return Box::new(std::iter::empty()),
         };
         match stride_ns {
-            None => Box::new((0..self.len()).filter_map(move |i| {
+            None => Box::new((0..self.len()).map(move |i| {
                 let view = self.delta_at(i);
-                CumulativeROHistogram32::from_parts(
-                    config,
-                    view.index.to_vec(),
-                    view.count.to_vec(),
-                )
-                .ok()
-                .map(|h| (self.timestamps[i], h))
+                let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                    config, view.index, view.count,
+                );
+                (self.timestamps[i], DeltaSnapshot::Borrowed(r))
             })),
-            Some(stride) => Box::new(StrideIter::new(self, stride, config)),
+            Some(stride) => Box::new(
+                StrideIter::new(self, stride, config).map(|(t, h)| (t, DeltaSnapshot::Owned(h))),
+            ),
         }
     }
+}
+
+/// One snapshot's bucket data, either borrowed directly from the series'
+/// flat buffers (the unstrided case — zero allocation) or freshly built
+/// from a stride accumulator (the strided case — owned `Vec<u32>`s).
+enum DeltaSnapshot<'a> {
+    Borrowed(CumulativeROHistogram32Ref<'a>),
+    Owned(CumulativeROHistogram32),
 }
 
 /// Sums consecutive per-period deltas until at least `stride` nanoseconds have
@@ -724,25 +741,28 @@ mod tests {
         series.insert(3_000_000_000, delta_to_32_or_empty(&s2, &s3));
         series.insert(4_000_000_000, delta_to_32_or_empty(&s3, &s4));
 
-        let entries: Vec<(u64, CumulativeROHistogram32)> = series.iter().collect();
+        let entries: Vec<(u64, bool, u64)> = series
+            .iter()
+            .map(|(t, h)| (t, h.is_empty(), h.total_count()))
+            .collect();
         assert_eq!(entries.len(), 3, "every timestamp must be preserved");
 
         let entry_at = |ts: u64| {
             entries
                 .iter()
-                .find(|(t, _)| *t == ts)
-                .map(|(_, h)| h.clone())
+                .find(|(t, _, _)| *t == ts)
+                .copied()
                 .expect("ts present")
         };
-        let e2 = entry_at(2_000_000_000);
-        assert!(e2.is_empty(), "no-events delta must be explicit empty");
+        let (_, e2_empty, _) = entry_at(2_000_000_000);
+        assert!(e2_empty, "no-events delta must be explicit empty");
 
-        let e3 = entry_at(3_000_000_000);
-        assert!(!e3.is_empty());
-        assert_eq!(e3.total_count(), 4);
+        let (_, e3_empty, e3_count) = entry_at(3_000_000_000);
+        assert!(!e3_empty);
+        assert_eq!(e3_count, 4);
 
-        let e4 = entry_at(4_000_000_000);
-        assert!(e4.is_empty(), "reset delta must be explicit empty");
+        let (_, e4_empty, _) = entry_at(4_000_000_000);
+        assert!(e4_empty, "reset delta must be explicit empty");
     }
 
     #[test]
@@ -789,15 +809,15 @@ mod tests {
         );
 
         let merged = a + &b;
-        let entries: Vec<(u64, CumulativeROHistogram32)> = merged.iter().collect();
+        let entries: Vec<(u64, u64)> = merged.iter().map(|(t, h)| (t, h.total_count())).collect();
         assert_eq!(entries.len(), 3);
         // 2_000 is the overlap: bucket 10 gets 3+7=10, bucket 20 gets 0+1=1.
-        let merged_2k = entries
+        let merged_2k_total = entries
             .iter()
             .find(|(t, _)| *t == 2_000)
-            .map(|(_, h)| h.clone())
+            .map(|(_, c)| *c)
             .unwrap();
-        assert_eq!(merged_2k.total_count(), 11);
+        assert_eq!(merged_2k_total, 11);
     }
 
     #[test]
@@ -820,11 +840,11 @@ mod tests {
             delta_to_32_or_empty(&s_prev, &build_cumu(c, &[(20, 3)])),
         );
 
-        let entries: Vec<(u64, CumulativeROHistogram32)> = series.iter().collect();
+        let entries: Vec<(u64, u64)> = series.iter().map(|(t, h)| (t, h.total_count())).collect();
         let times: Vec<u64> = entries.iter().map(|(t, _)| *t).collect();
         assert_eq!(times, vec![1_000, 2_000, 3_000]);
-        assert_eq!(entries[0].1.total_count(), 1);
-        assert_eq!(entries[1].1.total_count(), 3);
-        assert_eq!(entries[2].1.total_count(), 7);
+        assert_eq!(entries[0].1, 1);
+        assert_eq!(entries[1].1, 3);
+        assert_eq!(entries[2].1, 7);
     }
 }
