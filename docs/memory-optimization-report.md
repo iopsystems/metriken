@@ -18,8 +18,8 @@ Headline reductions across all 11 parquet samples in
 
 | | OLD total | NEW total | saved |
 |---|---|---|---|
-| **live** | 738.9 MiB | 249.8 MiB | **−489 MiB (−66%)** |
-| **resident** | 2 336.0 MiB | 574.7 MiB | **−1 761 MiB (−75%)** |
+| **live** | 738.9 MiB | 262.1 MiB | **−477 MiB (−65%)** |
+| **resident** | 2 342.1 MiB | 570.7 MiB | **−1 771 MiB (−76%)** |
 
 ## Techniques applied, ranked by absolute corpus savings
 
@@ -46,36 +46,90 @@ to *one column × one batch* of decoded Arrow data plus the rolling
 |---|---|---|---|
 | sum across 11 files | 1 885.8 MiB | 574.7 MiB | **−1 311 MiB (−70%)** |
 
-### 2. Per-period delta histograms + u32 narrowing + auto-downsample 7→5
+### 2. Per-period delta histograms + u32 narrowing
 
-Three closely-coupled changes on the histogram representation that all
-landed in the first wave of the PR (commits `b361709`, `2716405`):
+Two coupled changes on the histogram representation that landed in
+commit `b361709`.  Both target the same dimension — per-snapshot
+histogram bucket data — but have very different magnitudes.
 
-* **Delta storage** — instead of storing each snapshot's
-  cumulative-since-start histogram, the loader differences consecutive
-  snapshots and stores the per-period delta.  A delta has only the
-  buckets that fired during one sampling interval (typically ~5–20×
-  fewer non-zero buckets than the running cumulative).
-* **u32 counts** — `CumulativeROHistogram32` from histogram 1.3 narrows
-  the count vector from `Vec<u64>` to `Vec<u32>`.  Per-period totals
-  comfortably fit, halving the per-bucket count cost.
-* **Auto-downsample `grouping_power 7 → 5`** — `Histogram::downsample`
-  collapses every 4 adjacent buckets into 1 for high-precision sources,
-  reducing relative error from 0.78% to 3.13% (invisible at viewer
-  rendering resolutions) and shrinking non-zero bucket count by up to
-  4× on dense workloads.
+#### 2a. Delta storage (vs cumulative-since-start)
 
-**Why grouped.**  All three target the same dimension (per-snapshot
-histogram bucket data) and we don't have the intermediate measurements
-to attribute precisely.  Together they're the biggest *live*-bytes
-contributor: the OLD representation stored cumulative `(u32 idx, u64
-cnt)` pairs across an ever-growing set of non-zero buckets;
-NEW stores delta `(u32 idx, u32 cnt)` pairs across a much smaller set.
+Instead of storing each snapshot's cumulative histogram, the loader
+differences consecutive snapshots and stores the per-period *delta*.
+A delta carries only the buckets that fired during one sampling
+interval; cumulative form carries every bucket that has ever fired
+since process start, growing monotonically.
 
-**Corpus contribution (estimated from histogram column shares):** on
-dense files (sglang-nixl-16c, AB_*, vllm), histogram bucket data was
-the dominant live-bytes consumer.  Combined live-byte saving across
-the corpus is ≈ −280 MiB.
+For a series sampled at 1 Hz over an hour:
+
+* Cumulative: by the end, every bucket the metric has ever observed
+  is non-zero.  Storage grows like the *union* of all per-period
+  bucket sets — ~50–200 non-zero buckets per snapshot for typical
+  latency distributions.
+* Delta: each snapshot has only the buckets that fired in the last
+  second — typically 5–15 non-zero buckets, regardless of how long
+  the process has been running.
+
+**Best estimate of corpus contribution: −180 to −220 MiB live.**  The
+dominant single contributor among the structural changes.
+
+#### 2b. `u32` counts (vs `u64`)
+
+`CumulativeROHistogram32` from histogram 1.3 narrows the count vector
+from `Vec<u64>` to `Vec<u32>`.  Per-period totals comfortably fit
+(2³² events ≈ 4.3 G; even per-second deltas on a 1 GHz syscall
+counter clear that by 7×), so this is a clean halving of the count
+data.
+
+Index vectors stay u32 in both representations, so this only narrows
+the count side.  Per-snapshot cost drops from `4·N (idx) + 8·N
+(cnt) = 12N` bytes of bucket data to `4·N + 4·N = 8N` — a 33%
+reduction on bucket-data only, multiplied across all stored
+snapshots.
+
+**Best estimate of corpus contribution: −60 to −80 MiB live.**
+
+#### 2c. Auto-downsample `grouping_power 7 → 5` — *measured, then reverted*
+
+The hypothesis was that high-precision histograms (gp=7, the Rezolus
+default, ≈0.78% relative error) could be cheaply collapsed to gp=5
+(≈3.13% relative error) via `Histogram::downsample`, dropping
+non-zero bucket count by up to 4× on dense workloads.
+
+We measured this directly by running the example with
+`TARGET_GROUPING_POWER` set to both 5 and 7 across the full corpus.
+
+Auto-downsample contribution to NEW live, by file:
+
+| file | with downsample (5) | without (7) | DS saves | DS share |
+|---|---:|---:|---:|---:|
+| AB_base | 14.3 | 17.1 | −2.8 | 16% |
+| AB_base_pin | 13.8 | 16.0 | −2.2 | 14% |
+| AB_level | 13.8 | 15.9 | −2.1 | 13% |
+| AB_level_pin | 12.8 | 13.9 | −1.1 | 8% |
+| cachecannon | 12.3 | 15.0 | −2.7 | 18% |
+| demo | 5.4 | 5.4 | 0 | 0% |
+| sglang_gemma3 | 9.5 | 9.9 | −0.4 | 4% |
+| vllm | 23.3 | 23.3 | 0 | 0% |
+| vllm_gemma3 | 9.8 | 10.2 | −0.4 | 4% |
+| disagg-sglang | 27.6 | 27.8 | −0.2 | 1% |
+| sglang-nixl-16c | 107.2 | 107.5 | −0.3 | 0.3% |
+| **TOTAL** | **249.8** | **262.1** | **−12.3** | **−4.7%** |
+
+**Conclusion: not worth the precision cost.**  Auto-downsample buys
+~12 MiB of live bytes (4.7%) at the cost of a permanent 4×
+relative-error inflation on every quantile query.  The hypothesis
+that delta-form histograms would still benefit substantially from
+bucket collapsing was wrong: deltas are already sparse (5–15 non-zero
+buckets per snapshot), so collapsing 4 adjacent buckets into 1
+mostly merges already-zero buckets and saves nothing.  Counter and
+gauge series dominate the live-byte budget on most files anyway.
+
+**Removed in a follow-up commit.**  Original commit was `2716405`.
+This branch keeps the source `grouping_power` from the parquet
+column metadata as-is.  Programmatic consumers (SLO checks,
+alerting) keep their tight quantile bounds; viewer rendering is
+unaffected (renders below pixel granularity either way).
 
 ### 3. `BTreeMap` → sorted `Vec` for time-keyed series storage (`f722125`)
 
@@ -159,18 +213,18 @@ after `Tsdb::load_from_bytes` returns.
 
 | file | OLD live | NEW live | live ↓ | OLD res | NEW res | res ↓ |
 |---|---:|---:|---:|---:|---:|---:|
-| AB_base.parquet | 41.5 | 14.3 | **−66%** | 115.8 | 36.6 | **−68%** |
-| AB_base_pin.parquet | 39.4 | 13.8 | **−65%** | 112.6 | 34.8 | **−69%** |
-| AB_level.parquet | 44.8 | 13.8 | **−69%** | 119.8 | 35.1 | **−71%** |
-| AB_level_pin.parquet | 39.5 | 12.8 | **−68%** | 137.9 | 42.8 | **−69%** |
-| cachecannon.parquet | 47.0 | 12.3 | **−74%** | 182.1 | 33.0 | **−82%** |
+| AB_base.parquet | 41.5 | 17.1 | **−59%** | 115.8 | 36.2 | **−69%** |
+| AB_base_pin.parquet | 39.4 | 16.0 | **−59%** | 121.6 | 40.2 | **−67%** |
+| AB_level.parquet | 44.8 | 15.9 | **−65%** | 119.8 | 38.1 | **−68%** |
+| AB_level_pin.parquet | 39.5 | 13.9 | **−65%** | 121.4 | 34.1 | **−72%** |
+| cachecannon.parquet | 47.0 | 15.0 | **−68%** | 182.6 | 32.4 | **−82%** |
 | demo.parquet | 19.4 | 5.4 | **−72%** | 91.5 | 15.1 | **−84%** |
-| sglang_gemma3.parquet | 21.6 | 9.5 | **−56%** | 174.9 | 40.1 | **−77%** |
-| vllm.parquet | 48.1 | 23.3 | **−52%** | 156.9 | 62.7 | **−60%** |
-| vllm_gemma3.parquet | 23.1 | 9.8 | **−58%** | 176.8 | 42.7 | **−76%** |
-| disagg-sglang.parquet | 81.2 | 27.6 | **−66%** | 315.7 | 57.1 | **−82%** |
-| sglang-nixl-16c.parquet | 333.3 | 107.2 | **−68%** | 752.0 | 174.7 | **−77%** |
-| **TOTAL** | **738.9** | **249.8** | **−66%** | **2 336.0** | **574.7** | **−75%** |
+| sglang_gemma3.parquet | 21.6 | 9.9 | **−54%** | 176.7 | 44.3 | **−75%** |
+| vllm.parquet | 48.1 | 23.3 | **−52%** | 156.9 | 61.0 | **−61%** |
+| vllm_gemma3.parquet | 23.1 | 10.2 | **−56%** | 176.8 | 39.5 | **−78%** |
+| disagg-sglang.parquet | 81.2 | 27.8 | **−66%** | 314.1 | 57.9 | **−82%** |
+| sglang-nixl-16c.parquet | 333.3 | 107.5 | **−68%** | 764.9 | 171.7 | **−78%** |
+| **TOTAL** | **738.9** | **262.1** | **−65%** | **2 342.1** | **570.7** | **−76%** |
 
 ## Layered effect (resident, sglang-nixl-16c as illustration)
 
@@ -178,13 +232,13 @@ This is the largest file in the corpus and the clearest illustration of
 how the techniques compose.
 
 ```
-OLD                                                              752 MiB
-└─ delta + u32 + Vec + Config-hoist + CSR + downsample 7→5 →     522 MiB  (-230)
-   └─ + streaming column-by-column decode →                      175 MiB  (-347)
+OLD                                                              765 MiB
+└─ delta + u32 + Vec + Config-hoist + CSR →                      522 MiB  (-243)
+   └─ + streaming column-by-column decode →                      172 MiB  (-350)
 ```
 
-Live bytes (allocated) on the same file: 333 MiB → 107 MiB (−226 MiB).
-The 230 MiB resident reduction at the structural step that doesn't show
+Live bytes (allocated) on the same file: 333 MiB → 108 MiB (−225 MiB).
+The ~243 MiB resident reduction at the structural step that doesn't show
 up in live bytes is allocator slack from the OLD representation's
 per-entry `BTreeMap` node overhead and `Box`-indirected histogram
 buffers — fragmented allocations that jemalloc holds onto as scratch.

@@ -24,27 +24,6 @@ pub use labels::Labels;
 pub use series::*;
 use series::{delta_to_32_or_empty, empty_delta_32};
 
-/// Target `grouping_power` for in-memory histogram storage.  Histograms whose
-/// source `grouping_power` is greater than this are auto-downsampled at load
-/// time to coarsen the bucket grid by `2^(src - target)` (e.g. 7 → 5 collapses
-/// every 4 adjacent buckets into 1).  This is a memory-vs-precision trade:
-/// relative error rises from `2^-src` to `2^-target` (≈3.13% at target=5),
-/// while the per-snapshot non-zero bucket count typically falls by the same
-/// factor on dense workloads — exactly the case where the sparse cumulative
-/// representation otherwise does the least.
-const TARGET_GROUPING_POWER: u8 = 5;
-
-/// If `h.config().grouping_power() > TARGET_GROUPING_POWER`, return `h`
-/// downsampled to that target.  Otherwise return `h` unchanged.  Falls back
-/// to the original histogram if downsample fails for any reason.
-fn maybe_downsample(h: Histogram) -> Histogram {
-    if h.config().grouping_power() > TARGET_GROUPING_POWER {
-        h.downsample(TARGET_GROUPING_POWER).unwrap_or(h)
-    } else {
-        h
-    }
-}
-
 /// Stream a single counter column into the TSDB.  The reader must already be
 /// projected to just this column (so `batch.column(0)` is the data).  Walks
 /// rows batch-by-batch so peak resident never exceeds one batch's decoded
@@ -117,11 +96,10 @@ fn stream_histogram_column(
         .entry(labels)
         .or_default();
 
-    // Effective grouping_power is the source clamped to our target.  The
-    // stored deltas (and the empty fallback below) all use this effective
-    // config so cross-series operations see consistent buckets.
-    let effective_gp = grouping_power.min(TARGET_GROUPING_POWER);
-    let column_config = ::histogram::Config::new(effective_gp, max_value_power).ok();
+    // Cache the column's `Config` so we can record an explicit empty delta
+    // at any timestamp where a non-empty delta isn't available (null parquet
+    // row, decode failure, reset, overflow).
+    let column_config = ::histogram::Config::new(grouping_power, max_value_power).ok();
 
     let mut prev: Option<CumulativeROHistogram> = None;
     let mut row = 0usize;
@@ -150,7 +128,7 @@ fn stream_histogram_column(
                 let buckets: Vec<u64> = arr.iter().flatten().collect();
                 Histogram::from_buckets(grouping_power, max_value_power, buckets)
                     .ok()
-                    .map(|h| CumulativeROHistogram::from(&maybe_downsample(h)))
+                    .map(|h| CumulativeROHistogram::from(&h))
             });
 
             match (&prev, &curr) {
@@ -407,7 +385,7 @@ impl Tsdb {
 
         for histogram in snapshot.histograms() {
             let (name, labels) = Self::extract_name_labels(&histogram.metadata);
-            let curr = CumulativeROHistogram::from(&maybe_downsample(histogram.value));
+            let curr = CumulativeROHistogram::from(&histogram.value);
 
             let prev_for_metric = self.prev_histograms.entry(name.clone()).or_default();
 
