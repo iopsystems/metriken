@@ -13,6 +13,8 @@ use crate::tsdb::{GaugeSeries, Labels, Tsdb, UntypedCollection, UntypedSeries};
 #[cfg(feature = "http")]
 mod api;
 
+pub mod streaming;
+
 #[cfg(test)]
 mod tests;
 
