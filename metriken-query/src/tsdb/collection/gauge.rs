@@ -57,12 +57,8 @@ impl GaugeCollection {
         for (labels, series) in self.inner.iter() {
             if labels.matches(filter) {
                 let untyped = series.untyped();
-                for (time, value) in untyped.inner.iter() {
-                    if result.inner.contains_key(time) {
-                        *result.inner.get_mut(time).unwrap() += value;
-                    } else {
-                        result.inner.insert(*time, *value);
-                    }
+                for (time, value) in untyped.iter() {
+                    result.add_at(*time, *value);
                 }
             }
         }

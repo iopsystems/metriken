@@ -18,12 +18,8 @@ impl UntypedCollection {
         let mut result = UntypedSeries::default();
 
         for series in self.inner.values() {
-            for (time, value) in series.inner.iter() {
-                if !result.inner.contains_key(time) {
-                    result.inner.insert(*time, *value);
-                } else {
-                    *result.inner.get_mut(time).unwrap() += value;
-                }
+            for (time, value) in series.iter() {
+                result.add_at(*time, *value);
             }
         }
 

@@ -14,9 +14,13 @@ use super::*;
 /// realistic sampling interval, which halves the stored count footprint.
 /// Pre-differencing on load also removes the per-pair `delta()` work from the
 /// hot query paths.
+///
+/// Entries are kept as a sorted `Vec<(timestamp_ns, delta)>` ordered by
+/// timestamp.  Insertion is O(1) at the end (the load-time pattern) and falls
+/// back to a binary-search insert otherwise.
 #[derive(Default, Clone)]
 pub struct HistogramSeries {
-    inner: BTreeMap<u64, CumulativeROHistogram32>,
+    inner: Vec<(u64, CumulativeROHistogram32)>,
     /// Timestamp of the very first cumulative snapshot observed for this
     /// series.  That snapshot has no predecessor and so produces no stored
     /// delta, but its timestamp anchors stride-window emission so that
@@ -45,7 +49,23 @@ impl HistogramSeries {
     }
 
     pub fn insert(&mut self, timestamp: u64, value: CumulativeROHistogram32) {
-        self.inner.insert(timestamp, value);
+        if let Some((last_ts, _)) = self.inner.last() {
+            if timestamp > *last_ts {
+                self.inner.push((timestamp, value));
+                return;
+            }
+            if timestamp == *last_ts {
+                self.inner.last_mut().unwrap().1 = value;
+                return;
+            }
+        } else {
+            self.inner.push((timestamp, value));
+            return;
+        }
+        match self.inner.binary_search_by_key(&timestamp, |(t, _)| *t) {
+            Ok(idx) => self.inner[idx].1 = value,
+            Err(idx) => self.inner.insert(idx, (timestamp, value)),
+        }
     }
 
     /// Record the timestamp of the very first raw cumulative snapshot
@@ -60,8 +80,8 @@ impl HistogramSeries {
 
     /// Returns the time bounds (min, max) in nanoseconds, or None if empty.
     pub fn time_bounds(&self) -> Option<(u64, u64)> {
-        let min = *self.inner.keys().next()?;
-        let max = *self.inner.keys().next_back()?;
+        let min = self.inner.first()?.0;
+        let max = self.inner.last()?.0;
         Some((min, max))
     }
 
@@ -81,7 +101,7 @@ impl HistogramSeries {
                 for (id, q) in percentiles.iter().enumerate() {
                     if let Ok(quantile) = Quantile::new(*q) {
                         if let Some(bucket) = q_results.get(&quantile) {
-                            result[id].inner.insert(time, bucket.end() as f64);
+                            result[id].insert(time, bucket.end() as f64);
                         }
                     }
                 }
@@ -106,7 +126,7 @@ impl HistogramSeries {
         // across the series. Collect them once from an empty Histogram with the
         // same configuration so the Y-axis covers every bucket (not only the
         // non-zero ones we actually observe).
-        let config = self.inner.values().next().unwrap().config();
+        let config = self.inner.first().unwrap().1.config();
         if let Ok(empty) = Histogram::new(config.grouping_power(), config.max_value_power()) {
             result.bucket_bounds = empty.iter().map(|b| b.end()).collect();
         } else {
@@ -167,7 +187,7 @@ impl HistogramSeries {
 /// Sums consecutive per-period deltas until at least `stride` nanoseconds have
 /// elapsed since the last emitted bin, then yields the accumulated delta
 /// histogram timestamped at the last snapshot in the window.
-struct StrideIter<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> {
+struct StrideIter<'a, I: Iterator<Item = &'a (u64, CumulativeROHistogram32)>> {
     iter: I,
     stride: u64,
     last_emit: Option<u64>,
@@ -176,7 +196,7 @@ struct StrideIter<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>
     accum_end_time: u64,
 }
 
-impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> StrideIter<'a, I> {
+impl<'a, I: Iterator<Item = &'a (u64, CumulativeROHistogram32)>> StrideIter<'a, I> {
     fn new(iter: I, stride: u64, anchor: Option<u64>) -> Self {
         Self {
             iter,
@@ -215,15 +235,13 @@ impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> StrideIter<
     }
 }
 
-impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> Iterator
-    for StrideIter<'a, I>
-{
+impl<'a, I: Iterator<Item = &'a (u64, CumulativeROHistogram32)>> Iterator for StrideIter<'a, I> {
     type Item = (u64, CumulativeROHistogram32);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (time, hist) = match self.iter.next() {
-                Some(pair) => pair,
+                Some(pair) => (pair.0, &pair.1),
                 None => {
                     // Drain any final partial accumulator.
                     if !self.accum.is_empty() {
@@ -259,17 +277,17 @@ impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> Iterator
                     *self.accum.entry(idx).or_insert(0) += individual as u64;
                 }
             }
-            self.accum_end_time = *time;
+            self.accum_end_time = time;
 
             // Anchor at the first observed delta if no caller-supplied anchor.
             let last = match self.last_emit {
                 Some(t) => t,
                 None => {
-                    self.last_emit = Some(*time);
+                    self.last_emit = Some(time);
                     continue;
                 }
             };
-            if *time >= last && *time - last >= self.stride {
+            if time >= last && time - last >= self.stride {
                 if let Some(emit) = self.flush() {
                     return Some(emit);
                 }
@@ -281,20 +299,46 @@ impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> Iterator
 impl Add<&HistogramSeries> for HistogramSeries {
     type Output = HistogramSeries;
     fn add(self, other: &HistogramSeries) -> Self::Output {
-        let mut result = self.clone();
-
-        for (time, histogram) in other.inner.iter() {
-            if let Some(h) = result.inner.get_mut(time) {
-                if let Some(sum) = wrapping_add(h, histogram) {
-                    *h = sum;
+        let a = &self.inner;
+        let b = &other.inner;
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].0.cmp(&b[j].0) {
+                std::cmp::Ordering::Less => {
+                    out.push(a[i].clone());
+                    i += 1;
                 }
-                // Skip mismatched histograms rather than panicking
-            } else {
-                result.inner.insert(*time, histogram.clone());
+                std::cmp::Ordering::Greater => {
+                    out.push(b[j].clone());
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    if let Some(sum) = wrapping_add(&a[i].1, &b[j].1) {
+                        out.push((a[i].0, sum));
+                    } else {
+                        // Mismatched configs — skip rather than panicking;
+                        // keep this side's value so the bin isn't dropped.
+                        out.push(a[i].clone());
+                    }
+                    i += 1;
+                    j += 1;
+                }
             }
         }
+        out.extend_from_slice(&a[i..]);
+        out.extend_from_slice(&b[j..]);
 
-        result
+        let anchor_time = match (self.anchor_time, other.anchor_time) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
+
+        HistogramSeries {
+            inner: out,
+            anchor_time,
+        }
     }
 }
 

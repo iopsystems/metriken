@@ -29,7 +29,7 @@ impl Heatmap {
 
         // Collect unique timestamps and find min/max values
         for series in self.inner.values() {
-            for (ts, value) in series.inner.iter() {
+            for (ts, value) in series.iter() {
                 timestamps.insert(*ts);
                 min_value = min_value.min(*value);
                 max_value = max_value.max(*value);
@@ -67,7 +67,7 @@ impl Heatmap {
         // This organizes data points in rows which match how the heatmap is rendered
         for cpu_id in 0..=max_cpu_id {
             if let Some(series) = self.inner.get(&cpu_id) {
-                for (ts, value) in series.inner.iter() {
+                for (ts, value) in series.iter() {
                     if let Some(&i) = timestamp_indices.get(&ts) {
                         heatmap_data.push(vec![i as f64, cpu_id as f64, *value]);
                     }
