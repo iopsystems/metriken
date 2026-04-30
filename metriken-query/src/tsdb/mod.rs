@@ -627,7 +627,7 @@ mod ingest_tests {
         let (_, series) = collection.iter().next().expect("one labelset");
 
         // s1 produces no delta; s2..s5 each produce one.  4 entries expected.
-        let times: Vec<u64> = series.iter().map(|(t, _)| *t).collect();
+        let times: Vec<u64> = series.iter().map(|(t, _)| t).collect();
         let expected: Vec<u64> = vec![2_000_000_000, 3_000_000_000, 4_000_000_000, 5_000_000_000];
         assert_eq!(
             times, expected,
