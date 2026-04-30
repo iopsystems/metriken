@@ -97,10 +97,10 @@ fn streaming_irate_matches_eager_irate() {
     let stream = irate_counters(
         &collection,
         &Labels::default(),
-        1_000_000_000_000,                 // start_ns
-        1_003_000_000_000,                 // end_ns
-        1_000_000_000,                     // step_ns
-        5_000_000_000,                     // range_ns
+        1_000_000_000_000, // start_ns
+        1_003_000_000_000, // end_ns
+        1_000_000_000,     // step_ns
+        5_000_000_000,     // range_ns
     );
     let streaming = sort_by_name(collect_to_matrix(stream, "cgroup_cpu_usage"));
 
@@ -113,7 +113,12 @@ fn streaming_irate_matches_eager_irate() {
     );
     for (e, s) in eager.iter().zip(streaming.iter()) {
         assert_eq!(e.metric.get("name"), s.metric.get("name"));
-        assert_eq!(e.values.len(), s.values.len(), "point count for {:?}", e.metric.get("name"));
+        assert_eq!(
+            e.values.len(),
+            s.values.len(),
+            "point count for {:?}",
+            e.metric.get("name")
+        );
         for ((et, ev), (st, sv)) in e.values.iter().zip(s.values.iter()) {
             assert!((et - st).abs() < 1e-9, "ts mismatch: {et} vs {st}");
             assert!((ev - sv).abs() < 1e-9, "value mismatch: {ev} vs {sv}");
@@ -204,7 +209,13 @@ fn counter_irate_handles_reset() {
         (5_000_000_000, 150),
     ];
     // Range [5s], step 1s, evaluate at t=5s only.
-    let mut iter = CounterIrate::new(&samples, 5_000_000_000, 5_000_000_000, 1_000_000_000, 5_000_000_000);
+    let mut iter = CounterIrate::new(
+        &samples,
+        5_000_000_000,
+        5_000_000_000,
+        1_000_000_000,
+        5_000_000_000,
+    );
     let p = iter.next().expect("one point at t=5s");
     assert_eq!(p.0, 5_000_000_000);
     // Last two: (4s, 50) and (5s, 150). 150 >= 50 → delta=100/1s = 100.
