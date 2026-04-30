@@ -27,7 +27,6 @@ pub enum QueryError {
     #[error("Evaluation error: {0}")]
     EvaluationError(String),
 
-    #[allow(dead_code)]
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
 
@@ -450,23 +449,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             }
         }
 
-        // Try counters
-        if let Some(collection) = self.tsdb.counters(&metric_name, labels.clone()) {
-            // Return raw counter values
-            let _filtered = collection.filter(&labels);
-
-            // For now, just return a placeholder
-            let mut metric_labels = HashMap::new();
-            metric_labels.insert("__name__".to_string(), metric_name.to_string());
-
-            return Ok(QueryResult::Vector {
-                result: vec![Sample {
-                    metric: metric_labels,
-                    value: (time.unwrap_or(0.0), 0.0), // Placeholder
-                }],
-            });
-        }
-
+        // Counter instant-vector queries are not yet supported here — the
+        // PromQL semantics require `rate()` / `irate()` to be meaningful, and
+        // those go through `handle_function_call`.  Falling through to
+        // MetricNotFound matches what other unsupported instant-vector cases
+        // do.
         Err(QueryError::MetricNotFound(format!(
             "Metric not found: {metric_name}"
         )))

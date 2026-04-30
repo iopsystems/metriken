@@ -463,20 +463,6 @@ impl Tsdb {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn percentiles(
-        &self,
-        metric: &str,
-        labels: impl Into<Labels>,
-        percentiles: &[f64],
-    ) -> Option<Vec<UntypedSeries>> {
-        if let Some(collection) = self.histograms(metric, labels) {
-            collection.sum().percentiles(percentiles, None)
-        } else {
-            None
-        }
-    }
-
     // sampling interval in seconds
     pub fn interval(&self) -> f64 {
         self.sampling_interval_ms as f64 / 1000.0

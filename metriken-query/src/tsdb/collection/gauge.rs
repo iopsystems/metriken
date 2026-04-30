@@ -35,8 +35,9 @@ impl GaugeCollection {
         min_time.zip(max_time)
     }
 
-    /// Old filter method that clones - kept for compatibility but should be
-    /// avoided
+    /// Return the subset of series whose labels match `labels`.  Clones
+    /// the matching series; for hot paths that combine filter + aggregate
+    /// see [`filtered_sum`].
     pub fn filter(&self, labels: &Labels) -> Self {
         let mut result = Self::default();
 
