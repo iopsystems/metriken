@@ -27,13 +27,6 @@ axum = { version = "0.8", optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
-# Used by the memory_compare example to read live-bytes vs resident from the
-# allocator's POV — so we can distinguish actual data-structure cost from
-# glibc/jemalloc slack.
-[target.'cfg(not(any(target_os = "windows", target_env = "msvc")))'.dev-dependencies]
-tikv-jemallocator = { version = "0.6", features = ["stats"] }
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
-
 [features]
 default = ["ingest", "lz4"]
 ingest = ["metriken-exposition"]
