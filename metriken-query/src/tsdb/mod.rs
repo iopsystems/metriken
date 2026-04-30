@@ -21,6 +21,7 @@ mod series;
 pub use collection::*;
 pub use heatmap::Heatmap;
 pub use labels::Labels;
+use series::delta_to_32;
 pub use series::*;
 
 /// Snap a nanosecond timestamp to the nearest multiple of `interval_ns`.
@@ -44,6 +45,12 @@ pub struct Tsdb {
     counters: HashMap<String, CounterCollection>,
     gauges: HashMap<String, GaugeCollection>,
     histograms: HashMap<String, HistogramCollection>,
+    /// Sidecar holding the most-recent cumulative-since-start histogram per
+    /// series, used by the streaming `ingest` path to compute the per-period
+    /// delta against the next snapshot.  Not populated by the parquet load
+    /// path (which differences in-place during column iteration).
+    #[cfg(feature = "ingest")]
+    prev_histograms: HashMap<String, HashMap<Labels, CumulativeROHistogram>>,
 }
 
 impl Tsdb {
@@ -237,29 +244,51 @@ impl Tsdb {
                                 continue;
                             };
 
+                            // Pre-difference consecutive snapshots into u32
+                            // delta histograms.  The first snapshot in a series
+                            // has no predecessor so it's kept only as the
+                            // anchor for the next delta.
+                            let mut prev: Option<CumulativeROHistogram> = None;
+
                             for (id, value) in list_array.iter().enumerate() {
-                                if let Some(list_value) = value {
-                                    if let Some(ts) = timestamps.get(&id) {
-                                        let data = list_value
-                                            .as_any()
-                                            .downcast_ref::<UInt64Array>()
-                                            .expect("Failed to downcast to UInt64Array");
+                                let ts = match timestamps.get(&id) {
+                                    Some(ts) => *ts,
+                                    None => continue,
+                                };
+                                let list_value = match value {
+                                    Some(v) => v,
+                                    None => continue,
+                                };
 
-                                        let buckets: Vec<u64> = data.iter().flatten().collect();
+                                let data = list_value
+                                    .as_any()
+                                    .downcast_ref::<UInt64Array>()
+                                    .expect("Failed to downcast to UInt64Array");
 
-                                        if let Ok(h) = Histogram::from_buckets(
-                                            grouping_power,
-                                            max_value_power,
-                                            buckets,
-                                        ) {
-                                            // Histograms are only read back for
-                                            // analytical queries here, so drop
-                                            // the dense representation as soon
-                                            // as it is loaded.
-                                            series.insert(*ts, CumulativeROHistogram::from(&h));
-                                        }
+                                let buckets: Vec<u64> = data.iter().flatten().collect();
+
+                                let h = match Histogram::from_buckets(
+                                    grouping_power,
+                                    max_value_power,
+                                    buckets,
+                                ) {
+                                    Ok(h) => h,
+                                    Err(_) => continue,
+                                };
+
+                                let curr = CumulativeROHistogram::from(&h);
+
+                                if let Some(prev_cumu) = &prev {
+                                    if let Some(d) = delta_to_32(prev_cumu, &curr) {
+                                        series.insert(ts, d);
                                     }
+                                } else {
+                                    // First snapshot: anchor stride windows at
+                                    // its timestamp even though it produces no
+                                    // delta.
+                                    series.set_anchor_time(ts);
                                 }
+                                prev = Some(curr);
                             }
                         }
                     }
@@ -325,12 +354,34 @@ impl Tsdb {
 
         for histogram in snapshot.histograms() {
             let (name, labels) = Self::extract_name_labels(&histogram.metadata);
-            self.histograms
-                .entry(name)
-                .or_default()
-                .entry(labels)
-                .or_default()
-                .insert(ts, CumulativeROHistogram::from(&histogram.value));
+            let curr = CumulativeROHistogram::from(&histogram.value);
+
+            let prev_for_metric = self
+                .prev_histograms
+                .entry(name.clone())
+                .or_default();
+
+            if let Some(prev) = prev_for_metric.get(&labels) {
+                if let Some(d) = delta_to_32(prev, &curr) {
+                    self.histograms
+                        .entry(name.clone())
+                        .or_default()
+                        .entry(labels.clone())
+                        .or_default()
+                        .insert(ts, d);
+                }
+            } else {
+                // First snapshot for this series — anchor stride windows at
+                // its timestamp even though it produces no stored delta.
+                self.histograms
+                    .entry(name.clone())
+                    .or_default()
+                    .entry(labels.clone())
+                    .or_default()
+                    .set_anchor_time(ts);
+            }
+
+            prev_for_metric.insert(labels, curr);
         }
     }
 

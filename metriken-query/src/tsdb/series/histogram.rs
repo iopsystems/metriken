@@ -1,19 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ::histogram::{CumulativeROHistogram, Histogram, Quantile, SampleQuantiles};
+use ::histogram::{CumulativeROHistogram, CumulativeROHistogram32, Histogram, Quantile};
 
 use super::*;
 
 /// Represents a series of histogram readings.
 ///
-/// Histograms are stored as [`CumulativeROHistogram`]s, a read-only cumulative
-/// form that keeps only non-zero buckets in columnar form. This is
-/// substantially smaller than the dense [`Histogram`] representation when the
-/// underlying distribution is sparse, and the cumulative layout keeps quantile
-/// queries cheap.
+/// Each entry is a per-period delta histogram in [`CumulativeROHistogram32`]
+/// form: cumulative counts (a running prefix sum) across the non-zero buckets
+/// of one snapshot, but those counts represent the delta between two
+/// consecutive raw snapshots rather than a running cumulative across the whole
+/// process lifetime. Per-period deltas comfortably fit in `u32` for any
+/// realistic sampling interval, which halves the stored count footprint.
+/// Pre-differencing on load also removes the per-pair `delta()` work from the
+/// hot query paths.
 #[derive(Default, Clone)]
 pub struct HistogramSeries {
-    inner: BTreeMap<u64, CumulativeROHistogram>,
+    inner: BTreeMap<u64, CumulativeROHistogram32>,
+    /// Timestamp of the very first cumulative snapshot observed for this
+    /// series.  That snapshot has no predecessor and so produces no stored
+    /// delta, but its timestamp anchors stride-window emission so that
+    /// stride bins line up with the original (cumulative-form) behavior.
+    anchor_time: Option<u64>,
 }
 
 /// Data for rendering a histogram as a latency heatmap
@@ -36,8 +44,18 @@ impl HistogramSeries {
         self.inner.is_empty()
     }
 
-    pub fn insert(&mut self, timestamp: u64, value: CumulativeROHistogram) {
+    pub fn insert(&mut self, timestamp: u64, value: CumulativeROHistogram32) {
         self.inner.insert(timestamp, value);
+    }
+
+    /// Record the timestamp of the very first raw cumulative snapshot
+    /// observed for this series (which itself produces no stored delta).
+    /// Used to anchor stride windows correctly.  Subsequent calls are
+    /// ignored — the anchor is the earliest snapshot.
+    pub(crate) fn set_anchor_time(&mut self, ts: u64) {
+        if self.anchor_time.is_none_or(|prev| ts < prev) {
+            self.anchor_time = Some(ts);
+        }
     }
 
     /// Returns the time bounds (min, max) in nanoseconds, or None if empty.
@@ -56,41 +74,18 @@ impl HistogramSeries {
             return None;
         }
 
-        let (&first_time, first_hist) = self.inner.first_key_value().unwrap();
-        let mut prev = first_hist;
-        let mut prev_time = first_time;
-
         let mut result = vec![UntypedSeries::default(); percentiles.len()];
 
-        for (time, curr) in self.inner.iter().skip(1) {
-            // With a stride, skip snapshots until we've covered the stride window.
-            if let Some(stride) = stride_ns {
-                if *time - prev_time < stride {
-                    continue;
-                }
-            }
-
-            let delta = match delta(prev, curr) {
-                Some(d) => d,
-                None => {
-                    prev = curr;
-                    prev_time = *time;
-                    continue;
-                }
-            };
-
+        for (time, delta) in self.iter_strided(stride_ns) {
             if let Ok(Some(q_results)) = delta.quantiles(percentiles) {
                 for (id, q) in percentiles.iter().enumerate() {
                     if let Ok(quantile) = Quantile::new(*q) {
                         if let Some(bucket) = q_results.get(&quantile) {
-                            result[id].inner.insert(*time, bucket.end() as f64);
+                            result[id].inner.insert(time, bucket.end() as f64);
                         }
                     }
                 }
             }
-
-            prev = curr;
-            prev_time = *time;
         }
 
         Some(result)
@@ -99,7 +94,7 @@ impl HistogramSeries {
     /// Returns bucket data suitable for rendering as a heatmap.
     /// Y-axis is bucket index (latency range), X-axis is time, color is count.
     pub fn heatmap(&self, stride_ns: Option<u64>) -> Option<HistogramHeatmapData> {
-        if self.inner.len() < 2 {
+        if self.inner.is_empty() {
             return None;
         }
 
@@ -107,41 +102,22 @@ impl HistogramSeries {
         let mut min_value = f64::MAX;
         let mut max_value = f64::MIN;
 
-        let (&first_time, first_hist) = self.inner.first_key_value().unwrap();
-        let mut prev = first_hist;
-        let mut prev_time = first_time;
-
         // Bucket boundaries come from the histogram config, which is identical
-        // across the series.  Collect them once from an empty Histogram with
-        // the same configuration so the Y-axis covers every bucket (not only
-        // the non-zero ones we actually observe).
-        let config = first_hist.config();
+        // across the series. Collect them once from an empty Histogram with the
+        // same configuration so the Y-axis covers every bucket (not only the
+        // non-zero ones we actually observe).
+        let config = self.inner.values().next().unwrap().config();
         if let Ok(empty) = Histogram::new(config.grouping_power(), config.max_value_power()) {
             result.bucket_bounds = empty.iter().map(|b| b.end()).collect();
         } else {
             return None;
         }
 
-        for (time, curr) in self.inner.iter().skip(1) {
-            // With a stride, skip snapshots until we've covered the stride window.
-            if let Some(stride) = stride_ns {
-                if *time - prev_time < stride {
-                    continue;
-                }
-            }
-
-            let delta = match delta(prev, curr) {
-                Some(d) => d,
-                None => {
-                    prev = curr;
-                    prev_time = *time;
-                    continue;
-                }
-            };
+        for (time, delta) in self.iter_strided(stride_ns) {
             let time_index = result.timestamps.len();
 
             // Store timestamp in seconds
-            result.timestamps.push(*time as f64 / 1_000_000_000.0);
+            result.timestamps.push(time as f64 / 1_000_000_000.0);
 
             // Emit only the non-zero buckets of the delta — CumulativeRO only
             // stores those, so this is also a zero-copy walk.
@@ -152,9 +128,10 @@ impl HistogramSeries {
                 min_value = min_value.min(count_f64);
                 max_value = max_value.max(count_f64);
             }
+        }
 
-            prev = curr;
-            prev_time = *time;
+        if result.timestamps.is_empty() {
+            return None;
         }
 
         // Handle edge cases
@@ -169,6 +146,137 @@ impl HistogramSeries {
         result.max_value = max_value;
 
         Some(result)
+    }
+
+    /// Iterate the stored per-period deltas, optionally bucketing them into
+    /// stride windows.  Without a stride each entry is yielded individually;
+    /// with a stride, deltas are summed across windows of `stride_ns`
+    /// nanoseconds and yielded once per window (timestamped at the latest
+    /// snapshot in the window).
+    fn iter_strided<'a>(
+        &'a self,
+        stride_ns: Option<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, CumulativeROHistogram32)> + 'a> {
+        match stride_ns {
+            None => Box::new(self.inner.iter().map(|(t, h)| (*t, h.clone()))),
+            Some(stride) => Box::new(StrideIter::new(
+                self.inner.iter(),
+                stride,
+                self.anchor_time,
+            )),
+        }
+    }
+}
+
+/// Sums consecutive per-period deltas until at least `stride` nanoseconds have
+/// elapsed since the last emitted bin, then yields the accumulated delta
+/// histogram timestamped at the last snapshot in the window.
+struct StrideIter<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> {
+    iter: I,
+    stride: u64,
+    last_emit: Option<u64>,
+    accum: BTreeMap<u32, u64>,
+    accum_config: Option<::histogram::Config>,
+    accum_end_time: u64,
+}
+
+impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> StrideIter<'a, I> {
+    fn new(iter: I, stride: u64, anchor: Option<u64>) -> Self {
+        Self {
+            iter,
+            stride,
+            last_emit: anchor,
+            accum: BTreeMap::new(),
+            accum_config: None,
+            accum_end_time: 0,
+        }
+    }
+
+    fn flush(&mut self) -> Option<(u64, CumulativeROHistogram32)> {
+        let config = self.accum_config.take()?;
+        let mut index = Vec::with_capacity(self.accum.len());
+        let mut count = Vec::with_capacity(self.accum.len());
+        let mut running: u64 = 0;
+        for (idx, c) in std::mem::take(&mut self.accum) {
+            if c == 0 {
+                continue;
+            }
+            running = running.saturating_add(c);
+            // Saturate at u32::MAX on overflow rather than wrapping — produces
+            // a clipped but monotonic cumulative that `from_parts` will accept.
+            let clipped = running.min(u32::MAX as u64) as u32;
+            index.push(idx);
+            count.push(clipped);
+        }
+        let end_time = self.accum_end_time;
+        self.last_emit = Some(end_time);
+        if index.is_empty() {
+            return None;
+        }
+        CumulativeROHistogram32::from_parts(config, index, count)
+            .ok()
+            .map(|h| (end_time, h))
+    }
+}
+
+impl<'a, I: Iterator<Item = (&'a u64, &'a CumulativeROHistogram32)>> Iterator for StrideIter<'a, I> {
+    type Item = (u64, CumulativeROHistogram32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (time, hist) = match self.iter.next() {
+                Some(pair) => pair,
+                None => {
+                    // Drain any final partial accumulator.
+                    if !self.accum.is_empty() {
+                        if let Some(emit) = self.flush() {
+                            return Some(emit);
+                        }
+                    }
+                    return None;
+                }
+            };
+
+            // Initialize / validate config.
+            match &self.accum_config {
+                None => self.accum_config = Some(hist.config()),
+                Some(cfg) => {
+                    if *cfg != hist.config() {
+                        // Config change — drop accumulator and start fresh
+                        // from this snapshot.
+                        self.accum.clear();
+                        self.accum_config = Some(hist.config());
+                        self.last_emit = None;
+                    }
+                }
+            }
+
+            // Add this delta's individual bucket counts into the accumulator.
+            let mut prev = 0u32;
+            for (i, &idx) in hist.index().iter().enumerate() {
+                let cumu = hist.count()[i];
+                let individual = cumu - prev;
+                prev = cumu;
+                if individual > 0 {
+                    *self.accum.entry(idx).or_insert(0) += individual as u64;
+                }
+            }
+            self.accum_end_time = *time;
+
+            // Anchor at the first observed delta if no caller-supplied anchor.
+            let last = match self.last_emit {
+                Some(t) => t,
+                None => {
+                    self.last_emit = Some(*time);
+                    continue;
+                }
+            };
+            if *time >= last && *time - last >= self.stride {
+                if let Some(emit) = self.flush() {
+                    return Some(emit);
+                }
+            }
+        }
     }
 }
 
@@ -192,12 +300,12 @@ impl Add<&HistogramSeries> for HistogramSeries {
     }
 }
 
-/// Decompose a `CumulativeROHistogram` into `bucket_index -> individual_count`.
-fn individual_counts(h: &CumulativeROHistogram) -> BTreeMap<u32, u64> {
+/// Decompose a `CumulativeROHistogram32` into `bucket_index -> individual_count`.
+fn individual_counts(h: &CumulativeROHistogram32) -> BTreeMap<u32, u32> {
     let index = h.index();
     let count = h.count();
     let mut out = BTreeMap::new();
-    let mut prev = 0u64;
+    let mut prev = 0u32;
     for (i, &idx) in index.iter().enumerate() {
         let c = count[i];
         out.insert(idx, c - prev);
@@ -207,14 +315,16 @@ fn individual_counts(h: &CumulativeROHistogram) -> BTreeMap<u32, u64> {
 }
 
 /// Combine two decomposed histograms with a per-bucket binary operator and
-/// rebuild a `CumulativeROHistogram`.  Returns `None` if the configs differ.
+/// rebuild a `CumulativeROHistogram32`.  Returns `None` if the configs differ
+/// or the resulting cumulative is not strictly non-decreasing (e.g. after
+/// wraparound).
 fn combine<F>(
-    prev: &CumulativeROHistogram,
-    curr: &CumulativeROHistogram,
+    prev: &CumulativeROHistogram32,
+    curr: &CumulativeROHistogram32,
     op: F,
-) -> Option<CumulativeROHistogram>
+) -> Option<CumulativeROHistogram32>
 where
-    F: Fn(u64, u64) -> u64,
+    F: Fn(u32, u32) -> u32,
 {
     if prev.config() != curr.config() {
         return None;
@@ -229,7 +339,7 @@ where
 
     let mut index = Vec::new();
     let mut count = Vec::new();
-    let mut running: u64 = 0;
+    let mut running: u32 = 0;
 
     for idx in indices {
         let pv = p.get(&idx).copied().unwrap_or(0);
@@ -242,22 +352,68 @@ where
         }
     }
 
-    CumulativeROHistogram::from_parts(prev.config(), index, count).ok()
+    CumulativeROHistogram32::from_parts(prev.config(), index, count).ok()
 }
 
-/// Delta between two snapshots: `curr - prev` per bucket (wrapping).
-fn delta(
+/// Merge (sum) two delta snapshots bucket-wise.  Used when summing series at
+/// the same timestamp across label sets.
+fn wrapping_add(
+    a: &CumulativeROHistogram32,
+    b: &CumulativeROHistogram32,
+) -> Option<CumulativeROHistogram32> {
+    combine(a, b, |x, y| x.wrapping_add(y))
+}
+
+/// Compute the per-period delta between two consecutive cumulative-since-start
+/// snapshots and narrow to `CumulativeROHistogram32`.  Used by the loader to
+/// pre-difference snapshots at ingest time.  Returns `None` if the configs
+/// differ, the delta cannot be represented, or any per-bucket cumulative
+/// exceeds `u32::MAX`.
+pub(crate) fn delta_to_32(
     prev: &CumulativeROHistogram,
     curr: &CumulativeROHistogram,
-) -> Option<CumulativeROHistogram> {
-    combine(prev, curr, |p, c| c.wrapping_sub(p))
+) -> Option<CumulativeROHistogram32> {
+    if prev.config() != curr.config() {
+        return None;
+    }
+
+    let p = u64_individual_counts(prev);
+    let c = u64_individual_counts(curr);
+
+    let mut indices: BTreeSet<u32> = BTreeSet::new();
+    indices.extend(p.keys().copied());
+    indices.extend(c.keys().copied());
+
+    let mut index = Vec::new();
+    let mut count = Vec::new();
+    let mut running: u64 = 0;
+
+    for idx in indices {
+        let pv = p.get(&idx).copied().unwrap_or(0);
+        let cv = c.get(&idx).copied().unwrap_or(0);
+        let d = cv.wrapping_sub(pv);
+        if d > 0 {
+            running = running.wrapping_add(d);
+            if running > u32::MAX as u64 {
+                return None;
+            }
+            index.push(idx);
+            count.push(running as u32);
+        }
+    }
+
+    CumulativeROHistogram32::from_parts(prev.config(), index, count).ok()
 }
 
-/// Merge (sum) two snapshots bucket-wise.  Used when summing series at the
-/// same timestamp across label sets.
-fn wrapping_add(
-    a: &CumulativeROHistogram,
-    b: &CumulativeROHistogram,
-) -> Option<CumulativeROHistogram> {
-    combine(a, b, |x, y| x.wrapping_add(y))
+fn u64_individual_counts(h: &CumulativeROHistogram) -> BTreeMap<u32, u64> {
+    let index = h.index();
+    let count = h.count();
+    let mut out = BTreeMap::new();
+    let mut prev = 0u64;
+    for (i, &idx) in index.iter().enumerate() {
+        let c = count[i];
+        out.insert(idx, c - prev);
+        prev = c;
+    }
+    out
 }
