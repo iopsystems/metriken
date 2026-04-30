@@ -13,9 +13,17 @@
 //!     curl -L -o /tmp/cachecannon.parquet \
 //!       https://github.com/iopsystems/rezolus/raw/refs/heads/main/site/viewer/data/cachecannon.parquet
 //!
-//! Each run prints the parquet file size, the count of loaded series and the
-//! resident-set delta (RSS after load minus RSS before load).  Subtracting
-//! the `new` delta from the `old` delta gives the savings.
+//! Each run prints, at three points (baseline / after load / after drop):
+//!   - process RSS  (kernel pages claimed)
+//!   - jemalloc allocated  (live application bytes — actual data structure cost)
+//!   - jemalloc resident  (allocator-backed bytes — slack + live)
+//!
+//! The gap between `allocated` and `resident` is allocator slack: bytes the
+//! allocator hasn't returned to the kernel.  If `allocated` is small after
+//! the load completes but `resident` (and RSS) are large, that's slack from
+//! transient allocations during decoding (e.g. parquet RecordBatch buffers
+//! that have been freed but not unmapped).  The "after drop" line shows
+//! whether the slack also covers structures we still own.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -28,6 +36,25 @@ use histogram::{CumulativeROHistogram, Histogram};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use metriken_query::tsdb::{Labels, Tsdb};
+
+#[cfg(not(any(target_os = "windows", target_env = "msvc")))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(any(target_os = "windows", target_env = "msvc")))]
+fn jemalloc_stats() -> (u64, u64) {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // Stats are buffered; epoch::advance refreshes the counters.
+    epoch::advance().expect("jemalloc epoch advance");
+    let allocated = stats::allocated::read().unwrap_or(0) as u64;
+    let resident = stats::resident::read().unwrap_or(0) as u64;
+    (allocated, resident)
+}
+
+#[cfg(any(target_os = "windows", target_env = "msvc"))]
+fn jemalloc_stats() -> (u64, u64) {
+    (0, 0)
+}
 
 fn read_rss_kib() -> u64 {
     // /proc/self/statm: size resident shared text lib data dt (in pages)
@@ -197,6 +224,17 @@ fn load_old(bytes: Bytes) -> OldTsdb {
     data
 }
 
+fn print_mark(label: &str, baseline_rss_kib: u64) {
+    let rss = read_rss_kib();
+    let (alloc, res) = jemalloc_stats();
+    println!(
+        "{label:<14}  RSS={:>9}  alloc={:>9}  resident={:>9}",
+        fmt_bytes((rss.saturating_sub(baseline_rss_kib)) * 1024),
+        fmt_bytes(alloc),
+        fmt_bytes(res),
+    );
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| {
@@ -213,7 +251,7 @@ fn main() {
     println!("input: {path} ({})", fmt_bytes(file_size));
 
     let baseline = read_rss_kib();
-    println!("baseline RSS: {} KiB", baseline);
+    print_mark("baseline", baseline);
 
     let bytes = Bytes::from(raw);
     let start = Instant::now();
@@ -223,17 +261,13 @@ fn main() {
             let tsdb = load_old(bytes);
             let elapsed = start.elapsed();
             let series_count = tsdb.series_count();
-            let after = read_rss_kib();
             println!("--- OLD representation ---");
             println!("series loaded: {series_count}");
-            println!("load time: {elapsed:.2?}");
-            println!(
-                "RSS after load: {} KiB (+{} KiB / +{})",
-                after,
-                after - baseline,
-                fmt_bytes((after - baseline) * 1024)
-            );
+            println!("load time:     {elapsed:.2?}");
+            print_mark("after load", baseline);
             std::hint::black_box(&tsdb);
+            drop(tsdb);
+            print_mark("after drop", baseline);
         }
         "new" => {
             let tsdb = Tsdb::load_from_bytes(bytes).expect("load");
@@ -248,17 +282,13 @@ fn main() {
             let series_count = count_label_sets(tsdb.counter_names(), &|n| tsdb.counter_labels(n))
                 + count_label_sets(tsdb.gauge_names(), &|n| tsdb.gauge_labels(n))
                 + count_label_sets(tsdb.histogram_names(), &|n| tsdb.histogram_labels(n));
-            let after = read_rss_kib();
             println!("--- NEW representation ---");
             println!("series loaded: {series_count}");
-            println!("load time: {elapsed:.2?}");
-            println!(
-                "RSS after load: {} KiB (+{} KiB / +{})",
-                after,
-                after - baseline,
-                fmt_bytes((after - baseline) * 1024)
-            );
+            println!("load time:     {elapsed:.2?}");
+            print_mark("after load", baseline);
             std::hint::black_box(&tsdb);
+            drop(tsdb);
+            print_mark("after drop", baseline);
         }
         other => {
             eprintln!("unknown mode {other:?}, expected 'old' or 'new'");
