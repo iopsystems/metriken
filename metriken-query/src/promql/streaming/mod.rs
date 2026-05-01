@@ -1,7 +1,7 @@
-//! Streaming time-series model (prototype).
+//! Streaming time-series query pipeline.
 //!
-//! The eager pipeline materialises every intermediate stage as
-//! `Vec<(f64, f64)>`. For the WASM viewer this means a typical
+//! A naïve evaluator materialises every intermediate stage as
+//! `Vec<(f64, f64)>`. For the WASM viewer that means a typical
 //! `sum by (label) (irate(metric[5s]))` over many series produces a
 //! transient `O(stages × points × series)` heap footprint just to be
 //! reduced down to `O(stages × points)` at the boundary.
@@ -10,20 +10,25 @@
 //!
 //! * [`Point`] — the single sample carried through the pipeline.
 //! * [`LabeledSeries`] — labelset + boxed iterator yielding `Point`.
-//! * Operators (e.g. [`CounterIrate`], [`SumMerge`]) wrap upstream
+//! * Operators (e.g. [`CounterIrate`], [`MergeReduce`]) wrap upstream
 //!   iterators and pull lazily, holding only their own windowed state.
 //!
 //! Wired-up shapes:
 //!
 //! * Counter producers: [`CounterIrate`], [`CounterRate`].
 //! * Gauge producers: [`GaugeStepGrid`] (bare selector),
-//!   [`GaugeAvgOverTime`], [`GaugeIdelta`].
+//!   [`GaugeAvgOverTime`], [`GaugeIdelta`], [`GaugeDeriv`].
 //! * Aggregations: [`MergeReduce`] reducer driven by [`AggOp`]
 //!   (sum/avg/min/max/count) with [`GroupBy`] (by/without).
+//! * Binary ops: [`ScalarBroadcast`] (matrix×scalar) and
+//!   [`matrix_matrix_op`] (matrix×matrix with on/ignoring).
+//! * Histogram quantiles: [`histogram::quantiles`].
 //!
-//! The dispatcher (see [`dispatch::try_streaming`]) walks the parsed
-//! AST and assembles a producer + optional aggregator for each
-//! recognised shape; everything else falls back to the eager path.
+//! The dispatcher ([`dispatch::try_streaming`]) walks the parsed AST
+//! and assembles the pipeline for each recognised shape. Eager
+//! handlers in `promql::mod` cover the residual cases (heatmaps,
+//! one-side-eager binary ops, group_left/right, scalar/vector
+//! wrappers, counter-rate `deriv`).
 
 use std::collections::HashMap;
 

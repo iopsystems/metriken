@@ -530,8 +530,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 // histogram_quantile(quantile, histogram) — standard PromQL,
                 // single quantile.  Internally the same operation as
                 // `histogram_quantiles([q], m)`; both routes share the
-                // streaming pipeline below when streaming is enabled and
-                // fall back to the same eager call otherwise.
+                // `streaming::histogram::quantiles` pipeline below.
                 if call.args.args.len() < 2 {
                     return Err(QueryError::ParseError(
                         "histogram_quantile requires 2 arguments".to_string(),

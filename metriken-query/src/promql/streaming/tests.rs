@@ -229,19 +229,19 @@ fn counter_irate_handles_reset() {
 }
 
 // ---------------------------------------------------------------------------
-// Cachecannon-fixture parity test.
+// Cachecannon-fixture smoke test.
 //
 // Exercises the dispatcher against the real cachecannon dashboard
-// queries on a real parquet capture, comparing streaming-on vs
-// streaming-off output pointwise. Gated on `CACHECANNON_PARQUET` (or
-// the default rezolus checkout path) being present so CI doesn't
-// depend on the fixture; run locally with:
+// queries on a real parquet capture, asserting each one runs without
+// error. Gated on `CACHECANNON_PARQUET` (or the default rezolus
+// checkout path) being present so CI doesn't depend on the fixture;
+// run locally with:
 //
 //     CACHECANNON_PARQUET=/path/to/cachecannon.parquet \
 //       cargo test -p metriken-query streaming::tests::cachecannon -- --nocapture
 //
-// The test also prints per-query streaming-vs-eager timing as a
-// directional measurement of the savings on a real workload.
+// Per-query wall-clock is printed with `--nocapture` for a quick
+// perf sanity-check on local dev.
 // ---------------------------------------------------------------------------
 
 /// Every query-string the cachecannon dashboard generates, after the
