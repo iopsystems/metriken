@@ -90,6 +90,12 @@ pub enum QueryResult {
 /// other `Deref<Target = Tsdb>`) for zero-copy borrowed access.
 pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
     tsdb: T,
+    /// When true, `query_range` first attempts to evaluate via the
+    /// streaming pipeline (see `promql::streaming`); shapes the
+    /// dispatcher doesn't yet recognise fall back to the eager path
+    /// transparently.  Defaulted to `true`; flipped to `false` only
+    /// by parity tests / benchmarks that need to compare paths.
+    streaming_enabled: bool,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -130,7 +136,7 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
 }
 
 /// Extract label filter from parsed PromQL matchers, skipping `__name__`.
-fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
+pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     let mut filter_labels = Labels::default();
     for matcher in matchers {
         if matcher.name == "__name__" {
@@ -197,7 +203,19 @@ fn match_key(
 
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     pub fn new(tsdb: T) -> Self {
-        Self { tsdb }
+        Self {
+            tsdb,
+            streaming_enabled: true,
+        }
+    }
+
+    /// Toggle the streaming dispatcher.  Public but doc-hidden — the
+    /// streaming path is intended to be transparent; this hook exists
+    /// for parity tests and benchmarks that need to force the eager
+    /// path on a query the dispatcher would otherwise handle.
+    #[doc(hidden)]
+    pub fn set_streaming_enabled(&mut self, enabled: bool) {
+        self.streaming_enabled = enabled;
     }
 
     /// Get a reference to the underlying TSDB
@@ -1787,6 +1805,18 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // Parse the query into an AST
         match parser::parse(query_str) {
             Ok(expr) => {
+                // Streaming dispatcher: handles the hot-path shapes
+                // (currently `sum [by (..)] (irate(metric[range]))`).
+                // Returns `Ok(None)` for shapes it doesn't yet cover,
+                // letting us fall through to the eager path with no
+                // observable behaviour change.
+                if self.streaming_enabled {
+                    if let Some(result) =
+                        streaming::dispatch::try_streaming(&self.tsdb, &expr, start, end, step)?
+                    {
+                        return Ok(result);
+                    }
+                }
                 // Evaluate the AST
                 self.evaluate_expr(&expr, start, end, step)
             }

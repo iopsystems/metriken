@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use crate::promql::MatrixSample;
 use crate::tsdb::{CounterCollection, Labels};
 
+pub(crate) mod dispatch;
 mod irate;
 mod sum_by;
 
@@ -98,9 +99,13 @@ pub fn irate_counters<'a>(
 /// `MatrixSample` shape the eager engine returns, so the prototype can
 /// be plumbed through the existing JSON serializer unchanged.
 ///
+/// `metric_name` is added as the `__name__` label when present;
+/// callers pass `None` for aggregated results (matching the eager
+/// path, which strips `__name__` after `sum`/`avg`/etc.).
+///
 /// Empty series (operators that never emitted) are dropped to match
 /// the eager path's behaviour.
-pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: &str) -> Vec<MatrixSample> {
+pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) -> Vec<MatrixSample> {
     streaming
         .into_iter()
         .filter_map(|ls| {
@@ -109,7 +114,9 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: &str) -> Vec<Mat
                 return None;
             }
             let mut metric: HashMap<String, String> = HashMap::new();
-            metric.insert("__name__".to_string(), metric_name.to_string());
+            if let Some(name) = metric_name {
+                metric.insert("__name__".to_string(), name.to_string());
+            }
             for (k, v) in ls.labels.inner.iter() {
                 metric.insert(k.clone(), v.clone());
             }
