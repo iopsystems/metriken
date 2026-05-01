@@ -37,6 +37,12 @@ impl CounterSeries {
         Some((first, last))
     }
 
+    /// Borrow the raw sample slice. Used by streaming operators that
+    /// build iterator pipelines without cloning.
+    pub(crate) fn samples(&self) -> &[(u64, u64)] {
+        &self.inner
+    }
+
     /// Slice covering all samples whose timestamp falls in `[start, end]`.
     fn range_window(&self, start: u64, end: u64) -> &[(u64, u64)] {
         let lo = self.inner.partition_point(|&(t, _)| t < start);
