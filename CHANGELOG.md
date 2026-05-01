@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.10.2
+
+- Restore the matcher-less single-right binary broadcast. Queries
+  shaped like `sum(rate(x[..])) / y` (where the aggregate strips
+  labels and `y` carries some) were silently empty in 0.10.0/0.10.1
+  on single-host parquets — the rezolus viewer's CPU-utilization
+  tiles relied on this fallback. Now `matrix_matrix_op` materialises
+  the lone unmatched right series into a shared timestamp lookup
+  and broadcasts it across every unmatched left series, mirroring
+  the eager engine's per-left fallback.
+
 ### metriken-query 0.10.1
 
 - Cache the parquet footer once per load and decode columns one at a

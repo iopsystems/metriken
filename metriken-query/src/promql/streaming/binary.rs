@@ -11,24 +11,25 @@
 //! * **Series-set joining** — [`matrix_matrix_op`] groups the right
 //!   side by label-match key (per [`MatchSpec`]) and pairs each
 //!   left-side series with its matching right-side series. Series
-//!   that don't find a match are dropped, matching the eager
-//!   engine's behaviour modulo the single-right fallback (see
-//!   below).
+//!   that don't find a match are dropped.
 //!
-//! What's NOT covered here and falls back to eager:
+//! When no `on()`/`ignoring()` modifier is given AND exactly one
+//! right-side series is left after the keyed join, that singleton is
+//! broadcast against every unmatched left series via
+//! [`RightLookupBinary`] (materialises the one right series's points
+//! into a shared timestamp lookup). Mirrors the eager engine's
+//! per-left-series fallback.
+//!
+//! What's NOT covered here:
 //!
 //! * `group_left` / `group_right` (one-to-many matching) — needs an
 //!   iterator-tee mechanism that defeats streaming.
-//! * Single-right fallback (`metric / scalar_aggregate` without an
-//!   `on()`/`ignoring()` modifier) — would require buffering one
-//!   side. The eager path keeps this working transparently; the
-//!   streaming dispatcher returns `None` so the eager evaluator
-//!   takes over.
 //! * Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`) and
 //!   the `bool` modifier — not implemented in the eager engine
 //!   today either.
 
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use promql_parser::parser::token::TokenType;
 
@@ -211,20 +212,46 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
     }
 }
 
+/// Wrap a left-side `(t, v)` iterator and apply `op` against a
+/// pre-materialised right-side timestamp→value lookup.  Used by the
+/// single-right broadcast fallback in [`matrix_matrix_op`] — the same
+/// `Rc<HashMap<...>>` is shared across every left series, so the right
+/// singleton is decoded once regardless of left fan-out.
+pub struct RightLookupBinary<'a> {
+    upstream: Box<dyn Iterator<Item = Point> + 'a>,
+    op: BinOp,
+    rhs: Rc<HashMap<u64, f64>>,
+}
+
+impl<'a> Iterator for RightLookupBinary<'a> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        for (t, lv) in self.upstream.by_ref() {
+            if let Some(&rv) = self.rhs.get(&t) {
+                if let Some(v) = self.op.apply(lv, rv) {
+                    return Some((t, v));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// `left OP right` over two series sets, joining by `spec`-derived
 /// match key. Output preserves left's labels (matching the eager
 /// path, which copies `left_sample.metric.clone()` to the result).
 ///
-/// Returns `None` instead of an empty `SeriesSet` when the dispatcher
-/// would need the eager engine's single-right fallback (left has at
-/// least one series with no match on the right, AND `spec` is
-/// `Default`, AND right is single-series). Caller falls back to eager.
+/// When `spec` is `Default` and exactly one right-side series remains
+/// unmatched after the keyed join, that singleton is broadcast against
+/// every unmatched left series — common case is `sum(rate(x[..])) / y`
+/// where `sum(...)` strips labels and `y` carries some.
 pub fn matrix_matrix_op<'a>(
     left_set: SeriesSet<'a>,
     right_set: SeriesSet<'a>,
     op: BinOp,
     spec: MatchSpec<'_>,
-) -> Option<SeriesSet<'a>> {
+) -> SeriesSet<'a> {
     // Index right side by match key.  If two right-side series share
     // a key, the later one wins (the eager engine's HashMap-insert
     // has the same shape).
@@ -236,7 +263,7 @@ pub fn matrix_matrix_op<'a>(
     }
 
     let mut out: SeriesSet<'a> = Vec::new();
-    let mut any_unmatched = false;
+    let mut unmatched_left: Vec<LabeledSeries<'a>> = Vec::new();
     for left in left_set {
         let lk = match_key(&left.labels, spec);
         match right_by_key.remove(&lk) {
@@ -248,28 +275,26 @@ pub fn matrix_matrix_op<'a>(
                 };
                 out.push(LabeledSeries::new(left.labels, iter));
             }
-            None => {
-                // Drop this left series — it doesn't match anything
-                // on the right.  Track for the fallback decision
-                // below.
-                any_unmatched = true;
-                drop(left);
-            }
+            None => unmatched_left.push(left),
         }
     }
 
-    // Single-right fallback: when no explicit matcher is given AND
-    // left had unmatched series AND right was single-series, the
-    // eager engine pairs every left with that one right. We can't
-    // tee a streaming iterator without buffering, so signal "fall
-    // back to eager" rather than silently dropping series.
-    let needs_fallback = any_unmatched
-        && matches!(spec, MatchSpec::Default)
-        && right_by_key.len() == 1
-        && out.is_empty();
-    if needs_fallback {
-        return None;
+    // Single-right broadcast: with no explicit matcher and exactly one
+    // unmatched right series, pair every unmatched left with that
+    // singleton (timestamps via a shared lookup).  Mirrors the eager
+    // engine's per-left fallback for `aggregated / scalar_metric`.
+    if !unmatched_left.is_empty() && matches!(spec, MatchSpec::Default) && right_by_key.len() == 1 {
+        let (_, right_singleton) = right_by_key.into_iter().next().unwrap();
+        let rhs: Rc<HashMap<u64, f64>> = Rc::new(right_singleton.iter.collect());
+        for left in unmatched_left {
+            let iter = RightLookupBinary {
+                upstream: left.iter,
+                op,
+                rhs: Rc::clone(&rhs),
+            };
+            out.push(LabeledSeries::new(left.labels, iter));
+        }
     }
 
-    Some(out)
+    out
 }

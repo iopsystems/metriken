@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use metriken_exposition::{Counter, Snapshot, SnapshotV2};
+use metriken_exposition::{Counter, Gauge, Snapshot, SnapshotV2};
 
 use crate::promql::streaming::{
     collect_to_matrix, irate_counters, sum_by, CounterIrate, LabeledSeries,
@@ -226,6 +226,63 @@ fn counter_irate_handles_reset() {
     // Last two: (4s, 50) and (5s, 150). 150 >= 50 → delta=100/1s = 100.
     assert!((p.1 - 100.0).abs() < 1e-9);
     assert!(iter.next().is_none());
+}
+
+/// Models the rezolus viewer's CPU-utilization pattern:
+/// `sum(irate(cpu_usage[5s])) / cpu_cores`. The aggregator strips
+/// labels from the LHS, so default-matching against `cpu_cores`
+/// (which carries `node`, `source`) finds nothing — without the
+/// single-right broadcast the query returns empty and the viewer
+/// shows no data.
+#[test]
+fn single_right_broadcasts_against_label_stripping_aggregate() {
+    let mut tsdb = Tsdb::default();
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    // Two cpu_usage counter series at different cpus, each ramping
+    // 100/s. sum(irate(...)) over both = 200/s.
+    for step in 0u64..3 {
+        let mut counters = Vec::new();
+        for cpu in 0..2u64 {
+            let mut md = HashMap::new();
+            md.insert("metric".to_string(), "cpu_usage".to_string());
+            md.insert("cpu".to_string(), cpu.to_string());
+            counters.push(Counter {
+                name: "cpu_usage".to_string(),
+                value: cpu * 1000 + step * 100,
+                metadata: md,
+            });
+        }
+        let mut node_md = HashMap::new();
+        node_md.insert("metric".to_string(), "cpu_cores".to_string());
+        node_md.insert("node".to_string(), "agent-0".to_string());
+        node_md.insert("source".to_string(), "rezolus".to_string());
+        let gauges = vec![Gauge {
+            name: "cpu_cores".to_string(),
+            value: 4,
+            metadata: node_md,
+        }];
+
+        tsdb.ingest(Snapshot::V2(SnapshotV2 {
+            systemtime: base + Duration::from_secs(step),
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters,
+            gauges,
+            histograms: Vec::new(),
+        }));
+    }
+
+    let engine = QueryEngine::new(Arc::new(tsdb));
+    let q = "sum(irate(cpu_usage[5s])) / cpu_cores";
+    let r = engine.query(q, None).expect("query must succeed");
+    let samples = match r {
+        QueryResult::Vector { result } => result,
+        other => panic!("expected vector result, got {other:?}"),
+    };
+    assert_eq!(samples.len(), 1, "expected one broadcast series");
+    // sum(irate) = 200 c/s across both cpus; / cpu_cores (=4) = 50.
+    assert!((samples[0].value.1 - 50.0).abs() < 1e-9, "got {samples:?}");
 }
 
 // ---------------------------------------------------------------------------
