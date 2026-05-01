@@ -34,26 +34,4 @@ impl HistogramCollection {
 
         min_time.zip(max_time)
     }
-
-    pub fn filter(&self, labels: &Labels) -> Self {
-        let mut result = Self::default();
-
-        for (k, v) in self.inner.iter() {
-            if k.matches(labels) {
-                result.inner.insert(k.clone(), v.clone());
-            }
-        }
-
-        result
-    }
-
-    pub fn sum(&self) -> HistogramSeries {
-        let mut result = HistogramSeries::default();
-
-        for series in self.inner.values() {
-            result = result + series;
-        }
-
-        result
-    }
 }

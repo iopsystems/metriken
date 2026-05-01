@@ -22,9 +22,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror = "2"
 
-# Optional HTTP API dependencies
-axum = { version = "0.8", optional = true }
-
 [dev-dependencies]
 tempfile.workspace = true
 
@@ -32,4 +29,3 @@ tempfile.workspace = true
 default = ["ingest", "lz4"]
 ingest = ["metriken-exposition"]
 lz4 = ["parquet/lz4"]
-http = ["axum"]

@@ -337,3 +337,237 @@ fn apply_quantiles_ref(
         }
     }
 }
+
+/// Streaming `histogram_heatmap(metric{filter}[, stride])`.
+///
+/// Same per-tick walk as [`quantiles`] (sum across input series's
+/// per-timestamp deltas into reusable scratch), but for each tick
+/// emits one `(time_idx, bucket_idx, count)` triple per non-zero
+/// bucket directly into the output `HistogramHeatmapResult` instead
+/// of running the quantile reducer.
+///
+/// Time-range filtering happens during the walk (skip ticks outside
+/// `[start_ns, end_ns]`); bucket-range trimming happens in a single
+/// second pass over the collected triples.
+///
+/// The output is intrinsically 2-D so a `Vec` of triples gets
+/// materialised either way; the streaming-side win is avoiding the
+/// `tsdb.histograms()` clone and the `collection.sum()` merged
+/// `HistogramSeries` allocation that the eager path used to build.
+pub fn heatmap(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    stride_ns: Option<u64>,
+) -> Option<crate::promql::HistogramHeatmapResult> {
+    let mut iters: Vec<_> = collection
+        .iter()
+        .filter(|(labels, _)| label_filter.inner.is_empty() || labels.matches(label_filter))
+        .map(|(_, series)| series.iter().peekable())
+        .collect();
+
+    if iters.is_empty() {
+        return None;
+    }
+
+    let config: Option<Config> = iters
+        .iter_mut()
+        .filter_map(|it| it.peek().map(|(_, r)| r.config()))
+        .next();
+    let config = config?;
+
+    // Bucket bounds come from the series' shared Config — we use an
+    // empty Histogram with the same configuration so the Y-axis
+    // covers every bucket (not just the non-zero ones we observe).
+    let all_bounds: Vec<u64> =
+        ::histogram::Histogram::new(config.grouping_power(), config.max_value_power())
+            .ok()?
+            .iter()
+            .map(|b| b.end())
+            .collect();
+
+    // Per-tick scratch + stride accumulator (mirrors `quantiles`).
+    let mut scratch_idx: Vec<u32> = Vec::new();
+    let mut scratch_cnt: Vec<u32> = Vec::new();
+    let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut stride_last_emit: Option<u64> = None;
+    let mut stride_end_time: u64 = 0;
+
+    // Output accumulators.
+    let mut timestamps: Vec<f64> = Vec::new();
+    let mut data: Vec<(usize, usize, f64)> = Vec::new();
+    let mut min_value = f64::MAX;
+    let mut max_value = f64::MIN;
+    let mut min_bucket_idx = usize::MAX;
+    let mut max_bucket_idx = 0usize;
+
+    let emit_tick = |t_ns: u64,
+                     idx: &[u32],
+                     cnt: &[u32],
+                     timestamps: &mut Vec<f64>,
+                     data: &mut Vec<(usize, usize, f64)>,
+                     min_value: &mut f64,
+                     max_value: &mut f64,
+                     min_bucket_idx: &mut usize,
+                     max_bucket_idx: &mut usize| {
+        let time_idx = timestamps.len();
+        timestamps.push(t_ns as f64 / 1e9);
+        // Decompose cumulative back to per-bucket individual counts.
+        let mut prev = 0u32;
+        for k in 0..idx.len() {
+            let cumu = cnt[k];
+            let individual = cumu - prev;
+            prev = cumu;
+            if individual == 0 {
+                continue;
+            }
+            let bucket_idx = idx[k] as usize;
+            let count_f64 = individual as f64;
+            data.push((time_idx, bucket_idx, count_f64));
+            *min_value = min_value.min(count_f64);
+            *max_value = max_value.max(count_f64);
+            *min_bucket_idx = (*min_bucket_idx).min(bucket_idx);
+            *max_bucket_idx = (*max_bucket_idx).max(bucket_idx);
+        }
+    };
+
+    loop {
+        let mut min_ts: Option<u64> = None;
+        for it in iters.iter_mut() {
+            while let Some(&(ts, _)) = it.peek() {
+                if ts > end_ns {
+                    it.next();
+                    continue;
+                }
+                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                break;
+            }
+        }
+        let Some(t) = min_ts else { break };
+
+        if t < start_ns {
+            for it in iters.iter_mut() {
+                if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
+                    it.next();
+                }
+            }
+            continue;
+        }
+
+        let mut at_t: Vec<CumulativeROHistogram32Ref<'_>> = Vec::new();
+        for it in iters.iter_mut() {
+            if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
+                let (_, r) = it.next().expect("peek matched");
+                at_t.push(r);
+            }
+        }
+
+        if let Some(stride) = stride_ns {
+            for r in &at_t {
+                accumulate_into(&mut stride_accum, r);
+            }
+            stride_end_time = t;
+            let last = match stride_last_emit {
+                Some(t) => t,
+                None => {
+                    stride_last_emit = Some(t);
+                    continue;
+                }
+            };
+            if t >= last
+                && t - last >= stride
+                && flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt)
+            {
+                emit_tick(
+                    stride_end_time,
+                    &scratch_idx,
+                    &scratch_cnt,
+                    &mut timestamps,
+                    &mut data,
+                    &mut min_value,
+                    &mut max_value,
+                    &mut min_bucket_idx,
+                    &mut max_bucket_idx,
+                );
+                stride_last_emit = Some(t);
+            }
+        } else {
+            match at_t.len() {
+                1 => emit_tick(
+                    t,
+                    at_t[0].index(),
+                    at_t[0].count(),
+                    &mut timestamps,
+                    &mut data,
+                    &mut min_value,
+                    &mut max_value,
+                    &mut min_bucket_idx,
+                    &mut max_bucket_idx,
+                ),
+                _ => {
+                    merge_into(&at_t, &mut scratch_idx, &mut scratch_cnt);
+                    emit_tick(
+                        t,
+                        &scratch_idx,
+                        &scratch_cnt,
+                        &mut timestamps,
+                        &mut data,
+                        &mut min_value,
+                        &mut max_value,
+                        &mut min_bucket_idx,
+                        &mut max_bucket_idx,
+                    );
+                }
+            }
+        }
+    }
+
+    if stride_ns.is_some()
+        && !stride_accum.is_empty()
+        && flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt)
+    {
+        emit_tick(
+            stride_end_time,
+            &scratch_idx,
+            &scratch_cnt,
+            &mut timestamps,
+            &mut data,
+            &mut min_value,
+            &mut max_value,
+            &mut min_bucket_idx,
+            &mut max_bucket_idx,
+        );
+    }
+
+    if timestamps.is_empty() {
+        return None;
+    }
+
+    if min_value == f64::MAX {
+        min_value = 0.0;
+    }
+    if max_value == f64::MIN {
+        max_value = 0.0;
+    }
+
+    // Trim bucket_bounds to the active range and remap bucket indices.
+    let (bucket_bounds, data) = if !data.is_empty() && max_bucket_idx < all_bounds.len() {
+        let bounds = all_bounds[min_bucket_idx..=max_bucket_idx].to_vec();
+        let remapped = data
+            .into_iter()
+            .map(|(t, b, c)| (t, b - min_bucket_idx, c))
+            .collect();
+        (bounds, remapped)
+    } else {
+        (all_bounds, data)
+    };
+
+    Some(crate::promql::HistogramHeatmapResult {
+        timestamps,
+        bucket_bounds,
+        data,
+        min_value,
+        max_value,
+    })
+}

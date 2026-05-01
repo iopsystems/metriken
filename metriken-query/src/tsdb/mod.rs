@@ -421,22 +421,7 @@ impl Tsdb {
         (name, labels)
     }
 
-    pub fn counters(&self, name: &str, labels: impl Into<Labels>) -> Option<CounterCollection> {
-        if let Some(counters) = self.counters.get(name) {
-            let counters = counters.filter(&labels.into());
-
-            if counters.is_empty() {
-                None
-            } else {
-                Some(counters)
-            }
-        } else {
-            None
-        }
-    }
-
     /// Borrow the raw counter collection for `name` without cloning.
-    ///
     /// Used by the streaming pipeline so iterator chains can hold
     /// references into the TSDB's storage rather than building (and
     /// keeping resident) a per-query clone. Returns `None` if the
@@ -455,34 +440,6 @@ impl Tsdb {
     /// See [`Tsdb::counters_ref`].
     pub fn histograms_ref(&self, name: &str) -> Option<&HistogramCollection> {
         self.histograms.get(name)
-    }
-
-    pub fn gauges(&self, name: &str, labels: impl Into<Labels>) -> Option<GaugeCollection> {
-        if let Some(gauges) = self.gauges.get(name) {
-            let gauges = gauges.filter(&labels.into());
-
-            if gauges.is_empty() {
-                None
-            } else {
-                Some(gauges)
-            }
-        } else {
-            None
-        }
-    }
-
-    pub fn histograms(&self, name: &str, labels: impl Into<Labels>) -> Option<HistogramCollection> {
-        if let Some(histograms) = self.histograms.get(name) {
-            let histograms = histograms.filter(&labels.into());
-
-            if histograms.is_empty() {
-                None
-            } else {
-                Some(histograms)
-            }
-        } else {
-            None
-        }
     }
 
     // sampling interval in seconds
@@ -641,9 +598,7 @@ mod ingest_tests {
             tsdb.ingest(snapshot_at(*ts, h, "lat"));
         }
 
-        let collection = tsdb
-            .histograms("lat", Labels::default())
-            .expect("histogram series exists");
+        let collection = tsdb.histograms_ref("lat").expect("histogram series exists");
         let (_, series) = collection.iter().next().expect("one labelset");
 
         // s1 produces no delta; s2..s5 each produce one.  4 entries expected.
