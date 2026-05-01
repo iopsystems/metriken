@@ -369,16 +369,13 @@ end = 10.0
 step = 1.0
 description = "Single-quantile extraction over a normal histogram."
 # `request_latency(timestamp, buckets, p)` view exposes the histogram column
-# plus the per-column `grouping_power` as a literal. The self-join produces
-# the prior-row buckets without using LAG (LAG-on-LIST<UBIGINT> hits a known
-# duckdb-rs bug at chunk boundaries — see `metriken-query-sql/src/udf.rs`).
+# plus the per-column `grouping_power`. `hist_irate_quantile` expands to
+# `h2_quantile(h2_delta(buckets, LAG(buckets) OVER (ORDER BY ts)), q, p)`.
 sql = """
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.5, a.p) AS DOUBLE) AS v
-FROM request_latency a
-JOIN request_latency b
-  ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
-ORDER BY a.timestamp
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(hist_irate_quantile(buckets, 0.5, timestamp, p) AS DOUBLE) AS v
+FROM request_latency
+ORDER BY timestamp
 """
 value_columns = ["v"]
 label_columns = []
@@ -394,12 +391,10 @@ end = 10.0
 step = 1.0
 description = "p99 over the same histogram."
 sql = """
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.99, a.p) AS DOUBLE) AS v
-FROM request_latency a
-JOIN request_latency b
-  ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
-ORDER BY a.timestamp
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(hist_irate_quantile(buckets, 0.99, timestamp, p) AS DOUBLE) AS v
+FROM request_latency
+ORDER BY timestamp
 """
 value_columns = ["v"]
 label_columns = []
@@ -417,19 +412,16 @@ description = "Rezolus extension — multi-quantile in a single walk."
 # Use `h2_quantiles` to compute all three quantiles in a single walk
 # (the rezolus extension; matches metriken-query's `histogram_quantiles`).
 # The list output is array-indexed via CROSS JOIN to produce one row per
-# `(timestamp, quantile)`. Avoids multiple-h2_quantile-on-the-same-list
-# patterns that hit the LAG-on-list duckdb-rs chunk-boundary bug.
+# `(timestamp, quantile)`.
 sql = """
 WITH walked AS (
-    SELECT a.timestamp,
+    SELECT timestamp,
            h2_quantiles(
-               h2_delta(a.buckets, b.buckets),
+               h2_delta(buckets, LAG(buckets) OVER (ORDER BY timestamp)),
                [0.5, 0.9, 0.99]::DOUBLE[],
-               a.p
+               p
            ) AS qs
-    FROM request_latency a
-    JOIN request_latency b
-      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+    FROM request_latency
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        CAST(qs[q.idx] AS DOUBLE) AS v,
@@ -452,17 +444,15 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Rezolus extension — 2-D heatmap output for visualization."
-# Self-join + UNNEST WITH ORDINALITY: emit one row per non-zero bucket per
-# tick. The backend reconstructs timestamps, bucket_bounds (via h2_upper for
-# the contiguous index range), and remaps bucket_idx into the output frame.
+# UNNEST WITH ORDINALITY emits one row per non-zero bucket per tick. The
+# backend reconstructs timestamps, bucket_bounds (via h2_upper for the
+# contiguous index range), and remaps bucket_idx into the output frame.
 sql = """
 WITH paired AS (
-    SELECT a.timestamp,
-           h2_delta(a.buckets, b.buckets) AS d,
-           a.p AS p
-    FROM request_latency a
-    JOIN request_latency b
-      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+    SELECT timestamp,
+           h2_delta(buckets, LAG(buckets) OVER (ORDER BY timestamp)) AS d,
+           p
+    FROM request_latency
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        (u.ordinal - 1)::INTEGER AS bucket_idx,
@@ -489,11 +479,9 @@ description = "Quantile across a histogram-reset boundary (delta_to_32_or_empty 
 # so the timestamp at the reset is dropped from the output.
 sql = """
 SELECT t, v FROM (
-    SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-           CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.5, a.p) AS DOUBLE) AS v
-    FROM request_latency a
-    JOIN request_latency b
-      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+    SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+           CAST(hist_irate_quantile(buckets, 0.5, timestamp, p) AS DOUBLE) AS v
+    FROM request_latency
 )
 WHERE v IS NOT NULL
 ORDER BY t
@@ -513,11 +501,9 @@ step = 1.0
 description = "Quantile over a series with a no-events period in the middle."
 sql = """
 SELECT t, v FROM (
-    SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-           CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.5, a.p) AS DOUBLE) AS v
-    FROM request_latency a
-    JOIN request_latency b
-      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+    SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+           CAST(hist_irate_quantile(buckets, 0.5, timestamp, p) AS DOUBLE) AS v
+    FROM request_latency
 )
 WHERE v IS NOT NULL
 ORDER BY t
@@ -604,12 +590,10 @@ end = 20.0
 step = 1.0
 description = "Rezolus syscall_latency p99 — full Rezolus-shape histogram path."
 sql = """
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.99, a.p) AS DOUBLE) AS v
-FROM syscall_latency a
-JOIN syscall_latency b
-  ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
-ORDER BY a.timestamp
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(hist_irate_quantile(buckets, 0.99, timestamp, p) AS DOUBLE) AS v
+FROM syscall_latency
+ORDER BY timestamp
 """
 value_columns = ["v"]
 label_columns = []

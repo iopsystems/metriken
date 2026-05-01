@@ -63,17 +63,44 @@ impl TraitSqlBackend for DuckDbBackend {
             .ok_or_else(|| SqlError::Backend(format!("entry {} has no SQL twin", entry.id)))?;
         let sql = template.replace("{fixture_path}", data_source);
 
+        // Phase timings — enable with METRIKEN_SQL_TIMING=1 for per-query
+        // breakdown logging on stderr. Quiet by default so production logs
+        // don't get spammed.
+        let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+
         let conn = Connection::open_in_memory()
             .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
+        let t_open = t0.elapsed();
+
         crate::register_all(&conn)
             .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
+        let t_register = t0.elapsed() - t_open;
+
         crate::views::ensure_views(&conn, data_source)
             .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
+        let t_views = t0.elapsed() - t_open - t_register;
 
-        match entry.output_shape {
-            OutputShape::Matrix => run_matrix(&conn, entry, &sql),
-            OutputShape::Heatmap => run_heatmap(&conn, entry, &sql),
+        let result = match entry.output_shape {
+            OutputShape::Matrix => run_matrix(&conn, entry, &sql, timing),
+            OutputShape::Heatmap => run_heatmap(&conn, entry, &sql, timing),
+        };
+        let t_total = t0.elapsed();
+
+        if timing {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "duckdb {} open={:.1}ms reg={:.1}ms views={:.1}ms exec={:.1}ms total={:.1}ms",
+                entry.id,
+                ms(t_open),
+                ms(t_register),
+                ms(t_views),
+                ms(t_total - t_open - t_register - t_views),
+                ms(t_total),
+            );
         }
+
+        result
     }
 }
 
@@ -81,6 +108,7 @@ fn run_matrix(
     conn: &Connection,
     entry: &CatalogueEntry,
     sql: &str,
+    _timing: bool,
 ) -> Result<QueryResult, SqlError> {
     let mut stmt = conn
         .prepare(sql)
@@ -138,6 +166,7 @@ fn run_heatmap(
     conn: &Connection,
     entry: &CatalogueEntry,
     sql: &str,
+    _timing: bool,
 ) -> Result<QueryResult, SqlError> {
     let mut stmt = conn
         .prepare(sql)

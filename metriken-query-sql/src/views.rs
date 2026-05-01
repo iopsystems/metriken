@@ -86,6 +86,14 @@ fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
 /// `CREATE OR REPLACE VIEW <metric>` for each one. Counters and gauges share
 /// a `(timestamp, value, ...labels)` shape; histograms get
 /// `(timestamp, buckets, p, ...labels)`.
+///
+/// **Performance:** before any view is created, the parquet file is loaded
+/// **once** into an in-memory `_src` table. The view DDLs all reference
+/// `_src` instead of `read_parquet(...)` directly, so a query that touches a
+/// view with N UNION-ALL branches costs N in-memory scans of `_src` (cheap)
+/// rather than N full parquet reads (~10-100s on Rezolus production data).
+/// The single parquet read amortises across every view and every query for
+/// the lifetime of the connection.
 pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()> {
     let bytes = std::fs::read(parquet_path).map_err(|e| {
         duckdb::Error::DuckDBFailure(
@@ -126,6 +134,15 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
         })
         .collect();
 
+    // Single parquet read into an in-memory table. All metric views project
+    // from `_src` instead of `read_parquet(...)`, so per-view UNION ALL
+    // branches are cheap memory scans, not redundant parquet decodes.
+    let load_src = format!(
+        "CREATE OR REPLACE TEMP TABLE _src AS SELECT * FROM read_parquet('{}')",
+        parquet_path.replace('\'', "''")
+    );
+    conn.execute(&load_src, [])?;
+
     // Group by metric name, emit one view per metric. Within a metric, all
     // columns must share the same kind (counter / gauge / histogram) and
     // — for histograms — the same grouping_power. We don't enforce here;
@@ -145,19 +162,14 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
             .collect();
         let label_keys_vec: Vec<String> = label_keys.into_iter().collect();
 
-        let view_sql = build_view_sql(&metric, &cols, &label_keys_vec, parquet_path);
+        let view_sql = build_view_sql(&metric, &cols, &label_keys_vec);
         conn.execute(&view_sql, [])?;
     }
 
     Ok(())
 }
 
-fn build_view_sql(
-    metric: &str,
-    cols: &[&ColumnInfo],
-    label_keys: &[String],
-    parquet_path: &str,
-) -> String {
+fn build_view_sql(metric: &str, cols: &[&ColumnInfo], label_keys: &[String]) -> String {
     let mut selects: Vec<String> = Vec::with_capacity(cols.len());
     for c in cols {
         // Build the SELECT for this column. Each label key gets either the
@@ -171,19 +183,12 @@ fn build_view_sql(
             .collect::<Vec<_>>()
             .join(", ");
 
+        let physical = c.physical.replace('"', r#""""#);
         let value_expr = match &c.kind {
-            ColumnKind::Counter => format!(
-                r#"CAST("{c}" AS UBIGINT) AS value"#,
-                c = c.physical.replace('"', r#""""#)
-            ),
-            ColumnKind::Gauge => format!(
-                r#"CAST("{c}" AS BIGINT) AS value"#,
-                c = c.physical.replace('"', r#""""#)
-            ),
+            ColumnKind::Counter => format!(r#"CAST("{physical}" AS UBIGINT) AS value"#),
+            ColumnKind::Gauge => format!(r#"CAST("{physical}" AS BIGINT) AS value"#),
             ColumnKind::Histogram { grouping_power } => format!(
-                r#""{c}" AS buckets, {p}::INTEGER AS p"#,
-                c = c.physical.replace('"', r#""""#),
-                p = grouping_power
+                r#""{physical}" AS buckets, {grouping_power}::INTEGER AS p"#
             ),
             ColumnKind::Other => continue,
         };
@@ -191,18 +196,11 @@ fn build_view_sql(
         let label_part = if label_keys.is_empty() {
             String::new()
         } else {
-            format!(", {}", label_select)
+            format!(", {label_select}")
         };
 
         selects.push(format!(
-            "SELECT timestamp, {value_expr}{label_part} FROM read_parquet('{path}') WHERE \"{c}\" IS NOT NULL",
-            path = parquet_path.replace('\'', "''"),
-            c = cols
-                .iter()
-                .find(|x| x.metric == c.metric)
-                .map(|x| x.physical.clone())
-                .unwrap_or_default()
-                .replace('"', r#""""#),
+            "SELECT timestamp, {value_expr}{label_part} FROM _src WHERE \"{physical}\" IS NOT NULL"
         ));
     }
 

@@ -170,12 +170,29 @@ pub enum SqlError {
     Backend(String),
 }
 
-/// Hook the host wires up to observe shadow-mode disagreements (and any
-/// future telemetry the dispatcher emits). Default impl is a no-op so the
-/// dispatcher works without instrumentation.
+/// Hook the host wires up to observe shadow-mode disagreements and per-query
+/// dispatch telemetry. Default impls are no-ops so the dispatcher works
+/// without instrumentation.
 pub trait DispatchObserver: Send + Sync {
+    /// Called when shadow- or strict-mode comparison detects a divergence
+    /// between PromQL and SQL outputs. `Diff` carries the canonical JSON for
+    /// each side so the observer can serialise it for richer reports.
     fn on_diff(&self, entry: &CatalogueEntry, _diff: &Diff) {
         let _ = entry;
+    }
+
+    /// Called once per dispatched query (catalogue match), regardless of
+    /// mode or diff. `promql_ms` is `None` when mode = Primary (PromQL was
+    /// skipped); `sql_ms` is `None` when mode = Off (SQL was skipped) or the
+    /// SQL backend errored out before producing a result.
+    fn on_dispatch(
+        &self,
+        entry: &CatalogueEntry,
+        mode: Mode,
+        promql_ms: Option<f64>,
+        sql_ms: Option<f64>,
+    ) {
+        let _ = (entry, mode, promql_ms, sql_ms);
     }
 }
 

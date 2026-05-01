@@ -60,13 +60,15 @@ const MACROS: &[&str] = &[
 
     // Windowed quantile: quantile of the per-sample bucket-count delta.
     // Equivalent to PromQL `histogram_quantile(q, irate(<hist>[1s]))`.
-    "CREATE OR REPLACE MACRO hist_irate_quantile(buckets, q, ts) AS \
-        h2_quantile(h2_delta(buckets, LAG(buckets) OVER (ORDER BY ts)), q)",
+    // `p` is the histogram's `grouping_power` (always exposed by the
+    // metric views; required because bucket bounds depend on it).
+    "CREATE OR REPLACE MACRO hist_irate_quantile(buckets, q, ts, p) AS \
+        h2_quantile(h2_delta(buckets, LAG(buckets) OVER (ORDER BY ts)), q, p)",
 
     // Same but over a 5-minute window — equivalent to PromQL
     // `histogram_quantile(q, rate(<h>[5m]))`.
-    "CREATE OR REPLACE MACRO hist_rate5m_quantile(buckets, q, ts) AS \
-        h2_quantile(h2_delta(buckets, LAG(buckets, 300) OVER (ORDER BY ts)), q)",
+    "CREATE OR REPLACE MACRO hist_rate5m_quantile(buckets, q, ts, p) AS \
+        h2_quantile(h2_delta(buckets, LAG(buckets, 300) OVER (ORDER BY ts)), q, p)",
 
     // -------- Layer B: dashboard-concept helpers --------
     //

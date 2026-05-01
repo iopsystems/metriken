@@ -443,16 +443,22 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         if let Some(dispatch) = &self.dispatch {
             if let Some(entry) = dispatch.catalogue.lookup(query_str) {
                 use crate::dispatch::{canonicalise, Diff, Mode};
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
                 match entry.mode {
                     Mode::Off => self.query_range_promql(query_str, start, end, step),
                     Mode::Shadow => {
+                        let p_t0 = std::time::Instant::now();
                         let promql = self.query_range_promql(query_str, start, end, step)?;
+                        let promql_ms = ms(p_t0.elapsed());
+
                         // Best-effort SQL: a backend error in shadow mode is
-                        // logged via the observer (as a "diff against an
-                        // error placeholder") but does not fail the request.
-                        match dispatch
-                            .backend
-                            .run(entry, &dispatch.data_source, start, end, step) {
+                        // logged via the observer but does not fail the request.
+                        let s_t0 = std::time::Instant::now();
+                        let sql_outcome =
+                            dispatch.backend.run(entry, &dispatch.data_source, start, end, step);
+                        let sql_ms = ms(s_t0.elapsed());
+
+                        match sql_outcome {
                             Ok(sql) => {
                                 let p = canonicalise(&promql);
                                 let s = canonicalise(&sql);
@@ -462,6 +468,12 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                         &Diff { promql: p, sql: s },
                                     );
                                 }
+                                dispatch.observer.on_dispatch(
+                                    entry,
+                                    Mode::Shadow,
+                                    Some(promql_ms),
+                                    Some(sql_ms),
+                                );
                             }
                             Err(err) => {
                                 let p = canonicalise(&promql);
@@ -470,27 +482,41 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                                     entry,
                                     &Diff { promql: p, sql: s },
                                 );
+                                dispatch.observer.on_dispatch(
+                                    entry,
+                                    Mode::Shadow,
+                                    Some(promql_ms),
+                                    None,
+                                );
                             }
                         }
                         Ok(promql)
                     }
                     Mode::Strict => {
+                        let p_t0 = std::time::Instant::now();
                         let promql = self.query_range_promql(query_str, start, end, step)?;
+                        let promql_ms = ms(p_t0.elapsed());
+
+                        let s_t0 = std::time::Instant::now();
                         let sql = dispatch
                             .backend
-                            .run(entry, &dispatch.data_source, start, end, step).map_err(
-                            |e| QueryError::EvaluationError(format!("strict-mode SQL: {e}")),
-                        )?;
+                            .run(entry, &dispatch.data_source, start, end, step)
+                            .map_err(|e| QueryError::EvaluationError(format!("strict-mode SQL: {e}")))?;
+                        let sql_ms = ms(s_t0.elapsed());
+
                         let p = canonicalise(&promql);
                         let s = canonicalise(&sql);
-                        if p != s {
-                            dispatch.observer.on_diff(
-                                entry,
-                                &Diff {
-                                    promql: p,
-                                    sql: s,
-                                },
-                            );
+                        let diverged = p != s;
+                        if diverged {
+                            dispatch.observer.on_diff(entry, &Diff { promql: p, sql: s });
+                        }
+                        dispatch.observer.on_dispatch(
+                            entry,
+                            Mode::Strict,
+                            Some(promql_ms),
+                            Some(sql_ms),
+                        );
+                        if diverged {
                             return Err(QueryError::EvaluationError(format!(
                                 "strict-mode divergence on {}: PromQL and SQL outputs differ",
                                 entry.id
@@ -498,10 +524,21 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         }
                         Ok(promql)
                     }
-                    Mode::Primary => dispatch
-                        .backend
-                        .run(entry, &dispatch.data_source, start, end, step)
-                        .map_err(|e| QueryError::EvaluationError(e.to_string())),
+                    Mode::Primary => {
+                        let s_t0 = std::time::Instant::now();
+                        let result = dispatch
+                            .backend
+                            .run(entry, &dispatch.data_source, start, end, step)
+                            .map_err(|e| QueryError::EvaluationError(e.to_string()));
+                        let sql_ms = ms(s_t0.elapsed());
+                        dispatch.observer.on_dispatch(
+                            entry,
+                            Mode::Primary,
+                            None,
+                            if result.is_ok() { Some(sql_ms) } else { None },
+                        );
+                        result
+                    }
                 }
             } else {
                 self.query_range_promql(query_str, start, end, step)

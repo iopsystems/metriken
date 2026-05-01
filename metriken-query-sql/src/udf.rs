@@ -454,24 +454,21 @@ impl VScalar for H2QuantilesUdf {
             n,
             output,
             |r| {
-                list_entry(&in_lv, r, bch)
-                    .zip(list_entry(&in_qs, r, qch))
-                    .map(|((boff, blen), (qoff, qlen))| {
-                        (qlen, (boff, blen, qoff, qlen, ps[r]))
-                    })
-            },
-            |(boff, blen, qoff, qlen, p), dst| {
-                let total_count: u64 = if valid_p(p) {
-                    bdata[boff..boff + blen].iter().sum()
-                } else {
-                    0
-                };
-
-                if total_count == 0 {
-                    for slot in dst.iter_mut() { *slot = 0; }
-                    return;
+                let p = ps[r];
+                if !valid_p(p) {
+                    return None;
                 }
-
+                let ((boff, blen), (qoff, qlen)) =
+                    list_entry(&in_lv, r, bch).zip(list_entry(&in_qs, r, qch))?;
+                // Empty / NULL input histogram → NULL row, matching the
+                // singular `h2_quantile` UDF.
+                let total_count: u64 = bdata[boff..boff + blen].iter().sum();
+                if total_count == 0 {
+                    return None;
+                }
+                Some((qlen, (boff, blen, qoff, qlen, p, total_count)))
+            },
+            |(boff, blen, qoff, qlen, p, total_count), dst| {
                 let mut qs_sorted: Vec<(usize, f64)> = (0..qlen)
                     .map(|i| (i, qdata[qoff + i].clamp(0.0, 1.0)))
                     .collect();
