@@ -243,7 +243,7 @@ fn counter_irate_handles_reset() {
 
 /// Every query-string the cachecannon dashboard generates, after the
 /// dashboard wrapping logic (sum-irate for counters, raw selector
-/// for gauges, histogram_percentiles/heatmap for histograms), plus
+/// for gauges, histogram_quantiles/heatmap for histograms), plus
 /// representative shapes the broader rezolus dashboards generate
 /// against the same parquet (rate, avg/min/max/count, sum without,
 /// avg_over_time, idelta).
@@ -275,9 +275,9 @@ const CACHECANNON_QUERIES: &[&str] = &[
     "sum without (cpu) (irate(cpu_cycles[5s]))",
     "sum without (id) (irate(softirq_time[5s]))",
     // Histograms — eager path.
-    "histogram_percentiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
-    "histogram_percentiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",
-    "histogram_percentiles([0.5, 0.9, 0.99, 0.999], set_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], set_latency{source=\"cachecannon\"})",
     "histogram_heatmap(response_latency{source=\"cachecannon\"})",
 ];
 

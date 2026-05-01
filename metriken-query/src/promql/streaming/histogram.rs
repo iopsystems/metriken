@@ -1,7 +1,12 @@
-//! Streaming `histogram_percentiles` pipeline.
+//! Streaming `histogram_quantiles` pipeline.
+//!
+//! Used by both `histogram_quantile(q, m)` (standard PromQL, single
+//! quantile) and `histogram_quantiles([qs], m)` (rezolus extension,
+//! multiple quantiles in one walk) — they're the same operation
+//! with N=1 vs N>1 and share this code path.
 //!
 //! The eager path materialises an entire summed [`HistogramSeries`]
-//! before walking it for percentile extraction:
+//! before walking it for quantile extraction:
 //!
 //! 1. `tsdb.histograms()` clones every matching label-keyed series.
 //! 2. `collection.sum()` merges all of them into one new
@@ -33,18 +38,18 @@ use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult}
 use crate::promql::MatrixSample;
 use crate::tsdb::{HistogramCollection, Labels};
 
-/// Compute `histogram_percentiles(percentiles, metric{filter})` over the
-/// time range `[start_ns, end_ns]`. When `stride_ns` is `Some`, deltas
-/// are accumulated into stride-sized windows before percentile
-/// extraction, matching the eager engine's `iter_strided` semantics.
+/// Compute quantiles of `metric{filter}` over the time range
+/// `[start_ns, end_ns]`. When `stride_ns` is `Some`, deltas are
+/// accumulated into stride-sized windows before quantile extraction,
+/// matching the eager engine's `iter_strided` semantics.
 ///
 /// Returns one [`MatrixSample`] per requested quantile, with metric
-/// labels `{__name__: metric_name, percentile: q}` (matching the
-/// eager path).
-pub fn percentiles(
+/// labels `{__name__: metric_name, quantile: q}` — the standard
+/// PromQL convention used by `histogram_quantile`.
+pub fn quantiles(
     collection: &HistogramCollection,
     label_filter: &Labels,
-    percentiles_in: &[f64],
+    quantiles_in: &[f64],
     start_ns: u64,
     end_ns: u64,
     stride_ns: Option<u64>,
@@ -78,7 +83,7 @@ pub fn percentiles(
     // dropped, matching the eager path's `if let Ok(...)` shape.
     // We keep the original f64 for the `quantiles()` call (which
     // takes a `&[f64]`) and the `Quantile` for the result lookup.
-    let quantile_keys: Vec<(usize, f64, Quantile)> = percentiles_in
+    let quantile_keys: Vec<(usize, f64, Quantile)> = quantiles_in
         .iter()
         .enumerate()
         .filter_map(|(i, q)| Quantile::new(*q).ok().map(|qk| (i, *q, qk)))
@@ -89,7 +94,7 @@ pub fn percentiles(
     let quantile_floats: Vec<f64> = quantile_keys.iter().map(|(_, q, _)| *q).collect();
 
     // Output accumulators — one Vec per requested quantile.
-    let mut outputs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); percentiles_in.len()];
+    let mut outputs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); quantiles_in.len()];
 
     // Reusable scratch: a sorted bucket index → cumulative count
     // pair, rebuilt per emission. We use parallel `Vec<u32>`s so
@@ -220,14 +225,14 @@ pub fn percentiles(
 
     // Build the matrix samples in the input quantile order.
     let mut samples = Vec::with_capacity(outputs.len());
-    for (i, q) in percentiles_in.iter().enumerate() {
+    for (i, q) in quantiles_in.iter().enumerate() {
         let values = std::mem::take(&mut outputs[i]);
         if values.is_empty() {
             continue;
         }
         let mut metric: HashMap<String, String> = HashMap::new();
         metric.insert("__name__".to_string(), metric_name.to_string());
-        metric.insert("percentile".to_string(), q.to_string());
+        metric.insert("quantile".to_string(), q.to_string());
         samples.push(MatrixSample { metric, values });
     }
     samples

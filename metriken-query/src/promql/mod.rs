@@ -775,96 +775,110 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 }
             }
             "histogram_quantile" => {
-                // histogram_quantile(quantile, histogram)
-                if call.args.args.len() >= 2 {
-                    // First argument should be a quantile value (0.0 to 1.0)
-                    let quantile = match &*call.args.args[0] {
-                        Expr::NumberLiteral(num) => num.val,
-                        _ => {
-                            return Err(QueryError::ParseError(
-                                "histogram_quantile first argument must be a number".to_string(),
-                            ))
-                        }
-                    };
+                // histogram_quantile(quantile, histogram) — standard PromQL,
+                // single quantile.  Internally the same operation as
+                // `histogram_quantiles([q], m)`; both routes share the
+                // streaming pipeline below when streaming is enabled and
+                // fall back to the same eager call otherwise.
+                if call.args.args.len() < 2 {
+                    return Err(QueryError::ParseError(
+                        "histogram_quantile requires 2 arguments".to_string(),
+                    ));
+                }
 
-                    if !(0.0..=1.0).contains(&quantile) {
-                        return Err(QueryError::ParseError(format!(
-                            "histogram_quantile quantile must be between 0.0 and 1.0, got {}",
-                            quantile
-                        )));
+                let quantile = match &*call.args.args[0] {
+                    Expr::NumberLiteral(num) => num.val,
+                    _ => {
+                        return Err(QueryError::ParseError(
+                            "histogram_quantile first argument must be a number".to_string(),
+                        ))
                     }
+                };
+                if !(0.0..=1.0).contains(&quantile) {
+                    return Err(QueryError::ParseError(format!(
+                        "histogram_quantile quantile must be between 0.0 and 1.0, got {}",
+                        quantile
+                    )));
+                }
 
-                    // Second argument should be a vector selector (histogram metric)
-                    let metric_name = match &*call.args.args[1] {
-                        Expr::VectorSelector(selector) => {
-                            selector.name.as_deref().ok_or_else(|| {
-                                QueryError::ParseError("Vector selector missing name".to_string())
-                            })?
+                let metric_name = match &*call.args.args[1] {
+                    Expr::VectorSelector(selector) => {
+                        selector.name.as_deref().ok_or_else(|| {
+                            QueryError::ParseError("Vector selector missing name".to_string())
+                        })?
+                    }
+                    _ => {
+                        return Err(QueryError::ParseError(
+                            "histogram_quantile second argument must be a metric name".to_string(),
+                        ))
+                    }
+                };
+
+                let start_ns = (start * 1e9) as u64;
+                let end_ns = (end * 1e9) as u64;
+
+                if self.streaming_enabled {
+                    if let Some(collection) = self.tsdb.histograms_ref(metric_name) {
+                        let result = streaming::histogram::quantiles(
+                            collection,
+                            &Labels::default(),
+                            &[quantile],
+                            start_ns,
+                            end_ns,
+                            None,
+                            metric_name,
+                        );
+                        if !result.is_empty() {
+                            return Ok(QueryResult::Matrix { result });
                         }
-                        _ => {
-                            return Err(QueryError::ParseError(
-                                "histogram_quantile second argument must be a metric name"
-                                    .to_string(),
-                            ))
-                        }
-                    };
-
-                    // Get the histogram data
-                    if let Some(collection) = self.tsdb.histograms(metric_name, Labels::default()) {
-                        // Sum all histogram series together
-                        let summed_series = collection.sum();
-
-                        // Calculate the percentile
-                        if let Some(percentile_series) =
-                            summed_series.percentiles(&[quantile], None)
-                        {
-                            if let Some(series) = percentile_series.first() {
-                                let start_ns = (start * 1e9) as u64;
-                                let end_ns = (end * 1e9) as u64;
-
-                                let values: Vec<(f64, f64)> = series
-                                    .range(start_ns, end_ns)
-                                    .iter()
-                                    .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                                    .collect();
-
-                                if !values.is_empty() {
-                                    let mut metric_labels = HashMap::new();
-                                    metric_labels
-                                        .insert("__name__".to_string(), metric_name.to_string());
-                                    metric_labels
-                                        .insert("quantile".to_string(), quantile.to_string());
-
-                                    return Ok(QueryResult::Matrix {
-                                        result: vec![MatrixSample {
-                                            metric: metric_labels,
-                                            values,
-                                        }],
-                                    });
-                                }
-                            }
-                        }
-
-                        Err(QueryError::MetricNotFound(format!(
+                        return Err(QueryError::MetricNotFound(format!(
                             "No histogram data found for {}",
                             metric_name
-                        )))
-                    } else {
-                        Err(QueryError::MetricNotFound(metric_name.to_string()))
+                        )));
                     }
+                    return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                }
+
+                // Eager fallback.
+                if let Some(collection) = self.tsdb.histograms(metric_name, Labels::default()) {
+                    let summed_series = collection.sum();
+                    if let Some(quantile_series) = summed_series.percentiles(&[quantile], None) {
+                        if let Some(series) = quantile_series.first() {
+                            let values: Vec<(f64, f64)> = series
+                                .range(start_ns, end_ns)
+                                .iter()
+                                .map(|(ts, val)| (*ts as f64 / 1e9, *val))
+                                .collect();
+
+                            if !values.is_empty() {
+                                let mut metric_labels = HashMap::new();
+                                metric_labels
+                                    .insert("__name__".to_string(), metric_name.to_string());
+                                metric_labels.insert("quantile".to_string(), quantile.to_string());
+
+                                return Ok(QueryResult::Matrix {
+                                    result: vec![MatrixSample {
+                                        metric: metric_labels,
+                                        values,
+                                    }],
+                                });
+                            }
+                        }
+                    }
+                    Err(QueryError::MetricNotFound(format!(
+                        "No histogram data found for {}",
+                        metric_name
+                    )))
                 } else {
-                    Err(QueryError::ParseError(
-                        "histogram_quantile requires 2 arguments".to_string(),
-                    ))
+                    Err(QueryError::MetricNotFound(metric_name.to_string()))
                 }
             }
-            "histogram_percentiles" => {
-                // histogram_percentiles is handled via pre-parsing in query_range()
+            "histogram_quantiles" => {
+                // histogram_quantiles is handled via pre-parsing in query_range()
                 // due to array literal syntax not being standard PromQL.
                 // This branch handles any case where the parser does parse it.
                 Err(QueryError::Unsupported(
-                    "histogram_percentiles should be handled via query_range pre-parser"
-                        .to_string(),
+                    "histogram_quantiles should be handled via query_range pre-parser".to_string(),
                 ))
             }
             "scalar" => {
@@ -1548,49 +1562,60 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         Ok(result_samples)
     }
 
-    /// Handle histogram_percentiles(percentiles_array, histogram_metric)
-    /// queries Example: histogram_percentiles([0.5, 0.9, 0.99, 0.999],
-    /// tcp_packet_latency)
-    fn handle_histogram_percentiles(
+    /// Handle histogram_quantiles(quantiles_array, histogram_metric)
+    /// queries.  Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999],
+    /// tcp_packet_latency)`.
+    ///
+    /// This is a rezolus extension on top of standard PromQL — the
+    /// scalar `histogram_quantile(q, m)` only supports a single
+    /// quantile per call, so a dashboard wanting p50/p90/p99/p999
+    /// from one metric would otherwise issue four separate queries
+    /// and walk the histogram series four times.  The plural form
+    /// fuses them into a single walk.
+    ///
+    /// Output series are labeled `{__name__: name, quantile: "0.99"}`
+    /// to match the standard PromQL `histogram_quantile` convention,
+    /// so a dashboard can consume either entry point uniformly.
+    fn handle_histogram_quantiles(
         &self,
         query_str: &str,
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
         // Extract the inner part: [0.5, 0.9, 0.99, 0.999], tcp_packet_latency
-        let inner = &query_str["histogram_percentiles(".len()..query_str.len() - 1];
+        let inner = &query_str["histogram_quantiles(".len()..query_str.len() - 1];
 
         // Find the array portion [...]
         let array_start = inner.find('[').ok_or_else(|| {
             QueryError::ParseError(
-                "histogram_percentiles first argument must be an array of percentiles".to_string(),
+                "histogram_quantiles first argument must be an array of quantiles".to_string(),
             )
         })?;
         let array_end = inner.find(']').ok_or_else(|| {
-            QueryError::ParseError("Missing closing bracket in percentiles array".to_string())
+            QueryError::ParseError("Missing closing bracket in quantiles array".to_string())
         })?;
 
-        // Parse the percentiles array
+        // Parse the quantiles array
         let array_str = &inner[array_start + 1..array_end];
-        let percentiles: Vec<f64> = array_str
+        let quantiles: Vec<f64> = array_str
             .split(',')
             .map(|s| s.trim().parse::<f64>())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
-                QueryError::ParseError(format!("Failed to parse percentile value: {}", e))
+                QueryError::ParseError(format!("Failed to parse quantile value: {}", e))
             })?;
 
-        if percentiles.is_empty() {
+        if quantiles.is_empty() {
             return Err(QueryError::ParseError(
-                "Percentiles array cannot be empty".to_string(),
+                "Quantiles array cannot be empty".to_string(),
             ));
         }
 
-        for &p in &percentiles {
-            if !(0.0..=1.0).contains(&p) {
+        for &q in &quantiles {
+            if !(0.0..=1.0).contains(&q) {
                 return Err(QueryError::ParseError(format!(
-                    "histogram_percentiles values must be between 0.0 and 1.0, got {}",
-                    p
+                    "histogram_quantiles values must be between 0.0 and 1.0, got {}",
+                    q
                 )));
             }
         }
@@ -1602,7 +1627,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             .map(|s| s.trim())
             .ok_or_else(|| {
                 QueryError::ParseError(
-                    "histogram_percentiles requires a metric name as second argument".to_string(),
+                    "histogram_quantiles requires a metric name as second argument".to_string(),
                 )
             })?;
 
@@ -1619,10 +1644,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             if let Some(collection) = self.tsdb.histograms_ref(&metric_name) {
                 let start_ns = (start * 1e9) as u64;
                 let end_ns = (end * 1e9) as u64;
-                let result = streaming::histogram::percentiles(
+                let result = streaming::histogram::quantiles(
                     collection,
                     &labels,
-                    &percentiles,
+                    &quantiles,
                     start_ns,
                     end_ns,
                     stride_ns,
@@ -1644,15 +1669,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             // Sum all histogram series together
             let summed_series = collection.sum();
 
-            // Calculate all percentiles
-            if let Some(percentile_series_vec) = summed_series.percentiles(&percentiles, stride_ns)
-            {
+            // Calculate all quantiles
+            if let Some(quantile_series_vec) = summed_series.percentiles(&quantiles, stride_ns) {
                 let start_ns = (start * 1e9) as u64;
                 let end_ns = (end * 1e9) as u64;
 
                 let mut result_samples = Vec::new();
 
-                for (idx, series) in percentile_series_vec.iter().enumerate() {
+                for (idx, series) in quantile_series_vec.iter().enumerate() {
                     let values: Vec<(f64, f64)> = series
                         .range(start_ns, end_ns)
                         .iter()
@@ -1662,8 +1686,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     if !values.is_empty() {
                         let mut metric_labels = HashMap::new();
                         metric_labels.insert("__name__".to_string(), metric_name.to_string());
-                        metric_labels
-                            .insert("percentile".to_string(), percentiles[idx].to_string());
+                        metric_labels.insert("quantile".to_string(), quantiles[idx].to_string());
 
                         result_samples.push(MatrixSample {
                             metric: metric_labels,
@@ -1818,10 +1841,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        // Handle histogram_percentiles specially since it uses array literal syntax
+        // Handle histogram_quantiles specially since it uses array literal syntax
         // that may not be parsed correctly by the standard PromQL parser
-        if query_str.starts_with("histogram_percentiles(") && query_str.ends_with(")") {
-            return self.handle_histogram_percentiles(query_str, start, end);
+        if query_str.starts_with("histogram_quantiles(") && query_str.ends_with(")") {
+            return self.handle_histogram_quantiles(query_str, start, end);
         }
 
         // Handle histogram_heatmap specially

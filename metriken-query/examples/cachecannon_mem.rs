@@ -100,9 +100,9 @@ const QUERIES: &[&str] = &[
     "sum(irate(cache_misses{source=\"cachecannon\"}[5s]))",
     "sum(irate(get_count{source=\"cachecannon\"}[5s]))",
     "sum(irate(set_count{source=\"cachecannon\"}[5s]))",
-    "histogram_percentiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
-    "histogram_percentiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",
-    "histogram_percentiles([0.5, 0.9, 0.99, 0.999], set_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], set_latency{source=\"cachecannon\"})",
     "histogram_heatmap(response_latency{source=\"cachecannon\"})",
     // --- rezolus system dashboard (high cardinality) ---
     // These are the queries that fill up WASM memory in practice:
