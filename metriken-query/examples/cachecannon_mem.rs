@@ -134,6 +134,14 @@ const QUERIES: &[&str] = &[
     // sum without (..) — exercise GroupBy::Exclude.
     "sum without (cpu) (irate(cpu_cycles[5s]))",
     "sum without (id) (irate(softirq_time[5s]))",
+    // deriv on a gauge (target_rate is the cachecannon loadgen target)
+    "deriv(target_rate{source=\"cachecannon\"}[5s])",
+    // matrix x scalar (byte->bit, percent)
+    "sum(irate(bytes_rx{source=\"cachecannon\"}[5s])) * 8",
+    "sum(irate(softirq_time[5s])) / 1e9",
+    // matrix x matrix (IPC-style ratios)
+    "sum(irate(cpu_instructions[5s])) / sum(irate(cpu_cycles[5s]))",
+    "sum by (cpu) (irate(cpu_instructions[5s])) / sum by (cpu) (irate(cpu_cycles[5s]))",
 ];
 
 fn fixture_path() -> Option<PathBuf> {

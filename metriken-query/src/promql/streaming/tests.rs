@@ -274,6 +274,16 @@ const CACHECANNON_QUERIES: &[&str] = &[
     // sum without (..) modifier
     "sum without (cpu) (irate(cpu_cycles[5s]))",
     "sum without (id) (irate(softirq_time[5s]))",
+    // deriv on a gauge (target_rate is the cachecannon loadgen target)
+    "deriv(target_rate{source=\"cachecannon\"}[5s])",
+    // binary ops: matrix x scalar (byte->bit, percent, complement)
+    "sum(irate(bytes_rx{source=\"cachecannon\"}[5s])) * 8",
+    "sum(irate(cache_hits{source=\"cachecannon\"}[5s])) / 1000",
+    // binary ops: matrix x matrix (cache hit rate, IPC analogue)
+    "sum(irate(cache_hits{source=\"cachecannon\"}[5s])) / sum(irate(cache_misses{source=\"cachecannon\"}[5s]))",
+    "sum(irate(cpu_instructions[5s])) / sum(irate(cpu_cycles[5s]))",
+    // by-grouped binary op
+    "sum by (cpu) (irate(cpu_instructions[5s])) / sum by (cpu) (irate(cpu_cycles[5s]))",
     // Histograms — eager path.
     "histogram_quantiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
     "histogram_quantiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",

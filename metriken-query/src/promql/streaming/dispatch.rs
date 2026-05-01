@@ -10,22 +10,27 @@
 //! * `metric{matchers}` — gauge VectorSelector at step grid.
 //! * `irate(metric[range])` / `rate(metric[range])` — counter
 //!   producers.
-//! * `avg_over_time(metric[range])` / `idelta(metric[range])` —
-//!   gauge producers.
+//! * `avg_over_time(metric[range])` / `idelta(metric[range])` /
+//!   `deriv(metric[range])` (gauges only) — gauge producers.
 //! * `sum/avg/min/max/count [by | without (..)] (...)` — aggregator
 //!   over any of the above.
+//! * `lhs OP rhs` where OP ∈ {`+`, `-`, `*`, `/`} — binary ops
+//!   between two series sets, or between a series set and a number
+//!   literal. Honors `on(..)` and `ignoring(..)` matching modifiers.
+//!   Falls back to eager when the eager engine's single-right
+//!   fallback is needed (matcher-less, right-side single-series
+//!   broadcast) or when `group_left`/`group_right` is requested.
+//! * `NumberLiteral` — produces a `Built::Scalar`; usable on either
+//!   side of a binary op.
 //! * Parenthesised expressions are unwrapped.
-//!
-//! Histograms and binary operators stay on the eager path; they
-//! either don't fit the streaming shape (heatmaps are inherently 2D)
-//! or are deferred to a follow-up.
 
 use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, gauges_avg_over_time, gauges_idelta, gauges_step_grid,
-    irate_counters, rate_counters, AggOp, GroupBy, SeriesSet,
+    aggregate, collect_to_matrix, gauges_avg_over_time, gauges_deriv, gauges_idelta,
+    gauges_step_grid, irate_counters, matrix_matrix_op, matrix_scalar_op, rate_counters, AggOp,
+    BinOp, GroupBy, MatchSpec, SeriesSet,
 };
 use crate::promql::{QueryError, QueryResult};
 use crate::tsdb::Tsdb;
@@ -59,18 +64,28 @@ pub fn try_streaming(
     let Some(built) = build(&ctx, expr)? else {
         return Ok(None);
     };
-    let result = collect_to_matrix(built.series, built.metric_name);
-    if result.is_empty() {
-        // The eager path returns MetricNotFound when an aggregation
-        // produces nothing or a metric isn't present; mirror that so
-        // higher layers see consistent error shapes regardless of
-        // which path handled the query.
-        if let Some(name) = built.metric_name_for_error {
-            return Err(QueryError::MetricNotFound(name));
+    match built {
+        Built::Series {
+            series,
+            metric_name,
+            metric_name_for_error,
+        } => {
+            let result = collect_to_matrix(series, metric_name);
+            if result.is_empty() {
+                // The eager path returns MetricNotFound when an
+                // aggregation produces nothing or a metric isn't
+                // present; mirror that so higher layers see
+                // consistent error shapes regardless of which path
+                // handled the query.
+                if let Some(name) = metric_name_for_error {
+                    return Err(QueryError::MetricNotFound(name));
+                }
+                return Ok(Some(QueryResult::Matrix { result: vec![] }));
+            }
+            Ok(Some(QueryResult::Matrix { result }))
         }
-        return Ok(Some(QueryResult::Matrix { result: vec![] }));
+        Built::Scalar(v) => Ok(Some(QueryResult::Scalar { result: (start, v) })),
     }
-    Ok(Some(QueryResult::Matrix { result }))
 }
 
 struct Ctx<'a> {
@@ -81,16 +96,18 @@ struct Ctx<'a> {
     interval_ns: u64,
 }
 
-/// One step of recursion. `series` carries the lazy iterator chain;
-/// `metric_name` is `Some` for raw producers (so the boundary
-/// collector adds `__name__`) and `None` for aggregated results
-/// (matching the eager engine's behaviour). `metric_name_for_error`
-/// is the metric this stage was rooted in, used to produce a
-/// meaningful `MetricNotFound` when the result ends up empty.
-struct Built<'a> {
-    series: SeriesSet<'a>,
-    metric_name: Option<&'a str>,
-    metric_name_for_error: Option<String>,
+/// One step of recursion. The `Series` variant carries the lazy
+/// iterator chain plus optional `__name__` plumbing for the boundary
+/// collector and `MetricNotFound` shaping. `Scalar` is the AST
+/// `NumberLiteral` representation so binary ops can take a number on
+/// either side without going through a degenerate single-tick series.
+enum Built<'a> {
+    Series {
+        series: SeriesSet<'a>,
+        metric_name: Option<&'a str>,
+        metric_name_for_error: Option<String>,
+    },
+    Scalar(f64),
 }
 
 fn build<'a, 'expr>(ctx: &'a Ctx<'a>, expr: &'expr Expr) -> Result<Option<Built<'a>>, QueryError>
@@ -102,12 +119,13 @@ where
         Expr::Aggregate(agg) => build_aggregate(ctx, agg),
         Expr::Call(call) => build_call(ctx, call),
         Expr::VectorSelector(sel) => build_vector_selector(ctx, sel),
+        Expr::Binary(bin) => build_binary(ctx, bin),
+        Expr::NumberLiteral(num) => Ok(Some(Built::Scalar(num.val))),
         // Matrix selectors as standalone don't produce a meaningful
         // result (the eager path errors here); leave to the eager
         // engine to keep error shapes consistent.
         Expr::MatrixSelector(_) => Ok(None),
-        // Numbers, binary ops, unary ops, subqueries: not yet
-        // streamed.
+        // Unary ops, subqueries: not yet streamed.
         _ => Ok(None),
     }
 }
@@ -134,15 +152,110 @@ where
         Some(parser::LabelModifier::Exclude(ls)) => GroupBy::Exclude(ls.labels.as_slice()),
     };
 
-    let Some(inner) = build(ctx, &agg.expr)? else {
+    // The inner expression must be a series — aggregating over a
+    // bare scalar isn't meaningful (the eager engine returns the
+    // scalar unchanged in that case, but the streaming dispatcher
+    // can hand off to eager rather than reproduce the special case).
+    let Some(Built::Series {
+        series: inner_series,
+        metric_name_for_error,
+        ..
+    }) = build(ctx, &agg.expr)?
+    else {
         return Ok(None);
     };
-    let series = aggregate(inner.series, op, group_by);
-    Ok(Some(Built {
+    let series = aggregate(inner_series, op, group_by);
+    Ok(Some(Built::Series {
         series,
         metric_name: None,
-        metric_name_for_error: inner.metric_name_for_error,
+        metric_name_for_error,
     }))
+}
+
+fn build_binary<'a, 'expr>(
+    ctx: &'a Ctx<'a>,
+    bin: &'expr parser::BinaryExpr,
+) -> Result<Option<Built<'a>>, QueryError>
+where
+    'expr: 'a,
+{
+    let Some(op) = BinOp::from_token(&bin.op) else {
+        return Ok(None);
+    };
+
+    // Group-left / group-right (one-to-many) needs an iterator-tee
+    // mechanism that defeats streaming; fall through to eager.
+    if let Some(modifier) = &bin.modifier {
+        if modifier.card != parser::VectorMatchCardinality::OneToOne {
+            return Ok(None);
+        }
+    }
+
+    // Translate the optional `on(..)` / `ignoring(..)` modifier into
+    // the streaming pipeline's `MatchSpec`.
+    let spec = match bin.modifier.as_ref().and_then(|m| m.matching.as_ref()) {
+        None => MatchSpec::Default,
+        Some(parser::LabelModifier::Include(ls)) => MatchSpec::Include(ls.labels.as_slice()),
+        Some(parser::LabelModifier::Exclude(ls)) => MatchSpec::Exclude(ls.labels.as_slice()),
+    };
+
+    let lhs = build(ctx, &bin.lhs)?;
+    let rhs = build(ctx, &bin.rhs)?;
+    let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+        return Ok(None);
+    };
+
+    // For binary ops, an empty result means "no matching label
+    // pairs" or "all points filtered (e.g. divide-by-zero)" — both
+    // of which the eager engine returns as `Ok(empty matrix)` not
+    // `Err(MetricNotFound)`. Drop `metric_name_for_error` here so
+    // the boundary collector doesn't promote the empty case to an
+    // error.
+    match (lhs, rhs) {
+        (Built::Series { series, .. }, Built::Scalar(s)) => {
+            let result = matrix_scalar_op(series, op, s, false);
+            Ok(Some(Built::Series {
+                series: result,
+                metric_name: None,
+                metric_name_for_error: None,
+            }))
+        }
+        (Built::Scalar(s), Built::Series { series, .. }) => {
+            let result = matrix_scalar_op(series, op, s, true);
+            Ok(Some(Built::Series {
+                series: result,
+                metric_name: None,
+                metric_name_for_error: None,
+            }))
+        }
+        (
+            Built::Series {
+                series: left_series,
+                ..
+            },
+            Built::Series {
+                series: right_series,
+                ..
+            },
+        ) => {
+            // Returns `None` when the eager single-right fallback
+            // is needed; defer to eager in that case.
+            let Some(joined) = matrix_matrix_op(left_series, right_series, op, spec) else {
+                return Ok(None);
+            };
+            Ok(Some(Built::Series {
+                series: joined,
+                metric_name: None,
+                metric_name_for_error: None,
+            }))
+        }
+        (Built::Scalar(a), Built::Scalar(b)) => {
+            // Both literals — compute eagerly. Realistically never
+            // hits in dashboards but cheap to handle.
+            let v = op.apply(a, b).unwrap_or(f64::NAN);
+            Ok(Some(Built::Scalar(v)))
+        }
+    }
 }
 
 fn build_call<'a, 'expr>(
@@ -180,7 +293,7 @@ where
                 ctx.step_ns,
                 range_ns,
             );
-            Ok(Some(Built {
+            Ok(Some(Built::Series {
                 series,
                 metric_name: Some(metric_name),
                 metric_name_for_error: Some(metric_name.to_string()),
@@ -198,7 +311,7 @@ where
                 ctx.step_ns,
                 range_ns,
             );
-            Ok(Some(Built {
+            Ok(Some(Built::Series {
                 series,
                 metric_name: Some(metric_name),
                 metric_name_for_error: Some(metric_name.to_string()),
@@ -216,7 +329,7 @@ where
                 ctx.step_ns,
                 range_ns,
             );
-            Ok(Some(Built {
+            Ok(Some(Built::Series {
                 series,
                 metric_name: Some(metric_name),
                 metric_name_for_error: Some(metric_name.to_string()),
@@ -234,14 +347,34 @@ where
                 ctx.step_ns,
                 range_ns,
             );
-            Ok(Some(Built {
+            Ok(Some(Built::Series {
                 series,
                 metric_name: Some(metric_name),
                 metric_name_for_error: Some(metric_name.to_string()),
             }))
         }
-        // Anything else (deriv, histogram_*, scalar, vector, ...)
-        // stays on the eager path.
+        "deriv" => {
+            // Gauge case only. The eager engine also handles
+            // `deriv(counter[range])` by first computing the
+            // pair-wise rate (different from step-grid `rate`) and
+            // then deriving — that requires a different producer
+            // shape, deferred to a follow-up. Counters fall through
+            // to the eager path.
+            let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
+                return Ok(None);
+            };
+            let series = gauges_deriv(collection, &filter, ctx.start_ns, ctx.end_ns, ctx.step_ns);
+            // The eager engine relabels `__name__` to literally
+            // "deriv" rather than preserving the source metric
+            // name; mirror that so JSON output matches byte-for-byte.
+            Ok(Some(Built::Series {
+                series,
+                metric_name: Some("deriv"),
+                metric_name_for_error: Some(metric_name.to_string()),
+            }))
+        }
+        // Anything else (histogram_*, scalar, vector, ...) stays on
+        // the eager path.
         _ => Ok(None),
     }
 }
@@ -279,7 +412,7 @@ where
         ctx.step_ns,
         staleness_ns,
     );
-    Ok(Some(Built {
+    Ok(Some(Built::Series {
         series,
         metric_name: Some(metric_name),
         metric_name_for_error: Some(metric_name.to_string()),

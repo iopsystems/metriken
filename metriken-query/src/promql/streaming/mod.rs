@@ -31,6 +31,7 @@ use crate::promql::MatrixSample;
 use crate::tsdb::{CounterCollection, Labels};
 
 mod aggregate;
+mod binary;
 pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod histogram;
@@ -41,9 +42,10 @@ mod rate;
 mod tests;
 
 pub use aggregate::{aggregate, sum_by, AggOp, GroupBy, MergeReduce};
+pub use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec, ScalarBroadcast};
 pub use gauge::{
-    gauges_avg_over_time, gauges_idelta, gauges_step_grid, GaugeAvgOverTime, GaugeIdelta,
-    GaugeStepGrid,
+    gauges_avg_over_time, gauges_deriv, gauges_idelta, gauges_step_grid, GaugeAvgOverTime,
+    GaugeDeriv, GaugeIdelta, GaugeStepGrid,
 };
 pub use irate::CounterIrate;
 pub use rate::CounterRate;

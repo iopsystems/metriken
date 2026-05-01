@@ -252,3 +252,102 @@ pub fn gauges_idelta<'a>(
     }
     out
 }
+
+/// `deriv(metric[range])` evaluated at a step grid.
+///
+/// Eager semantics from `calculate_deriv_for_collection`: at each
+/// emit tick `t`, take all source samples in `[t - 2*step, t + step]`
+/// (a forward-leaning three-step window) and compute the
+/// least-squares regression slope of `(ts, value)` over them.  Skip
+/// ticks where the window has fewer than two samples.
+///
+/// Note the window is forward-looking by `step`. With random access
+/// to the source slice via `partition_point` this is fine — no
+/// look-ahead buffering is needed because we own the whole `&[(u64,
+/// i64)]`.
+pub struct GaugeDeriv<'a> {
+    samples: &'a [(u64, i64)],
+    cursor_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+    done: bool,
+}
+
+impl<'a> GaugeDeriv<'a> {
+    pub fn new(samples: &'a [(u64, i64)], start_ns: u64, end_ns: u64, step_ns: u64) -> Self {
+        Self {
+            samples,
+            cursor_ns: start_ns,
+            end_ns,
+            step_ns,
+            done: step_ns == 0,
+        }
+    }
+}
+
+impl<'a> Iterator for GaugeDeriv<'a> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        while !self.done && self.cursor_ns <= self.end_ns {
+            let t = self.cursor_ns;
+            match self.cursor_ns.checked_add(self.step_ns) {
+                Some(next) => self.cursor_ns = next,
+                None => self.done = true,
+            }
+
+            let window_start = t.saturating_sub(self.step_ns.saturating_mul(2));
+            let window_end = t.saturating_add(self.step_ns);
+            let lo = self.samples.partition_point(|&(ts, _)| ts < window_start);
+            let hi = self.samples.partition_point(|&(ts, _)| ts <= window_end);
+            if hi.saturating_sub(lo) < 2 {
+                continue;
+            }
+
+            // Allocation-free least-squares slope. `x` is in seconds
+            // (the eager path runs the same conversion before
+            // accumulating, so doing it inline preserves bit-for-bit
+            // parity).
+            let n = (hi - lo) as f64;
+            let mut sum_x = 0.0_f64;
+            let mut sum_y = 0.0_f64;
+            let mut sum_xy = 0.0_f64;
+            let mut sum_x2 = 0.0_f64;
+            for &(ts, v) in &self.samples[lo..hi] {
+                let x = ts as f64 / 1e9;
+                let y = v as f64;
+                sum_x += x;
+                sum_y += y;
+                sum_xy += x * y;
+                sum_x2 += x * x;
+            }
+            let denom = n * sum_x2 - sum_x * sum_x;
+            if denom.abs() < 1e-10 {
+                // Mirror eager: degenerate vertical-line input emits
+                // a slope of 0 rather than ±inf.
+                return Some((t, 0.0));
+            }
+            let slope = (n * sum_xy - sum_x * sum_y) / denom;
+            return Some((t, slope));
+        }
+        None
+    }
+}
+
+pub fn gauges_deriv<'a>(
+    collection: &'a GaugeCollection,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+) -> SeriesSet<'a> {
+    let mut out = Vec::new();
+    for (labels, series) in collection.iter() {
+        if !filter.inner.is_empty() && !labels.matches(filter) {
+            continue;
+        }
+        let iter = GaugeDeriv::new(series.samples(), start_ns, end_ns, step_ns);
+        out.push(LabeledSeries::new(labels.clone(), iter));
+    }
+    out
+}
