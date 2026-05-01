@@ -33,6 +33,7 @@ use crate::tsdb::{CounterCollection, Labels};
 mod aggregate;
 pub(crate) mod dispatch;
 mod gauge;
+pub(crate) mod histogram;
 mod irate;
 mod rate;
 

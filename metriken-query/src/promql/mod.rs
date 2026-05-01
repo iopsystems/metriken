@@ -1612,6 +1612,33 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
+        // Streaming dispatcher: when enabled, walk the histogram
+        // pipeline tick-by-tick instead of materialising
+        // `tsdb.histograms()` + `collection.sum()` + N output Vecs.
+        if self.streaming_enabled {
+            if let Some(collection) = self.tsdb.histograms_ref(&metric_name) {
+                let start_ns = (start * 1e9) as u64;
+                let end_ns = (end * 1e9) as u64;
+                let result = streaming::histogram::percentiles(
+                    collection,
+                    &labels,
+                    &percentiles,
+                    start_ns,
+                    end_ns,
+                    stride_ns,
+                    &metric_name,
+                );
+                if !result.is_empty() {
+                    return Ok(QueryResult::Matrix { result });
+                }
+                return Err(QueryError::MetricNotFound(format!(
+                    "No histogram data found for {}",
+                    metric_name
+                )));
+            }
+            return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        }
+
         // Get the histogram data with label filtering
         if let Some(collection) = self.tsdb.histograms(&metric_name, labels) {
             // Sum all histogram series together

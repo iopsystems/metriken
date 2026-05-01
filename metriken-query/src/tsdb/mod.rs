@@ -451,6 +451,12 @@ impl Tsdb {
         self.gauges.get(name)
     }
 
+    /// Borrow the raw histogram collection for `name` without cloning.
+    /// See [`Tsdb::counters_ref`].
+    pub fn histograms_ref(&self, name: &str) -> Option<&HistogramCollection> {
+        self.histograms.get(name)
+    }
+
     pub fn gauges(&self, name: &str, labels: impl Into<Labels>) -> Option<GaugeCollection> {
         if let Some(gauges) = self.gauges.get(name) {
             let gauges = gauges.filter(&labels.into());
