@@ -102,7 +102,7 @@ fn streaming_irate_matches_eager_irate() {
         1_000_000_000,     // step_ns
         5_000_000_000,     // range_ns
     );
-    let streaming = sort_by_name(collect_to_matrix(stream, "cgroup_cpu_usage"));
+    let streaming = sort_by_name(collect_to_matrix(stream, Some("cgroup_cpu_usage")));
 
     assert_eq!(
         eager.len(),
@@ -153,7 +153,9 @@ fn streaming_sum_by_matches_eager_sum_by() {
         5_000_000_000,
     );
     let summed = sum_by(irate_stream, &["name".to_string()]);
-    let streaming = sort_by_name(collect_to_matrix(summed, "cgroup_cpu_usage"));
+    // sum-by aggregated result: strip __name__ to match the eager
+    // path's `handle_aggregate` (which keeps only the by-labels).
+    let streaming = sort_by_name(collect_to_matrix(summed, None));
 
     assert_eq!(eager.len(), streaming.len());
     for (e, s) in eager.iter().zip(streaming.iter()) {
@@ -221,4 +223,226 @@ fn counter_irate_handles_reset() {
     // Last two: (4s, 50) and (5s, 150). 150 >= 50 → delta=100/1s = 100.
     assert!((p.1 - 100.0).abs() < 1e-9);
     assert!(iter.next().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Cachecannon-fixture parity test.
+//
+// Exercises the dispatcher against the real cachecannon dashboard
+// queries on a real parquet capture, comparing streaming-on vs
+// streaming-off output pointwise. Gated on `CACHECANNON_PARQUET` (or
+// the default rezolus checkout path) being present so CI doesn't
+// depend on the fixture; run locally with:
+//
+//     CACHECANNON_PARQUET=/path/to/cachecannon.parquet \
+//       cargo test -p metriken-query streaming::tests::cachecannon -- --nocapture
+//
+// The test also prints per-query streaming-vs-eager timing as a
+// directional measurement of the savings on a real workload.
+// ---------------------------------------------------------------------------
+
+/// Every query-string the cachecannon dashboard generates, after the
+/// dashboard wrapping logic (sum-irate for counters, raw selector
+/// for gauges, histogram_quantiles/heatmap for histograms), plus
+/// representative shapes the broader rezolus dashboards generate
+/// against the same parquet (rate, avg/min/max/count, sum without,
+/// avg_over_time, idelta).
+const CACHECANNON_QUERIES: &[&str] = &[
+    // --- cachecannon dashboard (loadgen, cardinality 1) ---
+    // Gauge selector — streaming gauge step-grid.
+    "target_rate{source=\"cachecannon\"}",
+    // sum(irate(..)) — streaming counter+sum.
+    "sum(irate(requests_sent{source=\"cachecannon\"}[5s]))",
+    "sum(irate(responses_received{source=\"cachecannon\"}[5s]))",
+    "sum(irate(bytes_rx{source=\"cachecannon\"}[5s]))",
+    "sum(irate(bytes_tx{source=\"cachecannon\"}[5s]))",
+    "sum(irate(request_errors{source=\"cachecannon\"}[5s]))",
+    "sum(irate(connections_failed{source=\"cachecannon\"}[5s]))",
+    "sum(irate(cache_hits{source=\"cachecannon\"}[5s]))",
+    "sum(irate(cache_misses{source=\"cachecannon\"}[5s]))",
+    "sum(irate(get_count{source=\"cachecannon\"}[5s]))",
+    "sum(irate(set_count{source=\"cachecannon\"}[5s]))",
+    // --- additional operators the broader rezolus dashboards use ---
+    // rate (instead of irate)
+    "sum(rate(cpu_cycles[5s]))",
+    "sum by (cpu) (rate(cpu_usage[5s]))",
+    // avg / min / max / count aggregations
+    "avg(irate(cpu_usage[5s]))",
+    "max(irate(cpu_usage[5s]))",
+    "min(irate(cpu_usage[5s]))",
+    "count(irate(cpu_usage[5s]))",
+    // sum without (..) modifier
+    "sum without (cpu) (irate(cpu_cycles[5s]))",
+    "sum without (id) (irate(softirq_time[5s]))",
+    // deriv on a gauge (target_rate is the cachecannon loadgen target)
+    "deriv(target_rate{source=\"cachecannon\"}[5s])",
+    // binary ops: matrix x scalar (byte->bit, percent, complement)
+    "sum(irate(bytes_rx{source=\"cachecannon\"}[5s])) * 8",
+    "sum(irate(cache_hits{source=\"cachecannon\"}[5s])) / 1000",
+    // binary ops: matrix x matrix (cache hit rate, IPC analogue)
+    "sum(irate(cache_hits{source=\"cachecannon\"}[5s])) / sum(irate(cache_misses{source=\"cachecannon\"}[5s]))",
+    "sum(irate(cpu_instructions[5s])) / sum(irate(cpu_cycles[5s]))",
+    // by-grouped binary op
+    "sum by (cpu) (irate(cpu_instructions[5s])) / sum by (cpu) (irate(cpu_cycles[5s]))",
+    // Histograms — eager path.
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",
+    "histogram_quantiles([0.5, 0.9, 0.99, 0.999], set_latency{source=\"cachecannon\"})",
+    "histogram_heatmap(response_latency{source=\"cachecannon\"})",
+];
+
+/// Look up the cachecannon parquet path, falling back to the
+/// rezolus checkout location used in dev. Returns `None` (and emits
+/// a diagnostic) when neither path is readable; the calling test
+/// then exits cleanly without failing.
+fn cachecannon_parquet_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CACHECANNON_PARQUET") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let rezolus =
+        std::path::PathBuf::from("/home/user/rezolus/site/viewer/data/cachecannon.parquet");
+    if rezolus.exists() {
+        return Some(rezolus);
+    }
+    None
+}
+
+fn count_points(result: &QueryResult) -> usize {
+    match result {
+        QueryResult::Matrix { result } => result.iter().map(|s| s.values.len()).sum(),
+        QueryResult::Vector { result } => result.len(),
+        QueryResult::Scalar { .. } => 1,
+        QueryResult::HistogramHeatmap { result } => result.data.len(),
+    }
+}
+
+fn results_match(a: &QueryResult, b: &QueryResult) -> bool {
+    match (a, b) {
+        (QueryResult::Matrix { result: ra }, QueryResult::Matrix { result: rb }) => {
+            if ra.len() != rb.len() {
+                return false;
+            }
+            // Sort both by labelset so map iteration order doesn't trip us.
+            let mut sa: Vec<&MatrixSample> = ra.iter().collect();
+            let mut sb: Vec<&MatrixSample> = rb.iter().collect();
+            let key = |s: &&MatrixSample| {
+                let mut kv: Vec<(String, String)> = s
+                    .metric
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                kv.sort();
+                kv
+            };
+            sa.sort_by_key(key);
+            sb.sort_by_key(key);
+            for (xa, xb) in sa.iter().zip(sb.iter()) {
+                if xa.metric != xb.metric || xa.values.len() != xb.values.len() {
+                    return false;
+                }
+                for ((ta, va), (tb, vb)) in xa.values.iter().zip(xb.values.iter()) {
+                    if (ta - tb).abs() > 1e-6 {
+                        return false;
+                    }
+                    if va.is_nan() && vb.is_nan() {
+                        continue;
+                    }
+                    // Relative tolerance: streaming and eager order
+                    // float adds differently, so when a value is the
+                    // result of summing many rate-per-series numbers
+                    // it can drift by a few ulps. 1e-12 relative gives
+                    // ~1000 ulps of slack — well below any meaningful
+                    // numerical difference.
+                    let abs_tol = 1e-9_f64.max(va.abs() * 1e-12).max(vb.abs() * 1e-12);
+                    if (va - vb).abs() > abs_tol {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        // Histograms / vectors / scalars take the eager path either
+        // way, so deep-equality reduces to round-tripped JSON.
+        (a, b) => serde_json::to_string(a).ok() == serde_json::to_string(b).ok(),
+    }
+}
+
+#[test]
+fn cachecannon_streaming_matches_eager() {
+    let Some(path) = cachecannon_parquet_path() else {
+        eprintln!(
+            "skipping cachecannon parity test: set CACHECANNON_PARQUET=/path/to/cachecannon.parquet \
+             or check out rezolus alongside metriken"
+        );
+        return;
+    };
+
+    let tsdb = match crate::Tsdb::load(&path) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            eprintln!("skipping cachecannon parity test: failed to load {path:?}: {e}");
+            return;
+        }
+    };
+
+    let (start, end) = QueryEngine::new(tsdb.clone()).get_time_range();
+    let step = 1.0;
+
+    let mut total_eager = std::time::Duration::ZERO;
+    let mut total_streaming = std::time::Duration::ZERO;
+
+    println!(
+        "\ncachecannon parity: {n} queries, range = [{start:.0}, {end:.0}], step = {step}",
+        n = CACHECANNON_QUERIES.len(),
+    );
+    println!(
+        "{:<70} {:>9} {:>10} {:>10} {:>7}",
+        "query", "points", "eager µs", "stream µs", "match"
+    );
+
+    for q in CACHECANNON_QUERIES {
+        let mut eager_engine = QueryEngine::new(tsdb.clone());
+        eager_engine.set_streaming_enabled(false);
+        let mut stream_engine = QueryEngine::new(tsdb.clone());
+        stream_engine.set_streaming_enabled(true);
+
+        let t0 = std::time::Instant::now();
+        let eager = eager_engine.query_range(q, start, end, step);
+        let eager_dt = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        let stream = stream_engine.query_range(q, start, end, step);
+        let stream_dt = t0.elapsed();
+
+        total_eager += eager_dt;
+        total_streaming += stream_dt;
+
+        let (matches, points) = match (&eager, &stream) {
+            (Ok(e), Ok(s)) => (results_match(e, s), count_points(e)),
+            (Err(_), Err(_)) => (true, 0),
+            _ => (false, 0),
+        };
+
+        let q_short: String = if q.len() > 68 {
+            format!("{}…", &q[..67])
+        } else {
+            (*q).to_string()
+        };
+        println!(
+            "{:<70} {:>9} {:>10} {:>10} {:>7}",
+            q_short,
+            points,
+            eager_dt.as_micros(),
+            stream_dt.as_micros(),
+            if matches { "OK" } else { "MISMATCH" }
+        );
+
+        assert!(matches, "streaming/eager output diverged on query: {q}");
+    }
+
+    println!(
+        "\ntotal: eager {} µs, streaming {} µs",
+        total_eager.as_micros(),
+        total_streaming.as_micros()
+    );
 }

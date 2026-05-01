@@ -13,24 +13,42 @@
 //! * Operators (e.g. [`CounterIrate`], [`SumMerge`]) wrap upstream
 //!   iterators and pull lazily, holding only their own windowed state.
 //!
-//! Only `irate` and `sum by` are wired up here; the rest of the engine
-//! still uses the eager path. The intent of this module is to validate
-//! the model end-to-end (parity-tested against the eager path) before
-//! migrating the remaining operators.
+//! Wired-up shapes:
+//!
+//! * Counter producers: [`CounterIrate`], [`CounterRate`].
+//! * Gauge producers: [`GaugeStepGrid`] (bare selector),
+//!   [`GaugeAvgOverTime`], [`GaugeIdelta`].
+//! * Aggregations: [`MergeReduce`] reducer driven by [`AggOp`]
+//!   (sum/avg/min/max/count) with [`GroupBy`] (by/without).
+//!
+//! The dispatcher (see [`dispatch::try_streaming`]) walks the parsed
+//! AST and assembles a producer + optional aggregator for each
+//! recognised shape; everything else falls back to the eager path.
 
 use std::collections::HashMap;
 
 use crate::promql::MatrixSample;
 use crate::tsdb::{CounterCollection, Labels};
 
+mod aggregate;
+mod binary;
+pub(crate) mod dispatch;
+mod gauge;
+pub(crate) mod histogram;
 mod irate;
-mod sum_by;
+mod rate;
 
 #[cfg(test)]
 mod tests;
 
+pub use aggregate::{aggregate, sum_by, AggOp, GroupBy, MergeReduce};
+pub use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec, ScalarBroadcast};
+pub use gauge::{
+    gauges_avg_over_time, gauges_deriv, gauges_idelta, gauges_step_grid, GaugeAvgOverTime,
+    GaugeDeriv, GaugeIdelta, GaugeStepGrid,
+};
 pub use irate::CounterIrate;
-pub use sum_by::{sum_by, SumMerge};
+pub use rate::CounterRate;
 
 /// A single sample emitted through a streaming pipeline.
 ///
@@ -94,13 +112,38 @@ pub fn irate_counters<'a>(
     out
 }
 
+/// `rate(metric[range])` over every counter series in `collection`
+/// whose labels match `filter`. See [`irate_counters`].
+pub fn rate_counters<'a>(
+    collection: &'a CounterCollection,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+    range_ns: u64,
+) -> SeriesSet<'a> {
+    let mut out = Vec::new();
+    for (labels, series) in collection.iter() {
+        if !filter.inner.is_empty() && !labels.matches(filter) {
+            continue;
+        }
+        let iter = CounterRate::new(series.samples(), start_ns, end_ns, step_ns, range_ns);
+        out.push(LabeledSeries::new(labels.clone(), iter));
+    }
+    out
+}
+
 /// Boundary collector: drain a streaming result into the same
 /// `MatrixSample` shape the eager engine returns, so the prototype can
 /// be plumbed through the existing JSON serializer unchanged.
 ///
+/// `metric_name` is added as the `__name__` label when present;
+/// callers pass `None` for aggregated results (matching the eager
+/// path, which strips `__name__` after `sum`/`avg`/etc.).
+///
 /// Empty series (operators that never emitted) are dropped to match
 /// the eager path's behaviour.
-pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: &str) -> Vec<MatrixSample> {
+pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) -> Vec<MatrixSample> {
     streaming
         .into_iter()
         .filter_map(|ls| {
@@ -109,7 +152,9 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: &str) -> Vec<Mat
                 return None;
             }
             let mut metric: HashMap<String, String> = HashMap::new();
-            metric.insert("__name__".to_string(), metric_name.to_string());
+            if let Some(name) = metric_name {
+                metric.insert("__name__".to_string(), name.to_string());
+            }
             for (k, v) in ls.labels.inner.iter() {
                 metric.insert(k.clone(), v.clone());
             }

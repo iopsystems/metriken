@@ -435,6 +435,28 @@ impl Tsdb {
         }
     }
 
+    /// Borrow the raw counter collection for `name` without cloning.
+    ///
+    /// Used by the streaming pipeline so iterator chains can hold
+    /// references into the TSDB's storage rather than building (and
+    /// keeping resident) a per-query clone. Returns `None` if the
+    /// metric is unknown.
+    pub fn counters_ref(&self, name: &str) -> Option<&CounterCollection> {
+        self.counters.get(name)
+    }
+
+    /// Borrow the raw gauge collection for `name` without cloning.
+    /// See [`Tsdb::counters_ref`].
+    pub fn gauges_ref(&self, name: &str) -> Option<&GaugeCollection> {
+        self.gauges.get(name)
+    }
+
+    /// Borrow the raw histogram collection for `name` without cloning.
+    /// See [`Tsdb::counters_ref`].
+    pub fn histograms_ref(&self, name: &str) -> Option<&HistogramCollection> {
+        self.histograms.get(name)
+    }
+
     pub fn gauges(&self, name: &str, labels: impl Into<Labels>) -> Option<GaugeCollection> {
         if let Some(gauges) = self.gauges.get(name) {
             let gauges = gauges.filter(&labels.into());
