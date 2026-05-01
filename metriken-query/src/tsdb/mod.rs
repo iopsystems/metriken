@@ -11,8 +11,6 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use parquet::arrow::ProjectionMask;
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
 use serde::Serialize;
 
 mod collection;
@@ -27,15 +25,9 @@ pub use series::*;
 use series::{delta_to_32_or_empty, empty_delta_32};
 
 /// Per-column dispatch target precomputed from the parquet schema.
-///
-/// One slot per column index; the loader iterates row-group batches
-/// once and routes each column slice to its target via this table.
-/// Histogram columns also hold their rolling `prev` cumulative so the
-/// per-period delta computation works across batches without re-walking
-/// the series.
+/// Histogram targets carry the rolling `prev` cumulative so per-period
+/// deltas work across batches.
 enum ColumnTarget {
-    /// Timestamp column or unsupported type — handled separately or
-    /// dropped.
     Skip,
     Counter {
         name: String,
@@ -57,7 +49,6 @@ enum ColumnTarget {
 
 /// Snap a nanosecond timestamp to the nearest multiple of `interval_ns`.
 /// Returns the timestamp unchanged when `interval_ns` is zero (i.e. unknown).
-#[allow(clippy::manual_checked_ops)]
 fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
     if interval_ns > 0 {
         ((ts + interval_ns / 2) / interval_ns) * interval_ns
@@ -76,10 +67,9 @@ pub struct Tsdb {
     counters: HashMap<String, CounterCollection>,
     gauges: HashMap<String, GaugeCollection>,
     histograms: HashMap<String, HistogramCollection>,
-    /// Sidecar holding the most-recent cumulative-since-start histogram per
-    /// series, used by the streaming `ingest` path to compute the per-period
-    /// delta against the next snapshot.  Not populated by the parquet load
-    /// path (which differences in-place during column iteration).
+    /// Most-recent cumulative per series; `ingest` differences against the
+    /// next snapshot to produce the per-period delta. Unused on the parquet
+    /// load path (which differences in-place).
     #[cfg(feature = "ingest")]
     prev_histograms: HashMap<String, HashMap<Labels, CumulativeROHistogram>>,
 }
@@ -100,13 +90,17 @@ impl Tsdb {
     pub fn load_from_bytes(bytes: Bytes) -> Result<Self, Box<dyn Error>> {
         let mut data = Tsdb::default();
 
-        // ----- one-time: file-level metadata -----
-        // Decode the parquet file metadata (small, never holds bulk
-        // data). The schema is cached once and reused below.
-        let parquet_metadata = SerializedFileReader::new(bytes.clone())?.metadata().clone();
+        // Parse the footer once and reuse for every per-(row-group, column)
+        // reader below — `try_new` re-parses on every call (multi-second on
+        // wide files).
+        let arrow_reader_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        let arrow_schema = arrow_reader_meta.schema().clone();
+        let pq_metadata = arrow_reader_meta.metadata().clone();
+        let parquet_schema = pq_metadata.file_metadata().schema_descr_ptr();
+        let num_row_groups = pq_metadata.num_row_groups();
 
         let mut metadata = HashMap::new();
-        if let Some(kv) = parquet_metadata.file_metadata().key_value_metadata() {
+        if let Some(kv) = pq_metadata.file_metadata().key_value_metadata() {
             for entry in kv {
                 metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
             }
@@ -128,25 +122,12 @@ impl Tsdb {
 
         let interval_ns = data.sampling_interval_ms * 1_000_000;
 
-        // Load parquet metadata once. `ArrowReaderMetadata` caches
-        // the footer parse + the Arrow-side schema descriptor in
-        // refcounted form so every per-(row-group, column) reader
-        // built below shares that work — `try_new` would re-parse
-        // the footer on every call (multi-second cost on wide files).
-        let arrow_reader_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
-        let arrow_schema = arrow_reader_meta.schema().clone();
-        let pq_metadata = arrow_reader_meta.metadata().clone();
-        let parquet_schema = pq_metadata.file_metadata().schema_descr_ptr();
-        let num_row_groups = pq_metadata.num_row_groups();
-
         let ts_col_idx = arrow_schema
             .index_of("timestamp")
             .map_err(|_| "missing 'timestamp' column")?;
 
-        // Pre-compute per-column dispatch targets so the per-batch
-        // hot loop just routes the right `arr.column(col_idx)` slice
-        // to the right destination without re-parsing schema metadata
-        // on every batch.
+        // Precompute targets so the hot loop doesn't re-parse schema
+        // metadata per batch.
         let mut targets: Vec<ColumnTarget> = arrow_schema
             .fields()
             .iter()
@@ -203,18 +184,10 @@ impl Tsdb {
             })
             .collect();
 
-        // Reusable timestamp scratch — grown once to the largest
-        // row group's row count and reused across row groups.
+        // Decode one column at a time within each row group; peak resident
+        // is bounded by one decoded Arrow array.
         let mut timestamps: Vec<Option<u64>> = Vec::new();
-
-        // Walk row groups; within each row group, decode columns one
-        // at a time. Memory peak is bounded by one column chunk's
-        // decoded Arrow array (vs one row group's worth of all
-        // columns in the previous all-columns-per-batch shape).
         for rg_idx in 0..num_row_groups {
-            // Per-row-group timestamp decode. Built with shared
-            // metadata; only the `with_row_groups` + `with_projection`
-            // selectors are per-call.
             let ts_reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
                 bytes.clone(),
                 arrow_reader_meta.clone(),
@@ -455,22 +428,17 @@ impl Tsdb {
         (name, labels)
     }
 
-    /// Borrow the raw counter collection for `name` without cloning.
-    /// Used by the streaming pipeline so iterator chains can hold
-    /// references into the TSDB's storage rather than building (and
-    /// keeping resident) a per-query clone. Returns `None` if the
-    /// metric is unknown.
+    /// Borrow the raw counter collection without cloning, so streaming
+    /// iterator chains can reference TSDB storage directly.
     pub fn counters_ref(&self, name: &str) -> Option<&CounterCollection> {
         self.counters.get(name)
     }
 
-    /// Borrow the raw gauge collection for `name` without cloning.
     /// See [`Tsdb::counters_ref`].
     pub fn gauges_ref(&self, name: &str) -> Option<&GaugeCollection> {
         self.gauges.get(name)
     }
 
-    /// Borrow the raw histogram collection for `name` without cloning.
     /// See [`Tsdb::counters_ref`].
     pub fn histograms_ref(&self, name: &str) -> Option<&HistogramCollection> {
         self.histograms.get(name)
