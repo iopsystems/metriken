@@ -198,40 +198,25 @@ fn main() {
         fmt_bytes(after_load.total - load.total),
     );
 
-    let (start, end) = QueryEngine::new(tsdb.clone()).get_time_range();
+    let engine = QueryEngine::new(tsdb.clone());
+    let (start, end) = engine.get_time_range();
     let step = 1.0;
 
-    println!(
-        "{:<70} {:>14} {:>14} {:>14} {:>14}",
-        "query", "eager peak", "stream peak", "eager alloc", "stream alloc",
-    );
+    println!("{:<70} {:>14} {:>14}", "query", "peak", "alloc");
 
-    let (mut eager_peak_total, mut stream_peak_total) = (0usize, 0usize);
-    let (mut eager_alloc_total, mut stream_alloc_total) = (0usize, 0usize);
+    let (mut peak_total, mut alloc_total) = (0usize, 0usize);
 
     for q in QUERIES {
-        let mut engine = QueryEngine::new(tsdb.clone());
-
-        // Run each path twice and keep the second run's number — the
-        // first run pays for one-time map-grow / cache effects in
-        // the parquet metadata path that aren't representative of
-        // the hot loop.
-        engine.set_streaming_enabled(false);
+        // Run twice and keep the second run's number — the first
+        // pays for one-time map-grow / cache effects in the parquet
+        // metadata path that aren't representative of the hot loop.
         let _ = engine.query_range(q, start, end, step);
-        let (eager_peak, eager_alloc) = measure(|| {
+        let (peak, alloc) = measure(|| {
             let _ = engine.query_range(q, start, end, step);
         });
 
-        engine.set_streaming_enabled(true);
-        let _ = engine.query_range(q, start, end, step);
-        let (stream_peak, stream_alloc) = measure(|| {
-            let _ = engine.query_range(q, start, end, step);
-        });
-
-        eager_peak_total += eager_peak;
-        stream_peak_total += stream_peak;
-        eager_alloc_total += eager_alloc;
-        stream_alloc_total += stream_alloc;
+        peak_total += peak;
+        alloc_total += alloc;
 
         let q_short: String = if q.len() > 68 {
             format!("{}…", &q[..67])
@@ -239,25 +224,17 @@ fn main() {
             (*q).to_string()
         };
         println!(
-            "{:<70} {:>14} {:>14} {:>14} {:>14}",
+            "{:<70} {:>14} {:>14}",
             q_short,
-            fmt_bytes(eager_peak),
-            fmt_bytes(stream_peak),
-            fmt_bytes(eager_alloc),
-            fmt_bytes(stream_alloc),
+            fmt_bytes(peak),
+            fmt_bytes(alloc),
         );
     }
 
     println!(
-        "\ntotals (sum across queries):\n  eager   peak {}, alloc {}\n  stream  peak {}, alloc {}\n  \
-         delta   peak {} ({:+.0}%), alloc {} ({:+.0}%)",
-        fmt_bytes(eager_peak_total),
-        fmt_bytes(eager_alloc_total),
-        fmt_bytes(stream_peak_total),
-        fmt_bytes(stream_alloc_total),
-        fmt_bytes(eager_peak_total.saturating_sub(stream_peak_total)),
-        100.0 * (stream_peak_total as f64 - eager_peak_total as f64) / eager_peak_total as f64,
-        fmt_bytes(eager_alloc_total.saturating_sub(stream_alloc_total)),
-        100.0 * (stream_alloc_total as f64 - eager_alloc_total as f64) / eager_alloc_total as f64,
+        "\ntotals across {n} queries:\n  peak  {}\n  alloc {}",
+        fmt_bytes(peak_total),
+        fmt_bytes(alloc_total),
+        n = QUERIES.len(),
     );
 }

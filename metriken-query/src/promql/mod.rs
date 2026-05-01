@@ -90,12 +90,6 @@ pub enum QueryResult {
 /// other `Deref<Target = Tsdb>`) for zero-copy borrowed access.
 pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
     tsdb: T,
-    /// When true, `query_range` first attempts to evaluate via the
-    /// streaming pipeline (see `promql::streaming`); shapes the
-    /// dispatcher doesn't yet recognise fall back to the eager path
-    /// transparently.  Defaulted to `true`; flipped to `false` only
-    /// by parity tests / benchmarks that need to compare paths.
-    streaming_enabled: bool,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -203,19 +197,7 @@ fn match_key(
 
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     pub fn new(tsdb: T) -> Self {
-        Self {
-            tsdb,
-            streaming_enabled: true,
-        }
-    }
-
-    /// Toggle the streaming dispatcher.  Public but doc-hidden — the
-    /// streaming path is intended to be transparent; this hook exists
-    /// for parity tests and benchmarks that need to force the eager
-    /// path on a query the dispatcher would otherwise handle.
-    #[doc(hidden)]
-    pub fn set_streaming_enabled(&mut self, enabled: bool) {
-        self.streaming_enabled = enabled;
+        Self { tsdb }
     }
 
     /// Get a reference to the underlying TSDB
@@ -489,150 +471,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         step: f64,
     ) -> Result<QueryResult, QueryError> {
         match call.func.name {
-            "rate" => {
-                // rate(metric[duration]) - windowed average per-second rate
-                if let Some(first_arg) = call.args.args.first() {
-                    if let Expr::MatrixSelector(selector) = &**first_arg {
-                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
-                            QueryError::ParseError("Matrix selector missing name".to_string())
-                        })?;
-
-                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
-                        let range_ns = selector.range.as_nanos() as u64;
-
-                        if let Some(collection) = self.tsdb.counters(metric_name, Labels::default())
-                        {
-                            let start_ns = (start * 1e9) as u64;
-                            let end_ns = (end * 1e9) as u64;
-                            let step_ns = (step * 1e9) as u64;
-                            let mut result_samples = Vec::new();
-
-                            for (labels, series) in collection.iter() {
-                                if !filter_labels.inner.is_empty()
-                                    && !labels.matches(&filter_labels)
-                                {
-                                    continue;
-                                }
-
-                                let mut rate_values = Vec::new();
-                                let mut current = start_ns;
-
-                                while current <= end_ns {
-                                    let window_start = current.saturating_sub(range_ns);
-                                    if let Some(rate) = series.windowed_rate(window_start, current)
-                                    {
-                                        rate_values.push((current as f64 / 1e9, rate));
-                                    }
-                                    current += step_ns;
-                                }
-
-                                if !rate_values.is_empty() {
-                                    let mut metric_labels = HashMap::new();
-                                    metric_labels
-                                        .insert("__name__".to_string(), metric_name.to_string());
-                                    for (key, value) in labels.inner.iter() {
-                                        metric_labels.insert(key.clone(), value.clone());
-                                    }
-                                    result_samples.push(MatrixSample {
-                                        metric: metric_labels,
-                                        values: rate_values,
-                                    });
-                                }
-                            }
-
-                            if result_samples.is_empty() {
-                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-                            }
-
-                            Ok(QueryResult::Matrix {
-                                result: result_samples,
-                            })
-                        } else {
-                            Err(QueryError::MetricNotFound(metric_name.to_string()))
-                        }
-                    } else {
-                        Err(QueryError::ParseError(
-                            "rate requires matrix selector argument".to_string(),
-                        ))
-                    }
-                } else {
-                    Err(QueryError::ParseError(
-                        "rate requires an argument".to_string(),
-                    ))
-                }
-            }
-            "irate" => {
-                // irate(metric[duration]) - windowed instantaneous per-second rate
-                if let Some(first_arg) = call.args.args.first() {
-                    if let Expr::MatrixSelector(selector) = &**first_arg {
-                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
-                            QueryError::ParseError("Matrix selector missing name".to_string())
-                        })?;
-
-                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
-                        let range_ns = selector.range.as_nanos() as u64;
-
-                        if let Some(collection) = self.tsdb.counters(metric_name, Labels::default())
-                        {
-                            let start_ns = (start * 1e9) as u64;
-                            let end_ns = (end * 1e9) as u64;
-                            let step_ns = (step * 1e9) as u64;
-                            let mut result_samples = Vec::new();
-
-                            for (labels, series) in collection.iter() {
-                                if !filter_labels.inner.is_empty()
-                                    && !labels.matches(&filter_labels)
-                                {
-                                    continue;
-                                }
-
-                                let mut irate_values = Vec::new();
-                                let mut current = start_ns;
-
-                                while current <= end_ns {
-                                    let window_start = current.saturating_sub(range_ns);
-                                    if let Some(rate) = series.windowed_irate(window_start, current)
-                                    {
-                                        irate_values.push((current as f64 / 1e9, rate));
-                                    }
-                                    current += step_ns;
-                                }
-
-                                if !irate_values.is_empty() {
-                                    let mut metric_labels = HashMap::new();
-                                    metric_labels
-                                        .insert("__name__".to_string(), metric_name.to_string());
-                                    for (key, value) in labels.inner.iter() {
-                                        metric_labels.insert(key.clone(), value.clone());
-                                    }
-                                    result_samples.push(MatrixSample {
-                                        metric: metric_labels,
-                                        values: irate_values,
-                                    });
-                                }
-                            }
-
-                            if result_samples.is_empty() {
-                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-                            }
-
-                            Ok(QueryResult::Matrix {
-                                result: result_samples,
-                            })
-                        } else {
-                            Err(QueryError::MetricNotFound(metric_name.to_string()))
-                        }
-                    } else {
-                        Err(QueryError::ParseError(
-                            "irate requires matrix selector argument".to_string(),
-                        ))
-                    }
-                } else {
-                    Err(QueryError::ParseError(
-                        "irate requires an argument".to_string(),
-                    ))
-                }
-            }
             "deriv" => {
                 // deriv expects a gauge range vector and calculates derivative using linear
                 // regression
@@ -688,92 +526,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     ))
                 }
             }
-            "idelta" => {
-                // idelta takes a range vector and returns the difference between
-                // the last two samples. It operates on gauge metrics.
-                if let Some(first_arg) = call.args.args.first() {
-                    if let Expr::MatrixSelector(selector) = &**first_arg {
-                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
-                            QueryError::ParseError("Matrix selector missing name".to_string())
-                        })?;
-
-                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
-
-                        let range_ns = selector.range.as_nanos() as u64;
-
-                        if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
-                            let start_ns = (start * 1e9) as u64;
-                            let end_ns = (end * 1e9) as u64;
-                            let step_ns = (step * 1e9) as u64;
-                            let mut result_samples = Vec::new();
-
-                            for (labels, series) in collection.iter() {
-                                if !filter_labels.inner.is_empty()
-                                    && !labels.matches(&filter_labels)
-                                {
-                                    continue;
-                                }
-
-                                let untyped = series.untyped();
-                                let mut idelta_values = Vec::new();
-                                let mut current = start_ns;
-
-                                while current <= end_ns {
-                                    let window_start = current.saturating_sub(range_ns);
-
-                                    // Get the last two samples in the window
-                                    let last_two: Vec<(u64, f64)> = untyped
-                                        .range(window_start, current)
-                                        .iter()
-                                        .rev()
-                                        .take(2)
-                                        .copied()
-                                        .collect();
-
-                                    if last_two.len() == 2 {
-                                        // last_two[0] is the latest, last_two[1] is second-to-last
-                                        let delta = last_two[0].1 - last_two[1].1;
-                                        idelta_values.push((current as f64 / 1e9, delta));
-                                    }
-
-                                    current += step_ns;
-                                }
-
-                                if !idelta_values.is_empty() {
-                                    let mut metric_labels = HashMap::new();
-                                    metric_labels
-                                        .insert("__name__".to_string(), metric_name.to_string());
-                                    for (key, value) in labels.inner.iter() {
-                                        metric_labels.insert(key.clone(), value.clone());
-                                    }
-                                    result_samples.push(MatrixSample {
-                                        metric: metric_labels,
-                                        values: idelta_values,
-                                    });
-                                }
-                            }
-
-                            if result_samples.is_empty() {
-                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-                            }
-
-                            Ok(QueryResult::Matrix {
-                                result: result_samples,
-                            })
-                        } else {
-                            Err(QueryError::MetricNotFound(metric_name.to_string()))
-                        }
-                    } else {
-                        Err(QueryError::ParseError(
-                            "idelta requires matrix selector argument".to_string(),
-                        ))
-                    }
-                } else {
-                    Err(QueryError::ParseError(
-                        "idelta requires an argument".to_string(),
-                    ))
-                }
-            }
             "histogram_quantile" => {
                 // histogram_quantile(quantile, histogram) — standard PromQL,
                 // single quantile.  Internally the same operation as
@@ -817,61 +569,25 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 let start_ns = (start * 1e9) as u64;
                 let end_ns = (end * 1e9) as u64;
 
-                if self.streaming_enabled {
-                    if let Some(collection) = self.tsdb.histograms_ref(metric_name) {
-                        let result = streaming::histogram::quantiles(
-                            collection,
-                            &Labels::default(),
-                            &[quantile],
-                            start_ns,
-                            end_ns,
-                            None,
-                            metric_name,
-                        );
-                        if !result.is_empty() {
-                            return Ok(QueryResult::Matrix { result });
-                        }
-                        return Err(QueryError::MetricNotFound(format!(
-                            "No histogram data found for {}",
-                            metric_name
-                        )));
-                    }
+                let Some(collection) = self.tsdb.histograms_ref(metric_name) else {
                     return Err(QueryError::MetricNotFound(metric_name.to_string()));
-                }
-
-                // Eager fallback.
-                if let Some(collection) = self.tsdb.histograms(metric_name, Labels::default()) {
-                    let summed_series = collection.sum();
-                    if let Some(quantile_series) = summed_series.percentiles(&[quantile], None) {
-                        if let Some(series) = quantile_series.first() {
-                            let values: Vec<(f64, f64)> = series
-                                .range(start_ns, end_ns)
-                                .iter()
-                                .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                                .collect();
-
-                            if !values.is_empty() {
-                                let mut metric_labels = HashMap::new();
-                                metric_labels
-                                    .insert("__name__".to_string(), metric_name.to_string());
-                                metric_labels.insert("quantile".to_string(), quantile.to_string());
-
-                                return Ok(QueryResult::Matrix {
-                                    result: vec![MatrixSample {
-                                        metric: metric_labels,
-                                        values,
-                                    }],
-                                });
-                            }
-                        }
-                    }
-                    Err(QueryError::MetricNotFound(format!(
+                };
+                let result = streaming::histogram::quantiles(
+                    collection,
+                    &Labels::default(),
+                    &[quantile],
+                    start_ns,
+                    end_ns,
+                    None,
+                    metric_name,
+                );
+                if result.is_empty() {
+                    return Err(QueryError::MetricNotFound(format!(
                         "No histogram data found for {}",
                         metric_name
-                    )))
-                } else {
-                    Err(QueryError::MetricNotFound(metric_name.to_string()))
+                    )));
                 }
+                Ok(QueryResult::Matrix { result })
             }
             "histogram_quantiles" => {
                 // histogram_quantiles is handled via pre-parsing in query_range()
@@ -953,86 +669,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     ))
                 }
             }
-            "avg_over_time" => {
-                // avg_over_time(metric[duration]) - average value over each window
-                if let Some(first_arg) = call.args.args.first() {
-                    if let Expr::MatrixSelector(selector) = &**first_arg {
-                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
-                            QueryError::ParseError("Matrix selector missing name".to_string())
-                        })?;
-
-                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
-                        let range_ns = selector.range.as_nanos() as u64;
-
-                        if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
-                            let start_ns = (start * 1e9) as u64;
-                            let end_ns = (end * 1e9) as u64;
-                            let step_ns = (step * 1e9) as u64;
-                            let mut result_samples = Vec::new();
-
-                            for (labels, series) in collection.iter() {
-                                if !filter_labels.inner.is_empty()
-                                    && !labels.matches(&filter_labels)
-                                {
-                                    continue;
-                                }
-
-                                let untyped = series.untyped();
-                                let mut avg_values = Vec::new();
-                                let mut current = start_ns;
-
-                                while current <= end_ns {
-                                    let window_start = current.saturating_sub(range_ns);
-                                    let samples: Vec<f64> = untyped
-                                        .range(window_start, current)
-                                        .iter()
-                                        .map(|(_, v)| *v)
-                                        .collect();
-
-                                    if !samples.is_empty() {
-                                        let sum: f64 = samples.iter().sum();
-                                        let avg = sum / samples.len() as f64;
-                                        avg_values.push((current as f64 / 1e9, avg));
-                                    }
-
-                                    current += step_ns;
-                                }
-
-                                if !avg_values.is_empty() {
-                                    let mut metric_labels = HashMap::new();
-                                    metric_labels
-                                        .insert("__name__".to_string(), metric_name.to_string());
-                                    for (key, value) in labels.inner.iter() {
-                                        metric_labels.insert(key.clone(), value.clone());
-                                    }
-                                    result_samples.push(MatrixSample {
-                                        metric: metric_labels,
-                                        values: avg_values,
-                                    });
-                                }
-                            }
-
-                            if result_samples.is_empty() {
-                                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-                            }
-
-                            Ok(QueryResult::Matrix {
-                                result: result_samples,
-                            })
-                        } else {
-                            Err(QueryError::MetricNotFound(metric_name.to_string()))
-                        }
-                    } else {
-                        Err(QueryError::ParseError(
-                            "avg_over_time requires matrix selector argument".to_string(),
-                        ))
-                    }
-                } else {
-                    Err(QueryError::ParseError(
-                        "avg_over_time requires an argument".to_string(),
-                    ))
-                }
-            }
             _ => Err(QueryError::Unsupported(format!(
                 "Function {} not yet supported",
                 call.func.name
@@ -1040,7 +676,13 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle aggregate expressions like sum, sum by, avg, etc.
+    /// Aggregate-expression backstop. The streaming dispatcher
+    /// (called first by `evaluate_expr`) handles every supported
+    /// `sum`/`avg`/`min`/`max`/`count` over a streamable inner; this
+    /// path runs only when the inner couldn't stream — e.g.
+    /// `sum(scalar(...))`, where the inner evaluates to a `Scalar`.
+    /// Per PromQL semantics the aggregate of a scalar passes the
+    /// scalar through unchanged.
     fn handle_aggregate(
         &self,
         agg: &parser::AggregateExpr,
@@ -1049,111 +691,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         step: f64,
     ) -> Result<QueryResult, QueryError> {
         let op_str = agg.op.to_string();
-
-        match op_str.as_str() {
-            "sum" | "avg" | "min" | "max" | "count" => {
-                let inner = self.evaluate_expr(&agg.expr, start, end, step)?;
-
-                match inner {
-                    QueryResult::Matrix { result: samples } => {
-                        if samples.is_empty() {
-                            return Ok(QueryResult::Matrix { result: vec![] });
-                        }
-
-                        // Group samples by labels (or all into one group if no modifier)
-                        let mut grouped: HashMap<BTreeMap<String, String>, Vec<&MatrixSample>> =
-                            HashMap::new();
-
-                        for sample in &samples {
-                            let group_key = if let Some(modifier) = &agg.modifier {
-                                let mut key = BTreeMap::new();
-                                match modifier {
-                                    parser::LabelModifier::Include(labels) => {
-                                        for label_name in &labels.labels {
-                                            if let Some(value) = sample.metric.get(label_name) {
-                                                key.insert(label_name.clone(), value.clone());
-                                            }
-                                        }
-                                    }
-                                    parser::LabelModifier::Exclude(labels) => {
-                                        for (k, v) in &sample.metric {
-                                            if !labels.labels.contains(k) && k != "__name__" {
-                                                key.insert(k.clone(), v.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                                key
-                            } else {
-                                BTreeMap::new()
-                            };
-
-                            grouped.entry(group_key).or_default().push(sample);
-                        }
-
-                        // Reduce each group
-                        let mut result_samples = Vec::new();
-
-                        for (group_labels, group_samples) in grouped {
-                            let mut sum_map: BTreeMap<u64, f64> = BTreeMap::new();
-                            let mut count_map: BTreeMap<u64, usize> = BTreeMap::new();
-                            let mut min_map: BTreeMap<u64, f64> = BTreeMap::new();
-                            let mut max_map: BTreeMap<u64, f64> = BTreeMap::new();
-
-                            for sample in &group_samples {
-                                for (ts, val) in &sample.values {
-                                    let ts_key = (*ts * 1e9) as u64;
-                                    *sum_map.entry(ts_key).or_insert(0.0) += val;
-                                    *count_map.entry(ts_key).or_insert(0) += 1;
-                                    min_map
-                                        .entry(ts_key)
-                                        .and_modify(|v| *v = v.min(*val))
-                                        .or_insert(*val);
-                                    max_map
-                                        .entry(ts_key)
-                                        .and_modify(|v| *v = v.max(*val))
-                                        .or_insert(*val);
-                                }
-                            }
-
-                            let result_values: Vec<(f64, f64)> = sum_map
-                                .keys()
-                                .map(|ts_key| {
-                                    let ts = *ts_key as f64 / 1e9;
-                                    let val = match op_str.as_str() {
-                                        "sum" => sum_map[ts_key],
-                                        "avg" => sum_map[ts_key] / count_map[ts_key] as f64,
-                                        "min" => min_map[ts_key],
-                                        "max" => max_map[ts_key],
-                                        "count" => count_map[ts_key] as f64,
-                                        _ => unreachable!(),
-                                    };
-                                    (ts, val)
-                                })
-                                .collect();
-
-                            if !result_values.is_empty() {
-                                let metric_map: HashMap<String, String> =
-                                    group_labels.into_iter().collect();
-                                result_samples.push(MatrixSample {
-                                    metric: metric_map,
-                                    values: result_values,
-                                });
-                            }
-                        }
-
-                        Ok(QueryResult::Matrix {
-                            result: result_samples,
-                        })
-                    }
-                    _ => Ok(inner),
-                }
-            }
-            _ => Err(QueryError::Unsupported(format!(
-                "Unknown aggregation: {}",
-                op_str
-            ))),
+        if !matches!(op_str.as_str(), "sum" | "avg" | "min" | "max" | "count") {
+            return Err(QueryError::Unsupported(format!(
+                "Unknown aggregation: {op_str}"
+            )));
         }
+        // Streaming would have handled a Series-typed inner; only
+        // Scalar (or other non-Matrix) results reach here.
+        self.evaluate_expr(&agg.expr, start, end, step)
     }
 
     /// Apply a binary operation to two query results
@@ -1339,6 +884,20 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
+        // Streaming dispatcher first — handles every shape the
+        // pipeline currently covers (rate/irate/gauge selector/
+        // avg_over_time/idelta/deriv/sum-avg-min-max-count by/
+        // without/+ - * / matrix x scalar/matrix x matrix). Returns
+        // `None` for shapes streaming doesn't yet handle so we fall
+        // through to the eager match below. Firing here (rather than
+        // only in `query_range`) means the inner sub-tree of an
+        // eager-only top-level shape — e.g. `scalar(sum(irate(...)))`
+        // — also goes through streaming.
+        if let Some(result) =
+            streaming::dispatch::try_streaming(&self.tsdb, expr, start, end, step)?
+        {
+            return Ok(result);
+        }
         match expr {
             Expr::Binary(binary) => {
                 // Evaluate left and right sides
@@ -1349,75 +908,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 self.apply_binary_op(&binary.op, left, right, binary.modifier.as_ref())
             }
             Expr::VectorSelector(selector) => {
-                // Handle simple metric selection
+                // VectorSelector backstop: streaming covers gauge
+                // selectors (the 99% case). Reaching this arm means
+                // either the metric doesn't exist or it's a counter
+                // (PromQL requires rate/irate to access counters);
+                // both produce MetricNotFound.
                 let metric_name = selector.name.as_deref().ok_or_else(|| {
                     QueryError::ParseError("Vector selector missing name".to_string())
                 })?;
-
-                let filter_labels = extract_filter_labels(&selector.matchers.matchers);
-
-                // Handle simple metric selection - return all series with their labels
-                // Check for gauges first
-                if let Some(collection) = self.tsdb.gauges(metric_name, Labels::default()) {
-                    let start_ns = (start * 1e9) as u64;
-                    let end_ns = (end * 1e9) as u64;
-                    let step_ns = (step * 1e9) as u64;
-                    let interval_ns = (self.tsdb.interval() * 1e9) as u64;
-
-                    let mut result_samples = Vec::new();
-
-                    // Return all series with their labels
-                    for (labels, series) in collection.iter() {
-                        // Skip series that don't match the filter
-                        if !filter_labels.inner.is_empty() && !labels.matches(&filter_labels) {
-                            continue;
-                        }
-                        let untyped = series.untyped();
-                        // Always evaluate at step-aligned timestamps so
-                        // gauge results can participate in binary operations
-                        // with other step-aligned series (e.g. irate
-                        // results).
-                        let staleness = step_ns.max(interval_ns);
-                        let values: Vec<(f64, f64)> = {
-                            let mut vals = Vec::new();
-                            let mut current = start_ns;
-                            while current <= end_ns {
-                                if let Some((ts, val)) = untyped.last_at_or_before(current) {
-                                    if current - ts <= staleness {
-                                        vals.push((current as f64 / 1e9, val));
-                                    }
-                                }
-                                current += step_ns;
-                            }
-                            vals
-                        };
-
-                        if !values.is_empty() {
-                            let mut metric_labels = HashMap::new();
-                            metric_labels.insert("__name__".to_string(), metric_name.to_string());
-
-                            // Add all labels from this series
-                            for (key, value) in labels.inner.iter() {
-                                metric_labels.insert(key.clone(), value.clone());
-                            }
-
-                            result_samples.push(MatrixSample {
-                                metric: metric_labels,
-                                values,
-                            });
-                        }
-                    }
-
-                    if !result_samples.is_empty() {
-                        return Ok(QueryResult::Matrix {
-                            result: result_samples,
-                        });
-                    }
-                }
-
-                // Counters should only be accessed through rate/irate functions
-                // Direct access to raw counter values is not meaningful
-
                 Err(QueryError::MetricNotFound(metric_name.to_string()))
             }
             Expr::NumberLiteral(num) => {
@@ -1637,78 +1135,27 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        // Streaming dispatcher: when enabled, walk the histogram
-        // pipeline tick-by-tick instead of materialising
-        // `tsdb.histograms()` + `collection.sum()` + N output Vecs.
-        if self.streaming_enabled {
-            if let Some(collection) = self.tsdb.histograms_ref(&metric_name) {
-                let start_ns = (start * 1e9) as u64;
-                let end_ns = (end * 1e9) as u64;
-                let result = streaming::histogram::quantiles(
-                    collection,
-                    &labels,
-                    &quantiles,
-                    start_ns,
-                    end_ns,
-                    stride_ns,
-                    &metric_name,
-                );
-                if !result.is_empty() {
-                    return Ok(QueryResult::Matrix { result });
-                }
-                return Err(QueryError::MetricNotFound(format!(
-                    "No histogram data found for {}",
-                    metric_name
-                )));
-            }
+        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
             return Err(QueryError::MetricNotFound(metric_name.to_string()));
-        }
-
-        // Get the histogram data with label filtering
-        if let Some(collection) = self.tsdb.histograms(&metric_name, labels) {
-            // Sum all histogram series together
-            let summed_series = collection.sum();
-
-            // Calculate all quantiles
-            if let Some(quantile_series_vec) = summed_series.percentiles(&quantiles, stride_ns) {
-                let start_ns = (start * 1e9) as u64;
-                let end_ns = (end * 1e9) as u64;
-
-                let mut result_samples = Vec::new();
-
-                for (idx, series) in quantile_series_vec.iter().enumerate() {
-                    let values: Vec<(f64, f64)> = series
-                        .range(start_ns, end_ns)
-                        .iter()
-                        .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                        .collect();
-
-                    if !values.is_empty() {
-                        let mut metric_labels = HashMap::new();
-                        metric_labels.insert("__name__".to_string(), metric_name.to_string());
-                        metric_labels.insert("quantile".to_string(), quantiles[idx].to_string());
-
-                        result_samples.push(MatrixSample {
-                            metric: metric_labels,
-                            values,
-                        });
-                    }
-                }
-
-                if !result_samples.is_empty() {
-                    return Ok(QueryResult::Matrix {
-                        result: result_samples,
-                    });
-                }
-            }
-
-            Err(QueryError::MetricNotFound(format!(
+        };
+        let start_ns = (start * 1e9) as u64;
+        let end_ns = (end * 1e9) as u64;
+        let result = streaming::histogram::quantiles(
+            collection,
+            &labels,
+            &quantiles,
+            start_ns,
+            end_ns,
+            stride_ns,
+            &metric_name,
+        );
+        if result.is_empty() {
+            return Err(QueryError::MetricNotFound(format!(
                 "No histogram data found for {}",
                 metric_name
-            )))
-        } else {
-            Err(QueryError::MetricNotFound(metric_name.to_string()))
+            )));
         }
+        Ok(QueryResult::Matrix { result })
     }
 
     /// Calculate slope using least squares linear regression
@@ -1852,24 +1299,13 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
 
-        // Parse the query into an AST
+        // Parse the query into an AST and evaluate. The streaming
+        // dispatcher fires inside `evaluate_expr`, so it covers
+        // every recursion level — not just the top — letting eager
+        // wrappers like `scalar(sum(irate(...)))` benefit from
+        // streaming on their inner sub-trees too.
         match parser::parse(query_str) {
-            Ok(expr) => {
-                // Streaming dispatcher: handles the hot-path shapes
-                // (currently `sum [by (..)] (irate(metric[range]))`).
-                // Returns `Ok(None)` for shapes it doesn't yet cover,
-                // letting us fall through to the eager path with no
-                // observable behaviour change.
-                if self.streaming_enabled {
-                    if let Some(result) =
-                        streaming::dispatch::try_streaming(&self.tsdb, &expr, start, end, step)?
-                    {
-                        return Ok(result);
-                    }
-                }
-                // Evaluate the AST
-                self.evaluate_expr(&expr, start, end, step)
-            }
+            Ok(expr) => self.evaluate_expr(&expr, start, end, step),
             Err(err) => {
                 // Provide more helpful error messages for common mistakes
                 let error_msg = format!("{:?}", err);
