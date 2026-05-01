@@ -17,8 +17,9 @@
 //! * `lhs OP rhs` where OP ∈ {`+`, `-`, `*`, `/`} — binary ops
 //!   between two series sets or between a series set and a number
 //!   literal. Honors `on(..)` and `ignoring(..)` matching modifiers.
-//!   `group_left` / `group_right` and the matcher-less single-right
-//!   broadcast are NOT supported (errors with `Unsupported`).
+//!   With no modifier, an unmatched left set is broadcast against a
+//!   single unmatched right series (eager-engine parity). `group_left`
+//!   / `group_right` are NOT supported.
 //! * `NumberLiteral` — produces a `Built::Scalar`; usable on either
 //!   side of a binary op.
 //! * Parenthesised expressions are unwrapped.
@@ -232,21 +233,11 @@ where
                 series: right_series,
                 ..
             },
-        ) => {
-            let Some(joined) = matrix_matrix_op(left_series, right_series, op, spec) else {
-                return Err(QueryError::Unsupported(
-                    "matrix×matrix without an `on(..)` / `ignoring(..)` modifier requires \
-                     compatible label sets; the matcher-less single-right broadcast is not \
-                     supported"
-                        .to_string(),
-                ));
-            };
-            Ok(Built::Series {
-                series: joined,
-                metric_name: None,
-                metric_name_for_error: None,
-            })
-        }
+        ) => Ok(Built::Series {
+            series: matrix_matrix_op(left_series, right_series, op, spec),
+            metric_name: None,
+            metric_name_for_error: None,
+        }),
         (Built::Scalar(a), Built::Scalar(b)) => {
             Ok(Built::Scalar(op.apply(a, b).unwrap_or(f64::NAN)))
         }
