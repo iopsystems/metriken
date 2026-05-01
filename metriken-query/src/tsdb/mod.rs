@@ -445,6 +445,12 @@ impl Tsdb {
         self.counters.get(name)
     }
 
+    /// Borrow the raw gauge collection for `name` without cloning.
+    /// See [`Tsdb::counters_ref`].
+    pub fn gauges_ref(&self, name: &str) -> Option<&GaugeCollection> {
+        self.gauges.get(name)
+    }
+
     pub fn gauges(&self, name: &str, labels: impl Into<Labels>) -> Option<GaugeCollection> {
         if let Some(gauges) = self.gauges.get(name) {
             let gauges = gauges.filter(&labels.into());

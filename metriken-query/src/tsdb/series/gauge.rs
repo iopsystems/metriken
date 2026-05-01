@@ -38,4 +38,11 @@ impl GaugeSeries {
     pub fn untyped(&self) -> UntypedSeries {
         UntypedSeries::from_sorted(self.inner.iter().map(|(t, v)| (*t, *v as f64)).collect())
     }
+
+    /// Borrow the raw sample slice. Used by streaming gauge operators
+    /// that build iterator pipelines without cloning into an
+    /// `UntypedSeries` first.
+    pub(crate) fn samples(&self) -> &[(u64, i64)] {
+        &self.inner
+    }
 }

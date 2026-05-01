@@ -243,11 +243,15 @@ fn counter_irate_handles_reset() {
 
 /// Every query-string the cachecannon dashboard generates, after the
 /// dashboard wrapping logic (sum-irate for counters, raw selector
-/// for gauges, histogram_percentiles/heatmap for histograms).
+/// for gauges, histogram_percentiles/heatmap for histograms), plus
+/// representative shapes the broader rezolus dashboards generate
+/// against the same parquet (rate, avg/min/max/count, sum without,
+/// avg_over_time, idelta).
 const CACHECANNON_QUERIES: &[&str] = &[
-    // Gauge selector — falls through to the eager path.
+    // --- cachecannon dashboard (loadgen, cardinality 1) ---
+    // Gauge selector — streaming gauge step-grid.
     "target_rate{source=\"cachecannon\"}",
-    // sum(irate(..)) — streaming path.
+    // sum(irate(..)) — streaming counter+sum.
     "sum(irate(requests_sent{source=\"cachecannon\"}[5s]))",
     "sum(irate(responses_received{source=\"cachecannon\"}[5s]))",
     "sum(irate(bytes_rx{source=\"cachecannon\"}[5s]))",
@@ -258,6 +262,18 @@ const CACHECANNON_QUERIES: &[&str] = &[
     "sum(irate(cache_misses{source=\"cachecannon\"}[5s]))",
     "sum(irate(get_count{source=\"cachecannon\"}[5s]))",
     "sum(irate(set_count{source=\"cachecannon\"}[5s]))",
+    // --- additional operators the broader rezolus dashboards use ---
+    // rate (instead of irate)
+    "sum(rate(cpu_cycles[5s]))",
+    "sum by (cpu) (rate(cpu_usage[5s]))",
+    // avg / min / max / count aggregations
+    "avg(irate(cpu_usage[5s]))",
+    "max(irate(cpu_usage[5s]))",
+    "min(irate(cpu_usage[5s]))",
+    "count(irate(cpu_usage[5s]))",
+    // sum without (..) modifier
+    "sum without (cpu) (irate(cpu_cycles[5s]))",
+    "sum without (id) (irate(softirq_time[5s]))",
     // Histograms — eager path.
     "histogram_percentiles([0.5, 0.9, 0.99, 0.999], response_latency{source=\"cachecannon\"})",
     "histogram_percentiles([0.5, 0.9, 0.99, 0.999], get_latency{source=\"cachecannon\"})",
@@ -318,7 +334,17 @@ fn results_match(a: &QueryResult, b: &QueryResult) -> bool {
                     if (ta - tb).abs() > 1e-6 {
                         return false;
                     }
-                    if (va - vb).abs() > 1e-9 && !(va.is_nan() && vb.is_nan()) {
+                    if va.is_nan() && vb.is_nan() {
+                        continue;
+                    }
+                    // Relative tolerance: streaming and eager order
+                    // float adds differently, so when a value is the
+                    // result of summing many rate-per-series numbers
+                    // it can drift by a few ulps. 1e-12 relative gives
+                    // ~1000 ulps of slack — well below any meaningful
+                    // numerical difference.
+                    let abs_tol = 1e-9_f64.max(va.abs() * 1e-12).max(vb.abs() * 1e-12);
+                    if (va - vb).abs() > abs_tol {
                         return false;
                     }
                 }

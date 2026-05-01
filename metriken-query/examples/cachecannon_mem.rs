@@ -122,6 +122,18 @@ const QUERIES: &[&str] = &[
     "sum by (cpu) (irate(cpu_usage[5s]))",
     "sum by (id) (irate(softirq_time[5s]))",
     "sum by (name) (irate(cgroup_cpu_usage[5s]))",
+    // rate (windowed average) — same producer shape as irate.
+    "sum(rate(softirq[5s]))",
+    "sum(rate(cpu_usage[5s]))",
+    "sum by (cpu) (rate(cpu_usage[5s]))",
+    // avg / min / max / count — exercise the generalised reducer.
+    "avg(irate(cpu_usage[5s]))",
+    "max(irate(cpu_usage[5s]))",
+    "min(irate(cpu_usage[5s]))",
+    "count(irate(cpu_usage[5s]))",
+    // sum without (..) — exercise GroupBy::Exclude.
+    "sum without (cpu) (irate(cpu_cycles[5s]))",
+    "sum without (id) (irate(softirq_time[5s]))",
 ];
 
 fn fixture_path() -> Option<PathBuf> {

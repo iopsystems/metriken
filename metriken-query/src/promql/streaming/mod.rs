@@ -13,25 +13,39 @@
 //! * Operators (e.g. [`CounterIrate`], [`SumMerge`]) wrap upstream
 //!   iterators and pull lazily, holding only their own windowed state.
 //!
-//! Only `irate` and `sum by` are wired up here; the rest of the engine
-//! still uses the eager path. The intent of this module is to validate
-//! the model end-to-end (parity-tested against the eager path) before
-//! migrating the remaining operators.
+//! Wired-up shapes:
+//!
+//! * Counter producers: [`CounterIrate`], [`CounterRate`].
+//! * Gauge producers: [`GaugeStepGrid`] (bare selector),
+//!   [`GaugeAvgOverTime`], [`GaugeIdelta`].
+//! * Aggregations: [`MergeReduce`] reducer driven by [`AggOp`]
+//!   (sum/avg/min/max/count) with [`GroupBy`] (by/without).
+//!
+//! The dispatcher (see [`dispatch::try_streaming`]) walks the parsed
+//! AST and assembles a producer + optional aggregator for each
+//! recognised shape; everything else falls back to the eager path.
 
 use std::collections::HashMap;
 
 use crate::promql::MatrixSample;
 use crate::tsdb::{CounterCollection, Labels};
 
+mod aggregate;
 pub(crate) mod dispatch;
+mod gauge;
 mod irate;
-mod sum_by;
+mod rate;
 
 #[cfg(test)]
 mod tests;
 
+pub use aggregate::{aggregate, sum_by, AggOp, GroupBy, MergeReduce};
+pub use gauge::{
+    gauges_avg_over_time, gauges_idelta, gauges_step_grid, GaugeAvgOverTime, GaugeIdelta,
+    GaugeStepGrid,
+};
 pub use irate::CounterIrate;
-pub use sum_by::{sum_by, SumMerge};
+pub use rate::CounterRate;
 
 /// A single sample emitted through a streaming pipeline.
 ///
@@ -90,6 +104,27 @@ pub fn irate_counters<'a>(
             continue;
         }
         let iter = CounterIrate::new(series.samples(), start_ns, end_ns, step_ns, range_ns);
+        out.push(LabeledSeries::new(labels.clone(), iter));
+    }
+    out
+}
+
+/// `rate(metric[range])` over every counter series in `collection`
+/// whose labels match `filter`. See [`irate_counters`].
+pub fn rate_counters<'a>(
+    collection: &'a CounterCollection,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+    range_ns: u64,
+) -> SeriesSet<'a> {
+    let mut out = Vec::new();
+    for (labels, series) in collection.iter() {
+        if !filter.inner.is_empty() && !labels.matches(filter) {
+            continue;
+        }
+        let iter = CounterRate::new(series.samples(), start_ns, end_ns, step_ns, range_ns);
         out.push(LabeledSeries::new(labels.clone(), iter));
     }
     out
