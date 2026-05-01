@@ -283,10 +283,7 @@ pub fn matrix_matrix_op<'a>(
     // unmatched right series, pair every unmatched left with that
     // singleton (timestamps via a shared lookup).  Mirrors the eager
     // engine's per-left fallback for `aggregated / scalar_metric`.
-    if !unmatched_left.is_empty()
-        && matches!(spec, MatchSpec::Default)
-        && right_by_key.len() == 1
-    {
+    if !unmatched_left.is_empty() && matches!(spec, MatchSpec::Default) && right_by_key.len() == 1 {
         let (_, right_singleton) = right_by_key.into_iter().next().unwrap();
         let rhs: Rc<HashMap<u64, f64>> = Rc::new(right_singleton.iter.collect());
         for left in unmatched_left {
