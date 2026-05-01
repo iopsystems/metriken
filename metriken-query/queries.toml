@@ -1,0 +1,594 @@
+# Canonical query catalogue and migration ledger for the metriken-query →
+# DuckDB SQL migration.
+#
+# This file plays two roles. At test time it drives the golden-snapshot
+# harness in `tests/golden.rs` (PromQL queries are run against fixtures and
+# their output is checked against checked-in `insta` snapshots). At runtime
+# it drives the dispatcher inside `QueryEngine::query_range`: incoming
+# PromQL is matched against entries here and routed to PromQL, the SQL
+# twin, or both, according to each entry's `mode`.
+#
+# Schema:
+#   id           — unique slug, used as the snapshot file name
+#   mode         — off | shadow | strict | primary (lifecycle, see below)
+#   promql       — the PromQL query (literal for now; template captures TBD)
+#   sql          — the DuckDB SQL twin; absent → mode forced to off
+#   value_columns / label_columns — used to project SQL rows back into a
+#                  QueryResult::Matrix shape. value_columns are the value
+#                  fields per row (typically one); label_columns are the
+#                  series-defining label columns (empty → single series).
+#   fixture / start / end / step — used by the golden harness only;
+#                  ignored by the runtime dispatcher.
+#   description  — free text.
+#
+# `mode` lifecycle:
+#   off     — PromQL only. Default for entries without a SQL twin or whose
+#             SQL hasn't been validated yet.
+#   shadow  — Run both engines on every request; compare; log/metricise
+#             diffs; return PromQL's answer.
+#   strict  — Run both; compare; diff = hard error; otherwise return either.
+#   primary — Run SQL only.
+#
+# Promotions are catalogue commits — `git log -p queries.toml` is the
+# canonical migration history.
+
+# ---------- Gauges ----------
+
+[[query]]
+id = "gauge_bare"
+mode = "shadow"
+promql = "memory_total"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Bare gauge selector — no rate function, just emit the points."
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(memory_total AS DOUBLE) AS v
+FROM read_parquet('{fixture_path}')
+WHERE memory_total IS NOT NULL
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+# Static labels added to every emitted series — mirrors PromQL's implicit
+# `__name__` label on bare selectors.
+output_metric = { __name__ = "memory_total" }
+
+[[query]]
+id = "gauge_negative"
+mode = "shadow"
+promql = "temperature_offset"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Gauge series that crosses zero (i64 column path)."
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(temperature_offset AS DOUBLE) AS v
+FROM read_parquet('{fixture_path}')
+WHERE temperature_offset IS NOT NULL
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "temperature_offset" }
+
+[[query]]
+id = "gauge_avg_over_time"
+mode = "shadow"
+promql = "avg_over_time(queue_depth[5m])"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Time-aggregation function family — windowed mean of a gauge."
+# 1Hz sampling → 300 rows ≈ 5 minutes. ROWS BETWEEN avoids the RANGE
+# unit-mismatch problem (timestamps are ns, the [5m] window is seconds).
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9,
+       AVG(CAST(queue_depth AS DOUBLE)) OVER (
+         ORDER BY timestamp
+         ROWS BETWEEN 300 PRECEDING AND CURRENT ROW
+       )
+FROM read_parquet('{fixture_path}')
+WHERE queue_depth IS NOT NULL
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "queue_depth" }
+
+# ---------- Counters ----------
+
+[[query]]
+id = "counter_irate_basic"
+mode = "shadow"
+promql = "irate(requests[5m])"
+fixture = "counter_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Baseline irate — instantaneous rate from the last two samples in the window."
+# `irate_1s` is `c - LAG(c) OVER (...)`. The first row produces NULL (no LAG)
+# which the WHERE clause filters, matching PromQL's `start = 1.0` (skipping t=0).
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9,
+       CAST(irate_1s(requests, timestamp) AS DOUBLE) AS v
+FROM read_parquet('{fixture_path}')
+QUALIFY v IS NOT NULL
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "requests" }
+
+[[query]]
+id = "counter_rate_basic"
+mode = "shadow"
+promql = "rate(requests[5m])"
+fixture = "counter_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Baseline rate — average over the window."
+# Windowed monotonic rate: (current - first_in_window) / span_in_seconds.
+# Correct for monotonic counters; for reset-prone counters use the
+# CTE pattern in `counter_rate_reset`.
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       (CAST(requests AS DOUBLE) - FIRST_VALUE(CAST(requests AS DOUBLE)) OVER w)
+       / NULLIF(
+           CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
+           0
+       ) AS v
+FROM read_parquet('{fixture_path}')
+WHERE requests IS NOT NULL
+WINDOW w AS (ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
+QUALIFY v IS NOT NULL
+ORDER BY t
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "requests" }
+
+[[query]]
+id = "counter_irate_reset"
+mode = "shadow"
+promql = "irate(requests[5m])"
+fixture = "counter_reset"
+start = 1001.0
+end = 1004.0
+step = 1.0
+description = "irate over a counter that resets at t=1003 — exercises reset semantics."
+# `irate_1s` is now reset-aware (post-reset value as the increment).
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       irate_1s(requests, timestamp) AS v
+FROM read_parquet('{fixture_path}')
+WHERE requests IS NOT NULL
+QUALIFY v IS NOT NULL
+ORDER BY t
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "requests" }
+
+[[query]]
+id = "counter_rate_reset"
+mode = "shadow"
+promql = "rate(requests[5m])"
+fixture = "counter_reset"
+start = 1001.0
+end = 1004.0
+step = 1.0
+description = "rate over a counter that resets at t=1003 (post-reset value as increase)."
+# Reset-aware rate: per-pair PromQL increments computed in a CTE (so the
+# `LAG` isn't nested under another window function), then summed and
+# normalised over a 5-minute row window. Equivalent to PromQL's reset-aware
+# `rate()` semantics from `streaming/rate.rs:60-68`.
+sql = """
+WITH incr AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(requests) OVER (ORDER BY timestamp) IS NULL THEN NULL
+               WHEN requests >= LAG(requests) OVER (ORDER BY timestamp)
+                   THEN CAST(requests - LAG(requests) OVER (ORDER BY timestamp) AS DOUBLE)
+               ELSE CAST(requests AS DOUBLE)
+           END AS inc
+    FROM read_parquet('{fixture_path}')
+    WHERE requests IS NOT NULL
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(inc) OVER w
+       / NULLIF(
+           CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
+           0
+       ) AS v
+FROM incr
+WINDOW w AS (ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
+QUALIFY v IS NOT NULL
+ORDER BY t
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "requests" }
+
+[[query]]
+id = "counter_sum_by_id"
+mode = "shadow"
+promql = "sum by (id) (irate(cpu_usage[5m]))"
+fixture = "counter_multi_label"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Sum aggregation grouped by label — Rezolus per-CPU dashboard pattern."
+# Uses the auto-generated `cpu_usage(timestamp, value, id, state)` view.
+# Per-series irate is computed with `PARTITION BY id, state` so LAG only
+# walks within a single labeled series.
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id, state,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_usage
+    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+# `sum by (id)` drops `__name__` (PromQL aggregation rule).
+output_metric = {}
+
+[[query]]
+id = "counter_sum_by_id_filtered"
+mode = "shadow"
+promql = "sum by (id) (irate(cpu_usage{state=\"user\"}[5m]))"
+fixture = "counter_multi_label"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Label-filtered selector inside an aggregation — Rezolus 'user CPU per id' shape."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id, state,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_usage
+    WHERE state = 'user'
+    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+
+[[query]]
+id = "counter_total_sum"
+mode = "shadow"
+promql = "sum(irate(cpu_usage[5m]))"
+fixture = "counter_multi_label"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Top-level sum across all labels — Rezolus 'total CPU' shape."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id, state,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_usage
+    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+
+[[query]]
+id = "counter_ratio"
+mode = "shadow"
+promql = "sum(irate(cpu_usage{state=\"user\"}[5m])) / sum(irate(cpu_usage[5m]))"
+fixture = "counter_multi_label"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Counter ratio shape (e.g. user-fraction-of-total)."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id, state,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_usage
+    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+),
+sums AS (
+    SELECT timestamp,
+           SUM(CASE WHEN state = 'user' THEN rate ELSE 0 END) AS user_rate,
+           SUM(rate) AS total_rate
+    FROM per_series
+    WHERE rate IS NOT NULL
+    GROUP BY timestamp
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       user_rate / NULLIF(total_rate, 0) AS v
+FROM sums
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+
+# ---------- Histograms ----------
+
+[[query]]
+id = "histogram_quantile_p50"
+mode = "shadow"
+promql = "histogram_quantile(0.5, request_latency)"
+fixture = "histogram_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Single-quantile extraction over a normal histogram."
+# `request_latency(timestamp, buckets, p)` view exposes the histogram column
+# plus the per-column `grouping_power` as a literal. The self-join produces
+# the prior-row buckets without using LAG (LAG-on-LIST<UBIGINT> hits a known
+# duckdb-rs bug at chunk boundaries — see `metriken-query-sql/src/udf.rs`).
+sql = """
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.5, a.p) AS DOUBLE) AS v
+FROM request_latency a
+JOIN request_latency b
+  ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "request_latency", quantile = "0.5" }
+
+[[query]]
+id = "histogram_quantile_p99"
+mode = "shadow"
+promql = "histogram_quantile(0.99, request_latency)"
+fixture = "histogram_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "p99 over the same histogram."
+sql = """
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.99, a.p) AS DOUBLE) AS v
+FROM request_latency a
+JOIN request_latency b
+  ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "request_latency", quantile = "0.99" }
+
+[[query]]
+id = "histogram_quantiles_rezolus_ext"
+mode = "shadow"
+promql = "histogram_quantiles([0.5, 0.9, 0.99], request_latency)"
+fixture = "histogram_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Rezolus extension — multi-quantile in a single walk."
+# Use `h2_quantiles` to compute all three quantiles in a single walk
+# (the rezolus extension; matches metriken-query's `histogram_quantiles`).
+# The list output is array-indexed via CROSS JOIN to produce one row per
+# `(timestamp, quantile)`. Avoids multiple-h2_quantile-on-the-same-list
+# patterns that hit the LAG-on-list duckdb-rs chunk-boundary bug.
+sql = """
+WITH walked AS (
+    SELECT a.timestamp,
+           h2_quantiles(
+               h2_delta(a.buckets, b.buckets),
+               [0.5, 0.9, 0.99]::DOUBLE[],
+               a.p
+           ) AS qs
+    FROM request_latency a
+    JOIN request_latency b
+      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(qs[q.idx] AS DOUBLE) AS v,
+       q.label AS quantile
+FROM walked
+CROSS JOIN (VALUES (1, '0.5'), (2, '0.9'), (3, '0.99')) AS q(idx, label)
+ORDER BY quantile, t
+"""
+value_columns = ["v"]
+label_columns = ["quantile"]
+output_metric = { __name__ = "request_latency" }
+
+[[query]]
+id = "histogram_heatmap"
+mode = "off"
+promql = "histogram_heatmap(request_latency)"
+fixture = "histogram_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Rezolus extension — 2-D heatmap output for visualization."
+
+[[query]]
+id = "histogram_quantile_with_reset"
+mode = "shadow"
+promql = "histogram_quantile(0.5, request_latency)"
+fixture = "histogram_reset"
+start = 1.0
+end = 4.0
+step = 1.0
+description = "Quantile across a histogram-reset boundary (delta_to_32_or_empty path)."
+# h2_delta is element-wise saturating sub: when the cumulative drops, every
+# bucket goes to 0 → empty histogram → h2_quantile returns NULL. Same
+# observable behaviour as PromQL's `delta_to_32_or_empty` empty-fallback,
+# so the timestamp at the reset is dropped from the output.
+sql = """
+SELECT t, v FROM (
+    SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+           CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.5, a.p) AS DOUBLE) AS v
+    FROM request_latency a
+    JOIN request_latency b
+      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+)
+WHERE v IS NOT NULL
+ORDER BY t
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "request_latency", quantile = "0.5" }
+
+[[query]]
+id = "histogram_quantile_empty_period"
+mode = "shadow"
+promql = "histogram_quantile(0.5, request_latency)"
+fixture = "histogram_empty_period"
+start = 1.0
+end = 3.0
+step = 1.0
+description = "Quantile over a series with a no-events period in the middle."
+sql = """
+SELECT t, v FROM (
+    SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+           CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.5, a.p) AS DOUBLE) AS v
+    FROM request_latency a
+    JOIN request_latency b
+      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+)
+WHERE v IS NOT NULL
+ORDER BY t
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "request_latency", quantile = "0.5" }
+
+# ---------- Rezolus dashboard shapes ----------
+
+[[query]]
+id = "rezolus_cpu_busy_pct"
+mode = "shadow"
+promql = "sum(irate(cpu_usage[5m])) / 2 / 1000000000"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Rezolus CPU busy-% pattern (cpu_cores=2 hard-coded for the fixture)."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id, state,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_usage
+    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / 2 / 1000000000 AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+
+[[query]]
+id = "rezolus_cpu_user_per_id"
+mode = "shadow"
+promql = "sum by (id) (irate(cpu_usage{state=\"user\"}[5m])) / 1000000000"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Rezolus per-CPU user-time fraction (matches dashboard/cpu.rs:45)."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id, state,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_usage
+    WHERE state = 'user'
+    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / 1000000000 AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+
+[[query]]
+id = "rezolus_syscall_p99"
+mode = "shadow"
+promql = "histogram_quantile(0.99, syscall_latency)"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Rezolus syscall_latency p99 — full Rezolus-shape histogram path."
+sql = """
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(h2_quantile(h2_delta(a.buckets, b.buckets), 0.99, a.p) AS DOUBLE) AS v
+FROM syscall_latency a
+JOIN syscall_latency b
+  ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "syscall_latency", quantile = "0.99" }

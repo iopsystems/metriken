@@ -1,0 +1,10 @@
+[package]
+name = "metriken-query-fixtures"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Synthetic Parquet fixtures for the metriken-query → DuckDB migration regression harness"
+
+[dependencies]
+histogram.workspace = true
+metriken-exposition = { path = "../metriken-exposition", default-features = false, features = ["parquet-conversion"] }

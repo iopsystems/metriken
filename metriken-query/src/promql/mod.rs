@@ -81,8 +81,25 @@ pub enum QueryResult {
 /// Generic over the TSDB handle type. The default (`Arc<Tsdb>`) covers the
 /// common owned case (MCP, tests, file-backed viewer). Pass `&Tsdb` (or any
 /// other `Deref<Target = Tsdb>`) for zero-copy borrowed access.
+///
+/// Optionally hosts a [`DispatchConfig`] to route incoming queries through
+/// the SQL twin per the catalogue's `mode`. Without one, behavior is
+/// unchanged from the pre-dispatcher engine.
 pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
     tsdb: T,
+    dispatch: Option<DispatchConfig>,
+}
+
+/// Routing configuration for a `QueryEngine`. Built once and shared across
+/// every query the engine serves. See `metriken_query::dispatch` for the
+/// `Catalogue` / `SqlBackend` / `DispatchObserver` types.
+pub struct DispatchConfig {
+    pub catalogue: crate::dispatch::Catalogue,
+    pub backend: Arc<dyn crate::dispatch::SqlBackend>,
+    pub observer: Arc<dyn crate::dispatch::DispatchObserver>,
+    /// The parquet path (or glob) the SQL backend reads from. Substituted
+    /// into the `{fixture_path}` placeholder in catalogue SQL templates.
+    pub data_source: String,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -169,7 +186,17 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
 
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     pub fn new(tsdb: T) -> Self {
-        Self { tsdb }
+        Self {
+            tsdb,
+            dispatch: None,
+        }
+    }
+
+    /// Attach (or replace) a dispatcher that routes queries through the
+    /// catalogue. Without one, every query goes through the PromQL path.
+    pub fn with_dispatch(mut self, config: DispatchConfig) -> Self {
+        self.dispatch = Some(config);
+        self
     }
 
     /// Get a reference to the underlying TSDB
@@ -404,6 +431,90 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     }
 
     pub fn query_range(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+        step: f64,
+    ) -> Result<QueryResult, QueryError> {
+        // Catalogue-driven dispatch — only when a `DispatchConfig` was
+        // attached via `with_dispatch`. The pre-dispatcher path is just
+        // `query_range_promql` directly.
+        if let Some(dispatch) = &self.dispatch {
+            if let Some(entry) = dispatch.catalogue.lookup(query_str) {
+                use crate::dispatch::{canonicalise, Diff, Mode};
+                match entry.mode {
+                    Mode::Off => self.query_range_promql(query_str, start, end, step),
+                    Mode::Shadow => {
+                        let promql = self.query_range_promql(query_str, start, end, step)?;
+                        // Best-effort SQL: a backend error in shadow mode is
+                        // logged via the observer (as a "diff against an
+                        // error placeholder") but does not fail the request.
+                        match dispatch
+                            .backend
+                            .run(entry, &dispatch.data_source, start, end, step) {
+                            Ok(sql) => {
+                                let p = canonicalise(&promql);
+                                let s = canonicalise(&sql);
+                                if p != s {
+                                    dispatch.observer.on_diff(
+                                        entry,
+                                        &Diff { promql: p, sql: s },
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                let p = canonicalise(&promql);
+                                let s = serde_json::json!({ "sql_error": err.to_string() });
+                                dispatch.observer.on_diff(
+                                    entry,
+                                    &Diff { promql: p, sql: s },
+                                );
+                            }
+                        }
+                        Ok(promql)
+                    }
+                    Mode::Strict => {
+                        let promql = self.query_range_promql(query_str, start, end, step)?;
+                        let sql = dispatch
+                            .backend
+                            .run(entry, &dispatch.data_source, start, end, step).map_err(
+                            |e| QueryError::EvaluationError(format!("strict-mode SQL: {e}")),
+                        )?;
+                        let p = canonicalise(&promql);
+                        let s = canonicalise(&sql);
+                        if p != s {
+                            dispatch.observer.on_diff(
+                                entry,
+                                &Diff {
+                                    promql: p,
+                                    sql: s,
+                                },
+                            );
+                            return Err(QueryError::EvaluationError(format!(
+                                "strict-mode divergence on {}: PromQL and SQL outputs differ",
+                                entry.id
+                            )));
+                        }
+                        Ok(promql)
+                    }
+                    Mode::Primary => dispatch
+                        .backend
+                        .run(entry, &dispatch.data_source, start, end, step)
+                        .map_err(|e| QueryError::EvaluationError(e.to_string())),
+                }
+            } else {
+                self.query_range_promql(query_str, start, end, step)
+            }
+        } else {
+            self.query_range_promql(query_str, start, end, step)
+        }
+    }
+
+    /// Direct PromQL evaluation, bypassing the dispatcher. Useful inside
+    /// the dispatcher itself (for shadow-mode comparison) and as the
+    /// fallback path when no dispatcher is attached.
+    pub fn query_range_promql(
         &self,
         query_str: &str,
         start: f64,

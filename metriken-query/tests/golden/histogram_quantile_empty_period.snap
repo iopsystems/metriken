@@ -1,0 +1,25 @@
+---
+source: metriken-query/tests/golden.rs
+assertion_line: 132
+---
+{
+  "result": [
+    {
+      "metric": {
+        "__name__": "request_latency",
+        "quantile": "0.5"
+      },
+      "values": [
+        [
+          1.0,
+          103.0
+        ],
+        [
+          3.0,
+          103.0
+        ]
+      ]
+    }
+  ],
+  "resultType": "matrix"
+}

@@ -21,9 +21,15 @@ promql-parser = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "2"
+toml = "0.8"
 
 [dev-dependencies]
+duckdb = { version = "1.1.1", features = ["bundled"] }
+insta = { version = "1", features = ["json"] }
+metriken-query-fixtures = { path = "../metriken-query-fixtures" }
+metriken-query-sql = { path = "../metriken-query-sql" }
 tempfile.workspace = true
+toml = "0.8"
 
 [features]
 default = ["ingest", "lz4"]

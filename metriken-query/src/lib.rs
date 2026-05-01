@@ -22,9 +22,17 @@
 //! let result = engine.query_range("rate(http_requests[5m])", start, end, step);
 //! ```
 
+pub mod dispatch;
 pub mod promql;
 pub mod tsdb;
 
 pub use bytes::Bytes;
-pub use promql::{QueryEngine, QueryError, QueryResult};
+pub use dispatch::{
+    canonicalise, Catalogue, CatalogueEntry, Diff, DispatchObserver, Mode, NoopObserver,
+    SqlBackend, SqlError,
+};
+pub use promql::{
+    DispatchConfig, HistogramHeatmapResult, MatrixSample, QueryEngine, QueryError, QueryResult,
+    Sample,
+};
 pub use tsdb::Tsdb;

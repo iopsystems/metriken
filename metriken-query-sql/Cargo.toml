@@ -1,0 +1,24 @@
+[package]
+name = "metriken-query-sql"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+    "Yao Yue <yao@iop.systems>",
+    "Yuri Vishnevsky <yuri@iop.systems>",
+]
+license = "MIT OR Apache-2.0"
+description = "DuckDB-backed SQL query engine + H2 histogram UDFs for metriken parquet files"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
+publish = false
+
+[dependencies]
+arrow.workspace = true
+bytes = "1"
+duckdb = { version = "1.1.1", features = ["bundled", "vscalar"] }
+metriken-query = { path = "../metriken-query", default-features = false }
+parquet = { workspace = true, default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
+
+[dev-dependencies]
+histogram.workspace = true

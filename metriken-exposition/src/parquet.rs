@@ -299,20 +299,25 @@ impl ParquetSchema {
             histograms.push(histogram);
         }
 
-        // Merge metadata and convert to vector format
+        // Merge metadata and convert to vector format. Sort by key so the
+        // file-level kv list serializes in a deterministic order — the
+        // backing HashMap's iteration is randomized per process, which would
+        // otherwise make Parquet output bytes differ across runs even when
+        // the inputs are identical.
         self.metadata.extend(metadata.unwrap_or_default());
         let schema_metadata: Option<Vec<KeyValue>> = if self.metadata.is_empty() {
             None
         } else {
-            Some(
-                self.metadata
-                    .into_iter()
-                    .map(|(key, value)| KeyValue {
-                        key,
-                        value: Some(value),
-                    })
-                    .collect(),
-            )
+            let mut kvs: Vec<KeyValue> = self
+                .metadata
+                .into_iter()
+                .map(|(key, value)| KeyValue {
+                    key,
+                    value: Some(value),
+                })
+                .collect();
+            kvs.sort_by(|a, b| a.key.cmp(&b.key));
+            Some(kvs)
         };
 
         let schema = Arc::new(Schema::new(fields));
