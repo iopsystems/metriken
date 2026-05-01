@@ -79,3 +79,57 @@ impl<'a> Iterator for CounterRate<'a> {
         None
     }
 }
+
+/// Pair-wise rate producer over a counter sample slice.
+///
+/// Distinct from [`CounterRate`] (windowed step-grid average): this
+/// emits one `(ts_cur, rate)` per consecutive sample pair, anchored
+/// at the second sample's timestamp. Mirrors the eager
+/// `CounterSeries::rate()` method that produces an `UntypedSeries`
+/// of pair-wise rates — used as the upstream for `deriv()` over a
+/// counter (the 2nd-derivative case).
+///
+/// Holds two cursor positions; no buffering. Skips pairs where the
+/// duration is non-positive (matching the eager skip-on-zero-dur).
+pub struct CounterPairwiseRate<'a> {
+    samples: &'a [(u64, u64)],
+    cursor: usize,
+    end_ns: u64,
+}
+
+impl<'a> CounterPairwiseRate<'a> {
+    pub fn new(samples: &'a [(u64, u64)], end_ns: u64) -> Self {
+        Self {
+            samples,
+            cursor: 0,
+            end_ns,
+        }
+    }
+}
+
+impl<'a> Iterator for CounterPairwiseRate<'a> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        while self.cursor + 1 < self.samples.len() {
+            let i = self.cursor;
+            self.cursor += 1;
+            let (ts_prev, v_prev) = self.samples[i];
+            let (ts_cur, v_cur) = self.samples[i + 1];
+            if ts_cur > self.end_ns {
+                return None;
+            }
+            let delta = if v_cur >= v_prev {
+                (v_cur - v_prev) as f64
+            } else {
+                v_cur as f64
+            };
+            let dur_s = (ts_cur - ts_prev) as f64 / 1e9;
+            if dur_s <= 0.0 {
+                continue;
+            }
+            return Some((ts_cur, delta / dur_s));
+        }
+        None
+    }
+}

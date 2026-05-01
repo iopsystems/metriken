@@ -3,7 +3,6 @@ use std::ops::Range;
 
 use ::histogram::{
     Config, CumulativeROHistogram, CumulativeROHistogram32, CumulativeROHistogram32Ref, Histogram,
-    Quantile, QuantilesResult,
 };
 
 use super::*;
@@ -209,37 +208,6 @@ impl HistogramSeries {
             Some((self.timestamps[i], r))
         })
     }
-
-    pub fn percentiles(
-        &self,
-        percentiles: &[f64],
-        stride_ns: Option<u64>,
-    ) -> Option<Vec<UntypedSeries>> {
-        if self.is_empty() {
-            return None;
-        }
-
-        let mut result = vec![UntypedSeries::default(); percentiles.len()];
-
-        for (time, delta) in self.iter_strided(stride_ns) {
-            let q_result: Result<Option<QuantilesResult>, _> = match &delta {
-                DeltaSnapshot::Borrowed(r) => r.quantiles(percentiles),
-                DeltaSnapshot::Owned(o) => o.quantiles(percentiles),
-            };
-            if let Ok(Some(q_results)) = q_result {
-                for (id, q) in percentiles.iter().enumerate() {
-                    if let Ok(quantile) = Quantile::new(*q) {
-                        if let Some(bucket) = q_results.get(&quantile) {
-                            result[id].insert(time, bucket.end() as f64);
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(result)
-    }
-
     /// Returns bucket data suitable for rendering as a heatmap.
     /// Y-axis is bucket index (latency range), X-axis is time, color is count.
     pub fn heatmap(&self, stride_ns: Option<u64>) -> Option<HistogramHeatmapData> {

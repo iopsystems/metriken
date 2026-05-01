@@ -37,6 +37,7 @@ use crate::tsdb::{CounterCollection, Labels};
 
 mod aggregate;
 mod binary;
+mod deriv;
 pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod histogram;
@@ -48,12 +49,13 @@ mod tests;
 
 pub use aggregate::{aggregate, sum_by, AggOp, GroupBy, MergeReduce};
 pub use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec, ScalarBroadcast};
+pub use deriv::StreamingDeriv;
 pub use gauge::{
     gauges_avg_over_time, gauges_deriv, gauges_idelta, gauges_step_grid, GaugeAvgOverTime,
     GaugeDeriv, GaugeIdelta, GaugeStepGrid,
 };
 pub use irate::CounterIrate;
-pub use rate::CounterRate;
+pub use rate::{CounterPairwiseRate, CounterRate};
 
 /// A single sample emitted through a streaming pipeline.
 ///

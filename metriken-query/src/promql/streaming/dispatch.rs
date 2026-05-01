@@ -30,7 +30,7 @@ use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
     aggregate, collect_to_matrix, gauges_avg_over_time, gauges_deriv, gauges_idelta,
     gauges_step_grid, irate_counters, matrix_matrix_op, matrix_scalar_op, rate_counters, AggOp,
-    BinOp, GroupBy, MatchSpec, SeriesSet,
+    BinOp, CounterPairwiseRate, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{QueryError, QueryResult};
 use crate::tsdb::Tsdb;
@@ -354,21 +354,39 @@ where
             }))
         }
         "deriv" => {
-            // Gauge case only. The eager engine also handles
-            // `deriv(counter[range])` by first computing the
-            // pair-wise rate (different from step-grid `rate`) and
-            // then deriving — that requires a different producer
-            // shape, deferred to a follow-up. Counters fall through
-            // to the eager path.
-            let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-                return Ok(None);
+            // Gauge: random-access slope over the source slice
+            // (cheap, see `gauges_deriv`). Counter (2nd-derivative
+            // case): chain a pair-wise rate producer into the
+            // generic streaming deriv consumer.
+            //
+            // Both paths relabel `__name__` to literally "deriv"
+            // rather than preserving the source metric name —
+            // matching the eager engine's historical behaviour so
+            // JSON output is byte-for-byte identical.
+            if let Some(collection) = ctx.tsdb.gauges_ref(metric_name) {
+                let series =
+                    gauges_deriv(collection, &filter, ctx.start_ns, ctx.end_ns, ctx.step_ns);
+                return Ok(Some(Built::Series {
+                    series,
+                    metric_name: Some("deriv"),
+                    metric_name_for_error: Some(metric_name.to_string()),
+                }));
+            }
+            let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
+                return Err(QueryError::MetricNotFound(metric_name.to_string()));
             };
-            let series = gauges_deriv(collection, &filter, ctx.start_ns, ctx.end_ns, ctx.step_ns);
-            // The eager engine relabels `__name__` to literally
-            // "deriv" rather than preserving the source metric
-            // name; mirror that so JSON output matches byte-for-byte.
+            let mut out: SeriesSet<'_> = Vec::new();
+            for (labels, series) in collection.iter() {
+                if !filter.inner.is_empty() && !labels.matches(&filter) {
+                    continue;
+                }
+                let rate_iter = CounterPairwiseRate::new(series.samples(), ctx.end_ns);
+                let deriv_iter =
+                    StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns);
+                out.push(LabeledSeries::new(labels.clone(), deriv_iter));
+            }
             Ok(Some(Built::Series {
-                series,
+                series: out,
                 metric_name: Some("deriv"),
                 metric_name_for_error: Some(metric_name.to_string()),
             }))

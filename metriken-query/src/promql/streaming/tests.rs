@@ -95,10 +95,10 @@ fn streaming_irate_matches_eager_irate() {
 
     // Streaming.
     let collection = tsdb
-        .counters("cgroup_cpu_usage", Labels::default())
+        .counters_ref("cgroup_cpu_usage")
         .expect("collection present");
     let stream = irate_counters(
-        &collection,
+        collection,
         &Labels::default(),
         1_000_000_000_000, // start_ns
         1_003_000_000_000, // end_ns
@@ -145,10 +145,10 @@ fn streaming_sum_by_matches_eager_sum_by() {
     let eager = into_sorted(eager);
 
     let collection = tsdb
-        .counters("cgroup_cpu_usage", Labels::default())
+        .counters_ref("cgroup_cpu_usage")
         .expect("collection present");
     let irate_stream = irate_counters(
-        &collection,
+        collection,
         &Labels::default(),
         1_000_000_000_000,
         1_003_000_000_000,

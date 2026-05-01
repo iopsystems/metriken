@@ -34,36 +34,4 @@ impl GaugeCollection {
 
         min_time.zip(max_time)
     }
-
-    /// Return the subset of series whose labels match `labels`.  Clones
-    /// the matching series; for hot paths that combine filter + aggregate
-    /// see [`filtered_sum`].
-    pub fn filter(&self, labels: &Labels) -> Self {
-        let mut result = Self::default();
-
-        for (k, v) in self.inner.iter() {
-            if k.matches(labels) {
-                result.inner.insert(k.clone(), v.clone());
-            }
-        }
-
-        result
-    }
-
-    /// Efficiently compute sum only for series matching the filter
-    /// This avoids cloning the time series data
-    pub fn filtered_sum(&self, filter: &Labels) -> UntypedSeries {
-        let mut result = UntypedSeries::default();
-
-        for (labels, series) in self.inner.iter() {
-            if labels.matches(filter) {
-                let untyped = series.untyped();
-                for (time, value) in untyped.iter() {
-                    result.add_at(*time, *value);
-                }
-            }
-        }
-
-        result
-    }
 }

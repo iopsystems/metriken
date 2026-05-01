@@ -8,7 +8,7 @@ use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tsdb::{GaugeSeries, Labels, Tsdb, UntypedCollection, UntypedSeries};
+use crate::tsdb::{Labels, Tsdb};
 
 #[cfg(feature = "http")]
 mod api;
@@ -129,6 +129,26 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Collapse a matrix result into a vector by taking the latest
+/// point of each series. Used by `query()` to convert a degenerate
+/// range query (`start = end = time`) into instant-query shape.
+/// Non-matrix results pass through unchanged.
+fn matrix_to_vector(result: QueryResult) -> QueryResult {
+    let QueryResult::Matrix { result: samples } = result else {
+        return result;
+    };
+    let vector: Vec<Sample> = samples
+        .into_iter()
+        .filter_map(|s| {
+            s.values.last().copied().map(|value| Sample {
+                metric: s.metric,
+                value,
+            })
+        })
+        .collect();
+    QueryResult::Vector { result: vector }
+}
+
 /// Extract label filter from parsed PromQL matchers, skipping `__name__`.
 pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     let mut filter_labels = Labels::default();
@@ -220,141 +240,29 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             })
     }
 
-    /// Execute a simple query - for now, just basic metric access and irate()
-    /// function
+    /// Execute an instant query — evaluate `query_str` at a single
+    /// timestamp. Mirrors Prometheus' `/api/v1/query` semantics.
+    ///
+    /// Internally this is a degenerate range query (`start = end =
+    /// time`, `step = sampling_interval`) collapsed into a vector by
+    /// taking the latest point of each result series. That gives us
+    /// the full PromQL surface — every operator the streaming
+    /// pipeline supports plus the eager backstops (`scalar`, `vector`,
+    /// `deriv` on counters, `histogram_heatmap`) — for free.
+    ///
+    /// `time` defaults to the latest timestamp in the TSDB.
     pub fn query(&self, query_str: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        // For now, handle very simple cases manually
-        // TODO: Replace with proper PromQL parser once we fix the API issues
-
-        if query_str.starts_with("irate(") && query_str.ends_with(")") {
-            self.handle_simple_rate(query_str, time)
-        } else if query_str.starts_with("sum(irate(") && query_str.ends_with("))") {
-            self.handle_sum_rate(query_str, time)
-        } else {
-            self.handle_simple_metric(query_str, time)
-        }
-    }
-
-    /// Handle simple irate() queries like irate(cpu_cycles[5m]) or
-    /// irate(network_bytes{direction="transmit"}[5m])
-    fn handle_simple_rate(
-        &self,
-        query: &str,
-        time: Option<f64>,
-    ) -> Result<QueryResult, QueryError> {
-        // Extract metric name from irate(metric_name[duration])
-        let inner = &query[6..query.len() - 1]; // Remove "irate(" and ")"
-
-        if let Some(bracket_pos) = inner.find('[') {
-            let metric_part = inner[..bracket_pos].trim();
-
-            // Parse metric name and labels
-            let (metric_name, labels) = self.parse_metric_selector(metric_part)?;
-
-            if let Some(collection) = self.tsdb.counters(&metric_name, labels.clone()) {
-                let rate_collection = collection.filtered_rate(&labels);
-
-                // If no specific labels were provided, return all series separately
-                // Otherwise, sum matching series
-                if labels.inner.is_empty() {
-                    // Return all series separately
-                    let mut result_samples = Vec::new();
-
-                    for (series_labels, series) in rate_collection.iter() {
-                        if let Some((timestamp, value)) = self.get_value_at_time(series, time) {
-                            let mut metric_labels = HashMap::new();
-                            metric_labels.insert("__name__".to_string(), metric_name.to_string());
-
-                            // Add all labels from this series
-                            for (key, value) in series_labels.inner.iter() {
-                                metric_labels.insert(key.clone(), value.clone());
-                            }
-
-                            result_samples.push(Sample {
-                                metric: metric_labels,
-                                value: (timestamp, value),
-                            });
-                        }
-                    }
-
-                    if !result_samples.is_empty() {
-                        return Ok(QueryResult::Vector {
-                            result: result_samples,
-                        });
-                    }
-                } else {
-                    // Labels specified, sum matching series
-                    let sum_series = rate_collection.sum();
-                    if let Some((timestamp, value)) = self.get_value_at_time(&sum_series, time) {
-                        let mut metric_labels = HashMap::new();
-                        metric_labels.insert("__name__".to_string(), metric_name.to_string());
-
-                        // Add the labels from the query to the result
-                        for (key, value) in labels.inner.iter() {
-                            metric_labels.insert(key.clone(), value.clone());
-                        }
-
-                        return Ok(QueryResult::Vector {
-                            result: vec![Sample {
-                                metric: metric_labels,
-                                value: (timestamp, value),
-                            }],
-                        });
-                    }
-                }
-            }
-        }
-
-        Err(QueryError::MetricNotFound(format!(
-            "Could not find metric for query: {query}"
-        )))
-    }
-
-    /// Handle sum(irate()) queries like sum(irate(cpu_cycles[5m]))
-    fn handle_sum_rate(&self, query: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        // Extract the irate() part
-        let rate_part = &query[4..query.len() - 1]; // Remove "sum(" and ")"
-
-        // First get the rate results
-        let rate_result = self.handle_simple_rate(rate_part, time)?;
-
-        // Sum all the series together
-        if let QueryResult::Vector { result: samples } = rate_result {
-            if samples.is_empty() {
-                return Err(QueryError::MetricNotFound(
-                    "No data found for sum(irate()) query".to_string(),
-                ));
-            }
-
-            // For instant queries, sum all values at the same timestamp
-            let timestamp = samples[0].value.0;
-            let summed_value: f64 = samples.iter().map(|s| s.value.1).sum();
-
-            // Extract metric name from the first sample
-            let metric_name = samples[0]
-                .metric
-                .get("__name__")
-                .cloned()
-                .unwrap_or_else(|| "sum".to_string());
-
-            let mut metric_labels = HashMap::new();
-            metric_labels.insert("__name__".to_string(), metric_name);
-
-            return Ok(QueryResult::Vector {
-                result: vec![Sample {
-                    metric: metric_labels,
-                    value: (timestamp, summed_value),
-                }],
-            });
-        }
-
-        Err(QueryError::MetricNotFound(format!(
-            "Could not process sum(irate()) query: {query}"
-        )))
+        let target = time.unwrap_or_else(|| self.get_time_range().1);
+        let step = self.tsdb.interval().max(1.0);
+        let result = self.query_range(query_str, target, target, step)?;
+        Ok(matrix_to_vector(result))
     }
 
     /// Parse a metric selector like
-    /// "metric_name{label1=\"value1\",label2=\"value2\"}"
+    /// `metric_name{label1="value1",label2="value2"}`. Used by the
+    /// `histogram_quantiles` / `histogram_heatmap` pre-parsers in
+    /// `query_range`, which take their argument as a query string
+    /// rather than going through the standard PromQL AST.
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
         if let Some(brace_pos) = selector.find('{') {
             let metric_name = selector[..brace_pos].trim().to_string();
@@ -397,72 +305,16 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             }
             Ok((metric_name, labels))
         } else {
-            // Simple metric name
             Ok((selector.to_string(), Labels::default()))
         }
     }
 
-    /// Get a value at a specific time from a time series
-    fn get_value_at_time(&self, series: &UntypedSeries, time: Option<f64>) -> Option<(f64, f64)> {
-        if series.is_empty() {
-            return None;
-        }
-
-        let target_ns = if let Some(t) = time {
-            (t * 1e9) as u64
-        } else {
-            // Use the latest value
-            series.last()?.0
-        };
-
-        // Find the closest value at or before target, falling back to the
-        // first sample if target precedes the series.
-        if let Some((ts, val)) = series.last_at_or_before(target_ns) {
-            Some((ts as f64 / 1e9, val))
-        } else if let Some((ts, val)) = series.first() {
-            Some((ts as f64 / 1e9, val))
-        } else {
-            None
-        }
-    }
-
-    /// Handle simple metric queries like cpu_cores or cpu_cores{cpu="0"}
-    fn handle_simple_metric(
-        &self,
-        query: &str,
-        time: Option<f64>,
-    ) -> Result<QueryResult, QueryError> {
-        // Parse metric name and labels
-        let (metric_name, labels) = self.parse_metric_selector(query)?;
-
-        // Try gauges first
-        if let Some(collection) = self.tsdb.gauges(&metric_name, labels.clone()) {
-            let sum_series = collection.filtered_sum(&labels);
-            if let Some((timestamp, value)) = self.get_value_at_time(&sum_series, time) {
-                let mut metric_labels = HashMap::new();
-                metric_labels.insert("__name__".to_string(), metric_name.to_string());
-
-                return Ok(QueryResult::Vector {
-                    result: vec![Sample {
-                        metric: metric_labels,
-                        value: (timestamp, value),
-                    }],
-                });
-            }
-        }
-
-        // Counter instant-vector queries are not yet supported here — the
-        // PromQL semantics require `rate()` / `irate()` to be meaningful, and
-        // those go through `handle_function_call`.  Falling through to
-        // MetricNotFound matches what other unsupported instant-vector cases
-        // do.
-        Err(QueryError::MetricNotFound(format!(
-            "Metric not found: {metric_name}"
-        )))
-    }
-
-    /// Range queries - return multiple data points over time
-    /// Handle function calls from the AST
+    /// Handle function calls from the parsed AST. Most functions are
+    /// handled by the streaming dispatcher (called first in
+    /// `evaluate_expr`); the branches here cover the residual cases:
+    /// `scalar`, `vector`, `deriv` on counter rates, `histogram_quantile`
+    /// (which routes through `streaming::histogram::quantiles`), plus
+    /// the `histogram_quantiles` placeholder error.
     fn handle_function_call(
         &self,
         call: &parser::Call,
@@ -471,61 +323,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         step: f64,
     ) -> Result<QueryResult, QueryError> {
         match call.func.name {
-            "deriv" => {
-                // deriv expects a gauge range vector and calculates derivative using linear
-                // regression
-                if let Some(first_arg) = call.args.args.first() {
-                    if let Expr::MatrixSelector(selector) = &**first_arg {
-                        let metric_name = selector.vs.name.as_deref().ok_or_else(|| {
-                            QueryError::ParseError("Matrix selector missing name".to_string())
-                        })?;
-
-                        let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
-
-                        // Try gauges first (deriv typically used on gauges or rates)
-                        let result_samples = if let Some(collection) =
-                            self.tsdb.gauges(metric_name, Labels::default())
-                        {
-                            self.calculate_deriv_for_collection(
-                                collection.iter(),
-                                &filter_labels,
-                                start,
-                                end,
-                                step,
-                            )?
-                        } else if let Some(collection) =
-                            self.tsdb.counters(metric_name, Labels::default())
-                        {
-                            // Also support deriv on counter rates (for 2nd derivative)
-                            let rate_collection = if filter_labels.inner.is_empty() {
-                                collection.rate()
-                            } else {
-                                collection.filtered_rate(&filter_labels)
-                            };
-                            self.calculate_deriv_for_rate_collection(
-                                &rate_collection,
-                                start,
-                                end,
-                                step,
-                            )?
-                        } else {
-                            return Err(QueryError::MetricNotFound(metric_name.to_string()));
-                        };
-
-                        Ok(QueryResult::Matrix {
-                            result: result_samples,
-                        })
-                    } else {
-                        Err(QueryError::ParseError(
-                            "deriv requires matrix selector argument".to_string(),
-                        ))
-                    }
-                } else {
-                    Err(QueryError::ParseError(
-                        "deriv requires an argument".to_string(),
-                    ))
-                }
-            }
             "histogram_quantile" => {
                 // histogram_quantile(quantile, histogram) — standard PromQL,
                 // single quantile.  Internally the same operation as
@@ -948,117 +745,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Calculate derivative using linear regression for gauge collections
-    fn calculate_deriv_for_collection<'a>(
-        &self,
-        series_iter: impl Iterator<Item = (&'a Labels, &'a GaugeSeries)>,
-        filter_labels: &Labels,
-        start: f64,
-        end: f64,
-        step: f64,
-    ) -> Result<Vec<MatrixSample>, QueryError> {
-        let mut result_samples = Vec::new();
-        let start_ns = (start * 1e9) as u64;
-        let end_ns = (end * 1e9) as u64;
-        let step_ns = (step * 1e9) as u64;
-
-        for (labels, series) in series_iter {
-            // Skip series that don't match the filter
-            if !filter_labels.inner.is_empty() && !labels.matches(filter_labels) {
-                continue;
-            }
-
-            let untyped = series.untyped();
-            let mut deriv_values = Vec::new();
-            let mut current = start_ns;
-
-            while current <= end_ns {
-                // Get points in a window for linear regression
-                let window_start = current.saturating_sub(step_ns * 2);
-                let window_end = current + step_ns;
-
-                let points: Vec<(f64, f64)> = untyped
-                    .range(window_start, window_end)
-                    .iter()
-                    .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                    .collect();
-
-                if points.len() >= 2 {
-                    // Calculate linear regression slope (derivative)
-                    let slope = self.calculate_slope(&points);
-                    deriv_values.push((current as f64 / 1e9, slope));
-                }
-                current += step_ns;
-            }
-
-            if !deriv_values.is_empty() {
-                let mut metric_labels = HashMap::new();
-                metric_labels.insert("__name__".to_string(), "deriv".to_string());
-                for (key, value) in labels.inner.iter() {
-                    metric_labels.insert(key.clone(), value.clone());
-                }
-                result_samples.push(MatrixSample {
-                    metric: metric_labels,
-                    values: deriv_values,
-                });
-            }
-        }
-
-        Ok(result_samples)
-    }
-
-    /// Calculate derivative for rate collections (2nd derivative of counters)
-    fn calculate_deriv_for_rate_collection(
-        &self,
-        rate_collection: &UntypedCollection,
-        start: f64,
-        end: f64,
-        step: f64,
-    ) -> Result<Vec<MatrixSample>, QueryError> {
-        let mut result_samples = Vec::new();
-        let start_ns = (start * 1e9) as u64;
-        let end_ns = (end * 1e9) as u64;
-        let step_ns = (step * 1e9) as u64;
-
-        for (labels, series) in rate_collection.iter() {
-            let mut deriv_values = Vec::new();
-            let mut current = start_ns;
-
-            while current <= end_ns {
-                // Get points in a window for linear regression
-                let window_start = current.saturating_sub(step_ns * 2);
-                let window_end = current + step_ns;
-
-                let points: Vec<(f64, f64)> = series
-                    .range(window_start, window_end)
-                    .iter()
-                    .map(|(ts, val)| (*ts as f64 / 1e9, *val))
-                    .collect();
-
-                if points.len() >= 2 {
-                    // Calculate linear regression slope (derivative)
-                    let slope = self.calculate_slope(&points);
-                    deriv_values.push((current as f64 / 1e9, slope));
-                }
-                current += step_ns;
-            }
-
-            if !deriv_values.is_empty() {
-                let mut metric_labels = HashMap::new();
-                metric_labels.insert("__name__".to_string(), "deriv".to_string());
-                for (key, value) in labels.inner.iter() {
-                    metric_labels.insert(key.clone(), value.clone());
-                }
-                result_samples.push(MatrixSample {
-                    metric: metric_labels,
-                    values: deriv_values,
-                });
-            }
-        }
-
-        Ok(result_samples)
-    }
-
     /// Handle histogram_quantiles(quantiles_array, histogram_metric)
     /// queries.  Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999],
     /// tcp_packet_latency)`.
@@ -1155,34 +841,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             )));
         }
         Ok(QueryResult::Matrix { result })
-    }
-
-    /// Calculate slope using least squares linear regression
-    fn calculate_slope(&self, points: &[(f64, f64)]) -> f64 {
-        if points.len() < 2 {
-            return 0.0;
-        }
-
-        let n = points.len() as f64;
-        let mut sum_x = 0.0;
-        let mut sum_y = 0.0;
-        let mut sum_xy = 0.0;
-        let mut sum_x2 = 0.0;
-
-        for (x, y) in points {
-            sum_x += x;
-            sum_y += y;
-            sum_xy += x * y;
-            sum_x2 += x * x;
-        }
-
-        // Calculate slope: (n*sum_xy - sum_x*sum_y) / (n*sum_x2 - sum_x*sum_x)
-        let denominator = n * sum_x2 - sum_x * sum_x;
-        if denominator.abs() < 1e-10 {
-            return 0.0; // Avoid division by zero
-        }
-
-        (n * sum_xy - sum_x * sum_y) / denominator
     }
 
     /// Handle histogram_heatmap(histogram_metric) queries
