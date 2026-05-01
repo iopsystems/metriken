@@ -5,14 +5,17 @@
 // (rezolus metrics.parquet), there are 1-arg-shorter overloads that default to
 // p=3. llmperf.parquet uses p=7, so always pass it explicitly there.
 //
-// **Known issue:** `h2_delta(buckets, LAG(buckets) OVER (ORDER BY ts))` reads
-// wrong child-vector contents at chunk boundaries — the LAG'd list_vector's
-// child layout doesn't match what `in0.child(in0.len())` returns through the
-// duckdb-rs `vscalar` API, so deltas are corrupted at the last row of large
-// chunks. As a workaround, catalogue queries should use a self-join
-// (`LEFT JOIN ... ON b.ts = a.ts - 1Hz_interval`) instead of LAG when computing
-// histogram deltas. The bug only surfaces with LIST<UBIGINT> + LAG; scalar
-// LAG (used in `irate_1s` / `rate_5m`) is unaffected.
+// **duckdb-rs gotcha (input child reads):** `ListVector::child(capacity)` calls
+// `duckdb_list_vector_reserve(vector, capacity)` unconditionally. When applied
+// to an *input* list_vector that shares physical storage with a sibling LAG'd
+// LIST argument in the same UDF chunk, that reserve zeroes the input's child
+// past index `STANDARD_VECTOR_SIZE` (= 2048). This corrupted
+// `h2_delta(buckets, LAG(buckets) OVER (ORDER BY ts))` for any chunk with more
+// than 1024 rows. Fix: read input children via `child(0).as_slice_with_len(n)`
+// (no reserve, just data ptr); only call `child(N)` when *writing* output.
+// All h2_* UDFs in this file follow that pattern. See `tests/lag_repro.rs` for
+// the diagnostic suite. Scalar `LAG(...)` (used in `irate_1s` / `rate_5m`) is
+// unaffected because the bug requires a LAG'd LIST argument to trigger.
 //
 // Bucket bounds are **inclusive on both ends**, matching the canonical
 // `histogram` crate (used by rezolus itself — see its `Bucket::start/end`).
@@ -35,8 +38,11 @@ const N: u32 = 64;
 const DEFAULT_P: u32 = 3;
 const MAX_BUCKET_COUNT: usize = ((N - 2 + 1) * (1u32 << 14)) as usize; // generous upper
 
+/// Total number of buckets in an H2 histogram with grouping power `p` and
+/// `n = 64`. `pub` so callers (e.g. the heatmap projector in `backend.rs`)
+/// can size bucket-bound vectors without round-tripping through DuckDB.
 #[inline]
-fn bucket_count(p: u32) -> u32 {
+pub fn bucket_count(p: u32) -> u32 {
     (N - p + 1) * (1 << p)
 }
 
@@ -45,8 +51,11 @@ fn valid_p(p: u32) -> bool {
     (2..=14).contains(&p)
 }
 
+/// Inclusive lower bound of bucket `idx` with grouping power `p`. Same
+/// formula as the `h2_lower` SQL UDF — exposed publicly so the heatmap
+/// projector can call it directly without a SQL round-trip.
 #[inline]
-fn h2_lower_p(idx: u32, p: u32) -> u64 {
+pub fn h2_lower(idx: u32, p: u32) -> u64 {
     if idx < (1u32 << (p + 1)) {
         idx as u64
     } else {
@@ -55,8 +64,11 @@ fn h2_lower_p(idx: u32, p: u32) -> u64 {
     }
 }
 
+/// Inclusive upper bound of bucket `idx` with grouping power `p`. Same
+/// formula as the `h2_upper` SQL UDF — exposed publicly so the heatmap
+/// projector can call it directly without a SQL round-trip.
 #[inline]
-fn h2_upper_p(idx: u32, p: u32) -> u64 {
+pub fn h2_upper(idx: u32, p: u32) -> u64 {
     if idx + 1 == bucket_count(p) {
         // Top bucket — the inclusive upper of the value space.
         // (Computing it from the formula would overflow `2^p+w + h·2^w` past u64.)
@@ -68,6 +80,17 @@ fn h2_upper_p(idx: u32, p: u32) -> u64 {
         let w = (idx >> p) - 1;
         (1u64 << (p + w)) + (((idx & ((1 << p) - 1)) + 1) as u64) * (1u64 << w) - 1
     }
+}
+
+// Internal aliases to keep the existing call sites in this file unchanged.
+#[inline]
+fn h2_lower_p(idx: u32, p: u32) -> u64 {
+    h2_lower(idx, p)
+}
+
+#[inline]
+fn h2_upper_p(idx: u32, p: u32) -> u64 {
+    h2_upper(idx, p)
 }
 
 #[inline]
@@ -206,7 +229,7 @@ impl VScalar for H2TotalUdf {
         let n = input.len();
         let in_lv = input.list_vector(0);
         let child_n = in_lv.len();
-        let data = in_lv.child(child_n).as_slice_with_len::<u64>(child_n).to_vec();
+        let data = in_lv.child(0).as_slice_with_len::<u64>(child_n).to_vec();
         let mut out_vec = output.flat_vector();
         let out_ptr = out_vec.as_mut_ptr::<u64>();
         for r in 0..n {
@@ -242,8 +265,8 @@ impl VScalar for H2DeltaUdf {
         let in0 = input.list_vector(1);
         let in1_n = in1.len();
         let in0_n = in0.len();
-        let in1_data = in1.child(in1_n).as_slice_with_len::<u64>(in1_n).to_vec();
-        let in0_data = in0.child(in0_n).as_slice_with_len::<u64>(in0_n).to_vec();
+        let in1_data = in1.child(0).as_slice_with_len::<u64>(in1_n).to_vec();
+        let in0_data = in0.child(0).as_slice_with_len::<u64>(in0_n).to_vec();
 
         write_list_output(
             n,
@@ -288,7 +311,7 @@ impl VScalar for H2QuantileUdf {
         let ncols = input.num_columns();
         let in_lv = input.list_vector(0);
         let child_n = in_lv.len();
-        let data = in_lv.child(child_n).as_slice_with_len::<u64>(child_n).to_vec();
+        let data = in_lv.child(0).as_slice_with_len::<u64>(child_n).to_vec();
         let qs = input.flat_vector(1).as_slice_with_len::<f64>(n).to_vec();
 
         // 4-/5-arg overloads carry (lo, hi); fold the no-range case into
@@ -373,7 +396,7 @@ impl VScalar for H2CountInRangeUdf {
         let n = input.len();
         let in_lv = input.list_vector(0);
         let child_n = in_lv.len();
-        let data = in_lv.child(child_n).as_slice_with_len::<u64>(child_n).to_vec();
+        let data = in_lv.child(0).as_slice_with_len::<u64>(child_n).to_vec();
         let los = input.flat_vector(1).as_slice_with_len::<u64>(n).to_vec();
         let his = input.flat_vector(2).as_slice_with_len::<u64>(n).to_vec();
         let ps = read_p(input, 3, n);
@@ -423,8 +446,8 @@ impl VScalar for H2QuantilesUdf {
         let in_qs = input.list_vector(1);
         let bch = in_lv.len();
         let qch = in_qs.len();
-        let bdata = in_lv.child(bch).as_slice_with_len::<u64>(bch).to_vec();
-        let qdata = in_qs.child(qch).as_slice_with_len::<f64>(qch).to_vec();
+        let bdata = in_lv.child(0).as_slice_with_len::<u64>(bch).to_vec();
+        let qdata = in_qs.child(0).as_slice_with_len::<f64>(qch).to_vec();
         let ps = read_p(input, 2, n);
 
         write_list_output(
@@ -492,7 +515,7 @@ impl VScalar for H2CombineUdf {
         let outer = input.list_vector(0);
         let inner = outer.list_child();
         let leaf_n = inner.len();
-        let leaf = inner.child(leaf_n).as_slice_with_len::<u64>(leaf_n).to_vec();
+        let leaf = inner.child(0).as_slice_with_len::<u64>(leaf_n).to_vec();
 
         // First pass: max inner length per outer row → output width per row.
         let mut row_widths = Vec::with_capacity(n);

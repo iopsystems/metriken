@@ -29,7 +29,7 @@ pub mod tsdb;
 pub use bytes::Bytes;
 pub use dispatch::{
     canonicalise, Catalogue, CatalogueEntry, Diff, DispatchObserver, Mode, NoopObserver,
-    SqlBackend, SqlError,
+    OutputShape, SqlBackend, SqlError,
 };
 pub use promql::{
     DispatchConfig, HistogramHeatmapResult, MatrixSample, QueryEngine, QueryError, QueryResult,

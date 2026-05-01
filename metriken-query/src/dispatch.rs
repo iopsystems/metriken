@@ -32,6 +32,22 @@ pub enum Mode {
     Primary,
 }
 
+/// Output shape of a SQL twin — controls how the backend projects rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputShape {
+    /// `(t, value, [labels...])` rows projected into `QueryResult::Matrix`.
+    Matrix,
+    /// `(t, bucket_idx, count, p)` rows projected into
+    /// `QueryResult::HistogramHeatmap`. Backend reconstructs `bucket_bounds`
+    /// using the H2 bucket math directly.
+    Heatmap,
+}
+
+fn default_output_shape() -> OutputShape {
+    OutputShape::Matrix
+}
+
 /// One entry in the catalogue. Mirrors the `[[query]]` table in `queries.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CatalogueEntry {
@@ -41,6 +57,11 @@ pub struct CatalogueEntry {
     pub promql: String,
     #[serde(default)]
     pub sql: Option<String>,
+    /// `matrix` (default) or `heatmap`. For `heatmap`, `value_columns` /
+    /// `label_columns` / `output_metric` are ignored — the backend uses the
+    /// positional `(t, bucket_idx, count, p)` shape instead.
+    #[serde(default = "default_output_shape")]
+    pub output_shape: OutputShape,
     #[serde(default)]
     pub value_columns: Vec<String>,
     #[serde(default)]

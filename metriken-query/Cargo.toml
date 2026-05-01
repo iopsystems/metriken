@@ -35,3 +35,8 @@ toml = "0.8"
 default = ["ingest", "lz4"]
 ingest = ["metriken-exposition"]
 lz4 = ["parquet/lz4"]
+# `http` is a back-compat no-op kept so downstream callers (Rezolus) that
+# still request the published 0.9.x's HTTP-routes feature continue to build.
+# The actual HTTP routing has moved upstream into the dispatcher's host —
+# see `src/dispatch.rs` and `metriken-query-sql::DuckDbBackend`.
+http = []

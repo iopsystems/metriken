@@ -444,13 +444,35 @@ output_metric = { __name__ = "request_latency" }
 
 [[query]]
 id = "histogram_heatmap"
-mode = "off"
+mode = "shadow"
 promql = "histogram_heatmap(request_latency)"
+output_shape = "heatmap"
 fixture = "histogram_basic"
 start = 1.0
 end = 10.0
 step = 1.0
 description = "Rezolus extension — 2-D heatmap output for visualization."
+# Self-join + UNNEST WITH ORDINALITY: emit one row per non-zero bucket per
+# tick. The backend reconstructs timestamps, bucket_bounds (via h2_upper for
+# the contiguous index range), and remaps bucket_idx into the output frame.
+sql = """
+WITH paired AS (
+    SELECT a.timestamp,
+           h2_delta(a.buckets, b.buckets) AS d,
+           a.p AS p
+    FROM request_latency a
+    JOIN request_latency b
+      ON CAST(b.timestamp AS HUGEINT) = CAST(a.timestamp AS HUGEINT) - 1000000000
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       (u.ordinal - 1)::INTEGER AS bucket_idx,
+       u.value::DOUBLE AS count,
+       p::INTEGER AS p
+FROM paired
+CROSS JOIN UNNEST(d) WITH ORDINALITY AS u(value, ordinal)
+WHERE u.value > 0
+ORDER BY t, bucket_idx
+"""
 
 [[query]]
 id = "histogram_quantile_with_reset"
