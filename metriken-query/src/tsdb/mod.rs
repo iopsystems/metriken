@@ -7,10 +7,10 @@ use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use histogram::{CumulativeROHistogram, Histogram};
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ProjectionMask;
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
 use serde::Serialize;
 
 mod collection;
@@ -24,138 +24,31 @@ pub use labels::Labels;
 pub use series::*;
 use series::{delta_to_32_or_empty, empty_delta_32};
 
-/// Stream a single counter column into the TSDB.  The reader must already be
-/// projected to just this column (so `batch.column(0)` is the data).  Walks
-/// rows batch-by-batch so peak resident never exceeds one batch's decoded
-/// `UInt64Array`.
-fn stream_counter_column(
-    counters: &mut HashMap<String, CounterCollection>,
-    name: String,
-    labels: Labels,
-    timestamps: &[Option<u64>],
-    reader: ParquetRecordBatchReader,
-) {
-    let series = counters.entry(name).or_default().entry(labels).or_default();
-    let mut row = 0usize;
-    for batch in reader.flatten() {
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("counter column is not UInt64");
-        for v in arr.iter() {
-            if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                series.insert(*ts, v);
-            }
-            row += 1;
-        }
-    }
-}
-
-/// Stream a single gauge column into the TSDB.  See `stream_counter_column`.
-fn stream_gauge_column(
-    gauges: &mut HashMap<String, GaugeCollection>,
-    name: String,
-    labels: Labels,
-    timestamps: &[Option<u64>],
-    reader: ParquetRecordBatchReader,
-) {
-    let series = gauges.entry(name).or_default().entry(labels).or_default();
-    let mut row = 0usize;
-    for batch in reader.flatten() {
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("gauge column is not Int64");
-        for v in arr.iter() {
-            if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                series.insert(*ts, v);
-            }
-            row += 1;
-        }
-    }
-}
-
-/// Stream a single histogram column into the TSDB, pre-differencing
-/// consecutive snapshots into u32 deltas as it goes.  Peak resident scratch
-/// is one batch of decoded `ListArray` data plus the rolling `prev`
-/// cumulative — typically tens of KB regardless of the column's total size.
-fn stream_histogram_column(
-    histograms: &mut HashMap<String, HistogramCollection>,
-    name: String,
-    labels: Labels,
-    grouping_power: u8,
-    max_value_power: u8,
-    timestamps: &[Option<u64>],
-    reader: ParquetRecordBatchReader,
-) {
-    let series = histograms
-        .entry(name)
-        .or_default()
-        .entry(labels)
-        .or_default();
-
-    // Cache the column's `Config` so we can record an explicit empty delta
-    // at any timestamp where a non-empty delta isn't available (null parquet
-    // row, decode failure, reset, overflow).
-    let column_config = ::histogram::Config::new(grouping_power, max_value_power).ok();
-
-    let mut prev: Option<CumulativeROHistogram> = None;
-    let mut row = 0usize;
-
-    for batch in reader.flatten() {
-        let list = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("histogram column is not List");
-
-        for value in list.iter() {
-            let Some(Some(ts)) = timestamps.get(row).copied() else {
-                row += 1;
-                continue;
-            };
-
-            // Decode this row's cumulative (or `None` for null / decode
-            // failure — see the matching block below for explicit-empty
-            // handling so the timestamp axis stays aligned).
-            let curr = value.and_then(|list_value| {
-                let arr = list_value
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .expect("histogram inner is not UInt64");
-                let buckets: Vec<u64> = arr.iter().flatten().collect();
-                Histogram::from_buckets(grouping_power, max_value_power, buckets)
-                    .ok()
-                    .map(|h| CumulativeROHistogram::from(&h))
-            });
-
-            match (&prev, &curr) {
-                (Some(prev_cumu), Some(curr_cumu)) => {
-                    series.insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
-                }
-                (Some(_), None) => {
-                    if let Some(cfg) = column_config {
-                        series.insert(ts, empty_delta_32(cfg));
-                    }
-                }
-                // First row, or no prev yet: nothing to delta against.
-                // Drop this point but capture it as the new baseline if
-                // we decoded it.
-                _ => {}
-            }
-            if curr.is_some() {
-                prev = curr;
-            }
-            row += 1;
-        }
-    }
+/// Per-column dispatch target precomputed from the parquet schema.
+/// Histogram targets carry the rolling `prev` cumulative so per-period
+/// deltas work across batches.
+enum ColumnTarget {
+    Skip,
+    Counter {
+        name: String,
+        labels: Labels,
+    },
+    Gauge {
+        name: String,
+        labels: Labels,
+    },
+    Histogram {
+        name: String,
+        labels: Labels,
+        grouping_power: u8,
+        max_value_power: u8,
+        config: Option<::histogram::Config>,
+        prev: Option<CumulativeROHistogram>,
+    },
 }
 
 /// Snap a nanosecond timestamp to the nearest multiple of `interval_ns`.
 /// Returns the timestamp unchanged when `interval_ns` is zero (i.e. unknown).
-#[allow(clippy::manual_checked_ops)]
 fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
     if interval_ns > 0 {
         ((ts + interval_ns / 2) / interval_ns) * interval_ns
@@ -174,10 +67,9 @@ pub struct Tsdb {
     counters: HashMap<String, CounterCollection>,
     gauges: HashMap<String, GaugeCollection>,
     histograms: HashMap<String, HistogramCollection>,
-    /// Sidecar holding the most-recent cumulative-since-start histogram per
-    /// series, used by the streaming `ingest` path to compute the per-period
-    /// delta against the next snapshot.  Not populated by the parquet load
-    /// path (which differences in-place during column iteration).
+    /// Most-recent cumulative per series; `ingest` differences against the
+    /// next snapshot to produce the per-period delta. Unused on the parquet
+    /// load path (which differences in-place).
     #[cfg(feature = "ingest")]
     prev_histograms: HashMap<String, HashMap<Labels, CumulativeROHistogram>>,
 }
@@ -198,15 +90,17 @@ impl Tsdb {
     pub fn load_from_bytes(bytes: Bytes) -> Result<Self, Box<dyn Error>> {
         let mut data = Tsdb::default();
 
-        // ----- one-time: file-level metadata -----
-        // Decode the parquet file metadata (small, never holds bulk data).
-        // Keep an Arc<ParquetMetaData> so we can drop the reader before
-        // re-opening per-column readers below — the metadata's
-        // SchemaDescriptor is what `ProjectionMask::roots` needs.
-        let parquet_metadata = SerializedFileReader::new(bytes.clone())?.metadata().clone();
+        // Parse the footer once and reuse for every per-(row-group, column)
+        // reader below — `try_new` re-parses on every call (multi-second on
+        // wide files).
+        let arrow_reader_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        let arrow_schema = arrow_reader_meta.schema().clone();
+        let pq_metadata = arrow_reader_meta.metadata().clone();
+        let parquet_schema = pq_metadata.file_metadata().schema_descr_ptr();
+        let num_row_groups = pq_metadata.num_row_groups();
 
         let mut metadata = HashMap::new();
-        if let Some(kv) = parquet_metadata.file_metadata().key_value_metadata() {
+        if let Some(kv) = pq_metadata.file_metadata().key_value_metadata() {
             for entry in kv {
                 metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
             }
@@ -227,105 +121,218 @@ impl Tsdb {
         data.file_metadata = metadata;
 
         let interval_ns = data.sampling_interval_ms * 1_000_000;
-        let parquet_schema = parquet_metadata.file_metadata().schema_descr_ptr();
-
-        // Cache the Arrow schema once.  The builder is dropped immediately;
-        // we re-open one builder per column below with a projection mask so
-        // peak resident never holds more than one column's worth of decoded
-        // Arrow data at a time.
-        let arrow_schema = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
-            .schema()
-            .clone();
 
         let ts_col_idx = arrow_schema
             .index_of("timestamp")
             .map_err(|_| "missing 'timestamp' column")?;
 
-        // ----- pass 1: timestamps only -----
-        // Stream-decode just the timestamp column into a Vec<Option<u64>>
-        // indexed by row.  Memory cost is bounded by N_rows * 8 B (a few
-        // hundred KB even for the largest viewer samples).  `None` entries
-        // mark rows with a NULL timestamp — those rows are dropped from
-        // the per-column passes below.
-        let timestamps: Vec<Option<u64>> = {
-            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
-                .with_projection(ProjectionMask::roots(&parquet_schema, [ts_col_idx]))
-                .build()?;
-            let mut out = Vec::with_capacity(parquet_metadata.file_metadata().num_rows() as usize);
-            for batch in reader.flatten() {
-                let arr = batch
+        // Precompute targets so the hot loop doesn't re-parse schema
+        // metadata per batch.
+        let mut targets: Vec<ColumnTarget> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(col_idx, field)| {
+                if col_idx == ts_col_idx {
+                    return ColumnTarget::Skip;
+                }
+                let mut meta = field.metadata().clone();
+                let name = if let Some(n) = meta.get("metric").cloned() {
+                    n
+                } else {
+                    let col_name = field.name();
+                    col_name
+                        .strip_suffix(":buckets")
+                        .unwrap_or(col_name)
+                        .to_string()
+                };
+                let grouping_power: Option<u8> =
+                    meta.remove("grouping_power").and_then(|v| v.parse().ok());
+                let max_value_power: Option<u8> =
+                    meta.remove("max_value_power").and_then(|v| v.parse().ok());
+
+                let mut labels = Labels::default();
+                for (k, v) in meta.iter() {
+                    match k.as_str() {
+                        // Internal metadata — not user-facing labels
+                        "metric" | "metric_type" | "unit" => continue,
+                        _ => {
+                            labels.inner.insert(k.to_string(), v.to_string());
+                        }
+                    }
+                }
+
+                match field.data_type() {
+                    DataType::UInt64 => ColumnTarget::Counter { name, labels },
+                    DataType::Int64 => ColumnTarget::Gauge { name, labels },
+                    DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
+                        let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
+                            return ColumnTarget::Skip;
+                        };
+                        let config = ::histogram::Config::new(gp, mvp).ok();
+                        ColumnTarget::Histogram {
+                            name,
+                            labels,
+                            grouping_power: gp,
+                            max_value_power: mvp,
+                            config,
+                            prev: None,
+                        }
+                    }
+                    _ => ColumnTarget::Skip,
+                }
+            })
+            .collect();
+
+        // Decode one column at a time within each row group; peak resident
+        // is bounded by one decoded Arrow array.
+        let mut timestamps: Vec<Option<u64>> = Vec::new();
+        for rg_idx in 0..num_row_groups {
+            let ts_reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                bytes.clone(),
+                arrow_reader_meta.clone(),
+            )
+            .with_row_groups(vec![rg_idx])
+            .with_projection(ProjectionMask::roots(&parquet_schema, [ts_col_idx]))
+            .build()?;
+            timestamps.clear();
+            for batch in ts_reader.flatten() {
+                let ts_arr = batch
                     .column(0)
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or("timestamp column is not UInt64")?;
-                for v in arr.iter() {
-                    out.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
-                }
-            }
-            out
-        };
-
-        // ----- pass 2: each non-timestamp column streamed alone -----
-        for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
-            if col_idx == ts_col_idx {
-                continue;
-            }
-
-            let mut meta = field.metadata().clone();
-            let name = if let Some(n) = meta.get("metric").cloned() {
-                n
-            } else {
-                let col_name = field.name();
-                col_name
-                    .strip_suffix(":buckets")
-                    .unwrap_or(col_name)
-                    .to_string()
-            };
-            let grouping_power: Option<u8> =
-                meta.remove("grouping_power").and_then(|v| v.parse().ok());
-            let max_value_power: Option<u8> =
-                meta.remove("max_value_power").and_then(|v| v.parse().ok());
-
-            let mut labels = Labels::default();
-            for (k, v) in meta.iter() {
-                match k.as_str() {
-                    // Internal metadata — not user-facing labels
-                    "metric" | "metric_type" | "unit" => continue,
-                    _ => {
-                        labels.inner.insert(k.to_string(), v.to_string());
-                    }
+                timestamps.reserve(ts_arr.len());
+                for v in ts_arr.iter() {
+                    timestamps.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
                 }
             }
 
-            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
+            for (col_idx, target) in targets.iter_mut().enumerate() {
+                if col_idx == ts_col_idx {
+                    continue;
+                }
+                if matches!(target, ColumnTarget::Skip) {
+                    continue;
+                }
+
+                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    bytes.clone(),
+                    arrow_reader_meta.clone(),
+                )
+                .with_row_groups(vec![rg_idx])
                 .with_projection(ProjectionMask::roots(&parquet_schema, [col_idx]))
                 .build()?;
 
-            match field.data_type() {
-                DataType::UInt64 => {
-                    stream_counter_column(&mut data.counters, name, labels, &timestamps, reader);
+                match target {
+                    ColumnTarget::Skip => unreachable!(),
+                    ColumnTarget::Counter { name, labels } => {
+                        let series = data
+                            .counters
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(labels.clone())
+                            .or_default();
+                        let mut row = 0usize;
+                        for batch in reader.flatten() {
+                            let arr = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .expect("counter column is not UInt64");
+                            for v in arr.iter() {
+                                if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
+                                    series.insert(*ts, v);
+                                }
+                                row += 1;
+                            }
+                        }
+                    }
+                    ColumnTarget::Gauge { name, labels } => {
+                        let series = data
+                            .gauges
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(labels.clone())
+                            .or_default();
+                        let mut row = 0usize;
+                        for batch in reader.flatten() {
+                            let arr = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("gauge column is not Int64");
+                            for v in arr.iter() {
+                                if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
+                                    series.insert(*ts, v);
+                                }
+                                row += 1;
+                            }
+                        }
+                    }
+                    ColumnTarget::Histogram {
+                        ref name,
+                        ref labels,
+                        grouping_power,
+                        max_value_power,
+                        ref config,
+                        ref mut prev,
+                    } => {
+                        let gp = *grouping_power;
+                        let mvp = *max_value_power;
+                        let cfg = *config;
+                        let series = data
+                            .histograms
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(labels.clone())
+                            .or_default();
+
+                        let mut row = 0usize;
+                        for batch in reader.flatten() {
+                            let list = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<ListArray>()
+                                .expect("histogram column is not List");
+                            for value in list.iter() {
+                                let Some(Some(ts)) = timestamps.get(row).copied() else {
+                                    row += 1;
+                                    continue;
+                                };
+
+                                let curr = value.and_then(|list_value| {
+                                    let arr = list_value
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .expect("histogram inner is not UInt64");
+                                    let buckets: Vec<u64> = arr.iter().flatten().collect();
+                                    Histogram::from_buckets(gp, mvp, buckets)
+                                        .ok()
+                                        .map(|h| CumulativeROHistogram::from(&h))
+                                });
+
+                                match (prev.as_ref(), curr.as_ref()) {
+                                    (Some(prev_cumu), Some(curr_cumu)) => {
+                                        series
+                                            .insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
+                                    }
+                                    (Some(_), None) => {
+                                        if let Some(cfg) = cfg {
+                                            series.insert(ts, empty_delta_32(cfg));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                if curr.is_some() {
+                                    *prev = curr;
+                                }
+                                row += 1;
+                            }
+                        }
+                    }
                 }
-                DataType::Int64 => {
-                    stream_gauge_column(&mut data.gauges, name, labels, &timestamps, reader);
-                }
-                DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
-                    let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
-                        continue;
-                    };
-                    stream_histogram_column(
-                        &mut data.histograms,
-                        name,
-                        labels,
-                        gp,
-                        mvp,
-                        &timestamps,
-                        reader,
-                    );
-                }
-                _ => {}
             }
-            // `reader` drops here, releasing this column's row-group
-            // decode buffers before we open the next column's reader.
         }
 
         Ok(data)
@@ -421,22 +428,17 @@ impl Tsdb {
         (name, labels)
     }
 
-    /// Borrow the raw counter collection for `name` without cloning.
-    /// Used by the streaming pipeline so iterator chains can hold
-    /// references into the TSDB's storage rather than building (and
-    /// keeping resident) a per-query clone. Returns `None` if the
-    /// metric is unknown.
+    /// Borrow the raw counter collection without cloning, so streaming
+    /// iterator chains can reference TSDB storage directly.
     pub fn counters_ref(&self, name: &str) -> Option<&CounterCollection> {
         self.counters.get(name)
     }
 
-    /// Borrow the raw gauge collection for `name` without cloning.
     /// See [`Tsdb::counters_ref`].
     pub fn gauges_ref(&self, name: &str) -> Option<&GaugeCollection> {
         self.gauges.get(name)
     }
 
-    /// Borrow the raw histogram collection for `name` without cloning.
     /// See [`Tsdb::counters_ref`].
     pub fn histograms_ref(&self, name: &str) -> Option<&HistogramCollection> {
         self.histograms.get(name)
