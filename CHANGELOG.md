@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.10.1
+
+- Cache the parquet footer once per load and decode columns one at a
+  time within each row group. Restores load performance on wide files
+  that regressed in 0.9.6's per-column projection rewrite — 5–28×
+  faster than 0.10.0 across the rezolus dashboard fixtures
+  (vllm.parquet 21.0s → 0.74s; sglang-nixl-16c 130s → 6.0s).
+
 ### metriken-query 0.10.0
 
 Breaking — collapses the PromQL evaluator to streaming-only and
