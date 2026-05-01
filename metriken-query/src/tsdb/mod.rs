@@ -442,23 +442,6 @@ impl Tsdb {
         self.histograms.get(name)
     }
 
-    /// Filtered, owned histogram collection. Used by the eager
-    /// `histogram_heatmap` handler, which is the last remaining
-    /// non-streaming consumer.
-    pub fn histograms(&self, name: &str, labels: impl Into<Labels>) -> Option<HistogramCollection> {
-        if let Some(histograms) = self.histograms.get(name) {
-            let histograms = histograms.filter(&labels.into());
-
-            if histograms.is_empty() {
-                None
-            } else {
-                Some(histograms)
-            }
-        } else {
-            None
-        }
-    }
-
     // sampling interval in seconds
     pub fn interval(&self) -> f64 {
         self.sampling_interval_ms as f64 / 1000.0
@@ -615,9 +598,7 @@ mod ingest_tests {
             tsdb.ingest(snapshot_at(*ts, h, "lat"));
         }
 
-        let collection = tsdb
-            .histograms("lat", Labels::default())
-            .expect("histogram series exists");
+        let collection = tsdb.histograms_ref("lat").expect("histogram series exists");
         let (_, series) = collection.iter().next().expect("one labelset");
 
         // s1 produces no delta; s2..s5 each produce one.  4 entries expected.
