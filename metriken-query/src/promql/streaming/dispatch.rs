@@ -16,7 +16,7 @@ use promql_parser::parser::{self, Expr};
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{collect_to_matrix, irate_counters, sum_by};
 use crate::promql::{QueryError, QueryResult};
-use crate::tsdb::{Labels, Tsdb};
+use crate::tsdb::Tsdb;
 
 /// Try to evaluate `expr` via the streaming pipeline.
 ///
@@ -86,11 +86,11 @@ fn try_sum_irate(
     let filter_labels = extract_filter_labels(&selector.vs.matchers.matchers);
     let range_ns = selector.range.as_nanos() as u64;
 
-    // The streaming `irate_counters` filters internally, but
-    // `tsdb.counters()` already accepts a label filter — passing
-    // `Labels::default()` keeps the full collection so the iterator
-    // borrows stable references for the lifetime of this call.
-    let Some(collection) = tsdb.counters(metric_name, Labels::default()) else {
+    // Borrow the raw collection — the streaming pipeline holds
+    // references into the TSDB's storage rather than cloning a
+    // filtered copy, so peak heap stays bounded by the iterator
+    // chain's own state instead of the input cardinality.
+    let Some(collection) = tsdb.counters_ref(metric_name) else {
         return Err(QueryError::MetricNotFound(metric_name.to_string()));
     };
 
@@ -99,7 +99,7 @@ fn try_sum_irate(
     let step_ns = (step * 1e9) as u64;
 
     let stream = irate_counters(
-        &collection,
+        collection,
         &filter_labels,
         start_ns,
         end_ns,
