@@ -29,6 +29,8 @@
 //! malformed. This keeps SQL like `SELECT {col} AS '...'` (empty label set
 //! literal in some catalogue values) from being misread.
 
+use std::collections::BTreeSet;
+
 use metriken_query::{CaptureValue, Captures, LabelOp};
 use thiserror::Error;
 
@@ -51,10 +53,18 @@ pub enum InterpError {
 }
 
 /// Interpolate a SQL template with the given captures and data-source path.
+///
+/// `available_labels`, when supplied, lists the label columns actually
+/// present in the metric view this template targets. The `as_predicate`
+/// transform uses it to fold predicates against absent labels into PromQL
+/// semantics (a missing label value is the empty string), avoiding
+/// `Binder Error: Referenced column "name" not found` when a viewer query
+/// filters on a label the current fixture doesn't carry.
 pub fn interpolate(
     template: &str,
     captures: &Captures,
     data_source: &str,
+    available_labels: Option<&BTreeSet<String>>,
 ) -> Result<String, InterpError> {
     let bytes = template.as_bytes();
     let mut out = String::with_capacity(template.len());
@@ -86,7 +96,7 @@ pub fn interpolate(
             if transform_end < bytes.len() && bytes[transform_end] == b'}' && name_end > body_start
             {
                 let name = &template[body_start..name_end];
-                let rendered = render(name, transform, captures, data_source)?;
+                let rendered = render(name, transform, captures, data_source, available_labels)?;
                 out.push_str(&rendered);
                 i = transform_end + 1;
                 continue;
@@ -107,6 +117,7 @@ fn render(
     transform: Option<&str>,
     captures: &Captures,
     data_source: &str,
+    available_labels: Option<&BTreeSet<String>>,
 ) -> Result<String, InterpError> {
     if name == "fixture_path" {
         return Ok(data_source.to_string());
@@ -117,6 +128,25 @@ fn render(
     match (value, transform) {
         // Default transform per kind.
         (CaptureValue::Ident(s), None) => Ok(s.clone()),
+
+        // `as_safe_col` — for `${g:ident}` placeholders that name a
+        // label column to project (`SELECT ..., {g:as_safe_col}`). When
+        // the metric view lacks that label, fall back to `'' AS g` so
+        // PromQL semantics (missing label = empty string) hold and
+        // DuckDB doesn't raise `Binder Error: Referenced column`.
+        // Downstream `GROUP BY g` / `ORDER BY g` clauses can still
+        // reference the alias, since DuckDB resolves output names there.
+        (CaptureValue::Ident(s), Some("as_safe_col")) => {
+            if !is_safe_ident(s) {
+                return Err(InterpError::InvalidLabelName(s.clone()));
+            }
+            let present = available_labels.map_or(true, |set| set.contains(s));
+            if present {
+                Ok(s.clone())
+            } else {
+                Ok(format!("'' AS {s}"))
+            }
+        }
         (CaptureValue::Number(n), None) => Ok(format_number(*n)),
         (CaptureValue::String(s), None) => Ok(sql_string_literal(s)),
         (CaptureValue::Duration { seconds }, None) => Ok(seconds.to_string()),
@@ -136,11 +166,21 @@ fn render(
                         return Err(InterpError::InvalidLabelName(m.name.clone()));
                     }
                     let lit = sql_string_literal(&m.value);
+                    // PromQL semantics: a series that lacks this label has
+                    // an implicit empty-string value. When the metric view
+                    // doesn't carry this column at all (e.g. cgroup_syscall
+                    // on demo.parquet has no `name`), substitute the empty
+                    // literal so DuckDB doesn't error with `Binder Error:
+                    // Referenced column "..." not found`.
+                    let col_present = available_labels
+                        .map(|s| s.contains(&m.name))
+                        .unwrap_or(true);
+                    let col_expr: &str = if col_present { &m.name } else { "''" };
                     parts.push(match m.op {
-                        LabelOp::Eq => format!("{} = {lit}", m.name),
-                        LabelOp::Ne => format!("{} != {lit}", m.name),
-                        LabelOp::ReEq => format!("regexp_matches({}, {lit})", m.name),
-                        LabelOp::ReNe => format!("NOT regexp_matches({}, {lit})", m.name),
+                        LabelOp::Eq => format!("{col_expr} = {lit}"),
+                        LabelOp::Ne => format!("{col_expr} != {lit}"),
+                        LabelOp::ReEq => format!("regexp_matches({col_expr}, {lit})"),
+                        LabelOp::ReNe => format!("NOT regexp_matches({col_expr}, {lit})"),
                     });
                 }
                 Ok(parts.join(" AND "))
@@ -222,7 +262,7 @@ mod tests {
 
     #[test]
     fn fixture_path_substitution_preserved() {
-        let s = interpolate("SELECT * FROM read_parquet('{fixture_path}')", &caps(), "/tmp/x")
+        let s = interpolate("SELECT * FROM read_parquet('{fixture_path}')", &caps(), "/tmp/x", None)
             .unwrap();
         assert_eq!(s, "SELECT * FROM read_parquet('/tmp/x')");
     }
@@ -230,14 +270,14 @@ mod tests {
     #[test]
     fn no_placeholders_passes_through_byte_identical() {
         let raw = "SELECT t, v FROM foo WHERE x = 1 ORDER BY t";
-        assert_eq!(interpolate(raw, &caps(), "ignored").unwrap(), raw);
+        assert_eq!(interpolate(raw, &caps(), "ignored", None).unwrap(), raw);
     }
 
     #[test]
     fn ident_capture_emits_verbatim() {
         let mut c = caps();
         c.insert("m".into(), CaptureValue::Ident("softirq".into()));
-        let s = interpolate("FROM {m}", &c, "").unwrap();
+        let s = interpolate("FROM {m}", &c, "", None).unwrap();
         assert_eq!(s, "FROM softirq");
     }
 
@@ -245,11 +285,11 @@ mod tests {
     fn number_capture_emits_short_form() {
         let mut c = caps();
         c.insert("q".into(), CaptureValue::Number(0.5));
-        let s = interpolate("hist({q})", &c, "").unwrap();
+        let s = interpolate("hist({q})", &c, "", None).unwrap();
         assert_eq!(s, "hist(0.5)");
 
         c.insert("q".into(), CaptureValue::Number(0.99));
-        let s = interpolate("hist({q})", &c, "").unwrap();
+        let s = interpolate("hist({q})", &c, "", None).unwrap();
         assert_eq!(s, "hist(0.99)");
     }
 
@@ -257,10 +297,10 @@ mod tests {
     fn string_capture_quotes_and_escapes() {
         let mut c = caps();
         c.insert("k".into(), CaptureValue::String("hi".into()));
-        assert_eq!(interpolate("WHERE kind = {k}", &c, "").unwrap(),
+        assert_eq!(interpolate("WHERE kind = {k}", &c, "", None).unwrap(),
                    "WHERE kind = 'hi'");
         c.insert("k".into(), CaptureValue::String("it's".into()));
-        assert_eq!(interpolate("WHERE kind = {k}", &c, "").unwrap(),
+        assert_eq!(interpolate("WHERE kind = {k}", &c, "", None).unwrap(),
                    "WHERE kind = 'it''s'");
     }
 
@@ -276,7 +316,7 @@ mod tests {
                 LabelMatcher { name: "d".into(), op: LabelOp::ReNe, value: "w".into() },
             ]),
         );
-        let s = interpolate("WHERE {labels:as_predicate}", &c, "").unwrap();
+        let s = interpolate("WHERE {labels:as_predicate}", &c, "", None).unwrap();
         assert_eq!(
             s,
             "WHERE a = 'x' AND b != 'y' AND regexp_matches(c, 'z.*') AND NOT regexp_matches(d, 'w')"
@@ -287,7 +327,7 @@ mod tests {
     fn labels_as_predicate_empty_emits_true() {
         let mut c = caps();
         c.insert("labels".into(), CaptureValue::Labels(Vec::new()));
-        let s = interpolate("WHERE {labels:as_predicate}", &c, "").unwrap();
+        let s = interpolate("WHERE {labels:as_predicate}", &c, "", None).unwrap();
         assert_eq!(s, "WHERE TRUE");
     }
 
@@ -302,7 +342,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            interpolate("PARTITION BY {labels:as_columns}", &c, "").unwrap(),
+            interpolate("PARTITION BY {labels:as_columns}", &c, "", None).unwrap(),
             "PARTITION BY id, state"
         );
     }
@@ -311,7 +351,7 @@ mod tests {
     fn duration_capture_emits_integer_seconds_default() {
         let mut c = caps();
         c.insert("r".into(), CaptureValue::Duration { seconds: 300 });
-        let s = interpolate("ROWS BETWEEN {r} PRECEDING AND CURRENT ROW", &c, "").unwrap();
+        let s = interpolate("ROWS BETWEEN {r} PRECEDING AND CURRENT ROW", &c, "", None).unwrap();
         assert_eq!(s, "ROWS BETWEEN 300 PRECEDING AND CURRENT ROW");
     }
 
@@ -319,13 +359,13 @@ mod tests {
     fn duration_capture_as_seconds_transform() {
         let mut c = caps();
         c.insert("r".into(), CaptureValue::Duration { seconds: 5 });
-        let s = interpolate("LAG(c, {r:as_seconds})", &c, "").unwrap();
+        let s = interpolate("LAG(c, {r:as_seconds})", &c, "", None).unwrap();
         assert_eq!(s, "LAG(c, 5)");
     }
 
     #[test]
     fn unknown_name_errors() {
-        let err = interpolate("{nope}", &caps(), "").unwrap_err();
+        let err = interpolate("{nope}", &caps(), "", None).unwrap_err();
         assert!(matches!(err, InterpError::UnknownName(_)));
     }
 
@@ -333,7 +373,7 @@ mod tests {
     fn labels_without_transform_errors() {
         let mut c = caps();
         c.insert("l".into(), CaptureValue::Labels(Vec::new()));
-        let err = interpolate("{l}", &c, "").unwrap_err();
+        let err = interpolate("{l}", &c, "", None).unwrap_err();
         assert!(matches!(err, InterpError::MissingTransform { .. }));
     }
 
@@ -341,21 +381,51 @@ mod tests {
     fn ident_with_label_transform_errors() {
         let mut c = caps();
         c.insert("m".into(), CaptureValue::Ident("foo".into()));
-        let err = interpolate("{m:as_predicate}", &c, "").unwrap_err();
+        let err = interpolate("{m:as_predicate}", &c, "", None).unwrap_err();
         assert!(matches!(err, InterpError::WrongTransformForKind { .. }));
+    }
+
+    #[test]
+    fn labels_as_predicate_folds_missing_label_to_empty_string() {
+        // PromQL: a series that lacks a label has implicit value "".
+        // When the metric view doesn't carry the label column at all, the
+        // interpolator must substitute the empty literal instead of the
+        // bare column name — otherwise DuckDB raises Binder Error.
+        let mut c = caps();
+        c.insert(
+            "labels".into(),
+            CaptureValue::Labels(vec![
+                LabelMatcher { name: "op".into(),   op: LabelOp::Eq,   value: "read".into() },
+                LabelMatcher { name: "name".into(), op: LabelOp::ReNe, value: "foo".into() },
+            ]),
+        );
+        let mut available = BTreeSet::new();
+        available.insert("op".to_string());
+        let s = interpolate(
+            "WHERE {labels:as_predicate}",
+            &c,
+            "",
+            Some(&available),
+        )
+        .unwrap();
+        // `op` survives as a column reference, `name` folds to ''.
+        assert_eq!(
+            s,
+            "WHERE op = 'read' AND NOT regexp_matches('', 'foo')"
+        );
     }
 
     #[test]
     fn malformed_braces_pass_through() {
         // `{}` with no name → leave as-is. Reasonable for output_metric maps
         // that legitimately contain `{}` JSON-like text in their values.
-        let s = interpolate("{}", &caps(), "").unwrap();
+        let s = interpolate("{}", &caps(), "", None).unwrap();
         assert_eq!(s, "{}");
         // A naked `{` at end of string also passes through.
-        let s = interpolate("trailing {", &caps(), "").unwrap();
+        let s = interpolate("trailing {", &caps(), "", None).unwrap();
         assert_eq!(s, "trailing {");
         // Brace followed by non-word char passes through.
-        let s = interpolate("{ }", &caps(), "").unwrap();
+        let s = interpolate("{ }", &caps(), "", None).unwrap();
         assert_eq!(s, "{ }");
     }
 }

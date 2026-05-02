@@ -116,21 +116,30 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
     })?;
     let schema = meta.schema().clone();
 
+    // Some Rezolus parquet writers (e.g. the disaggregated-serving sglang
+    // recordings) emit duplicate top-level column names with the same
+    // type/metadata. DuckDB's `read_parquet` silently keeps only the first
+    // occurrence in `_src`, but `arrow::Schema::fields()` returns all of
+    // them — leaving the metric-views layer to insert duplicate rows into
+    // `_metadata` (which has `col` as PRIMARY KEY) and to UNION-ALL views
+    // over a column that no longer exists by that name twice. Dedupe by
+    // physical name, first occurrence wins, matching DuckDB's behavior.
+    let mut seen_physical: BTreeSet<String> = BTreeSet::new();
     let columns: Vec<ColumnInfo> = schema
         .fields()
         .iter()
-        .enumerate()
-        .filter_map(|(_, f)| {
-            // Skip the timestamp / duration columns themselves.
+        .filter_map(|f| {
             if f.name() == "timestamp" || f.name() == "duration" {
                 return None;
             }
             let info = classify(f);
             if matches!(info.kind, ColumnKind::Other) {
-                None
-            } else {
-                Some(info)
+                return None;
             }
+            if !seen_physical.insert(info.physical.clone()) {
+                return None;
+            }
+            Some(info)
         })
         .collect();
 

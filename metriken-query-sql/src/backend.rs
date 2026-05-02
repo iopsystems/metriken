@@ -24,13 +24,13 @@
 //! Positional rather than name-based access avoids duckdb-rs's habit of
 //! panicking if column metadata is read before the statement executes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use duckdb::Connection;
 use metriken_query::{
-    CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, OutputShape, QueryResult,
-    SqlBackend as TraitSqlBackend, SqlError,
+    CaptureValue, CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, OutputShape,
+    QueryResult, SqlBackend as TraitSqlBackend, SqlError,
 };
 
 /// Default DuckDB-backed implementation of `SqlBackend`. Holds one in-memory
@@ -113,11 +113,63 @@ impl TraitSqlBackend for DuckDbBackend {
             .sql
             .as_ref()
             .ok_or_else(|| SqlError::Backend(format!("entry {} has no SQL twin", entry.id)))?;
-        let sql = crate::interp::interpolate(template, captures, data_source)
-            .map_err(|e| SqlError::Backend(format!("interp {}: {e}", entry.id)))?;
 
         let (arc, cold) = self.get_or_init(data_source)?;
         let conn = arc.lock().expect("poisoned");
+
+        // PromQL semantics: a query that references a metric absent from
+        // the fixture returns an empty matrix, not an error. The catalogue
+        // uses ident captures `m`/`a`/`b`/`c` for metric references (vs
+        // `g`/`ga`/`gb`/`ig` for grouping labels — see `FROM {x}` survey
+        // in queries.toml). If any of the metric idents in this entry's
+        // captures targets a view that doesn't exist in the fixture's
+        // catalogue (or has the wrong shape — e.g. the catalogue entry
+        // wants `value` but the metric is stored as a histogram with a
+        // `buckets` list, like `syscall_latency` on demo), short-circuit
+        // to empty before running SQL that would otherwise hit `Table
+        // with name X does not exist` or `Column "value" not found`.
+        let needs_buckets = entry
+            .sql
+            .as_deref()
+            .map(|s| s.contains("buckets"))
+            .unwrap_or(false);
+        const METRIC_IDENT_NAMES: &[&str] = &["m", "a", "b", "c"];
+        for &name in METRIC_IDENT_NAMES {
+            if let Some(CaptureValue::Ident(metric)) = captures.get(name) {
+                let shape = metric_view_shape(&conn, metric)?;
+                let mismatch = match shape {
+                    ViewShape::Missing => true,
+                    ViewShape::Scalar => needs_buckets,
+                    ViewShape::Histogram => !needs_buckets,
+                };
+                if mismatch {
+                    return Ok(QueryResult::Matrix { result: Vec::new() });
+                }
+            }
+        }
+        // For the `m` capture only, look up the view's label columns so
+        // `interp::interpolate` can fold predicates against labels the
+        // fixture doesn't expose (PromQL: missing label = empty string).
+        let available_labels = match captures.get("m") {
+            Some(CaptureValue::Ident(metric)) => Some(metric_label_columns(&conn, metric)?),
+            _ => None,
+        };
+
+        let sql = crate::interp::interpolate(template, captures, data_source, available_labels.as_ref())
+            .map_err(|e| SqlError::Backend(format!("interp {}: {e}", entry.id)))?;
+
+        // Many catalogue entries hardcode metric names directly in the SQL
+        // (`FROM rezolus_bpf_run_time`) rather than via `{m}` captures. If
+        // any such hardcoded metric isn't present in the fixture, return
+        // empty rather than letting DuckDB raise `Catalog Error: Table
+        // with name X does not exist`. We scan the rendered SQL for plain
+        // `FROM <ident>` tokens and skip CTE-introduced names.
+        if let Some(missing) = first_missing_from_view(&conn, &sql)? {
+            // The bench / viewer treats this as an empty result; the
+            // metric simply doesn't exist in this recording.
+            let _ = missing;
+            return Ok(QueryResult::Matrix { result: Vec::new() });
+        }
 
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
@@ -140,6 +192,250 @@ impl TraitSqlBackend for DuckDbBackend {
 
         result
     }
+}
+
+/// Whether the metric view named `metric` is missing entirely, has a
+/// scalar `value` column (counter/gauge), or has a `buckets` list
+/// column (histogram). Used by `run` to short-circuit to empty when a
+/// catalogue entry needs `value` but the fixture stores the metric as
+/// a histogram, or vice versa.
+#[derive(Debug, PartialEq)]
+enum ViewShape {
+    Missing,
+    Scalar,
+    Histogram,
+}
+
+/// Scan rendered SQL for `FROM <ident>` tokens and return the first one
+/// whose target neither exists as a view/table in the connection nor was
+/// introduced by a `WITH <ident> AS` clause earlier in the same query.
+///
+/// Used to pre-flight catalogue entries that hardcode metric names in
+/// the SQL template (e.g. `rezolus_bpf_avg_run_time_per_sampler`'s SQL
+/// reads `FROM rezolus_bpf_run_time` directly, not via `{m}`). Without
+/// this check, fixtures missing the hardcoded metric raise `Catalog
+/// Error: Table with name X does not exist` instead of returning an
+/// empty matrix the way PromQL does.
+///
+/// Heuristic-only: skips quoted identifiers, function-call FROM (read_parquet),
+/// and parenthesised subqueries. False negatives (reporting absent for a
+/// view that exists) are not possible — we only return Some(name) after
+/// confirming `name` isn't in duckdb_views/duckdb_tables AND wasn't
+/// declared in a CTE.
+fn first_missing_from_view(conn: &Connection, sql: &str) -> Result<Option<String>, SqlError> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut cte_names: std::collections::BTreeSet<String> = Default::default();
+
+    // Pre-pass: collect WITH ... AS (...) names so a self-referential
+    // FROM doesn't count as missing.
+    let lower = sql.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    let mut offset = 0;
+    while let Some(pos) = search.find("with ") {
+        let abs = offset + pos + "with ".len();
+        // After "WITH ", expect one or more `<name> AS (...)` separated by commas.
+        // Walk through until we hit a top-level keyword (SELECT/INSERT/etc.).
+        let mut k = abs;
+        loop {
+            // Skip whitespace.
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            // Read an identifier.
+            let id_start = k;
+            while k < bytes.len()
+                && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+            {
+                k += 1;
+            }
+            if id_start == k {
+                break;
+            }
+            let name = sql[id_start..k].to_string();
+            // Skip whitespace.
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            // Expect "AS".
+            if k + 2 > bytes.len()
+                || !sql[k..(k + 2).min(sql.len())]
+                    .eq_ignore_ascii_case("as")
+            {
+                break;
+            }
+            cte_names.insert(name);
+            // Skip past the parenthesised body of the CTE.
+            k += 2;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                let mut depth = 1;
+                k += 1;
+                while k < bytes.len() && depth > 0 {
+                    match bytes[k] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    k += 1;
+                }
+            }
+            // Skip whitespace then optional comma.
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b',' {
+                k += 1;
+                continue;
+            }
+            break;
+        }
+        offset = abs;
+        search = &lower[abs..];
+    }
+
+    // Scan for FROM <ident>. Lowercase form to match case-insensitively.
+    let mut search = lower.as_str();
+    let mut offset = 0;
+    while let Some(pos) = search.find("from") {
+        let abs = offset + pos;
+        // Word boundary checks: the char before must not be alphanumeric
+        // (otherwise this is e.g. `inform`), and the char after `from`
+        // must be whitespace.
+        let before_ok = abs == 0
+            || !(bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_');
+        let after_pos = abs + 4;
+        let after_ok = after_pos < bytes.len() && bytes[after_pos].is_ascii_whitespace();
+        if !(before_ok && after_ok) {
+            offset = abs + 4;
+            search = &lower[offset..];
+            continue;
+        }
+        // Skip whitespace after FROM.
+        i = after_pos;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // If the next char isn't an ident start, skip (function call,
+        // subquery, quoted name, etc.).
+        if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let name = &sql[start..i];
+            // Function call? Skip.
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_function_call = j < bytes.len() && bytes[j] == b'(';
+            if !is_function_call && !cte_names.contains(name) {
+                if !view_or_table_exists(conn, name)? {
+                    return Ok(Some(name.to_string()));
+                }
+            }
+        }
+        offset = i;
+        search = &lower[offset..];
+    }
+    Ok(None)
+}
+
+fn view_or_table_exists(conn: &Connection, name: &str) -> Result<bool, SqlError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM duckdb_views() WHERE view_name = ? \
+             UNION ALL SELECT 1 FROM duckdb_tables() WHERE table_name = ?",
+        )
+        .map_err(|e| SqlError::Backend(format!("view_or_table_exists prepare: {e}")))?;
+    let mut rows = stmt
+        .query([name, name])
+        .map_err(|e| SqlError::Backend(format!("view_or_table_exists query: {e}")))?;
+    Ok(rows
+        .next()
+        .map_err(|e| SqlError::Backend(format!("view_or_table_exists next: {e}")))?
+        .is_some())
+}
+
+fn metric_view_shape(conn: &Connection, metric: &str) -> Result<ViewShape, SqlError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT column_name FROM (DESCRIBE \"{}\") \
+             WHERE column_name IN ('value', 'buckets')",
+            metric.replace('"', "\"\"")
+        ));
+    let mut stmt = match stmt {
+        Ok(s) => s,
+        Err(_) => return Ok(ViewShape::Missing),
+    };
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(_) => return Ok(ViewShape::Missing),
+    };
+    let mut has_value = false;
+    let mut has_buckets = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| SqlError::Backend(format!("metric_view_shape {metric}: {e}")))?
+    {
+        let n: String = row
+            .get(0)
+            .map_err(|e| SqlError::Backend(format!("metric_view_shape get {metric}: {e}")))?;
+        match n.as_str() {
+            "value" => has_value = true,
+            "buckets" => has_buckets = true,
+            _ => {}
+        }
+    }
+    Ok(if has_value {
+        ViewShape::Scalar
+    } else if has_buckets {
+        ViewShape::Histogram
+    } else {
+        ViewShape::Missing
+    })
+}
+
+/// Inspect a per-metric view and return the set of label columns it
+/// carries — i.e. every column except the well-known fixed ones
+/// (`timestamp`, `value`, `buckets`, `p`, `col`). Used by
+/// `interp::interpolate` to gracefully handle WHERE predicates that
+/// reference labels the fixture doesn't expose (PromQL would treat
+/// such a label as the empty string; without this hint DuckDB raises
+/// `Binder Error: Referenced column "..." not found`). Returns an
+/// empty set if the metric view doesn't exist (caller should have
+/// short-circuited via `metric_view_exists` before reaching here).
+fn metric_label_columns(conn: &Connection, metric: &str) -> Result<BTreeSet<String>, SqlError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT column_name FROM (DESCRIBE \"{}\")",
+            metric.replace('"', "\"\"")
+        ))
+        .map_err(|e| SqlError::Backend(format!("describe {metric}: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| SqlError::Backend(format!("describe {metric} query: {e}")))?;
+    let mut out = BTreeSet::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| SqlError::Backend(format!("describe {metric} row: {e}")))?
+    {
+        let name: String = row
+            .get(0)
+            .map_err(|e| SqlError::Backend(format!("describe {metric} get: {e}")))?;
+        if !matches!(
+            name.as_str(),
+            "timestamp" | "value" | "buckets" | "p" | "col"
+        ) {
+            out.insert(name);
+        }
+    }
+    Ok(out)
 }
 
 fn run_matrix(
@@ -221,7 +517,7 @@ fn run_matrix(
     // than threading the real value to make that explicit.
     let mut interpolated_metric: HashMap<String, String> = HashMap::with_capacity(entry.output_metric.len());
     for (k, v) in &entry.output_metric {
-        let resolved = crate::interp::interpolate(v, captures, "")
+        let resolved = crate::interp::interpolate(v, captures, "", None)
             .map_err(|e| SqlError::Backend(format!("interp output_metric[{k}] for {}: {e}", entry.id)))?;
         interpolated_metric.insert(k.clone(), resolved);
     }

@@ -1943,7 +1943,7 @@ description = "Per-grouping-label gauge sum — `sum by (id) (gpu_temperature)` 
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(CAST(value AS DOUBLE)) AS v,
-       {g}
+       {g:as_safe_col}
 FROM {m}
 WHERE value IS NOT NULL
 GROUP BY {g}, timestamp
@@ -1968,7 +1968,7 @@ description = "Per-grouping-label label-filtered gauge sum — `sum by (id) (gpu
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(CAST(value AS DOUBLE)) AS v,
-       {g}
+       {g:as_safe_col}
 FROM {m}
 WHERE value IS NOT NULL
   AND {labels:as_predicate}
@@ -1994,7 +1994,7 @@ description = "Per-grouping-label gauge sum with scalar divisor — `sum by (id)
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(CAST(value AS DOUBLE)) / {d} AS v,
-       {g}
+       {g:as_safe_col}
 FROM {m}
 WHERE value IS NOT NULL
 GROUP BY {g}, timestamp
@@ -2019,7 +2019,7 @@ description = "Per-grouping-label label-filtered gauge sum with scalar divisor."
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(CAST(value AS DOUBLE)) / {d} AS v,
-       {g}
+       {g:as_safe_col}
 FROM {m}
 WHERE value IS NOT NULL
   AND {labels:as_predicate}
@@ -2410,7 +2410,7 @@ WITH per_series AS (
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) AS v,
-       {g}
+       {g:as_safe_col}
 FROM per_series
 WHERE rate IS NOT NULL
 GROUP BY {g}, timestamp
@@ -2448,7 +2448,7 @@ WITH per_series AS (
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) / {d} AS v,
-       {g}
+       {g:as_safe_col}
 FROM per_series
 WHERE rate IS NOT NULL
 GROUP BY {g}, timestamp

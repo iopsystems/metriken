@@ -62,24 +62,21 @@ pub fn try_streaming(
         Built::Series {
             series,
             metric_name,
-            metric_name_for_error,
+            metric_name_for_error: _,
         } => {
+            // An empty result here means the metric exists in the TSDB
+            // (the upstream `counters_ref`/`gauges_ref`/`histograms_ref`
+            // checks already errored out for genuinely-missing metrics)
+            // but the label predicates filtered every series out. Per
+            // Prometheus semantics that's an empty matrix, not an error.
+            // Conflating the two surfaces as `Metric not found` for
+            // viewer queries like `softirq{kind="block"}` against fixtures
+            // that have softirq but no block kind, which the SQL backend
+            // (correctly) returns as empty.
             let collected = collect_to_matrix(series, metric_name);
-            if collected.is_empty() {
-                if let Some(name) = metric_name_for_error {
-                    return Err(QueryError::MetricNotFound(name));
-                }
-                QueryResult::Matrix { result: vec![] }
-            } else {
-                QueryResult::Matrix { result: collected }
-            }
+            QueryResult::Matrix { result: collected }
         }
-        Built::Materialized { result, name } => {
-            if result.is_empty() {
-                return Err(QueryError::MetricNotFound(name));
-            }
-            QueryResult::Matrix { result }
-        }
+        Built::Materialized { result, name: _ } => QueryResult::Matrix { result },
         Built::Scalar(v) => QueryResult::Scalar { result: (start, v) },
     };
     Ok(result)
@@ -290,7 +287,11 @@ where
     match call.func.name {
         "irate" => {
             let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
             };
             let series = irate_counters(
                 collection,
@@ -308,7 +309,11 @@ where
         }
         "rate" => {
             let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
             };
             let series = rate_counters(
                 collection,
@@ -326,7 +331,11 @@ where
         }
         "avg_over_time" => {
             let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
             };
             let series = gauges_avg_over_time(
                 collection,
@@ -344,7 +353,11 @@ where
         }
         "idelta" => {
             let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
             };
             let series = gauges_idelta(
                 collection,
@@ -378,7 +391,11 @@ where
                 });
             }
             let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
             };
             let mut out: SeriesSet<'_> = Vec::new();
             for (labels, series) in collection.iter() {
@@ -438,7 +455,12 @@ where
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let Some(collection) = ctx.tsdb.histograms_ref(metric_name) else {
-        return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        // Match Prometheus + the SQL backend: missing metric → empty
+        // matrix, not an error. This is the histogram_quantile path.
+        return Ok(Built::Materialized {
+            result: Vec::new(),
+            name: metric_name.to_string(),
+        });
     };
     let result = streaming::histogram::quantiles(
         collection,
@@ -468,11 +490,17 @@ where
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
 
-    // Bare counter selectors aren't meaningful in PromQL (rate/irate
-    // are required) and aren't streamed; report MetricNotFound so the
-    // error shape matches an outright-missing metric.
+    // Bare gauge selector. If the metric isn't present, return an empty
+    // matrix (matching Prometheus + the SQL backend) rather than an
+    // error — important for viewer queries that ask for metrics that
+    // exist on some fixtures but not others (the dashboard renders an
+    // empty panel rather than popping an error).
     let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-        return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        return Ok(Built::Series {
+            series: Vec::new(),
+            metric_name: Some(metric_name),
+            metric_name_for_error: None,
+        });
     };
 
     // Mirror the historical staleness rule: at least the step size,

@@ -90,8 +90,15 @@ fn test_simple_rate_query_parsing() {
 
     // Should return MetricNotFound for empty TSDB, but shouldn't crash
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -105,8 +112,15 @@ fn test_simple_metric_query() {
 
     // Should return MetricNotFound for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -120,8 +134,15 @@ fn test_sum_rate_query() {
 
     // Should return MetricNotFound for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -135,8 +156,15 @@ fn test_range_query_delegation() {
 
     // Should return MetricNotFound for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -150,8 +178,15 @@ fn test_label_filtering_in_rate_query() {
 
     // Should return MetricNotFound for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -165,8 +200,15 @@ fn test_label_filtering_in_sum_rate_query() {
 
     // Should return MetricNotFound for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -180,8 +222,15 @@ fn test_simple_metric_with_labels() {
 
     // Should return MetricNotFound for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -218,8 +267,15 @@ fn test_histogram_quantile_parsing() {
 
     // Should return MetricNotFound error for empty TSDB
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
@@ -684,8 +740,15 @@ fn test_avg_over_time_empty_tsdb() {
 
     let result = engine.query_range("avg_over_time(test_gauge[5m])", 0.0, 3600.0, 60.0);
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        Ok(QueryResult::Matrix { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty matrix: {result:?}"
+        ),
+        Ok(QueryResult::Vector { result }) => assert!(
+            result.is_empty(),
+            "expected empty result for empty TSDB, got non-empty vector: {result:?}"
+        ),
+        other => panic!("expected empty result for empty TSDB, got: {other:?}"),
     }
 }
 
