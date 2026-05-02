@@ -17,6 +17,11 @@
 //!   `"..."` quotes and the capture value is the (unescaped) inner text. So a
 //!   template fragment `kind=${k:string}` matches a query fragment `kind="hi"`
 //!   (no quotes on the template side — the placeholder owns them).
+//! - `duration` — PromQL duration literal `<digits><s|m|h|d|w>`. Captured as
+//!   a count of seconds. Common in `[5m]` / `[5s]` window suffixes — one
+//!   templated entry covers both Rust dashboards (`[5m]`) and JSON service
+//!   templates (`[5s]`). Pair with the `as_seconds` SQL transform to emit an
+//!   integer second count.
 //! - `labels`  — full label-set inner text (between the surrounding `{` and
 //!   `}`, which are part of the template literal). The capture value is a
 //!   sorted-by-label-name list of `(name, op, value)` triples.
@@ -52,6 +57,9 @@ pub enum CaptureKind {
     /// value is parsed into a sorted list of `(name, op, value)` triples so
     /// `{a="x", b="y"}` and `{b="y", a="x"}` produce identical captures.
     Labels,
+    /// PromQL duration literal — `<digits><s|m|h|d|w>`. Captured as a count
+    /// of seconds. `5m` → 300, `5s` → 5, `1h` → 3600.
+    Duration,
 }
 
 /// One part of a parsed template — either a chunk of literal text or a named
@@ -105,6 +113,8 @@ pub enum CaptureValue {
     String(String),
     /// Label-set inner text, parsed and sorted by label name.
     Labels(Vec<LabelMatcher>),
+    /// Duration in seconds — `5m` → 300, `5s` → 5.
+    Duration { seconds: u64 },
 }
 
 /// A parsed catalogue template. Built once per entry at catalogue load time.
@@ -121,7 +131,7 @@ pub enum TemplateError {
     EmptyPlaceholder(usize),
     #[error("invalid placeholder name `{0}` (must match [A-Za-z_][A-Za-z0-9_]*)")]
     BadName(String),
-    #[error("unknown capture kind `{0}` (expected ident, number, string, labels)")]
+    #[error("unknown capture kind `{0}` (expected ident, number, string, duration, labels)")]
     UnknownKind(String),
     #[error("duplicate capture name `{0}` in template")]
     DuplicateName(String),
@@ -269,6 +279,7 @@ impl CompiledTemplate {
                         CaptureKind::Ident => scan_ident(&q[pos..])?,
                         CaptureKind::Number => scan_number(&q[pos..])?,
                         CaptureKind::String => scan_string(&q[pos..])?,
+                        CaptureKind::Duration => scan_duration(&q[pos..])?,
                         CaptureKind::Labels => scan_labels(&q[pos..], next_literal)?,
                     };
                     captures.insert(name.clone(), value);
@@ -289,6 +300,7 @@ fn parse_kind(s: &str) -> Result<CaptureKind, TemplateError> {
         "ident" => Ok(CaptureKind::Ident),
         "number" => Ok(CaptureKind::Number),
         "string" => Ok(CaptureKind::String),
+        "duration" => Ok(CaptureKind::Duration),
         "labels" => Ok(CaptureKind::Labels),
         other => Err(TemplateError::UnknownKind(other.to_string())),
     }
@@ -408,6 +420,37 @@ fn scan_number(q: &[u8]) -> Option<(usize, CaptureValue)> {
     let s = std::str::from_utf8(&q[..end]).ok()?;
     let n: f64 = s.parse().ok()?;
     Some((end, CaptureValue::Number(n)))
+}
+
+fn scan_duration(q: &[u8]) -> Option<(usize, CaptureValue)> {
+    // PromQL duration: `<digits><unit>` where unit is one of s, m, h, d, w.
+    // (The Rezolus dashboards only emit `[5m]` and `[5s]`; we accept the
+    // common units for completeness.)
+    if q.is_empty() {
+        return None;
+    }
+    let mut end = 0;
+    while end < q.len() && q[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    if end >= q.len() {
+        return None;
+    }
+    let unit_seconds: u64 = match q[end] {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3_600,
+        b'd' => 86_400,
+        b'w' => 604_800,
+        _ => return None,
+    };
+    let digits = std::str::from_utf8(&q[..end]).ok()?;
+    let n: u64 = digits.parse().ok()?;
+    let seconds = n.checked_mul(unit_seconds)?;
+    Some((end + 1, CaptureValue::Duration { seconds }))
 }
 
 fn scan_string(q: &[u8]) -> Option<(usize, CaptureValue)> {
@@ -690,6 +733,47 @@ mod tests {
             caps.get("s"),
             Some(&CaptureValue::String("redis/total_commands_processed".into()))
         );
+    }
+
+    #[test]
+    fn duration_capture_extracts_seconds_5m() {
+        let c = parse("rate(${m:ident}[${r:duration}])");
+        let caps = c.match_query("rate(requests[5m])").unwrap();
+        assert_eq!(caps.get("r"), Some(&CaptureValue::Duration { seconds: 300 }));
+    }
+
+    #[test]
+    fn duration_capture_extracts_seconds_5s() {
+        let c = parse("rate(${m:ident}[${r:duration}])");
+        let caps = c.match_query("rate(requests[5s])").unwrap();
+        assert_eq!(caps.get("r"), Some(&CaptureValue::Duration { seconds: 5 }));
+    }
+
+    #[test]
+    fn duration_capture_handles_all_units() {
+        let c = parse("foo(${r:duration})");
+        for (q, want_secs) in [
+            ("foo(30s)", 30u64),
+            ("foo(2m)", 120),
+            ("foo(1h)", 3600),
+            ("foo(1d)", 86_400),
+            ("foo(2w)", 1_209_600),
+        ] {
+            let caps = c.match_query(q).expect(q);
+            assert_eq!(
+                caps.get("r"),
+                Some(&CaptureValue::Duration { seconds: want_secs }),
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_capture_rejects_garbage() {
+        let c = parse("foo(${r:duration})");
+        assert!(c.match_query("foo(5x)").is_none());
+        assert!(c.match_query("foo(m)").is_none());
+        assert!(c.match_query("foo(5)").is_none());
     }
 
     #[test]

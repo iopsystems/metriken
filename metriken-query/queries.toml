@@ -373,6 +373,13 @@ mode = "shadow"
 # (metric, quantile) pair. Real Rezolus traffic (e.g.
 # `histogram_quantile(0.99, scheduler_runqueue_latency)`) hits this entry
 # directly without a per-metric catalogue change.
+#
+# Bucket aggregation: metriken-query's `histogram_quantile` semantics sum
+# bucket arrays across ALL matching series (e.g. syscall_latency has one
+# series per `op` label — they're combined into a single histogram before
+# the quantile is computed). The CTE uses `h2_combine(list(buckets))` to
+# do this per timestamp; for single-series metrics like
+# scheduler_runqueue_latency it's a no-op.
 promql = "histogram_quantile(${q:number}, ${m:ident})"
 fixture = "histogram_basic"
 start = 1.0
@@ -380,9 +387,16 @@ end = 10.0
 step = 1.0
 description = "Generic single-quantile extraction over any histogram view. One templated entry covers every (quantile, metric)."
 sql = """
+WITH per_ts AS (
+    SELECT timestamp,
+           h2_combine(list(buckets)) AS buckets,
+           ANY_VALUE(p) AS p
+    FROM {m}
+    GROUP BY timestamp
+)
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        CAST(hist_irate_quantile(buckets, {q}, timestamp, p) AS DOUBLE) AS v
-FROM {m}
+FROM per_ts
 ORDER BY timestamp
 """
 value_columns = ["v"]

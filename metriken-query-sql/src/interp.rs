@@ -9,6 +9,7 @@
 //!     when round-trippable; `1.5e-3` style otherwise — whatever Rust's
 //!     `Display` for `f64` produces).
 //!   - `String(s)` → SQL string literal `'s'` with `'` doubled per ANSI SQL.
+//!   - `Duration { seconds }` → integer second count.
 //!   - `Labels(_)` → error; labels need an explicit transform.
 //! - `{name:as_predicate}` — labels-only; emits a `WHERE`-clause fragment
 //!   joining each `name OP value` predicate with ` AND `. Empty labels emit
@@ -16,6 +17,9 @@
 //!   `regexp_matches(col, 'pat')` / `NOT regexp_matches(col, 'pat')`.
 //! - `{name:as_columns}` — labels-only; emits the comma-separated label
 //!   names. Useful inside `PARTITION BY` / `GROUP BY` clauses.
+//! - `{name:as_seconds}` — duration-only; emits the integer second count
+//!   (same as the default for a Duration capture, kept explicit so callers
+//!   can document intent).
 //! - `{fixture_path}` — preserved special case; substitutes the runtime
 //!   `data_source` path. Not a capture.
 //!
@@ -115,6 +119,8 @@ fn render(
         (CaptureValue::Ident(s), None) => Ok(s.clone()),
         (CaptureValue::Number(n), None) => Ok(format_number(*n)),
         (CaptureValue::String(s), None) => Ok(sql_string_literal(s)),
+        (CaptureValue::Duration { seconds }, None) => Ok(seconds.to_string()),
+        (CaptureValue::Duration { seconds }, Some("as_seconds")) => Ok(seconds.to_string()),
         (CaptureValue::Labels(_), None) => Err(InterpError::MissingTransform {
             name: name.to_string(),
         }),
@@ -199,6 +205,7 @@ fn kind_name(v: &CaptureValue) -> &'static str {
         CaptureValue::Ident(_) => "ident",
         CaptureValue::Number(_) => "number",
         CaptureValue::String(_) => "string",
+        CaptureValue::Duration { .. } => "duration",
         CaptureValue::Labels(_) => "labels",
     }
 }
@@ -298,6 +305,22 @@ mod tests {
             interpolate("PARTITION BY {labels:as_columns}", &c, "").unwrap(),
             "PARTITION BY id, state"
         );
+    }
+
+    #[test]
+    fn duration_capture_emits_integer_seconds_default() {
+        let mut c = caps();
+        c.insert("r".into(), CaptureValue::Duration { seconds: 300 });
+        let s = interpolate("ROWS BETWEEN {r} PRECEDING AND CURRENT ROW", &c, "").unwrap();
+        assert_eq!(s, "ROWS BETWEEN 300 PRECEDING AND CURRENT ROW");
+    }
+
+    #[test]
+    fn duration_capture_as_seconds_transform() {
+        let mut c = caps();
+        c.insert("r".into(), CaptureValue::Duration { seconds: 5 });
+        let s = interpolate("LAG(c, {r:as_seconds})", &c, "").unwrap();
+        assert_eq!(s, "LAG(c, 5)");
     }
 
     #[test]

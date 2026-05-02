@@ -15,14 +15,31 @@ use metriken_query_sql::DuckDbBackend;
 
 #[test]
 fn dump_histogram_quantile_diff() {
+    run_diff_check("histogram_quantile(0.5, scheduler_runqueue_latency)");
+}
+
+#[test]
+fn p99_matches() {
+    run_diff_check("histogram_quantile(0.99, scheduler_runqueue_latency)");
+}
+
+#[test]
+fn whitespace_variant_matches() {
+    run_diff_check("histogram_quantile(0.5,scheduler_runqueue_latency)");
+}
+
+#[test]
+fn syscall_latency_multi_op_series() {
+    run_diff_check("histogram_quantile(0.5, syscall_latency)");
+}
+
+fn run_diff_check(query: &str) {
     let parquet = Path::new("/work/rezolus/site/viewer/data/demo.parquet");
     if !parquet.exists() {
         eprintln!("demo.parquet not present at {}; skipping", parquet.display());
         return;
     }
-
-    // Pick a representative query.
-    let query = "histogram_quantile(0.5, scheduler_runqueue_latency)";
+    eprintln!("\n>>> {query}");
     // Time range matching demo.parquet (~1768956638..1768956939 in seconds).
     let start = 1768956638.0;
     let end = 1768956939.0;
@@ -64,6 +81,17 @@ fn dump_histogram_quantile_diff() {
     };
     summarize("PromQL", &promql_json);
     summarize("SQL", &sql_json);
+
+    // Full byte-equivalence check. After the snap fix, these MUST match.
+    if promql_json != sql_json {
+        let p = serde_json::to_string_pretty(&promql_json).unwrap();
+        let s = serde_json::to_string_pretty(&sql_json).unwrap();
+        eprintln!("=== PromQL JSON ===\n{p}");
+        eprintln!("=== SQL JSON ===\n{s}");
+        panic!("shadow divergence: PromQL ≠ SQL canonical JSON");
+    } else {
+        eprintln!("=== PROMQL == SQL (byte-equivalent canonical JSON) ===");
+    }
 
     // Spot-check: compare the rendered SQL string to confirm interpolation.
     let template = CompiledTemplate::parse(&entry.promql).unwrap();

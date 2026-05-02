@@ -134,11 +134,45 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
         })
         .collect();
 
+    // Sampling interval (ns), pulled from the parquet file-level kv. The
+    // metriken-query loader snaps every parquet timestamp to the nearest
+    // multiple of this interval (`tsdb/mod.rs:50-58`), so the SQL side has
+    // to do the same — otherwise shadow-mode comparison against PromQL diffs
+    // on the timestamp axis even when values agree exactly.
+    let interval_ns: u64 = meta
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kvs| {
+            kvs.iter().find_map(|kv| {
+                if kv.key == "sampling_interval_ms" {
+                    kv.value.as_ref().and_then(|v| v.parse::<u64>().ok())
+                } else {
+                    None
+                }
+            })
+        })
+        .map(|ms| ms * 1_000_000)
+        .unwrap_or(1_000_000_000);
+    let half = interval_ns / 2;
+
     // Single parquet read into an in-memory table. All metric views project
     // from `_src` instead of `read_parquet(...)`, so per-view UNION ALL
     // branches are cheap memory scans, not redundant parquet decodes.
+    //
+    // The `timestamp` column is replaced with its snapped form (round-to-
+    // nearest interval) so SQL queries see the same canonical timestamps
+    // PromQL does.
+    // Use `//` (integer division) — DuckDB's `/` promotes to DOUBLE which
+    // loses precision at parquet-timestamp scale (~1.8e18 ns; DOUBLE has
+    // only ~15.95 significant decimal digits, so the snap would silently
+    // become a no-op and shadow comparison would still diverge).
     let load_src = format!(
-        "CREATE OR REPLACE TEMP TABLE _src AS SELECT * FROM read_parquet('{}')",
+        "CREATE OR REPLACE TEMP TABLE _src AS \
+         SELECT \
+            ((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp, \
+            * EXCLUDE (timestamp) \
+         FROM read_parquet('{}')",
         parquet_path.replace('\'', "''")
     );
     conn.execute(&load_src, [])?;
@@ -326,6 +360,43 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open");
         crate::register_all(&conn).expect("register");
         conn
+    }
+
+    #[test]
+    fn timestamps_are_snapped_to_sampling_interval() {
+        // The synthetic fixtures already have clean integer-second timestamps,
+        // so the snap is a no-op there. This test verifies the snap math and
+        // its DuckDB types directly: a sub-second timestamp must round to the
+        // nearest second in BIGINT (not DOUBLE — DuckDB's `/` would otherwise
+        // promote to DOUBLE and lose precision at 1.8e18 scale).
+        let conn = fresh_conn();
+        let ts: i64 = conn
+            .query_row(
+                // Mirror the views.rs snap formula. 1768956638999716606 is
+                // a real Rezolus timestamp (~1ms shy of the second mark);
+                // it should snap UP to 1768956639_000000000.
+                "SELECT ((1768956638999716606::BIGINT + 500000000) // 1000000000) * 1000000000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts, 1_768_956_639_000_000_000);
+    }
+
+    #[test]
+    fn src_table_carries_snapped_timestamp() {
+        // End-to-end: load a fixture, query MIN(timestamp) % 1e9 from `_src`.
+        // Must be 0 for every row — proof that the snap was applied.
+        let conn = fresh_conn();
+        ensure_views(&conn, fixture_path("counter_basic").to_str().unwrap()).unwrap();
+        let nonzero: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _src WHERE (CAST(timestamp AS BIGINT) % 1000000000) != 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nonzero, 0, "every _src.timestamp must be a clean multiple of 1e9 ns");
     }
 
     #[test]
