@@ -9,17 +9,17 @@
 
 | fixture | size (MB) | Tsdb::load | duck open | duck register | duck views | first PromQL | first SQL |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `AB_base.parquet` | 3.6 | 340.5 ms | 24.0 ms | 6.7 ms | 289.5 ms | 1.8 ms | 254.2 ms |
-| `AB_base_pin.parquet` | 3.1 | 323.5 ms | 11.5 ms | 3.7 ms | 235.0 ms | 0.1 ms | 234.0 ms |
-| `AB_level.parquet` | 3.3 | 330.4 ms | 10.7 ms | 2.9 ms | 226.5 ms | 0.1 ms | 233.0 ms |
-| `AB_level_pin.parquet` | 2.8 | 329.3 ms | 11.1 ms | 2.3 ms | 221.5 ms | 0.2 ms | 228.9 ms |
-| `cachecannon.parquet` | 3.8 | 358.9 ms | 10.2 ms | 2.5 ms | 260.7 ms | 0.2 ms | 268.4 ms |
-| `demo.parquet` | 1.2 | 110.3 ms | 12.3 ms | 3.3 ms | 97.0 ms | 0.2 ms | 110.2 ms |
-| `disagg/disagg-sglang.parquet` | 5.7 | 737.3 ms | 11.1 ms | 4.1 ms | 916.9 ms | 0.4 ms | 1044.8 ms |
-| `disagg/sglang-nixl-16c.parquet` | 16.8 | 2650.6 ms | 28.8 ms | 3.4 ms | 4861.0 ms | 0.9 ms | 3599.9 ms |
-| `sglang_gemma3.parquet` | 2.1 | 296.5 ms | 23.8 ms | 3.6 ms | 426.5 ms | 0.8 ms | 453.9 ms |
-| `vllm.parquet` | 4.0 | 379.2 ms | 19.0 ms | 2.9 ms | 431.6 ms | 0.7 ms | 446.2 ms |
-| `vllm_gemma3.parquet` | 2.1 | 330.2 ms | 18.9 ms | 3.9 ms | 473.7 ms | 0.6 ms | 479.6 ms |
+| `AB_base.parquet` | 3.6 | 329.6 ms | 28.9 ms | 7.4 ms | 258.9 ms | 1.7 ms | 244.5 ms |
+| `AB_base_pin.parquet` | 3.1 | 320.2 ms | 11.7 ms | 3.7 ms | 212.4 ms | 0.1 ms | 226.7 ms |
+| `AB_level.parquet` | 3.3 | 340.8 ms | 9.9 ms | 2.9 ms | 225.7 ms | 0.2 ms | 226.8 ms |
+| `AB_level_pin.parquet` | 2.8 | 314.7 ms | 9.7 ms | 3.0 ms | 223.9 ms | 0.2 ms | 248.3 ms |
+| `cachecannon.parquet` | 3.8 | 359.4 ms | 9.6 ms | 3.1 ms | 275.5 ms | 0.2 ms | 279.0 ms |
+| `demo.parquet` | 1.2 | 110.7 ms | 10.2 ms | 3.2 ms | 101.2 ms | 0.2 ms | 118.6 ms |
+| `disagg/disagg-sglang.parquet` | 5.7 | 753.8 ms | 11.2 ms | 3.0 ms | 888.9 ms | 0.4 ms | 954.3 ms |
+| `disagg/sglang-nixl-16c.parquet` | 16.8 | 2628.9 ms | 26.0 ms | 3.3 ms | 3362.3 ms | 0.9 ms | 3215.5 ms |
+| `sglang_gemma3.parquet` | 2.1 | 289.0 ms | 25.2 ms | 2.8 ms | 491.9 ms | 0.8 ms | 479.4 ms |
+| `vllm.parquet` | 4.0 | 348.4 ms | 19.6 ms | 2.6 ms | 444.7 ms | 1.1 ms | 496.9 ms |
+| `vllm_gemma3.parquet` | 2.1 | 327.2 ms | 19.7 ms | 3.1 ms | 435.4 ms | 0.6 ms | 482.2 ms |
 
 _first-query probe used `(memory_total - memory_available) / memory_total` where it ran cleanly._
 
@@ -29,17 +29,17 @@ Total wall-clock summed across every measured query × rep, per engine.
 
 | fixture | measured | skipped (both err) | promql-only err | sql-only err | catalogue miss | PromQL total (s) | SQL total (s) | sql/promql |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `AB_base.parquet` | 308 | 0 | 5 | 0 | 0 | 0.127 | 1.069 | 8.39× |
-| `AB_base_pin.parquet` | 308 | 0 | 5 | 0 | 0 | 0.127 | 1.050 | 8.30× |
-| `AB_level.parquet` | 308 | 0 | 5 | 0 | 0 | 0.128 | 1.051 | 8.18× |
-| `AB_level_pin.parquet` | 308 | 0 | 5 | 0 | 0 | 0.129 | 1.094 | 8.48× |
-| `cachecannon.parquet` | 308 | 0 | 5 | 0 | 0 | 0.164 | 1.460 | 8.91× |
-| `demo.parquet` | 308 | 0 | 5 | 0 | 0 | 0.084 | 0.531 | 6.35× |
-| `disagg/disagg-sglang.parquet` | 308 | 0 | 5 | 0 | 0 | 0.189 | 1.628 | 8.62× |
-| `disagg/sglang-nixl-16c.parquet` | 308 | 0 | 5 | 0 | 0 | 0.897 | 6.730 | 7.51× |
-| `sglang_gemma3.parquet` | 308 | 0 | 5 | 0 | 0 | 0.157 | 1.521 | 9.68× |
-| `vllm.parquet` | 308 | 0 | 5 | 0 | 0 | 0.222 | 2.029 | 9.14× |
-| `vllm_gemma3.parquet` | 308 | 0 | 5 | 0 | 0 | 0.159 | 1.500 | 9.45× |
+| `AB_base.parquet` | 308 | 0 | 5 | 0 | 0 | 0.113 | 0.737 | 6.51× |
+| `AB_base_pin.parquet` | 308 | 0 | 5 | 0 | 0 | 0.116 | 0.729 | 6.27× |
+| `AB_level.parquet` | 308 | 0 | 5 | 0 | 0 | 0.122 | 0.818 | 6.73× |
+| `AB_level_pin.parquet` | 308 | 0 | 5 | 0 | 0 | 0.116 | 0.792 | 6.84× |
+| `cachecannon.parquet` | 308 | 0 | 5 | 0 | 0 | 0.154 | 1.294 | 8.43× |
+| `demo.parquet` | 308 | 0 | 5 | 0 | 0 | 0.081 | 0.532 | 6.58× |
+| `disagg/disagg-sglang.parquet` | 308 | 0 | 5 | 0 | 0 | 0.174 | 1.329 | 7.66× |
+| `disagg/sglang-nixl-16c.parquet` | 308 | 0 | 5 | 0 | 0 | 0.952 | 4.680 | 4.91× |
+| `sglang_gemma3.parquet` | 308 | 0 | 5 | 0 | 0 | 0.180 | 1.639 | 9.08× |
+| `vllm.parquet` | 308 | 0 | 5 | 0 | 0 | 0.237 | 1.684 | 7.10× |
+| `vllm_gemma3.parquet` | 308 | 0 | 5 | 0 | 0 | 0.155 | 1.259 | 8.11× |
 
 _"skipped (both err)" is dominated by queries referencing metrics absent from the fixture (e.g. GPU queries against a CPU-only recording) — expected. "promql-only err" or "sql-only err" are the alarming categories: an engine that errors where the other doesn't is a divergence worth investigating._
 
@@ -51,529 +51,529 @@ For each catalogue entry id, the median of per-query medians (so an outlier quer
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.37 | 6.14 | 16.69× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.11 | 1.76 | 15.78× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.14 | 1.87 | 13.78× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.13 | 1.72 | 13.44× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.07 | 0.86 | 12.74× |
-| `counter_total_sum_generic` | 11 | 44 | 0.09 | 1.15 | 12.20× |
-| `gauge_subtract` | 1 | 4 | 0.06 | 0.74 | 12.16× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.12 | 1.39 | 11.97× |
-| `counter_ratio_scaled` | 1 | 4 | 0.20 | 2.42 | 11.85× |
-| `memory_util_pct` | 1 | 4 | 0.06 | 0.70 | 11.71× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.23 | 2.68 | 11.58× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.15 | 1.70 | 11.49× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.28 | 3.16 | 11.35× |
-| `counter_irate_total_mul` | 2 | 8 | 0.08 | 0.82 | 10.46× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.23 | 2.31 | 9.98× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.10 | 1.04 | 9.95× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.15 | 1.45 | 9.63× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.12 | 1.11 | 9.14× |
-| `counter_ratio_generic` | 2 | 8 | 0.24 | 2.07 | 8.61× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.08 | 0.66 | 8.35× |
-| `gauge_sum_bare` | 2 | 8 | 0.05 | 0.40 | 7.35× |
-| `gauge_bare` | 10 | 40 | 0.05 | 0.34 | 7.03× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.39 | 2.76 | 7.02× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.16 | 0.43 | 2.67× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.10 | 0.21 | 2.13× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.11 | 0.23 | 2.11× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.07 | 0.09 | 1.30× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.35 | 5.93 | 16.80× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.11 | 1.43 | 12.72× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.12 | 1.49 | 12.49× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.20 | 2.39 | 11.88× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.12 | 1.46 | 11.75× |
+| `memory_util_pct` | 1 | 4 | 0.06 | 0.64 | 11.45× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.14 | 1.54 | 11.37× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.11 | 1.25 | 11.11× |
+| `counter_ratio_scaled` | 1 | 4 | 0.18 | 1.99 | 10.94× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.21 | 2.30 | 10.90× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.07 | 0.80 | 10.85× |
+| `gauge_subtract` | 1 | 4 | 0.06 | 0.61 | 10.71× |
+| `counter_total_sum_generic` | 11 | 44 | 0.09 | 0.96 | 10.63× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.19 | 1.93 | 9.99× |
+| `counter_ratio_generic` | 2 | 8 | 0.17 | 1.73 | 9.91× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.09 | 0.92 | 9.78× |
+| `counter_irate_total_mul` | 2 | 8 | 0.09 | 0.86 | 9.72× |
+| `gauge_sum_bare` | 2 | 8 | 0.04 | 0.35 | 9.28× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.14 | 1.17 | 8.61× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.10 | 0.85 | 8.56× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.07 | 0.56 | 8.48× |
+| `gauge_bare` | 10 | 40 | 0.04 | 0.29 | 7.12× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.39 | 2.42 | 6.22× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.10 | 0.33 | 3.19× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.08 | 0.20 | 2.49× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.19 | 2.05× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.06 | 0.09 | 1.44× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.06 | 0.02 | 0.39× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.07 | 0.02 | 0.31× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.06 | 0.02 | 0.26× |
 | `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.07 | 0.02 | 0.26× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.08 | 0.02 | 0.26× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.06 | 0.01 | 0.25× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.11 | 0.02 | 0.22× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.14 | 0.03 | 0.19× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.05 | 0.00 | 0.07× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.06 | 0.00 | 0.07× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.04 | 0.00 | 0.03× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.03 | 0.00 | 0.03× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.02× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.13 | 0.02 | 0.15× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.05 | 0.00 | 0.09× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.06 | 0.00 | 0.08× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.03 | 0.00 | 0.04× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.03× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.05 | 0.00 | 0.03× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.02× |
 | `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.01× |
-| `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
+| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
 | `gauge_sum_with_labels` | 5 | 20 | 0.04 | 0.00 | 0.01× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
+| `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.01× |
 | `gauge_max_bare` | 1 | 4 | 0.03 | 0.00 | 0.01× |
 
 ### `AB_base_pin.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_generic` | 5 | 20 | 0.11 | 1.71 | 15.25× |
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.35 | 5.07 | 14.30× |
-| `memory_util_pct` | 1 | 4 | 0.06 | 0.79 | 14.10× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.24 | 3.13 | 13.24× |
-| `gauge_subtract` | 1 | 4 | 0.06 | 0.77 | 12.99× |
-| `counter_ratio_scaled` | 1 | 4 | 0.20 | 2.42 | 12.40× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.25 | 3.10 | 12.38× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.08 | 0.97 | 11.52× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.13 | 1.46 | 11.00× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.17 | 1.80 | 10.35× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.13 | 1.36 | 10.34× |
-| `counter_total_sum_generic` | 11 | 44 | 0.10 | 1.02 | 10.33× |
-| `counter_ratio_generic` | 2 | 8 | 0.20 | 2.04 | 10.29× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.11 | 1.15 | 10.28× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.15 | 1.35 | 9.23× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.24 | 2.20 | 9.00× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.15 | 1.15 | 7.75× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.09 | 0.69 | 7.45× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.16 | 1.12 | 7.19× |
-| `gauge_sum_bare` | 2 | 8 | 0.05 | 0.38 | 7.10× |
-| `counter_irate_total_mul` | 2 | 8 | 0.12 | 0.81 | 6.79× |
-| `gauge_bare` | 10 | 40 | 0.04 | 0.30 | 6.77× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.43 | 2.80 | 6.56× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.11 | 0.41 | 3.53× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.20 | 2.31× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.13 | 0.23 | 1.69× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.08 | 0.11 | 1.47× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.08 | 0.03 | 0.33× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.06 | 0.02 | 0.29× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.07 | 0.02 | 0.25× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.10 | 0.02 | 0.22× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.13 | 0.02 | 0.14× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.08 | 0.00 | 0.06× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.35 | 5.29 | 14.91× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.11 | 1.55 | 14.32× |
+| `memory_util_pct` | 1 | 4 | 0.05 | 0.65 | 12.09× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.11 | 1.31 | 12.00× |
+| `counter_ratio_scaled` | 1 | 4 | 0.19 | 2.21 | 11.56× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.11 | 1.27 | 11.35× |
+| `counter_total_sum_generic` | 11 | 44 | 0.09 | 1.02 | 11.28× |
+| `gauge_subtract` | 1 | 4 | 0.06 | 0.60 | 10.76× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.14 | 1.50 | 10.70× |
+| `counter_ratio_generic` | 2 | 8 | 0.18 | 1.86 | 10.47× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.10 | 1.07 | 10.39× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.21 | 2.14 | 10.38× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.07 | 0.68 | 10.35× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.24 | 2.34 | 9.59× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.23 | 2.11 | 9.07× |
+| `counter_irate_total_mul` | 2 | 8 | 0.08 | 0.66 | 8.55× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.11 | 0.91 | 8.10× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.14 | 1.09 | 8.06× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.07 | 0.54 | 8.04× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.12 | 0.94 | 7.53× |
+| `gauge_sum_bare` | 2 | 8 | 0.04 | 0.31 | 7.06× |
+| `gauge_bare` | 10 | 40 | 0.05 | 0.28 | 6.11× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.40 | 2.35 | 5.86× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.12 | 0.35 | 2.95× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.09 | 0.18 | 2.03× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.18 | 1.93× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.06 | 0.08 | 1.25× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.09 | 0.03 | 0.28× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.08 | 0.02 | 0.26× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.06 | 0.01 | 0.25× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.07 | 0.02 | 0.24× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.10 | 0.02 | 0.17× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.05 | 0.00 | 0.07× |
 | `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.07 | 0.00 | 0.05× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.05 | 0.00 | 0.03× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.05 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.05 | 0.00 | 0.02× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.04 | 0.00 | 0.02× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.04 | 0.00 | 0.04× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.03× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.03 | 0.00 | 0.03× |
 | `gauge_max_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.03 | 0.00 | 0.01× |
-| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
+| `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.02× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.05 | 0.00 | 0.02× |
+| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.02× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.01× |
 | `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
 | `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.04 | 0.00 | 0.01× |
 
 ### `AB_level.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_ratio_scaled` | 1 | 4 | 0.20 | 3.00 | 14.68× |
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.45 | 6.21 | 13.90× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.13 | 1.73 | 13.54× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.13 | 1.63 | 12.36× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.12 | 1.51 | 12.30× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.25 | 3.03 | 12.10× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.14 | 1.65 | 12.07× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.23 | 2.66 | 11.77× |
-| `gauge_subtract` | 1 | 4 | 0.07 | 0.80 | 11.33× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.08 | 0.88 | 11.16× |
-| `memory_util_pct` | 1 | 4 | 0.06 | 0.69 | 11.04× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.15 | 1.59 | 10.25× |
-| `counter_total_sum_generic` | 11 | 44 | 0.10 | 0.99 | 9.54× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.10 | 0.97 | 9.41× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.21 | 1.91 | 9.27× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.16 | 1.45 | 9.02× |
-| `counter_ratio_generic` | 2 | 8 | 0.24 | 1.99 | 8.43× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.08 | 0.63 | 7.72× |
-| `counter_irate_total_mul` | 2 | 8 | 0.11 | 0.80 | 7.61× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.13 | 1.01 | 7.50× |
-| `gauge_sum_bare` | 2 | 8 | 0.05 | 0.36 | 6.96× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.44 | 2.82 | 6.34× |
-| `gauge_bare` | 10 | 40 | 0.05 | 0.32 | 6.28× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.13 | 0.42 | 3.17× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.09 | 0.25 | 2.82× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.20 | 2.17× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.11 | 0.10 | 0.90× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.07 | 0.02 | 0.32× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.06 | 0.02 | 0.32× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.09 | 0.02 | 0.26× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.10 | 0.02 | 0.23× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.13 | 0.02 | 0.18× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.35 | 5.70 | 16.10× |
+| `memory_util_pct` | 1 | 4 | 0.05 | 0.79 | 14.85× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.11 | 1.58 | 14.41× |
+| `gauge_subtract` | 1 | 4 | 0.06 | 0.71 | 12.56× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.13 | 1.62 | 12.08× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.14 | 1.58 | 11.70× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.12 | 1.34 | 11.26× |
+| `counter_ratio_scaled` | 1 | 4 | 0.21 | 2.37 | 11.22× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.24 | 2.60 | 11.00× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.15 | 1.56 | 10.78× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.26 | 2.81 | 10.74× |
+| `counter_ratio_generic` | 2 | 8 | 0.20 | 2.03 | 10.27× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.11 | 1.06 | 9.91× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.08 | 0.79 | 9.65× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.11 | 1.05 | 9.43× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.22 | 2.08 | 9.29× |
+| `counter_total_sum_generic` | 11 | 44 | 0.10 | 0.94 | 9.04× |
+| `gauge_sum_bare` | 2 | 8 | 0.05 | 0.42 | 8.54× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.18 | 1.47 | 8.34× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.08 | 0.66 | 8.31× |
+| `counter_irate_total_mul` | 2 | 8 | 0.11 | 0.82 | 7.60× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.40 | 2.68 | 6.79× |
+| `gauge_bare` | 10 | 40 | 0.05 | 0.31 | 6.56× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.12 | 0.41 | 3.38× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.09 | 0.24 | 2.63× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.08 | 0.20 | 2.32× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.08 | 0.11 | 1.38× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.07 | 0.02 | 0.27× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.07 | 0.02 | 0.26× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.09 | 0.02 | 0.25× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.10 | 0.02 | 0.16× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.12 | 0.02 | 0.13× |
 | `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.06 | 0.00 | 0.06× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.06 | 0.00 | 0.05× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.03× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.03× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.05 | 0.00 | 0.02× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.05 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.05 | 0.00 | 0.02× |
-| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.09 | 0.00 | 0.04× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.02× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.06 | 0.00 | 0.02× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.05 | 0.00 | 0.02× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
+| `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.02× |
 | `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.04 | 0.00 | 0.02× |
-| `gauge_max_bare` | 1 | 4 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
+| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
 | `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.04 | 0.00 | 0.01× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.05 | 0.00 | 0.01× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.03 | 0.00 | 0.01× |
 | `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.04 | 0.00 | 0.01× |
+| `gauge_max_bare` | 1 | 4 | 0.04 | 0.00 | 0.01× |
 
 ### `AB_level_pin.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.39 | 5.83 | 15.05× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.13 | 1.75 | 13.99× |
-| `gauge_subtract` | 1 | 4 | 0.06 | 0.78 | 13.22× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.13 | 1.75 | 12.98× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.12 | 1.48 | 12.04× |
-| `memory_util_pct` | 1 | 4 | 0.06 | 0.71 | 11.97× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.14 | 1.65 | 11.97× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.25 | 2.87 | 11.67× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.23 | 2.66 | 11.63× |
-| `counter_ratio_scaled` | 1 | 4 | 0.23 | 2.43 | 10.40× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.11 | 1.07 | 9.95× |
-| `counter_total_sum_generic` | 11 | 44 | 0.11 | 1.13 | 9.94× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.08 | 0.76 | 9.71× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.22 | 2.12 | 9.64× |
-| `counter_ratio_generic` | 2 | 8 | 0.22 | 2.05 | 9.14× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.18 | 1.50 | 8.49× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.09 | 0.71 | 7.82× |
-| `gauge_sum_bare` | 2 | 8 | 0.04 | 0.33 | 7.45× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.16 | 1.12 | 7.22× |
-| `counter_irate_total_mul` | 2 | 8 | 0.11 | 0.77 | 6.71× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.16 | 1.08 | 6.65× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.44 | 2.87 | 6.46× |
-| `gauge_bare` | 10 | 40 | 0.05 | 0.28 | 5.47× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.16 | 0.50 | 3.23× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.09 | 0.26 | 2.75× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.22 | 2.34× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.07 | 0.09 | 1.25× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.05 | 0.02 | 0.41× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.06 | 0.02 | 0.28× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.06 | 0.02 | 0.26× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.13 | 0.02 | 0.19× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.13 | 0.02 | 0.13× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.38 | 5.81 | 15.40× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.11 | 1.61 | 14.63× |
+| `counter_ratio_scaled` | 1 | 4 | 0.17 | 2.35 | 13.87× |
+| `memory_util_pct` | 1 | 4 | 0.06 | 0.74 | 13.08× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.06 | 0.82 | 13.07× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.11 | 1.44 | 12.57× |
+| `counter_total_sum_generic` | 11 | 44 | 0.08 | 1.02 | 12.47× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.12 | 1.46 | 12.16× |
+| `counter_ratio_generic` | 2 | 8 | 0.18 | 2.06 | 11.42× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.10 | 1.17 | 11.38× |
+| `gauge_subtract` | 1 | 4 | 0.06 | 0.70 | 11.31× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.21 | 2.36 | 11.14× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.18 | 2.04 | 11.09× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.25 | 2.65 | 10.59× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.16 | 1.65 | 10.42× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.11 | 1.05 | 9.87× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.13 | 1.24 | 9.51× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.10 | 0.99 | 9.47× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.07 | 0.64 | 8.85× |
+| `gauge_sum_bare` | 2 | 8 | 0.04 | 0.34 | 8.10× |
+| `counter_irate_total_mul` | 2 | 8 | 0.09 | 0.72 | 7.79× |
+| `gauge_bare` | 10 | 40 | 0.04 | 0.31 | 6.89× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.41 | 2.68 | 6.59× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.12 | 0.44 | 3.77× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.20 | 2.24× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.13 | 0.26 | 2.07× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.06 | 0.10 | 1.68× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.07 | 0.03 | 0.35× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.06 | 0.02 | 0.32× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.06 | 0.02 | 0.27× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.06 | 0.01 | 0.25× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.09 | 0.02 | 0.17× |
 | `rezolus_bpf_run_time_sec` | 1 | 4 | 0.05 | 0.00 | 0.07× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.05 | 0.00 | 0.07× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.06 | 0.00 | 0.06× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.03 | 0.00 | 0.03× |
 | `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.03 | 0.00 | 0.03× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.05 | 0.00 | 0.03× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.03× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.03× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.02× |
 | `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.02× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
 | `gauge_max_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.04 | 0.00 | 0.02× |
-| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.01× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.04 | 0.00 | 0.01× |
-| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
-| `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.02× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.03 | 0.00 | 0.01× |
 | `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
+| `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
 
 ### `cachecannon.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 1.31 | 41.34 | 31.67× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.42 | 9.09 | 21.46× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.25 | 4.15 | 16.46× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.70 | 10.20 | 14.57× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.32 | 4.53 | 13.98× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.29 | 4.00 | 13.89× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.20 | 2.63 | 13.35× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.73 | 9.19 | 12.65× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.26 | 3.19 | 12.05× |
-| `counter_ratio_generic` | 2 | 8 | 0.61 | 6.88 | 11.34× |
-| `memory_util_pct` | 1 | 4 | 0.07 | 0.84 | 11.33× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.11 | 1.09 | 9.53× |
-| `counter_ratio_scaled` | 1 | 4 | 0.57 | 5.29 | 9.30× |
-| `counter_total_sum_generic` | 11 | 44 | 0.17 | 1.59 | 9.14× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.50 | 4.37 | 8.76× |
-| `gauge_subtract` | 1 | 4 | 0.09 | 0.78 | 8.43× |
-| `counter_irate_total_mul` | 2 | 8 | 0.11 | 0.88 | 8.16× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.15 | 1.20 | 8.05× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.10 | 0.78 | 7.53× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.14 | 1.05 | 7.28× |
-| `gauge_bare` | 10 | 40 | 0.06 | 0.40 | 7.20× |
-| `gauge_sum_bare` | 2 | 8 | 0.07 | 0.49 | 7.05× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.16 | 0.52 | 3.25× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.11 | 0.24 | 2.24× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.15 | 0.25 | 1.72× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.12 | 0.11 | 0.94× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.12 | 0.11 | 0.90× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.09 | 0.02 | 0.23× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.09 | 0.02 | 0.21× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.12 | 0.02 | 0.13× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.25 | 0.02 | 0.09× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.29 | 0.02 | 0.08× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.10 | 0.00 | 0.04× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.11 | 0.00 | 0.04× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.04 | 0.00 | 0.02× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.39 | 8.96 | 23.26× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.28 | 4.82 | 17.01× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.24 | 4.01 | 16.77× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.18 | 2.73 | 15.24× |
+| `counter_ratio_generic` | 2 | 8 | 0.54 | 8.16 | 15.05× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.24 | 3.43 | 14.13× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.31 | 4.24 | 13.63× |
+| `memory_util_pct` | 1 | 4 | 0.07 | 0.96 | 12.81× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.11 | 1.33 | 12.18× |
+| `counter_total_sum_generic` | 11 | 44 | 0.13 | 1.53 | 11.95× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.76 | 9.01 | 11.83× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.39 | 4.13 | 10.70× |
+| `gauge_subtract` | 1 | 4 | 0.08 | 0.82 | 10.39× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.10 | 1.04 | 10.01× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.70 | 6.99 | 10.00× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.14 | 1.20 | 8.74× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.09 | 0.76 | 8.37× |
+| `counter_ratio_scaled` | 1 | 4 | 0.62 | 5.11 | 8.19× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 1.36 | 11.10 | 8.14× |
+| `counter_irate_total_mul` | 2 | 8 | 0.12 | 0.89 | 7.13× |
+| `gauge_bare` | 10 | 40 | 0.06 | 0.43 | 6.65× |
+| `gauge_sum_bare` | 2 | 8 | 0.07 | 0.44 | 6.48× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.15 | 0.40 | 2.61× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.08 | 0.20 | 2.53× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.10 | 0.22 | 2.26× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.08 | 0.08 | 1.06× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.13 | 0.11 | 0.87× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.08 | 0.02 | 0.23× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.09 | 0.02 | 0.20× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.11 | 0.01 | 0.13× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.24 | 0.02 | 0.08× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.07 | 0.01 | 0.07× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.33 | 0.02 | 0.07× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.06 | 0.00 | 0.06× |
 | `counter_irate_subtract_with_labels` | 2 | 8 | 0.05 | 0.00 | 0.02× |
-| `gauge_max_bare` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.06 | 0.00 | 0.02× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.06 | 0.00 | 0.02× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.04 | 0.00 | 0.02× |
+| `counter_ratio_complement` | 1 | 4 | 0.06 | 0.00 | 0.02× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.05 | 0.00 | 0.02× |
 | `gauge_sum_by_g_bare` | 1 | 4 | 0.04 | 0.00 | 0.01× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.10 | 0.00 | 0.01× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.08 | 0.00 | 0.01× |
 | `gauge_avg_scaled` | 6 | 24 | 0.05 | 0.00 | 0.01× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.06 | 0.00 | 0.01× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.04 | 0.00 | 0.01× |
+| `gauge_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.01× |
 | `gauge_sum_by_g_with_labels` | 6 | 24 | 0.04 | 0.00 | 0.01× |
-| `gauge_sum_scaled` | 1 | 4 | 0.05 | 0.00 | 0.01× |
+| `gauge_max_bare` | 1 | 4 | 0.04 | 0.00 | 0.01× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.05 | 0.00 | 0.01× |
 | `gauge_bare_with_labels` | 56 | 224 | 0.04 | 0.00 | 0.01× |
-| `counter_ratio_complement` | 1 | 4 | 0.09 | 0.00 | 0.01× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.07 | 0.00 | 0.01× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.04 | 0.00 | 0.01× |
 
 ### `demo.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.38 | 6.86 | 17.99× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.05 | 0.85 | 15.73× |
-| `counter_ratio_generic` | 2 | 8 | 0.15 | 2.16 | 14.87× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.13 | 1.85 | 13.86× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.11 | 1.46 | 13.46× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.13 | 1.79 | 13.43× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.13 | 1.64 | 13.03× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.21 | 2.52 | 12.10× |
-| `memory_util_pct` | 1 | 4 | 0.05 | 0.60 | 11.23× |
-| `counter_irate_total_mul` | 2 | 8 | 0.07 | 0.78 | 10.49× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.08 | 0.84 | 10.26× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.13 | 1.37 | 10.24× |
-| `counter_total_sum_generic` | 11 | 44 | 0.07 | 0.72 | 10.11× |
-| `gauge_subtract` | 1 | 4 | 0.06 | 0.56 | 9.72× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.40 | 3.38 | 8.37× |
-| `gauge_sum_bare` | 2 | 8 | 0.05 | 0.36 | 7.38× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.12 | 0.87 | 7.35× |
-| `gauge_bare` | 10 | 40 | 0.04 | 0.19 | 4.64× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.07 | 0.20 | 2.71× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.16 | 0.41 | 2.64× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.10 | 0.24 | 2.53× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.07 | 0.09 | 1.40× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.06 | 0.08 | 1.32× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.04 | 0.02 | 0.41× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.05 | 0.02 | 0.31× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.07 | 0.02 | 0.29× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.07 | 0.01 | 0.21× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.12 | 0.02 | 0.17× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.04 | 0.00 | 0.11× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.05 | 0.00 | 0.09× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.40 | 8.33 | 20.68× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.12 | 1.78 | 14.48× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.06 | 0.83 | 14.46× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.19 | 2.67 | 14.03× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.13 | 1.82 | 13.84× |
+| `counter_ratio_generic` | 2 | 8 | 0.15 | 2.09 | 13.72× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.13 | 1.76 | 13.61× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.11 | 1.42 | 12.71× |
+| `counter_irate_total_mul` | 2 | 8 | 0.07 | 0.78 | 11.80× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.12 | 1.39 | 11.63× |
+| `memory_util_pct` | 1 | 4 | 0.05 | 0.54 | 11.02× |
+| `counter_total_sum_generic` | 11 | 44 | 0.07 | 0.68 | 10.30× |
+| `gauge_subtract` | 1 | 4 | 0.05 | 0.52 | 9.64× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.09 | 0.86 | 9.39× |
+| `gauge_sum_bare` | 2 | 8 | 0.04 | 0.37 | 8.42× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.44 | 3.31 | 7.56× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.15 | 0.93 | 6.29× |
+| `gauge_bare` | 10 | 40 | 0.03 | 0.16 | 4.43× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.11 | 0.45 | 4.15× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.07 | 0.21 | 2.83× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.08 | 0.13 | 1.61× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.06 | 0.10 | 1.61× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.12 | 0.19 | 1.48× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.04 | 0.02 | 0.55× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.05 | 0.02 | 0.37× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.08 | 0.02 | 0.29× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.07 | 0.02 | 0.27× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.10 | 0.02 | 0.16× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.03 | 0.00 | 0.13× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.05 | 0.00 | 0.07× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.03× |
+| `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.03× |
 | `counter_ratio_by_id_complement` | 1 | 4 | 0.04 | 0.00 | 0.03× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.03× |
 | `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.03 | 0.00 | 0.02× |
-| `gauge_max_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.04 | 0.00 | 0.02× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.05 | 0.00 | 0.02× |
-| `counter_ratio_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
 | `counter_irate_by_id_generic` | 5 | 20 | 0.04 | 0.00 | 0.02× |
-| `gauge_avg_scaled` | 6 | 24 | 0.04 | 0.00 | 0.02× |
+| `gauge_avg_scaled` | 6 | 24 | 0.03 | 0.00 | 0.02× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.04 | 0.00 | 0.02× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.05 | 0.00 | 0.02× |
 | `gauge_a_over_a_plus_b` | 1 | 4 | 0.04 | 0.00 | 0.02× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.02× |
-| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.05 | 0.00 | 0.01× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.03 | 0.00 | 0.01× |
-| `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
+| `gauge_max_bare` | 1 | 4 | 0.03 | 0.00 | 0.02× |
+| `counter_ratio_scaled` | 1 | 4 | 0.04 | 0.00 | 0.01× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.03 | 0.00 | 0.01× |
 | `counter_irate_by_id_with_labels` | 6 | 24 | 0.05 | 0.00 | 0.01× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.03 | 0.00 | 0.01× |
+| `gauge_bare_with_labels` | 56 | 224 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.03 | 0.00 | 0.01× |
+| `gauge_sum_scaled` | 1 | 4 | 0.03 | 0.00 | 0.01× |
 
 ### `disagg/disagg-sglang.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.38 | 9.48 | 24.83× |
-| `counter_irate_by_id_scaled` | 2 | 8 | 1.01 | 19.89 | 19.61× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.24 | 3.05 | 12.61× |
-| `counter_ratio_scaled` | 1 | 4 | 0.33 | 4.08 | 12.51× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.26 | 3.20 | 12.17× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.15 | 1.72 | 11.55× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.11 | 1.27 | 11.33× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.22 | 2.49 | 11.29× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.26 | 2.87 | 11.20× |
-| `memory_util_pct` | 1 | 4 | 0.08 | 0.92 | 10.87× |
-| `counter_total_sum_generic` | 11 | 44 | 0.13 | 1.35 | 10.53× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.40 | 3.98 | 10.07× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.13 | 1.20 | 9.45× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.10 | 0.94 | 9.27× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.27 | 2.49 | 9.08× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.12 | 1.00 | 8.68× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.10 | 0.85 | 8.38× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.24 | 1.96 | 8.11× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.44 | 3.49 | 7.96× |
-| `gauge_subtract` | 1 | 4 | 0.10 | 0.72 | 7.48× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.16 | 1.18 | 7.45× |
-| `counter_irate_total_mul` | 2 | 8 | 0.12 | 0.88 | 7.39× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.07 | 0.43 | 6.37× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.19 | 1.22 | 6.37× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.09 | 0.50 | 5.76× |
-| `gauge_sum_bare` | 2 | 8 | 0.10 | 0.49 | 5.08× |
-| `gauge_sum_scaled` | 1 | 4 | 0.08 | 0.43 | 5.03× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.09 | 0.45 | 5.03× |
-| `gauge_bare` | 10 | 40 | 0.08 | 0.40 | 4.91× |
-| `gauge_max_bare` | 1 | 4 | 0.12 | 0.42 | 3.67× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.12 | 0.21 | 1.79× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.11 | 0.18 | 1.70× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.10 | 0.03 | 0.30× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.11 | 0.03 | 0.24× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.09 | 0.02 | 0.22× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.14 | 0.03 | 0.20× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.15 | 0.02 | 0.13× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.07 | 0.01 | 0.08× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.08 | 0.00 | 0.06× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.08 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.08 | 0.00 | 0.02× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.10 | 0.00 | 0.02× |
-| `counter_ratio_generic` | 2 | 8 | 0.11 | 0.00 | 0.01× |
-| `gauge_avg_scaled` | 6 | 24 | 0.08 | 0.00 | 0.01× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.20 | 7.54 | 36.82× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.10 | 1.27 | 13.35× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.19 | 2.47 | 12.71× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.24 | 3.09 | 12.70× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.14 | 1.75 | 12.56× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.36 | 4.28 | 11.88× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.25 | 2.93 | 11.64× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.27 | 2.89 | 10.91× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.22 | 2.16 | 9.98× |
+| `counter_total_sum_generic` | 11 | 44 | 0.14 | 1.36 | 9.98× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.10 | 0.92 | 9.64× |
+| `memory_util_pct` | 1 | 4 | 0.07 | 0.68 | 9.52× |
+| `counter_irate_total_mul` | 2 | 8 | 0.10 | 0.90 | 9.46× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.24 | 2.27 | 9.41× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.12 | 1.13 | 9.26× |
+| `counter_ratio_scaled` | 1 | 4 | 0.32 | 2.96 | 9.19× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.42 | 3.73 | 8.90× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.09 | 0.83 | 8.77× |
+| `gauge_subtract` | 1 | 4 | 0.08 | 0.70 | 8.43× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.11 | 0.80 | 7.62× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.14 | 1.08 | 7.60× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.07 | 0.51 | 7.27× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.94 | 6.22 | 6.59× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.17 | 1.06 | 6.39× |
+| `gauge_max_bare` | 1 | 4 | 0.07 | 0.42 | 6.06× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.10 | 0.57 | 5.50× |
+| `gauge_sum_bare` | 2 | 8 | 0.09 | 0.46 | 5.27× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.08 | 0.44 | 5.22× |
+| `gauge_bare` | 10 | 40 | 0.07 | 0.35 | 4.86× |
+| `gauge_sum_scaled` | 1 | 4 | 0.08 | 0.35 | 4.30× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.09 | 0.17 | 1.90× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.11 | 0.19 | 1.80× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.08 | 0.02 | 0.26× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.09 | 0.02 | 0.26× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.10 | 0.02 | 0.26× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.10 | 0.02 | 0.20× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.11 | 0.02 | 0.17× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.05 | 0.01 | 0.11× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.07 | 0.00 | 0.07× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.05 | 0.00 | 0.04× |
+| `counter_ratio_complement` | 1 | 4 | 0.05 | 0.00 | 0.02× |
+| `counter_ratio_generic` | 2 | 8 | 0.10 | 0.00 | 0.02× |
+| `gauge_avg_scaled` | 6 | 24 | 0.06 | 0.00 | 0.02× |
 | `counter_ratio_by_id_generic` | 2 | 8 | 0.11 | 0.00 | 0.01× |
-| `gauge_bare_with_labels` | 56 | 224 | 0.05 | 0.00 | 0.01× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.17 | 0.00 | 0.01× |
+| `gauge_bare_with_labels` | 56 | 224 | 0.04 | 0.00 | 0.01× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.11 | 0.00 | 0.01× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.15 | 0.00 | 0.01× |
 | `gauge_sum_by_g_scaled` | 7 | 28 | 0.08 | 0.00 | 0.01× |
 
 ### `disagg/sglang-nixl-16c.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `rezolus_cpu_ipns` | 1 | 4 | 0.36 | 19.43 | 53.27× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.25 | 10.29 | 41.22× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.86 | 19.53 | 22.58× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.27 | 4.76 | 17.67× |
-| `counter_irate_by_id_scaled` | 2 | 8 | 5.42 | 69.25 | 12.79× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.19 | 2.09 | 11.05× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.45 | 4.77 | 10.68× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.99 | 10.44 | 10.54× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.81 | 7.75 | 9.59× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.79 | 7.52 | 9.51× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.14 | 1.25 | 8.73× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.18 | 1.52 | 8.60× |
-| `gauge_subtract` | 1 | 4 | 0.15 | 1.26 | 8.57× |
-| `memory_util_pct` | 1 | 4 | 0.18 | 1.45 | 8.25× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 1.08 | 8.68 | 8.07× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.67 | 5.24 | 7.83× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 1.01 | 7.88 | 7.81× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.16 | 1.25 | 7.67× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 2.38 | 18.22 | 7.64× |
-| `counter_total_sum_generic` | 11 | 44 | 0.37 | 2.81 | 7.59× |
-| `gauge_bare` | 10 | 40 | 0.11 | 0.83 | 7.39× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.26 | 1.91 | 7.28× |
-| `counter_ratio_generic` | 2 | 8 | 0.80 | 5.32 | 6.66× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.21 | 1.32 | 6.34× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.13 | 0.77 | 5.85× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.12 | 0.68 | 5.81× |
-| `counter_irate_total_mul` | 2 | 8 | 0.21 | 1.22 | 5.74× |
-| `gauge_max_bare` | 1 | 4 | 0.10 | 0.55 | 5.71× |
-| `counter_ratio_scaled` | 1 | 4 | 0.85 | 4.65 | 5.45× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 1.43 | 7.74 | 5.42× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 2.81 | 14.87 | 5.30× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 4.12 | 20.11 | 4.88× |
-| `gauge_sum_bare` | 2 | 8 | 0.13 | 0.64 | 4.85× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.12 | 0.55 | 4.70× |
-| `gauge_sum_scaled` | 1 | 4 | 0.13 | 0.58 | 4.36× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.41 | 1.51 | 3.73× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.61 | 2.02 | 3.29× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.15 | 0.23 | 1.52× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.15 | 0.21 | 1.46× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.31 | 0.43 | 1.36× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.10 | 0.02 | 0.18× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.07 | 0.00 | 0.05× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.09 | 0.00 | 0.05× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.21 | 15.20 | 72.78× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.30 | 21.49 | 71.43× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.73 | 25.17 | 34.64× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.30 | 6.34 | 21.24× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.48 | 6.74 | 14.13× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.13 | 1.79 | 13.28× |
+| `counter_total_sum_generic` | 11 | 44 | 0.34 | 3.76 | 11.20× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.20 | 2.18 | 11.09× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 1.06 | 11.63 | 11.00× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.81 | 8.02 | 9.91× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 1.08 | 10.55 | 9.80× |
+| `gauge_subtract` | 1 | 4 | 0.21 | 1.92 | 8.97× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.79 | 6.99 | 8.83× |
+| `memory_util_pct` | 1 | 4 | 0.19 | 1.62 | 8.73× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.71 | 5.89 | 8.32× |
+| `gauge_bare` | 10 | 40 | 0.11 | 0.87 | 8.09× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 1.13 | 8.78 | 7.80× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.17 | 1.31 | 7.75× |
+| `counter_irate_total_mul` | 2 | 8 | 0.23 | 1.78 | 7.67× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 1.40 | 9.48 | 6.79× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 3.96 | 26.73 | 6.75× |
+| `counter_ratio_scaled` | 1 | 4 | 0.90 | 6.01 | 6.71× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.21 | 1.41 | 6.63× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.21 | 1.39 | 6.60× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 2.99 | 18.84 | 6.30× |
+| `counter_ratio_generic` | 2 | 8 | 0.94 | 5.64 | 6.01× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 2.31 | 13.66 | 5.92× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.38 | 2.13 | 5.61× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 5.16 | 27.59 | 5.35× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.44 | 2.17 | 4.91× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.15 | 0.74 | 4.83× |
+| `gauge_max_bare` | 1 | 4 | 0.12 | 0.58 | 4.64× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.14 | 0.65 | 4.58× |
+| `gauge_sum_bare` | 2 | 8 | 0.15 | 0.65 | 4.39× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.12 | 0.54 | 4.37× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.69 | 2.72 | 3.96× |
+| `gauge_sum_scaled` | 1 | 4 | 0.15 | 0.51 | 3.33× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.14 | 0.21 | 1.44× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.14 | 0.19 | 1.40× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.27 | 0.37 | 1.36× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.09 | 0.02 | 0.21× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.08 | 0.01 | 0.06× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.08 | 0.00 | 0.05× |
+| `counter_ratio_complement` | 1 | 4 | 0.07 | 0.00 | 0.03× |
 | `counter_ratio_by_id_complement` | 1 | 4 | 0.07 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.08 | 0.00 | 0.02× |
+| `gauge_bare_with_labels` | 56 | 224 | 0.05 | 0.00 | 0.01× |
 | `gauge_avg_scaled` | 6 | 24 | 0.08 | 0.00 | 0.01× |
-| `gauge_bare_with_labels` | 56 | 224 | 0.06 | 0.00 | 0.01× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.11 | 0.00 | 0.01× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.13 | 0.00 | 0.01× |
 
 ### `sglang_gemma3.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.49 | 12.92 | 26.26× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.45 | 8.12 | 18.01× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.60 | 10.22 | 17.00× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.35 | 5.70 | 16.17× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.22 | 3.57 | 15.96× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.21 | 3.36 | 15.93× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.19 | 2.87 | 15.34× |
-| `counter_ratio_scaled` | 1 | 4 | 0.22 | 3.30 | 15.04× |
-| `counter_ratio_generic` | 2 | 8 | 0.29 | 4.35 | 14.92× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.26 | 3.93 | 14.83× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.38 | 5.29 | 13.85× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.08 | 1.08 | 12.99× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.07 | 0.87 | 12.91× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.09 | 1.10 | 12.88× |
-| `memory_util_pct` | 1 | 4 | 0.06 | 0.75 | 12.51× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.80 | 9.74 | 12.12× |
-| `counter_total_sum_generic` | 11 | 44 | 0.15 | 1.68 | 11.46× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.18 | 2.02 | 11.21× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.08 | 0.85 | 10.24× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.11 | 1.02 | 9.47× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.25 | 2.32 | 9.31× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.46 | 3.78 | 8.15× |
-| `gauge_subtract` | 1 | 4 | 0.08 | 0.69 | 8.14× |
-| `counter_irate_total_mul` | 2 | 8 | 0.10 | 0.80 | 7.83× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.10 | 0.68 | 7.16× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.15 | 0.99 | 6.79× |
-| `gauge_bare` | 10 | 40 | 0.07 | 0.41 | 5.74× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.08 | 0.45 | 5.70× |
-| `gauge_max_bare` | 1 | 4 | 0.08 | 0.45 | 5.57× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.07 | 0.40 | 5.42× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.09 | 0.46 | 5.34× |
-| `gauge_avg_scaled` | 6 | 24 | 0.08 | 0.41 | 4.99× |
-| `gauge_sum_bare` | 2 | 8 | 0.11 | 0.49 | 4.53× |
-| `gauge_sum_scaled` | 1 | 4 | 0.08 | 0.37 | 4.53× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.09 | 0.38 | 4.32× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.16 | 0.41 | 2.61× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.10 | 0.19 | 1.85× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.14 | 0.24 | 1.73× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.11 | 0.12 | 1.05× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.14 | 0.12 | 0.87× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.14 | 0.11 | 0.75× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.08 | 0.02 | 0.23× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.06 | 0.00 | 0.07× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.07 | 0.00 | 0.06× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.06 | 0.00 | 0.03× |
-| `counter_irate_subtract_with_labels` | 2 | 8 | 0.04 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.06 | 0.00 | 0.02× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.29 | 6.27 | 21.64× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.39 | 7.64 | 19.55× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.62 | 11.21 | 18.16× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.24 | 3.92 | 16.47× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.84 | 13.72 | 16.24× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.58 | 8.89 | 15.44× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.45 | 6.90 | 15.39× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.52 | 7.65 | 14.75× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.25 | 3.73 | 14.65× |
+| `counter_ratio_scaled` | 1 | 4 | 0.25 | 3.57 | 14.19× |
+| `counter_ratio_generic` | 2 | 8 | 0.38 | 5.30 | 13.87× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.08 | 1.10 | 13.17× |
+| `memory_util_pct` | 1 | 4 | 0.06 | 0.83 | 13.03× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.10 | 1.33 | 12.88× |
+| `counter_total_sum_generic` | 11 | 44 | 0.18 | 2.15 | 12.03× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.52 | 5.64 | 10.95× |
+| `gauge_subtract` | 1 | 4 | 0.08 | 0.83 | 10.89× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.31 | 3.32 | 10.80× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.12 | 1.32 | 10.63× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.21 | 2.11 | 10.21× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.35 | 3.16 | 9.10× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.14 | 1.28 | 8.96× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.10 | 0.87 | 8.63× |
+| `counter_irate_total_mul` | 2 | 8 | 0.12 | 1.07 | 8.59× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.11 | 0.87 | 7.91× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.08 | 0.46 | 6.12× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.12 | 0.71 | 6.12× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.10 | 0.50 | 4.82× |
+| `gauge_sum_bare` | 2 | 8 | 0.10 | 0.45 | 4.51× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.10 | 0.42 | 4.13× |
+| `gauge_avg_scaled` | 6 | 24 | 0.09 | 0.38 | 4.09× |
+| `gauge_max_bare` | 1 | 4 | 0.11 | 0.41 | 3.71× |
+| `gauge_bare` | 10 | 40 | 0.09 | 0.32 | 3.43× |
+| `gauge_sum_scaled` | 1 | 4 | 0.12 | 0.38 | 3.33× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.11 | 0.36 | 3.22× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.15 | 0.46 | 3.05× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.15 | 0.25 | 1.63× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.15 | 0.22 | 1.48× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.11 | 0.09 | 0.76× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.15 | 0.11 | 0.76× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.15 | 0.10 | 0.66× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.14 | 0.03 | 0.19× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.08 | 0.00 | 0.06× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.10 | 0.00 | 0.05× |
+| `counter_irate_subtract_with_labels` | 2 | 8 | 0.06 | 0.00 | 0.02× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.11 | 0.00 | 0.01× |
+| `counter_ratio_complement` | 1 | 4 | 0.11 | 0.00 | 0.01× |
 | `gauge_bare_with_labels` | 56 | 224 | 0.04 | 0.00 | 0.01× |
 
 ### `vllm.parquet`
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.73 | 14.25 | 19.42× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.21 | 3.82 | 18.02× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.45 | 7.43 | 16.69× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.30 | 3.82 | 12.76× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.08 | 0.98 | 11.64× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.47 | 5.48 | 11.60× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.49 | 5.61 | 11.37× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.11 | 1.18 | 10.85× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 1.03 | 11.19 | 10.82× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.77 | 8.22 | 10.72× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.28 | 2.94 | 10.54× |
-| `counter_total_sum_generic` | 11 | 44 | 0.21 | 1.97 | 9.33× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.20 | 1.77 | 8.87× |
-| `counter_ratio_generic` | 2 | 8 | 0.44 | 3.85 | 8.84× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.31 | 2.67 | 8.66× |
-| `gauge_subtract` | 1 | 4 | 0.08 | 0.64 | 7.64× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.84 | 6.43 | 7.62× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.16 | 1.23 | 7.58× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.24 | 1.84 | 7.56× |
-| `counter_irate_total_mul` | 2 | 8 | 0.12 | 0.90 | 7.46× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.74 | 5.21 | 7.07× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.19 | 1.35 | 7.00× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.20 | 1.37 | 6.73× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.11 | 0.71 | 6.53× |
-| `memory_util_pct` | 1 | 4 | 0.09 | 0.62 | 6.50× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.20 | 1.26 | 6.40× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.14 | 0.82 | 5.97× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.09 | 0.51 | 5.43× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.09 | 0.46 | 5.08× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.11 | 0.54 | 4.99× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.10 | 0.46 | 4.50× |
-| `gauge_avg_scaled` | 6 | 24 | 0.09 | 0.41 | 4.47× |
-| `gauge_sum_bare` | 2 | 8 | 0.14 | 0.55 | 4.03× |
-| `gauge_max_bare` | 1 | 4 | 0.12 | 0.42 | 3.69× |
-| `gauge_sum_scaled` | 1 | 4 | 0.12 | 0.41 | 3.35× |
-| `gauge_bare` | 10 | 40 | 0.07 | 0.23 | 3.17× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.20 | 0.41 | 2.03× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.14 | 0.24 | 1.70× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.18 | 0.25 | 1.39× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.09 | 0.02 | 0.19× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.06 | 0.00 | 0.08× |
-| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.08 | 0.00 | 0.06× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 1.11 | 13.45 | 12.16× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.82 | 9.45 | 11.54× |
+| `counter_ratio_generic` | 2 | 8 | 0.36 | 4.13 | 11.39× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.48 | 5.47 | 11.35× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.30 | 3.33 | 11.13× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.37 | 4.08 | 10.94× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.51 | 5.39 | 10.68× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.19 | 1.96 | 10.51× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.76 | 7.70 | 10.10× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.15 | 1.46 | 10.04× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.09 | 0.92 | 9.83× |
+| `counter_total_sum_generic` | 11 | 44 | 0.20 | 1.96 | 9.69× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.81 | 7.75 | 9.60× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.36 | 3.40 | 9.53× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.60 | 5.52 | 9.28× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.11 | 0.92 | 8.60× |
+| `counter_irate_total_mul` | 2 | 8 | 0.10 | 0.85 | 8.51× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.24 | 1.98 | 8.32× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.17 | 1.39 | 8.05× |
+| `gauge_subtract` | 1 | 4 | 0.09 | 0.69 | 7.74× |
+| `memory_util_pct` | 1 | 4 | 0.11 | 0.80 | 7.44× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.26 | 1.87 | 7.20× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.17 | 1.22 | 7.15× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.77 | 5.49 | 7.10× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.11 | 0.74 | 6.79× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.20 | 1.36 | 6.64× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.19 | 1.26 | 6.63× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.09 | 0.49 | 5.64× |
+| `gauge_max_bare` | 1 | 4 | 0.11 | 0.52 | 4.77× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.10 | 0.48 | 4.72× |
+| `gauge_sum_scaled` | 1 | 4 | 0.09 | 0.42 | 4.56× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.11 | 0.45 | 4.11× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.12 | 0.44 | 3.64× |
+| `gauge_avg_scaled` | 6 | 24 | 0.13 | 0.47 | 3.54× |
+| `gauge_bare` | 10 | 40 | 0.10 | 0.29 | 2.93× |
+| `gauge_sum_bare` | 2 | 8 | 0.17 | 0.46 | 2.76× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.13 | 0.22 | 1.73× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.27 | 0.47 | 1.72× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.14 | 0.22 | 1.54× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.14 | 0.02 | 0.14× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.07 | 0.00 | 0.07× |
+| `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.12 | 0.00 | 0.04× |
 | `counter_irate_subtract_with_labels` | 2 | 8 | 0.05 | 0.00 | 0.03× |
-| `counter_ratio_by_id_complement` | 1 | 4 | 0.06 | 0.00 | 0.03× |
-| `counter_ratio_complement` | 1 | 4 | 0.07 | 0.00 | 0.02× |
+| `counter_ratio_by_id_complement` | 1 | 4 | 0.10 | 0.00 | 0.01× |
 | `gauge_bare_with_labels` | 56 | 224 | 0.04 | 0.00 | 0.01× |
+| `counter_ratio_complement` | 1 | 4 | 0.11 | 0.00 | 0.01× |
 | `counter_ratio_by_id_scaled` | 1 | 4 | 0.14 | 0.00 | 0.01× |
 | `counter_ratio_scaled` | 1 | 4 | 0.14 | 0.00 | 0.01× |
 
@@ -581,53 +581,53 @@ For each catalogue entry id, the median of per-query medians (so an outlier quer
 
 | entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |
 |---|---:|---:|---:|---:|---:|
-| `counter_irate_by_id_scaled` | 2 | 8 | 0.55 | 13.88 | 25.33× |
-| `rezolus_cpu_ipns` | 1 | 4 | 0.54 | 10.85 | 19.97× |
-| `counter_irate_by_id_with_labels` | 6 | 24 | 0.23 | 4.28 | 18.41× |
-| `counter_ratio_generic` | 2 | 8 | 0.26 | 3.85 | 14.65× |
-| `counter_irate_by_id_generic` | 5 | 20 | 0.20 | 2.80 | 14.25× |
-| `counter_rate_bare_generic` | 2 | 8 | 0.07 | 1.01 | 13.78× |
-| `counter_rate_sum_scaled` | 1 | 4 | 0.07 | 0.97 | 13.26× |
-| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.75 | 9.79 | 13.12× |
-| `counter_ratio_by_id_scaled` | 1 | 4 | 0.27 | 3.42 | 12.72× |
-| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.52 | 6.56 | 12.57× |
-| `counter_ratio_by_id_generic` | 2 | 8 | 0.40 | 4.98 | 12.38× |
-| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.40 | 4.94 | 12.29× |
-| `rezolus_cpu_user_per_id` | 1 | 4 | 0.25 | 3.03 | 11.93× |
-| `gauge_a_over_a_plus_b` | 1 | 4 | 0.09 | 1.07 | 11.92× |
-| `counter_irate_with_labels_scaled` | 3 | 12 | 0.20 | 2.39 | 11.87× |
-| `memory_util_pct` | 1 | 4 | 0.06 | 0.73 | 11.57× |
-| `counter_ratio_scaled` | 1 | 4 | 0.25 | 2.86 | 11.23× |
-| `counter_irate_total_scaled` | 1 | 4 | 0.07 | 0.80 | 10.72× |
-| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.07 | 0.79 | 10.67× |
-| `counter_total_sum_generic` | 11 | 44 | 0.16 | 1.71 | 10.52× |
-| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.18 | 1.73 | 9.69× |
-| `gauge_subtract` | 1 | 4 | 0.06 | 0.60 | 9.42× |
-| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.14 | 1.33 | 9.29× |
-| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.17 | 1.52 | 9.11× |
-| `softirq_irate_total_by_kind` | 10 | 40 | 0.15 | 1.29 | 8.73× |
-| `counter_irate_ratio_with_labels` | 3 | 12 | 0.11 | 0.97 | 8.57× |
-| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.56 | 4.74 | 8.44× |
-| `counter_irate_total_mul` | 2 | 8 | 0.10 | 0.77 | 7.37× |
-| `counter_irate_sum_with_labels` | 85 | 340 | 0.09 | 0.63 | 7.22× |
-| `gauge_max_bare` | 1 | 4 | 0.06 | 0.36 | 5.62× |
-| `gauge_bare` | 10 | 40 | 0.06 | 0.34 | 5.40× |
-| `gauge_sum_by_g_scaled` | 7 | 28 | 0.07 | 0.37 | 5.26× |
-| `gauge_sum_by_g_bare` | 1 | 4 | 0.08 | 0.40 | 5.14× |
-| `gauge_avg_scaled` | 6 | 24 | 0.08 | 0.37 | 4.88× |
-| `gauge_sum_scaled` | 1 | 4 | 0.07 | 0.35 | 4.80× |
-| `gauge_sum_with_labels` | 5 | 20 | 0.07 | 0.33 | 4.63× |
-| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.10 | 0.41 | 4.25× |
-| `gauge_sum_bare` | 2 | 8 | 0.09 | 0.37 | 4.06× |
-| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.20 | 0.45 | 2.18× |
-| `counter_irate_by_g_with_labels` | 20 | 80 | 0.10 | 0.19 | 1.84× |
-| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.12 | 0.20 | 1.73× |
-| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.08 | 0.02 | 0.20× |
-| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.06 | 0.00 | 0.07× |
+| `counter_irate_by_id_with_labels` | 6 | 24 | 0.23 | 3.58 | 15.78× |
+| `counter_irate_with_labels_scaled` | 3 | 12 | 0.17 | 2.39 | 13.67× |
+| `counter_ratio_by_id_scaled` | 1 | 4 | 0.23 | 3.10 | 13.35× |
+| `counter_ratio_generic` | 2 | 8 | 0.28 | 3.67 | 13.16× |
+| `rezolus_cpu_ipns_per_id` | 1 | 4 | 0.75 | 9.63 | 12.81× |
+| `rezolus_cpu_ipns` | 1 | 4 | 0.56 | 7.10 | 12.71× |
+| `counter_ratio_by_id_generic` | 2 | 8 | 0.36 | 4.57 | 12.71× |
+| `counter_rate_sum_scaled` | 1 | 4 | 0.08 | 0.98 | 12.44× |
+| `counter_irate_by_id_scaled` | 2 | 8 | 0.54 | 6.47 | 12.07× |
+| `rezolus_cpu_aperf_chain_total` | 1 | 4 | 0.38 | 4.55 | 11.86× |
+| `counter_ratio_scaled` | 1 | 4 | 0.20 | 2.37 | 11.80× |
+| `counter_irate_by_id_generic` | 5 | 20 | 0.22 | 2.56 | 11.67× |
+| `memory_util_pct` | 1 | 4 | 0.07 | 0.76 | 11.30× |
+| `rezolus_cpu_user_per_id` | 1 | 4 | 0.20 | 2.22 | 11.24× |
+| `gauge_subtract` | 1 | 4 | 0.07 | 0.75 | 11.20× |
+| `counter_total_sum_generic` | 11 | 44 | 0.15 | 1.65 | 10.88× |
+| `counter_irate_total_scaled` | 1 | 4 | 0.07 | 0.80 | 10.66× |
+| `gauge_ratio_with_labels_ignoring` | 2 | 8 | 0.07 | 0.77 | 10.31× |
+| `rezolus_cpu_aperf_chain_per_id` | 1 | 4 | 0.54 | 5.44 | 10.16× |
+| `softirq_time_pct_by_id_by_kind` | 10 | 40 | 0.15 | 1.47 | 9.63× |
+| `softirq_irate_total_by_kind` | 10 | 40 | 0.15 | 1.41 | 9.61× |
+| `gauge_a_over_a_plus_b` | 1 | 4 | 0.10 | 0.93 | 9.61× |
+| `counter_irate_total_per_cpu_core_pct` | 2 | 8 | 0.51 | 4.69 | 9.16× |
+| `counter_rate_bare_generic` | 2 | 8 | 0.12 | 1.10 | 9.01× |
+| `counter_irate_with_labels_per_cpu_core_pct` | 12 | 48 | 0.19 | 1.67 | 8.94× |
+| `softirq_irate_by_id_by_kind` | 10 | 40 | 0.18 | 1.48 | 8.32× |
+| `counter_irate_ratio_with_labels` | 3 | 12 | 0.12 | 0.98 | 8.18× |
+| `counter_irate_sum_with_labels` | 85 | 340 | 0.09 | 0.65 | 7.32× |
+| `counter_irate_total_mul` | 2 | 8 | 0.12 | 0.81 | 6.84× |
+| `gauge_sum_by_g_bare` | 1 | 4 | 0.07 | 0.43 | 6.28× |
+| `gauge_sum_scaled` | 1 | 4 | 0.06 | 0.37 | 5.69× |
+| `gauge_bare` | 10 | 40 | 0.06 | 0.34 | 5.33× |
+| `gauge_sum_by_g_scaled` | 7 | 28 | 0.08 | 0.43 | 5.32× |
+| `gauge_avg_scaled` | 6 | 24 | 0.08 | 0.40 | 5.22× |
+| `gauge_max_bare` | 1 | 4 | 0.07 | 0.35 | 4.98× |
+| `gauge_sum_by_g_with_labels` | 6 | 24 | 0.09 | 0.43 | 4.98× |
+| `gauge_sum_with_labels` | 5 | 20 | 0.07 | 0.36 | 4.86× |
+| `gauge_sum_bare` | 2 | 8 | 0.08 | 0.34 | 4.51× |
+| `counter_ratio_by_g_with_labels` | 1 | 4 | 0.17 | 0.44 | 2.69× |
+| `counter_irate_by_g_with_labels_scaled` | 4 | 16 | 0.10 | 0.20 | 2.05× |
+| `counter_irate_by_g_with_labels` | 20 | 80 | 0.10 | 0.19 | 1.91× |
+| `rezolus_bpf_avg_run_time_per_sampler` | 1 | 4 | 0.08 | 0.02 | 0.19× |
+| `rezolus_bpf_run_time_sec` | 1 | 4 | 0.07 | 0.01 | 0.07× |
 | `rezolus_bpf_run_time_sec_per_sampler` | 1 | 4 | 0.07 | 0.00 | 0.06× |
 | `counter_irate_subtract_with_labels` | 2 | 8 | 0.05 | 0.00 | 0.02× |
 | `counter_ratio_by_id_complement` | 1 | 4 | 0.06 | 0.00 | 0.02× |
-| `counter_ratio_complement` | 1 | 4 | 0.07 | 0.00 | 0.02× |
+| `counter_ratio_complement` | 1 | 4 | 0.06 | 0.00 | 0.02× |
 | `gauge_bare_with_labels` | 56 | 224 | 0.04 | 0.00 | 0.01× |
 
 ## Top-10 ratios per fixture
@@ -636,329 +636,329 @@ For each catalogue entry id, the median of per-query medians (so an outlier quer
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 21.13× | 3.32 | 70.09 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 16.69× | 0.37 | 6.14 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 16.10× | 0.07 | 1.15 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
-| 16.01× | 0.12 | 1.88 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
-| 15.78× | 0.11 | 1.76 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
-| 14.77× | 0.10 | 1.52 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
-| 14.30× | 0.13 | 1.83 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
-| 13.88× | 0.10 | 1.39 | `counter_total_sum_generic` | `sum(irate(cpu_dtlb_miss[5m]))` |
-| 13.78× | 0.14 | 1.87 | `rezolus_cpu_user_per_id` | `sum by (id) (irate(cpu_usage{state="user"}[5m])) / 1000000000` |
-| 12.91× | 0.14 | 1.77 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="to"}[5m]))` |
+| 16.80× | 0.35 | 5.93 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
+| 14.65× | 0.07 | 0.96 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
+| 13.86× | 0.19 | 2.65 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| 13.80× | 0.11 | 1.55 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
+| 13.35× | 0.12 | 1.65 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 12.59× | 0.12 | 1.53 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="timer"}[5m]))` |
+| 12.50× | 0.13 | 1.68 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
+| 12.49× | 0.12 | 1.49 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="sched"}[5m]))` |
+| 12.33× | 0.11 | 1.39 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="timer"}[5m]))` |
+| 12.21× | 0.13 | 1.59 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="to"}[5m]))` |
 
 ### `AB_base.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
+| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_utilization) / 100` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `sglang_e2e_request_latency_seconds{source="sglang-decode"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_request_prefill_time_seconds{source="vllm"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="write"}` |
 | 0.01× | 0.04 | 0.00 | `gauge_sum_by_g_with_labels` | `sum by (id) (gpu_memory{state="used"})` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `ttft{source="llm-perf"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="other"}` |
-| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `think_duration{source="llm-perf"}` |
-| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="error",source="llm-perf"}[5s]))` |
-| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
-| 0.01× | 0.10 | 0.00 | `counter_irate_by_g_with_labels` | `sum by (name) (irate(cgroup_cpu_throttled_time{name=~"__SELECTED_CGROUPS__"}[5m]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="lock"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_ratio_with_labels_ignoring` | `gpu_pcie_throughput{direction="transmit"} / ignoring(direction) gpu_pcie_bandwidth` |
-| 0.01× | 0.03 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
+| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
+| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_request_errors_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="memory"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="process"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_num_requests_waiting{source="vllm"}` |
 
 ### `AB_base_pin.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 20.45× | 3.50 | 71.62 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 16.27× | 0.11 | 1.83 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
-| 15.44× | 0.10 | 1.53 | `counter_total_sum_generic` | `sum(irate(cpu_dtlb_miss[5m]))` |
-| 14.99× | 0.07 | 1.02 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
-| 14.30× | 0.35 | 5.07 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 14.13× | 0.12 | 1.72 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
-| 14.10× | 0.06 | 0.79 | `memory_util_pct` | `(memory_total - memory_available) / memory_total` |
-| 13.81× | 0.19 | 2.60 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
-| 13.60× | 0.13 | 1.76 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="to"}[5m]))` |
-| 13.44× | 0.05 | 0.70 | `counter_irate_sum_with_labels` | `sum(irate(responses_received{source="cachecannon"}[5s]))` |
+| 15.44× | 0.11 | 1.68 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
+| 14.91× | 0.35 | 5.29 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
+| 14.76× | 0.13 | 1.91 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="to"}[5m]))` |
+| 14.55× | 0.07 | 1.02 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
+| 13.30× | 0.24 | 3.17 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))` |
+| 13.25× | 0.11 | 1.48 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
+| 12.58× | 0.04 | 0.57 | `counter_irate_sum_with_labels` | `sum(irate(responses_received{source="cachecannon"}[5s]))` |
+| 12.34× | 0.13 | 1.62 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 12.28× | 0.28 | 3.49 | `counter_irate_with_labels_scaled` | `sum(irate(cgroup_cpu_usage{name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000` |
+| 12.10× | 0.13 | 1.62 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="sched"}[5m]))` |
 
 ### `AB_base_pin.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `sglang_inter_token_latency_seconds{source="sglang-decode"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_avg_scaled` | `avg(gpu_sm_occupancy) / 100` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="yield"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_sm_occupancy) / 100` |
+| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_tensor_utilization) / 100` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `sglang_num_running_reqs{source="sglang"}` |
 | 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="sleep"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_with_labels` | `sum by (id) (gpu_memory{state="free"})` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="memory"}` |
-| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_tokens_total{source="sglang-router"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="canceled",source="llm-perf"}[5s]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_time_to_first_token_seconds{source="vllm"}` |
+| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="canceled",source="llm-perf"}[5s]))` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="socket"}` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_request_errors_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_http_requests_total{source="sglang-router"}[5s]))` |
 
 ### `AB_level.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 22.01× | 3.28 | 72.25 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 15.33× | 0.13 | 2.03 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
-| 14.68× | 0.20 | 3.00 | `counter_ratio_scaled` | `sum(irate(cpu_dtlb_miss[5m])) / sum(irate(cpu_instructions[5m])) * 1000` |
-| 13.90× | 0.45 | 6.21 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 13.69× | 0.13 | 1.80 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="tasklet"}[5m])) / 1000000000` |
-| 13.58× | 0.16 | 2.14 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
-| 13.54× | 0.13 | 1.73 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
-| 13.53× | 0.05 | 0.74 | `counter_irate_sum_with_labels` | `sum(irate(responses_received{source="cachecannon"}[5s]))` |
-| 13.27× | 0.20 | 2.68 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
-| 13.10× | 0.12 | 1.61 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="timer"}[5m]))` |
+| 16.10× | 0.35 | 5.70 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
+| 15.36× | 0.05 | 0.76 | `counter_irate_sum_with_labels` | `sum(irate(responses_received{source="cachecannon"}[5s]))` |
+| 14.85× | 0.05 | 0.79 | `memory_util_pct` | `(memory_total - memory_available) / memory_total` |
+| 14.64× | 0.06 | 0.94 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
+| 14.43× | 0.12 | 1.75 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 14.41× | 0.11 | 1.58 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
+| 14.23× | 0.10 | 1.48 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
+| 14.20× | 0.10 | 1.47 | `counter_total_sum_generic` | `sum(irate(cpu_dtlb_miss[5m]))` |
+| 13.90× | 0.18 | 2.51 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| 13.42× | 0.26 | 3.51 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{op="lock",name!~"__SELECTED_CGROUPS__"}[5m]))` |
 
 ### `AB_level.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.00× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
+| 0.00× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="input",source="llm-perf"}[5s]))` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="timer"}` |
+| 0.01× | 0.09 | 0.00 | `gauge_sum_with_labels` | `sum(smg_worker_requests_active{source="sglang-router"})` |
+| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `ttft{source="llm-perf"}` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
 | 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_time_to_first_token_seconds{source="vllm"}` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="lock"}` |
 | 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="yield"}` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_read_bytes_per_gpu_total{source="sglang"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `tpot{source="llm-perf"}` |
-| 0.01× | 0.08 | 0.00 | `counter_irate_by_g_with_labels` | `sum by (name) (irate(cgroup_cpu_throttled_time{name=~"__SELECTED_CGROUPS__"}[5m]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="write"}` |
-| 0.01× | 0.05 | 0.00 | `gauge_sum_with_labels` | `sum(gpu_memory{state="used"})` |
-| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_write_bytes_per_gpu_total{source="sglang"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_tensor_utilization) / 100` |
+| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_with_labels` | `sum by (id) (gpu_memory{state="free"})` |
 
 ### `AB_level_pin.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 22.99× | 0.18 | 4.09 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="sched"}[5m])) / cpu_cores / 1000000000` |
-| 20.53× | 3.57 | 73.20 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 16.31× | 0.07 | 1.13 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
-| 15.11× | 0.19 | 2.83 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
-| 15.05× | 0.12 | 1.85 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
-| 15.05× | 0.39 | 5.83 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 14.46× | 0.12 | 1.71 | `counter_total_sum_generic` | `sum(irate(scheduler_context_switch[5m]))` |
-| 14.31× | 0.14 | 1.97 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
-| 14.14× | 0.13 | 1.80 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="rcu"}[5m]))` |
-| 13.99× | 0.13 | 1.75 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
+| 17.20× | 0.11 | 1.89 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_dtlb_miss[5m]))` |
+| 16.09× | 0.06 | 1.02 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
+| 15.99× | 0.10 | 1.65 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 15.40× | 0.38 | 5.81 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
+| 14.92× | 0.16 | 2.43 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| 14.60× | 0.12 | 1.78 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="rcu"}[5m])) / 1000000000` |
+| 14.24× | 0.11 | 1.62 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="to"}[5m]))` |
+| 14.01× | 0.05 | 0.66 | `counter_irate_sum_with_labels` | `sum(irate(responses_received{source="cachecannon"}[5s]))` |
+| 13.99× | 0.12 | 1.73 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="sched"}[5m])) / 1000000000` |
+| 13.87× | 0.17 | 2.35 | `counter_ratio_scaled` | `sum(irate(cpu_dtlb_miss[5m])) / sum(irate(cpu_instructions[5m])) * 1000` |
 
 ### `AB_level_pin.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.00× | 0.08 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_read_bytes_per_gpu_total{source="sglang"}[5s]))` |
-| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_num_requests_total{source="sglang-prefill"}[5s]))` |
-| 0.01× | 0.06 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="error",source="llm-perf"}[5s]))` |
-| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_flops_per_gpu_total{source="sglang"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_num_aborted_requests_total{source="sglang-decode"}[5s]))` |
-| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
-| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_prompt_tokens_total{source="sglang-prefill"}[5s]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_e2e_request_latency_seconds{source="vllm"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_inter_token_latency_seconds{source="vllm"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_num_requests_waiting{source="vllm"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="query"}` |
+| 0.01× | 0.04 | 0.00 | `gauge_avg_scaled` | `avg(gpu_sm_utilization) / 100` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="socket"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `sglang_per_stage_req_latency_seconds{stage="prefill_forward",source="sglang-prefill"}` |
+| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="error",source="llm-perf"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="timer"}` |
+| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_http_requests_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="timeout",source="llm-perf"}[5s]))` |
 
 ### `cachecannon.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 33.65× | 0.13 | 4.51 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000` |
-| 31.67× | 1.31 | 41.34 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 21.88× | 0.60 | 13.16 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
-| 21.46× | 0.42 | 9.09 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(softirq_time[5m])) / cpu_cores / 1000000000` |
-| 20.01× | 0.37 | 7.42 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
-| 18.91× | 0.39 | 7.34 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
-| 17.51× | 0.32 | 5.55 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="net_rx"}[5m]))` |
-| 17.15× | 0.40 | 6.81 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="timer"}[5m]))` |
-| 17.13× | 0.38 | 6.55 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="sched"}[5m]))` |
-| 16.98× | 0.40 | 6.79 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
+| 28.88× | 0.16 | 4.50 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000` |
+| 23.26× | 0.39 | 8.96 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(softirq_time[5m])) / cpu_cores / 1000000000` |
+| 22.31× | 0.13 | 2.88 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="net_rx"}[5m])) / cpu_cores / 1000000000` |
+| 20.63× | 0.35 | 7.29 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 19.20× | 0.38 | 7.26 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
+| 18.37× | 0.37 | 6.89 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="rcu"}[5m]))` |
+| 18.20× | 0.28 | 5.11 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="net_rx"}[5m]))` |
+| 18.19× | 0.36 | 6.47 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="timer"}[5m]))` |
+| 17.69× | 0.36 | 6.39 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
+| 17.32× | 0.31 | 5.36 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="timer"}[5m]))` |
 
 ### `cachecannon.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.00× | 0.09 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_branch_misses[5m]))` |
-| 0.00× | 0.06 | 0.00 | `gauge_bare_with_labels` | `tpot{source="llm-perf"}` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="timer"}` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_generation_tokens_total{source="vllm"}[5s]))` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_write_bytes_per_gpu_total{source="sglang"}[5s]))` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_prompt_tokens_total{source="vllm"}[5s]))` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_generation_tokens_total{source="sglang-decode"}[5s]))` |
+| 0.00× | 0.08 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="filesystem"}` |
+| 0.00× | 0.07 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="ipc"}` |
+| 0.00× | 0.08 | 0.00 | `gauge_bare_with_labels` | `requests_inflight{source="llm-perf"}` |
 | 0.01× | 0.07 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))` |
-| 0.01× | 0.07 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(tokens{direction="output",source="llm-perf"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="other"}` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="memory"}` |
+| 0.01× | 0.08 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="event"}` |
+| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `tpot{source="llm-perf"}` |
+| 0.01× | 0.07 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_branch_misses[5m]))` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `ttft{source="llm-perf"}` |
+| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_generation_tokens_total{source="vllm"}[5s]))` |
 
 ### `demo.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 18.03× | 0.06 | 1.13 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
-| 17.99× | 0.38 | 6.86 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 17.38× | 0.16 | 2.86 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
-| 16.44× | 0.13 | 2.08 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="timer"}[5m]))` |
-| 16.44× | 0.11 | 1.86 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
-| 15.73× | 0.05 | 0.85 | `counter_irate_total_scaled` | `sum(irate(rezolus_cpu_usage[5m])) / 1000000000` |
-| 15.39× | 0.10 | 1.59 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
-| 15.37× | 0.13 | 2.05 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
-| 15.23× | 0.13 | 2.03 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
-| 14.87× | 0.15 | 2.16 | `counter_ratio_generic` | `sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m]))` |
+| 20.68× | 0.40 | 8.33 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
+| 19.23× | 0.16 | 3.14 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| 16.95× | 0.07 | 1.12 | `counter_total_sum_generic` | `sum(irate(blockio_bytes[5m]))` |
+| 16.79× | 0.14 | 2.36 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
+| 16.78× | 0.10 | 1.70 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
+| 15.79× | 0.11 | 1.80 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 14.62× | 0.12 | 1.80 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="timer"}[5m]))` |
+| 14.46× | 0.06 | 0.83 | `counter_irate_total_scaled` | `sum(irate(rezolus_cpu_usage[5m])) / 1000000000` |
+| 14.18× | 0.17 | 2.48 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
+| 14.03× | 0.19 | 2.67 | `counter_ratio_by_id_generic` | `sum by (id) (irate(cpu_instructions[5m])) / sum by (id) (irate(cpu_cycles[5m]))` |
 
 ### `demo.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.01× | 0.03 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="yield"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="other"}` |
-| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="timer"}` |
-| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_inter_token_latency_seconds{source="vllm"}` |
-| 0.01× | 0.03 | 0.00 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="task_switch"}[5m]))` |
-| 0.01× | 0.07 | 0.00 | `counter_irate_by_g_with_labels` | `sum by (name) (irate(cgroup_cpu_tlb_flush{name=~"__SELECTED_CGROUPS__"}[5m]))` |
-| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `request_latency{source="llm-perf"}` |
-| 0.01× | 0.04 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(bytes_tx{source="cachecannon"}[5s]))` |
+| 0.01× | 0.11 | 0.00 | `counter_irate_by_g_with_labels` | `sum by (name) (irate(cgroup_cpu_throttled_time{name=~"__SELECTED_CGROUPS__"}[5m]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="filesystem"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_request_prefill_time_seconds{source="vllm"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `target_rate{source="cachecannon"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `think_duration{source="llm-perf"}` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="error",source="llm-perf"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_num_requests_running{source="vllm"}` |
+| 0.01× | 0.03 | 0.00 | `gauge_bare_with_labels` | `vllm_num_requests_waiting{source="vllm"}` |
+| 0.01× | 0.03 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests{status="timeout",source="llm-perf"}[5s]))` |
+| 0.01× | 0.03 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_sm_occupancy) / 100` |
 
 ### `disagg/disagg-sglang.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 36.20× | 0.13 | 4.86 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="sched"}[5m])) / cpu_cores / 1000000000` |
-| 24.83× | 0.38 | 9.48 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(softirq_time[5m])) / cpu_cores / 1000000000` |
-| 21.65× | 0.12 | 2.50 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000` |
-| 19.61× | 1.01 | 19.89 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 18.21× | 3.66 | 66.57 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 17.11× | 0.69 | 11.74 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 16.69× | 0.17 | 2.83 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
-| 16.42× | 0.11 | 1.78 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="hrtimer"}[5m])) / cpu_cores / 1000000000` |
-| 16.03× | 0.21 | 3.39 | `counter_irate_sum_with_labels` | `sum(irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))` |
-| 15.21× | 0.22 | 3.31 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 36.82× | 0.20 | 7.54 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(softirq_time[5m])) / cpu_cores / 1000000000` |
+| 28.76× | 0.09 | 2.64 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000` |
+| 17.27× | 0.10 | 1.80 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="net_rx"}[5m])) / cpu_cores / 1000000000` |
+| 16.74× | 0.58 | 9.68 | `counter_irate_with_labels_scaled` | `sum(irate(cgroup_cpu_usage{name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000` |
+| 16.49× | 0.31 | 5.09 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_migrations{name!~"__SELECTED_CGROUPS__"}[5m]))` |
+| 16.32× | 0.17 | 2.77 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="from"}[5m]))` |
+| 16.09× | 0.22 | 3.55 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 16.03× | 0.14 | 2.31 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="sched"}[5m])) / cpu_cores / 1000000000` |
+| 15.14× | 0.21 | 3.22 | `counter_irate_sum_with_labels` | `sum(irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))` |
+| 15.13× | 0.11 | 1.66 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="hrtimer"}[5m])) / cpu_cores / 1000000000` |
 
 ### `disagg/disagg-sglang.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.01× | 0.08 | 0.00 | `gauge_avg_scaled` | `avg(gpu_sm_utilization) / 100` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `smg_router_ttft_seconds{source="sglang-router"}` |
-| 0.01× | 0.08 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.07 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.06 | 0.00 | `gauge_bare_with_labels` | `sglang_per_stage_req_latency_seconds{stage="prefill_forward",source="sglang-prefill"}` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_upstream_responses_total{source="sglang-router"}[5s]))` |
-| 0.01× | 0.07 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_tokens_total{source="sglang-router"}[5s]))` |
-| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="poll"}` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(bytes_tx{source="cachecannon"}[5s]))` |
+| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `smg_router_ttft_seconds{source="sglang-router"}` |
+| 0.01× | 0.10 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_sm_occupancy) / 100` |
+| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_http_requests_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `sglang_time_to_first_token_seconds{source="sglang-prefill"}` |
+| 0.01× | 0.07 | 0.00 | `gauge_bare_with_labels` | `response_latency{source="cachecannon"}` |
+| 0.01× | 0.05 | 0.00 | `gauge_avg_scaled` | `avg(gpu_sm_utilization) / 100` |
+| 0.01× | 0.08 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_dram_bandwidth_utilization) / 100` |
+| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_request_errors_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.05 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))` |
+| 0.01× | 0.07 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_tensor_utilization) / 100` |
 
 ### `disagg/sglang-nixl-16c.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 53.27× | 0.36 | 19.43 | `rezolus_cpu_ipns` | `sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m])) * sum(irate(cpu_tsc[5m])) * sum(irate(…` |
-| 41.22× | 0.25 | 10.29 | `rezolus_cpu_aperf_chain_total` | `sum(irate(cpu_tsc[5m])) * sum(irate(cpu_aperf[5m])) / sum(irate(cpu_mperf[5m])) / cpu_cores` |
-| 22.58× | 0.86 | 19.53 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(softirq_time[5m])) / cpu_cores / 1000000000` |
-| 21.86× | 0.23 | 4.97 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="net_rx"}[5m])) / cpu_cores / 1000000000` |
-| 19.33× | 0.26 | 5.10 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="rcu"}[5m])) / cpu_cores / 1000000000` |
-| 19.29× | 0.44 | 8.43 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000` |
-| 18.97× | 0.29 | 5.48 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(cpu_usage{state="user"}[5m])) / cpu_cores / 1000000000` |
-| 18.24× | 0.35 | 6.31 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="sched"}[5m])) / cpu_cores / 1000000000` |
-| 18.04× | 0.30 | 5.42 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="timer"}[5m])) / cpu_cores / 1000000000` |
-| 14.81× | 0.32 | 4.76 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(cpu_usage{state="system"}[5m])) / cpu_cores / 1000000000` |
+| 72.78× | 0.21 | 15.20 | `rezolus_cpu_aperf_chain_total` | `sum(irate(cpu_tsc[5m])) * sum(irate(cpu_aperf[5m])) / sum(irate(cpu_mperf[5m])) / cpu_cores` |
+| 71.43× | 0.30 | 21.49 | `rezolus_cpu_ipns` | `sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m])) * sum(irate(cpu_tsc[5m])) * sum(irate(…` |
+| 35.26× | 0.26 | 9.10 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="rcu"}[5m])) / cpu_cores / 1000000000` |
+| 34.64× | 0.73 | 25.17 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(softirq_time[5m])) / cpu_cores / 1000000000` |
+| 31.82× | 0.21 | 6.76 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="net_rx"}[5m])) / cpu_cores / 1000000000` |
+| 28.21× | 0.41 | 11.55 | `counter_irate_total_per_cpu_core_pct` | `sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000` |
+| 22.59× | 0.38 | 8.57 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="sched"}[5m])) / cpu_cores / 1000000000` |
+| 21.24× | 0.30 | 6.34 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(cpu_usage{state="user"}[5m])) / cpu_cores / 1000000000` |
+| 19.39× | 0.40 | 7.74 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(cpu_usage{state="system"}[5m])) / cpu_cores / 1000000000` |
+| 17.37× | 0.32 | 5.57 | `counter_total_sum_generic` | `sum(irate(blockio_operations[5m]))` |
 
 ### `disagg/sglang-nixl-16c.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.00× | 0.11 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_sm_utilization) / 100` |
-| 0.00× | 0.16 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.11 | 0.00 | `counter_irate_by_id_generic` | `sum by (id) (irate(cpu_branch_misses[5m]))` |
-| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(bytes_tx{source="cachecannon"}[5s]))` |
-| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_request_errors_total{source="sglang-router"}[5s]))` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests_sent{source="cachecannon"}[5s]))` |
-| 0.01× | 0.12 | 0.00 | `gauge_sum_with_labels` | `sum(smg_worker_requests_active{source="sglang-router"})` |
-| 0.01× | 0.07 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_prompt_tokens_total{source="vllm"}[5s]))` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_tokens_total{source="sglang-router"}[5s]))` |
-| 0.01× | 0.06 | 0.00 | `gauge_bare_with_labels` | `vllm_inter_token_latency_seconds{source="vllm"}` |
+| 0.01× | 0.14 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_tensor_utilization) / 100` |
+| 0.01× | 0.11 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_router_request_errors_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.14 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_branch_misses[5m]))` |
+| 0.01× | 0.13 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_dram_bandwidth_utilization) / 100` |
+| 0.01× | 0.08 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))` |
+| 0.01× | 0.08 | 0.00 | `gauge_sum_by_g_scaled` | `sum by (id) (gpu_sm_utilization) / 100` |
+| 0.01× | 0.13 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(smg_http_requests_total{source="sglang-router"}[5s]))` |
+| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(cache_hits{source="cachecannon"}[5s]))` |
+| 0.01× | 0.08 | 0.00 | `gauge_avg_scaled` | `avg(gpu_sm_utilization) / 100` |
+| 0.01× | 0.06 | 0.00 | `gauge_bare_with_labels` | `blockio_size{op="write"}` |
 
 ### `sglang_gemma3.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 32.06× | 1.41 | 45.05 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 26.26× | 0.49 | 12.92 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 21.15× | 0.22 | 4.64 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 19.84× | 0.14 | 2.69 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))` |
-| 19.60× | 0.19 | 3.78 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="timer"}[5m]))` |
-| 18.62× | 0.19 | 3.52 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
-| 18.59× | 0.39 | 7.27 | `counter_irate_ratio_with_labels` | `sum(irate(cgroup_cpu_instructions{name!~"__SELECTED_CGROUPS__"}[5m])) / sum(irate(cgroup_cpu_cycles{…` |
-| 18.21× | 0.20 | 3.72 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
-| 18.01× | 0.45 | 8.12 | `rezolus_cpu_aperf_chain_per_id` | `sum by (id) (irate(cpu_tsc[5m])) * sum by (id) (irate(cpu_aperf[5m])) / sum by (id) (irate(cpu_mperf…` |
-| 17.51× | 0.20 | 3.50 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="task_switch"}[5m]))` |
+| 22.94× | 0.26 | 5.87 | `counter_irate_sum_with_labels` | `sum(irate(cpu_tlb_flush{reason="remote_send_ipi"}[5m]))` |
+| 21.71× | 0.17 | 3.60 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
+| 21.64× | 0.29 | 6.27 | `counter_ratio_by_id_scaled` | `sum by (id) (irate(cpu_dtlb_miss[5m])) / sum by (id) (irate(cpu_instructions[5m])) * 1000` |
+| 21.30× | 0.20 | 4.17 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
+| 21.18× | 0.17 | 3.68 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="task_switch"}[5m]))` |
+| 20.94× | 0.22 | 4.61 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))` |
+| 20.50× | 0.21 | 4.23 | `counter_irate_with_labels_per_cpu_core_pct` | `sum(irate(softirq_time{kind="net_rx"}[5m])) / cpu_cores / 1000000000` |
+| 19.94× | 0.25 | 4.97 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{op="poll",name!~"__SELECTED_CGROUPS__"}[5m]))` |
+| 19.77× | 0.17 | 3.40 | `counter_irate_sum_with_labels` | `sum(irate(cpu_tlb_flush{reason="task_switch"}[5m]))` |
+| 19.55× | 0.39 | 7.64 | `rezolus_cpu_aperf_chain_total` | `sum(irate(cpu_tsc[5m])) * sum(irate(cpu_aperf[5m])) / sum(irate(cpu_mperf[5m])) / cpu_cores` |
 
 ### `sglang_gemma3.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.00× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="lock"}` |
-| 0.00× | 0.11 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="event"}` |
-| 0.00× | 0.07 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="filesystem"}` |
+| 0.00× | 0.06 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="lock"}` |
+| 0.00× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="read"}` |
+| 0.00× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="sleep"}` |
+| 0.00× | 0.11 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))` |
+| 0.00× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="yield"}` |
+| 0.01× | 0.08 | 0.00 | `gauge_bare_with_labels` | `blockio_latency{op="write"}` |
+| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `vllm_inter_token_latency_seconds{source="vllm"}` |
+| 0.01× | 0.14 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests_sent{source="cachecannon"}[5s]))` |
 | 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="memory"}` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `think_duration{source="llm-perf"}` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_prompt_tokens_total{source="vllm"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="read"}` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="sleep"}` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `vllm_num_requests_running{source="vllm"}` |
-| 0.01× | 0.06 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="ipc"}` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `vllm_request_prefill_time_seconds{source="vllm"}` |
 
 ### `vllm.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 24.13× | 0.21 | 5.12 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_tx"}[5m])) / 1000000000` |
-| 20.31× | 4.74 | 96.35 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 19.95× | 0.37 | 7.43 | `counter_irate_with_labels_scaled` | `sum(irate(cgroup_cpu_usage{state="user",name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000` |
-| 19.51× | 0.82 | 16.00 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 19.42× | 0.73 | 14.25 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 18.01× | 0.24 | 4.27 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
-| 17.55× | 0.23 | 3.99 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="remote_send_ipi"}[5m]))` |
-| 16.12× | 0.21 | 3.45 | `counter_total_sum_generic` | `sum(irate(cpu_branch_instructions[5m]))` |
-| 15.86× | 0.31 | 4.97 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="sched"}[5m])) / 1000000000` |
-| 15.39× | 0.26 | 3.99 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
+| 15.32× | 0.50 | 7.70 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| 15.10× | 0.29 | 4.32 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="timer"}[5m])) / 1000000000` |
+| 15.07× | 0.29 | 4.30 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
+| 14.53× | 0.33 | 4.73 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="sched"}[5m]))` |
+| 14.31× | 0.28 | 3.94 | `counter_irate_sum_with_labels` | `sum(irate(cpu_migrations{direction="to"}[5m]))` |
+| 14.18× | 0.27 | 3.89 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="rcu"}[5m])) / 1000000000` |
+| 13.92× | 0.28 | 3.95 | `softirq_time_pct_by_id_by_kind` | `sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000` |
+| 13.59× | 0.21 | 2.82 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="net_rx"}[5m]))` |
+| 13.58× | 0.40 | 5.39 | `counter_ratio_by_id_generic` | `sum by (id) (irate(cpu_instructions[5m])) / sum by (id) (irate(cpu_cycles[5m]))` |
+| 13.37× | 0.38 | 5.08 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="task_switch"}[5m]))` |
 
 ### `vllm.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.01× | 0.11 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_flops_per_gpu_total{source="sglang"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `think_duration{source="llm-perf"}` |
-| 0.01× | 0.09 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(cache_hits{source="cachecannon"}[5s]))` |
-| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `get_latency{source="cachecannon"}` |
-| 0.01× | 0.07 | 0.00 | `gauge_bare_with_labels` | `blockio_latency{op="write"}` |
-| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_read_bytes_per_gpu_total{source="sglang"}[5s]))` |
-| 0.01× | 0.07 | 0.00 | `gauge_bare_with_labels` | `blockio_size{op="write"}` |
-| 0.01× | 0.14 | 0.00 | `counter_total_sum_generic` | `sum(irate(cpu_dtlb_miss[5m]))` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="timer"}` |
-| 0.01× | 0.10 | 0.00 | `gauge_bare_with_labels` | `itl{source="llm-perf"}` |
+| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(cache_hits{source="cachecannon"}[5s]))` |
+| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(bytes_tx{source="cachecannon"}[5s]))` |
+| 0.01× | 0.16 | 0.00 | `counter_irate_by_g_with_labels` | `sum by (name) (irate(cgroup_cpu_throttled_time{name=~"__SELECTED_CGROUPS__"}[5m]))` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `sglang_per_stage_req_latency_seconds{stage="prefill_forward",source="sglang-prefill"}` |
+| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `sglang_time_to_first_token_seconds{source="sglang-prefill"}` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `sglang_inter_token_latency_seconds{source="sglang"}` |
+| 0.01× | 0.11 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(bytes_rx{source="cachecannon"}[5s]))` |
+| 0.01× | 0.10 | 0.00 | `gauge_bare_with_labels` | `blockio_latency{op="write"}` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `sglang_num_running_reqs{source="sglang-decode"}` |
+| 0.01× | 0.10 | 0.00 | `gauge_bare` | `syscall_latency` |
 
 ### `vllm_gemma3.parquet` — worst SQL/PromQL
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 31.99× | 1.23 | 39.47 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 25.33× | 0.55 | 13.88 | `counter_irate_by_id_scaled` | `sum by (id) (irate(softirq_time[5m])) / 1000000000` |
-| 21.62× | 0.19 | 4.06 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="rcu"}[5m]))` |
-| 19.97× | 0.54 | 10.85 | `rezolus_cpu_ipns` | `sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m])) * sum(irate(cpu_tsc[5m])) * sum(irate(…` |
-| 19.95× | 0.23 | 4.64 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))` |
-| 19.38× | 0.19 | 3.59 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="net_rx"}[5m]))` |
-| 19.16× | 0.23 | 4.39 | `counter_irate_with_labels_scaled` | `sum(irate(cgroup_cpu_usage{name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000` |
-| 18.26× | 0.17 | 3.18 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="net_rx"}[5m]))` |
-| 18.03× | 0.21 | 3.81 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="to"}[5m]))` |
-| 17.47× | 0.23 | 3.94 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_migrations{direction="from"}[5m]))` |
+| 19.72× | 0.22 | 4.39 | `counter_irate_with_labels_scaled` | `sum(irate(cgroup_cpu_usage{name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000` |
+| 19.05× | 0.34 | 6.47 | `counter_irate_by_id_scaled` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| 18.97× | 0.17 | 3.30 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="net_rx"}[5m]))` |
+| 18.86× | 0.19 | 3.58 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="remote_send_ipi"}[5m]))` |
+| 18.61× | 0.20 | 3.66 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="local_mm_shootdown"}[5m]))` |
+| 17.90× | 0.19 | 3.41 | `softirq_irate_by_id_by_kind` | `sum by (id) (irate(softirq{kind="sched"}[5m]))` |
+| 17.63× | 0.17 | 3.04 | `counter_irate_by_id_with_labels` | `sum by (id) (irate(cpu_tlb_flush{reason="task_switch"}[5m]))` |
+| 17.26× | 0.22 | 3.79 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_migrations{name!~"__SELECTED_CGROUPS__"}[5m]))` |
+| 17.15× | 0.20 | 3.50 | `softirq_irate_total_by_kind` | `sum(irate(softirq{kind="rcu"}[5m]))` |
+| 16.71× | 0.20 | 3.40 | `counter_irate_sum_with_labels` | `sum(irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))` |
 
 ### `vllm_gemma3.parquet` — best SQL/PromQL (SQL wins)
 
 | ratio | PromQL ms | SQL ms | entry | query |
 |---:|---:|---:|---|---|
-| 0.00× | 0.08 | 0.00 | `gauge_bare` | `scheduler_running` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `think_duration{source="llm-perf"}` |
+| 0.01× | 0.06 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="filesystem"}` |
 | 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="lock"}` |
-| 0.01× | 0.15 | 0.00 | `counter_irate_by_g_with_labels` | `sum by (name) (irate(cgroup_cpu_throttled_time{name=~"__SELECTED_CGROUPS__"}[5m]))` |
-| 0.01× | 0.07 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))` |
-| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="memory"}` |
-| 0.01× | 0.05 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="ipc"}` |
+| 0.01× | 0.08 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_read_bytes_per_gpu_total{source="sglang"}[5s]))` |
+| 0.01× | 0.10 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(requests_sent{source="cachecannon"}[5s]))` |
+| 0.01× | 0.07 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(bytes_tx{source="cachecannon"}[5s]))` |
 | 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="process"}` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(vllm_prompt_tokens_total{source="vllm"}[5s]))` |
-| 0.01× | 0.13 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(cgroup_cpu_throttled_time{name!~"__SELECTED_CGROUPS__"}[5m]))` |
-| 0.01× | 0.06 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_read_bytes_per_gpu_total{source="sglang"}[5s]))` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="time"}` |
+| 0.01× | 0.04 | 0.00 | `gauge_bare_with_labels` | `syscall_latency{op="yield"}` |
+| 0.01× | 0.08 | 0.00 | `counter_irate_sum_with_labels` | `sum(irate(sglang_estimated_write_bytes_per_gpu_total{source="sglang"}[5s]))` |
 
