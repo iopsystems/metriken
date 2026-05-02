@@ -350,14 +350,28 @@ fn scan_after_keyword(sql: &str, keyword: &str, out: &mut Vec<String>) {
 /// clauses so the FROM/JOIN scanner can skip self-references. A query
 /// like `WITH per_series AS (...) SELECT ... FROM per_series` would
 /// otherwise look like a missing-metric reference.
+///
+/// Matches `WITH` followed by any whitespace (space, newline, tab) —
+/// the wide-form generator emits `WITH\n`-prefixed SQL.
 fn collect_cte_names(sql: &str) -> BTreeSet<String> {
     let bytes = sql.as_bytes();
     let lower = sql.to_ascii_lowercase();
     let mut out: BTreeSet<String> = Default::default();
     let mut search = lower.as_str();
     let mut offset = 0;
-    while let Some(pos) = search.find("with ") {
-        let abs = offset + pos + "with ".len();
+    while let Some(pos) = search.find("with") {
+        // Word boundary checks: char before must not be alphanumeric;
+        // char after must be whitespace.
+        let abs_kw = offset + pos;
+        let before_ok = abs_kw == 0
+            || !(bytes[abs_kw - 1].is_ascii_alphanumeric() || bytes[abs_kw - 1] == b'_');
+        let after_ok = abs_kw + 4 < bytes.len() && bytes[abs_kw + 4].is_ascii_whitespace();
+        if !(before_ok && after_ok) {
+            offset = abs_kw + 4;
+            search = &lower[offset..];
+            continue;
+        }
+        let abs = abs_kw + 4;
         let mut k = abs;
         loop {
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {

@@ -64,8 +64,343 @@ pub fn try_generate(
     captures: &Captures,
     catalog: &MetricCatalog,
 ) -> Option<String> {
-    let shape = resolve_shape(entry, captures)?;
-    generate(catalog, &shape)
+    if let Some(shape) = resolve_shape(entry, captures) {
+        return generate(catalog, &shape);
+    }
+    if let Some(binary) = resolve_binary(entry, captures) {
+        return generate_binary(catalog, &binary);
+    }
+    None
+}
+
+/// Binary "lane combiner" shape for `f(sum(a), sum(b))` style entries.
+/// Each lane is a unary `Shape`; the lanes are joined on
+/// `timestamp` (and `group_label`, if both lanes share one) and
+/// combined via `op`.
+struct Binary<'a> {
+    a: Shape<'a>,
+    b: Shape<'a>,
+    op: BinaryOp,
+    /// Constant added to the result *before* dividing/multiplying by
+    /// the other lane. Currently only `Some(1.0)` for the "1 - a/b"
+    /// shape.
+    leading_constant: Option<f64>,
+    /// Multiplicative scale applied to the result.
+    scale: f64,
+}
+
+#[derive(Clone, Copy)]
+enum BinaryOp {
+    /// `a / NULLIF(b, 0)`.
+    Div,
+    /// `a - COALESCE(b, 0)` (LEFT JOIN so a-rows survive missing b).
+    Sub,
+    /// `a + COALESCE(b, 0)` (rare).
+    Add,
+    /// `a * COALESCE(b, 0)`.
+    Mul,
+}
+
+fn resolve_binary<'a>(entry: &'a CatalogueEntry, captures: &'a Captures) -> Option<Binary<'a>> {
+    use Aggregation::Sum;
+    use PerColExpr::IrateRate;
+    match entry.id.as_str() {
+        // sum(irate(a[5m])) / sum(irate(b[5m]))
+        "counter_ratio_generic" => Some(Binary {
+            a: Shape {
+                metric: ident_capture(captures, "a")?,
+                filter: Vec::new(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            b: Shape {
+                metric: ident_capture(captures, "b")?,
+                filter: Vec::new(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            op: BinaryOp::Div,
+            leading_constant: None,
+            scale: 1.0,
+        }),
+        // 1 - sum(irate(a)) / sum(irate(b))
+        "counter_ratio_complement" => Some(Binary {
+            a: Shape {
+                metric: ident_capture(captures, "a")?,
+                filter: Vec::new(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            b: Shape {
+                metric: ident_capture(captures, "b")?,
+                filter: Vec::new(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            op: BinaryOp::Div,
+            leading_constant: Some(1.0),
+            scale: 1.0,
+        }),
+        // sum by (id) (irate(a)) / sum by (id) (irate(b))
+        "counter_ratio_by_id_generic" => Some(Binary {
+            a: Shape {
+                metric: ident_capture(captures, "a")?,
+                filter: Vec::new(),
+                group_label: Some("id"),
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            b: Shape {
+                metric: ident_capture(captures, "b")?,
+                filter: Vec::new(),
+                group_label: Some("id"),
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            op: BinaryOp::Div,
+            leading_constant: None,
+            scale: 1.0,
+        }),
+        // 1 - sum by (id) (irate(a)) / sum by (id) (irate(b))
+        "counter_ratio_by_id_complement" => Some(Binary {
+            a: Shape {
+                metric: ident_capture(captures, "a")?,
+                filter: Vec::new(),
+                group_label: Some("id"),
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            b: Shape {
+                metric: ident_capture(captures, "b")?,
+                filter: Vec::new(),
+                group_label: Some("id"),
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            op: BinaryOp::Div,
+            leading_constant: Some(1.0),
+            scale: 1.0,
+        }),
+        // sum(irate(a{la}[ra])) - sum(irate(b{lb}[rb]))
+        "counter_irate_subtract_with_labels" => Some(Binary {
+            a: Shape {
+                metric: ident_capture(captures, "a")?,
+                filter: labels_capture(captures, "la").unwrap_or(&[]).to_vec(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            b: Shape {
+                metric: ident_capture(captures, "b")?,
+                filter: labels_capture(captures, "lb").unwrap_or(&[]).to_vec(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            op: BinaryOp::Sub,
+            leading_constant: None,
+            scale: 1.0,
+        }),
+        // sum(irate(a{la}[ra])) / sum(irate(b{lb}[rb]))
+        "counter_irate_ratio_with_labels" => Some(Binary {
+            a: Shape {
+                metric: ident_capture(captures, "a")?,
+                filter: labels_capture(captures, "la").unwrap_or(&[]).to_vec(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            b: Shape {
+                metric: ident_capture(captures, "b")?,
+                filter: labels_capture(captures, "lb").unwrap_or(&[]).to_vec(),
+                group_label: None,
+                expr: IrateRate,
+                aggregation: Sum,
+                scale: 1.0,
+            },
+            op: BinaryOp::Div,
+            leading_constant: None,
+            scale: 1.0,
+        }),
+        _ => None,
+    }
+}
+
+/// Generate SQL for a binary shape: two unary lanes joined on
+/// `timestamp` (and on `group_label` when both lanes share one) and
+/// combined via the binary `op`. Both lanes use the same wide-form
+/// rates+sum CTE pattern as `generate`.
+fn generate_binary(catalog: &MetricCatalog, binary: &Binary) -> Option<String> {
+    let a_lane = build_lane(catalog, &binary.a, "a")?;
+    let b_lane = build_lane(catalog, &binary.b, "b")?;
+
+    // Both lanes must agree on group_label for the join schema.
+    let group_label = match (binary.a.group_label, binary.b.group_label) {
+        (Some(ga), Some(gb)) if ga == gb => Some(ga),
+        (None, None) => None,
+        _ => return None, // mismatched grouping — fall back to long-form
+    };
+
+    // Empty-result short-circuit. If either lane returns no rows, the
+    // combined query is empty regardless of op (subtract, divide, etc.
+    // all collapse to empty under join).
+    if a_lane.matching_count == 0 || b_lane.matching_count == 0 {
+        return Some(empty_binary_sql(group_label));
+    }
+
+    let join_clause = match group_label {
+        Some(g) => format!("JOIN b_summed b ON a.timestamp = b.timestamp AND a.{g} = b.{g}", g = quote_ident(g)),
+        None => "JOIN b_summed b ON a.timestamp = b.timestamp".to_string(),
+    };
+    let (a_sub, _b_only_join) = match binary.op {
+        BinaryOp::Sub => {
+            // Subtract semantically should still emit if a present and b missing.
+            // Use LEFT JOIN with COALESCE(b, 0).
+            let lj = match group_label {
+                Some(g) => format!("LEFT JOIN b_summed b ON a.timestamp = b.timestamp AND a.{g} = b.{g}", g = quote_ident(g)),
+                None => "LEFT JOIN b_summed b ON a.timestamp = b.timestamp".to_string(),
+            };
+            (lj, true)
+        }
+        _ => (join_clause, false),
+    };
+
+    let combine_expr = match binary.op {
+        BinaryOp::Div => "a.v / NULLIF(b.v, 0)".to_string(),
+        BinaryOp::Sub => "a.v - COALESCE(b.v, 0)".to_string(),
+        BinaryOp::Add => "a.v + COALESCE(b.v, 0)".to_string(),
+        BinaryOp::Mul => "a.v * COALESCE(b.v, 0)".to_string(),
+    };
+    let combine_with_constant = match binary.leading_constant {
+        Some(c) => format!("({c} - ({combine_expr}))"),
+        None => combine_expr,
+    };
+    let scale_expr = if binary.scale == 1.0 {
+        String::new()
+    } else {
+        format!(" / {}", binary.scale)
+    };
+    let value_select = format!("({combine_with_constant}){scale_expr} AS v");
+
+    let group_select = match group_label {
+        Some(g) => format!(", a.{g}", g = quote_ident(g)),
+        None => String::new(),
+    };
+    let order_clause = match group_label {
+        Some(g) => format!("a.{g}, a.timestamp", g = quote_ident(g)),
+        None => "a.timestamp".to_string(),
+    };
+
+    Some(format!(
+        "WITH\n{a_ctes},\n{b_ctes}\n\
+         SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t, {value_select}{group_select}\n\
+         FROM a_summed a {a_sub}\n\
+         ORDER BY {order_clause}",
+        a_ctes = a_lane.ctes,
+        b_ctes = b_lane.ctes,
+    ))
+}
+
+struct Lane {
+    /// SQL fragments forming one or more CTEs whose final CTE has the
+    /// alias `<prefix>_summed` and the schema `(timestamp, v[, g])`.
+    ctes: String,
+    matching_count: usize,
+}
+
+/// Build a Lane for one side of a binary expression. Reuses the
+/// per-column WINDOW + UNPIVOT-ish-then-aggregate pattern from
+/// `generate` but emits CTEs the binary combiner can join, rather
+/// than a final SELECT.
+fn build_lane(catalog: &MetricCatalog, shape: &Shape, prefix: &str) -> Option<Lane> {
+    let filter = coerce_literal_regex(&shape.filter)?;
+    let series = catalog.series_by_metric.get(shape.metric)?;
+    let matching: Vec<&MetricSeries> = series
+        .iter()
+        .filter(|s| matches_all(s, &filter))
+        .collect();
+    if matching.is_empty() {
+        return Some(Lane {
+            ctes: String::new(),
+            matching_count: 0,
+        });
+    }
+    if shape.aggregation == Aggregation::None {
+        return None; // binary lanes always aggregate (sum_by or sum)
+    }
+
+    let (per_col_select, window_clause) = build_per_col(&matching, shape.expr);
+    let mut unions = String::new();
+    for (i, s) in matching.iter().enumerate() {
+        let label_proj = if let Some(g) = shape.group_label {
+            let v = s
+                .labels
+                .get(g)
+                .cloned()
+                .unwrap_or_default()
+                .replace('\'', "''");
+            format!(", '{v}' AS {}", quote_ident(g))
+        } else {
+            String::new()
+        };
+        let p = if i == 0 { "" } else { "\n      UNION ALL\n      " };
+        unions.push_str(&format!(
+            "{p}SELECT timestamp, val_{i} AS v{label_proj} FROM {prefix}_rates WHERE val_{i} IS NOT NULL"
+        ));
+    }
+    let agg_op = match shape.aggregation {
+        Aggregation::Sum => "SUM",
+        Aggregation::Max => "MAX",
+        Aggregation::Avg => "AVG",
+        Aggregation::None => unreachable!(),
+    };
+    let scale_expr = if shape.scale == 1.0 {
+        String::new()
+    } else {
+        format!(" / {}", shape.scale)
+    };
+    let (group_clause, group_select) = match shape.group_label {
+        Some(g) => (
+            format!("GROUP BY {g}, timestamp", g = quote_ident(g)),
+            format!(", {g}", g = quote_ident(g)),
+        ),
+        None => ("GROUP BY timestamp".to_string(), String::new()),
+    };
+
+    let ctes = format!(
+        "{prefix}_rates AS (\n  SELECT timestamp{per_col_select}\n  FROM _src\n  {window_clause}\n),\n\
+         {prefix}_summed AS (\n  SELECT timestamp, {agg_op}(v){scale_expr} AS v{group_select}\n  FROM (\n      {unions}\n  ) per_series\n  {group_clause}\n)"
+    );
+    Some(Lane {
+        ctes,
+        matching_count: matching.len(),
+    })
+}
+
+fn empty_binary_sql(group_label: Option<&str>) -> String {
+    if let Some(g) = group_label {
+        let g = quote_ident(g);
+        format!(
+            "SELECT CAST(NULL AS DOUBLE) AS t, CAST(NULL AS DOUBLE) AS v, CAST(NULL AS VARCHAR) AS {g} WHERE FALSE"
+        )
+    } else {
+        "SELECT CAST(NULL AS DOUBLE) AS t, CAST(NULL AS DOUBLE) AS v WHERE FALSE".to_string()
+    }
 }
 
 /// Map a recognised entry id + its captures onto a `Shape`. New entry

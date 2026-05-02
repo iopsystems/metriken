@@ -1,17 +1,17 @@
-loaded 313 queries from metriken-query/tests/data/production_queries.txt
+loaded 313 queries from /work/metriken/metriken-query/tests/data/production_queries.txt
 benchmarking 4 parquet fixtures, reps=5, warmup_passes=1
 --- /work/rezolus/site/viewer/data/demo.parquet ---
-    cold: tsdb_load=108ms duck(open=15 reg=6 views=109) first_promql=1ms first_sql=114ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=2.1s
+    cold: tsdb_load=114ms duck(open=23 reg=7 views=104) first_promql=2ms first_sql=111ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=2.0s
 --- /work/rezolus/site/viewer/data/cachecannon.parquet ---
-    cold: tsdb_load=338ms duck(open=9 reg=3 views=283) first_promql=0ms first_sql=278ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=9.7s
+    cold: tsdb_load=338ms duck(open=7 reg=3 views=277) first_promql=0ms first_sql=287ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=9.6s
 --- /work/rezolus/site/viewer/data/AB_base.parquet ---
-    cold: tsdb_load=322ms duck(open=12 reg=3 views=241) first_promql=0ms first_sql=236ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=6.0s
+    cold: tsdb_load=333ms duck(open=13 reg=3 views=224) first_promql=0ms first_sql=236ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=5.7s
 --- /work/rezolus/site/viewer/data/vllm.parquet ---
-    cold: tsdb_load=311ms duck(open=12 reg=3 views=462) first_promql=0ms first_sql=459ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=24.1s
---- total elapsed 41.8s ---
+    cold: tsdb_load=293ms duck(open=12 reg=3 views=416) first_promql=0ms first_sql=426ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=23.4s
+--- total elapsed 40.8s ---
 wrote report to /work/metriken/metriken-query/docs/bench/steady_state_full.md
 wrote csv to /work/metriken/metriken-query/docs/bench/steady_state_full.csv
