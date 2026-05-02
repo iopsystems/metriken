@@ -34,7 +34,7 @@ use metriken_query::{
     QueryResult, SqlBackend as TraitSqlBackend, SqlError,
 };
 
-use crate::views::{MetricCatalog, MetricSeries, MetricShape};
+use crate::views::{MetricCatalog, MetricShape};
 
 /// Per-data-source state: the DuckDB connection plus the metadata
 /// catalog produced by `ensure_views`. Pre-computing the catalog lets
