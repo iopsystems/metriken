@@ -98,6 +98,14 @@ fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
 /// time. The backend caches this alongside the connection so per-query
 /// pre-flight checks are hashmap reads instead of DESCRIBE roundtrips
 /// (~1-2ms saved per query for catalogue entries with metric idents).
+///
+/// `pending_view_sql` carries the un-executed `CREATE OR REPLACE VIEW`
+/// statement for each metric: the backend builds them lazily on first
+/// reference, so a fixture with hundreds of metrics only pays
+/// view-build cost for the metrics actually queried (a viewer
+/// typically touches a small subset of available metrics). Cuts
+/// observed cold-start on `disagg/sglang-nixl-16c.parquet` from
+/// ~16s to a few hundred ms.
 #[derive(Debug, Default, Clone)]
 pub struct MetricCatalog {
     /// `Scalar` for gauge/counter (view has a `value` column);
@@ -109,6 +117,9 @@ pub struct MetricCatalog {
     /// `first_missing_from_view` scan to short-circuit on hardcoded
     /// metric names that the fixture doesn't carry.
     pub view_names: BTreeSet<String>,
+    /// Per-metric `CREATE OR REPLACE VIEW` SQL. Not executed at
+    /// `ensure_views` time — the backend executes on first reference.
+    pub pending_view_sql: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,13 +220,13 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
     );
     conn.execute(&load_src, [])?;
 
-    // Column metadata index: one row per metric column, with the canonical
-    // metric name, type, histogram config (when applicable), and a
-    // MAP<VARCHAR, VARCHAR> of all user labels. Queries can look up the
-    // physical columns for a given metric / label predicate without
-    // re-parsing parquet metadata, enabling more efficient SQL patterns
-    // (e.g. dynamic UNPIVOT column lists driven by `_metadata` rows).
-    populate_metadata_table(conn, &columns)?;
+    // The `_metadata` table (one row per metric column with type +
+    // labels MAP) is currently unused by any catalogue SQL twin and
+    // takes ~280ms to populate on the largest fixtures (one big INSERT
+    // with thousands of literal tuples). Skipping it shaves cold-start
+    // without affecting correctness. `populate_metadata_table` is kept
+    // for future use; the original intent was dynamic-UNPIVOT-column-
+    // lists patterns driven by `_metadata` rows.
 
     // Group by metric name, emit one view per metric. Within a metric, all
     // columns must share the same kind (counter / gauge / histogram) and
@@ -245,8 +256,11 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
         };
 
         let view_sql = build_view_sql(&metric, &cols, &label_keys_vec);
-        conn.execute(&view_sql, [])?;
-
+        // Defer execution. The backend's per-query path checks
+        // `built_views` and runs the DDL on first reference for that
+        // metric. Avoids paying multi-second cold-start on fixtures with
+        // hundreds of metrics where the workload only touches a few.
+        catalog.pending_view_sql.insert(metric.clone(), view_sql);
         catalog.shapes.insert(metric.clone(), shape);
         catalog.label_keys.insert(metric.clone(), label_keys);
         catalog.view_names.insert(metric);
@@ -266,6 +280,7 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
 /// - `labels` MAP(VARCHAR, VARCHAR) — all user labels for this column
 ///   (excluding internal keys: metric, metric_type, unit, grouping_power,
 ///   max_value_power).
+#[allow(dead_code)] // kept for future dynamic-UNPIVOT patterns; see ensure_views
 fn populate_metadata_table(conn: &Connection, columns: &[ColumnInfo]) -> duckdb::Result<()> {
     conn.execute(
         "CREATE OR REPLACE TEMP TABLE _metadata (\

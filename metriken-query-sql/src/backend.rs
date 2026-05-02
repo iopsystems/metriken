@@ -42,9 +42,17 @@ use crate::views::{MetricCatalog, MetricShape};
 /// available-label-set) be a hashmap read instead of a DESCRIBE
 /// roundtrip — measured to save ~1-2ms per catalogue entry that uses
 /// metric-ident captures, which is most of them.
+///
+/// Metric VIEWs are built lazily: `catalog.pending_view_sql` carries
+/// the un-executed `CREATE VIEW` for each metric, and `built_views`
+/// tracks which ones are now live in the connection. Only metrics
+/// that the workload actually queries pay the (sometimes multi-second)
+/// view-DDL parse cost; this is most of the cold-start latency on
+/// large fixtures with hundreds of unused metrics.
 struct ConnState {
     conn: Mutex<Connection>,
     catalog: MetricCatalog,
+    built_views: Mutex<BTreeSet<String>>,
 }
 
 /// Default DuckDB-backed implementation of `SqlBackend`. Holds one in-memory
@@ -109,6 +117,7 @@ impl DuckDbBackend {
         let state = Arc::new(ConnState {
             conn: Mutex::new(conn),
             catalog,
+            built_views: Mutex::new(BTreeSet::new()),
         });
         map.insert(data_source.to_string(), state.clone());
         Ok((state, true))
@@ -185,6 +194,12 @@ impl TraitSqlBackend for DuckDbBackend {
 
         let conn = state.conn.lock().expect("poisoned");
 
+        // Lazy-build views the rendered SQL actually references, skipping
+        // any metric whose view is already live. Both metric-ident
+        // captures (`m`/`a`/`b`/`c`) and hardcoded `FROM` idents covered
+        // by the same scan we did pre-interp.
+        ensure_built_views(&state, &conn, captures, &sql)?;
+
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
 
@@ -208,6 +223,103 @@ impl TraitSqlBackend for DuckDbBackend {
     }
 }
 
+/// Build any pending metric VIEWs the query references and that
+/// haven't been built yet. Skips ones already live (`built_views`)
+/// and ones the catalog doesn't carry (PromQL-empty short-circuit
+/// already handled them upstream). Caller holds `state.conn` locked.
+fn ensure_built_views(
+    state: &ConnState,
+    conn: &Connection,
+    captures: &Captures,
+    sql: &str,
+) -> Result<(), SqlError> {
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    // From metric-ident captures.
+    for &name in &["m", "a", "b", "c"] {
+        if let Some(CaptureValue::Ident(metric)) = captures.get(name) {
+            if state.catalog.view_names.contains(metric) {
+                needed.insert(metric.clone());
+            }
+        }
+    }
+    // From hardcoded `FROM <ident>` tokens in the rendered SQL.
+    for ident in scan_from_idents(sql) {
+        if state.catalog.view_names.contains(&ident) {
+            needed.insert(ident);
+        }
+    }
+    if needed.is_empty() {
+        return Ok(());
+    }
+    let mut built = state.built_views.lock().expect("poisoned");
+    for metric in needed {
+        if built.contains(&metric) {
+            continue;
+        }
+        if let Some(view_sql) = state.catalog.pending_view_sql.get(&metric) {
+            conn.execute(view_sql, []).map_err(|e| {
+                SqlError::Backend(format!("lazy build view {metric}: {e}"))
+            })?;
+            built.insert(metric);
+        }
+    }
+    Ok(())
+}
+
+/// Lightweight FROM/JOIN-ident scanner: iterates both `FROM <ident>`
+/// and `JOIN <ident>` tokens in `sql` (case-insensitive,
+/// word-boundary-aware) and yields the alphanumeric identifier names.
+/// Skips function calls (`FROM read_parquet(...)`) and
+/// quoted/parenthesised forms.
+fn scan_from_idents(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    scan_after_keyword(sql, "from", &mut out);
+    scan_after_keyword(sql, "join", &mut out);
+    out
+}
+
+fn scan_after_keyword(sql: &str, keyword: &str, out: &mut Vec<String>) {
+    let bytes = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    let mut offset = 0;
+    let kw_len = keyword.len();
+    while let Some(pos) = search.find(keyword) {
+        let abs = offset + pos;
+        let before_ok = abs == 0
+            || !(bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_');
+        let after_pos = abs + kw_len;
+        let after_ok = after_pos < bytes.len() && bytes[after_pos].is_ascii_whitespace();
+        if !(before_ok && after_ok) {
+            offset = abs + kw_len;
+            search = &lower[offset..];
+            continue;
+        }
+        let mut i = after_pos;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_function_call = j < bytes.len() && bytes[j] == b'(';
+            if !is_function_call {
+                out.push(sql[start..i].to_string());
+            }
+        }
+        offset = i;
+        search = &lower[offset..];
+    }
+}
+
 /// Scan rendered SQL for `FROM <ident>` tokens and return the first one
 /// that names a metric absent from the fixture's `MetricCatalog`. Used
 /// to pre-flight catalogue entries that hardcode metric names directly
@@ -223,27 +335,23 @@ impl TraitSqlBackend for DuckDbBackend {
 /// against the catalog's `view_names` set — only metric views are in
 /// that set, so unrecognised idents fall through and the SQL itself
 /// gets to surface any problem.
-fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<String> {
+/// Collect identifier names introduced by `WITH <name> AS (...)`
+/// clauses so the FROM/JOIN scanner can skip self-references. A query
+/// like `WITH per_series AS (...) SELECT ... FROM per_series` would
+/// otherwise look like a missing-metric reference.
+fn collect_cte_names(sql: &str) -> BTreeSet<String> {
     let bytes = sql.as_bytes();
-    let mut i = 0;
-    let mut cte_names: std::collections::BTreeSet<String> = Default::default();
-
-    // Pre-pass: collect WITH ... AS (...) names so a self-referential
-    // FROM doesn't count as missing.
     let lower = sql.to_ascii_lowercase();
+    let mut out: BTreeSet<String> = Default::default();
     let mut search = lower.as_str();
     let mut offset = 0;
     while let Some(pos) = search.find("with ") {
         let abs = offset + pos + "with ".len();
-        // After "WITH ", expect one or more `<name> AS (...)` separated by commas.
-        // Walk through until we hit a top-level keyword (SELECT/INSERT/etc.).
         let mut k = abs;
         loop {
-            // Skip whitespace.
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
-            // Read an identifier.
             let id_start = k;
             while k < bytes.len()
                 && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
@@ -254,7 +362,6 @@ fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<St
                 break;
             }
             let name = sql[id_start..k].to_string();
-            // Skip whitespace.
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
@@ -265,8 +372,8 @@ fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<St
             {
                 break;
             }
-            cte_names.insert(name);
-            // Skip past the parenthesised body of the CTE.
+            out.insert(name);
+            // Skip past parenthesised CTE body.
             k += 2;
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
@@ -283,7 +390,6 @@ fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<St
                     k += 1;
                 }
             }
-            // Skip whitespace then optional comma.
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
@@ -296,59 +402,19 @@ fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<St
         offset = abs;
         search = &lower[abs..];
     }
+    out
+}
 
-    // Scan for FROM <ident>. Lowercase form to match case-insensitively.
-    let mut search = lower.as_str();
-    let mut offset = 0;
-    while let Some(pos) = search.find("from") {
-        let abs = offset + pos;
-        // Word boundary checks: the char before must not be alphanumeric
-        // (otherwise this is e.g. `inform`), and the char after `from`
-        // must be whitespace.
-        let before_ok = abs == 0
-            || !(bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_');
-        let after_pos = abs + 4;
-        let after_ok = after_pos < bytes.len() && bytes[after_pos].is_ascii_whitespace();
-        if !(before_ok && after_ok) {
-            offset = abs + 4;
-            search = &lower[offset..];
-            continue;
+fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<String> {
+    let cte_names = collect_cte_names(sql);
+    const INTERNAL_TABLES: &[&str] = &["_src", "_metadata"];
+    for name in scan_from_idents(sql) {
+        if !cte_names.contains(&name)
+            && !INTERNAL_TABLES.contains(&name.as_str())
+            && !catalog.view_names.contains(&name)
+        {
+            return Some(name);
         }
-        // Skip whitespace after FROM.
-        i = after_pos;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        // If the next char isn't an ident start, skip (function call,
-        // subquery, quoted name, etc.).
-        if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
-                i += 1;
-            }
-            let name = &sql[start..i];
-            // Function call? Skip.
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let is_function_call = j < bytes.len() && bytes[j] == b'(';
-            // A FROM target outside the catalog is "missing" only if it
-            // also isn't an internal table/CTE. Internal names known not
-            // to be metrics: `_src`, `_metadata` (created in views.rs).
-            const INTERNAL_TABLES: &[&str] = &["_src", "_metadata"];
-            if !is_function_call
-                && !cte_names.contains(name)
-                && !INTERNAL_TABLES.contains(&name)
-                && !catalog.view_names.contains(name)
-            {
-                return Some(name.to_string());
-            }
-        }
-        offset = i;
-        search = &lower[offset..];
     }
     None
 }
