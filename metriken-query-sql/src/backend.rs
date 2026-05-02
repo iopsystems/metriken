@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use arrow::array::{Array, Float64Array, StringArray};
 use duckdb::Connection;
 use metriken_query::{
     CaptureValue, CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, OutputShape,
@@ -366,62 +367,100 @@ fn run_matrix(
     let n_values = entry.value_columns.len().max(1);
     let label_offset = 1 + n_values;
 
-    // Resolve label column names. Two strategies:
-    // 1. Catalogue-declared (`entry.label_columns` non-empty) — used by entries
-    //    that explicitly project per-label columns (e.g. `id` for
-    //    `sum by (id) (...)`).
-    // 2. Schema-inferred — when the catalogue leaves `label_columns` empty but
-    //    the SQL projects extra columns past `(t, value(s))`, treat each
-    //    trailing column as a label name. This lets passthrough entries like
-    //    `gauge_bare` project a parquet's per-source labels via `* EXCLUDE
-    //    (timestamp, value, col)` without hard-coding the label set in TOML.
-    //    `column_names()` requires the statement to have been executed first
-    //    (otherwise duckdb-rs panics — see backend.rs module docs), so we
-    //    enter the rows path before reading the schema.
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| SqlError::Backend(format!("query {}: {e}", entry.id)))?;
+    // Bulk Arrow extraction: for queries that emit hundreds of rows
+    // (common for per-id or per-cpu shapes), per-row `Row::get()` calls
+    // through duckdb-rs are a measurable chunk of the warm-exec cost.
+    // `query_arrow` returns RecordBatches we can iterate with typed
+    // direct-array access (no virtual dispatch per cell).
+    let arrow = stmt
+        .query_arrow([])
+        .map_err(|e| SqlError::Backend(format!("query_arrow {}: {e}", entry.id)))?;
+    let schema = arrow.get_schema();
+
+    // Resolve label column names — same two strategies as before:
+    //   1. Catalogue-declared (`entry.label_columns` non-empty).
+    //   2. Schema-inferred (any columns past `(t, value(s))`). The latter
+    //      lets passthrough entries like `gauge_bare` project per-source
+    //      label columns via `* EXCLUDE (timestamp, value, col)` without
+    //      hard-coding them in TOML.
     let label_names: Vec<String> = if !entry.label_columns.is_empty() {
         entry.label_columns.clone()
+    } else if schema.fields().len() > label_offset {
+        schema.fields()[label_offset..]
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
     } else {
-        let schema = rows
-            .as_ref()
-            .map(|s| s.column_names())
-            .unwrap_or_default();
-        if schema.len() > label_offset {
-            schema[label_offset..].to_vec()
-        } else {
-            Vec::new()
-        }
+        Vec::new()
     };
 
-    let mut collected: Vec<(Vec<(String, String)>, Option<f64>, Option<f64>)> = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| SqlError::Backend(format!("collect rows for {}: {e}", entry.id)))?
-    {
-        let t: Option<f64> = row
-            .get(0)
-            .map_err(|e| SqlError::Backend(format!("read t for {}: {e}", entry.id)))?;
-        let v: Option<f64> = row
-            .get(1)
-            .map_err(|e| SqlError::Backend(format!("read v for {}: {e}", entry.id)))?;
-        let labels: Vec<(String, String)> = label_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let val: Option<String> = row.get(label_offset + i).ok().flatten();
-                (name.clone(), val.unwrap_or_default())
+    let mut series: BTreeMap<Vec<String>, Vec<(f64, f64)>> = BTreeMap::new();
+    let mut row_buf: Vec<String> = vec![String::new(); label_names.len()];
+    for batch in arrow {
+        let n_rows = batch.num_rows();
+        if n_rows == 0 {
+            continue;
+        }
+        let t_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                SqlError::Backend(format!(
+                    "{}: column 0 is not Float64 (got {:?})",
+                    entry.id,
+                    batch.column(0).data_type()
+                ))
+            })?;
+        let v_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                SqlError::Backend(format!(
+                    "{}: column 1 is not Float64 (got {:?})",
+                    entry.id,
+                    batch.column(1).data_type()
+                ))
+            })?;
+        // Label columns: downcast to StringArray once per batch. Some
+        // columns may be null-filled (StringArray::value panics on null);
+        // we check is_null per row in the inner loop.
+        let label_cols: Vec<&StringArray> = (0..label_names.len())
+            .map(|i| {
+                batch
+                    .column(label_offset + i)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        SqlError::Backend(format!(
+                            "{}: label column {} is not Utf8 (got {:?})",
+                            entry.id,
+                            label_offset + i,
+                            batch.column(label_offset + i).data_type()
+                        ))
+                    })
             })
-            .collect();
-        collected.push((labels, t, v));
-    }
-    let rows = collected;
+            .collect::<Result<_, _>>()?;
 
-    let mut series: BTreeMap<Vec<(String, String)>, Vec<(f64, f64)>> = BTreeMap::new();
-    for (labels, t, v) in rows {
-        let (Some(t), Some(v)) = (t, v) else { continue };
-        series.entry(labels).or_default().push((t, v));
+        for r in 0..n_rows {
+            if t_col.is_null(r) || v_col.is_null(r) {
+                continue;
+            }
+            let t = t_col.value(r);
+            let v = v_col.value(r);
+            for (i, col) in label_cols.iter().enumerate() {
+                row_buf[i] = if col.is_null(r) {
+                    String::new()
+                } else {
+                    col.value(r).to_string()
+                };
+            }
+            series
+                .entry(row_buf.clone())
+                .or_default()
+                .push((t, v));
+        }
     }
 
     // Interpolate any `{capture}` placeholders in output_metric values
@@ -438,10 +477,10 @@ fn run_matrix(
 
     let result: Vec<MatrixSample> = series
         .into_iter()
-        .map(|(labels, values)| {
+        .map(|(label_values, values)| {
             let mut metric: HashMap<String, String> = interpolated_metric.clone();
-            for (k, v) in labels {
-                metric.insert(k, v);
+            for (i, val) in label_values.into_iter().enumerate() {
+                metric.insert(label_names[i].clone(), val);
             }
             MatrixSample { metric, values }
         })

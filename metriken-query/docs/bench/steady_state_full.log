@@ -1,17 +1,17 @@
 loaded 313 queries from metriken-query/tests/data/production_queries.txt
 benchmarking 4 parquet fixtures, reps=5, warmup_passes=1
 --- /work/rezolus/site/viewer/data/demo.parquet ---
-    cold: tsdb_load=106ms duck(open=13 reg=5 views=148) first_promql=0ms first_sql=155ms
+    cold: tsdb_load=107ms duck(open=13 reg=6 views=154) first_promql=0ms first_sql=153ms
     measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=2.1s
 --- /work/rezolus/site/viewer/data/cachecannon.parquet ---
-    cold: tsdb_load=334ms duck(open=7 reg=3 views=1014) first_promql=0ms first_sql=1021ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=15.0s
+    cold: tsdb_load=348ms duck(open=7 reg=2 views=1115) first_promql=0ms first_sql=1060ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=15.2s
 --- /work/rezolus/site/viewer/data/AB_base.parquet ---
-    cold: tsdb_load=326ms duck(open=10 reg=3 views=491) first_promql=0ms first_sql=488ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=6.8s
+    cold: tsdb_load=342ms duck(open=10 reg=3 views=534) first_promql=0ms first_sql=500ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=6.9s
 --- /work/rezolus/site/viewer/data/vllm.parquet ---
-    cold: tsdb_load=286ms duck(open=11 reg=3 views=3312) first_promql=0ms first_sql=3301ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=46.5s
---- total elapsed 70.5s ---
+    cold: tsdb_load=288ms duck(open=11 reg=2 views=3631) first_promql=0ms first_sql=3394ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=46.7s
+--- total elapsed 71.0s ---
 wrote report to /work/metriken/metriken-query/docs/bench/steady_state_full.md
 wrote csv to /work/metriken/metriken-query/docs/bench/steady_state_full.csv
