@@ -278,10 +278,18 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
         // `built_views` and runs the DDL on first reference for that
         // metric. Avoids paying multi-second cold-start on fixtures with
         // hundreds of metrics where the workload only touches a few.
+        let series: Vec<MetricSeries> = cols
+            .iter()
+            .map(|c| MetricSeries {
+                physical: c.physical.clone(),
+                labels: c.labels.clone(),
+            })
+            .collect();
         catalog.pending_view_sql.insert(metric.clone(), view_sql);
         catalog.shapes.insert(metric.clone(), shape);
         catalog.label_keys.insert(metric.clone(), label_keys);
-        catalog.view_names.insert(metric);
+        catalog.view_names.insert(metric.clone());
+        catalog.series_by_metric.insert(metric, series);
     }
 
     Ok(catalog)
