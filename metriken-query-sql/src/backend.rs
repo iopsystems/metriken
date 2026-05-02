@@ -34,7 +34,7 @@ use metriken_query::{
     QueryResult, SqlBackend as TraitSqlBackend, SqlError,
 };
 
-use crate::views::{MetricCatalog, MetricShape};
+use crate::views::{MetricCatalog, MetricSeries, MetricShape};
 
 /// Per-data-source state: the DuckDB connection plus the metadata
 /// catalog produced by `ensure_views`. Pre-computing the catalog lets
@@ -181,8 +181,19 @@ impl TraitSqlBackend for DuckDbBackend {
             _ => None,
         };
 
-        let sql = crate::interp::interpolate(template, captures, data_source, available_labels)
-            .map_err(|e| SqlError::Backend(format!("interp {}: {e}", entry.id)))?;
+        // Wide-form fast path. For shapes the wide-form generator
+        // recognises (currently `sum by (G) (irate(M{F}[R]))`), emit
+        // SQL that projects rates per-physical-column directly off
+        // `_src` instead of going through the long-form metric VIEW.
+        // Avoids the PARTITION BY col on WINDOW that re-derives a
+        // partitioning the wide layout already has — measured ~2x
+        // faster end-to-end on the worst-case shape.
+        let wide_sql = crate::wide_form::try_generate(entry, captures, &state.catalog);
+        let sql = match wide_sql {
+            Some(s) => s,
+            None => crate::interp::interpolate(template, captures, data_source, available_labels)
+                .map_err(|e| SqlError::Backend(format!("interp {}: {e}", entry.id)))?,
+        };
 
         // 3) Hardcoded-metric scan: catalogue entries that bake metric
         //    names directly into SQL (e.g. `FROM rezolus_bpf_run_time`)

@@ -19,6 +19,7 @@ pub mod interp;
 pub mod macros;
 pub mod udf;
 pub mod views;
+pub mod wide_form;
 
 pub use backend::DuckDbBackend;
 
