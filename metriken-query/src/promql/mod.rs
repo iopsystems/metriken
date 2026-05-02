@@ -441,7 +441,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // attached via `with_dispatch`. The pre-dispatcher path is just
         // `query_range_promql` directly.
         if let Some(dispatch) = &self.dispatch {
-            if let Some(entry) = dispatch.catalogue.lookup(query_str) {
+            if let Some((entry, captures)) = dispatch.catalogue.lookup(query_str) {
                 use crate::dispatch::{canonicalise, Diff, Mode};
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
                 match entry.mode {
@@ -454,8 +454,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         // Best-effort SQL: a backend error in shadow mode is
                         // logged via the observer but does not fail the request.
                         let s_t0 = std::time::Instant::now();
-                        let sql_outcome =
-                            dispatch.backend.run(entry, &dispatch.data_source, start, end, step);
+                        let sql_outcome = dispatch.backend.run(
+                            entry,
+                            &captures,
+                            &dispatch.data_source,
+                            start,
+                            end,
+                            step,
+                        );
                         let sql_ms = ms(s_t0.elapsed());
 
                         match sql_outcome {
@@ -500,7 +506,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         let s_t0 = std::time::Instant::now();
                         let sql = dispatch
                             .backend
-                            .run(entry, &dispatch.data_source, start, end, step)
+                            .run(entry, &captures, &dispatch.data_source, start, end, step)
                             .map_err(|e| QueryError::EvaluationError(format!("strict-mode SQL: {e}")))?;
                         let sql_ms = ms(s_t0.elapsed());
 
@@ -528,7 +534,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                         let s_t0 = std::time::Instant::now();
                         let result = dispatch
                             .backend
-                            .run(entry, &dispatch.data_source, start, end, step)
+                            .run(entry, &captures, &dispatch.data_source, start, end, step)
                             .map_err(|e| QueryError::EvaluationError(e.to_string()));
                         let sql_ms = ms(s_t0.elapsed());
                         dispatch.observer.on_dispatch(

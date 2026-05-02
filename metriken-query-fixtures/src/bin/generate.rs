@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     histogram_empty_period(&out_dir)?;
     sampling_interval_500ms(&out_dir)?;
     rezolus_minimal(&out_dir)?;
+    softirq_multi_kind(&out_dir)?;
 
     println!("done");
     Ok(())
@@ -330,4 +331,37 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     builder.write(&dir.join("rezolus_minimal.parquet"))
+}
+
+/// Multi-label softirq counter, mirroring the Rezolus dashboard's softirq
+/// shape: one metric (`softirq`) with labels `(id, kind)`. Three kinds × two
+/// CPUs = six series, all monotonic at differentiated rates so per-`kind`
+/// aggregations have non-trivial expected values. Drives the templated
+/// catalogue entry `softirq_irate_total_by_kind`.
+fn softirq_multi_kind(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = FixtureBuilder::new().file_metadata("source", "fixture-softirq-multi-kind");
+    let mut col = 0u32;
+    for id in ["0", "1"] {
+        for kind in ["hi", "net_rx", "timer"] {
+            // Per-(kind, id) accumulation rates keep each series distinguishable.
+            let rate: u64 = match (kind, id) {
+                ("hi", "0") => 50,
+                ("hi", "1") => 30,
+                ("net_rx", "0") => 1000,
+                ("net_rx", "1") => 800,
+                ("timer", "0") => 200,
+                ("timer", "1") => 150,
+                _ => 0,
+            };
+            let points: Vec<(u64, u64)> = (0..=10).map(|s| (ts_secs(s), s * rate)).collect();
+            builder = builder.add_counter(CounterSeries {
+                column_name: format!("softirq__{col}"),
+                metric: "softirq".into(),
+                labels: labels(&[("id", id), ("kind", kind)]),
+                points,
+            });
+            col += 1;
+        }
+    }
+    builder.write(&dir.join("softirq_multi_kind.parquet"))
 }

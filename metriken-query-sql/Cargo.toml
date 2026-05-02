@@ -19,6 +19,7 @@ bytes = "1"
 duckdb = { version = "1.1.1", features = ["bundled", "vscalar"] }
 metriken-query = { path = "../metriken-query", default-features = false }
 parquet = { workspace = true, default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
+thiserror = "2"
 
 [dev-dependencies]
 histogram.workspace = true

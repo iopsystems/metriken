@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use metriken_query::{
-    Catalogue, CatalogueEntry, Mode, QueryEngine, QueryResult, SqlBackend, Tsdb,
+    Catalogue, CatalogueEntry, CompiledTemplate, Mode, QueryEngine, QueryResult, SqlBackend, Tsdb,
 };
 use metriken_query_sql::DuckDbBackend;
 use serde_json::{Map, Value};
@@ -95,7 +95,7 @@ fn fixture_path(entry: &CatalogueEntry) -> PathBuf {
     p
 }
 
-fn run_promql(entry: &CatalogueEntry) -> QueryResult {
+fn run_promql(entry: &CatalogueEntry, query: &str) -> QueryResult {
     let parquet = fixture_path(entry);
     let tsdb = Arc::new(Tsdb::load(&parquet).expect("load fixture"));
     let engine = QueryEngine::new(tsdb);
@@ -105,23 +105,45 @@ fn run_promql(entry: &CatalogueEntry) -> QueryResult {
     engine
         // `query_range_promql` bypasses the dispatcher — even if mode = primary
         // we still want the PromQL output for snapshot anchoring.
-        .query_range_promql(&entry.promql, start, end, step)
-        .unwrap_or_else(|e| panic!("PromQL query {} failed: {e}", entry.id))
+        .query_range_promql(query, start, end, step)
+        .unwrap_or_else(|e| panic!("PromQL query `{query}` ({}) failed: {e}", entry.id))
 }
 
 /// Run the SQL twin via the production `DuckDbBackend` — same code path the
 /// runtime dispatcher uses. Returns `None` when the entry has no SQL.
-fn run_sql(entry: &CatalogueEntry) -> Option<QueryResult> {
+/// `query` is the concrete PromQL (template literal for literal entries, or
+/// the example query for templated entries) used to extract captures.
+fn run_sql(entry: &CatalogueEntry, query: &str) -> Option<QueryResult> {
     entry.sql.as_ref()?;
     let parquet = fixture_path(entry);
     let backend = DuckDbBackend::new();
     let start = entry.start.expect("entry start");
     let end = entry.end.expect("entry end");
     let step = entry.step.expect("entry step");
+    let template = CompiledTemplate::parse(&entry.promql).expect("compile template");
+    let captures = template
+        .match_query(query)
+        .unwrap_or_else(|| panic!("entry {} template did not match `{query}`", entry.id));
     let result = backend
-        .run(entry, parquet.to_str().unwrap(), start, end, step)
-        .unwrap_or_else(|e| panic!("SQL twin for {} failed: {e}", entry.id));
+        .run(entry, &captures, parquet.to_str().unwrap(), start, end, step)
+        .unwrap_or_else(|e| panic!("SQL twin for {} (`{query}`) failed: {e}", entry.id));
     Some(result)
+}
+
+/// Concrete (snapshot_name, query) pairs to exercise for a catalogue entry.
+/// Literal-only entries produce one pair: (entry.id, entry.promql). Templated
+/// entries with `examples = [...]` produce one pair per example, named
+/// `{entry.id}_{example.id_suffix}`.
+fn snapshot_targets(entry: &CatalogueEntry) -> Vec<(String, String)> {
+    if entry.examples.is_empty() {
+        vec![(entry.id.clone(), entry.promql.clone())]
+    } else {
+        entry
+            .examples
+            .iter()
+            .map(|ex| (format!("{}_{}", entry.id, ex.id_suffix), ex.query.clone()))
+            .collect()
+    }
 }
 
 #[test]
@@ -133,25 +155,26 @@ fn golden_canonical_queries() {
     settings.set_omit_expression(true);
 
     for entry in catalogue.entries() {
-        // PromQL pass — always runs, anchors the golden.
-        let promql = canonicalize(&run_promql(entry));
-        let snapshot_name = entry.id.clone();
-        settings.bind(|| {
-            insta::assert_json_snapshot!(snapshot_name.clone(), promql);
-        });
-
-        // SQL pass — when the entry has a SQL twin, project via the
-        // production backend and snapshot against the SAME golden file.
-        // If the canonical forms diverge, this assertion fails with a diff.
-        // Skip when mode = off (the catalogue's "explicitly disabled" state).
-        if entry.mode == Mode::Off {
-            continue;
-        }
-        if let Some(sql_result) = run_sql(entry) {
-            let sql_canon = canonicalize(&sql_result);
+        for (snapshot_name, query) in snapshot_targets(entry) {
+            // PromQL pass — always runs, anchors the golden.
+            let promql = canonicalize(&run_promql(entry, &query));
             settings.bind(|| {
-                insta::assert_json_snapshot!(snapshot_name.clone(), sql_canon);
+                insta::assert_json_snapshot!(snapshot_name.clone(), promql);
             });
+
+            // SQL pass — when the entry has a SQL twin, project via the
+            // production backend and snapshot against the SAME golden file.
+            // If the canonical forms diverge, this assertion fails with a diff.
+            // Skip when mode = off (the catalogue's "explicitly disabled" state).
+            if entry.mode == Mode::Off {
+                continue;
+            }
+            if let Some(sql_result) = run_sql(entry, &query) {
+                let sql_canon = canonicalize(&sql_result);
+                settings.bind(|| {
+                    insta::assert_json_snapshot!(snapshot_name.clone(), sql_canon);
+                });
+            }
         }
     }
 }

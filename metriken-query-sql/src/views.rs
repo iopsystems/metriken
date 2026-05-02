@@ -143,6 +143,14 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
     );
     conn.execute(&load_src, [])?;
 
+    // Column metadata index: one row per metric column, with the canonical
+    // metric name, type, histogram config (when applicable), and a
+    // MAP<VARCHAR, VARCHAR> of all user labels. Queries can look up the
+    // physical columns for a given metric / label predicate without
+    // re-parsing parquet metadata, enabling more efficient SQL patterns
+    // (e.g. dynamic UNPIVOT column lists driven by `_metadata` rows).
+    populate_metadata_table(conn, &columns)?;
+
     // Group by metric name, emit one view per metric. Within a metric, all
     // columns must share the same kind (counter / gauge / histogram) and
     // — for histograms — the same grouping_power. We don't enforce here;
@@ -166,6 +174,80 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
         conn.execute(&view_sql, [])?;
     }
 
+    Ok(())
+}
+
+/// Build the `_metadata` table with one row per metric-bearing column.
+///
+/// Schema:
+/// - `col` VARCHAR — physical column name in the parquet (matches `_src` column).
+/// - `metric` VARCHAR — canonical metric name (from the `metric` field of the column's metadata).
+/// - `metric_type` VARCHAR — `'counter'`, `'gauge'`, or `'histogram'`.
+/// - `grouping_power` INTEGER — populated for histograms, NULL otherwise.
+/// - `max_value_power` INTEGER — populated for histograms, NULL otherwise.
+/// - `labels` MAP(VARCHAR, VARCHAR) — all user labels for this column
+///   (excluding internal keys: metric, metric_type, unit, grouping_power,
+///   max_value_power).
+fn populate_metadata_table(conn: &Connection, columns: &[ColumnInfo]) -> duckdb::Result<()> {
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _metadata (\
+            col VARCHAR PRIMARY KEY,\
+            metric VARCHAR,\
+            metric_type VARCHAR,\
+            grouping_power INTEGER,\
+            max_value_power INTEGER,\
+            labels MAP(VARCHAR, VARCHAR)\
+        )",
+        [],
+    )?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+
+    // Build a single multi-row INSERT for all columns. Faster than N
+    // separate inserts and keeps the transaction lock contention low.
+    let mut sql = String::from("INSERT INTO _metadata VALUES ");
+    for (i, info) in columns.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(",\n");
+        }
+        let (metric_type_str, gp_lit, mvp_lit) = match &info.kind {
+            ColumnKind::Counter => ("counter", "NULL".to_string(), "NULL".to_string()),
+            ColumnKind::Gauge => ("gauge", "NULL".to_string(), "NULL".to_string()),
+            ColumnKind::Histogram { grouping_power } => (
+                "histogram",
+                grouping_power.to_string(),
+                // We only carry grouping_power on ColumnInfo today; if the
+                // writer's metadata had max_value_power we can surface it
+                // by extending ColumnKind. For now leave NULL — the H2
+                // bucket math derives it from grouping_power + n=64.
+                "NULL".to_string(),
+            ),
+            ColumnKind::Other => continue,
+        };
+        // Build MAP literal: `MAP {'k1': 'v1', 'k2': 'v2'}` (DuckDB syntax).
+        let map_lit = if info.labels.is_empty() {
+            "MAP {}".to_string()
+        } else {
+            let pairs = info
+                .labels
+                .iter()
+                .map(|(k, v)| format!("'{}': '{}'", escape_sql(k), escape_sql(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("MAP {{{pairs}}}")
+        };
+        sql.push_str(&format!(
+            "  ('{col}', '{metric}', '{metric_type}', {gp}, {mvp}, {labels})",
+            col = escape_sql(&info.physical),
+            metric = escape_sql(&info.metric),
+            metric_type = metric_type_str,
+            gp = gp_lit,
+            mvp = mvp_lit,
+            labels = map_lit,
+        ));
+    }
+    conn.execute(&sql, [])?;
     Ok(())
 }
 
@@ -199,8 +281,16 @@ fn build_view_sql(metric: &str, cols: &[&ColumnInfo], label_keys: &[String]) -> 
             format!(", {label_select}")
         };
 
+        // Emit `col` as the physical column name — this is the unique
+        // per-series identifier in the wide-form parquet. Catalogue
+        // queries should `PARTITION BY col` for per-series windowed math
+        // (irate / rate / LAG): partitioning by a label subset like
+        // (id, state) collapses multi-source captures (e.g. cachecannon's
+        // rezolus-client::* and rezolus-server::* columns share id+state
+        // but represent different series under different `node` labels).
         selects.push(format!(
-            "SELECT timestamp, {value_expr}{label_part} FROM _src WHERE \"{physical}\" IS NOT NULL"
+            "SELECT timestamp, {value_expr}, '{col_lit}' AS col{label_part} FROM _src WHERE \"{physical}\" IS NOT NULL",
+            col_lit = escape_sql(&c.physical)
         ));
     }
 

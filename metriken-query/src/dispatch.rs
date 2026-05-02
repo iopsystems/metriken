@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::QueryResult;
+use crate::template::{CompiledTemplate, TemplateError};
+use crate::{Captures, QueryResult};
 
 /// Per-query lifecycle stage. Promotions are catalogue commits — `git log
 /// queries.toml` is the canonical migration history.
@@ -68,6 +69,13 @@ pub struct CatalogueEntry {
     pub label_columns: Vec<String>,
     #[serde(default)]
     pub output_metric: BTreeMap<String, String>,
+    /// Concrete query instantiations for the golden test harness, used when
+    /// `promql` is a *template* (contains `${...}` placeholders) rather than
+    /// a literal query. Each example produces its own golden under
+    /// `{entry.id}_{example.id_suffix}`. Empty for literal-only entries —
+    /// the harness uses `promql` directly.
+    #[serde(default)]
+    pub examples: Vec<GoldenExample>,
     /// Test-time fields. Included so a single struct deserialises both the
     /// runtime path and the test harness.
     #[serde(default)]
@@ -82,21 +90,68 @@ pub struct CatalogueEntry {
     pub description: Option<String>,
 }
 
+/// One concrete query instantiation for a templated catalogue entry. Drives
+/// the golden harness: each example produces its own snapshot, and the
+/// captures extracted from `query` are forwarded to the SQL backend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoldenExample {
+    pub id_suffix: String,
+    pub query: String,
+}
+
 fn default_mode() -> Mode {
     Mode::Off
 }
 
 /// All catalogue entries, parsed from `queries.toml`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Templates are compiled eagerly at `from_toml` time so that any malformed
+/// template is rejected at startup, not on the first query that happens to
+/// hit it. The compiled templates live in a parallel `Vec` indexed identically
+/// to `entries`.
+#[derive(Debug, Clone)]
 pub struct Catalogue {
-    #[serde(rename = "query")]
     entries: Vec<CatalogueEntry>,
+    templates: Vec<CompiledTemplate>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogueError {
+    #[error("toml parse error: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("template `{id}` failed to compile: {source}")]
+    Template {
+        id: String,
+        #[source]
+        source: TemplateError,
+    },
 }
 
 impl Catalogue {
     /// Parse the catalogue text (`queries.toml` content) into entries.
-    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
+    /// Compiles each entry's `promql` template and surfaces any template
+    /// parse error along with the offending entry id.
+    pub fn from_toml(text: &str) -> Result<Self, CatalogueError> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "query")]
+            entries: Vec<CatalogueEntry>,
+        }
+        let raw: Raw = toml::from_str(text)?;
+        let mut templates = Vec::with_capacity(raw.entries.len());
+        for e in &raw.entries {
+            let t = CompiledTemplate::parse(&e.promql).map_err(|source| {
+                CatalogueError::Template {
+                    id: e.id.clone(),
+                    source,
+                }
+            })?;
+            templates.push(t);
+        }
+        Ok(Self {
+            entries: raw.entries,
+            templates,
+        })
     }
 
     /// The version of the catalogue compiled into this crate.
@@ -109,37 +164,20 @@ impl Catalogue {
         &self.entries
     }
 
-    /// Find the entry whose `promql` matches `query` after light
-    /// whitespace normalisation. Rezolus generates queries via `format!`
-    /// today so an exact match is sufficient; capture-group templating
-    /// arrives when a generator emits AST-equivalent-but-textually-distinct
-    /// queries.
-    pub fn lookup(&self, query: &str) -> Option<&CatalogueEntry> {
-        let normalised = normalise(query);
-        self.entries
-            .iter()
-            .find(|e| normalise(&e.promql) == normalised)
-    }
-}
-
-fn normalise(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_space = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !last_space && !out.is_empty() {
-                out.push(' ');
+    /// Find the first entry whose compiled template matches `query`. Returns
+    /// the matched entry plus the bag of named captures extracted from the
+    /// query (empty for literal-only entries).
+    ///
+    /// Order matters: more-specific entries should appear before more-general
+    /// ones in `queries.toml`, since matching is first-hit.
+    pub fn lookup(&self, query: &str) -> Option<(&CatalogueEntry, Captures)> {
+        for (entry, template) in self.entries.iter().zip(self.templates.iter()) {
+            if let Some(captures) = template.match_query(query) {
+                return Some((entry, captures));
             }
-            last_space = true;
-        } else {
-            out.push(ch);
-            last_space = false;
         }
+        None
     }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
 }
 
 /// Backend that knows how to execute the SQL twin of a catalogue entry.
@@ -157,6 +195,7 @@ pub trait SqlBackend: Send + Sync {
     fn run(
         &self,
         entry: &CatalogueEntry,
+        captures: &Captures,
         data_source: &str,
         start: f64,
         end: f64,
@@ -267,16 +306,17 @@ mod tests {
     #[test]
     fn lookup_finds_known_query() {
         let cat = Catalogue::embedded();
-        let entry = cat.lookup("memory_total").expect("gauge_bare match");
+        let (entry, caps) = cat.lookup("memory_total").expect("gauge_bare match");
         assert_eq!(entry.id, "gauge_bare");
         assert_eq!(entry.mode, Mode::Shadow);
+        assert!(caps.is_empty(), "literal entry should have no captures");
     }
 
     #[test]
     fn lookup_is_whitespace_tolerant() {
         let cat = Catalogue::embedded();
-        let a = cat.lookup("sum by (id) (irate(cpu_usage[5m]))").unwrap();
-        let b = cat
+        let (a, _) = cat.lookup("sum by (id) (irate(cpu_usage[5m]))").unwrap();
+        let (b, _) = cat
             .lookup("  sum by (id)  (irate(cpu_usage[5m]))  ")
             .unwrap();
         assert_eq!(a.id, b.id);

@@ -226,7 +226,7 @@ end = 10.0
 step = 1.0
 description = "Sum aggregation grouped by label — Rezolus per-CPU dashboard pattern."
 # Uses the auto-generated `cpu_usage(timestamp, value, id, state)` view.
-# Per-series irate is computed with `PARTITION BY id, state` so LAG only
+# Per-series irate is computed with `PARTITION BY col` (unique physical column = unique series, so LAG only
 # walks within a single labeled series.
 sql = """
 WITH per_series AS (
@@ -238,7 +238,7 @@ WITH per_series AS (
                ELSE CAST(value AS DOUBLE)
            END AS rate
     FROM cpu_usage
-    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) AS v,
@@ -273,7 +273,7 @@ WITH per_series AS (
            END AS rate
     FROM cpu_usage
     WHERE state = 'user'
-    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) AS v,
@@ -306,7 +306,7 @@ WITH per_series AS (
                ELSE CAST(value AS DOUBLE)
            END AS rate
     FROM cpu_usage
-    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) AS v
@@ -338,7 +338,7 @@ WITH per_series AS (
                ELSE CAST(value AS DOUBLE)
            END AS rate
     FROM cpu_usage
-    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 ),
 sums AS (
     SELECT timestamp,
@@ -360,45 +360,38 @@ output_metric = {}
 # ---------- Histograms ----------
 
 [[query]]
-id = "histogram_quantile_p50"
+id = "histogram_quantile_generic"
 mode = "shadow"
-promql = "histogram_quantile(0.5, request_latency)"
+# Fully templated `histogram_quantile(q, m)` — captures both the quantile
+# literal and the metric name. ONE entry covers every (q, m) combination.
+# The SQL interpolates `{m}` into the FROM clause (referencing the
+# auto-generated wide-to-long view for that metric) and `{q}` as a numeric
+# literal. The series is tagged with both labels so the canonical output
+# matches PromQL's shape.
+#
+# Replaces the per-metric entries that previously needed one entry per
+# (metric, quantile) pair. Real Rezolus traffic (e.g.
+# `histogram_quantile(0.99, scheduler_runqueue_latency)`) hits this entry
+# directly without a per-metric catalogue change.
+promql = "histogram_quantile(${q:number}, ${m:ident})"
 fixture = "histogram_basic"
 start = 1.0
 end = 10.0
 step = 1.0
-description = "Single-quantile extraction over a normal histogram."
-# `request_latency(timestamp, buckets, p)` view exposes the histogram column
-# plus the per-column `grouping_power`. `hist_irate_quantile` expands to
-# `h2_quantile(h2_delta(buckets, LAG(buckets) OVER (ORDER BY ts)), q, p)`.
+description = "Generic single-quantile extraction over any histogram view. One templated entry covers every (quantile, metric)."
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(hist_irate_quantile(buckets, 0.5, timestamp, p) AS DOUBLE) AS v
-FROM request_latency
+       CAST(hist_irate_quantile(buckets, {q}, timestamp, p) AS DOUBLE) AS v
+FROM {m}
 ORDER BY timestamp
 """
 value_columns = ["v"]
 label_columns = []
-output_metric = { __name__ = "request_latency", quantile = "0.5" }
-
-[[query]]
-id = "histogram_quantile_p99"
-mode = "shadow"
-promql = "histogram_quantile(0.99, request_latency)"
-fixture = "histogram_basic"
-start = 1.0
-end = 10.0
-step = 1.0
-description = "p99 over the same histogram."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(hist_irate_quantile(buckets, 0.99, timestamp, p) AS DOUBLE) AS v
-FROM request_latency
-ORDER BY timestamp
-"""
-value_columns = ["v"]
-label_columns = []
-output_metric = { __name__ = "request_latency", quantile = "0.99" }
+output_metric = { __name__ = "{m}", quantile = "{q}" }
+examples = [
+    { id_suffix = "request_latency_p50", query = "histogram_quantile(0.5, request_latency)" },
+    { id_suffix = "request_latency_p99", query = "histogram_quantile(0.99, request_latency)" },
+]
 
 [[query]]
 id = "histogram_quantiles_rezolus_ext"
@@ -533,7 +526,7 @@ WITH per_series AS (
                ELSE CAST(value AS DOUBLE)
            END AS rate
     FROM cpu_usage
-    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) / 2 / 1000000000 AS v
@@ -566,7 +559,7 @@ WITH per_series AS (
            END AS rate
     FROM cpu_usage
     WHERE state = 'user'
-    WINDOW w AS (PARTITION BY id, state ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) / 1000000000 AS v,
@@ -598,3 +591,55 @@ ORDER BY timestamp
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "syscall_latency", quantile = "0.99" }
+
+# ---------- Templated entries ----------
+# Templated entries use `${name:kind}` placeholders in `promql` and matching
+# `{name}` interpolations in `sql`. The matcher extracts captures from
+# incoming queries; the SQL backend substitutes them. Each entry's `examples`
+# array drives the golden harness — one snapshot per concrete instantiation,
+# named `{entry.id}_{example.id_suffix}`. See `metriken-query/src/template.rs`
+# for the placeholder grammar and `metriken-query-sql/src/interp.rs` for the
+# interpolation rules.
+
+[[query]]
+id = "softirq_irate_total_by_kind"
+mode = "shadow"
+# Captures one label-value (`kind`) of an `irate(softirq{...})` aggregate.
+# The plan covers the four softirq shapes (rate, rate-by-id, time-pct,
+# time-pct-by-id) × ten kinds with one entry each — this is the rate one.
+promql = 'sum(irate(softirq{kind=${k:string}}[5m]))'
+fixture = "softirq_multi_kind"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Softirq rate per kind. One templated entry covers every kind value."
+# Note: `{k}` interpolates as a fully SQL-quoted string literal (e.g. `'hi'`)
+# — do not wrap it in extra single-quotes.
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM softirq
+    WHERE kind = {k}
+    WINDOW w AS (PARTITION BY id ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "hi", query = 'sum(irate(softirq{kind="hi"}[5m]))' },
+    { id_suffix = "net_rx", query = 'sum(irate(softirq{kind="net_rx"}[5m]))' },
+    { id_suffix = "timer", query = 'sum(irate(softirq{kind="timer"}[5m]))' },
+]

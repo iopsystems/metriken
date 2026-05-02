@@ -1571,6 +1571,7 @@ dependencies = [
  "histogram",
  "metriken-query",
  "parquet",
+ "thiserror",
 ]
 
 [[package]]

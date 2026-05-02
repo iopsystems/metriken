@@ -1,8 +1,10 @@
 //! Embedded-DuckDB implementation of `metriken_query::SqlBackend`.
 //!
-//! Each `run` call opens a fresh in-memory connection, registers the UDFs
-//! and macros, executes the SQL twin (with `{fixture_path}` substituted
-//! with the configured data source), and projects the rows.
+//! `DuckDbBackend` keeps one in-memory connection per `data_source` (parquet
+//! path or glob). The first request for a given source pays the cold-start
+//! cost — open in-memory DB, register UDFs + macros, load the parquet into a
+//! `_src` temp table via `views::ensure_views`. Subsequent requests reuse
+//! that same connection and only pay the SQL `prepare` + `execute` cost.
 //!
 //! Two output shapes, dispatched on `entry.output_shape`:
 //!
@@ -23,22 +25,71 @@
 //! panicking if column metadata is read before the statement executes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use duckdb::Connection;
 use metriken_query::{
-    CatalogueEntry, HistogramHeatmapResult, MatrixSample, OutputShape, QueryResult,
+    CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, OutputShape, QueryResult,
     SqlBackend as TraitSqlBackend, SqlError,
 };
 
-/// Default DuckDB-backed implementation of `SqlBackend`. Stateless — every
-/// query opens its own in-memory connection. This is fine because reading
-/// from a Parquet file via `read_parquet(...)` is the same regardless of
-/// connection state.
-pub struct DuckDbBackend;
+/// Default DuckDB-backed implementation of `SqlBackend`. Holds one in-memory
+/// `Connection` per unique `data_source`, lazily initialised on first request.
+/// `Connection` is `!Sync`, so each cached connection is wrapped in an inner
+/// `Mutex` that serialises queries against the same fixture; the outer mutex
+/// guards the lookup map and is rarely contended.
+pub struct DuckDbBackend {
+    connections: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
+}
 
 impl DuckDbBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            connections: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Look up (or lazily build) the cached connection for `data_source`.
+    /// Returns the `Arc` and a `cold` flag — `true` means this call paid
+    /// the open + UDF-registration + view-building cost, `false` means
+    /// the connection was already warm.
+    fn get_or_init(&self, data_source: &str) -> Result<(Arc<Mutex<Connection>>, bool), SqlError> {
+        // Fast path: already cached.
+        {
+            let map = self.connections.lock().expect("poisoned");
+            if let Some(arc) = map.get(data_source) {
+                return Ok((arc.clone(), false));
+            }
+        }
+        // Slow path: build under the outer lock.
+        let mut map = self.connections.lock().expect("poisoned");
+        if let Some(arc) = map.get(data_source) {
+            return Ok((arc.clone(), false));
+        }
+        let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+        let conn = Connection::open_in_memory()
+            .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
+        let t_open = t0.elapsed();
+        crate::register_all(&conn)
+            .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
+        let t_register = t0.elapsed() - t_open;
+        crate::views::ensure_views(&conn, data_source)
+            .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
+        let t_views = t0.elapsed() - t_open - t_register;
+        if timing {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "duckdb cold-start data_source={} open={:.1}ms reg={:.1}ms views={:.1}ms",
+                data_source,
+                ms(t_open),
+                ms(t_register),
+                ms(t_views)
+            );
+        }
+        let arc = Arc::new(Mutex::new(conn));
+        map.insert(data_source.to_string(), arc.clone());
+        Ok((arc, true))
     }
 }
 
@@ -52,6 +103,7 @@ impl TraitSqlBackend for DuckDbBackend {
     fn run(
         &self,
         entry: &CatalogueEntry,
+        captures: &Captures,
         data_source: &str,
         _start: f64,
         _end: f64,
@@ -61,42 +113,28 @@ impl TraitSqlBackend for DuckDbBackend {
             .sql
             .as_ref()
             .ok_or_else(|| SqlError::Backend(format!("entry {} has no SQL twin", entry.id)))?;
-        let sql = template.replace("{fixture_path}", data_source);
+        let sql = crate::interp::interpolate(template, captures, data_source)
+            .map_err(|e| SqlError::Backend(format!("interp {}: {e}", entry.id)))?;
 
-        // Phase timings — enable with METRIKEN_SQL_TIMING=1 for per-query
-        // breakdown logging on stderr. Quiet by default so production logs
-        // don't get spammed.
+        let (arc, cold) = self.get_or_init(data_source)?;
+        let conn = arc.lock().expect("poisoned");
+
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
 
-        let conn = Connection::open_in_memory()
-            .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
-        let t_open = t0.elapsed();
-
-        crate::register_all(&conn)
-            .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
-        let t_register = t0.elapsed() - t_open;
-
-        crate::views::ensure_views(&conn, data_source)
-            .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
-        let t_views = t0.elapsed() - t_open - t_register;
-
         let result = match entry.output_shape {
-            OutputShape::Matrix => run_matrix(&conn, entry, &sql, timing),
+            OutputShape::Matrix => run_matrix(&conn, entry, captures, &sql, timing),
             OutputShape::Heatmap => run_heatmap(&conn, entry, &sql, timing),
         };
-        let t_total = t0.elapsed();
+        let t_exec = t0.elapsed();
 
         if timing {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "duckdb {} open={:.1}ms reg={:.1}ms views={:.1}ms exec={:.1}ms total={:.1}ms",
+                "duckdb {} {} exec={:.1}ms",
                 entry.id,
-                ms(t_open),
-                ms(t_register),
-                ms(t_views),
-                ms(t_total - t_open - t_register - t_views),
-                ms(t_total),
+                if cold { "cold" } else { "warm" },
+                ms(t_exec)
             );
         }
 
@@ -107,6 +145,7 @@ impl TraitSqlBackend for DuckDbBackend {
 fn run_matrix(
     conn: &Connection,
     entry: &CatalogueEntry,
+    captures: &Captures,
     sql: &str,
     _timing: bool,
 ) -> Result<QueryResult, SqlError> {
@@ -142,13 +181,22 @@ fn run_matrix(
         series.entry(labels).or_default().push((t, v));
     }
 
+    // Interpolate any `{capture}` placeholders in output_metric values
+    // (e.g. `quantile = "{q}"` for the templated histogram_quantile entry).
+    // The data_source argument is irrelevant here — output_metric never
+    // legitimately contains `{fixture_path}` — but we pass empty rather
+    // than threading the real value to make that explicit.
+    let mut interpolated_metric: HashMap<String, String> = HashMap::with_capacity(entry.output_metric.len());
+    for (k, v) in &entry.output_metric {
+        let resolved = crate::interp::interpolate(v, captures, "")
+            .map_err(|e| SqlError::Backend(format!("interp output_metric[{k}] for {}: {e}", entry.id)))?;
+        interpolated_metric.insert(k.clone(), resolved);
+    }
+
     let result: Vec<MatrixSample> = series
         .into_iter()
         .map(|(labels, values)| {
-            let mut metric: HashMap<String, String> = HashMap::new();
-            for (k, v) in &entry.output_metric {
-                metric.insert(k.clone(), v.clone());
-            }
+            let mut metric: HashMap<String, String> = interpolated_metric.clone();
             for (k, v) in labels {
                 metric.insert(k, v);
             }

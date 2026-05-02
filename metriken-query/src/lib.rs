@@ -24,12 +24,17 @@
 
 pub mod dispatch;
 pub mod promql;
+pub mod template;
 pub mod tsdb;
 
 pub use bytes::Bytes;
 pub use dispatch::{
-    canonicalise, Catalogue, CatalogueEntry, Diff, DispatchObserver, Mode, NoopObserver,
-    OutputShape, SqlBackend, SqlError,
+    canonicalise, Catalogue, CatalogueEntry, CatalogueError, Diff, DispatchObserver,
+    GoldenExample, Mode, NoopObserver, OutputShape, SqlBackend, SqlError,
+};
+pub use template::{
+    CaptureKind, CaptureValue, Captures, CompiledTemplate, LabelMatcher, LabelOp, TemplateError,
+    TemplatePart,
 };
 pub use promql::{
     DispatchConfig, HistogramHeatmapResult, MatrixSample, QueryEngine, QueryError, QueryResult,

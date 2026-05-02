@@ -15,6 +15,7 @@
 use duckdb::Connection;
 
 pub mod backend;
+pub mod interp;
 pub mod macros;
 pub mod udf;
 pub mod views;
