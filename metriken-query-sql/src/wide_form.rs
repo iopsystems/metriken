@@ -622,20 +622,30 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
         format!(" / {}", shape.scale)
     };
 
-    // 1) Per-column expression. For irate we need a WINDOW for LAG.
+    // Per-column expression. For irate we need a WINDOW for LAG.
     let (per_col_select, window_clause) = build_per_col(&matching, shape.expr);
 
-    // 2) UNPIVOT-ish: select rows of (timestamp[, group_label_value],
-    //    per_col_value) for each column. This is the same shape for
-    //    Aggregation::None (passthrough) and Aggregation::* (input to GROUP BY).
+    // For Aggregation::Sum we pre-aggregate at the rate-expression
+    // level: group matching cols by their `group_label` value (or all
+    // into one group when there's no by-clause), emit one row per
+    // group via `(COALESCE(val_i, 0) + COALESCE(val_j, 0) + ...) AS v`,
+    // and skip the GROUP BY operator entirely. Profiled measurement:
+    // for vllm softirq{kind=rcu} the HASH_GROUP_BY operator was 1.14ms
+    // out of 1.94ms total (59%) — its work was identity-grouping rows
+    // that already had unique (id, timestamp) tuples. Eliminating it
+    // is a clean win.
+    if shape.aggregation == Aggregation::Sum {
+        return Some(generate_sum(&matching, shape, &per_col_select, &window_clause, &scale_expr));
+    }
+
+    // Other aggregations (None / Max / Avg) keep the UNPIVOT + GROUP BY
+    // pattern. None is also the schema-projecting passthrough for bare
+    // gauge selectors. Max/Avg can't be pushed through arithmetic the
+    // way Sum can.
     let mut unions = String::new();
     for (i, s) in matching.iter().enumerate() {
         let prefix = if i == 0 { "" } else { "\n      UNION ALL\n      " };
-        // Project all the labels of this series so passthrough output
-        // (Aggregation::None) carries them. For aggregated output we
-        // emit just the group label (or nothing).
         let label_proj = if shape.aggregation == Aggregation::None {
-            // Project every label key the metric has across all series.
             let mut all_keys: std::collections::BTreeSet<&str> = Default::default();
             for s in &matching {
                 for k in s.labels.keys() {
@@ -669,16 +679,14 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
         ));
     }
 
-    // 3) Final aggregation step. Aggregation::None passes through.
     let value_expr = match shape.aggregation {
         Aggregation::None => format!("v{scale_expr}"),
-        Aggregation::Sum => format!("SUM(v){scale_expr}"),
         Aggregation::Max => format!("MAX(v){scale_expr}"),
         Aggregation::Avg => format!("AVG(v){scale_expr}"),
+        Aggregation::Sum => unreachable!("handled above"),
     };
     let (group_clause, order_clause, group_select) = match (shape.aggregation, shape.group_label) {
         (Aggregation::None, _) => {
-            // Project labels we already SELECT in the UNPIVOT branches.
             let mut all_keys: std::collections::BTreeSet<&str> = Default::default();
             for s in &matching {
                 for k in s.labels.keys() {
@@ -720,6 +728,67 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
          {group_clause}\n\
          ORDER BY {order_clause}"
     ))
+}
+
+/// Sum aggregation, pre-aggregated at the rate-expression level so
+/// the final query has no GROUP BY operator. Group matching cols by
+/// their `group_label` value (or all into one group when there's no
+/// by-clause), then emit one row per (timestamp, group_value) via
+/// arithmetic on the rate columns.
+fn generate_sum(
+    matching: &[&MetricSeries],
+    shape: &Shape,
+    per_col_select: &str,
+    window_clause: &str,
+    scale_expr: &str,
+) -> String {
+    // Bucket matching cols by their group-label value. With no by-clause
+    // there's just one bucket containing all cols.
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for (i, s) in matching.iter().enumerate() {
+        let key = match shape.group_label {
+            Some(g) => s.labels.get(g).cloned().unwrap_or_default(),
+            None => String::new(),
+        };
+        groups.entry(key).or_default().push(i);
+    }
+
+    let mut union_branches: Vec<String> = Vec::with_capacity(groups.len());
+    for (g_value, col_idxs) in &groups {
+        let coalesce_terms: Vec<String> = col_idxs
+            .iter()
+            .map(|i| format!("COALESCE(val_{i}, 0)"))
+            .collect();
+        let null_check_terms: Vec<String> = col_idxs
+            .iter()
+            .map(|i| format!("val_{i} IS NOT NULL"))
+            .collect();
+        let sum_expr = coalesce_terms.join(" + ");
+        let any_present = null_check_terms.join(" OR ");
+        let g_select = match shape.group_label {
+            Some(g) => {
+                let g_quoted = quote_ident(g);
+                let g_lit = g_value.replace('\'', "''");
+                format!(", '{g_lit}' AS {g_quoted}")
+            }
+            None => String::new(),
+        };
+        union_branches.push(format!(
+            "SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, ({sum_expr}){scale_expr} AS v{g_select} FROM rates WHERE {any_present}"
+        ));
+    }
+    let unions = union_branches.join("\n      UNION ALL\n      ");
+
+    let order_clause = match shape.group_label {
+        Some(g) => format!("{g}, t", g = quote_ident(g)),
+        None => "t".to_string(),
+    };
+
+    format!(
+        "WITH rates AS (\n  SELECT timestamp{per_col_select}\n  FROM _src\n  {window_clause}\n)\n\
+         {unions}\n\
+         ORDER BY {order_clause}"
+    )
 }
 
 /// Emit one per-column expression aliased `val_<i>`. Returns
