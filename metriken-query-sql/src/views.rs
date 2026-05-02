@@ -106,6 +106,13 @@ fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
 /// typically touches a small subset of available metrics). Cuts
 /// observed cold-start on `disagg/sglang-nixl-16c.parquet` from
 /// ~16s to a few hundred ms.
+///
+/// `series_by_metric` is the per-(metric, physical-column) label map.
+/// Used by the backend's wide-form SQL generator to project rates
+/// directly off `_src` columns instead of going through the long-form
+/// VIEW (PARTITION BY col on the long form re-derives a partitioning
+/// the wide layout already has — measured 7× faster on WINDOW
+/// operator for the worst-case shape).
 #[derive(Debug, Default, Clone)]
 pub struct MetricCatalog {
     /// `Scalar` for gauge/counter (view has a `value` column);
@@ -120,6 +127,17 @@ pub struct MetricCatalog {
     /// Per-metric `CREATE OR REPLACE VIEW` SQL. Not executed at
     /// `ensure_views` time — the backend executes on first reference.
     pub pending_view_sql: std::collections::HashMap<String, String>,
+    /// Per-metric ordered list of physical columns + their label maps.
+    /// Drives the wide-form SQL generator. The order is the same as
+    /// what the long-form view UNION-ALLs over, so generated wide-form
+    /// SQL produces results in the same canonical order.
+    pub series_by_metric: std::collections::HashMap<String, Vec<MetricSeries>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricSeries {
+    pub physical: String,
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
