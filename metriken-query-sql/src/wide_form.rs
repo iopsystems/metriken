@@ -99,13 +99,35 @@ fn irate_aggregate(
     group_label: Option<&str>,
     scale: f64,
 ) -> Option<String> {
-    // Decline if any matcher uses a feature the wide-form generator
-    // doesn't support yet — caller falls back to long-form, which
-    // handles them. Important: this is NOT the same as "no rows match"
-    // (which still wants a wide-form empty-matrix SQL).
-    if !filter.iter().all(|m| matches!(m.op, LabelOp::Eq | LabelOp::Ne)) {
+    // Decline if any matcher uses a regex with metacharacters — those
+    // need real RE2 evaluation that the wide-form generator skips for
+    // now (caller falls back to long-form, which uses DuckDB's
+    // regexp_matches). PromQL regex is fully anchored, so a regex
+    // whose pattern is a plain string is equivalent to the
+    // corresponding `=`/`!=` matcher; we coerce those into Eq/Ne and
+    // proceed without invoking a regex engine. In practice every
+    // production query that uses `=~`/`!~` (cgroup `__SELECTED_CGROUPS__`
+    // placeholder pattern) is literal-only.
+    let coerced: Vec<LabelMatcher> = filter
+        .iter()
+        .map(|m| match m.op {
+            LabelOp::ReEq if is_regex_literal(&m.value) => LabelMatcher {
+                name: m.name.clone(),
+                op: LabelOp::Eq,
+                value: m.value.clone(),
+            },
+            LabelOp::ReNe if is_regex_literal(&m.value) => LabelMatcher {
+                name: m.name.clone(),
+                op: LabelOp::Ne,
+                value: m.value.clone(),
+            },
+            _ => m.clone(),
+        })
+        .collect();
+    if !coerced.iter().all(|m| matches!(m.op, LabelOp::Eq | LabelOp::Ne)) {
         return None;
     }
+    let filter = coerced.as_slice();
     let series = catalog.series_by_metric.get(metric)?;
     let matching: Vec<&MetricSeries> = series
         .iter()
@@ -240,4 +262,33 @@ fn empty_matrix_sql(group_label: Option<&str>) -> String {
 
 fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// True iff `s` contains no RE2 regex metacharacters — i.e. when used
+/// as the pattern of a fully-anchored PromQL regex matcher, it
+/// matches exactly one literal string. RE2 metacharacters per
+/// `https://github.com/google/re2/wiki/Syntax`.
+fn is_regex_literal(s: &str) -> bool {
+    !s.chars().any(|c| matches!(c,
+        '.' | '[' | ']' | '\\' | '^' | '$' | '(' | ')' | '|' |
+        '*' | '+' | '?' | '{' | '}'
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regex_literal_detection() {
+        assert!(is_regex_literal("__SELECTED_CGROUPS__"));
+        assert!(is_regex_literal("net_rx"));
+        assert!(is_regex_literal(""));
+        assert!(is_regex_literal("a-b_c"));
+        assert!(!is_regex_literal("net.*"));
+        assert!(!is_regex_literal("a|b"));
+        assert!(!is_regex_literal("a+"));
+        assert!(!is_regex_literal("a{1,2}"));
+        assert!(!is_regex_literal("[abc]"));
+    }
 }
