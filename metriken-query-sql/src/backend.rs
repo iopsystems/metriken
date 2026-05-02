@@ -33,13 +33,26 @@ use metriken_query::{
     QueryResult, SqlBackend as TraitSqlBackend, SqlError,
 };
 
+use crate::views::{MetricCatalog, MetricShape};
+
+/// Per-data-source state: the DuckDB connection plus the metadata
+/// catalog produced by `ensure_views`. Pre-computing the catalog lets
+/// every per-query pre-flight check (view-exists, view-shape,
+/// available-label-set) be a hashmap read instead of a DESCRIBE
+/// roundtrip — measured to save ~1-2ms per catalogue entry that uses
+/// metric-ident captures, which is most of them.
+struct ConnState {
+    conn: Mutex<Connection>,
+    catalog: MetricCatalog,
+}
+
 /// Default DuckDB-backed implementation of `SqlBackend`. Holds one in-memory
 /// `Connection` per unique `data_source`, lazily initialised on first request.
 /// `Connection` is `!Sync`, so each cached connection is wrapped in an inner
 /// `Mutex` that serialises queries against the same fixture; the outer mutex
 /// guards the lookup map and is rarely contended.
 pub struct DuckDbBackend {
-    connections: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
+    connections: Mutex<HashMap<String, Arc<ConnState>>>,
 }
 
 impl DuckDbBackend {
@@ -49,11 +62,11 @@ impl DuckDbBackend {
         }
     }
 
-    /// Look up (or lazily build) the cached connection for `data_source`.
-    /// Returns the `Arc` and a `cold` flag — `true` means this call paid
-    /// the open + UDF-registration + view-building cost, `false` means
-    /// the connection was already warm.
-    fn get_or_init(&self, data_source: &str) -> Result<(Arc<Mutex<Connection>>, bool), SqlError> {
+    /// Look up (or lazily build) the cached connection state for
+    /// `data_source`. Returns the `Arc` and a `cold` flag — `true`
+    /// means this call paid the open + UDF-registration + view-building
+    /// cost, `false` means the state was already warm.
+    fn get_or_init(&self, data_source: &str) -> Result<(Arc<ConnState>, bool), SqlError> {
         // Fast path: already cached.
         {
             let map = self.connections.lock().expect("poisoned");
@@ -70,11 +83,16 @@ impl DuckDbBackend {
         let t0 = std::time::Instant::now();
         let conn = Connection::open_in_memory()
             .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
+        // Default prepared-statement cache is 16; bump it so the catalogue
+        // (~70 distinct shapes) plus per-label-value variants all fit
+        // and stay parsed/planned across repeat queries from the viewer.
+        // Each cached Statement is small (planning artifacts only).
+        conn.set_prepared_statement_cache_capacity(1024);
         let t_open = t0.elapsed();
         crate::register_all(&conn)
             .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
         let t_register = t0.elapsed() - t_open;
-        crate::views::ensure_views(&conn, data_source)
+        let catalog = crate::views::ensure_views(&conn, data_source)
             .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
         let t_views = t0.elapsed() - t_open - t_register;
         if timing {
@@ -87,9 +105,12 @@ impl DuckDbBackend {
                 ms(t_views)
             );
         }
-        let arc = Arc::new(Mutex::new(conn));
-        map.insert(data_source.to_string(), arc.clone());
-        Ok((arc, true))
+        let state = Arc::new(ConnState {
+            conn: Mutex::new(conn),
+            catalog,
+        });
+        map.insert(data_source.to_string(), state.clone());
+        Ok((state, true))
     }
 }
 
@@ -114,62 +135,54 @@ impl TraitSqlBackend for DuckDbBackend {
             .as_ref()
             .ok_or_else(|| SqlError::Backend(format!("entry {} has no SQL twin", entry.id)))?;
 
-        let (arc, cold) = self.get_or_init(data_source)?;
-        let conn = arc.lock().expect("poisoned");
+        let (state, cold) = self.get_or_init(data_source)?;
 
-        // PromQL semantics: a query that references a metric absent from
-        // the fixture returns an empty matrix, not an error. The catalogue
-        // uses ident captures `m`/`a`/`b`/`c` for metric references (vs
-        // `g`/`ga`/`gb`/`ig` for grouping labels — see `FROM {x}` survey
-        // in queries.toml). If any of the metric idents in this entry's
-        // captures targets a view that doesn't exist in the fixture's
-        // catalogue (or has the wrong shape — e.g. the catalogue entry
-        // wants `value` but the metric is stored as a histogram with a
-        // `buckets` list, like `syscall_latency` on demo), short-circuit
-        // to empty before running SQL that would otherwise hit `Table
-        // with name X does not exist` or `Column "value" not found`.
+        // Pre-flight checks against the cached MetricCatalog (no DESCRIBE
+        // roundtrips). All checks return `Ok(empty matrix)` when they
+        // detect a query that targets metrics the fixture doesn't carry,
+        // matching PromQL semantics.
         let needs_buckets = entry
             .sql
             .as_deref()
             .map(|s| s.contains("buckets"))
             .unwrap_or(false);
+        // 1) Metric-ident capture check: if any of m/a/b/c references a
+        //    metric not in the catalog, or one whose shape doesn't match
+        //    what the entry needs, short-circuit.
         const METRIC_IDENT_NAMES: &[&str] = &["m", "a", "b", "c"];
         for &name in METRIC_IDENT_NAMES {
             if let Some(CaptureValue::Ident(metric)) = captures.get(name) {
-                let shape = metric_view_shape(&conn, metric)?;
-                let mismatch = match shape {
-                    ViewShape::Missing => true,
-                    ViewShape::Scalar => needs_buckets,
-                    ViewShape::Histogram => !needs_buckets,
-                };
-                if mismatch {
-                    return Ok(QueryResult::Matrix { result: Vec::new() });
+                match state.catalog.shapes.get(metric) {
+                    None => return Ok(QueryResult::Matrix { result: Vec::new() }),
+                    Some(MetricShape::Scalar) if needs_buckets => {
+                        return Ok(QueryResult::Matrix { result: Vec::new() })
+                    }
+                    Some(MetricShape::Histogram) if !needs_buckets => {
+                        return Ok(QueryResult::Matrix { result: Vec::new() })
+                    }
+                    _ => {}
                 }
             }
         }
-        // For the `m` capture only, look up the view's label columns so
-        // `interp::interpolate` can fold predicates against labels the
-        // fixture doesn't expose (PromQL: missing label = empty string).
+        // 2) Available-labels lookup for `m` (drives interp's missing-label
+        //    fold to PromQL semantics).
         let available_labels = match captures.get("m") {
-            Some(CaptureValue::Ident(metric)) => Some(metric_label_columns(&conn, metric)?),
+            Some(CaptureValue::Ident(metric)) => state.catalog.label_keys.get(metric),
             _ => None,
         };
 
-        let sql = crate::interp::interpolate(template, captures, data_source, available_labels.as_ref())
+        let sql = crate::interp::interpolate(template, captures, data_source, available_labels)
             .map_err(|e| SqlError::Backend(format!("interp {}: {e}", entry.id)))?;
 
-        // Many catalogue entries hardcode metric names directly in the SQL
-        // (`FROM rezolus_bpf_run_time`) rather than via `{m}` captures. If
-        // any such hardcoded metric isn't present in the fixture, return
-        // empty rather than letting DuckDB raise `Catalog Error: Table
-        // with name X does not exist`. We scan the rendered SQL for plain
-        // `FROM <ident>` tokens and skip CTE-introduced names.
-        if let Some(missing) = first_missing_from_view(&conn, &sql)? {
-            // The bench / viewer treats this as an empty result; the
-            // metric simply doesn't exist in this recording.
+        // 3) Hardcoded-metric scan: catalogue entries that bake metric
+        //    names directly into SQL (e.g. `FROM rezolus_bpf_run_time`)
+        //    short-circuit if any FROM target isn't in the catalog.
+        if let Some(missing) = first_missing_hardcoded_view(&state.catalog, &sql) {
             let _ = missing;
             return Ok(QueryResult::Matrix { result: Vec::new() });
         }
+
+        let conn = state.conn.lock().expect("poisoned");
 
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
@@ -194,35 +207,22 @@ impl TraitSqlBackend for DuckDbBackend {
     }
 }
 
-/// Whether the metric view named `metric` is missing entirely, has a
-/// scalar `value` column (counter/gauge), or has a `buckets` list
-/// column (histogram). Used by `run` to short-circuit to empty when a
-/// catalogue entry needs `value` but the fixture stores the metric as
-/// a histogram, or vice versa.
-#[derive(Debug, PartialEq)]
-enum ViewShape {
-    Missing,
-    Scalar,
-    Histogram,
-}
-
 /// Scan rendered SQL for `FROM <ident>` tokens and return the first one
-/// whose target neither exists as a view/table in the connection nor was
-/// introduced by a `WITH <ident> AS` clause earlier in the same query.
+/// that names a metric absent from the fixture's `MetricCatalog`. Used
+/// to pre-flight catalogue entries that hardcode metric names directly
+/// in their SQL templates (e.g. `rezolus_bpf_avg_run_time_per_sampler`
+/// reads `FROM rezolus_bpf_run_time` instead of going through `{m}`).
+/// Without this check, fixtures missing such a hardcoded metric raise
+/// `Catalog Error: Table with name X does not exist`; with it, the
+/// backend returns an empty matrix matching PromQL semantics.
 ///
-/// Used to pre-flight catalogue entries that hardcode metric names in
-/// the SQL template (e.g. `rezolus_bpf_avg_run_time_per_sampler`'s SQL
-/// reads `FROM rezolus_bpf_run_time` directly, not via `{m}`). Without
-/// this check, fixtures missing the hardcoded metric raise `Catalog
-/// Error: Table with name X does not exist` instead of returning an
-/// empty matrix the way PromQL does.
-///
-/// Heuristic-only: skips quoted identifiers, function-call FROM (read_parquet),
-/// and parenthesised subqueries. False negatives (reporting absent for a
-/// view that exists) are not possible — we only return Some(name) after
-/// confirming `name` isn't in duckdb_views/duckdb_tables AND wasn't
-/// declared in a CTE.
-fn first_missing_from_view(conn: &Connection, sql: &str) -> Result<Option<String>, SqlError> {
+/// Heuristic-only: skips quoted identifiers, function-call FROM
+/// (read_parquet), parenthesised subqueries, CTE-introduced names, and
+/// any non-metric identifier (e.g. `_src`, `_metadata`) by checking
+/// against the catalog's `view_names` set — only metric views are in
+/// that set, so unrecognised idents fall through and the SQL itself
+/// gets to surface any problem.
+fn first_missing_hardcoded_view(catalog: &MetricCatalog, sql: &str) -> Option<String> {
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut cte_names: std::collections::BTreeSet<String> = Default::default();
@@ -334,108 +334,22 @@ fn first_missing_from_view(conn: &Connection, sql: &str) -> Result<Option<String
                 j += 1;
             }
             let is_function_call = j < bytes.len() && bytes[j] == b'(';
-            if !is_function_call && !cte_names.contains(name) {
-                if !view_or_table_exists(conn, name)? {
-                    return Ok(Some(name.to_string()));
-                }
+            // A FROM target outside the catalog is "missing" only if it
+            // also isn't an internal table/CTE. Internal names known not
+            // to be metrics: `_src`, `_metadata` (created in views.rs).
+            const INTERNAL_TABLES: &[&str] = &["_src", "_metadata"];
+            if !is_function_call
+                && !cte_names.contains(name)
+                && !INTERNAL_TABLES.contains(&name)
+                && !catalog.view_names.contains(name)
+            {
+                return Some(name.to_string());
             }
         }
         offset = i;
         search = &lower[offset..];
     }
-    Ok(None)
-}
-
-fn view_or_table_exists(conn: &Connection, name: &str) -> Result<bool, SqlError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT 1 FROM duckdb_views() WHERE view_name = ? \
-             UNION ALL SELECT 1 FROM duckdb_tables() WHERE table_name = ?",
-        )
-        .map_err(|e| SqlError::Backend(format!("view_or_table_exists prepare: {e}")))?;
-    let mut rows = stmt
-        .query([name, name])
-        .map_err(|e| SqlError::Backend(format!("view_or_table_exists query: {e}")))?;
-    Ok(rows
-        .next()
-        .map_err(|e| SqlError::Backend(format!("view_or_table_exists next: {e}")))?
-        .is_some())
-}
-
-fn metric_view_shape(conn: &Connection, metric: &str) -> Result<ViewShape, SqlError> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT column_name FROM (DESCRIBE \"{}\") \
-             WHERE column_name IN ('value', 'buckets')",
-            metric.replace('"', "\"\"")
-        ));
-    let mut stmt = match stmt {
-        Ok(s) => s,
-        Err(_) => return Ok(ViewShape::Missing),
-    };
-    let mut rows = match stmt.query([]) {
-        Ok(r) => r,
-        Err(_) => return Ok(ViewShape::Missing),
-    };
-    let mut has_value = false;
-    let mut has_buckets = false;
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| SqlError::Backend(format!("metric_view_shape {metric}: {e}")))?
-    {
-        let n: String = row
-            .get(0)
-            .map_err(|e| SqlError::Backend(format!("metric_view_shape get {metric}: {e}")))?;
-        match n.as_str() {
-            "value" => has_value = true,
-            "buckets" => has_buckets = true,
-            _ => {}
-        }
-    }
-    Ok(if has_value {
-        ViewShape::Scalar
-    } else if has_buckets {
-        ViewShape::Histogram
-    } else {
-        ViewShape::Missing
-    })
-}
-
-/// Inspect a per-metric view and return the set of label columns it
-/// carries — i.e. every column except the well-known fixed ones
-/// (`timestamp`, `value`, `buckets`, `p`, `col`). Used by
-/// `interp::interpolate` to gracefully handle WHERE predicates that
-/// reference labels the fixture doesn't expose (PromQL would treat
-/// such a label as the empty string; without this hint DuckDB raises
-/// `Binder Error: Referenced column "..." not found`). Returns an
-/// empty set if the metric view doesn't exist (caller should have
-/// short-circuited via `metric_view_exists` before reaching here).
-fn metric_label_columns(conn: &Connection, metric: &str) -> Result<BTreeSet<String>, SqlError> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT column_name FROM (DESCRIBE \"{}\")",
-            metric.replace('"', "\"\"")
-        ))
-        .map_err(|e| SqlError::Backend(format!("describe {metric}: {e}")))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| SqlError::Backend(format!("describe {metric} query: {e}")))?;
-    let mut out = BTreeSet::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| SqlError::Backend(format!("describe {metric} row: {e}")))?
-    {
-        let name: String = row
-            .get(0)
-            .map_err(|e| SqlError::Backend(format!("describe {metric} get: {e}")))?;
-        if !matches!(
-            name.as_str(),
-            "timestamp" | "value" | "buckets" | "p" | "col"
-        ) {
-            out.insert(name);
-        }
-    }
-    Ok(out)
+    None
 }
 
 fn run_matrix(
@@ -446,7 +360,7 @@ fn run_matrix(
     _timing: bool,
 ) -> Result<QueryResult, SqlError> {
     let mut stmt = conn
-        .prepare(sql)
+        .prepare_cached(sql)
         .map_err(|e| SqlError::Backend(format!("prepare {}: {e}", entry.id)))?;
 
     let n_values = entry.value_columns.len().max(1);
@@ -546,7 +460,7 @@ fn run_heatmap(
     _timing: bool,
 ) -> Result<QueryResult, SqlError> {
     let mut stmt = conn
-        .prepare(sql)
+        .prepare_cached(sql)
         .map_err(|e| SqlError::Backend(format!("prepare {}: {e}", entry.id)))?;
 
     let rows = stmt

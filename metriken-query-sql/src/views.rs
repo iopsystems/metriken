@@ -94,7 +94,30 @@ fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
 /// rather than N full parquet reads (~10-100s on Rezolus production data).
 /// The single parquet read amortises across every view and every query for
 /// the lifetime of the connection.
-pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()> {
+/// Per-metric shape and label-key index built once at `ensure_views`
+/// time. The backend caches this alongside the connection so per-query
+/// pre-flight checks are hashmap reads instead of DESCRIBE roundtrips
+/// (~1-2ms saved per query for catalogue entries with metric idents).
+#[derive(Debug, Default, Clone)]
+pub struct MetricCatalog {
+    /// `Scalar` for gauge/counter (view has a `value` column);
+    /// `Histogram` for histogram (view has `buckets` + `p`).
+    pub shapes: std::collections::HashMap<String, MetricShape>,
+    /// Union of label keys present on each metric view.
+    pub label_keys: std::collections::HashMap<String, BTreeSet<String>>,
+    /// All view names registered — used by the backend's
+    /// `first_missing_from_view` scan to short-circuit on hardcoded
+    /// metric names that the fixture doesn't carry.
+    pub view_names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricShape {
+    Scalar,
+    Histogram,
+}
+
+pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<MetricCatalog> {
     let bytes = std::fs::read(parquet_path).map_err(|e| {
         duckdb::Error::DuckDBFailure(
             duckdb::ffi::Error {
@@ -203,6 +226,7 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
         by_metric.entry(c.metric.clone()).or_default().push(c);
     }
 
+    let mut catalog = MetricCatalog::default();
     for (metric, cols) in by_metric {
         // Union of label keys across columns of this metric — every series
         // contributes the same set of label columns to the view (rows that
@@ -211,13 +235,24 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<()>
             .iter()
             .flat_map(|c| c.labels.keys().cloned())
             .collect();
-        let label_keys_vec: Vec<String> = label_keys.into_iter().collect();
+        let label_keys_vec: Vec<String> = label_keys.iter().cloned().collect();
+
+        // All cols within a metric share kind (we trust the writer); pick
+        // the first to determine view shape for the catalog cache.
+        let shape = match cols.first().map(|c| &c.kind) {
+            Some(ColumnKind::Histogram { .. }) => MetricShape::Histogram,
+            _ => MetricShape::Scalar,
+        };
 
         let view_sql = build_view_sql(&metric, &cols, &label_keys_vec);
         conn.execute(&view_sql, [])?;
+
+        catalog.shapes.insert(metric.clone(), shape);
+        catalog.label_keys.insert(metric.clone(), label_keys);
+        catalog.view_names.insert(metric);
     }
 
-    Ok(())
+    Ok(catalog)
 }
 
 /// Build the `_metadata` table with one row per metric-bearing column.
