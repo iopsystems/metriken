@@ -76,7 +76,7 @@ pub fn try_streaming(
             let collected = collect_to_matrix(series, metric_name);
             QueryResult::Matrix { result: collected }
         }
-        Built::Materialized { result, name: _ } => QueryResult::Matrix { result },
+        Built::Materialized { result } => QueryResult::Matrix { result },
         Built::Scalar(v) => QueryResult::Scalar { result: (start, v) },
     };
     Ok(result)
@@ -106,10 +106,7 @@ enum Built<'a> {
         metric_name_for_error: Option<String>,
     },
     Scalar(f64),
-    Materialized {
-        result: Vec<MatrixSample>,
-        name: String,
-    },
+    Materialized { result: Vec<MatrixSample> },
 }
 
 fn build<'a, 'expr>(ctx: &'a Ctx<'a>, expr: &'expr Expr) -> Result<Built<'a>, QueryError>
@@ -457,10 +454,7 @@ where
     let Some(collection) = ctx.tsdb.histograms_ref(metric_name) else {
         // Match Prometheus + the SQL backend: missing metric → empty
         // matrix, not an error. This is the histogram_quantile path.
-        return Ok(Built::Materialized {
-            result: Vec::new(),
-            name: metric_name.to_string(),
-        });
+        return Ok(Built::Materialized { result: Vec::new() });
     };
     let result = streaming::histogram::quantiles(
         collection,
@@ -471,10 +465,7 @@ where
         None,
         metric_name,
     );
-    Ok(Built::Materialized {
-        result,
-        name: format!("No histogram data found for {metric_name}"),
-    })
+    Ok(Built::Materialized { result })
 }
 
 fn build_vector_selector<'a, 'expr>(

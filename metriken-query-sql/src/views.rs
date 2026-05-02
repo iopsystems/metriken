@@ -458,10 +458,22 @@ mod tests {
         assert_eq!(nonzero, 0, "every _src.timestamp must be a clean multiple of 1e9 ns");
     }
 
+    /// Build every view declared in `catalog.pending_view_sql`, mirroring
+    /// what the backend would do once a query references each. Tests
+    /// below invoke a metric view directly, so they need the eager
+    /// equivalent of the lazy build.
+    fn build_all_pending(conn: &Connection, catalog: &MetricCatalog) {
+        for sql in catalog.pending_view_sql.values() {
+            conn.execute(sql, []).unwrap();
+        }
+    }
+
     #[test]
     fn counter_basic_creates_a_one_column_long_view() {
         let conn = fresh_conn();
-        ensure_views(&conn, fixture_path("counter_basic").to_str().unwrap()).unwrap();
+        let catalog =
+            ensure_views(&conn, fixture_path("counter_basic").to_str().unwrap()).unwrap();
+        build_all_pending(&conn, &catalog);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
             .unwrap();
@@ -471,7 +483,9 @@ mod tests {
     #[test]
     fn counter_multi_label_unions_four_columns() {
         let conn = fresh_conn();
-        ensure_views(&conn, fixture_path("counter_multi_label").to_str().unwrap()).unwrap();
+        let catalog = ensure_views(&conn, fixture_path("counter_multi_label").to_str().unwrap())
+            .unwrap();
+        build_all_pending(&conn, &catalog);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM cpu_usage", [], |r| r.get(0))
             .unwrap();
@@ -492,7 +506,9 @@ mod tests {
     #[test]
     fn histogram_view_carries_grouping_power_as_p() {
         let conn = fresh_conn();
-        ensure_views(&conn, fixture_path("histogram_basic").to_str().unwrap()).unwrap();
+        let catalog =
+            ensure_views(&conn, fixture_path("histogram_basic").to_str().unwrap()).unwrap();
+        build_all_pending(&conn, &catalog);
         let p: i32 = conn
             .query_row("SELECT MIN(p) FROM request_latency", [], |r| r.get(0))
             .unwrap();
