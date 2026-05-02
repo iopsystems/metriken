@@ -362,6 +362,11 @@ fn collapse_ws(s: &str) -> String {
 //     number of bytes consumed plus the captured value, or None on mismatch.
 
 fn scan_ident(q: &[u8]) -> Option<(usize, CaptureValue)> {
+    // Accept the Rezolus metric-name superset: a leading [A-Za-z_] followed by
+    // [A-Za-z0-9_/:] — `/` is used by Rezolus to namespace per-source metrics
+    // (`redis/total_commands_processed`) and `:` is the PromQL convention for
+    // recording-rule names (`service:request_latency:p99`). Without these the
+    // template engine couldn't capture real production metric names.
     if q.is_empty() {
         return None;
     }
@@ -370,7 +375,12 @@ fn scan_ident(q: &[u8]) -> Option<(usize, CaptureValue)> {
         return None;
     }
     let mut end = 1;
-    while end < q.len() && (q[end].is_ascii_alphanumeric() || q[end] == b'_') {
+    while end < q.len()
+        && (q[end].is_ascii_alphanumeric()
+            || q[end] == b'_'
+            || q[end] == b'/'
+            || q[end] == b':')
+    {
         end += 1;
     }
     let s = std::str::from_utf8(&q[..end]).ok()?.to_string();

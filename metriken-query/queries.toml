@@ -57,8 +57,11 @@ id = "gauge_bare"
 mode = "shadow"
 # Templated bare-gauge selector — `${m:ident}` covers any gauge metric
 # (memory_total, memory_available, memory_buffers, memory_cached, …).
-# The SQL queries the auto-generated metric view, which exposes a single
-# `value` column (gauges have no labels in Rezolus's parquet schema).
+# Projects every label column the metric view exposes (e.g. `source` on
+# multi-source parquets like cachecannon's `0::memory_total` /
+# `rezolus-client::memory_total`) via `* EXCLUDE`. The backend infers label
+# names from the prepared-statement schema when `label_columns` is empty,
+# so this one entry covers both labelless and labeled gauge shapes.
 promql = "${m:ident}"
 fixture = "gauge_basic"
 start = 0.0
@@ -67,7 +70,8 @@ step = 1.0
 description = "Bare gauge selector — no rate function, just emit the points. One templated entry covers every gauge metric."
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(value AS DOUBLE) AS v
+       CAST(value AS DOUBLE) AS v,
+       * EXCLUDE (timestamp, value, col)
 FROM {m}
 WHERE value IS NOT NULL
 ORDER BY timestamp
@@ -137,13 +141,30 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Baseline irate — instantaneous rate from the last two samples in the window."
+# Reads from the auto-generated `requests` view rather than the raw parquet so
+# timestamps are snapped to the sampling-interval grid (matches the PromQL
+# loader; otherwise real parquets with sub-second-offset capture timestamps
+# diverge on the t-axis even when values agree). The view's `value` column is
+# the canonical counter value for the metric.
 # `irate_1s` is `c - LAG(c) OVER (...)`. The first row produces NULL (no LAG)
-# which the WHERE clause filters, matching PromQL's `start = 1.0` (skipping t=0).
+# which `QUALIFY v IS NOT NULL` filters, matching PromQL's `start = 1.0`
+# (skipping t=0).
 sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9,
-       CAST(irate_1s(requests, timestamp) AS DOUBLE) AS v
-FROM read_parquet('{fixture_path}')
-QUALIFY v IS NOT NULL
+WITH per_row AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS v,
+           * EXCLUDE (timestamp, value, col)
+    FROM requests
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, v, * EXCLUDE (timestamp, v)
+FROM per_row
+WHERE v IS NOT NULL
 ORDER BY timestamp
 """
 value_columns = ["v"]
@@ -159,19 +180,34 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Baseline rate — average over the window."
-# Windowed monotonic rate: (current - first_in_window) / span_in_seconds.
-# Correct for monotonic counters; for reset-prone counters use the
-# CTE pattern in `counter_rate_reset`.
+# Reads from the `requests` view (snapped timestamps) — see counter_irate_basic
+# for the rationale. Windowed monotonic rate: (current - first_in_window) /
+# span_in_seconds. Correct for monotonic counters; for reset-prone counters
+# use the CTE pattern in `counter_rate_reset`.
 sql = """
+WITH incr AS (
+    SELECT timestamp,
+           col,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS inc,
+           * EXCLUDE (timestamp, value, col)
+    FROM requests
+    WHERE value IS NOT NULL
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (CAST(requests AS DOUBLE) - FIRST_VALUE(CAST(requests AS DOUBLE)) OVER w)
+       SUM(inc) OVER w
        / NULLIF(
            CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
            0
-       ) AS v
-FROM read_parquet('{fixture_path}')
-WHERE requests IS NOT NULL
-WINDOW w AS (ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
+       ) AS v,
+       * EXCLUDE (timestamp, inc, col)
+FROM incr
+WINDOW w AS (PARTITION BY col ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
 QUALIFY v IS NOT NULL
 ORDER BY t
 """
@@ -188,13 +224,26 @@ start = 1001.0
 end = 1004.0
 step = 1.0
 description = "irate over a counter that resets at t=1003 — exercises reset semantics."
-# `irate_1s` is now reset-aware (post-reset value as the increment).
+# Reads from the `requests` view (snapped timestamps) — see counter_irate_basic
+# for the rationale. `irate_1s` is reset-aware (post-reset value as the
+# increment).
 sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       irate_1s(requests, timestamp) AS v
-FROM read_parquet('{fixture_path}')
-WHERE requests IS NOT NULL
-QUALIFY v IS NOT NULL
+WITH per_row AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS v,
+           * EXCLUDE (timestamp, value, col)
+    FROM requests
+    WHERE value IS NOT NULL
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, v, * EXCLUDE (timestamp, v)
+FROM per_row
+WHERE v IS NOT NULL
 ORDER BY t
 """
 value_columns = ["v"]
@@ -213,27 +262,32 @@ description = "rate over a counter that resets at t=1003 (post-reset value as in
 # Reset-aware rate: per-pair PromQL increments computed in a CTE (so the
 # `LAG` isn't nested under another window function), then summed and
 # normalised over a 5-minute row window. Equivalent to PromQL's reset-aware
-# `rate()` semantics from `streaming/rate.rs:60-68`.
+# `rate()` semantics from `streaming/rate.rs:60-68`. Reads from the
+# `requests` view (snapped timestamps) — see counter_irate_basic.
 sql = """
 WITH incr AS (
     SELECT timestamp,
+           col,
+           * EXCLUDE (timestamp, value, col),
            CASE
-               WHEN LAG(requests) OVER (ORDER BY timestamp) IS NULL THEN NULL
-               WHEN requests >= LAG(requests) OVER (ORDER BY timestamp)
-                   THEN CAST(requests - LAG(requests) OVER (ORDER BY timestamp) AS DOUBLE)
-               ELSE CAST(requests AS DOUBLE)
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
            END AS inc
-    FROM read_parquet('{fixture_path}')
-    WHERE requests IS NOT NULL
+    FROM requests
+    WHERE value IS NOT NULL
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(inc) OVER w
        / NULLIF(
            CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
            0
-       ) AS v
+       ) AS v,
+       * EXCLUDE (timestamp, inc, col)
 FROM incr
-WINDOW w AS (ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
+WINDOW w AS (PARTITION BY col ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
 QUALIFY v IS NOT NULL
 ORDER BY t
 """
@@ -632,24 +686,13 @@ value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
 
-[[query]]
-id = "rezolus_syscall_p99"
-mode = "shadow"
-promql = "histogram_quantile(0.99, syscall_latency)"
-fixture = "rezolus_minimal"
-start = 1.0
-end = 20.0
-step = 1.0
-description = "Rezolus syscall_latency p99 — full Rezolus-shape histogram path."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(hist_irate_quantile(buckets, 0.99, timestamp, p) AS DOUBLE) AS v
-FROM syscall_latency
-ORDER BY timestamp
-"""
-value_columns = ["v"]
-label_columns = []
-output_metric = { __name__ = "syscall_latency", quantile = "0.99" }
+# NOTE: The previous `rezolus_syscall_p99` literal entry was removed —
+# it predated `histogram_quantile_generic`'s multi-series CTE
+# (`h2_combine(list(buckets)) GROUP BY timestamp`) and broke on real Rezolus
+# parquets where `syscall_latency` carries one column per `op` label. The
+# generic templated entry (below) handles `histogram_quantile(0.99,
+# syscall_latency)` correctly via the dispatcher, so the literal twin was
+# redundant.
 
 # ---------- Templated entries ----------
 # Templated entries use `${name:kind}` placeholders in `promql` and matching
@@ -674,6 +717,12 @@ step = 1.0
 description = "Softirq rate per kind. One templated entry covers every kind value."
 # Note: `{k}` interpolates as a fully SQL-quoted string literal (e.g. `'hi'`)
 # — do not wrap it in extra single-quotes.
+# `PARTITION BY col` (the physical column id) — NOT `PARTITION BY id` (the
+# CPU id), since real multi-source parquets like cachecannon have repeated
+# `id` values across sources (`0::softirq` and `rezolus-client::softirq` both
+# expose id=0,1,…). Partitioning by `id` mixed sources within the LAG window
+# and produced spurious "rate" values equal to the absolute counter on the
+# first row after the source boundary. `col` is unique per physical series.
 sql = """
 WITH per_series AS (
     SELECT timestamp, id,
@@ -685,7 +734,7 @@ WITH per_series AS (
            END AS rate
     FROM softirq
     WHERE kind = {k}
-    WINDOW w AS (PARTITION BY id ORDER BY timestamp)
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        SUM(rate) AS v
@@ -1137,6 +1186,343 @@ label_columns = []
 output_metric = {}
 examples = [
     { id_suffix = "memory_total_minus_queue_depth", query = "memory_total - queue_depth" },
+]
+
+[[query]]
+id = "gauge_divide"
+mode = "shadow"
+# `${a:ident} / ${b:ident}` — pointwise gauge ratio. Companion to
+# `gauge_subtract`; covers utilisation-fraction shapes the dashboard
+# expresses without the `1 -` prefix.
+promql = "${a:ident} / ${b:ident}"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Pointwise gauge ratio. JOIN on timestamp, divide."
+sql = """
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(a.value AS DOUBLE) / NULLIF(CAST(b.value AS DOUBLE), 0) AS v
+FROM {a} a
+JOIN {b} b ON a.timestamp = b.timestamp
+WHERE a.value IS NOT NULL AND b.value IS NOT NULL
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "memory_total_div_queue_depth", query = "memory_total / queue_depth" },
+]
+
+# ---------- Group D: multi-operand counter ratios ----------
+#
+# Two-counter ratio shape — IPC, branch-miss-rate, etc. The PromQL form is
+# `sum(irate(${a:ident}[5m])) / sum(irate(${b:ident}[5m]))`. SQL: compute
+# the per-series rate for each operand separately, sum across series per
+# tick, then JOIN on timestamp and divide.
+
+[[query]]
+id = "counter_ratio_generic"
+mode = "shadow"
+promql = "sum(irate(${a:ident}[5m])) / sum(irate(${b:ident}[5m]))"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Generic two-counter ratio. Covers IPC (instructions/cycles), branch-miss-rate, etc."
+sql = """
+WITH a_per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {a}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+a_sum AS (
+    SELECT timestamp, SUM(rate) AS s
+    FROM a_per_series WHERE rate IS NOT NULL
+    GROUP BY timestamp
+),
+b_per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {b}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+b_sum AS (
+    SELECT timestamp, SUM(rate) AS s
+    FROM b_per_series WHERE rate IS NOT NULL
+    GROUP BY timestamp
+)
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       a.s / NULLIF(b.s, 0) AS v
+FROM a_sum a
+JOIN b_sum b ON a.timestamp = b.timestamp
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "bpf_avg_run_time_total", query = "sum(irate(rezolus_bpf_run_time[5m])) / sum(irate(rezolus_bpf_run_count[5m]))" },
+]
+
+[[query]]
+id = "counter_ratio_complement"
+mode = "shadow"
+# `1 - sum(irate(a)) / sum(irate(b))` — L3-hit-percent shape.
+# Same SQL pattern as `counter_ratio_generic` with a leading `1 -`.
+promql = "1 - sum(irate(${a:ident}[5m])) / sum(irate(${b:ident}[5m]))"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Two-counter ratio complement (1 - a/b). L3-hit-rate dashboard shape."
+sql = """
+WITH a_per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {a}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+a_sum AS (
+    SELECT timestamp, SUM(rate) AS s
+    FROM a_per_series WHERE rate IS NOT NULL
+    GROUP BY timestamp
+),
+b_per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {b}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+b_sum AS (
+    SELECT timestamp, SUM(rate) AS s
+    FROM b_per_series WHERE rate IS NOT NULL
+    GROUP BY timestamp
+)
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       1 - a.s / NULLIF(b.s, 0) AS v
+FROM a_sum a
+JOIN b_sum b ON a.timestamp = b.timestamp
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "bpf_complement", query = "1 - sum(irate(rezolus_bpf_run_count[5m])) / sum(irate(rezolus_bpf_run_time[5m]))" },
+]
+
+[[query]]
+id = "counter_ratio_scaled"
+mode = "shadow"
+# `sum(irate(a)) / sum(irate(b)) * ${d:number}` — DTLB-MPKI dashboard shape
+# (multiplies the ratio by 1000 to express misses-per-thousand-instructions).
+promql = "sum(irate(${a:ident}[5m])) / sum(irate(${b:ident}[5m])) * ${d:number}"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Two-counter ratio multiplied by a scalar — DTLB MPKI shape."
+sql = """
+WITH a_per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {a}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+a_sum AS (
+    SELECT timestamp, SUM(rate) AS s
+    FROM a_per_series WHERE rate IS NOT NULL
+    GROUP BY timestamp
+),
+b_per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {b}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+b_sum AS (
+    SELECT timestamp, SUM(rate) AS s
+    FROM b_per_series WHERE rate IS NOT NULL
+    GROUP BY timestamp
+)
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       a.s / NULLIF(b.s, 0) * {d} AS v
+FROM a_sum a
+JOIN b_sum b ON a.timestamp = b.timestamp
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "bpf_scaled", query = "sum(irate(rezolus_bpf_run_time[5m])) / sum(irate(rezolus_bpf_run_count[5m])) * 1000" },
+]
+
+# ---------- Group E: per-id heatmap aggregations ----------
+#
+# `sum by (id) (irate(${m:ident}[5m])) / ${d:number}` — aggregate counter rate
+# per CPU id and normalise by a scalar divisor. Covers per-CPU usage variants
+# across the dashboard. Pattern matches `rezolus_cpu_user_per_id` but
+# generalised over the metric name and divisor.
+
+[[query]]
+id = "counter_irate_by_id_scaled"
+mode = "shadow"
+promql = "sum by (id) (irate(${m:ident}[5m])) / ${d:number}"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Per-id rate of a counter metric, normalised by a scalar — one entry covers every per-CPU usage variant."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {m}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / {d} AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+examples = [
+    { id_suffix = "cpu_usage_div_1e9", query = "sum by (id) (irate(cpu_usage[5m])) / 1000000000" },
+]
+
+# ---------- Group B: labels-filtered counter rate aggregations ----------
+#
+# `sum(irate(${m:ident}{${labels:labels}}[${r:duration}]))` — generic
+# total-rate aggregation across any (metric, label-predicate, range)
+# combination. Subsumes `softirq_irate_total_by_kind` (when that entry is
+# eventually retired) and covers the bulk of Group B/C dashboard shapes
+# (service throughput, cache/db throughput).
+#
+# `{labels:as_predicate}` emits a SQL WHERE-fragment for the captured matchers
+# (e.g. `kind = 'hi' AND state != 'idle'`). The duration `${r:duration}` is
+# captured but not used in the SQL — irate's "5m lookback" only matters when
+# the parquet has gaps; the LAG-based per-tick delta is the same regardless.
+
+[[query]]
+id = "counter_irate_sum_with_labels"
+mode = "shadow"
+promql = 'sum(irate(${m:ident}{${labels:labels}}[${r:duration}]))'
+fixture = "softirq_multi_kind"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Generic labels-filtered counter rate aggregation. Covers Group B / C service-throughput dashboards."
+sql = """
+WITH per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {m}
+    WHERE {labels:as_predicate}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "softirq_kind_hi_5m", query = 'sum(irate(softirq{kind="hi"}[5m]))' },
+]
+
+[[query]]
+id = "counter_irate_by_id_with_labels"
+mode = "shadow"
+# `sum by (id) (irate(${m:ident}{${labels:labels}}[${r:duration}]))` —
+# per-CPU rate aggregation with arbitrary label predicate. Covers Group G
+# cgroup-filtered shapes (`name=~"/system.slice/.+"` regex matchers are
+# emitted as `regexp_matches(...)` by `{labels:as_predicate}`) and the
+# bulk of per-id Group B / Group F shapes.
+promql = 'sum by (id) (irate(${m:ident}{${labels:labels}}[${r:duration}]))'
+fixture = "softirq_multi_kind"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Generic per-id labels-filtered counter rate aggregation."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {m}
+    WHERE {labels:as_predicate}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+examples = [
+    { id_suffix = "softirq_kind_hi_5m", query = 'sum by (id) (irate(softirq{kind="hi"}[5m]))' },
 ]
 
 # NOTE: `(${a:ident} - ${b:ident}) / ${a:ident}` (the production memory

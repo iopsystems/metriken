@@ -154,26 +154,59 @@ fn run_matrix(
         .map_err(|e| SqlError::Backend(format!("prepare {}: {e}", entry.id)))?;
 
     let n_values = entry.value_columns.len().max(1);
-    let label_names = entry.label_columns.clone();
     let label_offset = 1 + n_values;
 
-    let rows = stmt
-        .query_map([], |row| {
-            let t: Option<f64> = row.get(0)?;
-            let v: Option<f64> = row.get(1)?;
-            let labels: Vec<(String, String)> = label_names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let val: Option<String> = row.get(label_offset + i).ok().flatten();
-                    (name.clone(), val.unwrap_or_default())
-                })
-                .collect();
-            Ok((labels, t, v))
-        })
-        .map_err(|e| SqlError::Backend(format!("query {}: {e}", entry.id)))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| SqlError::Backend(format!("collect rows for {}: {e}", entry.id)))?;
+    // Resolve label column names. Two strategies:
+    // 1. Catalogue-declared (`entry.label_columns` non-empty) — used by entries
+    //    that explicitly project per-label columns (e.g. `id` for
+    //    `sum by (id) (...)`).
+    // 2. Schema-inferred — when the catalogue leaves `label_columns` empty but
+    //    the SQL projects extra columns past `(t, value(s))`, treat each
+    //    trailing column as a label name. This lets passthrough entries like
+    //    `gauge_bare` project a parquet's per-source labels via `* EXCLUDE
+    //    (timestamp, value, col)` without hard-coding the label set in TOML.
+    //    `column_names()` requires the statement to have been executed first
+    //    (otherwise duckdb-rs panics — see backend.rs module docs), so we
+    //    enter the rows path before reading the schema.
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| SqlError::Backend(format!("query {}: {e}", entry.id)))?;
+    let label_names: Vec<String> = if !entry.label_columns.is_empty() {
+        entry.label_columns.clone()
+    } else {
+        let schema = rows
+            .as_ref()
+            .map(|s| s.column_names())
+            .unwrap_or_default();
+        if schema.len() > label_offset {
+            schema[label_offset..].to_vec()
+        } else {
+            Vec::new()
+        }
+    };
+
+    let mut collected: Vec<(Vec<(String, String)>, Option<f64>, Option<f64>)> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| SqlError::Backend(format!("collect rows for {}: {e}", entry.id)))?
+    {
+        let t: Option<f64> = row
+            .get(0)
+            .map_err(|e| SqlError::Backend(format!("read t for {}: {e}", entry.id)))?;
+        let v: Option<f64> = row
+            .get(1)
+            .map_err(|e| SqlError::Backend(format!("read v for {}: {e}", entry.id)))?;
+        let labels: Vec<(String, String)> = label_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let val: Option<String> = row.get(label_offset + i).ok().flatten();
+                (name.clone(), val.unwrap_or_default())
+            })
+            .collect();
+        collected.push((labels, t, v));
+    }
+    let rows = collected;
 
     let mut series: BTreeMap<Vec<(String, String)>, Vec<(f64, f64)>> = BTreeMap::new();
     for (labels, t, v) in rows {
@@ -233,10 +266,20 @@ fn run_heatmap(
         .map_err(|e| SqlError::Backend(format!("collect rows for {}: {e}", entry.id)))?;
 
     if rows.is_empty() {
-        return Err(SqlError::Backend(format!(
-            "no histogram data for {}",
-            entry.id
-        )));
+        // Match PromQL's `streaming::histogram::heatmap` shape on the
+        // "no events" case: return an empty HistogramHeatmap rather than
+        // an error so the dispatcher doesn't surface a synthetic
+        // "MetricNotFound"-shaped failure to callers when the metric exists
+        // but the requested range happens to be free of bucket events.
+        return Ok(QueryResult::HistogramHeatmap {
+            result: HistogramHeatmapResult {
+                timestamps: Vec::new(),
+                bucket_bounds: Vec::new(),
+                data: Vec::new(),
+                min_value: 0.0,
+                max_value: 0.0,
+            },
+        });
     }
 
     // Timestamps: sorted unique values, preserving the order in which rows
