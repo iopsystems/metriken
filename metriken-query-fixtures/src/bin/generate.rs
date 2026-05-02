@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     counter_multi_label(&out_dir)?;
     counter_near_overflow(&out_dir)?;
     gauge_basic(&out_dir)?;
+    gauge_multi_source(&out_dir)?;
     histogram_basic(&out_dir)?;
     histogram_reset(&out_dir)?;
     histogram_empty_period(&out_dir)?;
@@ -105,6 +106,36 @@ fn counter_multi_label(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     builder.write(&dir.join("counter_multi_label.parquet"))
 }
 
+/// Gauge metric with multiple `source` label values per metric, mirroring
+/// the shape Rezolus's service-extension parquets use (`cachecannon`,
+/// `valkey`, `vllm`, …). Drives the Group A `gauge_bare_with_labels`
+/// catalogue entry, which selects a single source out of a multi-series
+/// metric via a `WHERE source = '...'` predicate.
+fn gauge_multi_source(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = FixtureBuilder::new().file_metadata("source", "fixture-gauge-multi-source");
+    let mut col = 0u32;
+    // `target_rate` (gauge) per source × instance — three series so the
+    // source-only filter still keeps multiple series and the source+instance
+    // filter narrows to one. Mirrors cachecannon/valkey shape where the same
+    // metric name is exposed by every service capture.
+    for (source, instance, value) in [
+        ("cachecannon", "0", 100i64),
+        ("cachecannon", "1", 110),
+        ("valkey", "0", 200),
+    ] {
+        let points: Vec<(u64, i64)> =
+            (0..=10).map(|s| (ts_secs(s), value + (s as i64))).collect();
+        builder = builder.add_gauge(GaugeSeries {
+            column_name: format!("target_rate__{col}"),
+            metric: "target_rate".into(),
+            labels: labels(&[("source", source), ("instance", instance)]),
+            points,
+        });
+        col += 1;
+    }
+    builder.write(&dir.join("gauge_multi_source.parquet"))
+}
+
 /// Counter increments by 1 per second starting near u64::MAX-5, so the series
 /// crosses the boundary. Exercises width-of-arithmetic on subtraction.
 fn counter_near_overflow(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -122,12 +153,18 @@ fn counter_near_overflow(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// One gauge with a steady value, one with a sawtooth, one with negatives.
+/// Plus a `memory_available` companion to `memory_total` so the
+/// `memory_util_pct` entry can pair them in a JOIN.
 fn gauge_basic(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let steady: Vec<(u64, i64)> = (0..=10).map(|s| (ts_secs(s), 1024)).collect();
     let sawtooth: Vec<(u64, i64)> = (0..=10)
         .map(|s| (ts_secs(s), ((s as i64) % 4) * 10))
         .collect();
     let negative: Vec<(u64, i64)> = (0..=10).map(|s| (ts_secs(s), (s as i64) - 5)).collect();
+    // memory_available drifts down then up — non-trivial used-memory % so
+    // the golden snapshot is informative, not all-zeros.
+    let memory_avail: Vec<(u64, i64)> =
+        (0..=10).map(|s| (ts_secs(s), 1024 - (s as i64) * 32)).collect();
 
     FixtureBuilder::new()
         .file_metadata("source", "fixture-gauge-basic")
@@ -136,6 +173,12 @@ fn gauge_basic(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             metric: "memory_total".into(),
             labels: BTreeMap::new(),
             points: steady,
+        })
+        .add_gauge(GaugeSeries {
+            column_name: "memory_available".into(),
+            metric: "memory_available".into(),
+            labels: BTreeMap::new(),
+            points: memory_avail,
         })
         .add_gauge(GaugeSeries {
             column_name: "queue_depth".into(),
@@ -357,6 +400,41 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         });
         col += 1;
     }
+
+    // Per-CPU performance counters used by the IPC / IPNS dashboard
+    // queries. Two CPUs × five counters (instructions, cycles, tsc, aperf,
+    // mperf), all monotonic. cpu_aperf/cpu_mperf are equal so the
+    // aperf/mperf ratio is exactly 1.0 — easy to reason about in goldens.
+    let mut col = 0u32;
+    let perf_rates: &[(&str, u64, u64)] = &[
+        ("cpu_instructions", 6_000_000_000, 5_000_000_000), // CPU0 / CPU1
+        ("cpu_cycles", 3_000_000_000, 2_500_000_000),
+        ("cpu_tsc", 3_000_000_000, 3_000_000_000),
+        ("cpu_aperf", 3_000_000_000, 3_000_000_000),
+        ("cpu_mperf", 3_000_000_000, 3_000_000_000),
+    ];
+    for (metric, r0, r1) in perf_rates {
+        for (id, rate) in ["0", "1"].iter().zip([*r0, *r1]) {
+            let points: Vec<(u64, u64)> =
+                (0..=20).map(|s| (ts_secs(s), s * rate)).collect();
+            builder = builder.add_counter(CounterSeries {
+                column_name: format!("{metric}__{col}"),
+                metric: (*metric).to_string(),
+                labels: labels(&[("id", id)]),
+                points,
+            });
+            col += 1;
+        }
+    }
+    // cpu_cores is a steady-value gauge (equal to the number of CPUs in the
+    // fixture). Drives the trailing `/ cpu_cores` divisor in the IPNS query.
+    let cores_points: Vec<(u64, i64)> = (0..=20).map(|s| (ts_secs(s), 2)).collect();
+    builder = builder.add_gauge(GaugeSeries {
+        column_name: "cpu_cores".into(),
+        metric: "cpu_cores".into(),
+        labels: BTreeMap::new(),
+        points: cores_points,
+    });
 
     builder.write(&dir.join("rezolus_minimal.parquet"))
 }

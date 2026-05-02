@@ -1525,9 +1525,245 @@ examples = [
     { id_suffix = "softirq_kind_hi_5m", query = 'sum by (id) (irate(softirq{kind="hi"}[5m]))' },
 ]
 
-# NOTE: `(${a:ident} - ${b:ident}) / ${a:ident}` (the production memory
-# utilisation %) needs a back-reference capture (same `${a}` twice) which
-# the current template engine doesn't support — duplicate names error at
-# parse time. Tracking as a follow-up: either teach the engine to allow
-# repeat captures with a value-equality requirement, or land a concrete
-# `memory_util_pct` entry hardcoded to (memory_total, memory_available).
+# Concrete memory-utilisation entry. Production dashboards issue
+# `(memory_total - memory_available) / memory_total` for the memory-used %;
+# the templated `(${a} - ${b}) / ${a}` form needs a back-reference capture
+# (same `${a}` twice) which the current template engine rejects at parse
+# time as a duplicate name. A concrete entry pays its own way — there's only
+# one production query of this shape — and avoids changing the template
+# grammar to support an edge case.
+[[query]]
+id = "memory_util_pct"
+mode = "shadow"
+promql = "(memory_total - memory_available) / memory_total"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Memory used as a fraction of total — (memory_total - memory_available) / memory_total."
+# NATURAL JOIN over CTEs that drop the per-row identifiers (`col`, `value`)
+# before the join, so the only common columns are `timestamp` and any label
+# columns the parquet exposes (`source`, `node`, `instance`, …). This
+# matches PromQL's binary-op semantics: pair series with identical label
+# sets and keep those labels on the output. The backend infers label names
+# from the result schema when `label_columns = []`.
+sql = """
+WITH a AS (
+    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS av
+    FROM memory_total
+    WHERE value IS NOT NULL
+),
+b AS (
+    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS bv
+    FROM memory_available
+    WHERE value IS NOT NULL
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       (av - bv) / NULLIF(av, 0) AS v,
+       * EXCLUDE (timestamp, av, bv)
+FROM a NATURAL JOIN b
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+
+# ---------- Group D: IPNS chain ----------
+#
+# The longest concrete dashboard query. Computes instructions per nanosecond:
+# `(instructions / cycles) * (tsc * aperf / mperf) / 1e9 / cpu_cores`.
+# Aperf/mperf give the nominal-vs-running clock ratio so the IPC number
+# scales by the actual frequency the cores ran at; dividing by tsc-derived
+# wall time and cpu_cores normalises to per-ns-per-core.
+#
+# Concrete (not templated) because the operand list is fixed and there's no
+# templating gain. Reuses the per-series rate pattern from
+# `counter_ratio_generic`, but chained across five counters and joined to the
+# `cpu_cores` gauge view at every tick.
+[[query]]
+id = "rezolus_cpu_ipns"
+mode = "shadow"
+promql = "sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m])) * sum(irate(cpu_tsc[5m])) * sum(irate(cpu_aperf[5m])) / sum(irate(cpu_mperf[5m])) / 1000000000 / cpu_cores"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Rezolus CPU IPNS — instructions per nanosecond, the most-chained dashboard query."
+sql = """
+WITH ins AS (
+    SELECT timestamp,
+           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
+                WHEN value >= LAG(value) OVER w
+                    THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+                ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_instructions
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+ins_sum AS (SELECT timestamp, SUM(rate) AS s FROM ins WHERE rate IS NOT NULL GROUP BY timestamp),
+cyc AS (
+    SELECT timestamp,
+           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
+                WHEN value >= LAG(value) OVER w
+                    THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+                ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_cycles
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+cyc_sum AS (SELECT timestamp, SUM(rate) AS s FROM cyc WHERE rate IS NOT NULL GROUP BY timestamp),
+tsc AS (
+    SELECT timestamp,
+           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
+                WHEN value >= LAG(value) OVER w
+                    THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+                ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_tsc
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+tsc_sum AS (SELECT timestamp, SUM(rate) AS s FROM tsc WHERE rate IS NOT NULL GROUP BY timestamp),
+ape AS (
+    SELECT timestamp,
+           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
+                WHEN value >= LAG(value) OVER w
+                    THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+                ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_aperf
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+ape_sum AS (SELECT timestamp, SUM(rate) AS s FROM ape WHERE rate IS NOT NULL GROUP BY timestamp),
+mpe AS (
+    SELECT timestamp,
+           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
+                WHEN value >= LAG(value) OVER w
+                    THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+                ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM cpu_mperf
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+mpe_sum AS (SELECT timestamp, SUM(rate) AS s FROM mpe WHERE rate IS NOT NULL GROUP BY timestamp)
+SELECT CAST(ins_sum.timestamp AS DOUBLE) / 1e9 AS t,
+       ins_sum.s / NULLIF(cyc_sum.s, 0)
+       * tsc_sum.s
+       * ape_sum.s / NULLIF(mpe_sum.s, 0)
+       / 1000000000
+       / NULLIF(CAST(cores.value AS DOUBLE), 0) AS v
+FROM ins_sum
+JOIN cyc_sum ON ins_sum.timestamp = cyc_sum.timestamp
+JOIN tsc_sum ON ins_sum.timestamp = tsc_sum.timestamp
+JOIN ape_sum ON ins_sum.timestamp = ape_sum.timestamp
+JOIN mpe_sum ON ins_sum.timestamp = mpe_sum.timestamp
+JOIN cpu_cores cores ON ins_sum.timestamp = cores.timestamp
+ORDER BY ins_sum.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+
+# ---------- Group E: per-CPU two-counter ratios ----------
+#
+# `sum by (id) (irate(${a:ident}[5m])) / sum by (id) (irate(${b:ident}[5m]))`
+# — covers per-CPU IPC, branch-miss-rate, etc. Same shape as
+# `counter_ratio_generic` but the per-tick aggregation is grouped by `id`
+# and the two sides JOIN on (timestamp, id) instead of timestamp alone.
+[[query]]
+id = "counter_ratio_by_id_generic"
+mode = "shadow"
+promql = "sum by (id) (irate(${a:ident}[5m])) / sum by (id) (irate(${b:ident}[5m]))"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Generic per-id two-counter ratio — covers per-CPU IPC, per-CPU branch-miss rate, etc."
+sql = """
+WITH a_per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {a}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+a_sum AS (
+    SELECT timestamp, id, SUM(rate) AS s
+    FROM a_per_series WHERE rate IS NOT NULL
+    GROUP BY id, timestamp
+),
+b_per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {b}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+b_sum AS (
+    SELECT timestamp, id, SUM(rate) AS s
+    FROM b_per_series WHERE rate IS NOT NULL
+    GROUP BY id, timestamp
+)
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       a.s / NULLIF(b.s, 0) AS v,
+       a.id
+FROM a_sum a
+JOIN b_sum b ON a.timestamp = b.timestamp AND a.id = b.id
+ORDER BY a.id, a.timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+examples = [
+    { id_suffix = "ipc", query = "sum by (id) (irate(cpu_instructions[5m])) / sum by (id) (irate(cpu_cycles[5m]))" },
+]
+
+# ---------- Group A: bare label-filtered selector ----------
+#
+# `${m:ident}{${labels:labels}}` — covers the bare-selector-with-label-filter
+# shape that service-extension JSON templates issue directly (without an
+# `irate`/`sum` wrap), e.g. `target_rate{source="cachecannon"}`. Companion
+# to the no-filter `gauge_bare`; the two are separate entries because
+# `${m:ident}` cannot match the literal `{...}` and `${labels:labels}`
+# requires the braces to be present (the template grammar has no way to
+# express "optional brace block").
+#
+# The SQL `* EXCLUDE (timestamp, value, col)` projects every label column
+# the metric view exposes, mirroring PromQL's pass-through of all metric
+# labels on a bare selector. `{labels:as_predicate}` emits the WHERE
+# fragment that selects the requested label subset; an empty matcher set
+# becomes `WHERE TRUE` (so an explicit `metric{}` query returns every
+# series, matching PromQL).
+[[query]]
+id = "gauge_bare_with_labels"
+mode = "shadow"
+promql = "${m:ident}{${labels:labels}}"
+fixture = "gauge_multi_source"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Label-filtered bare selector — per-source / per-instance gauge reads."
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       CAST(value AS DOUBLE) AS v,
+       * EXCLUDE (timestamp, value, col)
+FROM {m}
+WHERE value IS NOT NULL
+  AND {labels:as_predicate}
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = { __name__ = "{m}" }
+examples = [
+    { id_suffix = "target_rate_cachecannon", query = 'target_rate{source="cachecannon"}' },
+    { id_suffix = "target_rate_cachecannon_inst0", query = 'target_rate{source="cachecannon",instance="0"}' },
+    { id_suffix = "target_rate_empty_filter", query = 'target_rate{}' },
+]
