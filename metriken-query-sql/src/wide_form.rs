@@ -340,6 +340,9 @@ fn build_lane(catalog: &MetricCatalog, shape: &Shape, prefix: &str) -> Option<La
             matching_count: 0,
         });
     }
+    if matching.len() > WIDE_FORM_MAX_COLS {
+        return None;
+    }
     if shape.aggregation == Aggregation::None {
         return None; // binary lanes always aggregate (sum_by or sum)
     }
@@ -587,10 +590,18 @@ fn resolve_shape<'a>(entry: &'a CatalogueEntry, captures: &'a Captures) -> Optio
     }
 }
 
+/// Beyond this many matching physical columns the wide-form SQL grows
+/// too large (one CASE-LAG expression per column) and the long-form
+/// VIEW path's predicate pushdown is competitive or faster. Empirical
+/// crossover from per-query timings: at ~60 matching cols the wide
+/// SQL's parse/plan overhead starts dominating its WINDOW savings.
+const WIDE_FORM_MAX_COLS: usize = 60;
+
 /// Build the wide-form SQL for `shape`. Returns `None` if the catalog
 /// doesn't carry the metric (caller falls through to long-form, which
-/// short-circuits to empty for missing metrics) or if the shape uses
-/// a feature the generator can't handle (e.g. real regex matchers).
+/// short-circuits to empty for missing metrics), if the shape uses a
+/// feature the generator can't handle (e.g. real regex matchers), or
+/// if the matching column count exceeds the wide-form's working range.
 fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
     let filter = coerce_literal_regex(&shape.filter)?;
     let series = catalog.series_by_metric.get(shape.metric)?;
@@ -600,6 +611,9 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
         .collect();
     if matching.is_empty() {
         return Some(empty_matrix_sql(shape));
+    }
+    if matching.len() > WIDE_FORM_MAX_COLS {
+        return None;
     }
 
     let scale_expr = if shape.scale == 1.0 {

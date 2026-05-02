@@ -1,17 +1,30 @@
 loaded 313 queries from /work/metriken/metriken-query/tests/data/production_queries.txt
-benchmarking 4 parquet fixtures, reps=5, warmup_passes=1
---- /work/rezolus/site/viewer/data/demo.parquet ---
-    cold: tsdb_load=114ms duck(open=23 reg=7 views=104) first_promql=2ms first_sql=111ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=2.0s
---- /work/rezolus/site/viewer/data/cachecannon.parquet ---
-    cold: tsdb_load=338ms duck(open=7 reg=3 views=277) first_promql=0ms first_sql=287ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=9.6s
+benchmarking 11 parquet fixtures, reps=5, warmup_passes=1
 --- /work/rezolus/site/viewer/data/AB_base.parquet ---
-    cold: tsdb_load=333ms duck(open=13 reg=3 views=224) first_promql=0ms first_sql=236ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=5.7s
+    cold: tsdb_load=330ms duck(open=29 reg=7 views=259) first_promql=2ms first_sql=244ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=5.1s
+--- /work/rezolus/site/viewer/data/AB_base_pin.parquet ---
+    cold: tsdb_load=320ms duck(open=12 reg=4 views=212) first_promql=0ms first_sql=227ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=5.2s
+--- /work/rezolus/site/viewer/data/AB_level.parquet ---
+    cold: tsdb_load=341ms duck(open=10 reg=3 views=226) first_promql=0ms first_sql=227ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=5.3s
+--- /work/rezolus/site/viewer/data/AB_level_pin.parquet ---
+    cold: tsdb_load=315ms duck(open=10 reg=3 views=224) first_promql=0ms first_sql=248ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=5.2s
+--- /work/rezolus/site/viewer/data/cachecannon.parquet ---
+    cold: tsdb_load=359ms duck(open=10 reg=3 views=275) first_promql=0ms first_sql=279ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=9.5s
+--- /work/rezolus/site/viewer/data/demo.parquet ---
+    cold: tsdb_load=111ms duck(open=10 reg=3 views=101) first_promql=0ms first_sql=119ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=2.1s
+--- /work/rezolus/site/viewer/data/disagg/disagg-sglang.parquet ---
+    cold: tsdb_load=754ms duck(open=11 reg=3 views=889) first_promql=0ms first_sql=954ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=28.9s
+--- /work/rezolus/site/viewer/data/disagg/sglang-nixl-16c.parquet ---
+    cold: tsdb_load=2629ms duck(open=26 reg=3 views=3362) first_promql=1ms first_sql=3215ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=141.5s
+--- /work/rezolus/site/viewer/data/sglang_gemma3.parquet ---
+    cold: tsdb_load=289ms duck(open=25 reg=3 views=492) first_promql=1ms first_sql=479ms
+    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=11.6s
 --- /work/rezolus/site/viewer/data/vllm.parquet ---
-    cold: tsdb_load=293ms duck(open=12 reg=3 views=416) first_promql=0ms first_sql=426ms
-    measured=308 skipped(both)=0 promql_only_err=5 sql_only_err=0 miss=0 elapsed=23.4s
---- total elapsed 40.8s ---
-wrote report to /work/metriken/metriken-query/docs/bench/steady_state_full.md
-wrote csv to /work/metriken/metriken-query/docs/bench/steady_state_full.csv
