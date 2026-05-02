@@ -1,5 +1,16 @@
 # Rezolus query backlog (un-shadowed)
 
+> **STATUS — 2026-05-02:** all 313 unique production queries (232 dashboard
+> templates + 81 service-extension KPIs) now hit a catalogue entry. Verified
+> via `cargo run --example enumerate_rezolus_queries -p metriken-query --
+> --classify` (313 hits, 0 misses). Phase 7.2 is complete.
+>
+> The shape-group write-up below is preserved for reference — it captures the
+> recommended landing order and the small number of remaining open questions
+> (slash-bearing metric names, `gpu_memory_used_pct` synthetic fixture).
+>
+> Replay-based perf characterization lives at `examples/shadow_replay.rs`.
+
 This file inventories the PromQL templates the Rezolus viewer issues against
 `metriken-query` that **don't yet have a SQL twin** in `queries.toml`. The
 20 catalogue entries we have today were tuned to synthetic test fixtures;

@@ -1,0 +1,313 @@
+(memory_total - memory_available) / memory_total
+(sum by (sampler) (irate(rezolus_bpf_run_time[5m])) / sum by (sampler) (irate(rezolus_bpf_run_count[5m]))) / 1000000000
+1 - sum by (id) (irate(cpu_l3_miss[5m])) / sum by (id) (irate(cpu_l3_access[5m]))
+1 - sum(irate(cpu_l3_miss[5m])) / sum(irate(cpu_l3_access[5m]))
+avg(gpu_dram_bandwidth_utilization) / 100
+avg(gpu_memory_utilization) / 100
+avg(gpu_sm_occupancy) / 100
+avg(gpu_sm_utilization) / 100
+avg(gpu_tensor_utilization) / 100
+avg(gpu_utilization) / 100
+blockio_latency{op="read"}
+blockio_latency{op="write"}
+blockio_size{op="read"}
+blockio_size{op="write"}
+get_latency{source="cachecannon"}
+gpu_pcie_throughput{direction="receive"} / ignoring(direction) gpu_pcie_bandwidth
+gpu_pcie_throughput{direction="transmit"} / ignoring(direction) gpu_pcie_bandwidth
+itl{source="llm-perf"}
+max(gpu_temperature)
+memory_available
+memory_buffers
+memory_cached
+memory_free
+memory_total
+memory_total - memory_available
+rate(memory_numa_foreign[5m])
+rate(memory_numa_local[5m])
+request_latency{source="llm-perf"}
+requests_inflight{source="llm-perf"}
+response_latency{source="cachecannon"}
+scheduler_offcpu
+scheduler_running
+scheduler_runqueue_latency
+set_latency{source="cachecannon"}
+sglang_e2e_request_latency_seconds{source="sglang"}
+sglang_e2e_request_latency_seconds{source="sglang-decode"}
+sglang_e2e_request_latency_seconds{source="sglang-prefill"}
+sglang_inter_token_latency_seconds{source="sglang"}
+sglang_inter_token_latency_seconds{source="sglang-decode"}
+sglang_num_queue_reqs{source="sglang"}
+sglang_num_queue_reqs{source="sglang-decode"}
+sglang_num_queue_reqs{source="sglang-prefill"}
+sglang_num_running_reqs{source="sglang"}
+sglang_num_running_reqs{source="sglang-decode"}
+sglang_num_running_reqs{source="sglang-prefill"}
+sglang_per_stage_req_latency_seconds{stage="decode_forward",source="sglang-decode"}
+sglang_per_stage_req_latency_seconds{stage="prefill_forward",source="sglang"}
+sglang_per_stage_req_latency_seconds{stage="prefill_forward",source="sglang-prefill"}
+sglang_time_to_first_token_seconds{source="sglang"}
+sglang_time_to_first_token_seconds{source="sglang-prefill"}
+smg_http_request_duration_seconds{source="sglang-router"}
+smg_router_generation_duration_seconds{source="sglang-router"}
+smg_router_tpot_seconds{source="sglang-router"}
+smg_router_ttft_seconds{source="sglang-router"}
+sum by (id) (gpu_clock{clock="compute"})
+sum by (id) (gpu_clock{clock="graphics"})
+sum by (id) (gpu_clock{clock="memory"})
+sum by (id) (gpu_clock{clock="video"})
+sum by (id) (gpu_dram_bandwidth_utilization) / 100
+sum by (id) (gpu_memory_utilization) / 100
+sum by (id) (gpu_memory{state="free"})
+sum by (id) (gpu_memory{state="used"})
+sum by (id) (gpu_power_usage) / 1000
+sum by (id) (gpu_sm_occupancy) / 100
+sum by (id) (gpu_sm_utilization) / 100
+sum by (id) (gpu_temperature)
+sum by (id) (gpu_tensor_utilization) / 100
+sum by (id) (gpu_utilization) / 100
+sum by (id) (irate(cpu_branch_instructions[5m]))
+sum by (id) (irate(cpu_branch_misses[5m]))
+sum by (id) (irate(cpu_branch_misses[5m])) / sum by (id) (irate(cpu_branch_instructions[5m]))
+sum by (id) (irate(cpu_dtlb_miss[5m]))
+sum by (id) (irate(cpu_dtlb_miss[5m])) / sum by (id) (irate(cpu_instructions[5m])) * 1000
+sum by (id) (irate(cpu_instructions[5m])) / sum by (id) (irate(cpu_cycles[5m]))
+sum by (id) (irate(cpu_instructions[5m])) / sum by (id) (irate(cpu_cycles[5m])) * sum by (id) (irate(cpu_tsc[5m])) * sum by (id) (irate(cpu_aperf[5m])) / sum by (id) (irate(cpu_mperf[5m])) / 1000000000
+sum by (id) (irate(cpu_migrations{direction="from"}[5m]))
+sum by (id) (irate(cpu_migrations{direction="to"}[5m]))
+sum by (id) (irate(cpu_tlb_flush[5m]))
+sum by (id) (irate(cpu_tlb_flush{reason="local_mm_shootdown"}[5m]))
+sum by (id) (irate(cpu_tlb_flush{reason="remote_send_ipi"}[5m]))
+sum by (id) (irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))
+sum by (id) (irate(cpu_tlb_flush{reason="task_switch"}[5m]))
+sum by (id) (irate(cpu_tsc[5m])) * sum by (id) (irate(cpu_aperf[5m])) / sum by (id) (irate(cpu_mperf[5m]))
+sum by (id) (irate(cpu_usage[5m])) / 1000000000
+sum by (id) (irate(cpu_usage{state="system"}[5m])) / 1000000000
+sum by (id) (irate(cpu_usage{state="user"}[5m])) / 1000000000
+sum by (id) (irate(softirq[5m]))
+sum by (id) (irate(softirq_time[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="block"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="hi"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="hrtimer"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="irq_poll"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="net_tx"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="rcu"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="sched"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="tasklet"}[5m])) / 1000000000
+sum by (id) (irate(softirq_time{kind="timer"}[5m])) / 1000000000
+sum by (id) (irate(softirq{kind="block"}[5m]))
+sum by (id) (irate(softirq{kind="hi"}[5m]))
+sum by (id) (irate(softirq{kind="hrtimer"}[5m]))
+sum by (id) (irate(softirq{kind="irq_poll"}[5m]))
+sum by (id) (irate(softirq{kind="net_rx"}[5m]))
+sum by (id) (irate(softirq{kind="net_tx"}[5m]))
+sum by (id) (irate(softirq{kind="rcu"}[5m]))
+sum by (id) (irate(softirq{kind="sched"}[5m]))
+sum by (id) (irate(softirq{kind="tasklet"}[5m]))
+sum by (id) (irate(softirq{kind="timer"}[5m]))
+sum by (name) (irate(cgroup_cpu_instructions{name=~"__SELECTED_CGROUPS__"}[5m])) / sum by (name) (irate(cgroup_cpu_cycles{name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_cpu_migrations{name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_cpu_throttled_time{name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_cpu_tlb_flush{name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_cpu_usage{name=~"__SELECTED_CGROUPS__"}[5m])) / 1000000000
+sum by (name) (irate(cgroup_cpu_usage{state="system",name=~"__SELECTED_CGROUPS__"}[5m])) / 1000000000
+sum by (name) (irate(cgroup_cpu_usage{state="user",name=~"__SELECTED_CGROUPS__"}[5m])) / 1000000000
+sum by (name) (irate(cgroup_syscall{name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="event",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="filesystem",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="ipc",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="lock",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="memory",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="other",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="poll",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="process",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="query",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="read",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="sleep",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="socket",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="time",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="timer",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="write",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (name) (irate(cgroup_syscall{op="yield",name=~"__SELECTED_CGROUPS__"}[5m]))
+sum by (sampler) (irate(rezolus_bpf_run_time[5m])) / 1000000000
+sum(gpu_memory{state="free"})
+sum(gpu_memory{state="used"})
+sum(gpu_memory{state="used"}) / (sum(gpu_memory{state="used"}) + sum(gpu_memory{state="free"}))
+sum(gpu_pcie_bandwidth)
+sum(gpu_pcie_throughput{direction="receive"})
+sum(gpu_pcie_throughput{direction="transmit"})
+sum(gpu_power_usage) / 1000
+sum(irate(blockio_bytes[5m]))
+sum(irate(blockio_bytes{op="read"}[5m]))
+sum(irate(blockio_bytes{op="write"}[5m]))
+sum(irate(blockio_operations[5m]))
+sum(irate(blockio_operations{op="read"}[5m]))
+sum(irate(blockio_operations{op="write"}[5m]))
+sum(irate(bytes_rx{source="cachecannon"}[5s]))
+sum(irate(bytes_tx{source="cachecannon"}[5s]))
+sum(irate(cache_hits{source="cachecannon"}[5s]))
+sum(irate(cache_misses{source="cachecannon"}[5s]))
+sum(irate(cgroup_cpu_instructions{name!~"__SELECTED_CGROUPS__"}[5m])) / sum(irate(cgroup_cpu_cycles{name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_cpu_instructions{name="/system.slice/rezolus.service"}[5m])) / sum(irate(cgroup_cpu_cycles{name="/system.slice/rezolus.service"}[5m]))
+sum(irate(cgroup_cpu_migrations{name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_cpu_throttled_time{name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_cpu_tlb_flush{name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_cpu_usage{name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000
+sum(irate(cgroup_cpu_usage{state="system",name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000
+sum(irate(cgroup_cpu_usage{state="user",name!~"__SELECTED_CGROUPS__"}[5m])) / 1000000000
+sum(irate(cgroup_syscall{name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{name="/system.slice/rezolus.service"}[5m]))
+sum(irate(cgroup_syscall{op="event",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="filesystem",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="ipc",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="lock",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="memory",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="other",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="poll",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="process",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="query",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="read",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="sleep",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="socket",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="time",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="timer",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="write",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(cgroup_syscall{op="yield",name!~"__SELECTED_CGROUPS__"}[5m]))
+sum(irate(connections_failed{source="cachecannon"}[5s]))
+sum(irate(cpu_branch_instructions[5m]))
+sum(irate(cpu_branch_misses[5m]))
+sum(irate(cpu_branch_misses[5m])) / sum(irate(cpu_branch_instructions[5m]))
+sum(irate(cpu_dtlb_miss[5m]))
+sum(irate(cpu_dtlb_miss[5m])) / sum(irate(cpu_instructions[5m])) * 1000
+sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m]))
+sum(irate(cpu_instructions[5m])) / sum(irate(cpu_cycles[5m])) * sum(irate(cpu_tsc[5m])) * sum(irate(cpu_aperf[5m])) / sum(irate(cpu_mperf[5m])) / 1000000000 / cpu_cores
+sum(irate(cpu_migrations{direction="from"}[5m]))
+sum(irate(cpu_migrations{direction="to"}[5m]))
+sum(irate(cpu_tlb_flush[5m]))
+sum(irate(cpu_tlb_flush{reason="local_mm_shootdown"}[5m]))
+sum(irate(cpu_tlb_flush{reason="remote_send_ipi"}[5m]))
+sum(irate(cpu_tlb_flush{reason="remote_shootdown"}[5m]))
+sum(irate(cpu_tlb_flush{reason="task_switch"}[5m]))
+sum(irate(cpu_tsc[5m])) * sum(irate(cpu_aperf[5m])) / sum(irate(cpu_mperf[5m])) / cpu_cores
+sum(irate(cpu_usage[5m])) / cpu_cores / 1000000000
+sum(irate(cpu_usage{state="system"}[5m])) / cpu_cores / 1000000000
+sum(irate(cpu_usage{state="user"}[5m])) / cpu_cores / 1000000000
+sum(irate(get_count{source="cachecannon"}[5s]))
+sum(irate(network_bytes{direction="receive"}[5m])) * 8
+sum(irate(network_bytes{direction="transmit"}[5m])) * 8
+sum(irate(network_drop[5m]))
+sum(irate(network_packets{direction="receive"}[5m]))
+sum(irate(network_packets{direction="transmit"}[5m]))
+sum(irate(redis/total_commands_processed{source="valkey"}[5s]))
+sum(irate(redis/total_net_input_bytes{source="valkey"}[5s]))
+sum(irate(redis/total_net_output_bytes{source="valkey"}[5s]))
+sum(irate(redis/total_reads_processed{source="valkey"}[5s]))
+sum(irate(redis/total_writes_processed{source="valkey"}[5s]))
+sum(irate(request_errors{source="cachecannon"}[5s]))
+sum(irate(requests_sent{source="cachecannon"}[5s]))
+sum(irate(requests{status="canceled",source="llm-perf"}[5s]))
+sum(irate(requests{status="error",source="llm-perf"}[5s]))
+sum(irate(requests{status="error",source="llm-perf"}[5s])) / sum(irate(requests{status="sent",source="llm-perf"}[5s]))
+sum(irate(requests{status="success",source="llm-perf"}[5s]))
+sum(irate(requests{status="timeout",source="llm-perf"}[5s]))
+sum(irate(responses_received{source="cachecannon"}[5s]))
+sum(irate(rezolus_bpf_run_time[5m])) / 1000000000
+sum(irate(rezolus_cpu_usage[5m])) / 1000000000
+sum(irate(scheduler_context_switch[5m]))
+sum(irate(set_count{source="cachecannon"}[5s]))
+sum(irate(sglang_estimated_flops_per_gpu_total{source="sglang"}[5s]))
+sum(irate(sglang_estimated_read_bytes_per_gpu_total{source="sglang"}[5s]))
+sum(irate(sglang_estimated_write_bytes_per_gpu_total{source="sglang"}[5s]))
+sum(irate(sglang_generation_tokens_total{source="sglang"}[5s]))
+sum(irate(sglang_generation_tokens_total{source="sglang-decode"}[5s]))
+sum(irate(sglang_num_aborted_requests_total{source="sglang"}[5s]))
+sum(irate(sglang_num_aborted_requests_total{source="sglang-decode"}[5s]))
+sum(irate(sglang_num_aborted_requests_total{source="sglang-prefill"}[5s]))
+sum(irate(sglang_num_requests_total{source="sglang"}[5s]))
+sum(irate(sglang_num_requests_total{source="sglang"}[5s])) - sum(irate(sglang_num_aborted_requests_total{source="sglang"}[5s]))
+sum(irate(sglang_num_requests_total{source="sglang-decode"}[5s])) - sum(irate(sglang_num_aborted_requests_total{source="sglang-decode"}[5s]))
+sum(irate(sglang_num_requests_total{source="sglang-prefill"}[5s]))
+sum(irate(sglang_prompt_tokens_total{source="sglang"}[5s]))
+sum(irate(sglang_prompt_tokens_total{source="sglang-prefill"}[5s]))
+sum(irate(smg_http_requests_total{source="sglang-router"}[5s]))
+sum(irate(smg_router_request_errors_total{source="sglang-router"}[5s]))
+sum(irate(smg_router_tokens_total{source="sglang-router"}[5s]))
+sum(irate(smg_router_upstream_responses_total{source="sglang-router"}[5s]))
+sum(irate(softirq[5m]))
+sum(irate(softirq_time[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="block"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="hi"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="hrtimer"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="irq_poll"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="net_rx"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="net_tx"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="rcu"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="sched"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="tasklet"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq_time{kind="timer"}[5m])) / cpu_cores / 1000000000
+sum(irate(softirq{kind="block"}[5m]))
+sum(irate(softirq{kind="hi"}[5m]))
+sum(irate(softirq{kind="hrtimer"}[5m]))
+sum(irate(softirq{kind="irq_poll"}[5m]))
+sum(irate(softirq{kind="net_rx"}[5m]))
+sum(irate(softirq{kind="net_tx"}[5m]))
+sum(irate(softirq{kind="rcu"}[5m]))
+sum(irate(softirq{kind="sched"}[5m]))
+sum(irate(softirq{kind="tasklet"}[5m]))
+sum(irate(softirq{kind="timer"}[5m]))
+sum(irate(syscall[5m]))
+sum(irate(syscall{op="event"}[5m]))
+sum(irate(syscall{op="filesystem"}[5m]))
+sum(irate(syscall{op="ipc"}[5m]))
+sum(irate(syscall{op="lock"}[5m]))
+sum(irate(syscall{op="memory"}[5m]))
+sum(irate(syscall{op="other"}[5m]))
+sum(irate(syscall{op="poll"}[5m]))
+sum(irate(syscall{op="process"}[5m]))
+sum(irate(syscall{op="query"}[5m]))
+sum(irate(syscall{op="read"}[5m]))
+sum(irate(syscall{op="sleep"}[5m]))
+sum(irate(syscall{op="socket"}[5m]))
+sum(irate(syscall{op="time"}[5m]))
+sum(irate(syscall{op="timer"}[5m]))
+sum(irate(syscall{op="write"}[5m]))
+sum(irate(syscall{op="yield"}[5m]))
+sum(irate(tcp_retransmit[5m]))
+sum(irate(tokens{direction="input",source="llm-perf"}[5s]))
+sum(irate(tokens{direction="output",source="llm-perf"}[5s]))
+sum(irate(vllm_generation_tokens_total{source="vllm"}[5s]))
+sum(irate(vllm_num_preemptions_total{source="vllm"}[5s]))
+sum(irate(vllm_prompt_tokens_total{source="vllm"}[5s]))
+sum(irate(vllm_request_success_total{source="vllm"}[5s]))
+sum(rate(gpu_energy_consumption[5m])) / 1000
+sum(rezolus_memory_usage_resident_set_size)
+sum(smg_worker_requests_active{source="sglang-router"})
+syscall_latency
+syscall_latency{op="event"}
+syscall_latency{op="filesystem"}
+syscall_latency{op="ipc"}
+syscall_latency{op="lock"}
+syscall_latency{op="memory"}
+syscall_latency{op="other"}
+syscall_latency{op="poll"}
+syscall_latency{op="process"}
+syscall_latency{op="query"}
+syscall_latency{op="read"}
+syscall_latency{op="sleep"}
+syscall_latency{op="socket"}
+syscall_latency{op="time"}
+syscall_latency{op="timer"}
+syscall_latency{op="write"}
+syscall_latency{op="yield"}
+target_rate{source="cachecannon"}
+tcp_packet_latency
+think_duration{source="llm-perf"}
+tpot{source="llm-perf"}
+ttft{source="llm-perf"}
+vllm_e2e_request_latency_seconds{source="vllm"}
+vllm_inter_token_latency_seconds{source="vllm"}
+vllm_num_requests_running{source="vllm"}
+vllm_num_requests_waiting{source="vllm"}
+vllm_request_prefill_time_seconds{source="vllm"}
+vllm_time_to_first_token_seconds{source="vllm"}

@@ -34,9 +34,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sampling_interval_500ms(&out_dir)?;
     rezolus_minimal(&out_dir)?;
     softirq_multi_kind(&out_dir)?;
+    gpu_basic(&out_dir)?;
 
     println!("done");
     Ok(())
+}
+
+/// GPU PCIe metrics with the production label shape:
+/// `gpu_pcie_throughput{direction=…, id=…}` (multi-direction) plus
+/// `gpu_pcie_bandwidth{id=…}` (no direction). Drives the
+/// `gauge_ratio_with_labels_ignoring` catalogue entry — the SQL twin needs
+/// to drop `direction` from the LHS via NATURAL JOIN against the
+/// no-direction RHS, mirroring PromQL's `ignoring(direction)` matching.
+fn gpu_basic(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = FixtureBuilder::new().file_metadata("source", "fixture-gpu-basic");
+    // PCIe throughput (rx + tx) at id=0, with steady deltas so divisions are
+    // easy to eyeball. Values in bytes/second.
+    builder = builder.add_gauge(GaugeSeries {
+        column_name: "gpu_pcie_throughput__rx".into(),
+        metric: "gpu_pcie_throughput".into(),
+        labels: labels(&[("id", "0"), ("direction", "receive")]),
+        points: (0..=10).map(|s| (ts_secs(s), 1_000_000 + (s as i64) * 100)).collect(),
+    });
+    builder = builder.add_gauge(GaugeSeries {
+        column_name: "gpu_pcie_throughput__tx".into(),
+        metric: "gpu_pcie_throughput".into(),
+        labels: labels(&[("id", "0"), ("direction", "transmit")]),
+        points: (0..=10).map(|s| (ts_secs(s), 500_000 + (s as i64) * 50)).collect(),
+    });
+    // PCIe bandwidth — single series, no direction label. Production parquets
+    // (vllm_gemma3, sglang_gemma3) have this exact shape.
+    builder = builder.add_gauge(GaugeSeries {
+        column_name: "gpu_pcie_bandwidth".into(),
+        metric: "gpu_pcie_bandwidth".into(),
+        labels: labels(&[("id", "0")]),
+        points: (0..=10).map(|s| (ts_secs(s), 16_000_000 + (s as i64) * 1000)).collect(),
+    });
+    // GPU memory used/free for `gauge_a_over_a_plus_b` shape.
+    builder = builder.add_gauge(GaugeSeries {
+        column_name: "gpu_memory__used".into(),
+        metric: "gpu_memory".into(),
+        labels: labels(&[("id", "0"), ("state", "used")]),
+        points: (0..=10).map(|s| (ts_secs(s), 8_000_000_000 + (s as i64) * 1_000_000)).collect(),
+    });
+    builder = builder.add_gauge(GaugeSeries {
+        column_name: "gpu_memory__free".into(),
+        metric: "gpu_memory".into(),
+        labels: labels(&[("id", "0"), ("state", "free"), ]),
+        points: (0..=10).map(|s| (ts_secs(s), 24_000_000_000 - (s as i64) * 1_000_000)).collect(),
+    });
+    builder.write(&dir.join("gpu_basic.parquet"))
 }
 
 /// One counter, single label set, strictly monotonic at 1Hz over 10 seconds.
