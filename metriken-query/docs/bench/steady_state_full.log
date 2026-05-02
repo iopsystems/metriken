@@ -1,0 +1,36 @@
+loaded 313 queries from metriken-query/tests/data/production_queries.txt
+benchmarking 11 parquet fixtures, reps=10, warmup_passes=1
+--- /work/rezolus/site/viewer/data/AB_base.parquet ---
+    cold: tsdb_load=339ms duck(open=17 reg=5 views=501) first_promql=1ms first_sql=506ms
+    measured=137 skipped(both)=143 promql_only_err=33 sql_only_err=0 miss=0 elapsed=30.1s
+--- /work/rezolus/site/viewer/data/AB_base_pin.parquet ---
+    cold: tsdb_load=334ms duck(open=10 reg=3 views=528) first_promql=0ms first_sql=536ms
+    measured=135 skipped(both)=143 promql_only_err=35 sql_only_err=0 miss=0 elapsed=32.0s
+--- /work/rezolus/site/viewer/data/AB_level.parquet ---
+    cold: tsdb_load=352ms duck(open=9 reg=3 views=524) first_promql=0ms first_sql=532ms
+    measured=135 skipped(both)=143 promql_only_err=35 sql_only_err=0 miss=0 elapsed=30.7s
+--- /work/rezolus/site/viewer/data/AB_level_pin.parquet ---
+    cold: tsdb_load=337ms duck(open=10 reg=3 views=520) first_promql=0ms first_sql=531ms
+    measured=138 skipped(both)=141 promql_only_err=34 sql_only_err=0 miss=0 elapsed=31.3s
+--- /work/rezolus/site/viewer/data/cachecannon.parquet ---
+    cold: tsdb_load=363ms duck(open=8 reg=3 views=1111) first_promql=0ms first_sql=1111ms
+    measured=116 skipped(both)=162 promql_only_err=17 sql_only_err=18 miss=0 elapsed=99.5s
+--- /work/rezolus/site/viewer/data/demo.parquet ---
+    cold: tsdb_load=113ms duck(open=9 reg=4 views=183) first_promql=0ms first_sql=180ms
+    measured=99 skipped(both)=188 promql_only_err=9 sql_only_err=17 miss=0 elapsed=7.4s
+--- /work/rezolus/site/viewer/data/disagg/disagg-sglang.parquet ---
+    FAILED in duck_views after 2.1s: Constraint Error: PRIMARY KEY or UNIQUE constraint violation: duplicate key "0::10"
+--- /work/rezolus/site/viewer/data/disagg/sglang-nixl-16c.parquet ---
+    FAILED in duck_views after 9.1s: Constraint Error: PRIMARY KEY or UNIQUE constraint violation: duplicate key "0::4"
+--- /work/rezolus/site/viewer/data/sglang_gemma3.parquet ---
+    cold: tsdb_load=286ms duck(open=11 reg=4 views=1465) first_promql=0ms first_sql=1396ms
+    measured=175 skipped(both)=105 promql_only_err=33 sql_only_err=0 miss=0 elapsed=94.5s
+--- /work/rezolus/site/viewer/data/vllm.parquet ---
+    cold: tsdb_load=311ms duck(open=13 reg=3 views=3732) first_promql=0ms first_sql=3711ms
+    measured=178 skipped(both)=103 promql_only_err=32 sql_only_err=0 miss=0 elapsed=299.6s
+--- /work/rezolus/site/viewer/data/vllm_gemma3.parquet ---
+    cold: tsdb_load=285ms duck(open=13 reg=3 views=1377) first_promql=0ms first_sql=1225ms
+    measured=179 skipped(both)=105 promql_only_err=29 sql_only_err=0 miss=0 elapsed=92.5s
+--- total elapsed 728.7s ---
+wrote report to /work/metriken/metriken-query/docs/bench/steady_state_full.md
+wrote csv to /work/metriken/metriken-query/docs/bench/steady_state_full.csv
