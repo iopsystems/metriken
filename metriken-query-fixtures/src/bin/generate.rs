@@ -330,6 +330,34 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         points: hist_points,
     });
 
+    // BPF self-monitoring counters — one column per `sampler`, two samplers,
+    // monotonic. Drives the Group J Rezolus self-monitoring catalogue
+    // entries (rezolus_bpf_run_time + rezolus_bpf_run_count).
+    let mut col = 0u32;
+    for sampler in ["cpu", "syscall"] {
+        let run_time_rate: u64 = 50_000_000; // ns/s of BPF time
+        let run_count_rate: u64 = 1_000; // events/s
+        let run_time: Vec<(u64, u64)> = (0..=20)
+            .map(|s| (ts_secs(s), s * run_time_rate))
+            .collect();
+        let run_count: Vec<(u64, u64)> = (0..=20)
+            .map(|s| (ts_secs(s), s * run_count_rate))
+            .collect();
+        builder = builder.add_counter(CounterSeries {
+            column_name: format!("rezolus_bpf_run_time__{col}"),
+            metric: "rezolus_bpf_run_time".into(),
+            labels: labels(&[("sampler", sampler)]),
+            points: run_time,
+        });
+        builder = builder.add_counter(CounterSeries {
+            column_name: format!("rezolus_bpf_run_count__{col}"),
+            metric: "rezolus_bpf_run_count".into(),
+            labels: labels(&[("sampler", sampler)]),
+            points: run_count,
+        });
+        col += 1;
+    }
+
     builder.write(&dir.join("rezolus_minimal.parquet"))
 }
 
@@ -357,6 +385,33 @@ fn softirq_multi_kind(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             builder = builder.add_counter(CounterSeries {
                 column_name: format!("softirq__{col}"),
                 metric: "softirq".into(),
+                labels: labels(&[("id", id), ("kind", kind)]),
+                points,
+            });
+            col += 1;
+        }
+    }
+    // softirq_time — ns-of-CPU-time-spent counter, same (id, kind) shape as
+    // `softirq` but with much larger per-second deltas (ns scale). Drives the
+    // time-percentage Group-F catalogue entries.
+    let mut col = 0u32;
+    for id in ["0", "1"] {
+        for kind in ["hi", "net_rx", "timer"] {
+            // ns/s of CPU time. Pick rates that don't all collapse to the
+            // same fraction so the per-id and total entries are distinguishable.
+            let rate_ns: u64 = match (kind, id) {
+                ("hi", "0") => 200_000,
+                ("hi", "1") => 100_000,
+                ("net_rx", "0") => 5_000_000,
+                ("net_rx", "1") => 4_000_000,
+                ("timer", "0") => 1_000_000,
+                ("timer", "1") => 800_000,
+                _ => 0,
+            };
+            let points: Vec<(u64, u64)> = (0..=10).map(|s| (ts_secs(s), s * rate_ns)).collect();
+            builder = builder.add_counter(CounterSeries {
+                column_name: format!("softirq_time__{col}"),
+                metric: "softirq_time".into(),
                 labels: labels(&[("id", id), ("kind", kind)]),
                 points,
             });

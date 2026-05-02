@@ -306,10 +306,16 @@ mod tests {
     #[test]
     fn lookup_finds_known_query() {
         let cat = Catalogue::embedded();
+        // `memory_total` matches the templated `gauge_bare` entry with
+        // `m = memory_total`. Both the entry id and the capture binding
+        // are part of the contract.
         let (entry, caps) = cat.lookup("memory_total").expect("gauge_bare match");
         assert_eq!(entry.id, "gauge_bare");
         assert_eq!(entry.mode, Mode::Shadow);
-        assert!(caps.is_empty(), "literal entry should have no captures");
+        assert_eq!(
+            caps.get("m"),
+            Some(&crate::CaptureValue::Ident("memory_total".to_string()))
+        );
     }
 
     #[test]
@@ -325,7 +331,11 @@ mod tests {
     #[test]
     fn lookup_misses_unknown_query() {
         let cat = Catalogue::embedded();
-        assert!(cat.lookup("nonsense_metric_that_isnt_in_catalogue").is_none());
+        // A free-form expression that doesn't fit any entry's template
+        // shape. (`gauge_bare` is now `${m:ident}` which would absorb a
+        // bare identifier — using a parenthesised form ensures no entry
+        // matches.)
+        assert!(cat.lookup("(nonsense + that + doesnt + match)").is_none());
     }
 
     #[test]

@@ -31,30 +31,55 @@
 #
 # Promotions are catalogue commits — `git log -p queries.toml` is the
 # canonical migration history.
+#
+# ---------- SQL idioms used by templated entries ----------
+#
+# 1. Per-series rate via `PARTITION BY col`. Every metric view exposes a `col`
+#    column carrying the physical parquet column name (one per labeled series),
+#    so `LAG(value) OVER (PARTITION BY col ORDER BY timestamp)` walks within
+#    a single series — no leakage across labels.
+# 2. Multi-series histogram aggregation with `h2_combine(list(buckets))` per
+#    timestamp, then `hist_irate_quantile`. Single-series metrics cost the
+#    same as without the wrap — `h2_combine` of a 1-element list is a no-op.
+# 3. Bare-counter `irate(${m:ident}[5m])` shape: union the per-series rates
+#    and SUM. See `counter_total_sum` for the canonical pattern; Group K
+#    singletons reuse it verbatim.
+# 4. Gauge arithmetic: gauges have no rate, so the SQL is a `SELECT t, expr`
+#    where `expr` does the arithmetic on the raw `value` column. For
+#    multi-metric arithmetic, JOIN the views on `timestamp`.
+# 5. Counter-with-source-label: same as `counter_total_sum` plus a
+#    `WHERE source = {s}` (or `WHERE {labels:as_predicate}` for multi-label).
 
 # ---------- Gauges ----------
 
 [[query]]
 id = "gauge_bare"
 mode = "shadow"
-promql = "memory_total"
+# Templated bare-gauge selector — `${m:ident}` covers any gauge metric
+# (memory_total, memory_available, memory_buffers, memory_cached, …).
+# The SQL queries the auto-generated metric view, which exposes a single
+# `value` column (gauges have no labels in Rezolus's parquet schema).
+promql = "${m:ident}"
 fixture = "gauge_basic"
 start = 0.0
 end = 10.0
 step = 1.0
-description = "Bare gauge selector — no rate function, just emit the points."
+description = "Bare gauge selector — no rate function, just emit the points. One templated entry covers every gauge metric."
 sql = """
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(memory_total AS DOUBLE) AS v
-FROM read_parquet('{fixture_path}')
-WHERE memory_total IS NOT NULL
+       CAST(value AS DOUBLE) AS v
+FROM {m}
+WHERE value IS NOT NULL
 ORDER BY timestamp
 """
 value_columns = ["v"]
 label_columns = []
 # Static labels added to every emitted series — mirrors PromQL's implicit
 # `__name__` label on bare selectors.
-output_metric = { __name__ = "memory_total" }
+output_metric = { __name__ = "{m}" }
+examples = [
+    { id_suffix = "memory_total", query = "memory_total" },
+]
 
 [[query]]
 id = "gauge_negative"
@@ -442,24 +467,41 @@ label_columns = ["quantile"]
 output_metric = { __name__ = "request_latency" }
 
 [[query]]
-id = "histogram_heatmap"
+id = "histogram_heatmap_generic"
 mode = "shadow"
-promql = "histogram_heatmap(request_latency)"
+# Templated `histogram_heatmap(${m:ident})` — captures the metric name. ONE
+# entry covers every histogram metric (request_latency,
+# scheduler_runqueue_latency, syscall_latency, vllm_e2e_request_latency, …).
+# Same `h2_combine(list(buckets))` GROUP BY pattern as
+# `histogram_quantile_generic` so multi-series histograms (e.g.
+# syscall_latency, with one column per `op` label) get aggregated across
+# series before the per-tick delta is taken. Self-join sidesteps the
+# `LAG(buckets) OVER (ORDER BY timestamp)` chunk-boundary issue across
+# multi-row-group parquet files.
+promql = "histogram_heatmap(${m:ident})"
 output_shape = "heatmap"
 fixture = "histogram_basic"
 start = 1.0
 end = 10.0
 step = 1.0
-description = "Rezolus extension — 2-D heatmap output for visualization."
+description = "Rezolus extension — 2-D heatmap output for visualization. One templated entry covers every histogram metric."
 # UNNEST WITH ORDINALITY emits one row per non-zero bucket per tick. The
 # backend reconstructs timestamps, bucket_bounds (via h2_upper for the
 # contiguous index range), and remaps bucket_idx into the output frame.
 sql = """
-WITH paired AS (
+WITH per_ts AS (
     SELECT timestamp,
-           h2_delta(buckets, LAG(buckets) OVER (ORDER BY timestamp)) AS d,
-           p
-    FROM request_latency
+           h2_combine(list(buckets)) AS buckets,
+           ANY_VALUE(p) AS p
+    FROM {m}
+    GROUP BY timestamp
+),
+paired AS (
+    SELECT a.timestamp,
+           h2_delta(a.buckets,
+                    LAG(a.buckets) OVER (ORDER BY a.timestamp)) AS d,
+           a.p
+    FROM per_ts a
 )
 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
        (u.ordinal - 1)::INTEGER AS bucket_idx,
@@ -470,6 +512,9 @@ CROSS JOIN UNNEST(d) WITH ORDINALITY AS u(value, ordinal)
 WHERE u.value > 0
 ORDER BY t, bucket_idx
 """
+examples = [
+    { id_suffix = "request_latency", query = "histogram_heatmap(request_latency)" },
+]
 
 [[query]]
 id = "histogram_quantile_with_reset"
@@ -657,3 +702,446 @@ examples = [
     { id_suffix = "net_rx", query = 'sum(irate(softirq{kind="net_rx"}[5m]))' },
     { id_suffix = "timer", query = 'sum(irate(softirq{kind="timer"}[5m]))' },
 ]
+
+# ---------- Group F: softirq per-kind shape family ----------
+#
+# Group F has four shapes per kind. We already have `softirq_irate_total_by_kind`
+# (rate). Below adds the other three: rate-by-id, time-pct (cores divisor),
+# and time-pct-by-id. Each is templated by `${k:string}` so one entry covers
+# every softirq kind (hi, net_rx, timer, …).
+
+[[query]]
+id = "softirq_irate_by_id_by_kind"
+mode = "shadow"
+# `sum by (id) (irate(softirq{kind=...}[5m]))` — per-CPU softirq rate.
+# Same SQL skeleton as `counter_sum_by_id_filtered` but the filter is on
+# `kind` (string capture) instead of `state`.
+promql = 'sum by (id) (irate(softirq{kind=${k:string}}[5m]))'
+fixture = "softirq_multi_kind"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Per-id softirq rate per kind."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM softirq
+    WHERE kind = {k}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+examples = [
+    { id_suffix = "hi", query = 'sum by (id) (irate(softirq{kind="hi"}[5m]))' },
+    { id_suffix = "net_rx", query = 'sum by (id) (irate(softirq{kind="net_rx"}[5m]))' },
+]
+
+[[query]]
+id = "softirq_time_pct_by_kind"
+mode = "shadow"
+# Total softirq CPU time as a fraction of available CPU. The dashboard
+# substitutes a numeric `cores` divisor JS-side (e.g. `... / 8 / 1e9`),
+# so this entry captures it as `${cores:number}`.
+promql = 'sum(irate(softirq_time{kind=${k:string}}[5m])) / ${cores:number} / 1000000000'
+fixture = "softirq_multi_kind"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Softirq CPU-time percentage per kind (ns/s summed, divided by cores and 1e9)."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM softirq_time
+    WHERE kind = {k}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / {cores} / 1000000000 AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "net_rx", query = 'sum(irate(softirq_time{kind="net_rx"}[5m])) / 2 / 1000000000' },
+    { id_suffix = "timer", query = 'sum(irate(softirq_time{kind="timer"}[5m])) / 2 / 1000000000' },
+]
+
+[[query]]
+id = "softirq_time_pct_by_id_by_kind"
+mode = "shadow"
+promql = 'sum by (id) (irate(softirq_time{kind=${k:string}}[5m])) / 1000000000'
+fixture = "softirq_multi_kind"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Per-id softirq CPU-time percentage per kind."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, id,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM softirq_time
+    WHERE kind = {k}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / 1000000000 AS v,
+       id
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY id, timestamp
+ORDER BY id, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["id"]
+output_metric = {}
+examples = [
+    { id_suffix = "net_rx", query = 'sum by (id) (irate(softirq_time{kind="net_rx"}[5m])) / 1000000000' },
+]
+
+# ---------- Group K: bare-counter singleton sums ----------
+#
+# `sum(irate(${m:ident}[5m]))` against bare counters (no labels).
+# Covers: network_drop, tcp_retransmit, scheduler_context_switch,
+# blockio_bytes, blockio_operations. The SQL is `counter_total_sum`'s
+# pattern, generalised across metric names.
+
+[[query]]
+id = "counter_total_sum_generic"
+mode = "shadow"
+promql = "sum(irate(${m:ident}[5m]))"
+fixture = "counter_multi_label"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Generic top-level sum of an irate'd counter — one entry covers every bare counter sum."
+sql = """
+WITH per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM {m}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "cpu_usage", query = "sum(irate(cpu_usage[5m]))" },
+]
+
+# ---------- Group J: Rezolus self-monitoring ----------
+#
+# BPF instrumentation overhead. Each is concrete because the formula is
+# unique (no useful templating gain). See dashboard/rezolus.rs:39-55.
+
+[[query]]
+id = "rezolus_bpf_run_time_sec"
+mode = "shadow"
+promql = "sum(irate(rezolus_bpf_run_time[5m])) / 1000000000"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Total BPF run time as a fraction of wall-clock (1e9 ns/s divisor)."
+sql = """
+WITH per_series AS (
+    SELECT timestamp,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM rezolus_bpf_run_time
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / 1000000000 AS v
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+
+[[query]]
+id = "rezolus_bpf_avg_run_time_per_sampler"
+mode = "shadow"
+promql = "(sum by (sampler) (irate(rezolus_bpf_run_time[5m])) / sum by (sampler) (irate(rezolus_bpf_run_count[5m]))) / 1000000000"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Per-sampler average BPF call duration in seconds (run_time / run_count / 1e9)."
+sql = """
+WITH time_per_series AS (
+    SELECT timestamp, sampler,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM rezolus_bpf_run_time
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+count_per_series AS (
+    SELECT timestamp, sampler,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM rezolus_bpf_run_count
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+time_summed AS (
+    SELECT timestamp, sampler, SUM(rate) AS time_sum
+    FROM time_per_series WHERE rate IS NOT NULL
+    GROUP BY sampler, timestamp
+),
+count_summed AS (
+    SELECT timestamp, sampler, SUM(rate) AS count_sum
+    FROM count_per_series WHERE rate IS NOT NULL
+    GROUP BY sampler, timestamp
+)
+SELECT CAST(t.timestamp AS DOUBLE) / 1e9 AS t,
+       (t.time_sum / NULLIF(c.count_sum, 0)) / 1000000000 AS v,
+       t.sampler
+FROM time_summed t
+JOIN count_summed c
+  ON t.timestamp = c.timestamp AND t.sampler = c.sampler
+ORDER BY t.sampler, t.timestamp
+"""
+value_columns = ["v"]
+label_columns = ["sampler"]
+output_metric = {}
+
+[[query]]
+id = "rezolus_bpf_run_time_sec_per_sampler"
+mode = "shadow"
+promql = "sum by (sampler) (irate(rezolus_bpf_run_time[5m])) / 1000000000"
+fixture = "rezolus_minimal"
+start = 1.0
+end = 20.0
+step = 1.0
+description = "Per-sampler BPF run time as a fraction of wall-clock."
+sql = """
+WITH per_series AS (
+    SELECT timestamp, sampler,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS rate
+    FROM rezolus_bpf_run_time
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate) / 1000000000 AS v,
+       sampler
+FROM per_series
+WHERE rate IS NOT NULL
+GROUP BY sampler, timestamp
+ORDER BY sampler, timestamp
+"""
+value_columns = ["v"]
+label_columns = ["sampler"]
+output_metric = {}
+
+# ---------- Group I: GPU metrics ----------
+#
+# GPU dashboards mostly read gauges with a scalar divisor. Two shapes:
+# `sum(${m:ident}) / ${d:number}` and `avg(${m:ident}) / ${d:number}`.
+# A third for `rate(${m:ident}[5m])` (gpu_energy_consumption is a counter).
+
+[[query]]
+id = "gauge_sum_scaled"
+mode = "shadow"
+# `sum(${m:ident}) / ${d:number}` — sums a (possibly multi-series) gauge
+# across labels at every timestamp, then divides by a scalar.
+# Examples in production: `sum(gpu_power_usage) / 1000`,
+# `sum(gpu_pcie_throughput{direction="rx"})` (with d=1).
+promql = "sum(${m:ident}) / ${d:number}"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Gauge cross-series sum with scalar divisor — common GPU/memory dashboard pattern."
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(CAST(value AS DOUBLE)) / {d} AS v
+FROM {m}
+WHERE value IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "memory_total_div_1024", query = "sum(memory_total) / 1024" },
+]
+
+[[query]]
+id = "gauge_avg_scaled"
+mode = "shadow"
+# `avg(${m:ident}) / ${d:number}` — multi-series gauge average with scalar
+# divisor. Production example: `avg(gpu_memory_utilization) / 100`.
+promql = "avg(${m:ident}) / ${d:number}"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Gauge cross-series average with scalar divisor."
+sql = """
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       AVG(CAST(value AS DOUBLE)) / {d} AS v
+FROM {m}
+WHERE value IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "memory_total_div_1", query = "avg(memory_total) / 1" },
+]
+
+[[query]]
+id = "counter_rate_sum_scaled"
+mode = "shadow"
+# `sum(rate(${m:ident}[5m])) / ${d:number}` — total rate across all series
+# divided by a scalar. Production: `sum(rate(gpu_energy_consumption[5m])) / 1000`.
+# Uses the windowed reset-aware `rate()` pattern from `counter_rate_reset`,
+# but generalised over the metric name.
+promql = "sum(rate(${m:ident}[5m])) / ${d:number}"
+fixture = "counter_basic"
+start = 1.0
+end = 10.0
+step = 1.0
+description = "Generic 5-minute windowed counter rate, summed across series, with scalar divisor."
+sql = """
+WITH incr AS (
+    SELECT timestamp, col,
+           CASE
+               WHEN LAG(value) OVER w IS NULL THEN NULL
+               WHEN value >= LAG(value) OVER w
+                   THEN CAST(value - LAG(value) OVER w AS DOUBLE)
+               ELSE CAST(value AS DOUBLE)
+           END AS inc
+    FROM {m}
+    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
+),
+windowed AS (
+    SELECT timestamp,
+           SUM(inc) OVER w_per_series
+           / NULLIF(
+               CAST(timestamp - FIRST_VALUE(timestamp) OVER w_per_series AS DOUBLE) / 1e9,
+               0
+           ) AS rate_per_series
+    FROM incr
+    WINDOW w_per_series AS (
+        PARTITION BY col ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW
+    )
+)
+SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
+       SUM(rate_per_series) / {d} AS v
+FROM windowed
+WHERE rate_per_series IS NOT NULL
+GROUP BY timestamp
+ORDER BY timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "requests_div_1", query = "sum(rate(requests[5m])) / 1" },
+]
+
+# ---------- Group H: memory / NUMA gauge arithmetic ----------
+#
+# Gauge subtraction and ratio shapes for memory utilisation. JOIN the two
+# views on timestamp, then evaluate the arithmetic. Both views are
+# guaranteed to have aligned timestamps because the snap pass in
+# `views::ensure_views` aligns every parquet timestamp to the sampling
+# interval boundary.
+
+[[query]]
+id = "gauge_subtract"
+mode = "shadow"
+# `${a:ident} - ${b:ident}` — pointwise subtraction across two bare gauges.
+# Production: `memory_total - memory_available`.
+promql = "${a:ident} - ${b:ident}"
+fixture = "gauge_basic"
+start = 0.0
+end = 10.0
+step = 1.0
+description = "Pointwise gauge subtraction. JOIN on timestamp, subtract."
+sql = """
+SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
+       (CAST(a.value AS DOUBLE) - CAST(b.value AS DOUBLE)) AS v
+FROM {a} a
+JOIN {b} b ON a.timestamp = b.timestamp
+WHERE a.value IS NOT NULL AND b.value IS NOT NULL
+ORDER BY a.timestamp
+"""
+value_columns = ["v"]
+label_columns = []
+output_metric = {}
+examples = [
+    { id_suffix = "memory_total_minus_queue_depth", query = "memory_total - queue_depth" },
+]
+
+# NOTE: `(${a:ident} - ${b:ident}) / ${a:ident}` (the production memory
+# utilisation %) needs a back-reference capture (same `${a}` twice) which
+# the current template engine doesn't support — duplicate names error at
+# parse time. Tracking as a follow-up: either teach the engine to allow
+# repeat captures with a value-equality requirement, or land a concrete
+# `memory_util_pct` entry hardcoded to (memory_total, memory_available).
