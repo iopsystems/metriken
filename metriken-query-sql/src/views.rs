@@ -1,22 +1,20 @@
-//! Wide-to-long metric view generation.
+//! Parquet load + per-metric catalog.
 //!
 //! Metriken parquet files store metrics in *wide* form: one column per
-//! labeled series, with the canonical metric name and label values living
-//! in Arrow field metadata. SQL queries naturally want a *long* view:
-//! `cpu_usage(timestamp, value, id, state)` — one row per `(time, label
-//! permutation)`. This module reads a parquet file's schema and emits a
-//! `CREATE OR REPLACE VIEW <metric>` per unique metric name, UNION-ALLing
-//! every column that shares the metric name and projecting its label
-//! values as columns.
+//! labeled series, with the canonical metric name and label values
+//! living in Arrow field metadata. The wide-form SQL generator
+//! projects directly off these columns, so this module's job is only:
 //!
-//! Counters, gauges, and histograms are all supported. For histograms the
-//! view exposes a `buckets` column (the cumulative `List<UBIGINT>`) plus a
-//! `p` column carrying the column's `grouping_power` — so SQL queries can
-//! pass the right `p` to `h2_quantile` without baking it in by hand.
+//! 1. Load the parquet into an in-memory `_src` table (one read,
+//!    snapped timestamps).
+//! 2. Build a `MetricCatalog` indexing each canonical metric name to
+//!    its physical columns + label maps + (for histograms)
+//!    `grouping_power`. The wide-form generator consumes this index
+//!    to know which columns to project for any `M{labels}` selector.
 //!
-//! The view generator is invoked once per `DuckDbBackend::run` call. It's
-//! cheap (a single parquet metadata read, no row-group decode) and idempotent
-//! within a connection (`CREATE OR REPLACE`).
+//! No per-metric VIEWs are created — the long-form
+//! `metric(timestamp, value, ...labels)` layer was removed once
+//! every catalogue entry had a wide-form path.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,18 +80,16 @@ fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
     }
 }
 
-/// Read the parquet schema, group columns by canonical metric name, and emit
-/// `CREATE OR REPLACE VIEW <metric>` for each one. Counters and gauges share
-/// a `(timestamp, value, ...labels)` shape; histograms get
-/// `(timestamp, buckets, p, ...labels)`.
+/// Read the parquet schema, load the file into a single in-memory
+/// `_src` TEMP TABLE, and build the per-metric catalog the wide-form
+/// SQL generator consumes.
 ///
-/// **Performance:** before any view is created, the parquet file is loaded
-/// **once** into an in-memory `_src` table. The view DDLs all reference
-/// `_src` instead of `read_parquet(...)` directly, so a query that touches a
-/// view with N UNION-ALL branches costs N in-memory scans of `_src` (cheap)
-/// rather than N full parquet reads (~10-100s on Rezolus production data).
-/// The single parquet read amortises across every view and every query for
-/// the lifetime of the connection.
+/// **Performance:** the parquet is loaded **once** into the `_src`
+/// table. Wide-form SQL queries reference `_src` instead of
+/// `read_parquet(...)` directly, so each query is an in-memory scan
+/// (cheap) rather than a fresh parquet read (~10-100s on Rezolus
+/// production data). The single parquet read amortises across every
+/// query for the lifetime of the connection.
 /// Per-metric metadata built once at `ensure_views` time. The backend
 /// caches this alongside the connection so per-query pre-flight
 /// checks (which physical columns belong to a metric, what the
@@ -145,10 +141,9 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
     // recordings) emit duplicate top-level column names with the same
     // type/metadata. DuckDB's `read_parquet` silently keeps only the first
     // occurrence in `_src`, but `arrow::Schema::fields()` returns all of
-    // them — leaving the metric-views layer to insert duplicate rows into
-    // `_metadata` (which has `col` as PRIMARY KEY) and to UNION-ALL views
-    // over a column that no longer exists by that name twice. Dedupe by
-    // physical name, first occurrence wins, matching DuckDB's behavior.
+    // them — without dedup the catalog would index physical column names
+    // that don't exist in `_src`. Dedupe by physical name, first
+    // occurrence wins, matching DuckDB's behavior.
     let mut seen_physical: BTreeSet<String> = BTreeSet::new();
     let columns: Vec<ColumnInfo> = schema
         .fields()
@@ -190,9 +185,10 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
         .unwrap_or(1_000_000_000);
     let half = interval_ns / 2;
 
-    // Single parquet read into an in-memory table. All metric views project
-    // from `_src` instead of `read_parquet(...)`, so per-view UNION ALL
-    // branches are cheap memory scans, not redundant parquet decodes.
+    // Single parquet read into an in-memory table. Every wide-form
+    // SQL query projects from `_src` instead of `read_parquet(...)`,
+    // so each query is a cheap memory scan rather than a fresh
+    // parquet decode.
     //
     // The `timestamp` column is replaced with its snapped form (round-to-
     // nearest interval) so SQL queries see the same canonical timestamps
