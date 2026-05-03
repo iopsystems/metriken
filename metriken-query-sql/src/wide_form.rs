@@ -731,7 +731,7 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
         Aggregation::Avg => format!("AVG(v){scale_expr}"),
         Aggregation::Sum => unreachable!("handled above"),
     };
-    let (group_clause, order_clause, group_select) = match (shape.aggregation, shape.group_label) {
+    let (group_clause, group_select) = match (shape.aggregation, shape.group_label) {
         (Aggregation::None, _) => {
             let mut all_keys: std::collections::BTreeSet<&str> = Default::default();
             for s in &matching {
@@ -745,34 +745,23 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
             } else {
                 format!(", {}", parts.join(", "))
             };
-            let order = if parts.is_empty() {
-                "timestamp".to_string()
-            } else {
-                format!("{}, timestamp", parts.join(", "))
-            };
-            (String::new(), order, labels_sql)
+            (String::new(), labels_sql)
         }
         (_, Some(g)) => {
             let g = quote_ident(g);
-            (
-                format!("GROUP BY {g}, timestamp"),
-                format!("{g}, timestamp"),
-                format!(", {g}"),
-            )
+            (format!("GROUP BY {g}, timestamp"), format!(", {g}"))
         }
-        (_, None) => (
-            "GROUP BY timestamp".to_string(),
-            "timestamp".to_string(),
-            String::new(),
-        ),
+        (_, None) => ("GROUP BY timestamp".to_string(), String::new()),
     };
 
+    // No ORDER BY — Rust-side groups by labels, canonical-JSON
+    // comparison sorts samples per series. Same reasoning as
+    // generate_sum and generate_binary.
     Some(format!(
         "WITH rates AS (\n  SELECT timestamp{per_col_select}\n  FROM _src\n  {window_clause}\n)\n\
          SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, {value_expr} AS v{group_select}\n\
          FROM (\n      {unions}\n) per_series\n\
-         {group_clause}\n\
-         ORDER BY {order_clause}"
+         {group_clause}"
     ))
 }
 
