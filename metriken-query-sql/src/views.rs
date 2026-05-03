@@ -94,56 +94,29 @@ fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
 /// rather than N full parquet reads (~10-100s on Rezolus production data).
 /// The single parquet read amortises across every view and every query for
 /// the lifetime of the connection.
-/// Per-metric shape and label-key index built once at `ensure_views`
-/// time. The backend caches this alongside the connection so per-query
-/// pre-flight checks are hashmap reads instead of DESCRIBE roundtrips
-/// (~1-2ms saved per query for catalogue entries with metric idents).
-///
-/// `pending_view_sql` carries the un-executed `CREATE OR REPLACE VIEW`
-/// statement for each metric: the backend builds them lazily on first
-/// reference, so a fixture with hundreds of metrics only pays
-/// view-build cost for the metrics actually queried (a viewer
-/// typically touches a small subset of available metrics). Cuts
-/// observed cold-start on `disagg/sglang-nixl-16c.parquet` from
-/// ~16s to a few hundred ms.
+/// Per-metric metadata built once at `ensure_views` time. The backend
+/// caches this alongside the connection so per-query pre-flight
+/// checks (which physical columns belong to a metric, what the
+/// histogram's grouping_power is) are hashmap reads.
 ///
 /// `series_by_metric` is the per-(metric, physical-column) label map.
-/// Used by the backend's wide-form SQL generator to project rates
-/// directly off `_src` columns instead of going through the long-form
-/// VIEW (PARTITION BY col on the long form re-derives a partitioning
-/// the wide layout already has — measured 7× faster on WINDOW
-/// operator for the worst-case shape).
+/// Used by the wide-form SQL generator to project values/rates
+/// directly off `_src` columns; the long-form metric VIEW is gone.
 #[derive(Debug, Default, Clone)]
 pub struct MetricCatalog {
-    /// `Scalar` for gauge/counter (view has a `value` column);
-    /// `Histogram` for histogram (view has `buckets` + `p`).
-    pub shapes: std::collections::HashMap<String, MetricShape>,
-    /// Union of label keys present on each metric view.
-    pub label_keys: std::collections::HashMap<String, BTreeSet<String>>,
-    /// All view names registered — used by the backend's
-    /// `first_missing_from_view` scan to short-circuit on hardcoded
-    /// metric names that the fixture doesn't carry.
-    pub view_names: BTreeSet<String>,
-    /// Per-metric `CREATE OR REPLACE VIEW` SQL. Not executed at
-    /// `ensure_views` time — the backend executes on first reference.
-    pub pending_view_sql: std::collections::HashMap<String, String>,
     /// Per-metric ordered list of physical columns + their label maps.
-    /// Drives the wide-form SQL generator. The order is the same as
-    /// what the long-form view UNION-ALLs over, so generated wide-form
-    /// SQL produces results in the same canonical order.
+    /// Drives the wide-form SQL generator. Order is parquet-schema order.
     pub series_by_metric: std::collections::HashMap<String, Vec<MetricSeries>>,
+    /// Per-histogram-metric `grouping_power` (`p`). The wide-form
+    /// histogram path needs `p` to call `h2_quantile` / `h2_heatmap`.
+    /// Counters/gauges are absent from this map.
+    pub histogram_p_by_metric: std::collections::HashMap<String, u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MetricSeries {
     pub physical: String,
     pub labels: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetricShape {
-    Scalar,
-    Histogram,
 }
 
 pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<MetricCatalog> {
@@ -257,27 +230,15 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
 
     let mut catalog = MetricCatalog::default();
     for (metric, cols) in by_metric {
-        // Union of label keys across columns of this metric — every series
-        // contributes the same set of label columns to the view (rows that
-        // don't have a particular label fill it as ''/empty).
-        let label_keys: BTreeSet<String> = cols
-            .iter()
-            .flat_map(|c| c.labels.keys().cloned())
-            .collect();
-        let label_keys_vec: Vec<String> = label_keys.iter().cloned().collect();
-
-        // All cols within a metric share kind (we trust the writer); pick
-        // the first to determine view shape for the catalog cache.
-        let shape = match cols.first().map(|c| &c.kind) {
-            Some(ColumnKind::Histogram { .. }) => MetricShape::Histogram,
-            _ => MetricShape::Scalar,
-        };
-
-        let view_sql = build_view_sql(&metric, &cols, &label_keys_vec);
-        // Defer execution. The backend's per-query path checks
-        // `built_views` and runs the DDL on first reference for that
-        // metric. Avoids paying multi-second cold-start on fixtures with
-        // hundreds of metrics where the workload only touches a few.
+        // Record `grouping_power` for histogram metrics so wide-form
+        // can pass it to h2_quantile / h2_heatmap without recomputing.
+        if let Some(ColumnKind::Histogram { grouping_power }) =
+            cols.first().map(|c| &c.kind)
+        {
+            catalog
+                .histogram_p_by_metric
+                .insert(metric.clone(), *grouping_power);
+        }
         let series: Vec<MetricSeries> = cols
             .iter()
             .map(|c| MetricSeries {
@@ -285,148 +246,10 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
                 labels: c.labels.clone(),
             })
             .collect();
-        catalog.pending_view_sql.insert(metric.clone(), view_sql);
-        catalog.shapes.insert(metric.clone(), shape);
-        catalog.label_keys.insert(metric.clone(), label_keys);
-        catalog.view_names.insert(metric.clone());
         catalog.series_by_metric.insert(metric, series);
     }
 
     Ok(catalog)
-}
-
-/// Build the `_metadata` table with one row per metric-bearing column.
-///
-/// Schema:
-/// - `col` VARCHAR — physical column name in the parquet (matches `_src` column).
-/// - `metric` VARCHAR — canonical metric name (from the `metric` field of the column's metadata).
-/// - `metric_type` VARCHAR — `'counter'`, `'gauge'`, or `'histogram'`.
-/// - `grouping_power` INTEGER — populated for histograms, NULL otherwise.
-/// - `max_value_power` INTEGER — populated for histograms, NULL otherwise.
-/// - `labels` MAP(VARCHAR, VARCHAR) — all user labels for this column
-///   (excluding internal keys: metric, metric_type, unit, grouping_power,
-///   max_value_power).
-#[allow(dead_code)] // kept for future dynamic-UNPIVOT patterns; see ensure_views
-fn populate_metadata_table(conn: &Connection, columns: &[ColumnInfo]) -> duckdb::Result<()> {
-    conn.execute(
-        "CREATE OR REPLACE TEMP TABLE _metadata (\
-            col VARCHAR PRIMARY KEY,\
-            metric VARCHAR,\
-            metric_type VARCHAR,\
-            grouping_power INTEGER,\
-            max_value_power INTEGER,\
-            labels MAP(VARCHAR, VARCHAR)\
-        )",
-        [],
-    )?;
-    if columns.is_empty() {
-        return Ok(());
-    }
-
-    // Build a single multi-row INSERT for all columns. Faster than N
-    // separate inserts and keeps the transaction lock contention low.
-    let mut sql = String::from("INSERT INTO _metadata VALUES ");
-    for (i, info) in columns.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(",\n");
-        }
-        let (metric_type_str, gp_lit, mvp_lit) = match &info.kind {
-            ColumnKind::Counter => ("counter", "NULL".to_string(), "NULL".to_string()),
-            ColumnKind::Gauge => ("gauge", "NULL".to_string(), "NULL".to_string()),
-            ColumnKind::Histogram { grouping_power } => (
-                "histogram",
-                grouping_power.to_string(),
-                // We only carry grouping_power on ColumnInfo today; if the
-                // writer's metadata had max_value_power we can surface it
-                // by extending ColumnKind. For now leave NULL — the H2
-                // bucket math derives it from grouping_power + n=64.
-                "NULL".to_string(),
-            ),
-            ColumnKind::Other => continue,
-        };
-        // Build MAP literal: `MAP {'k1': 'v1', 'k2': 'v2'}` (DuckDB syntax).
-        let map_lit = if info.labels.is_empty() {
-            "MAP {}".to_string()
-        } else {
-            let pairs = info
-                .labels
-                .iter()
-                .map(|(k, v)| format!("'{}': '{}'", escape_sql(k), escape_sql(v)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("MAP {{{pairs}}}")
-        };
-        sql.push_str(&format!(
-            "  ('{col}', '{metric}', '{metric_type}', {gp}, {mvp}, {labels})",
-            col = escape_sql(&info.physical),
-            metric = escape_sql(&info.metric),
-            metric_type = metric_type_str,
-            gp = gp_lit,
-            mvp = mvp_lit,
-            labels = map_lit,
-        ));
-    }
-    conn.execute(&sql, [])?;
-    Ok(())
-}
-
-fn build_view_sql(metric: &str, cols: &[&ColumnInfo], label_keys: &[String]) -> String {
-    let mut selects: Vec<String> = Vec::with_capacity(cols.len());
-    for c in cols {
-        // Build the SELECT for this column. Each label key gets either the
-        // column's own value (string-quoted) or '' if absent.
-        let label_select = label_keys
-            .iter()
-            .map(|k| {
-                let v = c.labels.get(k).cloned().unwrap_or_default();
-                format!("'{}' AS {}", escape_sql(&v), quote_ident(k))
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let physical = c.physical.replace('"', r#""""#);
-        let value_expr = match &c.kind {
-            ColumnKind::Counter => format!(r#"CAST("{physical}" AS UBIGINT) AS value"#),
-            ColumnKind::Gauge => format!(r#"CAST("{physical}" AS BIGINT) AS value"#),
-            ColumnKind::Histogram { grouping_power } => format!(
-                r#""{physical}" AS buckets, {grouping_power}::INTEGER AS p"#
-            ),
-            ColumnKind::Other => continue,
-        };
-
-        let label_part = if label_keys.is_empty() {
-            String::new()
-        } else {
-            format!(", {label_select}")
-        };
-
-        // Emit `col` as the physical column name — this is the unique
-        // per-series identifier in the wide-form parquet. Catalogue
-        // queries should `PARTITION BY col` for per-series windowed math
-        // (irate / rate / LAG): partitioning by a label subset like
-        // (id, state) collapses multi-source captures (e.g. cachecannon's
-        // rezolus-client::* and rezolus-server::* columns share id+state
-        // but represent different series under different `node` labels).
-        selects.push(format!(
-            "SELECT timestamp, {value_expr}, '{col_lit}' AS col{label_part} FROM _src WHERE \"{physical}\" IS NOT NULL",
-            col_lit = escape_sql(&c.physical)
-        ));
-    }
-
-    let body = selects.join("\nUNION ALL\n");
-    format!(
-        "CREATE OR REPLACE VIEW {} AS\n{}",
-        quote_ident(metric),
-        body
-    )
-}
-
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -484,60 +307,47 @@ mod tests {
         assert_eq!(nonzero, 0, "every _src.timestamp must be a clean multiple of 1e9 ns");
     }
 
-    /// Build every view declared in `catalog.pending_view_sql`, mirroring
-    /// what the backend would do once a query references each. Tests
-    /// below invoke a metric view directly, so they need the eager
-    /// equivalent of the lazy build.
-    fn build_all_pending(conn: &Connection, catalog: &MetricCatalog) {
-        for sql in catalog.pending_view_sql.values() {
-            conn.execute(sql, []).unwrap();
-        }
-    }
-
     #[test]
-    fn counter_basic_creates_a_one_column_long_view() {
+    fn counter_basic_catalog_indexes_the_one_metric() {
         let conn = fresh_conn();
         let catalog =
             ensure_views(&conn, fixture_path("counter_basic").to_str().unwrap()).unwrap();
-        build_all_pending(&conn, &catalog);
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 11, "11 timestamped rows in counter_basic");
+        let series = catalog.series_by_metric.get("requests").expect("requests metric");
+        assert_eq!(series.len(), 1);
     }
 
     #[test]
-    fn counter_multi_label_unions_four_columns() {
+    fn counter_multi_label_catalog_indexes_four_series() {
         let conn = fresh_conn();
         let catalog = ensure_views(&conn, fixture_path("counter_multi_label").to_str().unwrap())
             .unwrap();
-        build_all_pending(&conn, &catalog);
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cpu_usage", [], |r| r.get(0))
-            .unwrap();
-        // 11 timestamps × 4 (id × state) labeled series = 44 rows
-        assert_eq!(count, 44);
-
-        // All four label permutations are present
-        let distinct: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT (id, state)) FROM cpu_usage",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(distinct, 4);
+        let series = catalog
+            .series_by_metric
+            .get("cpu_usage")
+            .expect("cpu_usage metric");
+        // 4 labeled series (id × state).
+        assert_eq!(series.len(), 4);
+        // All four label permutations are present.
+        let mut combos: std::collections::BTreeSet<(String, String)> = Default::default();
+        for s in series {
+            combos.insert((
+                s.labels.get("id").cloned().unwrap_or_default(),
+                s.labels.get("state").cloned().unwrap_or_default(),
+            ));
+        }
+        assert_eq!(combos.len(), 4);
     }
 
     #[test]
-    fn histogram_view_carries_grouping_power_as_p() {
+    fn histogram_grouping_power_is_recorded() {
         let conn = fresh_conn();
         let catalog =
             ensure_views(&conn, fixture_path("histogram_basic").to_str().unwrap()).unwrap();
-        build_all_pending(&conn, &catalog);
-        let p: i32 = conn
-            .query_row("SELECT MIN(p) FROM request_latency", [], |r| r.get(0))
-            .unwrap();
+        let p = catalog
+            .histogram_p_by_metric
+            .get("request_latency")
+            .copied()
+            .expect("request_latency p");
         // metriken-query-fixtures uses gp=4 for the rezolus histogram config.
         assert_eq!(p, 4);
     }

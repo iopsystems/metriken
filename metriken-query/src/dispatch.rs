@@ -56,8 +56,6 @@ pub struct CatalogueEntry {
     #[serde(default = "default_mode")]
     pub mode: Mode,
     pub promql: String,
-    #[serde(default)]
-    pub sql: Option<String>,
     /// `matrix` (default) or `heatmap`. For `heatmap`, `value_columns` /
     /// `label_columns` / `output_metric` are ignored — the backend uses the
     /// positional `(t, bucket_idx, count, p)` shape instead.

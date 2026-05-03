@@ -449,9 +449,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 // look like backed purely by SQL/DuckDB" experiments without
                 // editing queries.toml. The catalogue's per-entry `mode` is
                 // ignored when this is set.
-                let effective_mode = if std::env::var("METRIKEN_FORCE_PRIMARY").is_ok()
-                    && entry.sql.is_some()
-                {
+                let effective_mode = if std::env::var("METRIKEN_FORCE_PRIMARY").is_ok() {
                     Mode::Primary
                 } else {
                     entry.mode

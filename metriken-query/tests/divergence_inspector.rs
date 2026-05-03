@@ -400,10 +400,15 @@ fn indent_block(s: &str, prefix: &str) -> String {
 }
 
 fn render_sql(entry: &CatalogueEntry, q: &str, parquet: &Path) -> Option<String> {
-    let template = entry.sql.as_ref()?;
     let parsed = CompiledTemplate::parse(&entry.promql).ok()?;
     let captures = parsed.match_query(q)?;
-    metriken_query_sql::interp::interpolate(template, &captures, parquet.to_str().unwrap(), None).ok()
+    // Wide-form is the only SQL path now. Mirror the backend's
+    // catalog setup so try_generate sees the same metadata.
+    let conn = duckdb::Connection::open_in_memory().ok()?;
+    metriken_query_sql::register_all(&conn).ok()?;
+    let catalog =
+        metriken_query_sql::views::ensure_views(&conn, parquet.to_str().unwrap()).ok()?;
+    metriken_query_sql::wide_form::try_generate(entry, &captures, &catalog)
 }
 
 /// Default test: prints a divergence report but NEVER fails. Use this as the
@@ -614,12 +619,11 @@ fn run_diff_check(query: &str) {
 
     let template = CompiledTemplate::parse(&entry.promql).unwrap();
     let caps2 = template.match_query(query).unwrap();
-    let rendered_sql = metriken_query_sql::interp::interpolate(
-        entry.sql.as_ref().unwrap(),
-        &caps2,
-        parquet.to_str().unwrap(),
-        None,
-    )
-    .unwrap();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    metriken_query_sql::register_all(&conn).unwrap();
+    let catalog =
+        metriken_query_sql::views::ensure_views(&conn, parquet.to_str().unwrap()).unwrap();
+    let rendered_sql =
+        metriken_query_sql::wide_form::try_generate(entry, &caps2, &catalog).unwrap();
     eprintln!("=== rendered SQL ===\n{rendered_sql}");
 }

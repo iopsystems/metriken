@@ -109,12 +109,10 @@ fn run_promql(entry: &CatalogueEntry, query: &str) -> QueryResult {
         .unwrap_or_else(|e| panic!("PromQL query `{query}` ({}) failed: {e}", entry.id))
 }
 
-/// Run the SQL twin via the production `DuckDbBackend` — same code path the
-/// runtime dispatcher uses. Returns `None` when the entry has no SQL.
+/// Run the SQL backend (always succeeds — wide-form is the only path).
 /// `query` is the concrete PromQL (template literal for literal entries, or
 /// the example query for templated entries) used to extract captures.
 fn run_sql(entry: &CatalogueEntry, query: &str) -> Option<QueryResult> {
-    entry.sql.as_ref()?;
     let parquet = fixture_path(entry);
     let backend = DuckDbBackend::new();
     let start = entry.start.expect("entry start");

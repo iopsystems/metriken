@@ -83,14 +83,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Bare gauge selector — no rate function, just emit the points. One templated entry covers every gauge metric."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(value AS DOUBLE) AS v,
-       * EXCLUDE (timestamp, value, col)
-FROM {m}
-WHERE value IS NOT NULL
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 # Static labels added to every emitted series — mirrors PromQL's implicit
@@ -109,13 +101,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Gauge series that crosses zero (i64 column path)."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(temperature_offset AS DOUBLE) AS v
-FROM read_parquet('{fixture_path}')
-WHERE temperature_offset IS NOT NULL
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "temperature_offset" }
@@ -131,16 +116,6 @@ step = 1.0
 description = "Time-aggregation function family — windowed mean of a gauge."
 # 1Hz sampling → 300 rows ≈ 5 minutes. ROWS BETWEEN avoids the RANGE
 # unit-mismatch problem (timestamps are ns, the [5m] window is seconds).
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9,
-       AVG(CAST(queue_depth AS DOUBLE)) OVER (
-         ORDER BY timestamp
-         ROWS BETWEEN 300 PRECEDING AND CURRENT ROW
-       )
-FROM read_parquet('{fixture_path}')
-WHERE queue_depth IS NOT NULL
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "queue_depth" }
@@ -164,24 +139,6 @@ description = "Baseline irate — instantaneous rate from the last two samples i
 # `irate_1s` is `c - LAG(c) OVER (...)`. The first row produces NULL (no LAG)
 # which `QUALIFY v IS NOT NULL` filters, matching PromQL's `start = 1.0`
 # (skipping t=0).
-sql = """
-WITH per_row AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS v,
-           * EXCLUDE (timestamp, value, col)
-    FROM requests
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, v, * EXCLUDE (timestamp, v)
-FROM per_row
-WHERE v IS NOT NULL
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "requests" }
@@ -199,38 +156,6 @@ description = "Baseline rate — average over the window."
 # for the rationale. Windowed monotonic rate: (current - first_in_window) /
 # span_in_seconds. Correct for monotonic counters; for reset-prone counters
 # use the CTE pattern in `counter_rate_reset`.
-sql = """
-WITH incr AS (
-    SELECT timestamp,
-           col,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS inc,
-           * EXCLUDE (timestamp, value, col)
-    FROM requests
-    WHERE value IS NOT NULL
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
--- See counter_rate_bare_generic for the FIRST_VALUE(inc) subtraction:
--- it drops the inc whose `prev` sample is just outside [t-W, t], matching
--- PromQL's strictly-in-window pair count. Synthetic counter_basic starts
--- at row 0 (inc[0] is NULL → COALESCE keeps SUM intact), so this fix is a
--- no-op for the golden snapshot but correct on real-world data.
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (SUM(inc) OVER w - COALESCE(FIRST_VALUE(inc) OVER w, 0))
-       / NULLIF(
-           CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
-           0
-       ) AS v,
-       * EXCLUDE (timestamp, inc, col)
-FROM incr
-WINDOW w AS (PARTITION BY col ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
-QUALIFY v IS NOT NULL
-ORDER BY t
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "requests" }
@@ -247,25 +172,6 @@ description = "irate over a counter that resets at t=1003 — exercises reset se
 # Reads from the `requests` view (snapped timestamps) — see counter_irate_basic
 # for the rationale. `irate_1s` is reset-aware (post-reset value as the
 # increment).
-sql = """
-WITH per_row AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS v,
-           * EXCLUDE (timestamp, value, col)
-    FROM requests
-    WHERE value IS NOT NULL
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, v, * EXCLUDE (timestamp, v)
-FROM per_row
-WHERE v IS NOT NULL
-ORDER BY t
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "requests" }
@@ -284,34 +190,6 @@ description = "rate over a counter that resets at t=1003 (post-reset value as in
 # normalised over a 5-minute row window. Equivalent to PromQL's reset-aware
 # `rate()` semantics from `streaming/rate.rs:60-68`. Reads from the
 # `requests` view (snapped timestamps) — see counter_irate_basic.
-sql = """
-WITH incr AS (
-    SELECT timestamp,
-           col,
-           * EXCLUDE (timestamp, value, col),
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS inc
-    FROM requests
-    WHERE value IS NOT NULL
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
--- See counter_rate_bare_generic for the FIRST_VALUE(inc) subtraction.
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (SUM(inc) OVER w - COALESCE(FIRST_VALUE(inc) OVER w, 0))
-       / NULLIF(
-           CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
-           0
-       ) AS v,
-       * EXCLUDE (timestamp, inc, col)
-FROM incr
-WINDOW w AS (PARTITION BY col ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW)
-QUALIFY v IS NOT NULL
-ORDER BY t
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "requests" }
@@ -328,26 +206,6 @@ description = "Sum aggregation grouped by label — Rezolus per-CPU dashboard pa
 # Uses the auto-generated `cpu_usage(timestamp, value, id, state)` view.
 # Per-series irate is computed with `PARTITION BY col` (unique physical column = unique series, so LAG only
 # walks within a single labeled series.
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id, state,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_usage
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 # `sum by (id)` drops `__name__` (PromQL aggregation rule).
@@ -362,27 +220,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Label-filtered selector inside an aggregation — Rezolus 'user CPU per id' shape."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id, state,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_usage
-    WHERE state = 'user'
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -396,25 +233,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Top-level sum across all labels — Rezolus 'total CPU' shape."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id, state,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_usage
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -428,31 +246,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Counter ratio shape (e.g. user-fraction-of-total)."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id, state,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_usage
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-sums AS (
-    SELECT timestamp,
-           SUM(CASE WHEN state = 'user' THEN rate ELSE 0 END) AS user_rate,
-           SUM(rate) AS total_rate
-    FROM per_series
-    WHERE rate IS NOT NULL
-    GROUP BY timestamp
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       user_rate / NULLIF(total_rate, 0) AS v
-FROM sums
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -486,19 +279,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic single-quantile extraction over any histogram view. One templated entry covers every (quantile, metric)."
-sql = """
-WITH per_ts AS (
-    SELECT timestamp,
-           h2_combine(list(buckets)) AS buckets,
-           ANY_VALUE(p) AS p
-    FROM {m}
-    GROUP BY timestamp
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(hist_irate_quantile(buckets, {q}, timestamp, p) AS DOUBLE) AS v
-FROM per_ts
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "{m}", quantile = "{q}" }
@@ -520,23 +300,6 @@ description = "Rezolus extension — multi-quantile in a single walk."
 # (the rezolus extension; matches metriken-query's `histogram_quantiles`).
 # The list output is array-indexed via CROSS JOIN to produce one row per
 # `(timestamp, quantile)`.
-sql = """
-WITH walked AS (
-    SELECT timestamp,
-           h2_quantiles(
-               h2_delta(buckets, LAG(buckets) OVER (ORDER BY timestamp)),
-               [0.5, 0.9, 0.99]::DOUBLE[],
-               p
-           ) AS qs
-    FROM request_latency
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(qs[q.idx] AS DOUBLE) AS v,
-       q.label AS quantile
-FROM walked
-CROSS JOIN (VALUES (1, '0.5'), (2, '0.9'), (3, '0.99')) AS q(idx, label)
-ORDER BY quantile, t
-"""
 value_columns = ["v"]
 label_columns = ["quantile"]
 output_metric = { __name__ = "request_latency" }
@@ -563,30 +326,6 @@ description = "Rezolus extension — 2-D heatmap output for visualization. One t
 # UNNEST WITH ORDINALITY emits one row per non-zero bucket per tick. The
 # backend reconstructs timestamps, bucket_bounds (via h2_upper for the
 # contiguous index range), and remaps bucket_idx into the output frame.
-sql = """
-WITH per_ts AS (
-    SELECT timestamp,
-           h2_combine(list(buckets)) AS buckets,
-           ANY_VALUE(p) AS p
-    FROM {m}
-    GROUP BY timestamp
-),
-paired AS (
-    SELECT a.timestamp,
-           h2_delta(a.buckets,
-                    LAG(a.buckets) OVER (ORDER BY a.timestamp)) AS d,
-           a.p
-    FROM per_ts a
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (u.ordinal - 1)::INTEGER AS bucket_idx,
-       u.value::DOUBLE AS count,
-       p::INTEGER AS p
-FROM paired
-CROSS JOIN UNNEST(d) WITH ORDINALITY AS u(value, ordinal)
-WHERE u.value > 0
-ORDER BY t, bucket_idx
-"""
 examples = [
     { id_suffix = "request_latency", query = "histogram_heatmap(request_latency)" },
 ]
@@ -604,15 +343,6 @@ description = "Quantile across a histogram-reset boundary (delta_to_32_or_empty 
 # bucket goes to 0 → empty histogram → h2_quantile returns NULL. Same
 # observable behaviour as PromQL's `delta_to_32_or_empty` empty-fallback,
 # so the timestamp at the reset is dropped from the output.
-sql = """
-SELECT t, v FROM (
-    SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-           CAST(hist_irate_quantile(buckets, 0.5, timestamp, p) AS DOUBLE) AS v
-    FROM request_latency
-)
-WHERE v IS NOT NULL
-ORDER BY t
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "request_latency", quantile = "0.5" }
@@ -626,15 +356,6 @@ start = 1.0
 end = 3.0
 step = 1.0
 description = "Quantile over a series with a no-events period in the middle."
-sql = """
-SELECT t, v FROM (
-    SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-           CAST(hist_irate_quantile(buckets, 0.5, timestamp, p) AS DOUBLE) AS v
-    FROM request_latency
-)
-WHERE v IS NOT NULL
-ORDER BY t
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "request_latency", quantile = "0.5" }
@@ -650,25 +371,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Rezolus CPU busy-% pattern (cpu_cores=2 hard-coded for the fixture)."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id, state,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_usage
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / 2 / 1000000000 AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -682,27 +384,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Rezolus per-CPU user-time fraction (matches dashboard/cpu.rs:45)."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id, state,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_usage
-    WHERE state = 'user'
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / 1000000000 AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -744,26 +425,6 @@ description = "Softirq rate per kind. One templated entry covers every kind valu
 # expose id=0,1,…). Partitioning by `id` mixed sources within the LAG window
 # and produced spurious "rate" values equal to the absolute counter on the
 # first row after the source boundary. `col` is unique per physical series.
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM softirq
-    WHERE kind = {k}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -792,27 +453,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Per-id softirq rate per kind."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM softirq
-    WHERE kind = {k}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -833,26 +473,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Softirq CPU-time percentage per kind (ns/s summed, divided by cores and 1e9)."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM softirq_time
-    WHERE kind = {k}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / {cores} / 1000000000 AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -870,27 +490,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Per-id softirq CPU-time percentage per kind."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM softirq_time
-    WHERE kind = {k}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / 1000000000 AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -914,25 +513,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic top-level sum of an irate'd counter — one entry covers every bare counter sum."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -954,25 +534,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Total BPF run time as a fraction of wall-clock (1e9 ns/s divisor)."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM rezolus_bpf_run_time
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / 1000000000 AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -986,47 +547,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-sampler average BPF call duration in seconds (run_time / run_count / 1e9)."
-sql = """
-WITH time_per_series AS (
-    SELECT timestamp, sampler,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM rezolus_bpf_run_time
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-count_per_series AS (
-    SELECT timestamp, sampler,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM rezolus_bpf_run_count
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-time_summed AS (
-    SELECT timestamp, sampler, SUM(rate) AS time_sum
-    FROM time_per_series WHERE rate IS NOT NULL
-    GROUP BY sampler, timestamp
-),
-count_summed AS (
-    SELECT timestamp, sampler, SUM(rate) AS count_sum
-    FROM count_per_series WHERE rate IS NOT NULL
-    GROUP BY sampler, timestamp
-)
-SELECT CAST(t.timestamp AS DOUBLE) / 1e9 AS t,
-       (t.time_sum / NULLIF(c.count_sum, 0)) / 1000000000 AS v,
-       t.sampler
-FROM time_summed t
-JOIN count_summed c
-  ON t.timestamp = c.timestamp AND t.sampler = c.sampler
-ORDER BY t.sampler, t.timestamp
-"""
 value_columns = ["v"]
 label_columns = ["sampler"]
 output_metric = {}
@@ -1040,26 +560,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-sampler BPF run time as a fraction of wall-clock."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, sampler,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM rezolus_bpf_run_time
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / 1000000000 AS v,
-       sampler
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY sampler, timestamp
-ORDER BY sampler, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["sampler"]
 output_metric = {}
@@ -1083,14 +583,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Gauge cross-series sum with scalar divisor — common GPU/memory dashboard pattern."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) / {d} AS v
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1109,14 +601,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Gauge cross-series average with scalar divisor."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       AVG(CAST(value AS DOUBLE)) / {d} AS v
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1137,41 +621,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic 5-minute windowed counter rate, summed across series, with scalar divisor."
-sql = """
-WITH incr AS (
-    SELECT timestamp, col,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS inc
-    FROM {m}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-windowed AS (
-    -- See `counter_rate_bare_generic` for the FIRST_VALUE(inc) subtraction:
-    -- it drops the pair whose `prev` sample is just outside the window,
-    -- matching PromQL's "only count pairs with both samples in [t-W, t]"
-    -- semantics. Without it the per-series rate overcounts by one inc.
-    SELECT timestamp,
-           (SUM(inc) OVER w_per_series - COALESCE(FIRST_VALUE(inc) OVER w_per_series, 0))
-           / NULLIF(
-               CAST(timestamp - FIRST_VALUE(timestamp) OVER w_per_series AS DOUBLE) / 1e9,
-               0
-           ) AS rate_per_series
-    FROM incr
-    WINDOW w_per_series AS (
-        PARTITION BY col ORDER BY timestamp ROWS BETWEEN 300 PRECEDING AND CURRENT ROW
-    )
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate_per_series) / {d} AS v
-FROM windowed
-WHERE rate_per_series IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1203,23 +652,6 @@ description = "Pointwise gauge subtraction. NATURAL JOIN on (timestamp, …label
 # parquets join on `timestamp` only (no other common columns); multi-source
 # parquets pair series with identical label sets, producing one output
 # series per matched pair (PromQL's default vector matching).
-sql = """
-WITH a AS (
-    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS av
-    FROM {a}
-    WHERE value IS NOT NULL
-),
-b AS (
-    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS bv
-    FROM {b}
-    WHERE value IS NOT NULL
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (av - bv) AS v,
-       * EXCLUDE (timestamp, av, bv)
-FROM a NATURAL JOIN b
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1239,23 +671,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Pointwise gauge ratio. NATURAL JOIN on (timestamp, …labels) for PromQL-compatible vector matching on multi-source parquets."
-sql = """
-WITH a AS (
-    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS av
-    FROM {a}
-    WHERE value IS NOT NULL
-),
-b AS (
-    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS bv
-    FROM {b}
-    WHERE value IS NOT NULL
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       av / NULLIF(bv, 0) AS v,
-       * EXCLUDE (timestamp, av, bv)
-FROM a NATURAL JOIN b
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1279,45 +694,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Generic two-counter ratio. Covers IPC (instructions/cycles), branch-miss-rate, etc."
-sql = """
-WITH a_per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM a_per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-),
-b_per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM b_per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s, 0) AS v
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp
-ORDER BY a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1336,45 +712,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Two-counter ratio complement (1 - a/b). L3-hit-rate dashboard shape."
-sql = """
-WITH a_per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM a_per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-),
-b_per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM b_per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       1 - a.s / NULLIF(b.s, 0) AS v
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp
-ORDER BY a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1393,45 +730,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Two-counter ratio multiplied by a scalar — DTLB MPKI shape."
-sql = """
-WITH a_per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM a_per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-),
-b_per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM b_per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s, 0) * {d} AS v
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp
-ORDER BY a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1455,26 +753,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-id rate of a counter metric, normalised by a scalar — one entry covers every per-CPU usage variant."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / {d} AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -1504,26 +782,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic labels-filtered counter rate aggregation. Covers Group B / C service-throughput dashboards."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1545,27 +803,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic per-id labels-filtered counter rate aggregation."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -1595,23 +832,6 @@ description = "Memory used as a fraction of total — (memory_total - memory_ava
 # matches PromQL's binary-op semantics: pair series with identical label
 # sets and keep those labels on the output. The backend infers label names
 # from the result schema when `label_columns = []`.
-sql = """
-WITH a AS (
-    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS av
-    FROM memory_total
-    WHERE value IS NOT NULL
-),
-b AS (
-    SELECT * EXCLUDE (col, value), CAST(value AS DOUBLE) AS bv
-    FROM memory_available
-    WHERE value IS NOT NULL
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (av - bv) / NULLIF(av, 0) AS v,
-       * EXCLUDE (timestamp, av, bv)
-FROM a NATURAL JOIN b
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1637,76 +857,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Rezolus CPU IPNS — instructions per nanosecond, the most-chained dashboard query."
-sql = """
-WITH ins AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_instructions
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-ins_sum AS (SELECT timestamp, SUM(rate) AS s FROM ins WHERE rate IS NOT NULL GROUP BY timestamp),
-cyc AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_cycles
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-cyc_sum AS (SELECT timestamp, SUM(rate) AS s FROM cyc WHERE rate IS NOT NULL GROUP BY timestamp),
-tsc AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_tsc
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-tsc_sum AS (SELECT timestamp, SUM(rate) AS s FROM tsc WHERE rate IS NOT NULL GROUP BY timestamp),
-ape AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_aperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-ape_sum AS (SELECT timestamp, SUM(rate) AS s FROM ape WHERE rate IS NOT NULL GROUP BY timestamp),
-mpe AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_mperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-mpe_sum AS (SELECT timestamp, SUM(rate) AS s FROM mpe WHERE rate IS NOT NULL GROUP BY timestamp)
-SELECT CAST(ins_sum.timestamp AS DOUBLE) / 1e9 AS t,
-       ins_sum.s / NULLIF(cyc_sum.s, 0)
-       * tsc_sum.s
-       * ape_sum.s / NULLIF(mpe_sum.s, 0)
-       / 1000000000
-       / NULLIF(CAST(cores.value AS DOUBLE), 0) AS v
-FROM ins_sum
-JOIN cyc_sum ON ins_sum.timestamp = cyc_sum.timestamp
-JOIN tsc_sum ON ins_sum.timestamp = tsc_sum.timestamp
-JOIN ape_sum ON ins_sum.timestamp = ape_sum.timestamp
-JOIN mpe_sum ON ins_sum.timestamp = mpe_sum.timestamp
-JOIN cpu_cores cores ON ins_sum.timestamp = cores.timestamp
-ORDER BY ins_sum.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1726,46 +876,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Generic per-id two-counter ratio — covers per-CPU IPC, per-CPU branch-miss rate, etc."
-sql = """
-WITH a_per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (
-    SELECT timestamp, id, SUM(rate) AS s
-    FROM a_per_series WHERE rate IS NOT NULL
-    GROUP BY id, timestamp
-),
-b_per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (
-    SELECT timestamp, id, SUM(rate) AS s
-    FROM b_per_series WHERE rate IS NOT NULL
-    GROUP BY id, timestamp
-)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s, 0) AS v,
-       a.id
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp AND a.id = b.id
-ORDER BY a.id, a.timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -1798,15 +908,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Label-filtered bare selector — per-source / per-instance gauge reads."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       CAST(value AS DOUBLE) AS v,
-       * EXCLUDE (timestamp, value, col)
-FROM {m}
-WHERE value IS NOT NULL
-  AND {labels:as_predicate}
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = { __name__ = "{m}" }
@@ -1838,14 +939,6 @@ start = 0.0
 end = 20.0
 step = 1.0
 description = "Max across series of a bare gauge — for `max(gpu_temperature)`-style reads."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       MAX(CAST(value AS DOUBLE)) AS v
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1862,14 +955,6 @@ start = 0.0
 end = 20.0
 step = 1.0
 description = "Sum across series of a bare gauge."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) AS v
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1886,14 +971,6 @@ start = 0.0
 end = 20.0
 step = 1.0
 description = "Avg across series of a bare gauge."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       AVG(CAST(value AS DOUBLE)) AS v
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1910,15 +987,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Sum across series of a label-filtered gauge — `sum(gpu_memory{state=\"free\"})` shape."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) AS v
-FROM {m}
-WHERE value IS NOT NULL
-  AND {labels:as_predicate}
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1940,15 +1008,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Per-grouping-label gauge sum — `sum by (id) (gpu_temperature)` and `sum by (source) (target_rate)` shapes."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) AS v,
-       {g:as_safe_col}
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY {g}, timestamp
-ORDER BY {g}, timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1965,16 +1024,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Per-grouping-label label-filtered gauge sum — `sum by (id) (gpu_clock{clock=\"compute\"})` shape."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) AS v,
-       {g:as_safe_col}
-FROM {m}
-WHERE value IS NOT NULL
-  AND {labels:as_predicate}
-GROUP BY {g}, timestamp
-ORDER BY {g}, timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -1991,15 +1040,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Per-grouping-label gauge sum with scalar divisor — `sum by (id) (gpu_power_usage) / 1000` shape."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) / {d} AS v,
-       {g:as_safe_col}
-FROM {m}
-WHERE value IS NOT NULL
-GROUP BY {g}, timestamp
-ORDER BY {g}, timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2016,16 +1056,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Per-grouping-label label-filtered gauge sum with scalar divisor."
-sql = """
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(CAST(value AS DOUBLE)) / {d} AS v,
-       {g:as_safe_col}
-FROM {m}
-WHERE value IS NOT NULL
-  AND {labels:as_predicate}
-GROUP BY {g}, timestamp
-ORDER BY {g}, timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2062,33 +1092,6 @@ description = "Bare counter rate without sum aggregator. Emits one series per so
 # leaves the sum alone. The denominator's "first valid timestamp" picks the
 # first in-window sample for early data and the second in-window sample
 # (the partner of the dropped first inc) once the window is full.
-sql = """
-WITH incr AS (
-    SELECT timestamp,
-           col,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS inc,
-           * EXCLUDE (timestamp, value, col)
-    FROM {m}
-    WHERE value IS NOT NULL
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       (SUM(inc) OVER w - COALESCE(FIRST_VALUE(inc) OVER w, 0))
-       / NULLIF(
-           CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9,
-           0
-       ) AS v,
-       * EXCLUDE (timestamp, inc, col)
-FROM incr
-WINDOW w AS (PARTITION BY col ORDER BY timestamp ROWS BETWEEN {r:as_seconds} PRECEDING AND CURRENT ROW)
-QUALIFY v IS NOT NULL
-ORDER BY t
-"""
 value_columns = ["v"]
 label_columns = []
 # PromQL's `rate(metric[5m])` keeps the metric name on each output series,
@@ -2109,25 +1112,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic counter rate sum scaled by a constant — `sum(irate(rezolus_cpu_usage[5m])) / 1e9` shape."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / {d} AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2146,26 +1130,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Counter rate sum scaled by multiplication — covers `* 8` bit conversions."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) * {d} AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2185,26 +1149,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic labels-filtered counter rate sum with scalar divisor."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / {d} AS v
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY timestamp
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2235,35 +1179,6 @@ description = "Counter rate sum normalised by cpu_cores and a scalar — `cpu_us
 # multi-source parquets like cachecannon where cpu_cores has `{node, source}`
 # labels. Filter to timestamps where cpu_cores has exactly one row so the
 # JOIN matches PromQL's "single matching pair" semantics.
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-total AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-),
-cores_one AS (
-    SELECT timestamp, ANY_VALUE(value) AS cv
-    FROM cpu_cores
-    GROUP BY timestamp
-    HAVING COUNT(*) = 1
-)
-SELECT CAST(t.timestamp AS DOUBLE) / 1e9 AS t,
-       t.s / NULLIF(CAST(c.cv AS DOUBLE), 0) / {d} AS v
-FROM total t
-JOIN cores_one c ON t.timestamp = c.timestamp
-ORDER BY t.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2281,36 +1196,6 @@ end = 20.0
 step = 1.0
 description = "Labels-filtered counter rate sum normalised by cpu_cores — `softirq_time{kind=...} / cpu_cores / 1e9`."
 # See `counter_irate_total_per_cpu_core_pct` for the cores_one rationale.
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-total AS (
-    SELECT timestamp, SUM(rate) AS s
-    FROM per_series WHERE rate IS NOT NULL
-    GROUP BY timestamp
-),
-cores_one AS (
-    SELECT timestamp, ANY_VALUE(value) AS cv
-    FROM cpu_cores
-    GROUP BY timestamp
-    HAVING COUNT(*) = 1
-)
-SELECT CAST(t.timestamp AS DOUBLE) / 1e9 AS t,
-       t.s / NULLIF(CAST(c.cv AS DOUBLE), 0) / {d} AS v
-FROM total t
-JOIN cores_one c ON t.timestamp = c.timestamp
-ORDER BY t.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2331,39 +1216,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Generic two-counter ratio with shared label filter — covers cgroup IPC and Group C cache hit-rate."
-sql = """
-WITH a_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WHERE {la:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (SELECT timestamp, SUM(rate) AS s FROM a_series WHERE rate IS NOT NULL GROUP BY timestamp),
-b_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WHERE {lb:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (SELECT timestamp, SUM(rate) AS s FROM b_series WHERE rate IS NOT NULL GROUP BY timestamp)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s, 0) AS v
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp
-ORDER BY a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2394,28 +1246,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Per-arbitrary-label counter rate aggregation. Catches `by (name)` cgroup queries and any other grouping-label variant the literal `_by_id_` entry doesn't already absorb."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           * EXCLUDE (timestamp, value, col),
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v,
-       {g:as_safe_col}
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY {g}, timestamp
-ORDER BY {g}, timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2432,28 +1262,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Per-arbitrary-label counter rate sum with scalar divisor — covers cgroup `sum by (name) (...) / 1e9` etc."
-sql = """
-WITH per_series AS (
-    SELECT timestamp,
-           * EXCLUDE (timestamp, value, col),
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / {d} AS v,
-       {g:as_safe_col}
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY {g}, timestamp
-ORDER BY {g}, timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2470,42 +1278,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Per-arbitrary-label two-counter ratio — covers cgroup CPI, per-CPU hit-rate, and any grouping-label ratio dashboard."
-sql = """
-WITH a_series AS (
-    SELECT timestamp,
-           * EXCLUDE (timestamp, value, col),
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WHERE {la:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (SELECT timestamp, {ga}, SUM(rate) AS s FROM a_series WHERE rate IS NOT NULL GROUP BY {ga}, timestamp),
-b_series AS (
-    SELECT timestamp,
-           * EXCLUDE (timestamp, value, col),
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WHERE {lb:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (SELECT timestamp, {gb}, SUM(rate) AS s FROM b_series WHERE rate IS NOT NULL GROUP BY {gb}, timestamp)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s, 0) AS v,
-       a.{ga}
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp AND a.{ga} = b.{gb}
-ORDER BY a.{ga}, a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2524,26 +1296,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Generic per-id counter rate without label filters — `sum by (id) (irate(cpu_branch_misses[5m]))`."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -2560,27 +1312,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-id labels-filtered counter rate with scalar divisor."
-sql = """
-WITH per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {m}
-    WHERE {labels:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       SUM(rate) / {d} AS v,
-       id
-FROM per_series
-WHERE rate IS NOT NULL
-GROUP BY id, timestamp
-ORDER BY id, timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -2599,38 +1330,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-id two-counter ratio scaled by a constant — MPKI / per-CPU branch miss rate × 1000."
-sql = """
-WITH a_per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM a_per_series WHERE rate IS NOT NULL GROUP BY id, timestamp),
-b_per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM b_per_series WHERE rate IS NOT NULL GROUP BY id, timestamp)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s, 0) * {d} AS v,
-       a.id
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp AND a.id = b.id
-ORDER BY a.id, a.timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -2653,55 +1352,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "CPU base frequency × aperf/mperf ratio, normalised by core count — the freq dashboard headline."
-sql = """
-WITH tsc AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_tsc
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-tsc_sum AS (SELECT timestamp, SUM(rate) AS s FROM tsc WHERE rate IS NOT NULL GROUP BY timestamp),
-ape AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_aperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-ape_sum AS (SELECT timestamp, SUM(rate) AS s FROM ape WHERE rate IS NOT NULL GROUP BY timestamp),
-mpe AS (
-    SELECT timestamp,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_mperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-mpe_sum AS (SELECT timestamp, SUM(rate) AS s FROM mpe WHERE rate IS NOT NULL GROUP BY timestamp),
-cores_one AS (
-    SELECT timestamp, ANY_VALUE(value) AS cv
-    FROM cpu_cores
-    GROUP BY timestamp
-    HAVING COUNT(*) = 1
-)
-SELECT CAST(tsc_sum.timestamp AS DOUBLE) / 1e9 AS t,
-       tsc_sum.s * ape_sum.s / NULLIF(mpe_sum.s, 0)
-       / NULLIF(CAST(cores.cv AS DOUBLE), 0) AS v
-FROM tsc_sum
-JOIN ape_sum ON tsc_sum.timestamp = ape_sum.timestamp
-JOIN mpe_sum ON tsc_sum.timestamp = mpe_sum.timestamp
-JOIN cores_one cores ON tsc_sum.timestamp = cores.timestamp
-ORDER BY tsc_sum.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2715,48 +1365,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-CPU base frequency × aperf/mperf — same chain as `rezolus_cpu_aperf_chain_total` but per-id."
-sql = """
-WITH tsc AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_tsc
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-tsc_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM tsc WHERE rate IS NOT NULL GROUP BY id, timestamp),
-ape AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_aperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-ape_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM ape WHERE rate IS NOT NULL GROUP BY id, timestamp),
-mpe AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_mperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-mpe_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM mpe WHERE rate IS NOT NULL GROUP BY id, timestamp)
-SELECT CAST(tsc_sum.timestamp AS DOUBLE) / 1e9 AS t,
-       tsc_sum.s * ape_sum.s / NULLIF(mpe_sum.s, 0) AS v,
-       tsc_sum.id
-FROM tsc_sum
-JOIN ape_sum ON tsc_sum.timestamp = ape_sum.timestamp AND tsc_sum.id = ape_sum.id
-JOIN mpe_sum ON tsc_sum.timestamp = mpe_sum.timestamp AND tsc_sum.id = mpe_sum.id
-ORDER BY tsc_sum.id, tsc_sum.timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -2770,75 +1378,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-CPU instructions per nanosecond — IPNS chain at per-id granularity."
-sql = """
-WITH ins AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_instructions
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-ins_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM ins WHERE rate IS NOT NULL GROUP BY id, timestamp),
-cyc AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_cycles
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-cyc_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM cyc WHERE rate IS NOT NULL GROUP BY id, timestamp),
-tsc AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_tsc
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-tsc_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM tsc WHERE rate IS NOT NULL GROUP BY id, timestamp),
-ape AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_aperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-ape_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM ape WHERE rate IS NOT NULL GROUP BY id, timestamp),
-mpe AS (
-    SELECT timestamp, id,
-           CASE WHEN LAG(value) OVER w IS NULL THEN NULL
-                WHEN value >= LAG(value) OVER w
-                    THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-                ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM cpu_mperf
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-mpe_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM mpe WHERE rate IS NOT NULL GROUP BY id, timestamp)
-SELECT CAST(ins_sum.timestamp AS DOUBLE) / 1e9 AS t,
-       ins_sum.s / NULLIF(cyc_sum.s, 0)
-       * tsc_sum.s
-       * ape_sum.s / NULLIF(mpe_sum.s, 0)
-       / 1000000000 AS v,
-       ins_sum.id
-FROM ins_sum
-JOIN cyc_sum ON ins_sum.timestamp = cyc_sum.timestamp AND ins_sum.id = cyc_sum.id
-JOIN tsc_sum ON ins_sum.timestamp = tsc_sum.timestamp AND ins_sum.id = tsc_sum.id
-JOIN ape_sum ON ins_sum.timestamp = ape_sum.timestamp AND ins_sum.id = ape_sum.id
-JOIN mpe_sum ON ins_sum.timestamp = mpe_sum.timestamp AND ins_sum.id = mpe_sum.id
-ORDER BY ins_sum.id, ins_sum.timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -2879,26 +1418,6 @@ description = "Gauge / gauge with `ignoring(label)` modifier — covers `gpu_pci
 # because the RHS view may or may not have a `{ig}` column — vllm_gemma3 has
 # bandwidth without `direction`, vllm has it. The lambda silently filters
 # the intersection; EXCLUDE would error on the no-`direction` case.
-sql = """
-WITH a AS (
-    SELECT * EXCLUDE (col, value),
-           CAST(value AS DOUBLE) AS av
-    FROM {a}
-    WHERE value IS NOT NULL
-      AND {labels:as_predicate}
-),
-b AS (
-    SELECT COLUMNS(c -> c NOT IN ('col', 'value', '{ig}')),
-           CAST(value AS DOUBLE) AS bv
-    FROM {b}
-    WHERE value IS NOT NULL
-)
-SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t,
-       av / NULLIF(bv, 0) AS v,
-       * EXCLUDE (timestamp, av, bv)
-FROM a NATURAL JOIN b
-ORDER BY timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2924,29 +1443,6 @@ start = 0.0
 end = 10.0
 step = 1.0
 description = "Three-way gauge fraction-of-total — `used / (used + free)` shape."
-sql = """
-WITH a AS (
-    SELECT timestamp, SUM(CAST(value AS DOUBLE)) AS s
-    FROM {a} WHERE value IS NOT NULL AND {la:as_predicate}
-    GROUP BY timestamp
-),
-b AS (
-    SELECT timestamp, SUM(CAST(value AS DOUBLE)) AS s
-    FROM {b} WHERE value IS NOT NULL AND {lb:as_predicate}
-    GROUP BY timestamp
-),
-c AS (
-    SELECT timestamp, SUM(CAST(value AS DOUBLE)) AS s
-    FROM {c} WHERE value IS NOT NULL AND {lc:as_predicate}
-    GROUP BY timestamp
-)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s / NULLIF(b.s + c.s, 0) AS v
-FROM a
-JOIN b ON a.timestamp = b.timestamp
-JOIN c ON a.timestamp = c.timestamp
-ORDER BY a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}
@@ -2965,38 +1461,6 @@ start = 1.0
 end = 20.0
 step = 1.0
 description = "Per-id 1 - (a/b) — covers the per-CPU L3 hit-rate dashboard."
-sql = """
-WITH a_per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM a_per_series WHERE rate IS NOT NULL GROUP BY id, timestamp),
-b_per_series AS (
-    SELECT timestamp, id,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (SELECT timestamp, id, SUM(rate) AS s FROM b_per_series WHERE rate IS NOT NULL GROUP BY id, timestamp)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       1.0 - a.s / NULLIF(b.s, 0) AS v,
-       a.id
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp AND a.id = b.id
-ORDER BY a.id, a.timestamp
-"""
 value_columns = ["v"]
 label_columns = ["id"]
 output_metric = {}
@@ -3019,39 +1483,6 @@ start = 1.0
 end = 10.0
 step = 1.0
 description = "Two-counter rate subtraction with shared label predicate — `requests - aborted` shape."
-sql = """
-WITH a_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {a}
-    WHERE {la:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-a_sum AS (SELECT timestamp, SUM(rate) AS s FROM a_series WHERE rate IS NOT NULL GROUP BY timestamp),
-b_series AS (
-    SELECT timestamp,
-           CASE
-               WHEN LAG(value) OVER w IS NULL THEN NULL
-               WHEN value >= LAG(value) OVER w
-                   THEN CAST(value - LAG(value) OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-               ELSE CAST(value AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)
-           END AS rate
-    FROM {b}
-    WHERE {lb:as_predicate}
-    WINDOW w AS (PARTITION BY col ORDER BY timestamp)
-),
-b_sum AS (SELECT timestamp, SUM(rate) AS s FROM b_series WHERE rate IS NOT NULL GROUP BY timestamp)
-SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t,
-       a.s - b.s AS v
-FROM a_sum a
-JOIN b_sum b ON a.timestamp = b.timestamp
-ORDER BY a.timestamp
-"""
 value_columns = ["v"]
 label_columns = []
 output_metric = {}

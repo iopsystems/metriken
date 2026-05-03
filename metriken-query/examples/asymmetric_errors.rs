@@ -65,7 +65,7 @@ fn main() -> std::io::Result<()> {
             Some(x) => x,
             None => continue,
         };
-        if entry.mode == Mode::Off || entry.sql.is_none() {
+        if entry.mode == Mode::Off {
             continue;
         }
         let p = engine.query_range_promql(q, start, end, step);

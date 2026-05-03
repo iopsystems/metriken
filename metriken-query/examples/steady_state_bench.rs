@@ -291,7 +291,7 @@ fn measure_first_query(
             Some(x) => x,
             None => continue,
         };
-        if entry.mode == Mode::Off || entry.sql.is_none() {
+        if entry.mode == Mode::Off {
             continue;
         }
 
@@ -366,10 +366,8 @@ fn run_fixture(
     let mut sql_only_err = 0;
     for q in queries {
         let (entry, captures) = match cat.lookup(q) {
-            Some((entry, captures)) if entry.mode != Mode::Off && entry.sql.is_some() => {
-                (entry, captures)
-            }
-            Some(_) => continue, // mode=off or no SQL twin — skip silently
+            Some((entry, captures)) if entry.mode != Mode::Off => (entry, captures),
+            Some(_) => continue, // mode=off — skip silently
             None => {
                 misses += 1;
                 continue;
