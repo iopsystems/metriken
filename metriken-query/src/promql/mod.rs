@@ -444,7 +444,19 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             if let Some((entry, captures)) = dispatch.catalogue.lookup(query_str) {
                 use crate::dispatch::{canonicalise, Diff, Mode};
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-                match entry.mode {
+                // METRIKEN_FORCE_PRIMARY=1 promotes every catalogue entry to
+                // Mode::Primary at runtime — useful for "what does the viewer
+                // look like backed purely by SQL/DuckDB" experiments without
+                // editing queries.toml. The catalogue's per-entry `mode` is
+                // ignored when this is set.
+                let effective_mode = if std::env::var("METRIKEN_FORCE_PRIMARY").is_ok()
+                    && entry.sql.is_some()
+                {
+                    Mode::Primary
+                } else {
+                    entry.mode
+                };
+                match effective_mode {
                     Mode::Off => self.query_range_promql(query_str, start, end, step),
                     Mode::Shadow => {
                         let p_t0 = std::time::Instant::now();
