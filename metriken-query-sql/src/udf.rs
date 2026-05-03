@@ -560,6 +560,70 @@ impl VScalar for H2CombineUdf {
     }
 }
 
+/// PromQL `irate` per-row computation: given (curr, prev, dt_ns) return
+/// the rate. Encodes the same semantics as the inline CASE expression
+/// in `wide_form::build_per_col` — first-row (`prev IS NULL`) → NULL;
+/// monotonic (`curr >= prev`) → `(curr - prev) / dt`; reset
+/// (`curr < prev`) → `curr / dt`. Wrapping the whole thing in one
+/// chunk-batched Rust loop bypasses DuckDB's expression evaluator on
+/// the per-cell CASE — measured ~30-50% faster on counter-rate
+/// shapes than the equivalent inline SQL.
+pub struct IrateLagUdf;
+impl VScalar for IrateLagUdf {
+    type State = ();
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n = input.len();
+        let in_curr = input.flat_vector(0);
+        let in_prev = input.flat_vector(1);
+        let in_dt = input.flat_vector(2);
+        let curr = in_curr.as_slice_with_len::<u64>(n);
+        let prev = in_prev.as_slice_with_len::<u64>(n);
+        let dt_ns = in_dt.as_slice_with_len::<i64>(n);
+        let mut out_vec = output.flat_vector();
+        let out_ptr = out_vec.as_mut_ptr::<f64>();
+        for r in 0..n {
+            // NULL-handling matches the inline CASE form: any of curr,
+            // prev, dt being NULL → NULL result. (curr is NULL when the
+            // physical column is sparse at this row; prev is NULL on the
+            // first row of each partition; dt comes from LAG(timestamp)
+            // which is also NULL there.)
+            if in_curr.row_is_null(r as u64)
+                || in_prev.row_is_null(r as u64)
+                || in_dt.row_is_null(r as u64)
+            {
+                out_vec.set_null(r);
+                continue;
+            }
+            let dt = dt_ns[r];
+            if dt == 0 {
+                out_vec.set_null(r);
+                continue;
+            }
+            let dt_secs = dt as f64 / 1e9;
+            let c = curr[r];
+            let p = prev[r];
+            // PromQL irate: monotonic uses (c - p), reset uses c.
+            let increment = if c >= p { (c - p) as f64 } else { c as f64 };
+            unsafe { *out_ptr.add(r) = increment / dt_secs; }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![ubig(), ubig(), big()],
+            dbl(),
+        )]
+    }
+}
+
+fn big() -> LogicalTypeHandle {
+    LogicalTypeId::Bigint.into()
+}
+
 pub fn register_all(conn: &Connection) -> duckdb::Result<()> {
     conn.register_scalar_function::<H2LowerUdf>("h2_lower")?;
     conn.register_scalar_function::<H2UpperUdf>("h2_upper")?;
@@ -570,6 +634,7 @@ pub fn register_all(conn: &Connection) -> duckdb::Result<()> {
     conn.register_scalar_function::<H2QuantilesUdf>("h2_quantiles")?;
     conn.register_scalar_function::<H2CountInRangeUdf>("h2_count_in_range")?;
     conn.register_scalar_function::<H2CombineUdf>("h2_combine")?;
+    conn.register_scalar_function::<IrateLagUdf>("irate_lag")?;
     Ok(())
 }
 

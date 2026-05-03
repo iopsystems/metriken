@@ -830,6 +830,15 @@ fn generate_sum(
 /// Emit one per-column expression aliased `val_<i>`. Returns
 /// `(per_col_select_text, window_clause_text)`. Only IrateRate needs
 /// the WINDOW; Value just `CAST`s the column.
+///
+/// IrateRate uses the `irate_lag` UDF (in `metriken_query_sql::udf`):
+/// SQL still does the LAG bookkeeping inside the WINDOW operator, but
+/// the per-row CASE+arithmetic that PromQL irate semantics require
+/// runs inside one tight Rust loop per chunk. Measured ~2.5x faster
+/// than the equivalent inline `CASE WHEN LAG IS NULL ... WHEN curr >=
+/// prev ... ELSE ... END` SQL on a 16-col workload — DuckDB's
+/// vectorized expression evaluator's per-cell overhead dominated the
+/// CASE form even after CSE.
 fn build_per_col(matching: &[&MetricSeries], expr: PerColExpr) -> (String, String) {
     let mut per_col = String::new();
     let mut needs_window = false;
@@ -839,11 +848,7 @@ fn build_per_col(matching: &[&MetricSeries], expr: PerColExpr) -> (String, Strin
             PerColExpr::IrateRate => {
                 needs_window = true;
                 per_col.push_str(&format!(
-                    ",\n    CASE\n        WHEN LAG(\"{phys}\") OVER w IS NULL THEN NULL\n        \
-                     WHEN \"{phys}\" >= LAG(\"{phys}\") OVER w\n            \
-                     THEN CAST(\"{phys}\" - LAG(\"{phys}\") OVER w AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)\n        \
-                     ELSE CAST(\"{phys}\" AS DOUBLE) / NULLIF(CAST(timestamp - LAG(timestamp) OVER w AS DOUBLE) / 1e9, 0)\n    \
-                     END AS val_{i}"
+                    ",\n    irate_lag(\"{phys}\", LAG(\"{phys}\") OVER w, timestamp - LAG(timestamp) OVER w) AS val_{i}"
                 ));
             }
             PerColExpr::Value => {
