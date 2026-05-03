@@ -301,16 +301,16 @@ fn generate_binary(catalog: &MetricCatalog, binary: &Binary) -> Option<String> {
         Some(g) => format!(", a.{g}", g = quote_ident(g)),
         None => String::new(),
     };
-    let order_clause = match group_label {
-        Some(g) => format!("a.{g}, a.timestamp", g = quote_ident(g)),
-        None => "a.timestamp".to_string(),
-    };
 
+    // No ORDER BY here either — same reasoning as the unary
+    // generate_sum: the Rust-side `run_matrix` collects rows into a
+    // BTreeMap, and the canonical-JSON comparison sorts samples by
+    // timestamp before diffing. Profiled measurement: dropping ORDER
+    // BY shaves ~0.3-0.4ms (>30%) on the worst-case shape.
     Some(format!(
         "WITH\n{a_ctes},\n{b_ctes}\n\
          SELECT CAST(a.timestamp AS DOUBLE) / 1e9 AS t, {value_select}{group_select}\n\
-         FROM a_summed a {a_sub}\n\
-         ORDER BY {order_clause}",
+         FROM a_summed a {a_sub}",
         a_ctes = a_lane.ctes,
         b_ctes = b_lane.ctes,
     ))
@@ -348,46 +348,92 @@ fn build_lane(catalog: &MetricCatalog, shape: &Shape, prefix: &str) -> Option<La
     }
 
     let (per_col_select, window_clause) = build_per_col(&matching, shape.expr);
-    let mut unions = String::new();
-    for (i, s) in matching.iter().enumerate() {
-        let label_proj = if let Some(g) = shape.group_label {
-            let v = s
-                .labels
-                .get(g)
-                .cloned()
-                .unwrap_or_default()
-                .replace('\'', "''");
-            format!(", '{v}' AS {}", quote_ident(g))
-        } else {
-            String::new()
-        };
-        let p = if i == 0 { "" } else { "\n      UNION ALL\n      " };
-        unions.push_str(&format!(
-            "{p}SELECT timestamp, val_{i} AS v{label_proj} FROM {prefix}_rates WHERE val_{i} IS NOT NULL"
-        ));
-    }
-    let agg_op = match shape.aggregation {
-        Aggregation::Sum => "SUM",
-        Aggregation::Max => "MAX",
-        Aggregation::Avg => "AVG",
-        Aggregation::None => unreachable!(),
-    };
     let scale_expr = if shape.scale == 1.0 {
         String::new()
     } else {
         format!(" / {}", shape.scale)
     };
-    let (group_clause, group_select) = match shape.group_label {
-        Some(g) => (
-            format!("GROUP BY {g}, timestamp", g = quote_ident(g)),
-            format!(", {g}", g = quote_ident(g)),
-        ),
-        None => ("GROUP BY timestamp".to_string(), String::new()),
+
+    // For Aggregation::Sum: same pre-aggregate trick as the unary
+    // path — bucket cols by group_label value, emit one row per
+    // (timestamp, g_value) via per-row arithmetic, no GROUP BY.
+    let summed_cte = if shape.aggregation == Aggregation::Sum {
+        let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+        for (i, s) in matching.iter().enumerate() {
+            let key = match shape.group_label {
+                Some(g) => s.labels.get(g).cloned().unwrap_or_default(),
+                None => String::new(),
+            };
+            groups.entry(key).or_default().push(i);
+        }
+        let mut union_branches: Vec<String> = Vec::with_capacity(groups.len());
+        for (g_value, col_idxs) in &groups {
+            let coalesce_terms: Vec<String> = col_idxs
+                .iter()
+                .map(|i| format!("COALESCE(val_{i}, 0)"))
+                .collect();
+            let null_check_terms: Vec<String> = col_idxs
+                .iter()
+                .map(|i| format!("val_{i} IS NOT NULL"))
+                .collect();
+            let sum_expr = coalesce_terms.join(" + ");
+            let any_present = null_check_terms.join(" OR ");
+            let g_select = match shape.group_label {
+                Some(g) => {
+                    let g_quoted = quote_ident(g);
+                    let g_lit = g_value.replace('\'', "''");
+                    format!(", '{g_lit}' AS {g_quoted}")
+                }
+                None => String::new(),
+            };
+            union_branches.push(format!(
+                "SELECT timestamp, ({sum_expr}){scale_expr} AS v{g_select} FROM {prefix}_rates WHERE {any_present}"
+            ));
+        }
+        let unions = union_branches.join("\n      UNION ALL\n      ");
+        format!(
+            "{prefix}_summed AS (\n      {unions}\n)"
+        )
+    } else {
+        // Max / Avg keep the GROUP BY path.
+        let mut unions = String::new();
+        for (i, s) in matching.iter().enumerate() {
+            let label_proj = if let Some(g) = shape.group_label {
+                let v = s
+                    .labels
+                    .get(g)
+                    .cloned()
+                    .unwrap_or_default()
+                    .replace('\'', "''");
+                format!(", '{v}' AS {}", quote_ident(g))
+            } else {
+                String::new()
+            };
+            let p = if i == 0 { "" } else { "\n      UNION ALL\n      " };
+            unions.push_str(&format!(
+                "{p}SELECT timestamp, val_{i} AS v{label_proj} FROM {prefix}_rates WHERE val_{i} IS NOT NULL"
+            ));
+        }
+        let agg_op = match shape.aggregation {
+            Aggregation::Max => "MAX",
+            Aggregation::Avg => "AVG",
+            _ => unreachable!(),
+        };
+        let (group_clause, group_select) = match shape.group_label {
+            Some(g) => (
+                format!("GROUP BY {g}, timestamp", g = quote_ident(g)),
+                format!(", {g}", g = quote_ident(g)),
+            ),
+            None => ("GROUP BY timestamp".to_string(), String::new()),
+        };
+        format!(
+            "{prefix}_summed AS (\n  SELECT timestamp, {agg_op}(v){scale_expr} AS v{group_select}\n  FROM (\n      {unions}\n  ) per_series\n  {group_clause}\n)"
+        )
     };
 
     let ctes = format!(
         "{prefix}_rates AS (\n  SELECT timestamp{per_col_select}\n  FROM _src\n  {window_clause}\n),\n\
-         {prefix}_summed AS (\n  SELECT timestamp, {agg_op}(v){scale_expr} AS v{group_select}\n  FROM (\n      {unions}\n  ) per_series\n  {group_clause}\n)"
+         {summed_cte}"
     );
     Some(Lane {
         ctes,
@@ -779,15 +825,16 @@ fn generate_sum(
     }
     let unions = union_branches.join("\n      UNION ALL\n      ");
 
-    let order_clause = match shape.group_label {
-        Some(g) => format!("{g}, t", g = quote_ident(g)),
-        None => "t".to_string(),
-    };
-
+    // No ORDER BY: the Rust-side `run_matrix` collects rows into a
+    // BTreeMap keyed by labels (which sorts the groups), and the
+    // canonical-JSON comparison in `divergence_inspector` sorts each
+    // series's samples by timestamp before diffing. The bench likewise
+    // doesn't depend on a particular row order. Profiled measurement:
+    // dropping ORDER BY shaves another ~0.4ms (37% of remaining warm
+    // exec) on the worst-case sum_by shape.
     format!(
         "WITH rates AS (\n  SELECT timestamp{per_col_select}\n  FROM _src\n  {window_clause}\n)\n\
-         {unions}\n\
-         ORDER BY {order_clause}"
+         {unions}"
     )
 }
 
