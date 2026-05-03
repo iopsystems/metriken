@@ -531,6 +531,24 @@ fn resolve_shape<'a>(entry: &'a CatalogueEntry, captures: &'a Captures) -> Optio
             aggregation: Sum,
             scale: number_capture(captures, "d").unwrap_or(1.0),
         }),
+        // sum by (G) (irate(M{labels}[R])) — generic group label
+        "counter_irate_by_g_with_labels" => Some(Shape {
+            metric: ident_capture(captures, "m")?,
+            filter: labels_capture(captures, "labels").unwrap_or(&[]).to_vec(),
+            group_label: Some(ident_capture(captures, "g")?),
+            expr: IrateRate,
+            aggregation: Sum,
+            scale: 1.0,
+        }),
+        // sum by (G) (irate(M{labels}[R])) / D — generic group label, scaled
+        "counter_irate_by_g_with_labels_scaled" => Some(Shape {
+            metric: ident_capture(captures, "m")?,
+            filter: labels_capture(captures, "labels").unwrap_or(&[]).to_vec(),
+            group_label: Some(ident_capture(captures, "g")?),
+            expr: IrateRate,
+            aggregation: Sum,
+            scale: number_capture(captures, "d").unwrap_or(1.0),
+        }),
         // sum (irate(M{labels}[R])) / D — note the entry id is "counter_irate_with_labels_scaled"
         "counter_irate_with_labels_scaled" => Some(Shape {
             metric: ident_capture(captures, "m")?,
