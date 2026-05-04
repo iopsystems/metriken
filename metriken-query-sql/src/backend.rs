@@ -24,7 +24,7 @@
 //! Positional rather than name-based access avoids duckdb-rs's habit of
 //! panicking if column metadata is read before the statement executes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, Float64Array, StringArray};
@@ -208,35 +208,64 @@ fn run_matrix(
         Vec::new()
     };
 
-    let mut series: BTreeMap<Vec<String>, Vec<(f64, f64)>> = BTreeMap::new();
+    // Interpolate `output_metric` placeholders once, before the per-row
+    // unpack loop — saves a per-series clone of `interpolated_metric`
+    // when the result has zero or one series (extremely common: every
+    // unary aggregation entry without label columns hits this path).
+    let mut interpolated_metric: HashMap<String, String> =
+        HashMap::with_capacity(entry.output_metric.len());
+    for (k, v) in &entry.output_metric {
+        let resolved = crate::interp::interpolate(v, captures, "", None)
+            .map_err(|e| SqlError::Backend(format!("interp output_metric[{k}] for {}: {e}", entry.id)))?;
+        interpolated_metric.insert(k.clone(), resolved);
+    }
+
+    // Fast path: no label columns in the result schema. Most catalogue
+    // entries (every gauge_bare / counter_*_sum / softirq_*_total
+    // shape) project no labels — there's exactly one series and no
+    // grouping is needed. Skip the BTreeMap entirely and append (t, v)
+    // pairs directly to a Vec; no per-row hash, alloc, or clone.
+    if label_names.is_empty() {
+        let mut values: Vec<(f64, f64)> = Vec::new();
+        for batch in arrow {
+            let n_rows = batch.num_rows();
+            if n_rows == 0 {
+                continue;
+            }
+            let t_col = downcast_f64(&batch, 0, &entry.id)?;
+            let v_col = downcast_f64(&batch, 1, &entry.id)?;
+            values.reserve(n_rows);
+            for r in 0..n_rows {
+                if t_col.is_null(r) || v_col.is_null(r) {
+                    continue;
+                }
+                values.push((t_col.value(r), v_col.value(r)));
+            }
+        }
+        let result = if values.is_empty() {
+            Vec::new()
+        } else {
+            vec![MatrixSample {
+                metric: interpolated_metric,
+                values,
+            }]
+        };
+        return Ok(QueryResult::Matrix { result });
+    }
+
+    // Multi-series path. HashMap (not BTreeMap) for O(1) inserts —
+    // canonicalisation downstream sorts before diffing, so we don't
+    // need the BTreeMap's ordered iteration.
+    let mut series: HashMap<Vec<String>, Vec<(f64, f64)>> =
+        HashMap::with_capacity(8);
     let mut row_buf: Vec<String> = vec![String::new(); label_names.len()];
     for batch in arrow {
         let n_rows = batch.num_rows();
         if n_rows == 0 {
             continue;
         }
-        let t_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| {
-                SqlError::Backend(format!(
-                    "{}: column 0 is not Float64 (got {:?})",
-                    entry.id,
-                    batch.column(0).data_type()
-                ))
-            })?;
-        let v_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| {
-                SqlError::Backend(format!(
-                    "{}: column 1 is not Float64 (got {:?})",
-                    entry.id,
-                    batch.column(1).data_type()
-                ))
-            })?;
+        let t_col = downcast_f64(&batch, 0, &entry.id)?;
+        let v_col = downcast_f64(&batch, 1, &entry.id)?;
         // Label columns: downcast to StringArray once per batch. Some
         // columns may be null-filled (StringArray::value panics on null);
         // we check is_null per row in the inner loop.
@@ -263,44 +292,76 @@ fn run_matrix(
             }
             let t = t_col.value(r);
             let v = v_col.value(r);
+            // Refill row_buf in place: `String::clear` + `push_str`
+            // reuses the existing heap allocation rather than freeing
+            // and re-allocating each cell. Only on a series-key
+            // mismatch (HashMap miss) do we pay the `Vec<String>`
+            // clone — and that clones strings that already have the
+            // right backing storage.
             for (i, col) in label_cols.iter().enumerate() {
-                row_buf[i] = if col.is_null(r) {
-                    String::new()
-                } else {
-                    col.value(r).to_string()
-                };
+                let buf = &mut row_buf[i];
+                buf.clear();
+                if !col.is_null(r) {
+                    buf.push_str(col.value(r));
+                }
             }
-            series
-                .entry(row_buf.clone())
-                .or_default()
-                .push((t, v));
+            // Lookup-then-insert avoids the unconditional `entry().clone()`
+            // — on hit (the common case after the first row of each
+            // series) we don't allocate at all.
+            if let Some(samples) = series.get_mut(&row_buf) {
+                samples.push((t, v));
+            } else {
+                series.insert(row_buf.clone(), vec![(t, v)]);
+            }
         }
     }
 
-    // Interpolate any `{capture}` placeholders in output_metric values
-    // (e.g. `quantile = "{q}"` for the templated histogram_quantile entry).
-    // The data_source argument is irrelevant here — output_metric never
-    // legitimately contains `{fixture_path}` — but we pass empty rather
-    // than threading the real value to make that explicit.
-    let mut interpolated_metric: HashMap<String, String> = HashMap::with_capacity(entry.output_metric.len());
-    for (k, v) in &entry.output_metric {
-        let resolved = crate::interp::interpolate(v, captures, "", None)
-            .map_err(|e| SqlError::Backend(format!("interp output_metric[{k}] for {}: {e}", entry.id)))?;
-        interpolated_metric.insert(k.clone(), resolved);
+    let n_series = series.len();
+    let mut result: Vec<MatrixSample> = Vec::with_capacity(n_series);
+    let mut iter = series.into_iter();
+    if let Some((label_values, values)) = iter.next() {
+        // First series: take ownership of `interpolated_metric` (move,
+        // no clone). Subsequent series clone from a frozen template.
+        let template = if n_series > 1 {
+            Some(interpolated_metric.clone())
+        } else {
+            None
+        };
+        let mut metric = interpolated_metric;
+        for (i, val) in label_values.into_iter().enumerate() {
+            metric.insert(label_names[i].clone(), val);
+        }
+        result.push(MatrixSample { metric, values });
+        if let Some(template) = template {
+            for (label_values, values) in iter {
+                let mut metric = template.clone();
+                for (i, val) in label_values.into_iter().enumerate() {
+                    metric.insert(label_names[i].clone(), val);
+                }
+                result.push(MatrixSample { metric, values });
+            }
+        }
     }
 
-    let result: Vec<MatrixSample> = series
-        .into_iter()
-        .map(|(label_values, values)| {
-            let mut metric: HashMap<String, String> = interpolated_metric.clone();
-            for (i, val) in label_values.into_iter().enumerate() {
-                metric.insert(label_names[i].clone(), val);
-            }
-            MatrixSample { metric, values }
-        })
-        .collect();
-
     Ok(QueryResult::Matrix { result })
+}
+
+fn downcast_f64<'a>(
+    batch: &'a arrow::record_batch::RecordBatch,
+    col: usize,
+    entry_id: &str,
+) -> Result<&'a Float64Array, SqlError> {
+    batch
+        .column(col)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| {
+            SqlError::Backend(format!(
+                "{}: column {col} is not Float64 (got {:?})",
+                entry_id,
+                batch.column(col).data_type()
+            ))
+        })
 }
 
 /// Project rows shaped `(t DOUBLE, bucket_idx INTEGER, count DOUBLE, p INTEGER)`
