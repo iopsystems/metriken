@@ -1,10 +1,18 @@
 //! Embedded-DuckDB implementation of `metriken_query::SqlBackend`.
 //!
-//! `DuckDbBackend` keeps one in-memory connection per `data_source` (parquet
-//! path or glob). The first request for a given source pays the cold-start
-//! cost — open in-memory DB, register UDFs + macros, load the parquet into a
-//! `_src` temp table via `views::ensure_views`. Subsequent requests reuse
-//! that same connection and only pay the SQL `prepare` + `execute` cost.
+//! `DuckDbBackend` keeps a small **connection pool** per `data_source`
+//! (parquet path or glob). The first request for a given source pays the
+//! cold-start cost: for each pool slot, open an in-memory DB, register
+//! UDFs + macros, and load the parquet into a `_src` TEMP TABLE via
+//! `views::ensure_views`. Subsequent requests check out a slot via
+//! atomic round-robin and only pay the SQL `prepare_cached` + `execute`
+//! cost.
+//!
+//! `Connection` is `!Sync` (DuckDB connections are single-threaded), so
+//! each pool slot is a `Mutex<Connection>`. With pool size N, up to N
+//! requests against the same fixture proceed concurrently before any
+//! lock contention. Default N is `available_parallelism().min(8)`,
+//! overridable via `METRIKEN_SQL_POOL`.
 //!
 //! Two output shapes, dispatched on `entry.output_shape`:
 //!
@@ -25,6 +33,7 @@
 //! panicking if column metadata is read before the statement executes.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, Float64Array, StringArray};
@@ -36,35 +45,63 @@ use metriken_query::{
 
 use crate::views::MetricCatalog;
 
-/// Per-data-source state: the DuckDB connection plus the metadata
-/// catalog produced by `ensure_views`. Wide-form SQL projects
-/// directly off `_src` (no per-metric VIEW), so the only setup is
-/// the parquet load + UDF/macro registration.
+/// Per-data-source state: a pool of independent in-memory DuckDB
+/// connections plus the shared (Rust-side) metadata catalog produced
+/// by `ensure_views`. Each connection has its own UDF registrations,
+/// `_src` TEMP TABLE, and prepared-statement cache; checkout is
+/// lockless via a round-robin atomic counter, so contention only
+/// arises when concurrent requests > pool size.
 struct ConnState {
-    conn: Mutex<Connection>,
+    pool: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
     catalog: MetricCatalog,
 }
 
-/// Default DuckDB-backed implementation of `SqlBackend`. Holds one in-memory
-/// `Connection` per unique `data_source`, lazily initialised on first request.
-/// `Connection` is `!Sync`, so each cached connection is wrapped in an inner
-/// `Mutex` that serialises queries against the same fixture; the outer mutex
-/// guards the lookup map and is rarely contended.
+/// Default DuckDB-backed implementation of `SqlBackend`. Lazily builds
+/// a connection pool per unique `data_source` on first request. Pool
+/// size is fixed at backend construction; tune via
+/// `DuckDbBackend::with_pool_size` or the `METRIKEN_SQL_POOL` env var.
 pub struct DuckDbBackend {
     connections: Mutex<HashMap<String, Arc<ConnState>>>,
+    pool_size: usize,
+}
+
+/// Default pool size: `available_parallelism().min(8)`, with
+/// `METRIKEN_SQL_POOL` as an explicit override. Cap at 8 because
+/// cold-start scales linearly with pool size (each slot pays the
+/// open + register + parquet-read cost) and 8 is well past the
+/// point of diminishing returns on a busy single-fixture viewer.
+fn default_pool_size() -> usize {
+    if let Ok(v) = std::env::var("METRIKEN_SQL_POOL") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4)
 }
 
 impl DuckDbBackend {
     pub fn new() -> Self {
+        Self::with_pool_size(default_pool_size())
+    }
+
+    /// Construct a backend with an explicit pool size. `n` is clamped to
+    /// at least 1; passing 1 reproduces the pre-pool single-connection
+    /// behavior. Useful in tests where deterministic single-threaded
+    /// execution is wanted.
+    pub fn with_pool_size(n: usize) -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
+            pool_size: n.max(1),
         }
     }
 
-    /// Look up (or lazily build) the cached connection state for
+    /// Look up (or lazily build) the cached connection pool for
     /// `data_source`. Returns the `Arc` and a `cold` flag — `true`
-    /// means this call paid the open + UDF-registration + view-building
-    /// cost, `false` means the state was already warm.
+    /// means this call paid the per-slot open + UDF-registration +
+    /// view-building cost, `false` means the pool was already warm.
     fn get_or_init(&self, data_source: &str) -> Result<(Arc<ConnState>, bool), SqlError> {
         // Fast path: already cached.
         {
@@ -80,33 +117,67 @@ impl DuckDbBackend {
         }
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
-        let conn = Connection::open_in_memory()
-            .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
-        // Default prepared-statement cache is 16; bump it so the catalogue
-        // (~70 distinct shapes) plus per-label-value variants all fit
-        // and stay parsed/planned across repeat queries from the viewer.
-        // Each cached Statement is small (planning artifacts only).
-        conn.set_prepared_statement_cache_capacity(1024);
-        let t_open = t0.elapsed();
-        crate::register_all(&conn)
-            .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
-        let t_register = t0.elapsed() - t_open;
-        let catalog = crate::views::ensure_views(&conn, data_source)
-            .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
-        let t_views = t0.elapsed() - t_open - t_register;
+
+        let mut pool: Vec<Mutex<Connection>> = Vec::with_capacity(self.pool_size);
+        let mut catalog: Option<MetricCatalog> = None;
+        let (mut total_open_ms, mut total_register_ms, mut total_views_ms) = (0.0, 0.0, 0.0);
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+        for _ in 0..self.pool_size {
+            let s0 = std::time::Instant::now();
+            let conn = Connection::open_in_memory()
+                .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
+            // Default prepared-statement cache is 16; bump it so the catalogue
+            // (~70 distinct shapes) plus per-label-value variants all fit
+            // and stay parsed/planned across repeat queries from the viewer.
+            // Each cached Statement is small (planning artifacts only).
+            conn.set_prepared_statement_cache_capacity(1024);
+            // When pooling, cap DuckDB's intra-query worker threads to
+            // 1: we are already achieving parallelism at the pool
+            // level. pool_size connections × DuckDB's default of N
+            // internal workers per query oversubscribes the box
+            // (e.g. 4 slots × 4 internal workers = 16 threads on 4
+            // cores), causing context-switch storms that show up as
+            // a *regression* at N ≈ pool_size in the concurrent
+            // bench. With pool_size=1 (single-connection mode) we
+            // leave DuckDB's intra-query parallelism alone — that's
+            // the only way a single request gets multi-core.
+            if self.pool_size > 1 {
+                conn.execute("PRAGMA threads=1", [])
+                    .map_err(|e| SqlError::Backend(format!("pragma threads: {e}")))?;
+            }
+            let t_open = s0.elapsed();
+            crate::register_all(&conn)
+                .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
+            let t_register = s0.elapsed() - t_open;
+            let cat = crate::views::ensure_views(&conn, data_source)
+                .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
+            let t_views = s0.elapsed() - t_open - t_register;
+            total_open_ms += ms(t_open);
+            total_register_ms += ms(t_register);
+            total_views_ms += ms(t_views);
+            if catalog.is_none() {
+                catalog = Some(cat);
+            }
+            pool.push(Mutex::new(conn));
+        }
+
         if timing {
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "duckdb cold-start data_source={} open={:.1}ms reg={:.1}ms views={:.1}ms",
+                "duckdb cold-start data_source={} pool_size={} (sum across slots: open={:.1}ms reg={:.1}ms views={:.1}ms wall={:.1}ms)",
                 data_source,
-                ms(t_open),
-                ms(t_register),
-                ms(t_views)
+                self.pool_size,
+                total_open_ms,
+                total_register_ms,
+                total_views_ms,
+                ms(t0.elapsed()),
             );
         }
+
         let state = Arc::new(ConnState {
-            conn: Mutex::new(conn),
-            catalog,
+            pool,
+            next: AtomicUsize::new(0),
+            catalog: catalog.expect("pool_size >= 1 → catalog set"),
         });
         map.insert(data_source.to_string(), state.clone());
         Ok((state, true))
@@ -142,7 +213,15 @@ impl TraitSqlBackend for DuckDbBackend {
             )),
         )?;
 
-        let conn = state.conn.lock().expect("poisoned");
+        // Atomic round-robin pool checkout. With pool size N, up to N
+        // concurrent requests proceed in parallel; the `% pool.len()`
+        // is the only ordering needed (Relaxed is fine — we don't care
+        // which slot a given request lands on, just that distribution
+        // is roughly uniform). NOTE for future telemetry: this is the
+        // natural place to record lock-acquire wait time per slot if
+        // we want to surface contention as the catalogue grows.
+        let idx = state.next.fetch_add(1, Ordering::Relaxed) % state.pool.len();
+        let conn = state.pool[idx].lock().expect("poisoned");
 
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
@@ -156,9 +235,10 @@ impl TraitSqlBackend for DuckDbBackend {
         if timing {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "duckdb {} {} exec={:.1}ms",
+                "duckdb {} {} slot={} exec={:.1}ms",
                 entry.id,
                 if cold { "cold" } else { "warm" },
+                idx,
                 ms(t_exec)
             );
         }
