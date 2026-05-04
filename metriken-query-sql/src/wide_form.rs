@@ -2159,15 +2159,35 @@ fn build_rates_chain(
                 per_pair_cols.push_str(&format!(
                     ",\n    irate_lag(\"{phys}\", LAG(\"{phys}\") OVER w, timestamp - LAG(timestamp) OVER w) AS inc_{i}"
                 ));
-                // Match counter_rate_bare_generic's long-form formula:
-                // `(SUM(inc) OVER w - COALESCE(FIRST_VALUE(inc) OVER w, 0))
-                //  / NULLIF((curr_ts - first_ts_in_window)/1e9, 0)`.
-                // Subtracting FIRST_VALUE drops the pre-window pair (whose
-                // `prev` sample sits one step before the [t-W, t] window);
-                // COALESCE handles the early-data case where inc[0] is NULL.
+                // Per-series "first timestamp where this counter is
+                // non-NULL". Used as the rate denominator below — see
+                // the comment on `rates_cols`. NULL when the counter is
+                // missing for that row, so MIN(...) OVER w naturally
+                // skips them and returns the earliest present timestamp.
+                per_pair_cols.push_str(&format!(
+                    ",\n    CASE WHEN \"{phys}\" IS NOT NULL THEN timestamp END AS t_first_{i}"
+                ));
+                // (SUM(inc) OVER w - COALESCE(FIRST_VALUE(inc) OVER w, 0))
+                //  / NULLIF((curr_ts - first_present_ts_in_window)/1e9, 0)
+                //
+                // Numerator: telescoping SUM gives `last_v -
+                // first_present_v`; subtracting FIRST_VALUE removes the
+                // pre-window boundary increment (when one exists).
+                //
+                // Denominator: must be the time span between the
+                // FIRST-PRESENT counter sample and `current_ts`, not
+                // the first row's timestamp. PromQL's CounterRate
+                // iterates over a NULL-filtered sample slice, so leading
+                // NULLs in a series shrink its span; SQL operates on
+                // _src which carries every row, NULLs and all.
+                // `MIN(t_first_{i})` reproduces the PromQL behavior
+                // per-series — different series in the same query can
+                // have different leading-NULL prefixes (e.g. multi-
+                // status counters where one status only starts emitting
+                // partway through the recording).
                 rates_cols.push_str(&format!(
                     ",\n    (SUM(inc_{i}) OVER w - COALESCE(FIRST_VALUE(inc_{i}) OVER w, 0)) \
-                     / NULLIF(CAST(timestamp - FIRST_VALUE(timestamp) OVER w AS DOUBLE) / 1e9, 0) AS val_{i}"
+                     / NULLIF(CAST(timestamp - MIN(t_first_{i}) OVER w AS DOUBLE) / 1e9, 0) AS val_{i}"
                 ));
             }
             // For Rate, extras carry through both CTEs unchanged: the
