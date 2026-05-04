@@ -34,8 +34,10 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use duckdb::Connection;
 use metriken_query::{CatalogueEntry, Captures, Catalogue, Mode, QueryEngine, SqlBackend, Tsdb};
@@ -45,6 +47,7 @@ const DEFAULT_DATA_DIR: &str = "/work/rezolus/site/viewer/data";
 const DEFAULT_QUERIES: &str = "metriken-query/tests/data/production_queries.txt";
 const DEFAULT_REPS: usize = 10;
 const DEFAULT_WARMUP_PASSES: usize = 1;
+const DEFAULT_CONCURRENT_SECS: u64 = 5;
 
 #[derive(Default)]
 struct Args {
@@ -56,6 +59,11 @@ struct Args {
     filter: Option<String>,
     out: Option<PathBuf>,
     csv: Option<PathBuf>,
+    /// When `Some`, switches the bench into concurrent-load mode and
+    /// runs one sweep per requested thread count. `None` runs the
+    /// default sequential bench.
+    concurrent: Option<Vec<usize>>,
+    concurrent_secs: Option<u64>,
 }
 
 fn next_value(raw: &[String], i: usize) -> String {
@@ -111,11 +119,38 @@ fn parse_args() -> Args {
                 args.csv = Some(PathBuf::from(next_value(&raw, i)));
                 i += 2;
             }
+            "--concurrent" => {
+                let v = next_value(&raw, i);
+                let ns: Vec<usize> = v
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<usize>()
+                            .expect("--concurrent expects comma-separated positive integers")
+                    })
+                    .filter(|n| *n > 0)
+                    .collect();
+                if ns.is_empty() {
+                    eprintln!("--concurrent must list at least one positive integer");
+                    std::process::exit(2);
+                }
+                args.concurrent = Some(ns);
+                i += 2;
+            }
+            "--concurrent-secs" => {
+                args.concurrent_secs = Some(
+                    next_value(&raw, i)
+                        .parse()
+                        .expect("--concurrent-secs must be a positive integer"),
+                );
+                i += 2;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "Usage: steady_state_bench [--data-dir DIR | --parquet PATH ...]\n  \
                      [--queries FILE] [--reps N={DEFAULT_REPS}] [--warmup-passes N={DEFAULT_WARMUP_PASSES}]\n  \
-                     [--filter SUBSTRING] [--out FILE] [--csv FILE]"
+                     [--filter SUBSTRING] [--out FILE] [--csv FILE]\n  \
+                     [--concurrent N[,N...]] [--concurrent-secs SEC={DEFAULT_CONCURRENT_SECS}]"
                 );
                 std::process::exit(0);
             }
@@ -219,6 +254,12 @@ fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     percentile(&v, 0.5)
+}
+
+fn p99(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    percentile(&v, 0.99)
 }
 
 /// Match the viewer's step calculation: `max(1, floor(window / 500))`,
@@ -453,6 +494,219 @@ fn run_fixture(
     })
 }
 
+/// Concurrent-load mode: one fixture, one warm engine + backend, swept
+/// over a list of thread counts. Surfaces the `Mutex<Connection>` cap
+/// in `metriken-query-sql/src/backend.rs` (and any other shared state)
+/// that the sequential bench can't see.
+struct OwnedPlan {
+    query: String,
+    entry: CatalogueEntry,
+    captures: Captures,
+}
+
+struct ConcurrentSweep {
+    threads: usize,
+    duration_s: f64,
+    promql_total: usize,
+    sql_total: usize,
+    promql_qps: f64,
+    sql_qps: f64,
+    promql_p50: f64,
+    promql_p99: f64,
+    sql_p50: f64,
+    sql_p99: f64,
+}
+
+struct ConcurrentRun {
+    parquet: PathBuf,
+    cold: ColdStart,
+    plan_count: usize,
+    sweeps: Vec<ConcurrentSweep>,
+}
+
+fn run_concurrent_fixture(
+    parquet: &Path,
+    queries: &[String],
+    cat: &Catalogue,
+    thread_counts: &[usize],
+    duration: Duration,
+) -> Result<ConcurrentRun, FixtureFailure> {
+    let mut cold = measure_cold_start(parquet).map_err(|(phase, message)| FixtureFailure {
+        parquet: parquet.to_path_buf(),
+        phase,
+        message,
+    })?;
+    let (probe, fp, fs_ms) = measure_first_query(parquet, queries, cat);
+    cold.probe_query = probe;
+    cold.first_promql_ms = fp;
+    cold.first_sql_ms = fs_ms;
+
+    let tsdb = Arc::new(Tsdb::load(parquet).map_err(|e| FixtureFailure {
+        parquet: parquet.to_path_buf(),
+        phase: "tsdb_load",
+        message: e.to_string(),
+    })?);
+    let (start, end) = match tsdb.time_range() {
+        Some((min_ns, max_ns)) => (min_ns as f64 / 1e9, max_ns as f64 / 1e9),
+        None => {
+            return Err(FixtureFailure {
+                parquet: parquet.to_path_buf(),
+                phase: "tsdb_time_range",
+                message: "fixture has no rows".to_string(),
+            });
+        }
+    };
+    let step = compute_step(start, end);
+    let engine = Arc::new(QueryEngine::new(tsdb));
+    let backend = Arc::new(DuckDbBackend::new());
+    let parquet_path: Arc<String> = Arc::new(parquet.to_str().expect("utf8 path").to_string());
+
+    // Pre-flight + filter: only queries that succeed on both engines
+    // make it into the workload. The pre-flight pass also warms the
+    // catalog/view cache for the subsequent sweeps.
+    let mut plans: Vec<OwnedPlan> = Vec::new();
+    for q in queries {
+        let (entry, captures) = match cat.lookup(q) {
+            Some((entry, captures)) if entry.mode != Mode::Off => (entry, captures),
+            _ => continue,
+        };
+        let p_ok = engine.query_range_promql(q, start, end, step).is_ok();
+        let s_ok = backend
+            .run(entry, &captures, parquet_path.as_str(), start, end, step)
+            .is_ok();
+        if p_ok && s_ok {
+            plans.push(OwnedPlan {
+                query: q.clone(),
+                entry: entry.clone(),
+                captures,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return Err(FixtureFailure {
+            parquet: parquet.to_path_buf(),
+            phase: "concurrent_preflight",
+            message: "no queries succeed on both engines".to_string(),
+        });
+    }
+    let plans: Arc<Vec<OwnedPlan>> = Arc::new(plans);
+
+    let mut sweeps = Vec::with_capacity(thread_counts.len());
+    for &n in thread_counts {
+        let sweep = run_concurrent_sweep(
+            n,
+            duration,
+            plans.clone(),
+            engine.clone(),
+            backend.clone(),
+            parquet_path.clone(),
+            start,
+            end,
+            step,
+        );
+        sweeps.push(sweep);
+    }
+
+    Ok(ConcurrentRun {
+        parquet: parquet.to_path_buf(),
+        cold,
+        plan_count: plans.len(),
+        sweeps,
+    })
+}
+
+/// Run two independent engine pools sequentially, each with `threads`
+/// workers, so per-engine throughput is decoupled. (A paired loop —
+/// both engines on the same thread — would pin the faster engine's
+/// QPS to the slower's pace, blurring the scaling signal.)
+fn run_concurrent_sweep(
+    threads: usize,
+    duration: Duration,
+    plans: Arc<Vec<OwnedPlan>>,
+    engine: Arc<QueryEngine>,
+    backend: Arc<DuckDbBackend>,
+    parquet_path: Arc<String>,
+    start: f64,
+    end: f64,
+    step: f64,
+) -> ConcurrentSweep {
+    let promql_engine = engine.clone();
+    let (promql_ms, promql_elapsed) = run_engine_pool(threads, duration, &plans, move |p| {
+        let _ = promql_engine.query_range_promql(&p.query, start, end, step);
+    });
+    let sql_backend = backend.clone();
+    let sql_path = parquet_path.clone();
+    let (sql_ms, sql_elapsed) = run_engine_pool(threads, duration, &plans, move |p| {
+        let _ = sql_backend.run(
+            &p.entry,
+            &p.captures,
+            sql_path.as_str(),
+            start,
+            end,
+            step,
+        );
+    });
+
+    ConcurrentSweep {
+        threads,
+        // Report the longer of the two — surfaces the case where one
+        // engine ran past deadline; in practice both finish within
+        // ~ms of each other since the deadline check runs every
+        // iteration.
+        duration_s: promql_elapsed.max(sql_elapsed),
+        promql_total: promql_ms.len(),
+        sql_total: sql_ms.len(),
+        promql_qps: promql_ms.len() as f64 / promql_elapsed,
+        sql_qps: sql_ms.len() as f64 / sql_elapsed,
+        promql_p50: median(&promql_ms),
+        promql_p99: p99(&promql_ms),
+        sql_p50: median(&sql_ms),
+        sql_p99: p99(&sql_ms),
+    }
+}
+
+fn run_engine_pool<F>(
+    threads: usize,
+    duration: Duration,
+    plans: &Arc<Vec<OwnedPlan>>,
+    work: F,
+) -> (Vec<f64>, f64)
+where
+    F: Fn(&OwnedPlan) + Send + Sync + 'static,
+{
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + duration;
+    let work = Arc::new(work);
+
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let plans = plans.clone();
+            let cursor = cursor.clone();
+            let work = work.clone();
+            thread::spawn(move || {
+                let mut latencies: Vec<f64> = Vec::with_capacity(1024);
+                while Instant::now() < deadline {
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed) % plans.len();
+                    let p = &plans[idx];
+                    let t0 = Instant::now();
+                    work(p);
+                    latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                latencies
+            })
+        })
+        .collect();
+
+    let t0 = Instant::now();
+    let mut all: Vec<f64> = Vec::new();
+    for h in handles {
+        let v = h.join().expect("worker panicked");
+        all.extend(v);
+    }
+    let elapsed_s = t0.elapsed().as_secs_f64();
+    (all, elapsed_s)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -614,31 +868,38 @@ fn render_report(
         }
         writeln!(
             out,
-            "| entry id | n_queries | n_runs | PromQL median (ms) | SQL median (ms) | sql/promql |"
+            "| entry id | n_queries | n_runs | PromQL median (ms) | PromQL p99 (ms) | SQL median (ms) | SQL p99 (ms) | sql/promql |"
         )
         .unwrap();
-        writeln!(out, "|---|---:|---:|---:|---:|---:|").unwrap();
-        let mut rows: Vec<(String, usize, usize, f64, f64, f64)> = Vec::new();
+        writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|").unwrap();
+        // For each entry: aggregate p50 and p99 the same way
+        // (per-query first, then median across queries) so a single
+        // outlier query doesn't dominate either column.
+        let mut rows: Vec<(String, usize, usize, f64, f64, f64, f64, f64)> = Vec::new();
         for (id, items) in &by_entry {
             let n_queries = items.len();
             let n_runs: usize = items.iter().map(|s| s.promql_ms.len()).sum();
             let p_medians: Vec<f64> = items.iter().map(|s| median(&s.promql_ms)).collect();
+            let p_p99s: Vec<f64> = items.iter().map(|s| p99(&s.promql_ms)).collect();
             let s_medians: Vec<f64> = items.iter().map(|s| median(&s.sql_ms)).collect();
+            let s_p99s: Vec<f64> = items.iter().map(|s| p99(&s.sql_ms)).collect();
             let p = median(&p_medians);
+            let p_tail = median(&p_p99s);
             let s = median(&s_medians);
+            let s_tail = median(&s_p99s);
             let ratio = if p > 0.0 { s / p } else { f64::NAN };
-            rows.push((id.to_string(), n_queries, n_runs, p, s, ratio));
+            rows.push((id.to_string(), n_queries, n_runs, p, p_tail, s, s_tail, ratio));
         }
         rows.sort_by(|a, b| {
-            b.5.partial_cmp(&a.5)
+            b.7.partial_cmp(&a.7)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.0.cmp(&b.0))
         });
-        for (id, nq, nr, p, s, ratio) in rows {
+        for (id, nq, nr, p, p_tail, s, s_tail, ratio) in rows {
             writeln!(
                 out,
-                "| `{id}` | {nq} | {nr} | {p:.2} | {s:.2} | {ratio:.2}× |",
+                "| `{id}` | {nq} | {nr} | {p:.2} | {p_tail:.2} | {s:.2} | {s_tail:.2} | {ratio:.2}× |",
             )
             .unwrap();
         }
@@ -653,32 +914,51 @@ fn render_report(
             .strip_prefix(DEFAULT_DATA_DIR)
             .unwrap_or(&r.parquet)
             .display();
-        let mut rows: Vec<(f64, f64, f64, &str, &str)> = r
+        // (sql_over_promql_ratio, p_med, p_p99, s_med, s_p99, entry, query, sql_tail_ratio)
+        let mut rows: Vec<(f64, f64, f64, f64, f64, &str, &str, f64)> = r
             .queries
             .iter()
             .map(|s| {
-                let p = median(&s.promql_ms);
-                let q = median(&s.sql_ms);
-                let ratio = if p > 0.0 { q / p } else { f64::NAN };
-                (ratio, p, q, s.entry_id.as_str(), s.query.as_str())
+                let p_med = median(&s.promql_ms);
+                let p_tail = p99(&s.promql_ms);
+                let q_med = median(&s.sql_ms);
+                let q_tail = p99(&s.sql_ms);
+                let ratio = if p_med > 0.0 { q_med / p_med } else { f64::NAN };
+                let sql_tail_ratio = if q_med > 0.0 { q_tail / q_med } else { f64::NAN };
+                (
+                    ratio,
+                    p_med,
+                    p_tail,
+                    q_med,
+                    q_tail,
+                    s.entry_id.as_str(),
+                    s.query.as_str(),
+                    sql_tail_ratio,
+                )
             })
             .collect();
-        rows.retain(|(r, _, _, _, _)| r.is_finite());
+        rows.retain(|(r, _, _, _, _, _, _, _)| r.is_finite());
         if rows.is_empty() {
             continue;
         }
         rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         writeln!(out, "### `{name}` — worst SQL/PromQL\n").unwrap();
-        writeln!(out, "| ratio | PromQL ms | SQL ms | entry | query |").unwrap();
-        writeln!(out, "|---:|---:|---:|---|---|").unwrap();
-        for (ratio, p, q, id, query) in rows.iter().take(10) {
+        writeln!(
+            out,
+            "| ratio | PromQL p50 | PromQL p99 | SQL p50 | SQL p99 | entry | query |"
+        )
+        .unwrap();
+        writeln!(out, "|---:|---:|---:|---:|---:|---|---|").unwrap();
+        for (ratio, p_med, p_tail, q_med, q_tail, id, query, _) in rows.iter().take(10) {
             writeln!(
                 out,
-                "| {:.2}× | {:.2} | {:.2} | `{}` | `{}` |",
+                "| {:.2}× | {:.2} | {:.2} | {:.2} | {:.2} | `{}` | `{}` |",
                 ratio,
-                p,
-                q,
+                p_med,
+                p_tail,
+                q_med,
+                q_tail,
                 id,
                 truncate(query, 100),
             )
@@ -687,22 +967,178 @@ fn render_report(
         writeln!(out).unwrap();
 
         writeln!(out, "### `{name}` — best SQL/PromQL (SQL wins)\n").unwrap();
-        writeln!(out, "| ratio | PromQL ms | SQL ms | entry | query |").unwrap();
-        writeln!(out, "|---:|---:|---:|---|---|").unwrap();
-        for (ratio, p, q, id, query) in rows.iter().rev().take(10) {
+        writeln!(
+            out,
+            "| ratio | PromQL p50 | PromQL p99 | SQL p50 | SQL p99 | entry | query |"
+        )
+        .unwrap();
+        writeln!(out, "|---:|---:|---:|---:|---:|---|---|").unwrap();
+        for (ratio, p_med, p_tail, q_med, q_tail, id, query, _) in rows.iter().rev().take(10) {
             writeln!(
                 out,
-                "| {:.2}× | {:.2} | {:.2} | `{}` | `{}` |",
+                "| {:.2}× | {:.2} | {:.2} | {:.2} | {:.2} | `{}` | `{}` |",
                 ratio,
-                p,
-                q,
+                p_med,
+                p_tail,
+                q_med,
+                q_tail,
                 id,
                 truncate(query, 100),
             )
             .unwrap();
         }
         writeln!(out).unwrap();
+
+        // Tail-spike view: same query data, sorted by SQL p99/p50 within
+        // a single query (intra-query spread). Surfaces shapes whose
+        // median is fine but whose p99 isn't — invisible in the
+        // cross-engine ratio view above.
+        let mut tail_rows = rows.clone();
+        tail_rows.retain(|(_, _, _, _, _, _, _, t)| t.is_finite());
+        tail_rows.sort_by(|a, b| b.7.partial_cmp(&a.7).unwrap_or(std::cmp::Ordering::Equal));
+        if !tail_rows.is_empty() {
+            writeln!(out, "### `{name}` — worst SQL p99/p50 (intra-query tail)\n").unwrap();
+            writeln!(
+                out,
+                "| p99/p50 | SQL p50 | SQL p99 | sql/promql | entry | query |"
+            )
+            .unwrap();
+            writeln!(out, "|---:|---:|---:|---:|---|---|").unwrap();
+            for (ratio, _, _, q_med, q_tail, id, query, tail_ratio) in tail_rows.iter().take(10) {
+                writeln!(
+                    out,
+                    "| {:.2}× | {:.2} | {:.2} | {:.2}× | `{}` | `{}` |",
+                    tail_ratio,
+                    q_med,
+                    q_tail,
+                    ratio,
+                    id,
+                    truncate(query, 100),
+                )
+                .unwrap();
+            }
+            writeln!(out).unwrap();
+        }
     }
+
+    out
+}
+
+fn render_concurrent_report(
+    runs: &[ConcurrentRun],
+    failures: &[FixtureFailure],
+    duration: Duration,
+    query_count: usize,
+) -> String {
+    let mut out = String::new();
+
+    writeln!(out, "# Concurrent-load bench — PromQL vs DuckDB\n").unwrap();
+    writeln!(
+        out,
+        "**Duration per sweep**: {} s",
+        duration.as_secs_f64() as u64
+    )
+    .unwrap();
+    writeln!(out, "**Queries in workload**: {query_count}").unwrap();
+    writeln!(
+        out,
+        "**Fixtures**: {} measured, {} failed cold-start\n",
+        runs.len(),
+        failures.len()
+    )
+    .unwrap();
+
+    if !failures.is_empty() {
+        writeln!(out, "## Fixtures that failed cold-start\n").unwrap();
+        writeln!(out, "| fixture | phase | message |").unwrap();
+        writeln!(out, "|---|---|---|").unwrap();
+        for f in failures {
+            writeln!(
+                out,
+                "| `{}` | `{}` | {} |",
+                f.parquet.display(),
+                f.phase,
+                truncate(&f.message, 200),
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
+    for r in runs {
+        let name = r
+            .parquet
+            .strip_prefix(DEFAULT_DATA_DIR)
+            .unwrap_or(&r.parquet)
+            .display();
+        writeln!(out, "## `{name}`\n").unwrap();
+        writeln!(
+            out,
+            "_pre-flight admitted {} of {} queries. Each sweep runs two independent thread pools sequentially — `threads` PromQL workers, then `threads` SQL workers — so per-engine throughput is decoupled. Cold-start: tsdb_load={:.0}ms, duck_open={:.0}ms, duck_register={:.0}ms, duck_views={:.0}ms._\n",
+            r.plan_count,
+            query_count,
+            r.cold.tsdb_load_ms,
+            r.cold.duck_open_ms,
+            r.cold.duck_register_ms,
+            r.cold.duck_views_ms,
+        )
+        .unwrap();
+
+        // Per-engine throughput / latency table. Sweep rows are
+        // ordered by thread count.
+        writeln!(
+            out,
+            "| threads | engine | total | actual s | qps | scaling vs N=1 | p50 (ms) | p99 (ms) |"
+        )
+        .unwrap();
+        writeln!(out, "|---:|---|---:|---:|---:|---:|---:|---:|").unwrap();
+        let baseline = r.sweeps.first();
+        let base_promql = baseline.map(|s| s.promql_qps).unwrap_or(0.0);
+        let base_sql = baseline.map(|s| s.sql_qps).unwrap_or(0.0);
+        for s in &r.sweeps {
+            let p_scale = if base_promql > 0.0 {
+                format!("{:.2}×", s.promql_qps / base_promql)
+            } else {
+                "—".to_string()
+            };
+            let s_scale = if base_sql > 0.0 {
+                format!("{:.2}×", s.sql_qps / base_sql)
+            } else {
+                "—".to_string()
+            };
+            writeln!(
+                out,
+                "| {} | PromQL | {} | {:.2} | {:.1} | {} | {:.2} | {:.2} |",
+                s.threads,
+                s.promql_total,
+                s.duration_s,
+                s.promql_qps,
+                p_scale,
+                s.promql_p50,
+                s.promql_p99,
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "| {} | SQL | {} | {:.2} | {:.1} | {} | {:.2} | {:.2} |",
+                s.threads,
+                s.sql_total,
+                s.duration_s,
+                s.sql_qps,
+                s_scale,
+                s.sql_p50,
+                s.sql_p99,
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
+    writeln!(
+        out,
+        "_Linear scaling means `scaling vs N=1` matches the thread count. A 2× factor at N=8 means contention or shared-state serialization is the bottleneck — most likely the per-fixture `Mutex<Connection>` in `metriken-query-sql/src/backend.rs`._\n"
+    )
+    .unwrap();
 
     out
 }
@@ -764,21 +1200,85 @@ fn main() -> std::io::Result<()> {
 
     let reps = args.reps.unwrap_or(DEFAULT_REPS);
     let warmup_passes = args.warmup_passes.unwrap_or(DEFAULT_WARMUP_PASSES);
+    let concurrent_secs = args.concurrent_secs.unwrap_or(DEFAULT_CONCURRENT_SECS);
 
     eprintln!(
         "loaded {} queries from {}",
         queries.len(),
         queries_file.display()
     );
+
+    let cat = Catalogue::embedded();
+    let t_total = Instant::now();
+
+    if let Some(thread_counts) = args.concurrent.as_ref() {
+        // Concurrent-load mode: throughput / latency under N-thread
+        // pressure. Replaces the sequential bench for this run; the
+        // caller can invoke without --concurrent to get the regular
+        // per-query data.
+        let duration = Duration::from_secs(concurrent_secs);
+        let counts_str: Vec<String> = thread_counts.iter().map(|n| n.to_string()).collect();
+        eprintln!(
+            "concurrent mode: {} fixtures × thread counts [{}] × {}s each",
+            parquets.len(),
+            counts_str.join(","),
+            concurrent_secs,
+        );
+
+        let mut runs: Vec<ConcurrentRun> = Vec::new();
+        let mut failures: Vec<FixtureFailure> = Vec::new();
+        for p in &parquets {
+            eprintln!("--- {} ---", p.display());
+            let t0 = Instant::now();
+            match run_concurrent_fixture(p, &queries, &cat, thread_counts, duration) {
+                Ok(run) => {
+                    eprintln!(
+                        "    pre-flight admitted {} queries; sweeps:",
+                        run.plan_count
+                    );
+                    for s in &run.sweeps {
+                        eprintln!(
+                            "      n={:>3} promql={:>6.1}qps p50={:>6.2}ms p99={:>7.2}ms | sql={:>6.1}qps p50={:>6.2}ms p99={:>7.2}ms",
+                            s.threads,
+                            s.promql_qps, s.promql_p50, s.promql_p99,
+                            s.sql_qps, s.sql_p50, s.sql_p99,
+                        );
+                    }
+                    eprintln!("    elapsed={:.1}s", t0.elapsed().as_secs_f64());
+                    runs.push(run);
+                }
+                Err(failure) => {
+                    eprintln!(
+                        "    FAILED in {} after {:.1}s: {}",
+                        failure.phase,
+                        t0.elapsed().as_secs_f64(),
+                        failure.message,
+                    );
+                    failures.push(failure);
+                }
+            }
+        }
+        eprintln!(
+            "--- total elapsed {:.1}s ---",
+            t_total.elapsed().as_secs_f64()
+        );
+
+        let report = render_concurrent_report(&runs, &failures, duration, queries.len());
+        if let Some(out) = args.out.as_ref() {
+            fs::write(out, &report)?;
+            eprintln!("wrote report to {}", out.display());
+        } else {
+            print!("{report}");
+        }
+        return Ok(());
+    }
+
     eprintln!(
         "benchmarking {} parquet fixtures, reps={reps}, warmup_passes={warmup_passes}",
         parquets.len()
     );
-
-    let cat = Catalogue::embedded();
     let mut runs = Vec::new();
     let mut failures: Vec<FixtureFailure> = Vec::new();
-    let t_total = Instant::now();
     for p in &parquets {
         eprintln!("--- {} ---", p.display());
         let t0 = Instant::now();
