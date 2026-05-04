@@ -723,7 +723,14 @@ fn try_histogram(
     let p = catalog.histogram_p_by_metric.get(metric).copied()?;
 
     // Build `buckets_expr`: for one column, just project it directly;
-    // for many, use `h2_combine([c0, c1, ...])`.
+    // for many, call `h2_combine(c0, c1, ...)` variadically. The older
+    // `h2_combine([c0, c1, ...])` (LIST<LIST>) shape panicked at the
+    // STANDARD_VECTOR_SIZE=2048 boundary when N > 1 because duckdb-rs
+    // bounds-checks the inner vector's `get_entry` against a hardcoded
+    // 2048 capacity even though the actual inner content extends to
+    // 2048×N. The variadic shape gives each input its own top-level
+    // ListVector and sidesteps the inner-bound entirely. See
+    // `metriken-query-sql/src/udf.rs::H2CombineUdf` preamble.
     let buckets_expr = if series.len() == 1 {
         let phys = series[0].physical.replace('"', "\"\"");
         format!("\"{phys}\"")
@@ -735,19 +742,37 @@ fn try_histogram(
                 format!("\"{phys}\"")
             })
             .collect();
-        format!("h2_combine([{}])", cols.join(", "))
+        format!("h2_combine({})", cols.join(", "))
     };
 
-    // Per-tick delta uses LAG over timestamp.
-    let delta_expr = format!(
-        "h2_delta({buckets_expr}, LAG({buckets_expr}) OVER w)"
+    // Per-tick delta. Materialise the (possibly h2_combine'd) bucket
+    // list in a CTE keyed on a ROW_NUMBER, then self-join on rn-1 to
+    // pair each tick with its predecessor. This sidesteps a known
+    // duckdb-rs bug where `LAG(list_expr) OVER w` on Parquet-backed
+    // list columns indexes past the chunk boundary at exactly
+    // STANDARD_VECTOR_SIZE = 2048 rows (panics
+    // `index out of bounds: the len is 2048 but the index is 2048`
+    // inside duckdb-rs's vector code, originating in a UDF callback —
+    // i.e. non-unwinding, can't be caught by the backend's
+    // catch_unwind boundary). The ROW_NUMBER self-join doesn't depend
+    // on knowing the sampling interval, so it works for any cadence
+    // the parquet was recorded at. h2_delta with a NULL second arg
+    // (the first row's missing predecessor) returns NULL, matching
+    // LAG's semantic on the first row.
+    let combined_prelude = format!(
+        "WITH combined AS (\n  \
+            SELECT timestamp, {buckets_expr} AS buckets, \
+                   ROW_NUMBER() OVER (ORDER BY timestamp) AS rn FROM _src\n\
+         ),\n\
+         per_tick AS (\n  \
+            SELECT a.timestamp, h2_delta(a.buckets, b.buckets) AS d\n  \
+            FROM combined a LEFT JOIN combined b ON b.rn = a.rn - 1\n\
+         )"
     );
 
     match op {
         HistOp::Quantile { q } => Some(format!(
-            "WITH per_tick AS (\n  \
-                SELECT timestamp, {delta_expr} AS d FROM _src WINDOW w AS (ORDER BY timestamp)\n\
-             )\n\
+            "{combined_prelude}\n\
              SELECT t, v FROM (\n  \
                 SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, \
                        CAST(h2_quantile(d, {q}, {p}) AS DOUBLE) AS v\n  \
@@ -767,10 +792,19 @@ fn try_histogram(
                 .map(|(i, q)| format!("({}, '{q}')", i + 1))
                 .collect();
             let values_lit = values.join(", ");
+            // Quantiles needs a slightly different per_tick projection
+            // — h2_quantiles instead of h2_delta + h2_quantile — so we
+            // open the CTE chain inline rather than reusing
+            // `combined_prelude`. The `combined` CTE is the same.
             Some(format!(
-                "WITH walked AS (\n  \
-                    SELECT timestamp, h2_quantiles({delta_expr}, {qs_lit}, {p}) AS qs \n  \
-                    FROM _src WINDOW w AS (ORDER BY timestamp)\n\
+                "WITH combined AS (\n  \
+                    SELECT timestamp, {buckets_expr} AS buckets, \
+                           ROW_NUMBER() OVER (ORDER BY timestamp) AS rn FROM _src\n\
+                 ),\n\
+                 walked AS (\n  \
+                    SELECT a.timestamp, \
+                           h2_quantiles(h2_delta(a.buckets, b.buckets), {qs_lit}, {p}) AS qs\n  \
+                    FROM combined a LEFT JOIN combined b ON b.rn = a.rn - 1\n\
                  )\n\
                  SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, \
                         CAST(qs[q.idx] AS DOUBLE) AS v, q.label AS quantile\n\
@@ -779,9 +813,7 @@ fn try_histogram(
             ))
         }
         HistOp::Heatmap => Some(format!(
-            "WITH per_tick AS (\n  \
-                SELECT timestamp, {delta_expr} AS d FROM _src WINDOW w AS (ORDER BY timestamp)\n\
-             )\n\
+            "{combined_prelude}\n\
              SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, \
                     (u.ordinal - 1)::INTEGER AS bucket_idx, \
                     u.value::DOUBLE AS count, \

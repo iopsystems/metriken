@@ -497,8 +497,29 @@ impl VScalar for H2QuantilesUdf {
     }
 }
 
-// ----- h2_combine(LIST<UBIGINT[]>) -> UBIGINT[] -----
-// Element-wise sum. Output length = max input length encountered.
+// ----- h2_combine(LIST<UBIGINT>, ...) -> UBIGINT[] -----
+// Variadic: takes 1..MAX_COMBINE_ARITY LIST<UBIGINT> arguments and
+// returns their element-wise sum (saturating). Output length per row =
+// max length across all input lists for that row.
+//
+// Why variadic and not `LIST<LIST<UBIGINT>>` (the previous shape):
+//
+//   The LIST<LIST> form forced us through `outer.list_child()` which
+//   returns the *inner* list vector. duckdb-rs wraps that inner vector
+//   in a `FlatVector` whose capacity is hardcoded to STANDARD_VECTOR_SIZE
+//   = 2048 (see the `from_raw` constructor in core/vector.rs). The
+//   inner's actual content can vastly exceed 2048 entries — for an
+//   input chunk of 2048 rows × N inner-lists-per-row, the inner has
+//   2048*N entries — but `inner.get_entry(idx)` is bounds-checked
+//   against the 2048 capacity and panics for any idx >= 2048. With
+//   N=16 (e.g. multi-`op` syscall_latency) the panic triggers at row
+//   128. The panic comes from a UDF callback so it's non-unwinding —
+//   the backend's catch_unwind boundary cannot contain it.
+//
+//   Each top-level LIST<UBIGINT> arg has its own ListVector with its
+//   own capacity bound, sized to fit the row count, and `get_entry(r)`
+//   stays in-bounds for r < n <= 2048.
+const MAX_COMBINE_ARITY: usize = 32;
 
 pub struct H2CombineUdf;
 impl VScalar for H2CombineUdf {
@@ -509,54 +530,68 @@ impl VScalar for H2CombineUdf {
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let n = input.len();
-        let outer = input.list_vector(0);
-        let inner = outer.list_child();
-        let leaf_n = inner.len();
-        let leaf = inner.child(0).as_slice_with_len::<u64>(leaf_n).to_vec();
+        let ncols = input.num_columns();
 
-        // First pass: max inner length per outer row → output width per row.
-        let mut row_widths = Vec::with_capacity(n);
-        for r in 0..n {
-            let (oo, ol) = outer.get_entry(r);
-            let mut w = 0usize;
-            for i in 0..ol {
-                let (_, il) = inner.get_entry(oo + i);
-                if il > w { w = il; }
-            }
-            row_widths.push(w);
-        }
-        let total_out: usize = row_widths.iter().sum();
-        if total_out > MAX_BUCKET_COUNT * n {
-            return Err(format!("h2_combine: output too large ({total_out})").into());
+        // Snapshot each column's child data once, the same shape
+        // h2_delta uses (no `child(N)` reserve calls — those zero
+        // input data past STANDARD_VECTOR_SIZE per the documented
+        // duckdb-rs interaction in this file's preamble).
+        let mut col_data: Vec<Vec<u64>> = Vec::with_capacity(ncols);
+        let mut col_lens: Vec<usize> = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            let lv = input.list_vector(c);
+            let leaf_n = lv.len();
+            col_data.push(lv.child(0).as_slice_with_len::<u64>(leaf_n).to_vec());
+            col_lens.push(leaf_n);
         }
 
-        let mut out_lv = output.list_vector();
-        let mut out_child = out_lv.child(total_out);
-        let out_data = out_child.as_mut_slice_with_len::<u64>(total_out);
-        for v in out_data.iter_mut() { *v = 0; }
-
-        let mut dst_base = 0usize;
-        for r in 0..n {
-            let (oo, ol) = outer.get_entry(r);
-            let w = row_widths[r];
-            for i in 0..ol {
-                let (io, il) = inner.get_entry(oo + i);
-                for j in 0..il {
-                    out_data[dst_base + j] =
-                        out_data[dst_base + j].saturating_add(leaf[io + j]);
+        // Two-pass list output. For each row r, look up every input
+        // column's (offset, length) and remember them; the output
+        // length is the max across columns. Sum element-wise in pass 2.
+        write_list_output(
+            n,
+            output,
+            |r| {
+                // Collect (offset, length) per column for this row,
+                // bailing to NULL if any column has a malformed entry.
+                let mut entries = Vec::with_capacity(ncols);
+                let mut max_len = 0usize;
+                for c in 0..ncols {
+                    let lv = input.list_vector(c);
+                    let (off, len) = list_entry(&lv, r, col_lens[c])?;
+                    if len > max_len {
+                        max_len = len;
+                    }
+                    entries.push((off, len));
                 }
-            }
-            out_lv.set_entry(r, dst_base, w);
-            dst_base += w;
-        }
-        out_lv.set_len(total_out);
+                Some((max_len, entries))
+            },
+            |entries, dst| {
+                for slot in dst.iter_mut() {
+                    *slot = 0;
+                }
+                for (c, (off, len)) in entries.iter().enumerate() {
+                    let data = &col_data[c];
+                    for j in 0..*len {
+                        dst[j] = dst[j].saturating_add(data[off + j]);
+                    }
+                }
+            },
+        );
         Ok(())
     }
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeHandle::list(&ubig_list())],
-            ubig_list(),
-        )]
+        // Register signatures for arities 1..=MAX_COMBINE_ARITY. The
+        // UDF body inspects `input.num_columns()` at runtime to
+        // dispatch on actual arity. 32 covers every multi-series
+        // histogram in the Rezolus catalogue today (e.g. syscall_latency
+        // has 16 ops, well under the cap) with headroom.
+        (1..=MAX_COMBINE_ARITY)
+            .map(|n| {
+                let args: Vec<LogicalTypeHandle> = (0..n).map(|_| ubig_list()).collect();
+                ScalarFunctionSignature::exact(args, ubig_list())
+            })
+            .collect()
     }
 }
 
