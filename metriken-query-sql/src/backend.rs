@@ -51,10 +51,27 @@ use crate::views::MetricCatalog;
 /// `_src` TEMP TABLE, and prepared-statement cache; checkout is
 /// lockless via a round-robin atomic counter, so contention only
 /// arises when concurrent requests > pool size.
+///
+/// Each slot is `Mutex<Option<Connection>>` rather than
+/// `Mutex<Connection>`. A slot can be **empty** in two cases:
+/// 1. After a panic inside DuckDB query execution — we
+///    `catch_unwind` at the `run` boundary and clear the slot so
+///    its (possibly inconsistent) connection state isn't reused.
+/// 2. Lazy rebuild path — a fresh connection is built on the next
+///    checkout when the slot is `None`.
+///
+/// Crucially, because we catch the panic **before** the lock guard
+/// is dropped, the `Mutex` itself is never poisoned: peer slots in
+/// the pool keep serving without any cross-slot fallout. With the
+/// pool sized to expected concurrency, one bad query loses its own
+/// response and (briefly) one slot, not the whole process.
 struct ConnState {
-    pool: Vec<Mutex<Connection>>,
+    pool: Vec<Mutex<Option<Connection>>>,
     next: AtomicUsize,
     catalog: MetricCatalog,
+    /// Captured at backend-construction time; needed when a slot
+    /// post-panic rebuilds, since `pool_size` lives on the backend.
+    pool_size: usize,
 }
 
 /// Default DuckDB-backed implementation of `SqlBackend`. Lazily builds
@@ -118,58 +135,23 @@ impl DuckDbBackend {
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
 
-        let mut pool: Vec<Mutex<Connection>> = Vec::with_capacity(self.pool_size);
+        let mut pool: Vec<Mutex<Option<Connection>>> = Vec::with_capacity(self.pool_size);
         let mut catalog: Option<MetricCatalog> = None;
-        let (mut total_open_ms, mut total_register_ms, mut total_views_ms) = (0.0, 0.0, 0.0);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
 
         for _ in 0..self.pool_size {
-            let s0 = std::time::Instant::now();
-            let conn = Connection::open_in_memory()
-                .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
-            // Default prepared-statement cache is 16; bump it so the catalogue
-            // (~70 distinct shapes) plus per-label-value variants all fit
-            // and stay parsed/planned across repeat queries from the viewer.
-            // Each cached Statement is small (planning artifacts only).
-            conn.set_prepared_statement_cache_capacity(1024);
-            // When pooling, cap DuckDB's intra-query worker threads to
-            // 1: we are already achieving parallelism at the pool
-            // level. pool_size connections × DuckDB's default of N
-            // internal workers per query oversubscribes the box
-            // (e.g. 4 slots × 4 internal workers = 16 threads on 4
-            // cores), causing context-switch storms that show up as
-            // a *regression* at N ≈ pool_size in the concurrent
-            // bench. With pool_size=1 (single-connection mode) we
-            // leave DuckDB's intra-query parallelism alone — that's
-            // the only way a single request gets multi-core.
-            if self.pool_size > 1 {
-                conn.execute("PRAGMA threads=1", [])
-                    .map_err(|e| SqlError::Backend(format!("pragma threads: {e}")))?;
-            }
-            let t_open = s0.elapsed();
-            crate::register_all(&conn)
-                .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
-            let t_register = s0.elapsed() - t_open;
-            let cat = crate::views::ensure_views(&conn, data_source)
-                .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
-            let t_views = s0.elapsed() - t_open - t_register;
-            total_open_ms += ms(t_open);
-            total_register_ms += ms(t_register);
-            total_views_ms += ms(t_views);
+            let (conn, cat) = build_slot_connection(self.pool_size, data_source)?;
             if catalog.is_none() {
                 catalog = Some(cat);
             }
-            pool.push(Mutex::new(conn));
+            pool.push(Mutex::new(Some(conn)));
         }
 
         if timing {
             eprintln!(
-                "duckdb cold-start data_source={} pool_size={} (sum across slots: open={:.1}ms reg={:.1}ms views={:.1}ms wall={:.1}ms)",
+                "duckdb cold-start data_source={} pool_size={} wall={:.1}ms",
                 data_source,
                 self.pool_size,
-                total_open_ms,
-                total_register_ms,
-                total_views_ms,
                 ms(t0.elapsed()),
             );
         }
@@ -178,10 +160,48 @@ impl DuckDbBackend {
             pool,
             next: AtomicUsize::new(0),
             catalog: catalog.expect("pool_size >= 1 → catalog set"),
+            pool_size: self.pool_size,
         });
         map.insert(data_source.to_string(), state.clone());
         Ok((state, true))
     }
+}
+
+/// Build one pool slot's connection: open the in-memory DB, set the
+/// statement-cache capacity, register UDFs/macros, build the
+/// `_src` TEMP TABLE. Returns the `Connection` and the
+/// `MetricCatalog` it yielded (only the first slot's catalog is
+/// kept on `ConnState`; the rest are discarded since they're
+/// identical Rust-side metadata).
+fn build_slot_connection(
+    pool_size: usize,
+    data_source: &str,
+) -> Result<(Connection, MetricCatalog), SqlError> {
+    let conn = Connection::open_in_memory()
+        .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
+    // Default prepared-statement cache is 16; bump it so the catalogue
+    // (~70 distinct shapes) plus per-label-value variants all fit
+    // and stay parsed/planned across repeat queries from the viewer.
+    // Each cached Statement is small (planning artifacts only).
+    conn.set_prepared_statement_cache_capacity(1024);
+    // When pooling, cap DuckDB's intra-query worker threads to 1: we
+    // are already achieving parallelism at the pool level. pool_size
+    // connections × DuckDB's default of N internal workers per query
+    // oversubscribes the box (e.g. 4 slots × 4 internal workers = 16
+    // threads on 4 cores), causing context-switch storms that show up
+    // as a *regression* at N ≈ pool_size in the concurrent bench.
+    // With pool_size=1 (single-connection mode) we leave DuckDB's
+    // intra-query parallelism alone — that's the only way a single
+    // request gets multi-core.
+    if pool_size > 1 {
+        conn.execute("PRAGMA threads=1", [])
+            .map_err(|e| SqlError::Backend(format!("pragma threads: {e}")))?;
+    }
+    crate::register_all(&conn)
+        .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
+    let cat = crate::views::ensure_views(&conn, data_source)
+        .map_err(|e| SqlError::Backend(format!("create metric views: {e}")))?;
+    Ok((conn, cat))
 }
 
 impl Default for DuckDbBackend {
@@ -221,16 +241,57 @@ impl TraitSqlBackend for DuckDbBackend {
         // natural place to record lock-acquire wait time per slot if
         // we want to surface contention as the catalogue grows.
         let idx = state.next.fetch_add(1, Ordering::Relaxed) % state.pool.len();
-        let conn = state.pool[idx].lock().expect("poisoned");
+        // The slot's mutex is never poisoned: we catch_unwind below
+        // *inside* the lock guard, so a UDF/SQL panic doesn't
+        // unwind through the lock release. `expect` here is therefore
+        // a real bug-or-OOM signal, not a normal-failure path.
+        let mut slot = state.pool[idx].lock().expect("slot mutex poisoned");
+
+        // Lazy rebuild: a previous request on this slot panicked
+        // (catch_unwind below cleared the slot) — build a fresh
+        // connection now. Cold-start cost is paid by the unlucky
+        // caller that lands on the empty slot, which is the desired
+        // behavior: the rest of the pool kept serving uninterrupted.
+        if slot.is_none() {
+            let (conn, _cat) = build_slot_connection(state.pool_size, data_source)?;
+            *slot = Some(conn);
+        }
 
         let timing = std::env::var("METRIKEN_SQL_TIMING").is_ok();
         let t0 = std::time::Instant::now();
 
-        let result = match entry.output_shape {
-            OutputShape::Matrix => run_matrix(&conn, entry, captures, &sql, timing),
-            OutputShape::Heatmap => run_heatmap(&conn, entry, &sql, timing),
-        };
+        // catch_unwind boundary. DuckDB's intra-query execution can
+        // panic at chunk boundaries (e.g. the documented LAG-on-list
+        // class of bugs in `udf.rs`). Pre-pool, such a panic aborted
+        // the process — bad but only one in-flight request died. With
+        // the pool, that blast radius would extend to *every*
+        // concurrent request. Catching here surfaces the panic as
+        // `SqlError::Backend` for the offending request only, drops
+        // the slot's connection (its internal state may be
+        // inconsistent), and lets the next checkout rebuild it.
+        // Other slots in the pool are unaffected.
+        let conn_ref = slot.as_ref().expect("just-initialised slot");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match entry.output_shape {
+                OutputShape::Matrix => run_matrix(conn_ref, entry, captures, &sql, timing),
+                OutputShape::Heatmap => run_heatmap(conn_ref, entry, &sql, timing),
+            }
+        }));
         let t_exec = t0.elapsed();
+
+        let result = match result {
+            Ok(r) => r,
+            Err(payload) => {
+                // Drop the slot's connection — its prepared-statement
+                // cache and internal state may be inconsistent.
+                *slot = None;
+                let msg = panic_message(&payload);
+                Err(SqlError::Backend(format!(
+                    "internal SQL panic on entry {} (slot {}): {msg}",
+                    entry.id, idx
+                )))
+            }
+        };
 
         if timing {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -244,6 +305,20 @@ impl TraitSqlBackend for DuckDbBackend {
         }
 
         result
+    }
+}
+
+/// Best-effort extraction of a printable message from a panic payload.
+/// `Box<dyn Any + Send>` carries the `panic!()` argument, which is
+/// usually a `&'static str` or a `String`; a few panics carry other
+/// types and we fall back to a generic label rather than guessing.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
