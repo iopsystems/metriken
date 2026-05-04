@@ -2185,9 +2185,20 @@ fn build_rates_chain(
                     }
                 })
                 .collect();
+            // `RANGE` (not `ROWS`) so the window is *time*-based, not
+            // row-based — matching PromQL's `[5m]` semantic. With the
+            // previous `ROWS BETWEEN {range_secs} PRECEDING`, sparse-
+            // sampled metrics (e.g. `requests` on the LLM-perf
+            // recordings, where samples occur only when requests
+            // happen, not 1 Hz) saw a different window span on each
+            // side: PromQL bounded by 300 s of time, SQL by the
+            // previous 300 rows (which can span far more or far less
+            // than 300 s). `timestamp` is BIGINT nanoseconds, so the
+            // range constant is `range_secs * 1e9`.
+            let range_ns: i64 = (range_secs as i64) * 1_000_000_000;
             let cte = format!(
                 "{per_pair_name} AS (\n  SELECT timestamp{per_pair_cols}{extra_cols}\n  FROM _src\n  WINDOW w AS (ORDER BY timestamp)\n),\n\
-                 {rates_name} AS (\n  SELECT timestamp{rates_cols}{extra_forward}\n  FROM {per_pair_name}\n  WINDOW w AS (ORDER BY timestamp ROWS BETWEEN {range_secs} PRECEDING AND CURRENT ROW)\n)"
+                 {rates_name} AS (\n  SELECT timestamp{rates_cols}{extra_forward}\n  FROM {per_pair_name}\n  WINDOW w AS (ORDER BY timestamp RANGE BETWEEN {range_ns} PRECEDING AND CURRENT ROW)\n)"
             );
             (cte, rates_name)
         }
