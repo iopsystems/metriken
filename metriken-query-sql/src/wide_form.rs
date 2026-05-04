@@ -430,11 +430,141 @@ fn resolve_binary<'a>(entry: &'a CatalogueEntry, captures: &'a Captures) -> Opti
     }
 }
 
+/// Fast path: both lanes use IrateRate + Sum + no group_label + no
+/// cpu_cores_div. Emit a single rates CTE that projects both lanes'
+/// per-column irate values and combines them inline. Eliminates the
+/// HASH_JOIN of the two-CTE form, halves the WINDOW operator passes,
+/// and avoids the OR-of-IS-NOT-NULL filter that DuckDB compiles into
+/// a re-evaluation of `irate_lag` (the rates CTE inlines and the
+/// FILTER recomputes the UDF per column). Measured ~28% faster on
+/// the 30-cols-per-lane `counter_irate_ratio_with_labels` shape.
+fn generate_binary_fused(catalog: &MetricCatalog, binary: &Binary) -> Option<String> {
+    // Constraints: every binary entry today that uses Sum + IrateRate +
+    // no group_label fits — see resolve_binary. Group-by entries hit the
+    // slow path (per-g UNNEST is harder to fuse cleanly).
+    if binary.a.aggregation != Aggregation::Sum || binary.b.aggregation != Aggregation::Sum {
+        return None;
+    }
+    if !matches!(binary.a.expr, PerColExpr::IrateRate)
+        || !matches!(binary.b.expr, PerColExpr::IrateRate)
+    {
+        return None;
+    }
+    if binary.a.group_label.is_some() || binary.b.group_label.is_some() {
+        return None;
+    }
+    if binary.a.cpu_cores_div || binary.b.cpu_cores_div {
+        return None;
+    }
+    if binary.a.scale != 1.0 || binary.b.scale != 1.0 {
+        return None;
+    }
+
+    let a_filter = coerce_literal_regex(&binary.a.filter)?;
+    let b_filter = coerce_literal_regex(&binary.b.filter)?;
+    let a_series = catalog.series_by_metric.get(binary.a.metric);
+    let b_series = catalog.series_by_metric.get(binary.b.metric);
+
+    // Empty-result short-circuit when either side has no data — same as
+    // the slow path.
+    let (a_series, b_series) = match (a_series, b_series) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Some(empty_binary_sql(None)),
+    };
+    let a_matching: Vec<&MetricSeries> = a_series
+        .iter()
+        .filter(|s| matches_all(s, &a_filter))
+        .collect();
+    let b_matching: Vec<&MetricSeries> = b_series
+        .iter()
+        .filter(|s| matches_all(s, &b_filter))
+        .collect();
+    if a_matching.is_empty() || b_matching.is_empty() {
+        return Some(empty_binary_sql(None));
+    }
+    if a_matching.len() + b_matching.len() > WIDE_FORM_MAX_COLS {
+        // Combined width above the wide-form limit — defer to the slow
+        // path which can handle it via long-form fallback signals.
+        return None;
+    }
+
+    let mut lag_lines: Vec<String> = Vec::with_capacity(a_matching.len() + b_matching.len());
+    let mut a_coalesce: Vec<String> = Vec::with_capacity(a_matching.len());
+    let mut a_any: Vec<String> = Vec::with_capacity(a_matching.len());
+    for (i, s) in a_matching.iter().enumerate() {
+        let phys = s.physical.replace('"', "\"\"");
+        lag_lines.push(format!(
+            "    irate_lag(\"{phys}\", LAG(\"{phys}\") OVER w, timestamp - LAG(timestamp) OVER w) AS a_{i}"
+        ));
+        a_coalesce.push(format!("COALESCE(a_{i}, 0)"));
+        a_any.push(format!("a_{i} IS NOT NULL"));
+    }
+    let mut b_coalesce: Vec<String> = Vec::with_capacity(b_matching.len());
+    let mut b_any: Vec<String> = Vec::with_capacity(b_matching.len());
+    for (i, s) in b_matching.iter().enumerate() {
+        let phys = s.physical.replace('"', "\"\"");
+        lag_lines.push(format!(
+            "    irate_lag(\"{phys}\", LAG(\"{phys}\") OVER w, timestamp - LAG(timestamp) OVER w) AS b_{i}"
+        ));
+        b_coalesce.push(format!("COALESCE(b_{i}, 0)"));
+        b_any.push(format!("b_{i} IS NOT NULL"));
+    }
+
+    // CASE wrapper preserves the slow-path semantic that a row is dropped
+    // when *all* underlying physical columns are NULL on that row (which
+    // happens on row 0 of every partition because LAG returns NULL there,
+    // and on sparse rows where every matching col is missing). For Div,
+    // NULLIF(b, 0) plus NULL propagation handles the drop downstream;
+    // for Sub/Add/Mul, the COALESCE(b, 0) inside the op keeps a-only rows
+    // alive (matches the slow path's LEFT JOIN behaviour).
+    let a_sum = format!(
+        "CASE WHEN {} THEN ({}) END",
+        a_any.join(" OR "),
+        a_coalesce.join(" + ")
+    );
+    let b_sum = format!(
+        "CASE WHEN {} THEN ({}) END",
+        b_any.join(" OR "),
+        b_coalesce.join(" + ")
+    );
+    let combine = match binary.op {
+        BinaryOp::Div => format!("({a_sum}) / NULLIF(({b_sum}), 0)"),
+        BinaryOp::Sub => format!("({a_sum}) - COALESCE(({b_sum}), 0)"),
+        BinaryOp::Add => format!("({a_sum}) + COALESCE(({b_sum}), 0)"),
+        BinaryOp::Mul => format!("({a_sum}) * COALESCE(({b_sum}), 0)"),
+    };
+    let combine_with_constant = match binary.leading_constant {
+        Some(c) => format!("({c} - ({combine}))"),
+        None => combine,
+    };
+    let div_expr = if binary.divisor == 1.0 {
+        String::new()
+    } else {
+        format!(" / {}", binary.divisor)
+    };
+    let mult_expr = if binary.multiplier == 1.0 {
+        String::new()
+    } else {
+        format!(" * {}", binary.multiplier)
+    };
+    let value_select = format!("({combine_with_constant}){div_expr}{mult_expr}");
+
+    Some(format!(
+        "WITH rates AS (\n  SELECT timestamp,\n{lags}\n  FROM _src\n  WINDOW w AS (ORDER BY timestamp)\n)\n\
+         SELECT CAST(timestamp AS DOUBLE) / 1e9 AS t, {value_select} AS v\n\
+         FROM rates",
+        lags = lag_lines.join(",\n"),
+    ))
+}
+
 /// Generate SQL for a binary shape: two unary lanes joined on
 /// `timestamp` (and on `group_label` when both lanes share one) and
 /// combined via the binary `op`. Both lanes use the same wide-form
 /// rates+sum CTE pattern as `generate`.
 fn generate_binary(catalog: &MetricCatalog, binary: &Binary) -> Option<String> {
+    if let Some(sql) = generate_binary_fused(catalog, binary) {
+        return Some(sql);
+    }
     let a_lane = build_lane(catalog, &binary.a, "a")?;
     let b_lane = build_lane(catalog, &binary.b, "b")?;
 
@@ -1738,8 +1868,17 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
         } else {
             String::new()
         };
+        // No `WHERE val_{i} IS NOT NULL` here: the Rust backend's
+        // `run_matrix` already skips NULL `v` rows (`backend.rs:261`),
+        // so the SQL filter is redundant. Worse, when the rates CTE
+        // gets inlined by DuckDB the WHERE predicate compiles to a
+        // re-evaluation of the per-column UDF (e.g. `irate_lag`) on
+        // top of the projection's evaluation. Dropping the filter
+        // saves one UDF call per row per matching column. Confirmed
+        // ~7-12% on `counter_rate_bare_generic` via the `examples/
+        // probe_rate_shape` micro-bench.
         unions.push_str(&format!(
-            "{prefix}SELECT timestamp, val_{i} AS v{label_proj} FROM {rates_name} WHERE val_{i} IS NOT NULL"
+            "{prefix}SELECT timestamp, val_{i} AS v{label_proj} FROM {rates_name}"
         ));
     }
 
