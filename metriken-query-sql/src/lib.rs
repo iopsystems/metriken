@@ -17,11 +17,13 @@ use duckdb::Connection;
 pub mod backend;
 pub mod interp;
 pub mod macros;
+pub mod observability;
 pub mod udf;
 pub mod views;
 pub mod wide_form;
 
 pub use backend::DuckDbBackend;
+pub use observability::{BackendStats, PhaseSnapshot, StatsSnapshot};
 
 /// Register all UDFs and macros on `conn`. Idempotent within a single
 /// connection (registrations use `CREATE OR REPLACE`).

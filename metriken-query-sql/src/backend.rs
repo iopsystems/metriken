@@ -39,10 +39,11 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{Array, Float64Array, StringArray};
 use duckdb::Connection;
 use metriken_query::{
-    CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, OutputShape,
+    CaptureValue, CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, OutputShape,
     QueryResult, SqlBackend as TraitSqlBackend, SqlError,
 };
 
+use crate::observability::BackendStats;
 use crate::views::MetricCatalog;
 
 /// Per-data-source state: a pool of independent in-memory DuckDB
@@ -72,6 +73,18 @@ struct ConnState {
     /// Captured at backend-construction time; needed when a slot
     /// post-panic rebuilds, since `pool_size` lives on the backend.
     pool_size: usize,
+    /// Cache of generated wide-form SQL keyed on
+    /// `(entry.id, hash(captures))`. The catalog is fixed for the
+    /// lifetime of this `ConnState`, so identical inputs always
+    /// produce identical SQL. Hit path skips the `format!`-heavy
+    /// SQL builder; the value is `Arc<str>` so it can be handed to
+    /// `prepare_cached` without copying.
+    ///
+    /// Sized at 256 entries — the production catalogue has ~70
+    /// shapes × per-label variants; if we exceed the cap we clear
+    /// the whole map (simpler and lower-overhead than LRU eviction
+    /// on every insert; rebuild cost is one `try_generate` call).
+    sql_cache: Mutex<HashMap<(String, u64), Arc<str>>>,
 }
 
 /// Default DuckDB-backed implementation of `SqlBackend`. Lazily builds
@@ -81,6 +94,7 @@ struct ConnState {
 pub struct DuckDbBackend {
     connections: Mutex<HashMap<String, Arc<ConnState>>>,
     pool_size: usize,
+    stats: Arc<BackendStats>,
 }
 
 /// Default pool size: `available_parallelism().min(8)`, with
@@ -112,7 +126,15 @@ impl DuckDbBackend {
         Self {
             connections: Mutex::new(HashMap::new()),
             pool_size: n.max(1),
+            stats: Arc::new(BackendStats::default()),
         }
+    }
+
+    /// Per-backend in-process counters. Lock-free; safe to read from
+    /// any thread. See `observability::StatsSnapshot::Display` for a
+    /// human-readable dump.
+    pub fn stats(&self) -> Arc<BackendStats> {
+        self.stats.clone()
     }
 
     /// Look up (or lazily build) the cached connection pool for
@@ -161,6 +183,7 @@ impl DuckDbBackend {
             next: AtomicUsize::new(0),
             catalog: catalog.expect("pool_size >= 1 → catalog set"),
             pool_size: self.pool_size,
+            sql_cache: Mutex::new(HashMap::with_capacity(64)),
         });
         map.insert(data_source.to_string(), state.clone());
         Ok((state, true))
@@ -220,32 +243,61 @@ impl TraitSqlBackend for DuckDbBackend {
         _end: f64,
         _step: f64,
     ) -> Result<QueryResult, SqlError> {
+        let t_total_start = std::time::Instant::now();
         let (state, cold) = self.get_or_init(data_source)?;
 
         // Wide-form is the only SQL path. Returns `None` only when the
         // entry id is unknown to the generator — in which case the
         // catalog has an entry we forgot to wire up. Surface that as a
         // hard error, since the long-form fallback is gone.
-        let sql = crate::wide_form::try_generate(entry, captures, &state.catalog).ok_or_else(
-            || SqlError::Backend(format!(
-                "entry {} has no wide-form generator (long-form fallback was removed)",
-                entry.id
-            )),
-        )?;
+        //
+        // SQL is a deterministic function of `(entry, captures, catalog)`;
+        // since the catalog is fixed for the life of this `ConnState`,
+        // we cache by `(entry.id, hash(captures))`. Hit path skips the
+        // ~5–15 KB `format!`-heavy builder entirely.
+        let t_gen_start = std::time::Instant::now();
+        let cache_key = (entry.id.clone(), hash_captures(captures));
+        let sql_arc: Arc<str> = {
+            let cache = state.sql_cache.lock().expect("sql_cache poisoned");
+            if let Some(arc) = cache.get(&cache_key) {
+                arc.clone()
+            } else {
+                // Drop lock around the SQL build — building can be
+                // multi-millisecond on wide shapes; we don't want to
+                // serialise other slots' lookups behind it.
+                drop(cache);
+                let sql = crate::wide_form::try_generate(entry, captures, &state.catalog)
+                    .ok_or_else(|| {
+                        SqlError::Backend(format!(
+                            "entry {} has no wide-form generator (long-form fallback was removed)",
+                            entry.id
+                        ))
+                    })?;
+                let arc: Arc<str> = Arc::from(sql.into_boxed_str());
+                let mut cache = state.sql_cache.lock().expect("sql_cache poisoned");
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+                cache.insert(cache_key.clone(), arc.clone());
+                arc
+            }
+        };
+        let sql: &str = &sql_arc;
+        self.stats.gen_sql.record(t_gen_start.elapsed().as_nanos() as u64);
 
         // Atomic round-robin pool checkout. With pool size N, up to N
         // concurrent requests proceed in parallel; the `% pool.len()`
         // is the only ordering needed (Relaxed is fine — we don't care
         // which slot a given request lands on, just that distribution
-        // is roughly uniform). NOTE for future telemetry: this is the
-        // natural place to record lock-acquire wait time per slot if
-        // we want to surface contention as the catalogue grows.
+        // is roughly uniform).
         let idx = state.next.fetch_add(1, Ordering::Relaxed) % state.pool.len();
         // The slot's mutex is never poisoned: we catch_unwind below
         // *inside* the lock guard, so a UDF/SQL panic doesn't
         // unwind through the lock release. `expect` here is therefore
         // a real bug-or-OOM signal, not a normal-failure path.
+        let t_lock_start = std::time::Instant::now();
         let mut slot = state.pool[idx].lock().expect("slot mutex poisoned");
+        self.stats.slot_lock.record(t_lock_start.elapsed().as_nanos() as u64);
 
         // Lazy rebuild: a previous request on this slot panicked
         // (catch_unwind below cleared the slot) — build a fresh
@@ -271,13 +323,15 @@ impl TraitSqlBackend for DuckDbBackend {
         // inconsistent), and lets the next checkout rebuild it.
         // Other slots in the pool are unaffected.
         let conn_ref = slot.as_ref().expect("just-initialised slot");
+        let stats = self.stats.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match entry.output_shape {
-                OutputShape::Matrix => run_matrix(conn_ref, entry, captures, &sql, timing),
-                OutputShape::Heatmap => run_heatmap(conn_ref, entry, &sql, timing),
+                OutputShape::Matrix => run_matrix(conn_ref, entry, captures, &sql, timing, &stats),
+                OutputShape::Heatmap => run_heatmap(conn_ref, entry, &sql, timing, &stats),
             }
         }));
         let t_exec = t0.elapsed();
+        self.stats.total.record(t_total_start.elapsed().as_nanos() as u64);
 
         let result = match result {
             Ok(r) => r,
@@ -308,6 +362,53 @@ impl TraitSqlBackend for DuckDbBackend {
     }
 }
 
+/// Stable 64-bit hash of a `Captures` map. `Captures` is a
+/// `BTreeMap`, so iteration order is sorted — same input always
+/// produces the same hash. We can't `#[derive(Hash)]` because
+/// `CaptureValue::Number(f64)` doesn't impl `Hash`; we hash the bits
+/// instead. Used as a cache key alongside `entry.id`; collisions are
+/// possible in principle but vanishingly rare in practice with the
+/// std hasher's quality, and the worst case is a single wrong
+/// cache hit which would surface immediately as a wrong query
+/// result during testing.
+fn hash_captures(captures: &Captures) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut h = DefaultHasher::new();
+    for (k, v) in captures {
+        h.write(k.as_bytes());
+        h.write_u8(0xff);
+        match v {
+            CaptureValue::Ident(s) => {
+                h.write_u8(1);
+                h.write(s.as_bytes());
+            }
+            CaptureValue::Number(n) => {
+                h.write_u8(2);
+                h.write_u64(n.to_bits());
+            }
+            CaptureValue::String(s) => {
+                h.write_u8(3);
+                h.write(s.as_bytes());
+            }
+            CaptureValue::Labels(matchers) => {
+                h.write_u8(4);
+                h.write_usize(matchers.len());
+                for m in matchers {
+                    h.write(m.name.as_bytes());
+                    h.write_u8(m.op as u8);
+                    h.write(m.value.as_bytes());
+                }
+            }
+            CaptureValue::Duration { seconds } => {
+                h.write_u8(5);
+                h.write_u64(*seconds);
+            }
+        }
+    }
+    h.finish()
+}
+
 /// Best-effort extraction of a printable message from a panic payload.
 /// `Box<dyn Any + Send>` carries the `panic!()` argument, which is
 /// usually a `&'static str` or a `String`; a few panics carry other
@@ -328,10 +429,13 @@ fn run_matrix(
     captures: &Captures,
     sql: &str,
     _timing: bool,
+    stats: &BackendStats,
 ) -> Result<QueryResult, SqlError> {
+    let t_prep_start = std::time::Instant::now();
     let mut stmt = conn
         .prepare_cached(sql)
         .map_err(|e| SqlError::Backend(format!("prepare {}: {e}", entry.id)))?;
+    stats.prepare.record(t_prep_start.elapsed().as_nanos() as u64);
 
     let n_values = entry.value_columns.len().max(1);
     let label_offset = 1 + n_values;
@@ -341,10 +445,13 @@ fn run_matrix(
     // through duckdb-rs are a measurable chunk of the warm-exec cost.
     // `query_arrow` returns RecordBatches we can iterate with typed
     // direct-array access (no virtual dispatch per cell).
+    let t_exec_start = std::time::Instant::now();
     let arrow = stmt
         .query_arrow([])
         .map_err(|e| SqlError::Backend(format!("query_arrow {}: {e}", entry.id)))?;
     let schema = arrow.get_schema();
+    stats.execute.record(t_exec_start.elapsed().as_nanos() as u64);
+    let t_extract_start = std::time::Instant::now();
 
     // Resolve label column names — same two strategies as before:
     //   1. Catalogue-declared (`entry.label_columns` non-empty).
@@ -405,6 +512,7 @@ fn run_matrix(
                 values,
             }]
         };
+        stats.extract.record(t_extract_start.elapsed().as_nanos() as u64);
         return Ok(QueryResult::Matrix { result });
     }
 
@@ -498,6 +606,7 @@ fn run_matrix(
         }
     }
 
+    stats.extract.record(t_extract_start.elapsed().as_nanos() as u64);
     Ok(QueryResult::Matrix { result })
 }
 
@@ -527,11 +636,15 @@ fn run_heatmap(
     entry: &CatalogueEntry,
     sql: &str,
     _timing: bool,
+    stats: &BackendStats,
 ) -> Result<QueryResult, SqlError> {
+    let t_prep_start = std::time::Instant::now();
     let mut stmt = conn
         .prepare_cached(sql)
         .map_err(|e| SqlError::Backend(format!("prepare {}: {e}", entry.id)))?;
+    stats.prepare.record(t_prep_start.elapsed().as_nanos() as u64);
 
+    let t_exec_start = std::time::Instant::now();
     let rows = stmt
         .query_map([], |row| {
             let t: f64 = row.get(0)?;
@@ -543,6 +656,8 @@ fn run_heatmap(
         .map_err(|e| SqlError::Backend(format!("query {}: {e}", entry.id)))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| SqlError::Backend(format!("collect rows for {}: {e}", entry.id)))?;
+    stats.execute.record(t_exec_start.elapsed().as_nanos() as u64);
+    let t_extract_start = std::time::Instant::now();
 
     if rows.is_empty() {
         // Match PromQL's `streaming::histogram::heatmap` shape on the
@@ -550,6 +665,7 @@ fn run_heatmap(
         // an error so the dispatcher doesn't surface a synthetic
         // "MetricNotFound"-shaped failure to callers when the metric exists
         // but the requested range happens to be free of bucket events.
+        stats.extract.record(t_extract_start.elapsed().as_nanos() as u64);
         return Ok(QueryResult::HistogramHeatmap {
             result: HistogramHeatmapResult {
                 timestamps: Vec::new(),
@@ -623,6 +739,7 @@ fn run_heatmap(
         max_value = 0.0;
     }
 
+    stats.extract.record(t_extract_start.elapsed().as_nanos() as u64);
     Ok(QueryResult::HistogramHeatmap {
         result: HistogramHeatmapResult {
             timestamps,

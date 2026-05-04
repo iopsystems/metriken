@@ -827,8 +827,12 @@ mod tests {
     #[test]
     fn h2_combine_sums_elementwise_with_widest_input_winning() {
         let conn = fresh();
+        // Variadic `UBIGINT[]` args (one column per histogram) — see the
+        // signature note at the top of `H2CombineUdf`. The legacy
+        // `h2_combine([list, list])` (LIST<LIST<UBIGINT>>) shape was
+        // dropped to work around the duckdb-rs inner-vector capacity bug.
         assert_eq!(
-            one_list(&conn, "SELECT h2_combine([[1,2,3]::UBIGINT[], [10,20,30,40]::UBIGINT[]])"),
+            one_list(&conn, "SELECT h2_combine([1,2,3]::UBIGINT[], [10,20,30,40]::UBIGINT[])"),
             Some(vec![11, 22, 33, 40])
         );
     }
@@ -967,7 +971,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",");
             let expected: u64 = hists.iter().flat_map(|h| h.iter()).sum();
-            let got = one_u64(&conn, &format!("SELECT h2_total(h2_combine([{outer}]))")).unwrap();
+            // Variadic call form — see `H2CombineUdf` signature note.
+            let got = one_u64(&conn, &format!("SELECT h2_total(h2_combine({outer}))")).unwrap();
             assert_eq!(got, expected, "hists={hists:?}");
         }
     }
