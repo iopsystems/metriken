@@ -1,27 +1,23 @@
-//! Wide-form SQL generator.
+//! PromQL → SQL translator (wide-form generator).
 //!
 //! For catalogue entries whose shape we recognise, emit SQL that
 //! references the parquet's physical columns directly via `_src`, with
 //! a single un-partitioned `WINDOW w AS (ORDER BY timestamp)` doing
 //! N parallel `LAG(...)` expressions — one per matching physical
-//! column. Compare with the long-form approach, where the metric VIEW
-//! UNION-ALLs every column into a long stream and the catalogue's
-//! query then `WINDOW (PARTITION BY col ORDER BY timestamp)` re-derives
-//! a partitioning the wide layout already has.
+//! column.
 //!
-//! The wide-form output rows are byte-identical to the long-form
-//! output rows for the shapes we handle (verified by the
-//! `frontend_coverage` integration test). Wins are concentrated on the
-//! shapes whose long-form WINDOW is the dominant cost — measured 7x
-//! faster on `WINDOW` and ~3x faster end-to-end on
-//! `softirq_irate_by_id_by_kind`.
+//! Lives on the translator side (`metriken-query`); the
+//! `metriken-query-sql` engine below is PromQL-agnostic and only
+//! executes the SQL strings this module produces. When the migration
+//! window closes and Rezolus emits SQL natively, this whole module
+//! goes away with the catalogue.
 //!
 //! When no recognised shape matches the entry, `try_generate` returns
-//! `None` and the caller falls back to the long-form VIEW path.
+//! `None` — callers surface that as a hard error, since the long-form
+//! interpolation fallback was removed.
 
-use metriken_query::{CaptureValue, CatalogueEntry, Captures, LabelMatcher, LabelOp};
-
-use crate::views::{MetricCatalog, MetricSeries};
+use crate::{CaptureValue, CatalogueEntry, Captures, LabelMatcher, LabelOp};
+use metriken_query_sql::{MetricCatalog, MetricSeries};
 
 /// What value to compute per matching physical column. The `Value`
 /// variant emits `CAST("col" AS DOUBLE)` (gauges/counters as gauges);

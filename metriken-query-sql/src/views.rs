@@ -24,7 +24,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
 /// Internal: classify a column from its data type + metadata.
 #[derive(Debug)]
-enum ColumnKind {
+pub(crate) enum ColumnKind {
     Counter,
     Gauge,
     Histogram { grouping_power: u8 },
@@ -32,16 +32,16 @@ enum ColumnKind {
 }
 
 #[derive(Debug)]
-struct ColumnInfo {
+pub(crate) struct ColumnInfo {
     /// The actual column name in the parquet file.
-    physical: String,
+    pub(crate) physical: String,
     /// Canonical metric name (from `metric` metadata, or the column name
     /// minus a `:buckets` suffix).
-    metric: String,
-    kind: ColumnKind,
+    pub(crate) metric: String,
+    pub(crate) kind: ColumnKind,
     /// All label key-value pairs (excluding the internal keys `metric`,
     /// `metric_type`, `unit`, `grouping_power`, `max_value_power`).
-    labels: BTreeMap<String, String>,
+    pub(crate) labels: BTreeMap<String, String>,
 }
 
 fn classify(field: &arrow::datatypes::Field) -> ColumnInfo {
@@ -115,7 +115,11 @@ pub struct MetricSeries {
     pub labels: BTreeMap<String, String>,
 }
 
-pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<MetricCatalog> {
+/// Read parquet metadata: classify columns, dedupe duplicates, extract
+/// the sampling interval. Pure introspection — no DuckDB side effects.
+pub(crate) fn read_introspection(
+    parquet_path: &str,
+) -> duckdb::Result<(Vec<ColumnInfo>, u64)> {
     let bytes = std::fs::read(parquet_path).map_err(|e| {
         duckdb::Error::DuckDBFailure(
             duckdb::ffi::Error {
@@ -183,44 +187,15 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
         })
         .map(|ms| ms * 1_000_000)
         .unwrap_or(1_000_000_000);
-    let half = interval_ns / 2;
 
-    // Single parquet read into an in-memory table. Every wide-form
-    // SQL query projects from `_src` instead of `read_parquet(...)`,
-    // so each query is a cheap memory scan rather than a fresh
-    // parquet decode.
-    //
-    // The `timestamp` column is replaced with its snapped form (round-to-
-    // nearest interval) so SQL queries see the same canonical timestamps
-    // PromQL does.
-    // Use `//` (integer division) — DuckDB's `/` promotes to DOUBLE which
-    // loses precision at parquet-timestamp scale (~1.8e18 ns; DOUBLE has
-    // only ~15.95 significant decimal digits, so the snap would silently
-    // become a no-op and shadow comparison would still diverge).
-    let load_src = format!(
-        "CREATE OR REPLACE TEMP TABLE _src AS \
-         SELECT \
-            ((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp, \
-            * EXCLUDE (timestamp) \
-         FROM read_parquet('{}')",
-        parquet_path.replace('\'', "''")
-    );
-    conn.execute(&load_src, [])?;
+    Ok((columns, interval_ns))
+}
 
-    // The `_metadata` table (one row per metric column with type +
-    // labels MAP) is currently unused by any catalogue SQL twin and
-    // takes ~280ms to populate on the largest fixtures (one big INSERT
-    // with thousands of literal tuples). Skipping it shaves cold-start
-    // without affecting correctness. `populate_metadata_table` is kept
-    // for future use; the original intent was dynamic-UNPIVOT-column-
-    // lists patterns driven by `_metadata` rows.
-
-    // Group by metric name, emit one view per metric. Within a metric, all
-    // columns must share the same kind (counter / gauge / histogram) and
-    // — for histograms — the same grouping_power. We don't enforce here;
-    // we trust the writer.
+/// Group classified columns by canonical metric name and record
+/// histogram grouping_power. Pure data transformation; no I/O.
+pub(crate) fn build_catalog(columns: &[ColumnInfo]) -> MetricCatalog {
     let mut by_metric: BTreeMap<String, Vec<&ColumnInfo>> = BTreeMap::new();
-    for c in &columns {
+    for c in columns {
         by_metric.entry(c.metric.clone()).or_default().push(c);
     }
 
@@ -244,8 +219,56 @@ pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<Met
             .collect();
         catalog.series_by_metric.insert(metric, series);
     }
+    catalog
+}
 
-    Ok(catalog)
+/// Read the parquet schema and return the per-metric catalog without
+/// any DuckDB side effects. Used by callers that need parquet metadata
+/// (e.g. to generate SQL for a wide-form selector) but don't yet have
+/// — or don't want to commit to — a `_src` table. Cheap to call from
+/// any thread; reads the file once.
+pub fn describe_parquet(parquet_path: &str) -> duckdb::Result<MetricCatalog> {
+    let (columns, _interval_ns) = read_introspection(parquet_path)?;
+    Ok(build_catalog(&columns))
+}
+
+/// Create the `_src` TEMP TABLE on `conn` from `parquet_path`,
+/// snapping timestamps to the nearest multiple of `interval_ns`.
+///
+/// The snap matches PromQL's `Tsdb` loader so SQL queries see the
+/// same canonical timestamps PromQL does. `//` is integer division —
+/// DuckDB's `/` promotes to DOUBLE which loses precision at parquet-
+/// timestamp scale (~1.8e18 ns; DOUBLE has only ~15.95 significant
+/// decimal digits, so the snap would silently become a no-op).
+pub(crate) fn create_src_table(
+    conn: &Connection,
+    parquet_path: &str,
+    interval_ns: u64,
+) -> duckdb::Result<()> {
+    let half = interval_ns / 2;
+    let load_src = format!(
+        "CREATE OR REPLACE TEMP TABLE _src AS \
+         SELECT \
+            ((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp, \
+            * EXCLUDE (timestamp) \
+         FROM read_parquet('{}')",
+        parquet_path.replace('\'', "''")
+    );
+    conn.execute(&load_src, [])?;
+    Ok(())
+}
+
+/// Read the parquet schema, load the file into a single in-memory
+/// `_src` TEMP TABLE on `conn`, and return the per-metric catalog the
+/// wide-form SQL generator consumes.
+///
+/// Convenience: combines `read_introspection` + `create_src_table` +
+/// `build_catalog` for callers that don't want to pool slot setup.
+/// Used by tests and one-off perf scripts.
+pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<MetricCatalog> {
+    let (columns, interval_ns) = read_introspection(parquet_path)?;
+    create_src_table(conn, parquet_path, interval_ns)?;
+    Ok(build_catalog(&columns))
 }
 
 #[cfg(test)]
@@ -346,5 +369,37 @@ mod tests {
             .expect("request_latency p");
         // metriken-query-fixtures uses gp=4 for the rezolus histogram config.
         assert_eq!(p, 4);
+    }
+
+    #[test]
+    fn describe_parquet_returns_same_catalog_without_creating_src_table() {
+        // describe_parquet does pure introspection — no DuckDB side
+        // effects. Two assertions: (1) the catalog matches what
+        // ensure_views builds; (2) `_src` does not exist on a fresh
+        // connection that only saw describe_parquet.
+        let path = fixture_path("counter_multi_label");
+        let path = path.to_str().unwrap();
+
+        let described = describe_parquet(path).unwrap();
+        assert_eq!(described.series_by_metric.get("cpu_usage").unwrap().len(), 4);
+
+        let conn = fresh_conn();
+        // No call to ensure_views — only describe_parquet was used.
+        let src_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM duckdb_tables() WHERE table_name = '_src')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!src_exists, "describe_parquet must not create _src");
+
+        // ensure_views still produces an equivalent catalog.
+        let ensured = ensure_views(&conn, path).unwrap();
+        assert_eq!(
+            described.series_by_metric.keys().collect::<Vec<_>>(),
+            ensured.series_by_metric.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(described.histogram_p_by_metric, ensured.histogram_p_by_metric);
     }
 }

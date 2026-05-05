@@ -1,18 +1,13 @@
-//! Coverage check: for every catalogue entry whose `mode != off`,
-//! run `wide_form::try_generate` against a real production parquet
-//! and report which entries emit wide-form SQL vs fall through to
-//! long-form. Intended as the gate that confirms the long-form
-//! fallback path is no longer reachable before deleting it.
+//! Coverage check: for every catalogue entry, run `translate::try_generate`
+//! against a real production parquet and report which entries emit
+//! wide-form SQL vs fall through. Intended as a sanity gate that the
+//! catalogue stays fully covered by the wide-form generator.
 //!
 //! Usage: `cargo run -p metriken-query --release --example wide_form_coverage`
-//!
-//! Picks the smallest available production parquet for the catalog,
-//! then walks every entry. For templated entries, uses the first
-//! `examples[]` query; for literal entries, uses `entry.promql` as-is.
 
 use std::path::PathBuf;
 
-use metriken_query::{Catalogue, CompiledTemplate, Mode};
+use metriken_query::{Catalogue, CompiledTemplate};
 
 fn main() {
     let parquet: PathBuf = "/work/rezolus/site/viewer/data/demo.parquet".into();
@@ -21,20 +16,14 @@ fn main() {
         std::process::exit(2);
     }
 
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    metriken_query_sql::register_all(&conn).unwrap();
-    let catalog = metriken_query_sql::views::ensure_views(&conn, parquet.to_str().unwrap()).unwrap();
+    let backend = metriken_query_sql::DuckDbBackend::with_pool_size(1);
+    let catalog = backend.describe_parquet(parquet.to_str().unwrap()).unwrap();
 
     let cat = Catalogue::embedded();
     let mut covered = 0usize;
     let mut uncovered: Vec<(String, String)> = Vec::new();
-    let mut off = 0usize;
 
     for entry in cat.entries() {
-        if entry.mode == Mode::Off {
-            off += 1;
-            continue;
-        }
         // Use the first example for templated entries; the literal
         // promql for non-templated.
         let query = if entry.examples.is_empty() {
@@ -46,23 +35,25 @@ fn main() {
         let captures = match template.match_query(&query) {
             Some(c) => c,
             None => {
-                uncovered.push((entry.id.clone(), format!("template did not match its own example: {query}")));
+                uncovered.push((
+                    entry.id.clone(),
+                    format!("template did not match its own example: {query}"),
+                ));
                 continue;
             }
         };
-        match metriken_query_sql::wide_form::try_generate(entry, &captures, &catalog) {
+        match metriken_query::translate::try_generate(entry, &captures, &catalog) {
             Some(_) => covered += 1,
             None => uncovered.push((entry.id.clone(), query)),
         }
     }
 
     println!("\nWide-form coverage on {}", parquet.display());
-    println!("  shadow/primary entries: {}", covered + uncovered.len());
-    println!("  off:                    {}", off);
+    println!("  total entries:          {}", covered + uncovered.len());
     println!("  wide-form covered:      {}", covered);
     println!("  fall through:           {}", uncovered.len());
     if !uncovered.is_empty() {
-        println!("\nEntries falling through to long-form:");
+        println!("\nEntries with no wide-form generator:");
         for (id, q) in &uncovered {
             println!("  {id} :: {q}");
         }

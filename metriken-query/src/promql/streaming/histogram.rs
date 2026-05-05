@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult};
 
-use crate::promql::MatrixSample;
+use crate::result::{HistogramHeatmapResult, MatrixSample};
 use crate::tsdb::{HistogramCollection, Labels};
 
 /// Compute quantiles of `metric{filter}` over the time range
@@ -360,7 +360,7 @@ pub fn heatmap(
     start_ns: u64,
     end_ns: u64,
     stride_ns: Option<u64>,
-) -> Option<crate::promql::HistogramHeatmapResult> {
+) -> Option<HistogramHeatmapResult> {
     let mut iters: Vec<_> = collection
         .iter()
         .filter(|(labels, _)| label_filter.inner.is_empty() || labels.matches(label_filter))
@@ -563,7 +563,7 @@ pub fn heatmap(
         (all_bounds, data)
     };
 
-    Some(crate::promql::HistogramHeatmapResult {
+    Some(HistogramHeatmapResult {
         timestamps,
         bucket_bounds,
         data,

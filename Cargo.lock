@@ -1569,7 +1569,6 @@ dependencies = [
  "bytes",
  "duckdb",
  "histogram",
- "metriken-query",
  "parquet",
  "thiserror",
 ]

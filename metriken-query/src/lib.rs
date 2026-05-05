@@ -1,43 +1,56 @@
-//! PromQL query engine and time-series database for metriken parquet files.
+//! Query frontend for metriken parquet files.
 //!
-//! This crate provides:
-//! - A time-series database (TSDB) that loads metrics from parquet files
-//! - A PromQL query engine for querying the loaded metrics
-//! - Optional HTTP API routes for serving PromQL queries (with `http` feature)
+//! Two backends, gated by Cargo features:
 //!
-//! # Example
+//! - `sql` (default for desktop): translates incoming PromQL queries
+//!   against a catalogue of templates and routes execution through
+//!   the DuckDB engine in `metriken-query-sql`. Returns Arrow-projected
+//!   `QueryResult`s. This is the production path.
 //!
-//! ```ignore
-//! use metriken_query::{Tsdb, QueryEngine};
-//! use std::sync::Arc;
-//! use std::path::Path;
+//! - `legacy` (default off; enabled by the Rezolus WASM viewer): the
+//!   original in-memory PromQL evaluator (`promql/streaming/`) over an
+//!   in-process `Tsdb`. Kept for WASM consumers because DuckDB doesn't
+//!   compile to wasm32 today.
 //!
-//! // Load a parquet file
-//! let tsdb = Arc::new(Tsdb::load(Path::new("metrics.parquet")).unwrap());
-//!
-//! // Create a query engine
-//! let engine = QueryEngine::new(tsdb);
-//!
-//! // Execute a range query
-//! let result = engine.query_range("rate(http_requests[5m])", start, end, step);
-//! ```
+//! Shared by both backends: `result::{QueryResult, Sample, MatrixSample,
+//! HistogramHeatmapResult, QueryError}`.
 
-pub mod dispatch;
-pub mod promql;
+pub mod result;
+
+#[cfg(feature = "sql")]
+pub mod catalogue;
+#[cfg(feature = "sql")]
+pub mod engine;
+#[cfg(feature = "sql")]
+pub mod interp;
+#[cfg(feature = "sql")]
+pub mod project;
+#[cfg(feature = "sql")]
 pub mod template;
+#[cfg(feature = "sql")]
+pub mod translate;
+
+#[cfg(feature = "legacy")]
+pub mod promql;
+#[cfg(feature = "legacy")]
 pub mod tsdb;
 
 pub use bytes::Bytes;
-pub use dispatch::{
-    canonicalise, Catalogue, CatalogueEntry, CatalogueError, Diff, DispatchObserver,
-    GoldenExample, Mode, NoopObserver, OutputShape, SqlBackend, SqlError,
-};
+pub use result::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
+
+#[cfg(feature = "sql")]
+pub use catalogue::{Catalogue, CatalogueEntry, CatalogueError, GoldenExample, OutputShape};
+#[cfg(feature = "sql")]
+pub use engine::{Engine, EngineError, ParquetMetadata};
+#[cfg(feature = "sql")]
+pub use metriken_query_sql::SqlError;
+#[cfg(feature = "sql")]
 pub use template::{
     CaptureKind, CaptureValue, Captures, CompiledTemplate, LabelMatcher, LabelOp, TemplateError,
     TemplatePart,
 };
-pub use promql::{
-    DispatchConfig, HistogramHeatmapResult, MatrixSample, QueryEngine, QueryError, QueryResult,
-    Sample,
-};
+
+#[cfg(feature = "legacy")]
+pub use promql::QueryEngine;
+#[cfg(feature = "legacy")]
 pub use tsdb::Tsdb;

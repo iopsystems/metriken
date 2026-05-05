@@ -16,8 +16,9 @@ arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
 metriken-exposition = { version = "0.16.0", path = "../metriken-exposition", default-features = false, optional = true }
+metriken-query-sql = { path = "../metriken-query-sql", optional = true }
 parquet = { workspace = true, default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
-promql-parser = "0.8"
+promql-parser = { version = "0.8", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "2"
@@ -27,16 +28,16 @@ toml = "0.8"
 duckdb = { version = "1.1.1", features = ["bundled"] }
 insta = { version = "1", features = ["json"] }
 metriken-query-fixtures = { path = "../metriken-query-fixtures" }
-metriken-query-sql = { path = "../metriken-query-sql" }
 tempfile.workspace = true
 toml = "0.8"
 
 [features]
-default = ["ingest", "lz4"]
-ingest = ["metriken-exposition"]
+# Desktop default: SQL pipeline only. No legacy PromQL evaluator, no
+# in-memory Tsdb store. The Rezolus WASM viewer crate must opt out
+# (`default-features = false`) and opt into `legacy` instead, since
+# `metriken-query-sql` (and DuckDB) don't compile to wasm32.
+default = ["sql", "lz4"]
+sql = ["dep:metriken-query-sql"]
+legacy = ["dep:promql-parser"]
+ingest = ["legacy", "dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]
-# `http` is a back-compat no-op kept so downstream callers (Rezolus) that
-# still request the published 0.9.x's HTTP-routes feature continue to build.
-# The actual HTTP routing has moved upstream into the dispatcher's host —
-# see `src/dispatch.rs` and `metriken-query-sql::DuckDbBackend`.
-http = []

@@ -11,19 +11,41 @@
 //!   `hist_p99`, …). Composes the UDF layer.
 //!
 //! `register_all(&conn)` registers everything in the right order.
+//!
+//! The crate's public API is two methods on [`DuckDbBackend`]:
+//! [`DuckDbBackend::run_sql`] (SQL string + parquet path → Arrow) and
+//! [`DuckDbBackend::describe_parquet`] (parquet path → per-metric
+//! catalog). Callers (today: `metriken-query`'s translator; in the next
+//! phase: Rezolus directly) own SQL generation and any projection of
+//! the Arrow output.
 
 use duckdb::Connection;
+use thiserror::Error;
 
-pub mod backend;
-pub mod interp;
-pub mod macros;
-pub mod observability;
+// `backend`, `macros`, and `observability` are implementation
+// details — their public types are re-exported below. `udf` and
+// `views` stay `pub`: `udf::h2_lower` / `udf::h2_upper` are called
+// across the crate boundary by the projector, and `views::ensure_views`
+// is used by perf-investigation scripts in `metriken-query`.
+pub(crate) mod backend;
+pub(crate) mod macros;
+pub(crate) mod observability;
 pub mod udf;
 pub mod views;
-pub mod wide_form;
 
 pub use backend::DuckDbBackend;
 pub use observability::{BackendStats, PhaseSnapshot, StatsSnapshot};
+pub use views::{MetricCatalog, MetricSeries};
+
+/// Errors returned by the engine. The single `Backend` variant covers
+/// all DuckDB-side failures with a free-form message; callers compose
+/// their own context. Kept simple: callers don't dispatch on variants
+/// today, so a richer enum would be extra surface for no benefit.
+#[derive(Debug, Error)]
+pub enum SqlError {
+    #[error("SQL backend error: {0}")]
+    Backend(String),
+}
 
 /// Register all UDFs and macros on `conn`. Idempotent within a single
 /// connection (registrations use `CREATE OR REPLACE`).

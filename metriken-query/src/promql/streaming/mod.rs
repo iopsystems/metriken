@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use crate::promql::MatrixSample;
+use crate::result::MatrixSample;
 use crate::tsdb::{CounterCollection, Labels};
 
 mod aggregate;

@@ -2,14 +2,10 @@
 //! query. Both run against an identical _src + 16 softirq columns,
 //! 5 reps each, prepare_cached, no result iteration.
 
-use std::sync::Arc;
 use std::time::Instant;
-
-use metriken_query::Tsdb;
 
 fn main() {
     let parquet = "/work/rezolus/site/viewer/data/vllm.parquet";
-    let _tsdb = Arc::new(Tsdb::load(std::path::Path::new(parquet)).unwrap());
 
     let conn = duckdb::Connection::open_in_memory().unwrap();
     metriken_query_sql::register_all(&conn).unwrap();

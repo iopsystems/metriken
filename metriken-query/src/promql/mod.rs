@@ -1,11 +1,15 @@
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use promql_parser::label::Matcher;
 use promql_parser::parser::{self, Expr};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+
+// Re-export the shared result types under their original
+// `metriken_query::promql::*` paths so the Rezolus desktop and WASM
+// viewers keep compiling without source changes.
+pub use crate::result::{
+    HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
+};
 
 use crate::tsdb::{Labels, Tsdb};
 
@@ -14,92 +18,16 @@ pub mod streaming;
 #[cfg(test)]
 mod tests;
 
-#[derive(Error, Debug)]
-pub enum QueryError {
-    #[error("Parse error: {0}")]
-    ParseError(String),
-
-    #[error("Evaluation error: {0}")]
-    EvaluationError(String),
-
-    #[error("Unsupported operation: {0}")]
-    Unsupported(String),
-
-    #[error("Metric not found: {0}")]
-    MetricNotFound(String),
-}
-
-/// A single sample in the result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Sample {
-    pub metric: HashMap<String, String>,
-    pub value: (f64, f64), // (timestamp_seconds, value)
-}
-
-/// A matrix sample with multiple values over time
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatrixSample {
-    pub metric: HashMap<String, String>,
-    pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
-}
-
-/// Histogram heatmap data for visualization
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistogramHeatmapResult {
-    /// Timestamps in seconds
-    pub timestamps: Vec<f64>,
-    /// Bucket boundaries (latency values in the histogram's unit, e.g.,
-    /// nanoseconds)
-    pub bucket_bounds: Vec<u64>,
-    /// Heatmap data as [time_index, bucket_index, count]
-    pub data: Vec<(usize, usize, f64)>,
-    /// Minimum count value (for color scaling)
-    pub min_value: f64,
-    /// Maximum count value (for color scaling)
-    pub max_value: f64,
-}
-
-/// Result of a PromQL query
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "resultType", rename_all = "camelCase")]
-pub enum QueryResult {
-    #[serde(rename = "vector")]
-    Vector { result: Vec<Sample> },
-
-    #[serde(rename = "matrix")]
-    Matrix { result: Vec<MatrixSample> },
-
-    #[serde(rename = "scalar")]
-    Scalar { result: (f64, f64) }, // (timestamp, value)
-
-    #[serde(rename = "histogram_heatmap")]
-    HistogramHeatmap { result: HistogramHeatmapResult },
-}
-
-/// The PromQL query engine
+/// The legacy in-memory PromQL evaluator.
 ///
 /// Generic over the TSDB handle type. The default (`Arc<Tsdb>`) covers the
-/// common owned case (MCP, tests, file-backed viewer). Pass `&Tsdb` (or any
-/// other `Deref<Target = Tsdb>`) for zero-copy borrowed access.
+/// common owned case; pass `&Tsdb` (or any other `Deref<Target = Tsdb>`)
+/// for zero-copy borrowed access.
 ///
-/// Optionally hosts a [`DispatchConfig`] to route incoming queries through
-/// the SQL twin per the catalogue's `mode`. Without one, behavior is
-/// unchanged from the pre-dispatcher engine.
+/// Available only with feature `legacy` (Rezolus WASM viewer); the desktop
+/// path goes through `crate::engine::Engine` over DuckDB.
 pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
     tsdb: T,
-    dispatch: Option<DispatchConfig>,
-}
-
-/// Routing configuration for a `QueryEngine`. Built once and shared across
-/// every query the engine serves. See `metriken_query::dispatch` for the
-/// `Catalogue` / `SqlBackend` / `DispatchObserver` types.
-pub struct DispatchConfig {
-    pub catalogue: crate::dispatch::Catalogue,
-    pub backend: Arc<dyn crate::dispatch::SqlBackend>,
-    pub observer: Arc<dyn crate::dispatch::DispatchObserver>,
-    /// The parquet path (or glob) the SQL backend reads from. Substituted
-    /// into the `{fixture_path}` placeholder in catalogue SQL templates.
-    pub data_source: String,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -186,17 +114,7 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
 
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     pub fn new(tsdb: T) -> Self {
-        Self {
-            tsdb,
-            dispatch: None,
-        }
-    }
-
-    /// Attach (or replace) a dispatcher that routes queries through the
-    /// catalogue. Without one, every query goes through the PromQL path.
-    pub fn with_dispatch(mut self, config: DispatchConfig) -> Self {
-        self.dispatch = Some(config);
-        self
+        Self { tsdb }
     }
 
     /// Get a reference to the underlying TSDB
@@ -431,143 +349,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     }
 
     pub fn query_range(
-        &self,
-        query_str: &str,
-        start: f64,
-        end: f64,
-        step: f64,
-    ) -> Result<QueryResult, QueryError> {
-        // Catalogue-driven dispatch — only when a `DispatchConfig` was
-        // attached via `with_dispatch`. The pre-dispatcher path is just
-        // `query_range_promql` directly.
-        if let Some(dispatch) = &self.dispatch {
-            if let Some((entry, captures)) = dispatch.catalogue.lookup(query_str) {
-                use crate::dispatch::{canonicalise, Diff, Mode};
-                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-                // METRIKEN_FORCE_PRIMARY=1 promotes every catalogue entry to
-                // Mode::Primary at runtime — useful for "what does the viewer
-                // look like backed purely by SQL/DuckDB" experiments without
-                // editing queries.toml. The catalogue's per-entry `mode` is
-                // ignored when this is set.
-                let effective_mode = if std::env::var("METRIKEN_FORCE_PRIMARY").is_ok() {
-                    Mode::Primary
-                } else {
-                    entry.mode
-                };
-                match effective_mode {
-                    Mode::Off => self.query_range_promql(query_str, start, end, step),
-                    Mode::Shadow => {
-                        let p_t0 = std::time::Instant::now();
-                        let promql = self.query_range_promql(query_str, start, end, step)?;
-                        let promql_ms = ms(p_t0.elapsed());
-
-                        // Best-effort SQL: a backend error in shadow mode is
-                        // logged via the observer but does not fail the request.
-                        let s_t0 = std::time::Instant::now();
-                        let sql_outcome = dispatch.backend.run(
-                            entry,
-                            &captures,
-                            &dispatch.data_source,
-                            start,
-                            end,
-                            step,
-                        );
-                        let sql_ms = ms(s_t0.elapsed());
-
-                        match sql_outcome {
-                            Ok(sql) => {
-                                let p = canonicalise(&promql);
-                                let s = canonicalise(&sql);
-                                if p != s {
-                                    dispatch.observer.on_diff(
-                                        entry,
-                                        &Diff { promql: p, sql: s },
-                                    );
-                                }
-                                dispatch.observer.on_dispatch(
-                                    entry,
-                                    Mode::Shadow,
-                                    Some(promql_ms),
-                                    Some(sql_ms),
-                                );
-                            }
-                            Err(err) => {
-                                let p = canonicalise(&promql);
-                                let s = serde_json::json!({ "sql_error": err.to_string() });
-                                dispatch.observer.on_diff(
-                                    entry,
-                                    &Diff { promql: p, sql: s },
-                                );
-                                dispatch.observer.on_dispatch(
-                                    entry,
-                                    Mode::Shadow,
-                                    Some(promql_ms),
-                                    None,
-                                );
-                            }
-                        }
-                        Ok(promql)
-                    }
-                    Mode::Strict => {
-                        let p_t0 = std::time::Instant::now();
-                        let promql = self.query_range_promql(query_str, start, end, step)?;
-                        let promql_ms = ms(p_t0.elapsed());
-
-                        let s_t0 = std::time::Instant::now();
-                        let sql = dispatch
-                            .backend
-                            .run(entry, &captures, &dispatch.data_source, start, end, step)
-                            .map_err(|e| QueryError::EvaluationError(format!("strict-mode SQL: {e}")))?;
-                        let sql_ms = ms(s_t0.elapsed());
-
-                        let p = canonicalise(&promql);
-                        let s = canonicalise(&sql);
-                        let diverged = p != s;
-                        if diverged {
-                            dispatch.observer.on_diff(entry, &Diff { promql: p, sql: s });
-                        }
-                        dispatch.observer.on_dispatch(
-                            entry,
-                            Mode::Strict,
-                            Some(promql_ms),
-                            Some(sql_ms),
-                        );
-                        if diverged {
-                            return Err(QueryError::EvaluationError(format!(
-                                "strict-mode divergence on {}: PromQL and SQL outputs differ",
-                                entry.id
-                            )));
-                        }
-                        Ok(promql)
-                    }
-                    Mode::Primary => {
-                        let s_t0 = std::time::Instant::now();
-                        let result = dispatch
-                            .backend
-                            .run(entry, &captures, &dispatch.data_source, start, end, step)
-                            .map_err(|e| QueryError::EvaluationError(e.to_string()));
-                        let sql_ms = ms(s_t0.elapsed());
-                        dispatch.observer.on_dispatch(
-                            entry,
-                            Mode::Primary,
-                            None,
-                            if result.is_ok() { Some(sql_ms) } else { None },
-                        );
-                        result
-                    }
-                }
-            } else {
-                self.query_range_promql(query_str, start, end, step)
-            }
-        } else {
-            self.query_range_promql(query_str, start, end, step)
-        }
-    }
-
-    /// Direct PromQL evaluation, bypassing the dispatcher. Useful inside
-    /// the dispatcher itself (for shadow-mode comparison) and as the
-    /// fallback path when no dispatcher is attached.
-    pub fn query_range_promql(
         &self,
         query_str: &str,
         start: f64,
