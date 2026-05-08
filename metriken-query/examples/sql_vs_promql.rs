@@ -432,7 +432,12 @@ fn setup_parquet_sql(
     // aren't always identical to the source labels).
     let _ = &recorded_sources;
 
-    // Build one TEMP VIEW per source.
+    // Build one TEMP VIEW per source. In addition to the bare-name
+    // alias (`<col>`), expose a `<col>:src0` alias for scalar columns
+    // — kept in sync with `duckdb-registry.js::buildSourceViews` —
+    // so multi-source-aware emitters (avg/max/min over per-(source,id)
+    // values) can use a single regex that works in both single-source
+    // mode (one `:src0` per id) and combined mode (N `:src<i>` per id).
     for (src, aliases) in &by_source {
         let view = view_name_for_source(src);
         let mut projections: Vec<String> = vec![];
@@ -445,6 +450,9 @@ fn setup_parquet_sql(
             let orig_q = orig.replace('"', "\"\"");
             let alias_q = alias.replace('"', "\"\"");
             projections.push(format!("\"{orig_q}\" AS \"{alias_q}\""));
+            if is_scalar_type(col_type.get(orig).map(String::as_str).unwrap_or("")) {
+                projections.push(format!("\"{orig_q}\" AS \"{alias_q}:src0\""));
+            }
         }
         let create = format!(
             "CREATE OR REPLACE TEMP VIEW {view} AS SELECT {} FROM read_parquet('{parquet_str}')",
@@ -465,14 +473,16 @@ fn setup_parquet_sql(
         .collect();
 
     if rezolus_sources.len() >= 2 {
-        // Union of unprefixed metric names across rezolus sources.
-        let mut all_metrics: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for src in &rezolus_sources {
+        // For each unprefixed metric name across rezolus sources, track
+        // which source it came from (for `:src<i>` aliases) plus the
+        // prefixed column name (for the projection expression).
+        let mut all_metrics: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+        for (i, src) in rezolus_sources.iter().enumerate() {
             for (orig, alias) in by_source.get(*src).unwrap() {
                 all_metrics
                     .entry(alias.clone())
                     .or_default()
-                    .push(orig.clone());
+                    .push((i, orig.clone()));
             }
         }
         let mut projections: Vec<String> = vec![];
@@ -483,19 +493,18 @@ fn setup_parquet_sql(
         }
         for (alias, contribs) in &all_metrics {
             let alias_q = alias.replace('"', "\"\"");
-            // Histogram columns (UBIGINT[] / BIGINT[]) need element-wise
-            // sum via `h2_combine`; scalars use `+` with COALESCE so
-            // a missing source contributes 0 instead of NULL.
             let is_list = contribs
                 .iter()
-                .any(|c| col_type.get(c).map(|t| t.ends_with("[]")).unwrap_or(false));
+                .any(|(_, c)| col_type.get(c).map(|t| t.ends_with("[]")).unwrap_or(false));
+            // Sum form: drives `sum(...)` / `sum by (id) (...)` /
+            // `histogram_quantiles(...)` emitters.
             if contribs.len() == 1 {
-                let orig_q = contribs[0].replace('"', "\"\"");
+                let orig_q = contribs[0].1.replace('"', "\"\"");
                 projections.push(format!("\"{orig_q}\" AS \"{alias_q}\""));
             } else if is_list {
                 let parts: Vec<String> = contribs
                     .iter()
-                    .map(|c| {
+                    .map(|(_, c)| {
                         let q = c.replace('"', "\"\"");
                         format!("COALESCE(\"{q}\", []::UBIGINT[])")
                     })
@@ -504,12 +513,20 @@ fn setup_parquet_sql(
             } else {
                 let parts: Vec<String> = contribs
                     .iter()
-                    .map(|c| {
+                    .map(|(_, c)| {
                         let q = c.replace('"', "\"\"");
                         format!("COALESCE(\"{q}\", 0)")
                     })
                     .collect();
                 projections.push(format!("({}) AS \"{alias_q}\"", parts.join(" + ")));
+            }
+            // Per-source `:src<i>` aliases for scalar columns — let
+            // avg/max/min emitters see each per-(source, id) value.
+            if !is_list {
+                for (src_idx, c) in contribs {
+                    let q = c.replace('"', "\"\"");
+                    projections.push(format!("\"{q}\" AS \"{alias_q}:src{src_idx}\""));
+                }
             }
         }
         let view = "_src_rezolus_combined";
@@ -577,6 +594,10 @@ fn parquet_recorded_sources(conn: &Connection, parquet_str: &str) -> std::collec
         }
     }
     out
+}
+
+fn is_scalar_type(t: &str) -> bool {
+    !t.is_empty() && !t.ends_with("[]")
 }
 
 fn view_name_for_source(src: &str) -> String {
