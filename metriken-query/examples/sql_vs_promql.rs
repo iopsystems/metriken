@@ -30,6 +30,8 @@ use arrow::array::{
     Array, Decimal128Array, Decimal256Array, Float64Array, Int32Array, Int64Array, StringArray,
     TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
@@ -396,34 +398,52 @@ fn setup_parquet_sql(
     // Read the parquet's `source` KV metadata so we know what counts
     // as a real source vs. a metric-name artefact.
     let recorded_sources = parquet_recorded_sources(conn, parquet_str);
+    let field_meta = read_field_metadata(parquet);
 
     let mut by_source: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut alias_seen: BTreeMap<String, std::collections::HashSet<String>> = BTreeMap::new();
     for c in &cols {
         if let Some((prefix, rest)) = c.split_once("::") {
+            let alias = canonical_alias(rest, field_meta.get(c));
+            let seen = alias_seen.entry(prefix.to_string()).or_default();
+            if seen.contains(&alias) { continue; }
+            seen.insert(alias.clone());
             by_source
                 .entry(prefix.to_string())
                 .or_default()
-                .push((c.clone(), rest.to_string()));
+                .push((c.clone(), alias));
         }
     }
-    if by_source.is_empty() {
-        // Single-source parquet — use `read_parquet(...)` directly.
-        return Ok(ParquetSqlState {
-            from_clause: format!("read_parquet('{parquet_str}')"),
-        });
-    }
-    // Reject "fake" prefix detection: when the prefix's column count
-    // is a tiny fraction of the parquet's total columns (< 10%), the
-    // `<x>::<y>` pattern is much more likely to be a literal `::` in
-    // a metric/cgroup name than a real source prefix. Falling back
-    // to single-source mode lets queries reach the unprefixed
-    // rezolus columns. (Example: vllm.parquet has 22/2015 cols
-    // prefixed `task_cpu_usage//system.slice/.../VLLM` — those are
-    // cgroup-task path artefacts, not a "source".)
+    // Single-source path. The `:src0` aliases needed by avg/max/min
+    // emitters (see follow-up #1) only get materialised in source
+    // views, so we always build a `_src_default` view here — even for
+    // truly-single-source parquets and for "fake-prefix" parquets
+    // (rare ::-bearing column names that aren't real source prefixes,
+    // see vllm.parquet's task_cpu_usage//system.slice/... cgroup-task
+    // columns) — to keep the dashboard SQL working.
     let total_prefixed: usize = by_source.values().map(|v| v.len()).sum();
-    if total_prefixed * 10 < cols.len() {
+    let single_source_fallback = by_source.is_empty() || total_prefixed * 10 < cols.len();
+    if single_source_fallback {
+        let mut projections: Vec<String> = vec![];
+        for c in &cols {
+            let q = c.replace('"', "\"\"");
+            projections.push(format!("\"{q}\""));
+        }
+        for c in &cols {
+            if c == "timestamp" || c == "duration" { continue; }
+            let ty = col_type.get(c).map(String::as_str).unwrap_or("");
+            if !is_scalar_type(ty) { continue; }
+            let q = c.replace('"', "\"\"");
+            projections.push(format!("\"{q}\" AS \"{q}:src0\""));
+        }
+        let create = format!(
+            "CREATE OR REPLACE TEMP VIEW _src_default AS SELECT {} FROM read_parquet('{parquet_str}')",
+            projections.join(", ")
+        );
+        conn.execute(&create, [])
+            .map_err(|e| format!("create _src_default: {e}"))?;
         return Ok(ParquetSqlState {
-            from_clause: format!("read_parquet('{parquet_str}')"),
+            from_clause: "_src_default".to_string(),
         });
     }
     // Hint the recorded sources for picking — but don't filter the
@@ -598,6 +618,80 @@ fn parquet_recorded_sources(conn: &Connection, parquet_str: &str) -> std::collec
 
 fn is_scalar_type(t: &str) -> bool {
     !t.is_empty() && !t.ends_with("[]")
+}
+
+/// "Infrastructure" labels — Arrow field metadata keys that don't
+/// participate in the canonical column name (they describe where the
+/// value came from rather than which series it belongs to).
+const NON_VALUE_METADATA_KEYS: &[&str] = &[
+    "metric", "metric_type", "unit", "endpoint", "instance", "node", "source",
+    "grouping_power", "max_value_power",
+];
+
+/// Per-field metadata pulled from the parquet's Arrow schema.
+#[derive(Debug)]
+struct FieldMeta {
+    metric: String,
+    metric_type: String,
+    /// Sorted (key, value) for value labels only — drop infrastructure
+    /// labels here so callers don't repeat the filter.
+    value_labels: Vec<(String, String)>,
+}
+
+/// Read the parquet's Arrow schema and return a map from column name
+/// → [`FieldMeta`] for fields with a `metric` metadata entry. Used to
+/// canonicalise numeric-encoded column aliases (`decode::117` →
+/// `memory_total`).
+fn read_field_metadata(parquet_path: &Path) -> HashMap<String, FieldMeta> {
+    let mut out = HashMap::new();
+    let bytes = match std::fs::read(parquet_path) {
+        Ok(b) => Bytes::from(b),
+        Err(_) => return out,
+    };
+    let m = match ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default()) {
+        Ok(m) => m,
+        Err(_) => return out,
+    };
+    for f in m.schema().fields().iter() {
+        let md = f.metadata();
+        let metric = match md.get("metric") {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let metric_type = md.get("metric_type").cloned().unwrap_or_default();
+        let mut value_labels: Vec<(String, String)> = md
+            .iter()
+            .filter(|(k, _)| !NON_VALUE_METADATA_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        value_labels.sort_by(|a, b| a.0.cmp(&b.0));
+        out.insert(f.name().clone(), FieldMeta { metric, metric_type, value_labels });
+    }
+    out
+}
+
+/// Resolve a parquet field's prefixed column name to the alias
+/// the dashboard SQL would reference. Trust `rest_after_prefix`
+/// when it's already canonical (named-column parquets); rebuild
+/// from Arrow metadata otherwise (numeric-encoded). See the JS-side
+/// `canonicalAlias` for the matching logic.
+fn canonical_alias(rest: &str, meta: Option<&FieldMeta>) -> String {
+    let Some(meta) = meta else { return rest.to_string() };
+    if rest == meta.metric
+        || rest == format!("{}:buckets", meta.metric)
+        || rest.starts_with(&format!("{}/", meta.metric))
+    {
+        return rest.to_string();
+    }
+    let mut name = meta.metric.clone();
+    for (_, v) in &meta.value_labels {
+        name.push('/');
+        name.push_str(v);
+    }
+    if meta.metric_type == "histogram" {
+        name.push_str(":buckets");
+    }
+    name
 }
 
 fn view_name_for_source(src: &str) -> String {
