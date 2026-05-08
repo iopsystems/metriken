@@ -353,24 +353,28 @@ struct ParquetSqlState {
 /// Mirror `duckdb-registry.js:buildSourceViews` + the picker in
 /// `CaptureRegistry::attach`. For each `<src>::<col>` column in the
 /// parquet, build a TEMP VIEW `_src_<sanitised_src>` whose projection
-/// aliases `<src>::<col>` back to `<col>`. Then pick the source the
-/// way the JS viewer would (rezolus-shaped sources first, filename
-/// hint, fallback to first).
+/// aliases `<src>::<col>` back to `<col>`. When the parquet has 2+
+/// rezolus sources (sources that include a `memory_total` column),
+/// also build a `_src_rezolus_combined` view that sums same-named
+/// columns across rezolus sources — matching the legacy PromQL
+/// evaluator's Tsdb-side aggregation. The picker prefers the combined
+/// view when present.
 ///
-/// The JS picker is naïve — it treats any `<x>::<y>` column name as
-/// signalling a source even when `<x>` is e.g. a cgroup-task path
-/// (`task_cpu_usage//system.slice/.../VLLM::EngineCor/...`). On
-/// parquets like that the harness used to drop the unprefixed
-/// rezolus columns and compare empty matrices everywhere. We
-/// cross-check the detected prefixes against the parquet's `source`
-/// KV metadata; if no detected prefix matches, fall back to
-/// single-source mode (the dashboard SQL references unprefixed names).
+/// The JS picker is naïve about prefix detection — any `<x>::<y>`
+/// column name signals a source even when `<x>` is e.g. a cgroup-task
+/// path (`task_cpu_usage//system.slice/.../VLLM::EngineCor/...`). On
+/// parquets like that the harness drops the unprefixed rezolus
+/// columns. We sidestep that by reading column types from DESCRIBE
+/// (so artefactual prefixes show ≪ 10% of total columns) and falling
+/// back to single-source mode when that ratio holds.
 fn setup_parquet_sql(
     conn: &Connection,
     parquet: &Path,
 ) -> Result<ParquetSqlState, String> {
     let parquet_str = parquet.to_str().expect("parquet path utf-8");
-    // List all columns via DESCRIBE.
+    // DESCRIBE returns column_name + column_type — we need the latter
+    // to know whether to use scalar `+` vs `h2_combine` when summing
+    // a histogram column across sources.
     let desc_sql = format!(
         "DESCRIBE SELECT * FROM read_parquet('{parquet_str}')"
     );
@@ -379,8 +383,11 @@ fn setup_parquet_sql(
         .map_err(|e| format!("describe: {e}"))?;
     let mut rows = stmt.query([]).map_err(|e| format!("describe query: {e}"))?;
     let mut cols: Vec<String> = vec![];
+    let mut col_type: HashMap<String, String> = HashMap::new();
     while let Some(row) = rows.next().map_err(|e| format!("describe iter: {e}"))? {
         let name: String = row.get(0).map_err(|e| format!("col name: {e}"))?;
+        let ty: String = row.get(1).map_err(|e| format!("col type: {e}"))?;
+        col_type.insert(name.clone(), ty);
         cols.push(name);
     }
     drop(rows);
@@ -448,12 +455,75 @@ fn setup_parquet_sql(
 
     // Picker: rezolus sources (those with `memory_total` aliased) first,
     // optionally hinted by the parquet filename; fall back to the first
-    // source.
+    // source. With ≥2 rezolus sources, build a combined view and use
+    // it instead of any single source — matches the legacy PromQL
+    // evaluator's cross-source aggregation.
     let rezolus_sources: Vec<&String> = by_source
         .iter()
         .filter(|(_src, aliases)| aliases.iter().any(|(_o, a)| a == "memory_total"))
         .map(|(s, _)| s)
         .collect();
+
+    if rezolus_sources.len() >= 2 {
+        // Union of unprefixed metric names across rezolus sources.
+        let mut all_metrics: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for src in &rezolus_sources {
+            for (orig, alias) in by_source.get(*src).unwrap() {
+                all_metrics
+                    .entry(alias.clone())
+                    .or_default()
+                    .push(orig.clone());
+            }
+        }
+        let mut projections: Vec<String> = vec![];
+        for must in &["timestamp", "duration"] {
+            if cols.iter().any(|c| c == must) {
+                projections.push(format!("\"{must}\""));
+            }
+        }
+        for (alias, contribs) in &all_metrics {
+            let alias_q = alias.replace('"', "\"\"");
+            // Histogram columns (UBIGINT[] / BIGINT[]) need element-wise
+            // sum via `h2_combine`; scalars use `+` with COALESCE so
+            // a missing source contributes 0 instead of NULL.
+            let is_list = contribs
+                .iter()
+                .any(|c| col_type.get(c).map(|t| t.ends_with("[]")).unwrap_or(false));
+            if contribs.len() == 1 {
+                let orig_q = contribs[0].replace('"', "\"\"");
+                projections.push(format!("\"{orig_q}\" AS \"{alias_q}\""));
+            } else if is_list {
+                let parts: Vec<String> = contribs
+                    .iter()
+                    .map(|c| {
+                        let q = c.replace('"', "\"\"");
+                        format!("COALESCE(\"{q}\", []::UBIGINT[])")
+                    })
+                    .collect();
+                projections.push(format!("h2_combine([{}]) AS \"{alias_q}\"", parts.join(", ")));
+            } else {
+                let parts: Vec<String> = contribs
+                    .iter()
+                    .map(|c| {
+                        let q = c.replace('"', "\"\"");
+                        format!("COALESCE(\"{q}\", 0)")
+                    })
+                    .collect();
+                projections.push(format!("({}) AS \"{alias_q}\"", parts.join(" + ")));
+            }
+        }
+        let view = "_src_rezolus_combined";
+        let create = format!(
+            "CREATE OR REPLACE TEMP VIEW {view} AS SELECT {} FROM read_parquet('{parquet_str}')",
+            projections.join(", ")
+        );
+        conn.execute(&create, [])
+            .map_err(|e| format!("create combined view: {e}"))?;
+        return Ok(ParquetSqlState {
+            from_clause: view.to_string(),
+        });
+    }
+
     let stem_lower = parquet
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
