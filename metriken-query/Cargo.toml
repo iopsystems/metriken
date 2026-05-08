@@ -41,3 +41,7 @@ sql = ["dep:metriken-query-sql"]
 legacy = ["dep:promql-parser"]
 ingest = ["legacy", "dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]
+
+[[example]]
+name = "sql_vs_promql"
+required-features = ["legacy", "sql"]
