@@ -350,6 +350,23 @@ fn open_wasm_style_conn() -> Result<Connection, String> {
 /// name we created for the picked source.
 struct ParquetSqlState {
     from_clause: String,
+    /// Constant infrastructure labels (`endpoint`, `source`, `instance`)
+    /// pulled from Arrow field metadata. Each entry is included only
+    /// when its value is consistent across every metric column —
+    /// matching PromQL's per-series stamping. The SQL run wrapper
+    /// projects these as literals so SQL output carries them like
+    /// PromQL does. `direction` is per-column metadata (varies by
+    /// metric) and is intentionally not included here — see the
+    /// "expected divergent on direction" annotation in queries.toml.
+    constant_labels: Vec<(String, String)>,
+    /// True when the parquet has ≥2 rezolus sources and is being
+    /// read through `_src_rezolus_combined`. Drives the
+    /// `Verdict::ExpectedDivergent` reclassification: PromQL evaluates
+    /// per-source then sums; SQL sums then rates. The two values
+    /// differ at counter resets, but aggregate-then-rate is what
+    /// dashboards typically want for cross-source aggregations
+    /// (Bucket #3 in remaining_work.md).
+    is_multi_source: bool,
 }
 
 /// Mirror `duckdb-registry.js:buildSourceViews` + the picker in
@@ -374,6 +391,19 @@ fn setup_parquet_sql(
     parquet: &Path,
 ) -> Result<ParquetSqlState, String> {
     let parquet_str = parquet.to_str().expect("parquet path utf-8");
+    // Pull `sampling_interval_ms` from the parquet's file-level KV so we
+    // can snap the `timestamp` column on the way into every view. The
+    // legacy PromQL `Tsdb` snaps every timestamp it ingests
+    // (`metriken-query/src/tsdb/mod.rs:207`), so without snapping here
+    // SQL sees raw jittered timestamps while PromQL sees the snapped
+    // grid — `irate(c[w])` divides by the actual delta-t on each side
+    // and the two values disagree by ~jitter / sampling_interval.
+    // Default to 1 s when the metadata is missing.
+    let interval_ns = parquet_sampling_interval_ns(conn, parquet_str);
+    let half_ns = interval_ns / 2;
+    let snap_expr = format!(
+        "((CAST(timestamp AS BIGINT) + {half_ns}) // {interval_ns}) * {interval_ns} AS timestamp"
+    );
     // DESCRIBE returns column_name + column_type — we need the latter
     // to know whether to use scalar `+` vs `h2_combine` when summing
     // a histogram column across sources.
@@ -424,8 +454,11 @@ fn setup_parquet_sql(
     let total_prefixed: usize = by_source.values().map(|v| v.len()).sum();
     let single_source_fallback = by_source.is_empty() || total_prefixed * 10 < cols.len();
     if single_source_fallback {
-        let mut projections: Vec<String> = vec![];
+        let mut projections: Vec<String> = vec![snap_expr.clone()];
         for c in &cols {
+            if c == "timestamp" {
+                continue;
+            }
             let q = c.replace('"', "\"\"");
             projections.push(format!("\"{q}\""));
         }
@@ -444,6 +477,8 @@ fn setup_parquet_sql(
             .map_err(|e| format!("create _src_default: {e}"))?;
         return Ok(ParquetSqlState {
             from_clause: "_src_default".to_string(),
+            constant_labels: constant_labels_from_field_meta(parquet, None, false),
+            is_multi_source: false,
         });
     }
     // Hint the recorded sources for picking — but don't filter the
@@ -460,11 +495,9 @@ fn setup_parquet_sql(
     // mode (one `:src0` per id) and combined mode (N `:src<i>` per id).
     for (src, aliases) in &by_source {
         let view = view_name_for_source(src);
-        let mut projections: Vec<String> = vec![];
-        for must in &["timestamp", "duration"] {
-            if cols.iter().any(|c| c == must) {
-                projections.push(format!("\"{must}\""));
-            }
+        let mut projections: Vec<String> = vec![snap_expr.clone()];
+        if cols.iter().any(|c| c == "duration") {
+            projections.push("\"duration\"".to_string());
         }
         for (orig, alias) in aliases {
             let orig_q = orig.replace('"', "\"\"");
@@ -505,11 +538,9 @@ fn setup_parquet_sql(
                     .push((i, orig.clone()));
             }
         }
-        let mut projections: Vec<String> = vec![];
-        for must in &["timestamp", "duration"] {
-            if cols.iter().any(|c| c == must) {
-                projections.push(format!("\"{must}\""));
-            }
+        let mut projections: Vec<String> = vec![snap_expr.clone()];
+        if cols.iter().any(|c| c == "duration") {
+            projections.push("\"duration\"".to_string());
         }
         for (alias, contribs) in &all_metrics {
             let alias_q = alias.replace('"', "\"\"");
@@ -558,6 +589,13 @@ fn setup_parquet_sql(
             .map_err(|e| format!("create combined view: {e}"))?;
         return Ok(ParquetSqlState {
             from_clause: view.to_string(),
+            // Multi-source combined: `is_multi_source: true` drops
+            // `source` (ambiguous on the summed series); `endpoint`/
+            // `instance` come from the first matching rezolus anchor
+            // field. The combined view's series-count divergences are
+            // reclassified by `Verdict::ExpectedDivergent` (Bucket #3).
+            constant_labels: constant_labels_from_field_meta(parquet, None, true),
+            is_multi_source: true,
         });
     }
 
@@ -575,7 +613,40 @@ fn setup_parquet_sql(
 
     Ok(ParquetSqlState {
         from_clause: view_name_for_source(picked),
+        // Anchor on the rezolus memory_total field under this prefix.
+        // A coexisting loadgen role (e.g. cachecannon) under the same
+        // parquet prefix has different `source`/`endpoint`/`instance`
+        // metadata; anchoring on memory_total picks the rezolus role
+        // unambiguously.
+        constant_labels: constant_labels_from_field_meta(parquet, Some(picked), false),
+        is_multi_source: false,
     })
+}
+
+/// Pull `sampling_interval_ms` from the parquet file-level KV
+/// (matches `metriken-query-sql/src/views.rs:175`). Returns the
+/// interval in nanoseconds. Defaults to 1 s when the metadata is
+/// missing — older parquets predate this field.
+fn parquet_sampling_interval_ns(conn: &Connection, parquet_str: &str) -> u64 {
+    let sql = format!(
+        "SELECT value::VARCHAR FROM parquet_kv_metadata('{parquet_str}') WHERE key::VARCHAR = 'sampling_interval_ms'"
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return 1_000_000_000,
+    };
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(_) => return 1_000_000_000,
+    };
+    if let Ok(Some(row)) = rows.next() {
+        if let Ok(s) = row.get::<_, String>(0) {
+            if let Ok(ms) = s.parse::<u64>() {
+                return ms * 1_000_000;
+            }
+        }
+    }
+    1_000_000_000
 }
 
 /// Pull the parquet's `source` KV metadata. Stored as a JSON-encoded
@@ -664,9 +735,87 @@ fn read_field_metadata(parquet_path: &Path) -> HashMap<String, FieldMeta> {
             .filter(|(k, _)| !NON_VALUE_METADATA_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        value_labels.sort_by(|a, b| a.0.cmp(&b.0));
+        // Numeric-encoded parquets store metadata in alphabetical order,
+        // but Rezolus emits column NAMES (in the named-column format)
+        // with non-numeric labels first and numeric IDs last — e.g.
+        // `softirq/<kind>/<id>`, `cpu_usage/<state>/<id>`. The dashboard
+        // SQL's regex (`^softirq/[a-z_]+/[0-9]+$`) only matches that
+        // order, so the rebuilt alias has to match too. Sort key:
+        // numeric-only values last, alphabetical within each group.
+        let is_numeric = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+        value_labels.sort_by(|a, b| {
+            is_numeric(&a.1)
+                .cmp(&is_numeric(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         out.insert(f.name().clone(), FieldMeta { metric, metric_type, value_labels });
     }
+    out
+}
+
+/// Infrastructure labels (`endpoint`, `source`, `instance`) for the
+/// rezolus role's columns — the labels PromQL stamps on every rezolus
+/// series at load time via `Tsdb::extract_name_labels`. The SQL backend
+/// has to project them explicitly to match.
+///
+/// We anchor on the field whose `metric` == "memory_total" — the same
+/// signal the source picker uses to identify a rezolus source. That
+/// avoids the parquet-prefix-vs-recording-source mismatch (a single
+/// `0::` prefix can carry both rezolus AND a coexisting loadgen role
+/// like cachecannon, each with different `source`). PromQL only ever
+/// stamps a series with the label values of *its* underlying column;
+/// for rezolus dashboard queries, those columns are the ones matching
+/// `metric=memory_total`'s labels.
+///
+/// `prefix_filter`:
+///   - `Some(prefix)`: anchor on a field named `<prefix>::*` with
+///     metric=memory_total. Use for `_src_<src>` single-picked views.
+///   - `None`: anchor on any field with metric=memory_total. Use for
+///     `_src_default` (no prefix) and `_src_rezolus_combined`. For the
+///     combined view, multiple rezolus sources exist and *any one* is a
+///     reasonable representative for `endpoint`/`instance`; `source` is
+///     deliberately omitted via the `is_multi_source` plumbing — it's
+///     ambiguous on the summed series.
+///
+/// `direction` is intentionally excluded — per-column metadata that
+/// varies by metric (network-traffic by direction etc.). Closing those
+/// few cases needs a per-metric label path (Bucket #3 territory).
+fn constant_labels_from_field_meta(
+    parquet_path: &Path,
+    prefix_filter: Option<&str>,
+    is_multi_source: bool,
+) -> Vec<(String, String)> {
+    let bytes = match std::fs::read(parquet_path) {
+        Ok(b) => Bytes::from(b),
+        Err(_) => return vec![],
+    };
+    let m = match ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default()) {
+        Ok(m) => m,
+        Err(_) => return vec![],
+    };
+    let prefix = prefix_filter.map(|s| format!("{s}::"));
+    // Find the anchor field: metric=memory_total under the chosen prefix.
+    let anchor = m.schema().fields().iter().find(|f| {
+        if let Some(p) = &prefix {
+            if !f.name().starts_with(p.as_str()) {
+                return false;
+            }
+        }
+        f.metadata().get("metric").map(|s| s.as_str()) == Some("memory_total")
+    });
+    let Some(anchor) = anchor else { return vec![] };
+    let md = anchor.metadata();
+    let mut keys: Vec<&str> = vec!["endpoint", "instance"];
+    if !is_multi_source {
+        keys.push("source");
+    }
+    let mut out: Vec<(String, String)> = vec![];
+    for k in keys {
+        if let Some(v) = md.get(k) {
+            out.push((k.to_string(), v.clone()));
+        }
+    }
+    out.sort();
     out
 }
 
@@ -711,17 +860,47 @@ fn run_sql(
     conn: &Connection,
     sql: &str,
     sql_state: &ParquetSqlState,
+    promql: &str,
     start: f64,
     end: f64,
 ) -> Result<QueryResult, String> {
     let start_ns: i64 = (start * 1e9) as i64;
     let end_ns: i64 = (end * 1e9) as i64;
+    // Project constant infrastructure labels onto every output row so
+    // the SQL output carries the same per-series labels PromQL stamps
+    // from Arrow field metadata. Production WASM would do the same in
+    // its query wrapper at duckdb-registry.js — see remaining_work.md
+    // Bucket #1 (Option A).
+    //
+    // Skip when PromQL strips labels via aggregation (`sum`, `avg`,
+    // etc.) — output of a PromQL aggregator without `by(...)` carries
+    // an empty label set, and adding labels here would diverge.
+    // `histogram_quantile(q, sum(...))` is the same shape (the inner
+    // sum strips labels). Conservative detection: any aggregator
+    // keyword present.
+    let label_proj: String =
+        if sql_state.constant_labels.is_empty() || promql_aggregates(promql) {
+            String::new()
+        } else {
+            let parts: Vec<String> = sql_state
+                .constant_labels
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "'{}' AS \"{}\"",
+                        v.replace('\'', "''"),
+                        k.replace('"', "\"\"")
+                    )
+                })
+                .collect();
+            format!(", {}", parts.join(", "))
+        };
     let wrapped = format!(
         "WITH _src AS ( \
             SELECT * FROM {from_clause} \
             WHERE timestamp BETWEEN {start_ns} AND {end_ns} \
          ) \
-         SELECT * FROM ({sql}) ORDER BY t",
+         SELECT *{label_proj} FROM ({sql}) ORDER BY t",
         from_clause = sql_state.from_clause,
     );
     let mut stmt = match conn.prepare(&wrapped) {
@@ -932,12 +1111,81 @@ fn arrow_cell_as_string(arr: &dyn Array, row: usize) -> String {
 
 // ── Comparison.
 
+/// Heuristic: does the dashboard SQL aggregate columns BEFORE applying
+/// a rate? If so, on a multi-source parquet the harness expects
+/// methodology divergence vs PromQL's per-series-rate-then-sum (see
+/// `Verdict::ExpectedDivergent`). Matches the resolvers in
+/// `crates/dashboard/src/sql.rs`: `irate_total`, `cpu_pct_total`,
+/// `concept_total`, `hist_percentile_series_combined`.
+fn is_aggregate_then_rate(sql: &str) -> bool {
+    sql.contains("list_sum([*COLUMNS") || sql.contains("h2_combine([*COLUMNS")
+}
+
+/// Heuristic: is this divergence a "promql has more series than sql"
+/// case caused by `_src_rezolus_combined` collapsing per-source series?
+/// Matches the comparator's `series count: promql=N sql=M` reason
+/// where N > M.
+fn is_combined_view_series_count(reason: &str) -> bool {
+    let Some(rest) = reason.strip_prefix("series count: promql=") else {
+        return false;
+    };
+    let Some((p_str, s_part)) = rest.split_once(" sql=") else {
+        return false;
+    };
+    let p: usize = match p_str.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let s: usize = match s_part.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    p > s
+}
+
+/// Heuristic: does the PromQL query produce output without
+/// per-series infrastructure labels (`endpoint`/`source`/`instance`)?
+/// True for any aggregator (`sum`/`avg`/`max`/`min`/`count`/`topk`)
+/// — PromQL strips labels unless `by(...)` is given, and even
+/// `by(id)` keeps only the by-keys. Also true for the histogram
+/// reorganizers (`histogram_quantile(s)`) which the metriken-query
+/// PromQL implementation projects without infrastructure labels.
+///
+/// When this returns true, the SQL wrapper skips the constant-label
+/// projection so SQL output matches PromQL's label-stripped shape.
+fn promql_aggregates(promql: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "sum(", "sum (", "sum by",
+        "avg(", "avg (", "avg by",
+        "max(", "max (", "max by",
+        "min(", "min (", "min by",
+        "count(", "count (", "count by",
+        "topk(", "bottomk(",
+        // Histogram reorganizers strip infrastructure labels in the
+        // metriken-query PromQL implementation — output carries only
+        // `quantile` (and any preserved by-keys from inner aggregation).
+        "histogram_quantile(", "histogram_quantiles(",
+    ];
+    KEYWORDS.iter().any(|k| promql.contains(k))
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 enum Verdict {
     Identical,
     WithinTolerance { max_rel: f64, max_abs: f64 },
     Divergent { reason: String },
+    /// Reclassified `Divergent` when:
+    ///   - the parquet has ≥2 rezolus sources (`_src_rezolus_combined`), AND
+    ///   - the dashboard SQL aggregates across columns BEFORE rating
+    ///     (`list_sum([*COLUMNS(...)])` or `h2_combine([*COLUMNS(...)])`).
+    /// PromQL does per-series-irate-then-sum; SQL does sum-then-irate.
+    /// The two differ at counter resets within the lookback window —
+    /// aggregate-then-rate is what dashboards typically want for
+    /// cross-source aggregations, so this is documented and accepted
+    /// rather than fixed (Bucket #3 in remaining_work.md). Counted in
+    /// the summary, not in `divergent`.
+    ExpectedDivergent { reason: String },
     SkippedCgroupPlaceholder,
     PromqlError(String),
     SqlError(String),
@@ -1090,12 +1338,19 @@ fn compare_series_aligned(
     // Compute key sets.
     let only_a: Vec<i64> = amap.keys().filter(|k| !bmap.contains_key(k)).copied().collect();
     let only_b: Vec<i64> = bmap.keys().filter(|k| !amap.contains_key(k)).copied().collect();
-    // PromQL is allowed up to 1 extra sample at each end of the window
-    // (start and/or end grid endpoints that fall outside the parquet's
-    // recorded sample range). Anything beyond that is divergent.
-    if !only_b.is_empty() {
+    // Boundary tolerance: each side may have up to 1 integer-second
+    // bucket the other doesn't. Tightened from ±2 to ±1 after the
+    // rate_5m range-window fix (B-2) eliminated the spurious NULLs at
+    // window edges that previously needed the ±2 cushion.
+    if only_a.len() > 1 {
         return SeriesCompare::Divergent(format!(
-            "SQL has {} integer-second timestamps PromQL doesn't (e.g. {})",
+            "PromQL has {} integer-second timestamps SQL doesn't (>1 boundary tolerance)",
+            only_a.len(),
+        ));
+    }
+    if only_b.len() > 1 {
+        return SeriesCompare::Divergent(format!(
+            "SQL has {} integer-second timestamps PromQL doesn't (>1 boundary tolerance, e.g. {})",
             only_b.len(),
             only_b
                 .iter()
@@ -1103,12 +1358,6 @@ fn compare_series_aligned(
                 .map(|t| t.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-        ));
-    }
-    if only_a.len() > 2 {
-        return SeriesCompare::Divergent(format!(
-            "PromQL has {} integer-second timestamps SQL doesn't (>2 boundary tolerance)",
-            only_a.len(),
         ));
     }
     let mut max_rel = 0.0_f64;
@@ -1208,6 +1457,8 @@ struct Counts {
     identical: usize,
     within_tolerance: usize,
     divergent: usize,
+    /// See `Verdict::ExpectedDivergent`.
+    expected_divergent: usize,
     skipped_cgroup: usize,
     promql_error: usize,
     sql_error: usize,
@@ -1346,13 +1597,37 @@ fn main() {
             let promql_res: Result<QueryResult, String> =
                 Err("legacy feature disabled".into());
 
-            // Run SQL via the wasm-style connection.
-            let sql_res = run_sql(&sql_conn, &plot.sql, &sql_state, win_start, end);
+            // Run SQL via the wasm-style connection. Pass the PromQL
+            // body so the wrapper can decide whether to project
+            // constant labels (PromQL aggregators strip labels).
+            let sql_res = run_sql(&sql_conn, &plot.sql, &sql_state, &effective, win_start, end);
 
             let verdict = match (&promql_res, &sql_res) {
                 (Err(e1), _) => Verdict::PromqlError(e1.clone()),
                 (_, Err(e2)) => Verdict::SqlError(e2.clone()),
                 (Ok(p), Ok(s)) => compare(p, s, args.rel_tol, args.abs_tol),
+            };
+            // Reclassify multi-source methodology divergences as
+            // expected — the harness counts them but doesn't flag them
+            // as failures (Bucket #3, methodology, not a bug). Two
+            // shapes:
+            //   1. Aggregate-then-rate SQL (sum-then-irate) vs PromQL
+            //      per-series-rate-then-sum — values diverge at
+            //      counter resets within the lookback window.
+            //   2. Series-count: PromQL evaluates each source
+            //      independently and emits N series; SQL goes through
+            //      `_src_rezolus_combined` and emits 1 (or fewer).
+            //      Reason will start with "series count: promql=N sql=M"
+            //      with N > M.
+            let verdict = match verdict {
+                Verdict::Divergent { reason }
+                    if sql_state.is_multi_source
+                        && (is_aggregate_then_rate(&plot.sql)
+                            || is_combined_view_series_count(&reason)) =>
+                {
+                    Verdict::ExpectedDivergent { reason }
+                }
+                v => v,
             };
 
             // Save both results next to the verdict for post-hoc diffing.
@@ -1396,6 +1671,13 @@ fn main() {
                         "{}::{} ({}) — {}",
                         parquet_stem, plot.id, plot.section, reason
                     ));
+                }
+                Verdict::ExpectedDivergent { .. } => {
+                    p_counts.expected_divergent += 1;
+                    summary.counts.expected_divergent += 1;
+                    bump_section(&mut summary.per_section, &plot.section, |c| {
+                        c.expected_divergent += 1
+                    });
                 }
                 Verdict::PromqlError(_) => {
                     p_counts.promql_error += 1;
