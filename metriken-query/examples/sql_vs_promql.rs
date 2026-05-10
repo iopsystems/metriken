@@ -805,7 +805,7 @@ fn constant_labels_from_field_meta(
     });
     let Some(anchor) = anchor else { return vec![] };
     let md = anchor.metadata();
-    let mut keys: Vec<&str> = vec!["endpoint", "instance"];
+    let mut keys: Vec<&str> = vec!["endpoint", "instance", "node"];
     if !is_multi_source {
         keys.push("source");
     }
