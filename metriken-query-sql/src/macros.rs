@@ -22,13 +22,21 @@ const MACROS: &[&str] = &[
     // exhaustigen tests (`metriken-query-sql/tests/exhaustigen.rs`) walk
     // every short counter sequence and assert byte-equality.
 
-    // Per-second delta with PromQL reset semantics.
-    // NULL on the first sample of the table (no LAG).
+    // Per-second rate with PromQL reset semantics. NULL on the first
+    // sample of the table (no LAG) and on duplicate timestamps (dt=0).
+    // Divides by the actual `(ts - LAG(ts))` so a missing sample (gap >
+    // sampling interval) produces a rate computed over the longer
+    // interval — matching PromQL's `irate(c[w])` which divides by the
+    // time delta between the last two samples in the window.
     "CREATE OR REPLACE MACRO irate_1s(c, ts) AS \
         CASE \
             WHEN LAG(c) OVER (ORDER BY ts) IS NULL THEN NULL \
-            WHEN c >= LAG(c) OVER (ORDER BY ts) THEN CAST(c - LAG(c) OVER (ORDER BY ts) AS DOUBLE) \
-            ELSE CAST(c AS DOUBLE) \
+            WHEN c >= LAG(c) OVER (ORDER BY ts) THEN \
+                CAST(c - LAG(c) OVER (ORDER BY ts) AS DOUBLE) \
+                / NULLIF((ts - LAG(ts) OVER (ORDER BY ts))::DOUBLE / 1e9, 0) \
+            ELSE \
+                CAST(c AS DOUBLE) \
+                / NULLIF((ts - LAG(ts) OVER (ORDER BY ts))::DOUBLE / 1e9, 0) \
         END",
 
     // Same value, different name — for callers who think in deltas, not rates.
@@ -39,15 +47,21 @@ const MACROS: &[&str] = &[
             ELSE CAST(c AS DOUBLE) \
         END",
 
-    // 5-minute average rate over a windowed `c - LAG(c, 300)` / 300s.
-    // **Caveat:** this is correct ONLY for monotonic counters. PromQL's
-    // `rate(c[5m])` handles intra-window resets via sum-of-increments, but
-    // DuckDB rejects `SUM(LAG(...) OVER ...) OVER ...` ("window function
-    // calls cannot be nested"), so the reset-aware form has to be written
-    // out as a CTE in the catalogue's SQL twin. For the common case
-    // (Rezolus dashboards over reset-free data) this macro suffices.
+    // 5-minute average rate over a *time-range* window. RANGE BETWEEN
+    // 300000000000 PRECEDING AND CURRENT ROW (300s in ns — DuckDB 1.1.1
+    // requires a literal) so parquets shorter than 5 minutes still
+    // produce values and sample gaps don't shift the lookback by row
+    // count. Pre-fix used positional `LAG(c, 300)` which returned NULL
+    // on every sample for ≤300-row tables.
+    //
+    // **Caveat:** monotonic-only. PromQL's `rate(c[5m])` handles
+    // intra-window resets via sum-of-increments; the reset-aware form
+    // is the per-pair CTE pattern in metriken-query/src/translate.rs
+    // (Rate variant of PerColExpr), not expressible as a macro under
+    // DuckDB's "window function calls cannot be nested" rule.
     "CREATE OR REPLACE MACRO rate_5m(c, ts) AS \
-        (c - LAG(c, 300) OVER (ORDER BY ts)) / 300.0",
+        (c - first_value(c) OVER (ORDER BY ts RANGE BETWEEN 300000000000 PRECEDING AND CURRENT ROW)) \
+        / NULLIF((ts - first_value(ts) OVER (ORDER BY ts RANGE BETWEEN 300000000000 PRECEDING AND CURRENT ROW))::DOUBLE / 1e9, 0)",
 
     // -------- Layer A: histogram primitives --------
     // Cumulative quantiles do not need a window — just delegate to h2_quantile.
@@ -149,26 +163,63 @@ mod tests {
     }
 
     #[test]
-    fn irate_1s_is_pairwise_diff() {
+    fn irate_1s_is_per_second_rate() {
+        // ts is in nanoseconds (matches `_src` post-snap). 1e9-ns spacing
+        // → dt=1s → rate equals delta. Verifies division by dt and not
+        // bare-delta semantics.
         let conn = fresh();
         let r = col_f64(
             &conn,
-            "WITH t(ts, x) AS (VALUES (1, 100.0), (2, 250.0), (3, 425.0)) \
+            "WITH t(ts, x) AS (VALUES (1000000000, 100.0), (2000000000, 250.0), (3000000000, 425.0)) \
              SELECT irate_1s(x, ts) FROM t ORDER BY ts",
         );
         assert_eq!(r, vec![None, Some(150.0), Some(175.0)]);
     }
 
     #[test]
-    fn rate_5m_lags_300_seconds_and_divides() {
+    fn irate_1s_divides_by_actual_dt_when_samples_are_gappy() {
+        // 1s, then 2s gap. PromQL `irate` divides by the actual delta-t,
+        // so the second result should be `delta / 2`, not bare delta.
         let conn = fresh();
-        // x_n = n*(n-1)/2 over ts = 1..305. At ts=305: x=46360, lag=10, delta=46350, /300=154.5.
         let r = col_f64(
             &conn,
-            "WITH s AS (SELECT ts, ts*(ts-1)/2 AS x FROM range(1, 306) t(ts)) \
-             SELECT rate_5m(x, ts) FROM s ORDER BY ts DESC LIMIT 1",
+            "WITH t(ts, x) AS (VALUES (1000000000, 0.0), (2000000000, 100.0), (4000000000, 300.0)) \
+             SELECT irate_1s(x, ts) FROM t ORDER BY ts",
+        );
+        assert_eq!(r, vec![None, Some(100.0), Some(100.0)]);
+    }
+
+    #[test]
+    fn rate_5m_lags_300_seconds_and_divides() {
+        let conn = fresh();
+        // x_n = n*(n-1)/2 with ts in nanoseconds.
+        // At ts=305s: x=46360. The 300s-back range window starts at ts=5s,
+        // so first_value(x)=10 and first_value(ts)=5e9.
+        // delta=46350; dt=300s; rate=154.5.
+        let r = col_f64(
+            &conn,
+            "WITH s AS (SELECT ts*1000000000 AS ts_ns, ts*(ts-1)/2 AS x FROM range(1, 306) t(ts)) \
+             SELECT rate_5m(x, ts_ns) FROM s ORDER BY ts_ns DESC LIMIT 1",
         );
         assert_eq!(r, vec![Some(154.5)]);
+    }
+
+    #[test]
+    fn rate_5m_handles_short_parquets_via_range_window() {
+        // Pre-fix: positional `LAG(c, 300)` returned NULL on every sample
+        // of a 60-row table, so SQL emitted no series. The range-based
+        // form computes a rate over the actual span seen.
+        // x = ts*(ts-1)/2 over ts in [1, 60] (in ns: ts*1e9).
+        // At ts=60s: x=1770; first_value at ts=1s: x=0.
+        // delta=1770; dt=59s; rate≈30.0.
+        let conn = fresh();
+        let r = col_f64(
+            &conn,
+            "WITH s AS (SELECT ts*1000000000 AS ts_ns, ts*(ts-1)/2 AS x FROM range(1, 61) t(ts)) \
+             SELECT rate_5m(x, ts_ns) FROM s ORDER BY ts_ns DESC LIMIT 1",
+        );
+        let v = r[0].expect("non-NULL on short window");
+        assert!((v - 30.0).abs() < 1e-9, "expected ~30.0 got {v}");
     }
 
     #[test]
@@ -177,7 +228,7 @@ mod tests {
         // 4 cores; usage in ns. 1e9 ns delta over 1s on 4 cores → 0.25 busy.
         let r = col_f64(
             &conn,
-            "WITH t(ts, u) AS (VALUES (1, 0.0), (2, 1.0e9), (3, 3.0e9)) \
+            "WITH t(ts, u) AS (VALUES (1000000000, 0.0), (2000000000, 1.0e9), (3000000000, 3.0e9)) \
              SELECT cpu_busy_pct(u, 4, ts) FROM t ORDER BY ts",
         );
         assert_eq!(r, vec![None, Some(0.25), Some(0.5)]);
@@ -188,7 +239,7 @@ mod tests {
         let conn = fresh();
         let r = col_f64(
             &conn,
-            "WITH t(ts, i, c) AS (VALUES (1, 0.0, 0.0), (2, 200.0, 100.0), (3, 700.0, 200.0)) \
+            "WITH t(ts, i, c) AS (VALUES (1000000000, 0.0, 0.0), (2000000000, 200.0, 100.0), (3000000000, 700.0, 200.0)) \
              SELECT ipc(i, c, ts) FROM t ORDER BY ts",
         );
         assert_eq!(r, vec![None, Some(2.0), Some(5.0)]);
@@ -202,8 +253,8 @@ mod tests {
         let r = col_f64(
             &conn,
             "WITH t(ts, i, c, tsc, ap, mp) AS (VALUES \
-                (1, 0.0, 0.0, 0.0, 0.0, 0.0), \
-                (2, 200.0, 100.0, 1000.0, 800.0, 1000.0)) \
+                (1000000000, 0.0, 0.0, 0.0, 0.0, 0.0), \
+                (2000000000, 200.0, 100.0, 1000.0, 800.0, 1000.0)) \
              SELECT ipns(i, c, tsc, ap, mp, 1, ts) FROM t ORDER BY ts",
         );
         assert!(r[0].is_none());
@@ -234,19 +285,21 @@ mod tests {
         let conn = fresh();
         let r = col_f64(
             &conn,
-            "WITH t(ts, b) AS (VALUES (1, 0.0), (2, 100.0)) \
+            "WITH t(ts, b) AS (VALUES (1000000000, 0.0), (2000000000, 100.0)) \
              SELECT bps_from_bytes(b, ts) FROM t ORDER BY ts",
         );
         assert_eq!(r, vec![None, Some(800.0)]);
     }
 
     #[test]
-    fn delta_1s_matches_irate_1s() {
-        // The two macros have identical bodies; verify they produce the same output.
+    fn delta_1s_equals_irate_1s_at_1s_spacing() {
+        // `delta_1s` is the bare pairwise diff; `irate_1s` is delta/dt.
+        // At evenly-1s spacing they coincide. Verifies the (deliberately
+        // small) overlap between the two macros.
         let conn = fresh();
         let pair = col_f64(
             &conn,
-            "WITH t(ts, x) AS (VALUES (1, 5.0), (2, 11.0), (3, 20.0)) \
+            "WITH t(ts, x) AS (VALUES (1000000000, 5.0), (2000000000, 11.0), (3000000000, 20.0)) \
              SELECT delta_1s(x, ts) - irate_1s(x, ts) FROM t ORDER BY ts",
         );
         // None for the first row (LAG NULL), 0.0 thereafter.
