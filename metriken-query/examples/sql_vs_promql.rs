@@ -866,6 +866,16 @@ fn run_sql(
 ) -> Result<QueryResult, String> {
     let start_ns: i64 = (start * 1e9) as i64;
     let end_ns: i64 = (end * 1e9) as i64;
+    // PromQL `rate(c[5m])` / `irate(c)` need samples *before* the
+    // requested eval window to produce correct values at the leading
+    // edge of the window. PromQL's Tsdb has the whole parquet
+    // available; SQL's `_src` is filtered to [start, end] which
+    // clips the lookback. For the dashboard's macros / helpers, 5 min
+    // is the maximum lookback we use, so widening _src by that much
+    // gives SQL the same context PromQL has — without paying the cost
+    // of running rate computations on the whole parquet.
+    const LOOKBACK_PADDING_NS: i64 = 300 * 1_000_000_000;
+    let src_start_ns: i64 = start_ns.saturating_sub(LOOKBACK_PADDING_NS);
     // Project constant infrastructure labels onto every output row so
     // the SQL output carries the same per-series labels PromQL stamps
     // from Arrow field metadata. Production WASM would do the same in
@@ -898,9 +908,9 @@ fn run_sql(
     let wrapped = format!(
         "WITH _src AS ( \
             SELECT * FROM {from_clause} \
-            WHERE timestamp BETWEEN {start_ns} AND {end_ns} \
+            WHERE timestamp BETWEEN {src_start_ns} AND {end_ns} \
          ) \
-         SELECT *{label_proj} FROM ({sql}) ORDER BY t",
+         SELECT *{label_proj} FROM ({sql}) WHERE t * 1e9 >= {start_ns} ORDER BY t",
         from_clause = sql_state.from_clause,
     );
     let mut stmt = match conn.prepare(&wrapped) {
