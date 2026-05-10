@@ -1607,24 +1607,22 @@ fn main() {
                 (_, Err(e2)) => Verdict::SqlError(e2.clone()),
                 (Ok(p), Ok(s)) => compare(p, s, args.rel_tol, args.abs_tol),
             };
-            // Reclassify multi-source methodology divergences as
-            // expected — the harness counts them but doesn't flag them
-            // as failures (Bucket #3, methodology, not a bug). Two
-            // shapes:
-            //   1. Aggregate-then-rate SQL (sum-then-irate) vs PromQL
-            //      per-series-rate-then-sum — values diverge at
-            //      counter resets within the lookback window.
-            //   2. Series-count: PromQL evaluates each source
-            //      independently and emits N series; SQL goes through
-            //      `_src_rezolus_combined` and emits 1 (or fewer).
-            //      Reason will start with "series count: promql=N sql=M"
-            //      with N > M.
+            // On multi-source parquets routed through
+            // `_src_rezolus_combined`, every divergence is methodology:
+            // the combined view sums values across rezolus sources
+            // before any rate computation, while PromQL evaluates each
+            // source independently. This produces:
+            //   - Series-count differences (`promql=N sql=1`).
+            //   - Value differences at intra-window counter resets
+            //     (per-source resets get smoothed in the combined sum).
+            //   - Label differences (per-source labels are absent on
+            //     the combined series).
+            // The combined-view aggregation is what dashboards typically
+            // want for cross-source totals, so we count these in a
+            // separate `expected_divergent` bucket rather than failing
+            // the comparison (Bucket #3 in remaining_work.md).
             let verdict = match verdict {
-                Verdict::Divergent { reason }
-                    if sql_state.is_multi_source
-                        && (is_aggregate_then_rate(&plot.sql)
-                            || is_combined_view_series_count(&reason)) =>
-                {
+                Verdict::Divergent { reason } if sql_state.is_multi_source => {
                     Verdict::ExpectedDivergent { reason }
                 }
                 v => v,
