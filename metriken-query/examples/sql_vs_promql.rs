@@ -1111,38 +1111,6 @@ fn arrow_cell_as_string(arr: &dyn Array, row: usize) -> String {
 
 // ── Comparison.
 
-/// Heuristic: does the dashboard SQL aggregate columns BEFORE applying
-/// a rate? If so, on a multi-source parquet the harness expects
-/// methodology divergence vs PromQL's per-series-rate-then-sum (see
-/// `Verdict::ExpectedDivergent`). Matches the resolvers in
-/// `crates/dashboard/src/sql.rs`: `irate_total`, `cpu_pct_total`,
-/// `concept_total`, `hist_percentile_series_combined`.
-fn is_aggregate_then_rate(sql: &str) -> bool {
-    sql.contains("list_sum([*COLUMNS") || sql.contains("h2_combine([*COLUMNS")
-}
-
-/// Heuristic: is this divergence a "promql has more series than sql"
-/// case caused by `_src_rezolus_combined` collapsing per-source series?
-/// Matches the comparator's `series count: promql=N sql=M` reason
-/// where N > M.
-fn is_combined_view_series_count(reason: &str) -> bool {
-    let Some(rest) = reason.strip_prefix("series count: promql=") else {
-        return false;
-    };
-    let Some((p_str, s_part)) = rest.split_once(" sql=") else {
-        return false;
-    };
-    let p: usize = match p_str.parse() {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    let s: usize = match s_part.parse() {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    p > s
-}
-
 /// Heuristic: does the PromQL query produce output without
 /// per-series infrastructure labels (`endpoint`/`source`/`instance`)?
 /// True for any aggregator (`sum`/`avg`/`max`/`min`/`count`/`topk`)
