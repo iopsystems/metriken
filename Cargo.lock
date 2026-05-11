@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "arrow",
  "chrono",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "arrow",
  "bytes",
