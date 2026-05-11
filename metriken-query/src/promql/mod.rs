@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::tsdb::{Labels, Tsdb};
 
+mod columns;
 pub mod streaming;
 
 #[cfg(test)]
