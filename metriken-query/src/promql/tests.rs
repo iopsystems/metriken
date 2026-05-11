@@ -1017,16 +1017,10 @@ fn test_mismatched_labels_without_modifier_do_not_match() {
 
 // -- columns() resolver tests --
 //
-// `columns()` resolves a PromQL query to the set of parquet columns
-// it touches, without evaluating values. These tests exercise the
-// matcher → column resolution against a TSDB populated via the
-// ingest path. The ingest path synthesizes column names (metric
-// name, or `name:buckets` for histograms), so the assertions key
-// off those synthesized names.
+// The ingest path synthesizes column names as the metric name (or
+// `name:buckets` for histograms), so assertions key off those
+// synthesized names rather than per-labelset parquet field names.
 
-/// Build a TSDB exercising every selector shape `columns()` resolves:
-/// two counter series (with label), two gauges (with label), and one
-/// gauge with no labels.
 fn create_columns_tsdb() -> Tsdb {
     use metriken_exposition::{Counter, Gauge, Snapshot, SnapshotV2};
 
@@ -1081,9 +1075,6 @@ fn create_columns_tsdb() -> Tsdb {
     tsdb
 }
 
-/// Build a TSDB with one histogram metric (`tcp_packet_latency`)
-/// across two CPUs.  Histograms differ from counters/gauges in that
-/// the synthesized column name is `name:buckets`.
 fn create_columns_histogram_tsdb() -> Tsdb {
     use histogram::Histogram;
     use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
@@ -1127,10 +1118,6 @@ fn test_columns_bare_gauge_selector_matches_all_labels() {
     let engine = QueryEngine::new(tsdb);
 
     let cols = engine.columns("cpu_temp").unwrap();
-    // Ingest synthesizes one column per (name, labels) pair, all
-    // named "cpu_temp" in our model. With two host labels they
-    // share a synthesized column name, so the set collapses to one
-    // entry — the test still verifies the metric is resolved.
     assert_eq!(cols, ["cpu_temp".to_string()].into_iter().collect());
 }
 
@@ -1139,9 +1126,6 @@ fn test_columns_bare_selector_with_label_filter() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // Label filter on a gauge returns only the matching series'
-    // synthesized column (still "cpu_temp" since ingest doesn't
-    // diversify column names by label).
     let cols = engine.columns(r#"cpu_temp{host="a"}"#).unwrap();
     assert_eq!(cols, ["cpu_temp".to_string()].into_iter().collect());
 }
@@ -1151,8 +1135,6 @@ fn test_columns_bare_selector_no_match_is_empty() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // Bare selector against a name that doesn't exist as a gauge
-    // resolves to an empty set, not an error.
     let cols = engine.columns("nonexistent_metric").unwrap();
     assert!(cols.is_empty());
 }
@@ -1162,9 +1144,9 @@ fn test_columns_irate_resolves_counters_not_gauges() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // irate(...) routes its selector to the counter collection; a
-    // counter named "cpu_cycles" exists, a gauge with that name
-    // doesn't, so the resolver must pick the counter side.
+    // No gauge named cpu_cycles exists, so the result must come from
+    // the counter side — guarding against the resolver falling back
+    // to gauges by accident.
     let cols = engine.columns("irate(cpu_cycles[5s])").unwrap();
     assert_eq!(cols, ["cpu_cycles".to_string()].into_iter().collect());
 }
@@ -1197,8 +1179,6 @@ fn test_columns_aggregation_preserves_all_inner_columns() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // `sum without (...)` projects labels but still requires every
-    // input column to compute the aggregate.
     let cols = engine
         .columns("sum without (cpu) (irate(cpu_cycles[5s]))")
         .unwrap();
@@ -1210,8 +1190,8 @@ fn test_columns_name_regex_resolves_multiple_metrics() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // {__name__=~"cpu_.*"} should match cpu_temp and cpu_cores (both
-    // gauges) but not cpu_cycles (counter).
+    // cpu_cycles is a counter; the bare regex selector targets gauges
+    // only, so it must not appear in the result.
     let cols = engine.columns(r#"{__name__=~"cpu_.*"}"#).unwrap();
     let expected: HashSet<String> = ["cpu_temp".to_string(), "cpu_cores".to_string()]
         .into_iter()
@@ -1240,7 +1220,6 @@ fn test_columns_histogram_quantiles_array_form() {
     let tsdb = Arc::new(create_columns_histogram_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // Rezolus-specific array form is intercepted before AST parsing.
     let cols = engine
         .columns("histogram_quantiles([0.5, 0.99], tcp_packet_latency)")
         .unwrap();
@@ -1276,9 +1255,6 @@ fn test_columns_histogram_heatmap_with_label_filter() {
     let cols = engine
         .columns(r#"histogram_heatmap(tcp_packet_latency{cpu="0"})"#)
         .unwrap();
-    // Even though the label filter narrows series, the synthesized
-    // column name is shared across labelsets in the ingest path —
-    // so the resolved set is the single bucket column.
     assert_eq!(
         cols,
         ["tcp_packet_latency:buckets".to_string()]
@@ -1304,7 +1280,6 @@ fn test_columns_empty_tsdb_resolves_empty_set() {
     let tsdb = Arc::new(create_test_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // No data, but a syntactically valid query → empty set, not error.
     let cols = engine.columns("cpu_temp").unwrap();
     assert!(cols.is_empty());
 }

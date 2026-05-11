@@ -26,12 +26,9 @@ use series::{delta_to_32_or_empty, empty_delta_32};
 
 /// Per-column dispatch target precomputed from the parquet schema.
 /// Histogram targets carry the rolling `prev` cumulative so per-period
-/// deltas work across batches.
-///
-/// `column_name` is the parquet field name as it appears in the
-/// schema — preserved so callers (e.g. parquet column-trimming
-/// against a query) can map a resolved series back to its on-disk
-/// column without re-parsing the schema.
+/// deltas work across batches. `column_name` is the parquet field
+/// name, preserved so callers can map a resolved series back to its
+/// on-disk column without re-parsing the schema.
 enum ColumnTarget {
     Skip,
     Counter {
@@ -75,11 +72,10 @@ pub struct Tsdb {
     counters: HashMap<String, CounterCollection>,
     gauges: HashMap<String, GaugeCollection>,
     histograms: HashMap<String, HistogramCollection>,
-    /// Parquet column name for each loaded (metric_name, labels) pair,
-    /// grouped by metric kind. Populated from `field.name()` on the
-    /// parquet load path and synthesized on the ingest path. Consumed
-    /// by `QueryEngine::columns()` so callers can compute the minimum
-    /// parquet column set a query touches.
+    /// Parquet column name for each loaded `(metric_name, labels)`
+    /// pair: populated from `field.name()` on the parquet load path,
+    /// synthesized on the ingest path. Consumed by
+    /// `QueryEngine::columns()`.
     counter_columns: HashMap<String, HashMap<Labels, String>>,
     gauge_columns: HashMap<String, HashMap<Labels, String>>,
     histogram_columns: HashMap<String, HashMap<Labels, String>>,
@@ -532,20 +528,16 @@ impl Tsdb {
             .map(String::as_str)
     }
 
-    /// Borrow the parquet-column-name map for counters, keyed by
-    /// `metric_name → (labels → column_name)`.  Internal access for
-    /// `QueryEngine::columns()`, which needs to iterate every loaded
-    /// series to resolve regex/negated `__name__` matchers.
+    /// Iteration-friendly view of the column map, for resolvers that
+    /// need to scan every series (e.g. regex / negated `__name__`).
     pub(crate) fn counter_columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
         &self.counter_columns
     }
 
-    /// See [`Tsdb::counter_columns_ref`].
     pub(crate) fn gauge_columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
         &self.gauge_columns
     }
 
-    /// See [`Tsdb::counter_columns_ref`].
     pub(crate) fn histogram_columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
         &self.histogram_columns
     }
