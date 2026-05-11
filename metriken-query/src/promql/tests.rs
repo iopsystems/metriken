@@ -1140,19 +1140,16 @@ fn test_columns_bare_selector_no_match_is_empty() {
 }
 
 #[test]
-fn test_columns_irate_resolves_counters_not_gauges() {
+fn test_columns_irate_resolves_inner_metric() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // No gauge named cpu_cycles exists, so the result must come from
-    // the counter side — guarding against the resolver falling back
-    // to gauges by accident.
     let cols = engine.columns("irate(cpu_cycles[5s])").unwrap();
     assert_eq!(cols, ["cpu_cycles".to_string()].into_iter().collect());
 }
 
 #[test]
-fn test_columns_rate_resolves_counters() {
+fn test_columns_rate_resolves_inner_metric() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
@@ -1190,12 +1187,14 @@ fn test_columns_name_regex_resolves_multiple_metrics() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    // cpu_cycles is a counter; the bare regex selector targets gauges
-    // only, so it must not appear in the result.
     let cols = engine.columns(r#"{__name__=~"cpu_.*"}"#).unwrap();
-    let expected: HashSet<String> = ["cpu_temp".to_string(), "cpu_cores".to_string()]
-        .into_iter()
-        .collect();
+    let expected: HashSet<String> = [
+        "cpu_temp".to_string(),
+        "cpu_cores".to_string(),
+        "cpu_cycles".to_string(),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(cols, expected);
 }
 

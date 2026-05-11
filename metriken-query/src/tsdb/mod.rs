@@ -76,9 +76,7 @@ pub struct Tsdb {
     /// pair: populated from `field.name()` on the parquet load path,
     /// synthesized on the ingest path. Consumed by
     /// `QueryEngine::columns()`.
-    counter_columns: HashMap<String, HashMap<Labels, String>>,
-    gauge_columns: HashMap<String, HashMap<Labels, String>>,
-    histogram_columns: HashMap<String, HashMap<Labels, String>>,
+    columns: HashMap<String, HashMap<Labels, String>>,
     /// Most-recent cumulative per series; `ingest` differences against the
     /// next snapshot to produce the per-period delta. Unused on the parquet
     /// load path (which differences in-place).
@@ -252,7 +250,7 @@ impl Tsdb {
                         labels,
                         column_name,
                     } => {
-                        data.counter_columns
+                        data.columns
                             .entry(name.clone())
                             .or_default()
                             .insert(labels.clone(), column_name.clone());
@@ -282,7 +280,7 @@ impl Tsdb {
                         labels,
                         column_name,
                     } => {
-                        data.gauge_columns
+                        data.columns
                             .entry(name.clone())
                             .or_default()
                             .insert(labels.clone(), column_name.clone());
@@ -319,7 +317,7 @@ impl Tsdb {
                         let gp = *grouping_power;
                         let mvp = *max_value_power;
                         let cfg = *config;
-                        data.histogram_columns
+                        data.columns
                             .entry(name.clone())
                             .or_default()
                             .insert(labels.clone(), column_name.clone());
@@ -414,7 +412,7 @@ impl Tsdb {
 
         for counter in snapshot.counters() {
             let (name, labels) = Self::extract_name_labels(&counter.metadata);
-            self.counter_columns
+            self.columns
                 .entry(name.clone())
                 .or_default()
                 .entry(labels.clone())
@@ -429,7 +427,7 @@ impl Tsdb {
 
         for gauge in snapshot.gauges() {
             let (name, labels) = Self::extract_name_labels(&gauge.metadata);
-            self.gauge_columns
+            self.columns
                 .entry(name.clone())
                 .or_default()
                 .entry(labels.clone())
@@ -450,7 +448,7 @@ impl Tsdb {
 
             if let Some(prev) = prev_for_metric.get(&labels) {
                 let d = delta_to_32_or_empty(prev, &curr);
-                self.histogram_columns
+                self.columns
                     .entry(name.clone())
                     .or_default()
                     .entry(labels.clone())
@@ -501,45 +499,16 @@ impl Tsdb {
         self.histograms.get(name)
     }
 
-    /// Parquet column name for a counter `(metric_name, labels)` pair.
-    /// Returns `None` if no such series was loaded.
-    pub fn counter_column(&self, name: &str, labels: &Labels) -> Option<&str> {
-        self.counter_columns
-            .get(name)?
-            .get(labels)
-            .map(String::as_str)
-    }
-
-    /// Parquet column name for a gauge `(metric_name, labels)` pair.
-    /// Returns `None` if no such series was loaded.
-    pub fn gauge_column(&self, name: &str, labels: &Labels) -> Option<&str> {
-        self.gauge_columns
-            .get(name)?
-            .get(labels)
-            .map(String::as_str)
-    }
-
-    /// Parquet column name for a histogram `(metric_name, labels)` pair.
-    /// Returns `None` if no such series was loaded.
-    pub fn histogram_column(&self, name: &str, labels: &Labels) -> Option<&str> {
-        self.histogram_columns
-            .get(name)?
-            .get(labels)
-            .map(String::as_str)
+    /// Parquet column name for the `(metric_name, labels)` pair, or
+    /// `None` if no such series was loaded.
+    pub fn column(&self, name: &str, labels: &Labels) -> Option<&str> {
+        self.columns.get(name)?.get(labels).map(String::as_str)
     }
 
     /// Iteration-friendly view of the column map, for resolvers that
     /// need to scan every series (e.g. regex / negated `__name__`).
-    pub(crate) fn counter_columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
-        &self.counter_columns
-    }
-
-    pub(crate) fn gauge_columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
-        &self.gauge_columns
-    }
-
-    pub(crate) fn histogram_columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
-        &self.histogram_columns
+    pub(crate) fn columns_ref(&self) -> &HashMap<String, HashMap<Labels, String>> {
+        &self.columns
     }
 
     // sampling interval in seconds
