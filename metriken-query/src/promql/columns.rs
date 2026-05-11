@@ -253,11 +253,14 @@ fn columns_histogram_quantiles(
         QueryError::ParseError("Missing closing bracket in quantiles array".to_string())
     })?;
     let after_array = inner[array_end + 1..].trim_start();
-    let remaining = after_array.strip_prefix(',').map(str::trim).ok_or_else(|| {
-        QueryError::ParseError(
-            "histogram_quantiles requires a metric name as second argument".to_string(),
-        )
-    })?;
+    let remaining = after_array
+        .strip_prefix(',')
+        .map(str::trim)
+        .ok_or_else(|| {
+            QueryError::ParseError(
+                "histogram_quantiles requires a metric name as second argument".to_string(),
+            )
+        })?;
     let (metric_selector, _stride) = strip_trailing_stride(remaining);
     let (name, labels) = parse_selector(metric_selector);
     collect_histogram(tsdb, &name, &labels, out);
@@ -343,4 +346,3 @@ fn parse_selector(selector: &str) -> (String, Labels) {
     }
     (name, labels)
 }
-
