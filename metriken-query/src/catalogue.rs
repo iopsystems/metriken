@@ -58,21 +58,6 @@ pub struct CatalogueEntry {
     /// are forwarded to the SQL pipeline. Empty for literal-only entries.
     #[serde(default)]
     pub examples: Vec<GoldenExample>,
-    /// Migration-window fields kept on the deserialiser so the existing
-    /// `queries.toml` continues to parse without rewriting every entry.
-    /// They are not consumed at runtime.
-    #[serde(default)]
-    pub mode: Option<String>,
-    #[serde(default)]
-    pub fixture: Option<String>,
-    #[serde(default)]
-    pub start: Option<f64>,
-    #[serde(default)]
-    pub end: Option<f64>,
-    #[serde(default)]
-    pub step: Option<f64>,
-    #[serde(default)]
-    pub description: Option<String>,
 }
 
 /// One concrete query instantiation for a templated catalogue entry.

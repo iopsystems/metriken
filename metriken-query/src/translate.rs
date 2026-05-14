@@ -1,5 +1,13 @@
 //! PromQL → SQL translator (wide-form generator).
 //!
+//! **This whole module is migration scaffolding.** It exists to bridge
+//! Rezolus's still-PromQL dashboard emitter to the new SQL backend.
+//! Once Rezolus emits SQL natively (see `/work/rezolus/REVIEWING.md`),
+//! delete this file along with `catalogue.rs`, `template.rs`, `interp.rs`,
+//! `project.rs`, and `queries.toml`.
+//!
+//! ## How it works
+//!
 //! For catalogue entries whose shape we recognise, emit SQL that
 //! references the parquet's physical columns directly via `_src`, with
 //! a single un-partitioned `WINDOW w AS (ORDER BY timestamp)` doing
@@ -7,14 +15,37 @@
 //! column.
 //!
 //! Lives on the translator side (`metriken-query`); the
-//! `metriken-query-sql` engine below is PromQL-agnostic and only
-//! executes the SQL strings this module produces. When the migration
-//! window closes and Rezolus emits SQL natively, this whole module
-//! goes away with the catalogue.
+//! `metriken-query-sql` engine is PromQL-agnostic and only executes the
+//! SQL strings this module produces.
 //!
 //! When no recognised shape matches the entry, `try_generate` returns
-//! `None` — callers surface that as a hard error, since the long-form
-//! interpolation fallback was removed.
+//! `None` — callers surface that as a hard error.
+//!
+//! ## How it's organised
+//!
+//! Reading order for someone auditing the translator:
+//!
+//! 1. `try_generate` (top of file) — top-level dispatch on entry id.
+//! 2. `Shape` struct and `PerColExpr` / `Aggregation` enums — the
+//!    canonical "what to compute" representation. Most resolvers
+//!    produce one of these.
+//! 3. `resolve_shape` (~1370) and `resolve_binary` (~140) — the big
+//!    switch tables. **65 entry ids** match here today (grep
+//!    `'"\w*" =>'` to enumerate). Each arm unpacks `captures` and
+//!    constructs a `Shape` or `Binary`.
+//! 4. `try_histogram`, `try_pair_match`, `try_chain`,
+//!    `try_avg_over_time` — shape families that need bespoke SQL
+//!    rather than the generic chain/binary emitters.
+//! 5. `generate`, `generate_binary`, `generate_binary_fused`,
+//!    `generate_sum`, `build_lane`, `build_rates_chain` — the SQL
+//!    emitters. These turn `Shape` / `Binary` into wide-form CTEs.
+//! 6. Helpers (`format_lit`, `quote_ident`, `is_regex_literal`,
+//!    `*_capture`) — capture-unpacking and SQL formatting.
+//!
+//! Spot-checking strategy: pick one shape from each family
+//! (`gauge_bare`, `counter_irate_total_sum`, `histogram_quantile_*`,
+//! `counter_ratio`, `rezolus_cpu_busy_pct`) and trace it end-to-end.
+//! Trust the `sql_vs_promql.rs` harness for the rest.
 
 use crate::{CaptureValue, CatalogueEntry, Captures, LabelMatcher, LabelOp};
 use metriken_query_sql::{MetricCatalog, MetricSeries};

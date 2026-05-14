@@ -1,5 +1,11 @@
 // SQL macros mirroring the rezolus dashboard's recurring PromQL idioms.
 //
+// **Parallel copy.** A wasm-side pure-SQL version of these macros lives at
+// `/work/rezolus/crates/viewer-sql/src/macros.sql` because duckdb-wasm
+// can't take Rust vscalar registrations. The two files must stay in
+// sync; the parity scaffold is `rezolus/crates/viewer-sql/tests/macros.rs`.
+// See REVIEWING.md (both repos) for the "two macro libraries" hazard.
+//
 // DuckDB validates macro bodies at CREATE time — a `LAG(c) OVER w` body fails
 // because the window `w` doesn't exist yet, and `OVER (ORDER BY ts)` fails
 // because `ts` is unbound. So every windowed macro takes the ordering column

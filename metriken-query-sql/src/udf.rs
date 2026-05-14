@@ -1,5 +1,13 @@
 // H2 histogram UDFs.
 //
+// **Why this much `unsafe`?** DuckDB's vscalar UDF API hands you raw output
+// vectors and expects you to write into them via FFI. There is no zero-cost
+// safe wrapper in `duckdb-rs` today. The unsafe blocks below are all
+// bounds-checked FFI writes; all follow the same pattern (documented in the
+// duckdb-rs gotcha block); all are exercised by `tests/lag_repro.rs` — the
+// regression suite for the LAG-on-LIST corruption bug that motivated the
+// input-read pattern.
+//
 // All UDFs accept `p` (grouping_power) as their last argument. `n` is fixed at
 // 64 (the only size used in this dataset). For columns where p=3 is implied
 // (rezolus metrics.parquet), there are 1-arg-shorter overloads that default to
