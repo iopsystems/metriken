@@ -18,9 +18,12 @@ The pre-existing PromQL evaluator (`metriken-query::promql` +
 the rezolus binary's server-backed viewer + live-agent ingest.
 It moved to streaming-only in commit `a25e285` ("collapse PromQL
 evaluator to streaming-only"), losing ~2,300 lines of
-pre-aggregation machinery.
+pre-aggregation machinery; surviving changes on this branch are
+~270 LOC of small edits across `promql/{mod.rs, streaming/*.rs,
+tests.rs}` plus the `METRIKEN_FORCE_PRIMARY` env var (`0ce0ada`)
+that was used during shadow-mode and is now harmless.
 
-Branch shape: **66** commits, **+16,210 / −396** across **59**
+Branch shape: **70** commits, **+14,844 / −397** across **58**
 files (`git diff --shortstat main...yv/sql-testing`,
 `git rev-list --count main..yv/sql-testing`).
 
