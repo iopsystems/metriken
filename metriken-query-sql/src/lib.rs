@@ -34,6 +34,7 @@ pub mod udf;
 pub mod views;
 
 pub use backend::DuckDbBackend;
+pub use macros::SHARED_MACROS;
 pub use observability::{BackendStats, PhaseSnapshot, StatsSnapshot};
 pub use views::{MetricCatalog, MetricSeries};
 

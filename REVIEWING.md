@@ -66,16 +66,17 @@ non-default feature flag keeps the question reversible.
 
 ## Crate layout
 
-### `metriken-query-sql/src/` — DuckDB engine (2,470 LOC, live)
+### `metriken-query-sql/src/` — DuckDB engine (2,380 LOC, live)
 
 | File | LOC | Owns |
 |---|---:|---|
 | `udf.rs` | 1,123 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 13 `unsafe` blocks). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
 | `backend.rs` | 414 | `DuckDbBackend` (line 87), connection pool with panic-safe slot evacuation, `run_sql` (:192), `describe_parquet` (:254). |
 | `views.rs` | 405 | Parquet metric metadata + `_src` TEMP TABLE loader. |
-| `macros.rs` | 315 | **19** `CREATE OR REPLACE MACRO` strings registered via `register_all`. |
+| `macros.rs` | 224 | Loads `shared_macros.sql` via `include_str!`, splits on `;`, registers each `CREATE MACRO` on the connection. Re-exports the file as `SHARED_MACROS` so the wasm side consumes the same bytes. |
+| `shared_macros.sql` | 145 | **19** canonical macros (3 rate/delta primitives + 7 histogram primitives + 9 dashboard helpers). Single source of truth for both native and wasm. |
 | `observability.rs` | 157 | `BackendStats`. |
-| `lib.rs` | 56 | Public surface. |
+| `lib.rs` | 57 | Public surface. |
 
 ### `metriken-query/src/` — legacy PromQL + harness (4,447 LOC)
 
@@ -123,6 +124,19 @@ cargo build -p metriken-query --all-features                    # everything (ha
 | Rezolus binary | `ingest, lz4` → `legacy` transitively (`/work/rezolus/Cargo.toml:76`, workspace dep at `:22` is `default-features = false`) | `Tsdb`, `promql::QueryEngine` |
 | Rezolus dashboard crate (`/work/rezolus/crates/dashboard/Cargo.toml:13`) | `legacy` | `Tsdb` only (`data.rs:12`, `lib.rs:8`) |
 | Rezolus static viewer (`/work/rezolus/crates/viewer-sql/Cargo.toml`) | — | does not link `metriken-query` |
+
+### Test infrastructure
+
+- **`metriken-query-fixtures`** (new crate, 297 + 547 LOC): 13
+  baked-in parquets covering counter / gauge / histogram /
+  multi-source / reset / overflow / GPU / softirq / 500 ms
+  sampling shapes. `src/lib.rs` exposes path lookups; the
+  `generate` binary rebuilds them. Used by every integration
+  test in `metriken-query` (and by `tests/lag_repro.rs` in
+  `metriken-query-sql`).
+- **`metriken-query-sql/CAUTION.md`** (176 LOC): the running
+  catalog of known PromQL ↔ SQL semantic divergences. When a
+  harness run produces a divergence, check this file first.
 
 ---
 
@@ -187,13 +201,4 @@ cross-branch A/B for the PromQL evaluator alone against `main`.
 ## Open questions
 
 1. **Land or delete `harness::Engine`.** The only merge-blocker.
-2. **Macro library hazard.** 19 macros here as Rust strings; 30
-   parallel macros in `/work/rezolus/crates/viewer-sql/src/macros.sql`,
-   of which 19 are nominally the same. The parity test
-   (`/work/rezolus/crates/viewer-sql/tests/macros.rs`) catches
-   behavioural drift but not signature drift —
-   `hist_irate_quantile` / `hist_rate5m_quantile` already differ
-   (native `(buckets, q, ts, p)` vs wasm `(buckets, q, ts)`).
-   A shared `.sql` file `include_str!`'d from both sides closes
-   it; ~1 day.
-3. **Refresh harness numbers** before the PR opens.
+2. **Refresh harness numbers** before the PR opens.
