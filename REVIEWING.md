@@ -34,9 +34,11 @@ comments and the unrelated `orphan_detector` "shadowed entry"
 concept). Other changes on this branch are ~270 LOC of small
 edits across `promql/{mod.rs, streaming/*.rs, tests.rs}`.
 
-Branch shape: **70** commits, **+14,844 / −397** across **58**
-files (`git diff --shortstat main...yv/sql-testing`,
-`git rev-list --count main..yv/sql-testing`).
+Branch shape: **74** commits, **+14,858 / −397** across **58**
+files (`git diff --shortstat origin/main...HEAD`,
+`git rev-list --count origin/main..HEAD`). Includes a merge from
+`origin/main` that brought `QueryEngine::columns()`, trimmed
+parquet codecs to zstd-only, and bumped arrow/parquet/chrono.
 
 ---
 
@@ -156,12 +158,13 @@ cargo build -p metriken-query --all-features                    # everything (ha
 
 ## Test coverage
 
-**205** `#[test]` items across the workspace, exercising the SQL
+**231** test items pass across the workspace (`cargo test
+--workspace --all-features`), exercising the SQL
 path at three layers:
 
 | Layer | Where | Coverage |
 |---|---|---|
-| UDFs | `metriken-query-sql/src/udf.rs` (inline) + `tests/lag_repro.rs` | 21 + 12 + 6 = **39** tests. Per-UDF happy-path/boundary/NULL for every public UDF; LAG-on-LIST regression suite; `irate_lag` (every counter-rate routes through it) with 6 tests: monotonic/sub-second/reset/NULL/dt=0/zero-rate. |
+| UDFs | `metriken-query-sql/src/udf.rs` (inline) + `tests/lag_repro.rs` | **27 + 12 = 39** tests. Per-UDF happy-path/boundary/NULL for every public UDF; LAG-on-LIST regression suite; the inline file includes 6 `irate_lag` cases (monotonic/sub-second/reset/NULL/dt=0/zero-rate) since every counter-rate routes through it. |
 | Macros | `metriken-query-sql/src/macros.rs` (inline) | 11 tests — `irate_1s` ×2, `rate_5m` ×2, `cpu_busy_pct`, `ipc`, `ipns`, `hist_p99`, `bps_from_bytes`, `delta_1s`, registration smoke. |
 | Harness translator | `metriken-query/tests/translate_snapshots.rs` | One combined `insta` snapshot covers every catalogue id (all 69) — `entry_id → SQL`. Resolver drift surfaces as a single intra-file diff via `cargo insta review`. |
 | Harness catalogue health | `tests/orphan_detector.rs` | Strict: every entry produces non-empty SQL. `#[ignore]`'d informational: 10 entries shadowed by an earlier, more-general entry in `Catalogue::lookup` — a real audit item. |
