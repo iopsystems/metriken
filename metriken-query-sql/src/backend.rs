@@ -269,6 +269,22 @@ impl DuckDbBackend {
                 SqlError::Backend(format!("describe_parquet {data_source}: {e}"))
             })
     }
+
+    /// Evict the cached connection pool for `data_source`. Subsequent
+    /// `run_sql` / `describe_parquet` calls against that source pay
+    /// the full cold-start cost again. Returns `true` if a pool was
+    /// actually present (the source was warm).
+    ///
+    /// Callers (e.g. the rezolus viewer's experiment-detach handler)
+    /// invoke this after the underlying parquet file is removed or
+    /// replaced — the pool's `_src` TEMP TABLE was loaded from that
+    /// file at pool-init time and is stale by definition. In-flight
+    /// queries holding an `Arc<ConnState>` keep their pool slots
+    /// alive until they finish; only the cache entry is dropped.
+    pub fn invalidate(&self, data_source: &str) -> bool {
+        let mut map = self.connections.lock().expect("poisoned");
+        map.remove(data_source).is_some()
+    }
 }
 
 /// Build one pool slot's connection: open the in-memory DB, set the
