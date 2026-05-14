@@ -152,7 +152,7 @@ not an induced panic).
 
 `metriken-query/examples/sql_vs_promql.rs` (1,719 LOC) compares
 legacy and SQL evaluators plot-by-plot against real Rezolus
-parquets. Requires both features (`Cargo.toml:46-48`).
+parquets. Requires both features (`Cargo.toml:45-47`).
 
 ```bash
 cargo run --release --example sql_vs_promql --features "legacy,harness" \
