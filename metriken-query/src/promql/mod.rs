@@ -13,6 +13,7 @@ pub use crate::result::{
 
 use crate::tsdb::{Labels, Tsdb};
 
+mod columns;
 pub mod streaming;
 
 #[cfg(test)]

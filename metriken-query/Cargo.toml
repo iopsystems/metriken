@@ -1,6 +1,6 @@
 [package]
 name = "metriken-query"
-version = "0.10.2"
+version = "0.10.4"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -15,9 +15,9 @@ repository = "https://github.com/iopsystems/metriken"
 arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
-metriken-exposition = { version = "0.16.0", path = "../metriken-exposition", default-features = false, optional = true }
+metriken-exposition = { version = "0.16.1", path = "../metriken-exposition", default-features = false, optional = true }
 metriken-query-sql = { path = "../metriken-query-sql", optional = true }
-parquet = { workspace = true, default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
+parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = { version = "0.8", optional = true }
 serde.workspace = true
 serde_json.workspace = true
