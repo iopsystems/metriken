@@ -25,8 +25,9 @@ const MACROS: &[&str] = &[
     // treat the post-reset value `c` as the increment. The metriken-query
     // PromQL engine is the source of truth; see
     // `metriken-query/src/promql/streaming/{rate,irate}.rs:60-70`. The
-    // exhaustigen tests (`metriken-query-sql/tests/exhaustigen.rs`) walk
-    // every short counter sequence and assert byte-equality.
+    // matching unit tests live in this file's `#[cfg(test)] mod tests`
+    // below (irate_1s, rate_5m, delta_1s); the same primitives are also
+    // exercised end-to-end via `examples/sql_vs_promql.rs`.
 
     // Per-second rate with PromQL reset semantics. NULL on the first
     // sample of the table (no LAG) and on duplicate timestamps (dt=0).

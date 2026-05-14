@@ -1019,4 +1019,105 @@ mod tests {
             assert_eq!(r, Some(vec![0; len]));
         }
     }
+
+    // ---------- irate_lag(curr, prev, dt_ns) -> DOUBLE ----------
+    //
+    // The UDF every catalogue counter-rate query routes through. Mirrors
+    // PromQL's `irate(c[w])` shape: pair-wise (c, LAG(c)) over a fixed
+    // dt; reset semantics treat post-reset value as the increment.
+
+    fn one_f64(conn: &Connection, sql: &str) -> Option<f64> {
+        conn.query_row(sql, [], |row| row.get::<_, Option<f64>>(0))
+            .expect("query")
+    }
+
+    #[test]
+    fn irate_lag_monotonic_is_per_second_rate() {
+        let conn = fresh();
+        // curr=200 prev=100 dt=1s → (200-100)/1.0 = 100.0
+        assert_eq!(
+            one_f64(
+                &conn,
+                "SELECT irate_lag(200::UBIGINT, 100::UBIGINT, 1000000000::BIGINT)"
+            ),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn irate_lag_divides_by_actual_dt() {
+        let conn = fresh();
+        // curr=110 prev=100 dt=500ms → 10/0.5 = 20.0
+        assert_eq!(
+            one_f64(
+                &conn,
+                "SELECT irate_lag(110::UBIGINT, 100::UBIGINT, 500000000::BIGINT)"
+            ),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn irate_lag_reset_uses_post_reset_value_as_increment() {
+        let conn = fresh();
+        // curr=5, prev=100 (reset!), dt=1s → 5/1.0 = 5.0 (NOT (5-100))
+        // Matches PromQL `irate` reset semantics, same as metriken-query
+        // streaming/irate.rs:60-70.
+        assert_eq!(
+            one_f64(
+                &conn,
+                "SELECT irate_lag(5::UBIGINT, 100::UBIGINT, 1000000000::BIGINT)"
+            ),
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn irate_lag_returns_null_on_null_inputs() {
+        let conn = fresh();
+        // Any of curr/prev/dt being NULL → NULL result. The CASE branches
+        // mirror the in-code is_null guards.
+        let null_curr = one_f64(
+            &conn,
+            "SELECT irate_lag(NULL::UBIGINT, 100::UBIGINT, 1000000000::BIGINT)",
+        );
+        let null_prev = one_f64(
+            &conn,
+            "SELECT irate_lag(200::UBIGINT, NULL::UBIGINT, 1000000000::BIGINT)",
+        );
+        let null_dt = one_f64(
+            &conn,
+            "SELECT irate_lag(200::UBIGINT, 100::UBIGINT, NULL::BIGINT)",
+        );
+        assert_eq!(null_curr, None, "NULL curr should propagate to NULL");
+        assert_eq!(null_prev, None, "NULL prev should propagate to NULL");
+        assert_eq!(null_dt, None, "NULL dt should propagate to NULL");
+    }
+
+    #[test]
+    fn irate_lag_returns_null_when_dt_is_zero() {
+        let conn = fresh();
+        // Duplicate timestamps land dt=0; protect against divide-by-zero
+        // by returning NULL instead of inf/NaN.
+        assert_eq!(
+            one_f64(
+                &conn,
+                "SELECT irate_lag(200::UBIGINT, 100::UBIGINT, 0::BIGINT)"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn irate_lag_equal_values_is_zero_rate() {
+        let conn = fresh();
+        // c == p (no change): increment is 0, rate is 0/dt = 0.0 (not NULL).
+        assert_eq!(
+            one_f64(
+                &conn,
+                "SELECT irate_lag(100::UBIGINT, 100::UBIGINT, 1000000000::BIGINT)"
+            ),
+            Some(0.0)
+        );
+    }
 }
