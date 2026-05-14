@@ -16,12 +16,22 @@ is for" below.
 The pre-existing PromQL evaluator (`metriken-query::promql` +
 `tsdb`, gated `feature = "legacy"`) stays as the live engine for
 the rezolus binary's server-backed viewer + live-agent ingest.
-It moved to streaming-only in commit `a25e285` ("collapse PromQL
-evaluator to streaming-only"), losing ~2,300 lines of
-pre-aggregation machinery; surviving changes on this branch are
-~270 LOC of small edits across `promql/{mod.rs, streaming/*.rs,
-tests.rs}` plus the `METRIKEN_FORCE_PRIMARY` env var (`0ce0ada`)
-that was used during shadow-mode and is now harmless.
+
+The evaluator now has two modes: a **streaming dispatcher**
+(`promql/streaming/`) that walks expressions window-by-window
+without materialising whole matrices — used for rate, irate,
+avg_over_time, idelta, the aggregate matrix grouping body, and
+both `histogram_quantile{,s}` — and a small **eager** residual
+that handles cases streaming can't subsume: binary operators
+with `group_left`/`group_right` and the scalar-passthrough
+backstop. The dispatcher is always-on (no toggle) and runs at
+every recursion level. Commit `a25e285` ("collapse PromQL
+evaluator to streaming-only") removed ~2,300 lines of eager
+pre-aggregation that streaming now covers. Other changes on
+this branch are ~270 LOC of small edits across
+`promql/{mod.rs, streaming/*.rs, tests.rs}` plus the
+`METRIKEN_FORCE_PRIMARY` env var (`0ce0ada`) used during
+shadow-mode, now harmless.
 
 Branch shape: **70** commits, **+14,844 / −397** across **58**
 files (`git diff --shortstat main...yv/sql-testing`,
