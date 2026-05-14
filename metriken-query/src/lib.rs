@@ -2,15 +2,25 @@
 //!
 //! Two backends, gated by Cargo features:
 //!
-//! - `sql` (default for desktop): translates incoming PromQL queries
-//!   against a catalogue of templates and routes execution through
-//!   the DuckDB engine in `metriken-query-sql`. Returns Arrow-projected
-//!   `QueryResult`s. This is the production path.
+//! - `sql` (default): translates incoming PromQL queries against a
+//!   catalogue of templates and routes execution through the DuckDB
+//!   engine in `metriken-query-sql`. Returns Arrow-projected
+//!   `QueryResult`s. This is the long-term path; the catalogue +
+//!   translator layer is migration scaffolding that goes away once
+//!   callers emit SQL directly.
 //!
-//! - `legacy` (default off; enabled by the Rezolus WASM viewer): the
-//!   original in-memory PromQL evaluator (`promql/streaming/`) over an
-//!   in-process `Tsdb`. Kept for WASM consumers because DuckDB doesn't
-//!   compile to wasm32 today.
+//! - `legacy`: the original in-memory PromQL evaluator
+//!   (`promql/streaming/`) over an in-process `Tsdb`. Still linked
+//!   today by the Rezolus dashboard crate (for `Tsdb`) and the
+//!   Rezolus binary's server-backed `/api/v1/query_range` endpoint +
+//!   live-agent ingest path. Goes away when those callers migrate to
+//!   the SQL path.
+//!
+//! There was previously a third "shadow" / dispatcher mode that ran
+//! both backends side-by-side for verification. It was removed in
+//! commit a25e285 ("collapse PromQL evaluator to streaming-only");
+//! the `sql` and `legacy` features are now mutually-exclusive runtime
+//! paths.
 //!
 //! Shared by both backends: `result::{QueryResult, Sample, MatrixSample,
 //! HistogramHeatmapResult, QueryError}`.

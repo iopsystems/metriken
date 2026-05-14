@@ -32,10 +32,11 @@ tempfile.workspace = true
 toml = "0.8"
 
 [features]
-# Desktop default: SQL pipeline only. No legacy PromQL evaluator, no
-# in-memory Tsdb store. The Rezolus WASM viewer crate must opt out
-# (`default-features = false`) and opt into `legacy` instead, since
-# `metriken-query-sql` (and DuckDB) don't compile to wasm32.
+# Default: SQL pipeline only. No legacy PromQL evaluator, no in-memory
+# `Tsdb` store. Callers that still need the PromQL evaluator (Rezolus
+# dashboard for `Tsdb`, Rezolus binary's server-backed query endpoint
+# and live-agent ingest) opt out with `default-features = false` and
+# enable `legacy` or `ingest`.
 default = ["sql", "lz4"]
 sql = ["dep:metriken-query-sql"]
 legacy = ["dep:promql-parser"]
