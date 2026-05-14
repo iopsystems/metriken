@@ -1,13 +1,9 @@
 # Reviewing the `yv/sql-testing` branch (metriken side)
 
-This doc orients a reviewer cold. Every concrete claim below is tied to
-a file:line in the working tree at commit `82f41f6`; counts come from
-`wc -l` and `grep -c` over those files. Companion doc:
+This doc orients a reviewer cold. Every concrete claim below is tied
+to a `file:line` in the working tree at the current HEAD; counts come
+from `wc -l` and `grep -c` over those files. Companion doc:
 `/work/rezolus/REVIEWING.md`.
-
-The previous version of this file made claims that turned out to be
-stale; this rewrite cites each claim to a verifiable source. If a
-number drifts, fix it here and update the citation.
 
 ---
 
@@ -32,50 +28,30 @@ The new code is split across two crates:
   > bridge Rezolus's still-PromQL dashboard emitter to the new SQL
   > backend."
 
-Branch diff vs `main` (after the review-prep cleanup commit): **+15,045 /
-−397 across 59 files**. `git rev-list --count main..yv/sql-testing` →
-**60** commits.
+Branch diff vs `main`: **+16,247 / −396 across 59 files**
+(`git diff --shortstat main...yv/sql-testing`).
+`git rev-list --count main..yv/sql-testing` → **65** commits.
 
 The correctness harness lives at
 `metriken-query/examples/sql_vs_promql.rs` (1,719 LOC). Numbers in the
 Verification section.
 
----
+### What changed since the first round of REVIEWING.md drafting
 
-## Stale claims removed from the prior version of this doc
-
-The previous TL;DR stated:
-
-> "the Rezolus WASM viewer cannot run DuckDB in the browser"
-
-This is **false** as of this branch. The Rezolus static viewer is a
-WASM crate at `rezolus/crates/viewer-sql/` that runs queries through
-`@duckdb/duckdb-wasm@1.33.1-dev45.0`, imported at
-`rezolus/site/viewer-sql/lib/script.js:12`:
-
-```js
-import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev45.0/+esm';
-```
-
-The viewer-sql crate's `Cargo.toml` (lines 21-29) has **no
-`metriken-query` dependency** at all — only `dashboard`, `wasm-bindgen`,
-`serde`, etc. So the `legacy` feature gate is *not* there "for the WASM
-viewer"; the WASM viewer doesn't link metriken-query.
-
-Related stale claims also corrected in this rewrite:
-
-- `metriken-query/src/lib.rs:5-13` (module docstring) says `legacy` is
-  "enabled by the Rezolus WASM viewer". **Stale** — fix should land
-  here.
-- `metriken-query/Cargo.toml` comment above `[features]` says
-  "The Rezolus WASM viewer crate must opt out (`default-features =
-  false`) and opt into `legacy` instead". **Stale** — same fix.
-- The prior REVIEWING feature-gate matrix row "Rezolus WASM viewer |
-  legacy only | DuckDB doesn't compile to wasm32". **Stale** — the
-  WASM viewer is duckdb-wasm-backed; see the rezolus REVIEWING.md
-  "Why the JS / Rust split" section for the architecture.
-
-The actual current consumers of `metriken-query` are listed below.
+- **Shadow-mode dispatch was retired.** It existed as a transitional
+  verification mechanism (every query routed through both engines for
+  divergence logging). Removed from metriken in commit `a25e285`
+  ("collapse PromQL evaluator to streaming-only") and from rezolus in
+  commit `519c24c` ("viewer: remove dead shadow-mode dispatch
+  plumbing"). The path forward is SQL-only; `legacy` survives only
+  for the consumers in the table below.
+- **Test coverage filled in.** Previously translate.rs had 1 unit
+  test for 2,403 LOC and `irate_lag` had zero. Both now covered —
+  see "Test coverage" section.
+- **Archival probes deleted.** Four diagnostic examples whose
+  optimizations have landed (probe_filter_cost, probe_rate_shape,
+  bench_irate_udf, check_ts_dups) — −733 LOC of branch-only
+  diagnostic code.
 
 ---
 
@@ -174,13 +150,22 @@ The 5-step pipeline documented at `metriken-query/src/engine.rs:1-18`:
 
 Counts that need explicit verification:
 
-- **9 H2 UDFs** — `grep '^\s*conn.register_scalar_function::<H2' metriken-query-sql/src/udf.rs` lists: `H2LowerUdf`, `H2UpperUdf`, `H2MidUdf`, `H2TotalUdf`, `H2DeltaUdf`, `H2QuantileUdf`, `H2QuantilesUdf`, `H2CountInRangeUdf`, `H2CombineUdf`.
-- **13 unsafe blocks** in `udf.rs` — `grep -c '^\s*unsafe ' metriken-query-sql/src/udf.rs` → 13.
-- **19 SQL macros** in `macros.rs` — `grep -c 'CREATE OR REPLACE MACRO' metriken-query-sql/src/macros.rs` → 19.
+- **9 H2 UDFs + 1 irate_lag UDF = 10 registrations** —
+  `grep -c 'register_scalar_function' metriken-query-sql/src/udf.rs` → 10.
+  The H2 family: `H2LowerUdf`, `H2UpperUdf`, `H2MidUdf`, `H2TotalUdf`,
+  `H2DeltaUdf`, `H2QuantileUdf`, `H2QuantilesUdf`, `H2CountInRangeUdf`,
+  `H2CombineUdf`. Plus `IrateLagUdf` used by every catalogue
+  counter-rate query.
+- **13 unsafe blocks** in `udf.rs` —
+  `grep -c '^\s*unsafe ' metriken-query-sql/src/udf.rs` → 13.
+- **19 SQL macros** in `macros.rs` —
+  `grep -c 'CREATE OR REPLACE MACRO' metriken-query-sql/src/macros.rs` → 19.
   Note: the wasm-side `crates/viewer-sql/src/macros.sql` contains 30
-  `CREATE MACRO` statements (verified separately in the rezolus
-  REVIEWING.md). The two files have different macro inventories;
-  treat them as parallel copies, not byte-identical.
+  `CREATE MACRO` statements (the H2 UDFs are re-expressed as macros
+  there because duckdb-wasm can't take Rust scalar function
+  registrations from JS). Parity is asserted by
+  `rezolus/crates/viewer-sql/tests/macros.rs` — see "Test coverage"
+  section below.
 
 `udf.rs` preamble (`metriken-query-sql/src/udf.rs:1-37`) documents two
 real DuckDB-rs gotchas inline: the `ListVector::child(capacity)` reserve
@@ -227,53 +212,30 @@ The "65 entry ids" wording supersedes prior claims of "40+ shapes".
 
 ---
 
-## Known current build issue (rezolus binary)
+## Test coverage
 
-`cargo check --bin rezolus` from the rezolus repo currently fails at
-compile time before BPF compilation (we couldn't get past the BPF
-build on this dev box without `clang`, but the static analysis is
-clear). The reason is **type references that no longer exist in
-metriken-query**:
+Counts as of HEAD: **205 `#[test]` items across metriken**,
+exercising the SQL pipeline at three layers:
 
-`rezolus/src/viewer/mod.rs` references the following:
+| Layer | Where | Coverage |
+|---|---|---|
+| **UDFs** (`metriken-query-sql/src/udf.rs`) | inline `#[cfg(test)]` + `tests/lag_repro.rs` | 21 + 12 + 6 = **39** tests. H2 family: per-UDF happy-path + boundary + NULL cases (every public UDF tested). LAG-on-LIST regression suite (`lag_repro.rs`) for the duckdb-rs gotcha. **`irate_lag`** (the UDF every counter-rate query routes through) — 6 unit tests: monotonic rate, sub-second dt, reset semantics, NULL on any NULL input, NULL on dt=0, zero-rate equality. |
+| **Macros** (`metriken-query-sql/src/macros.rs`) | inline `#[cfg(test)]` | 11 tests covering irate_1s ×2, rate_5m ×2, cpu_busy_pct, ipc, ipns, hist_p99 (h2_quantile delegation), bps_from_bytes, delta_1s, registration smoke test. |
+| **Translator** (`metriken-query/src/translate.rs`) | `tests/translate_snapshots.rs` (combined insta snapshot) | One snapshot covers every catalogue entry (all 69 ids) — `entry_id → SQL`. Drift in any resolver surfaces as a single intra-file diff via `cargo insta review`. Snapshot is 1,179 lines and stable across runs. |
+| **Catalogue health** | `tests/orphan_detector.rs` | (a) Strict test: every entry produces non-empty SQL via `try_generate`. (b) `#[ignore]`'d informational test: 10 entries whose example is intercepted by an earlier, more-general entry in `Catalogue::lookup`. Surfaces a real catalogue rationalization audit item. |
+| **End-to-end pipeline** | `tests/engine_pipeline.rs` | 5 integration tests against `metriken-query-fixtures` parquets: counter irate matrix, histogram quantile (verifies `output_metric` interpolation), unrecognized query error, missing-file error, no-labels fast path in `project::matrix`. |
+| **Template parser** | `metriken-query/src/template.rs` (inline) | 29 tests covering ident/number/string/duration/labels capture kinds. |
+| **Catalogue loader** | `metriken-query/src/catalogue.rs` (inline) | 4 tests on TOML deserialization. |
+| **End-to-end harness** | `metriken-query/examples/sql_vs_promql.rs` (1,719 LOC, **not** a `#[test]` — runtime example) | Per-plot PromQL vs SQL comparison against real Rezolus parquets. Last numbers are stale; rerun before opening the PR. |
 
-| Reference site | Type |
-|---|---|
-| `:1650` | `promql::DispatchConfig` |
-| `:1663` | `promql::DispatchConfig` (struct literal) |
-| `:1676` | `metriken_query::DispatchObserver` |
-| `:1677` | `metriken_query::CatalogueEntry`, `metriken_query::Diff` |
-| `:1695` | `metriken_query::Mode` |
+What this *doesn't* test directly:
 
-`grep -rn 'DispatchConfig\|DispatchObserver' /work/metriken/ --include='*.rs'`
-returns **no results** — the types are gone.
-`pub enum Mode` is not defined in metriken at all
-(`grep -rn 'pub enum Mode' /work/metriken/`).
-
-The most likely removal is commit `a25e285` —
-"collapse PromQL evaluator to streaming-only (rezolus subset; ~2300
-line shrink) (#94)" landed 2026-05-01 from
-`yao@iop.systems`. That commit's title matches the shape of the
-deletion.
-
-The previous rezolus REVIEWING.md FAQ explained the build failure as
-"those types still exist in metriken-query, but they're feature-gated
-behind `sql`". That's **wrong**: `CatalogueEntry` is feature-gated;
-the rest (`DispatchConfig`, `DispatchObserver`, `Diff`, `Mode`) are
-gone entirely.
-
-Fixing the rezolus binary build is either:
-
-1. Remove the `dispatch_for_capture` + `LoggingDispatchObserver` code
-   path at `src/viewer/mod.rs:1640-1700` and the calls at `:1727-1731`
-   and `:1756-1760`. The server-backed viewer then runs PromQL only,
-   which matches the current `BACKEND='promql'` constant at
-   `src/viewer/assets/lib/viewer_api.js:7`.
-2. Or restore the dispatch types on the metriken side if shadow-mode
-   evaluation is still wanted.
-
-This is out of scope for the SQL-migration branch itself but blocks
-landing — flag it in the PR description.
+- `metriken-query/src/project.rs` per-`OutputShape` variant — covered
+  transitively via `tests/engine_pipeline.rs`. Direct per-shape tests
+  on hand-crafted RecordBatches are a future tightening.
+- `metriken-query-sql/src/backend.rs` connection-pool concurrency under
+  panic — 4 backend tests exist; the panic-safe slot evacuation is
+  tested only through the type-system contract.
 
 ---
 
@@ -387,14 +349,13 @@ cargo run --release --example sql_vs_promql \
 
 Output lands in `/tmp/sql_vs_promql_yv/` per the example source.
 
-**Reviewer note: the numerical results in the prior version of this
-doc are not re-verified here.** The prior numbers (~89% identical on
-single-source parquets; 849/3/1370 across 11 parquets) were taken from
-`/tmp/sql_vs_promql_yv/summary.json` at commit `c9b105b`. The branch
-has advanced 4 more commits since then (HEAD is `82f41f6`); a re-run
-is needed to refresh the table before the PR is opened. See
-`/work/rezolus/REVIEWING.md` "Known divergence taxonomy" section for
-the cumulative behaviour story.
+**Reviewer note: the numerical results from prior harness runs are
+not re-verified here.** Earlier reports (~89% identical on
+single-source parquets; 849/3/1370 across 11 parquets at commit
+`c9b105b`) reflect a much earlier branch state. The branch has
+advanced ~50 commits since; a re-run is needed to refresh the table
+before the PR is opened. See `/work/rezolus/REVIEWING.md` "Known
+divergence taxonomy" section for the cumulative behaviour story.
 
 ### Cross-branch sanity check
 
@@ -408,7 +369,7 @@ for direct A/B. Per its top doc-comment:
 
 ## Branch layout
 
-`git rev-list --count main..yv/sql-testing` → **60** commits. Commit
+`git rev-list --count main..yv/sql-testing` → **65** commits. Commit
 log (`git log --oneline main..yv/sql-testing`) groups roughly into:
 
 - Wide-form scaffolding (cachecannon, irate, hist_irate, fixtures,
@@ -422,12 +383,14 @@ log (`git log --oneline main..yv/sql-testing`) groups roughly into:
   per-cpu / per-id resolvers, `rate_5m` range-window fix.
 - Harness: `sql_vs_promql.rs`, `promql_only.rs`. Multi-source
   aggregation. Fixture coverage.
-- Review prep (latest): bench CSV deletion, planning docs deletion,
-  REVIEWING.md, `.gitattributes` — commit `82f41f6`.
-
-`a25e285` is the commit that broke the rezolus binary build by
-removing `DispatchConfig`/`DispatchObserver`/`Diff`/`Mode` — see the
-"Known current build issue" section.
+- Review prep: bench CSV deletion, planning docs deletion,
+  REVIEWING.md, `.gitattributes`.
+- Documentation rewrite to ground every claim in code; doc-comment
+  fixes for the now-removed shadow-mode path.
+- Test coverage fill-in: irate_lag UDF (6 tests), translate.rs
+  per-entry snapshot (69 ids), Engine pipeline integration tests
+  (5 tests), orphan detector.
+- Archival probe deletion (−733 LOC of branch-only diagnostics).
 
 Don't squash. The stage-by-stage history is reading-order for a
 commit-by-commit review.
