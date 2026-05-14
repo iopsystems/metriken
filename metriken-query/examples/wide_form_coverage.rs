@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use metriken_query::{Catalogue, CompiledTemplate};
+use metriken_query::harness::{Catalogue, CompiledTemplate};
 
 fn main() {
     let parquet: PathBuf = "/work/rezolus/site/viewer/data/demo.parquet".into();
@@ -42,7 +42,7 @@ fn main() {
                 continue;
             }
         };
-        match metriken_query::translate::try_generate(entry, &captures, &catalog) {
+        match metriken_query::harness::translate::try_generate(entry, &captures, &catalog) {
             Some(_) => covered += 1,
             None => uncovered.push((entry.id.clone(), query)),
         }

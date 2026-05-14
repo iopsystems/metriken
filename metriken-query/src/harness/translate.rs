@@ -47,7 +47,8 @@
 //! `counter_ratio`, `rezolus_cpu_busy_pct`) and trace it end-to-end.
 //! Trust the `sql_vs_promql.rs` harness for the rest.
 
-use crate::{CaptureValue, CatalogueEntry, Captures, LabelMatcher, LabelOp};
+use super::catalogue::CatalogueEntry;
+use super::template::{CaptureValue, Captures, LabelMatcher, LabelOp};
 use metriken_query_sql::{MetricCatalog, MetricSeries};
 
 /// What value to compute per matching physical column. The `Value`

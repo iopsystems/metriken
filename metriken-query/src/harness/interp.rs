@@ -14,7 +14,7 @@
 //! generator emits SQL directly. Resurrect from git if a future
 //! consumer needs them.
 
-use crate::{CaptureValue, Captures};
+use super::template::{CaptureValue, Captures};
 use thiserror::Error;
 
 #[derive(Debug, Error)]

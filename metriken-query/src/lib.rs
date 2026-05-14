@@ -1,44 +1,28 @@
 //! Query frontend for metriken parquet files.
 //!
-//! Two backends, gated by Cargo features:
+//! Two feature-gated paths:
 //!
-//! - `sql` (default): translates incoming PromQL queries against a
-//!   catalogue of templates and routes execution through the DuckDB
-//!   engine in `metriken-query-sql`. Returns Arrow-projected
-//!   `QueryResult`s. This is the long-term path; the catalogue +
-//!   translator layer is migration scaffolding that goes away once
-//!   callers emit SQL directly.
+//! - `legacy` (live): the streaming PromQL evaluator (`promql/`) over
+//!   an in-process `Tsdb`. Linked today by the Rezolus dashboard crate
+//!   (for `Tsdb`) and the Rezolus binary's server-backed
+//!   `/api/v1/query_range` and live-agent ingest paths.
 //!
-//! - `legacy`: the original in-memory PromQL evaluator
-//!   (`promql/streaming/`) over an in-process `Tsdb`. Still linked
-//!   today by the Rezolus dashboard crate (for `Tsdb`) and the
-//!   Rezolus binary's server-backed `/api/v1/query_range` endpoint +
-//!   live-agent ingest path. Goes away when those callers migrate to
-//!   the SQL path.
+//! - `harness` (off by default): the PromQL→SQL catalogue + translator
+//!   + `Engine` (`harness::*`). **Migration scaffolding**: zero
+//!   production callers. Only consumed by `tests/engine_pipeline.rs`,
+//!   `tests/translate_snapshots.rs`, `tests/orphan_detector.rs`, and
+//!   the `examples/sql_vs_promql.rs` correctness harness. The feature
+//!   exists so the harness can co-exist with the legacy evaluator
+//!   side-by-side; if a real consumer never materializes the whole
+//!   `harness/` subdirectory + `queries.toml` is a clean delete.
 //!
-//! There was previously a third "shadow" / dispatcher mode that ran
-//! both backends side-by-side for verification. It was removed in
-//! commit a25e285 ("collapse PromQL evaluator to streaming-only");
-//! the `sql` and `legacy` features are now mutually-exclusive runtime
-//! paths.
-//!
-//! Shared by both backends: `result::{QueryResult, Sample, MatrixSample,
+//! Shared by both paths: `result::{QueryResult, Sample, MatrixSample,
 //! HistogramHeatmapResult, QueryError}`.
 
 pub mod result;
 
-#[cfg(feature = "sql")]
-pub mod catalogue;
-#[cfg(feature = "sql")]
-pub mod engine;
-#[cfg(feature = "sql")]
-pub mod interp;
-#[cfg(feature = "sql")]
-pub mod project;
-#[cfg(feature = "sql")]
-pub mod template;
-#[cfg(feature = "sql")]
-pub mod translate;
+#[cfg(feature = "harness")]
+pub mod harness;
 
 #[cfg(feature = "legacy")]
 pub mod promql;
@@ -47,18 +31,6 @@ pub mod tsdb;
 
 pub use bytes::Bytes;
 pub use result::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
-
-#[cfg(feature = "sql")]
-pub use catalogue::{Catalogue, CatalogueEntry, CatalogueError, GoldenExample, OutputShape};
-#[cfg(feature = "sql")]
-pub use engine::{Engine, EngineError, ParquetMetadata};
-#[cfg(feature = "sql")]
-pub use metriken_query_sql::SqlError;
-#[cfg(feature = "sql")]
-pub use template::{
-    CaptureKind, CaptureValue, Captures, CompiledTemplate, LabelMatcher, LabelOp, TemplateError,
-    TemplatePart,
-};
 
 #[cfg(feature = "legacy")]
 pub use promql::QueryEngine;

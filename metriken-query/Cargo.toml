@@ -32,17 +32,24 @@ tempfile.workspace = true
 toml = "0.8"
 
 [features]
-# Default: SQL pipeline only. No legacy PromQL evaluator, no in-memory
-# `Tsdb` store. Callers that still need the PromQL evaluator (Rezolus
-# dashboard for `Tsdb`, Rezolus binary's server-backed query endpoint
-# and live-agent ingest) opt out with `default-features = false` and
-# enable `legacy` or `ingest`.
-default = ["sql", "lz4"]
-sql = ["dep:metriken-query-sql"]
+# Default: legacy PromQL evaluator + `Tsdb` is the only live path.
+# `harness` (off by default) compiles in the PromQL→SQL pipeline used
+# by the sql_vs_promql correctness harness and its supporting tests;
+# no production caller links it today.
+default = ["legacy", "lz4"]
 legacy = ["dep:promql-parser"]
 ingest = ["legacy", "dep:metriken-exposition"]
+harness = ["dep:metriken-query-sql"]
 lz4 = ["parquet/lz4"]
 
 [[example]]
 name = "sql_vs_promql"
-required-features = ["legacy", "sql"]
+required-features = ["legacy", "harness"]
+
+[[example]]
+name = "enumerate_rezolus_queries"
+required-features = ["harness"]
+
+[[example]]
+name = "wide_form_coverage"
+required-features = ["harness"]

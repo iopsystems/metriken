@@ -1,7 +1,7 @@
 //! End-to-end Engine pipeline tests against baked-in fixture parquets.
 //!
 //! Exercises the 5-step `Engine::query_range` pipeline documented at
-//! `metriken-query/src/engine.rs:1-18`:
+//! `metriken-query/src/harness/engine.rs:1-18`:
 //!   Catalogue::lookup → describe_parquet → translate::try_generate →
 //!   run_sql → project::run → QueryResult.
 //!
@@ -15,11 +15,12 @@
 //! Covers gaps 6 and 7 from /work/coverage_audit.md (project.rs and
 //! engine.rs had zero direct tests; the pipeline now has them).
 
-#![cfg(feature = "sql")]
+#![cfg(feature = "harness")]
 
 use std::path::PathBuf;
 
-use metriken_query::{Engine, EngineError, QueryResult};
+use metriken_query::harness::{Engine, EngineError};
+use metriken_query::QueryResult;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

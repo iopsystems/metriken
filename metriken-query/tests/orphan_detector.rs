@@ -14,11 +14,11 @@
 //!    directly. Logged, not asserted, because shadowed entries can
 //!    still be valid documentation/test fixtures.
 
-#![cfg(feature = "sql")]
+#![cfg(feature = "harness")]
 
 use std::collections::{BTreeMap, HashMap};
 
-use metriken_query::{Catalogue, CompiledTemplate};
+use metriken_query::harness::{self, Catalogue, CompiledTemplate};
 use metriken_query_sql::views::{MetricCatalog, MetricSeries};
 
 /// Build a `MetricCatalog` that contains every metric referenced by an
@@ -97,7 +97,7 @@ fn synthetic_catalog() -> MetricCatalog {
 
 /// Pick a query string for an entry: first golden example for
 /// templated entries, the literal `promql` field for literal entries.
-fn example_for(entry: &metriken_query::CatalogueEntry) -> String {
+fn example_for(entry: &harness::CatalogueEntry) -> String {
     if entry.examples.is_empty() {
         entry.promql.clone()
     } else {
@@ -134,7 +134,7 @@ fn every_catalogue_entry_has_a_resolver() {
             }
         };
 
-        if metriken_query::translate::try_generate(entry, &captures, &metric_catalog).is_none() {
+        if harness::translate::try_generate(entry, &captures, &metric_catalog).is_none() {
             orphans.push(entry.id.clone());
         }
     }

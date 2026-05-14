@@ -899,7 +899,7 @@ mod tests {
     fn every_existing_catalogue_entry_compiles_and_matches_a_concrete_query() {
         // For literal-only entries: each should match its own promql verbatim.
         // For templated entries: each example query should match.
-        let raw = include_str!("../queries.toml");
+        let raw = include_str!("../../queries.toml");
         let value: toml::Value = toml::from_str(raw).expect("parse toml");
         let queries = value
             .get("query")

@@ -3,9 +3,9 @@
 //! The catalogue is a TOML registry: one entry per recognised PromQL
 //! shape, with a compiled template that matches incoming queries and
 //! extracts captures. Matched entries are routed through
-//! `crate::translate` to produce SQL, then through
+//! `super::translate` to produce SQL, then through
 //! `metriken-query-sql::DuckDbBackend::run_sql`, then through
-//! `crate::project` to produce a `QueryResult`.
+//! `super::project` to produce a `QueryResult`.
 //!
 //! The catalogue is migration scaffolding. Once Rezolus emits SQL
 //! natively, the whole layer can be deleted (along with `template`,
@@ -15,8 +15,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::template::{CompiledTemplate, TemplateError};
-use crate::Captures;
+use super::template::{CompiledTemplate, Captures, TemplateError};
 
 /// Output shape of a SQL twin — controls how the projector reads the
 /// Arrow batches DuckDB returns.
@@ -118,7 +117,7 @@ impl Catalogue {
 
     /// The version of the catalogue compiled into this crate.
     pub fn embedded() -> Self {
-        Self::from_toml(include_str!("../queries.toml"))
+        Self::from_toml(include_str!("../../queries.toml"))
             .expect("invalid embedded queries.toml — should have been caught by the test harness")
     }
 
@@ -162,7 +161,7 @@ mod tests {
         assert_eq!(entry.id, "gauge_bare");
         assert_eq!(
             caps.get("m"),
-            Some(&crate::CaptureValue::Ident("memory_total".to_string()))
+            Some(&crate::harness::template::CaptureValue::Ident("memory_total".to_string()))
         );
     }
 

@@ -22,7 +22,7 @@
 //! - Column 3 — `p`, INTEGER (grouping_power; expected constant within a query).
 //!
 //! Positional rather than name-based access is a hidden contract with
-//! the translator (`crate::translate`): SQL output column order must
+//! the translator (`super::translate`): SQL output column order must
 //! match these expectations. Together they form a small private
 //! protocol between two modules in this crate; documenting both halves
 //! keeps the contract auditable.
@@ -33,8 +33,9 @@ use arrow::array::{Array, Float64Array, Int32Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use metriken_query_sql::SqlError;
 
-use crate::catalogue::OutputShape;
-use crate::{CatalogueEntry, Captures, HistogramHeatmapResult, MatrixSample, QueryResult};
+use super::catalogue::{CatalogueEntry, OutputShape};
+use super::template::Captures;
+use crate::{HistogramHeatmapResult, MatrixSample, QueryResult};
 
 /// Project Arrow batches into a `QueryResult` shape per the catalogue
 /// entry's `output_shape`. Single seam between the SQL pipeline and
@@ -94,7 +95,7 @@ pub fn matrix(
     let mut interpolated_metric: HashMap<String, String> =
         HashMap::with_capacity(entry.output_metric.len());
     for (k, v) in &entry.output_metric {
-        let resolved = crate::interp::interpolate(v, captures).map_err(|e| {
+        let resolved = super::interp::interpolate(v, captures).map_err(|e| {
             SqlError::Backend(format!(
                 "interp output_metric[{k}] for {}: {e}",
                 entry.id

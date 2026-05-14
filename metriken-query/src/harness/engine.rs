@@ -8,9 +8,9 @@
 //!    extract captures.
 //! 2. `metriken-query-sql::DuckDbBackend::describe_parquet` — get the
 //!    parquet's metric metadata (cached after first request).
-//! 3. `crate::translate::try_generate` — emit the wide-form SQL.
+//! 3. `super::translate::try_generate` — emit the wide-form SQL.
 //! 4. `metriken-query-sql::DuckDbBackend::run_sql` — execute it.
-//! 5. `crate::project::run` — turn Arrow batches back into `QueryResult`.
+//! 5. `super::project::run` — turn Arrow batches back into `QueryResult`.
 //!
 //! No PromQL evaluator, no shadow comparison, no `Mode` lifecycle.
 //! Queries that don't match any catalogue entry are a hard error.
@@ -22,7 +22,7 @@ use bytes::Bytes;
 use metriken_query_sql::{DuckDbBackend, SqlError};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
-use crate::catalogue::Catalogue;
+use super::catalogue::Catalogue;
 use crate::result::{MatrixSample, QueryError, QueryResult, Sample};
 
 /// Errors returned by `Engine`.
@@ -199,10 +199,10 @@ impl Engine {
             .lookup(query_str)
             .ok_or_else(|| EngineError::NoCatalogueMatch(query_str.to_string()))?;
         let catalog = self.backend.describe_parquet(&self.parquet)?;
-        let sql = crate::translate::try_generate(entry, &captures, &catalog)
+        let sql = super::translate::try_generate(entry, &captures, &catalog)
             .ok_or_else(|| EngineError::NoTranslator(entry.id.clone()))?;
         let batches = self.backend.run_sql(&sql, &self.parquet)?;
-        Ok(crate::project::run(&batches, entry, &captures)?)
+        Ok(super::project::run(&batches, entry, &captures)?)
     }
 
     /// Instant query: degenerate range query at a single timestamp,

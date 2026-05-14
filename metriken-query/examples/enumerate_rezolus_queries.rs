@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use metriken_query::Catalogue;
+use metriken_query::harness::Catalogue;
 use serde_json::Value;
 
 const DEFAULT_DASHBOARD_DIR: &str = "/tmp/dashboard_json";

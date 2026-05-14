@@ -1,6 +1,6 @@
 //! Snapshot tests for every catalogue entry's emitted SQL.
 //!
-//! `translate.rs` has 2,403 LOC of PromQL→SQL emission logic and
+//! `harness/translate.rs` has 2,400 LOC of PromQL→SQL emission logic and
 //! previously had a single trivial unit test (`regex_literal_detection`).
 //! These snapshots pin the SQL string each entry produces against a
 //! known synthetic `MetricCatalog` — drift in resolver bodies surfaces
@@ -12,15 +12,15 @@
 //! visible review action.
 //!
 //! Running:
-//!   cargo test -p metriken-query --test translate_snapshots --features sql
+//!   cargo test -p metriken-query --test translate_snapshots --features harness
 //! Reviewing changes:
 //!   cargo insta review --workspace
 
-#![cfg(feature = "sql")]
+#![cfg(feature = "harness")]
 
 use std::collections::{BTreeMap, HashMap};
 
-use metriken_query::{Catalogue, CompiledTemplate};
+use metriken_query::harness::{self, Catalogue, CompiledTemplate};
 use metriken_query_sql::views::{MetricCatalog, MetricSeries};
 
 /// Build a synthetic `MetricCatalog` rich enough to drive every
@@ -174,7 +174,7 @@ fn synthetic_catalog() -> MetricCatalog {
     }
 }
 
-fn example_for(entry: &metriken_query::CatalogueEntry) -> String {
+fn example_for(entry: &harness::CatalogueEntry) -> String {
     if entry.examples.is_empty() {
         entry.promql.clone()
     } else {
@@ -213,7 +213,7 @@ fn every_entry_emits_stable_sql() {
                 continue;
             }
         };
-        let sql = metriken_query::translate::try_generate(entry, &captures, &metric_catalog);
+        let sql = harness::translate::try_generate(entry, &captures, &metric_catalog);
         let body = match sql {
             Some(s) => s,
             None => "<None>".to_string(),
