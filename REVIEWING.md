@@ -1,304 +1,381 @@
-# Reviewing the `yv/sql-testing` branch
+# Reviewing the `yv/sql-testing` branch (metriken side)
 
-This document orients a reviewer who has not seen the SQL migration before.
-Read it before opening the diff. It covers what changed, what's load-bearing
-vs. scaffolding, where to spend attention, and what the known correctness
-gaps are.
+This doc orients a reviewer cold. Every concrete claim below is tied to
+a file:line in the working tree at commit `82f41f6`; counts come from
+`wc -l` and `grep -c` over those files. Companion doc:
+`/work/rezolus/REVIEWING.md`.
 
-The companion document lives at `/work/rezolus/REVIEWING.md` — it covers the
-viewer side. Read this one first; Rezolus's doc references it.
+The previous version of this file made claims that turned out to be
+stale; this rewrite cites each claim to a verifiable source. If a
+number drifts, fix it here and update the citation.
 
 ---
 
 ## TL;DR
 
-We replaced an in-house PromQL-subset evaluator with DuckDB SQL. The legacy
-evaluator stays behind a feature gate (`legacy`) because the Rezolus WASM
-viewer cannot run DuckDB in the browser and the Rezolus desktop binary's
-live-agent ingest path has no DuckDB equivalent yet.
+This branch adds a DuckDB-based query engine alongside the existing
+PromQL evaluator. The PromQL evaluator stays in tree because both the
+Rezolus binary's `rezolus view` server-side path and the dashboard
+crate still link `metriken-query::{promql,tsdb}` (verified below).
 
 The new code is split across two crates:
 
-- **`metriken-query-sql`** (new, ~2.3 KLOC) — a pure DuckDB engine with H2
-  histogram UDFs, SQL macros, and a connection pool. **This is what
-  survives long-term.** Read it carefully.
-- **`metriken-query`** (changed, feature-gated) — gains a `sql` feature that
-  routes incoming PromQL strings through a catalogue → SQL translator →
-  `metriken-query-sql`. **This layer is migration scaffolding** and is
-  designed to be deleted in one commit once Rezolus emits SQL natively.
-  Skim it.
+- **`metriken-query-sql`** (new, **2,368 LOC** of `src/*.rs` — `wc -l
+  metriken-query-sql/src/*.rs`) — pure DuckDB engine, H2 histogram
+  UDFs, SQL macros, and a connection pool.
+- **`metriken-query`** (changed, **4,432 LOC** of `src/*.rs` —
+  `wc -l metriken-query/src/*.rs`) — gains a `sql` Cargo feature that
+  routes incoming PromQL strings through a catalogue → SQL translator
+  → `metriken-query-sql`. The translator is migration scaffolding;
+  its module preamble at `metriken-query/src/translate.rs:3` reads:
+  > "**This whole module is migration scaffolding.** It exists to
+  > bridge Rezolus's still-PromQL dashboard emitter to the new SQL
+  > backend."
 
-Correctness is validated by `metriken-query/examples/sql_vs_promql.rs` —
-runs every Rezolus dashboard plot through both engines, classifies each
-pair as identical / tolerant / divergent. Current numbers: ~89% identical
-on single-source rezolus parquets; all known divergences trace to a small
-set of root causes documented in `/work/rezolus/REVIEWING.md`.
+Branch diff vs `main` (after the review-prep cleanup commit): **+15,045 /
+−397 across 59 files**. `git rev-list --count main..yv/sql-testing` →
+**60** commits.
 
----
-
-## Architecture before / after
-
-### Before (legacy `main`)
-
-```
-metriken-query  (one crate, ~3.9 KLOC)
-  ├─ promql/   streaming PromQL evaluator (promql-parser → custom dispatcher)
-  ├─ tsdb/     in-memory time-series store loaded from parquet
-  └─ public:   QueryEngine::query_range(promql, ...) → QueryResult
-```
-
-One execution path. One consumer (Rezolus) issues PromQL strings; the engine
-parses, dispatches over the in-memory `Tsdb`, and returns a Prometheus-shaped
-matrix or histogram heatmap.
-
-### After (`yv/sql-testing`)
-
-```
-metriken-query-sql  (new crate, ~2.3 KLOC — load-bearing)
-  ├─ backend.rs   (414 LOC) DuckDB connection pool, panic-safe slot evacuation
-  ├─ udf.rs      (1014 LOC) 9 H2 histogram UDFs + 13 unsafe FFI blocks
-  ├─ macros.rs    (308 LOC) 30 SQL macros (irate/rate primitives + dashboard composites)
-  ├─ views.rs     (405 LOC) parquet introspection + `_src` TEMP TABLE loader
-  ├─ observability.rs (157 LOC) BackendStats
-  └─ public:      DuckDbBackend::run_sql(sql, parquet) → Vec<RecordBatch>
-                  DuckDbBackend::describe_parquet(path) → Arc<MetricCatalog>
-
-metriken-query  (feature-gated, ~4.4 KLOC total)
-  feature "sql"     (default desktop)
-    engine.rs       (237 LOC) Engine::new(parquet) + query_range(promql,…)
-    catalogue.rs    (184 LOC) queries.toml registry: PromQL string → entry id + captures
-    translate.rs   (2403 LOC) ~65 entry-id resolvers emit wide-form SQL
-    template.rs     (948 LOC) capture parser/matcher
-    project.rs      (394 LOC) Arrow RecordBatch → QueryResult projection
-    interp.rs       (133 LOC) output_metric placeholder interpolation
-    result.rs        (77 LOC) shared QueryResult/Sample/HistogramHeatmap types
-    queries.toml   (1055 lines, 69 entries)
-
-  feature "legacy"  (default off, on for Rezolus WASM viewer + ingest)
-    promql/        (~1.5 KLOC) original streaming PromQL evaluator, unchanged
-    tsdb/          (~0.9 KLOC) in-memory store, unchanged
-```
-
-Three execution paths now live under the `metriken-query::*` namespace:
-
-1. **`Engine::query_range`** (sql feature) — `PromQL string → Catalogue::lookup
-   → translate::try_generate → DuckDbBackend::run_sql → project::run → QueryResult`.
-2. **`QueryEngine::query_range`** (legacy feature) — unchanged from `main`.
-3. **`DuckDbBackend::run_sql`** directly — bypasses the catalogue entirely.
-   Callers issue arbitrary DuckDB SQL. Used today by Rezolus's static
-   viewer (it has its own SQL emitter); Rezolus's dashboard crate ships
-   the SQL templates that drive it.
-
-The `QueryResult` type is shared across all three paths — same shape going
-out, three different engines computing it.
+The correctness harness lives at
+`metriken-query/examples/sql_vs_promql.rs` (1,719 LOC). Numbers in the
+Verification section.
 
 ---
 
-## Feature-gate matrix
+## Stale claims removed from the prior version of this doc
 
-The Cargo features in `metriken-query/Cargo.toml`:
+The previous TL;DR stated:
+
+> "the Rezolus WASM viewer cannot run DuckDB in the browser"
+
+This is **false** as of this branch. The Rezolus static viewer is a
+WASM crate at `rezolus/crates/viewer-sql/` that runs queries through
+`@duckdb/duckdb-wasm@1.33.1-dev45.0`, imported at
+`rezolus/site/viewer-sql/lib/script.js:12`:
+
+```js
+import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev45.0/+esm';
+```
+
+The viewer-sql crate's `Cargo.toml` (lines 21-29) has **no
+`metriken-query` dependency** at all — only `dashboard`, `wasm-bindgen`,
+`serde`, etc. So the `legacy` feature gate is *not* there "for the WASM
+viewer"; the WASM viewer doesn't link metriken-query.
+
+Related stale claims also corrected in this rewrite:
+
+- `metriken-query/src/lib.rs:5-13` (module docstring) says `legacy` is
+  "enabled by the Rezolus WASM viewer". **Stale** — fix should land
+  here.
+- `metriken-query/Cargo.toml` comment above `[features]` says
+  "The Rezolus WASM viewer crate must opt out (`default-features =
+  false`) and opt into `legacy` instead". **Stale** — same fix.
+- The prior REVIEWING feature-gate matrix row "Rezolus WASM viewer |
+  legacy only | DuckDB doesn't compile to wasm32". **Stale** — the
+  WASM viewer is duckdb-wasm-backed; see the rezolus REVIEWING.md
+  "Why the JS / Rust split" section for the architecture.
+
+The actual current consumers of `metriken-query` are listed below.
+
+---
+
+## Who actually links metriken-query (verified)
+
+| Consumer | Features enabled | Source |
+|---|---|---|
+| Rezolus binary (`rezolus`) | `ingest`, `lz4` → transitively `legacy` | `rezolus/Cargo.toml:78`: `metriken-query = { workspace = true, features = ["ingest", "lz4"] }`. Workspace dep at `rezolus/Cargo.toml:22` is `default-features = false`, so `sql` is *not* enabled here. |
+| Rezolus dashboard crate | `legacy` | `rezolus/crates/dashboard/Cargo.toml:13`: `metriken-query = { workspace = true, features = ["legacy"] }`. Only uses `metriken_query::Tsdb` (`crates/dashboard/src/data.rs:12`, `crates/dashboard/src/lib.rs:8`). |
+| Rezolus viewer-sql crate (WASM viewer) | — | `rezolus/crates/viewer-sql/Cargo.toml` has no `metriken-query` dep. |
+
+The metriken workspace cargo features (`metriken-query/Cargo.toml:5-10`):
 
 ```toml
 default = ["sql", "lz4"]
-sql     = ["dep:metriken-query-sql"]
-legacy  = ["dep:promql-parser"]
-ingest  = ["legacy", "dep:metriken-exposition"]
-lz4     = ["parquet/lz4"]
+sql = ["dep:metriken-query-sql"]
+legacy = ["dep:promql-parser"]
+ingest = ["legacy", "dep:metriken-exposition"]
+lz4 = ["parquet/lz4"]
 ```
 
-What each consumer enables:
+Module gating at `metriken-query/src/lib.rs:20-36`:
 
-| Consumer | Features | Code paths active | Why |
-|---|---|---|---|
-| Rezolus desktop binary | `ingest, lz4` → transitively `legacy, sql, lz4` | both | Live-agent ingest needs `Tsdb`/PromQL; future SQL path available |
-| Rezolus dashboard crate | `legacy` | legacy only | Dashboard generators run native against `Tsdb` |
-| Rezolus WASM viewer | `legacy` only (no default) | legacy only | DuckDB doesn't compile to `wasm32` |
-| Future "Rezolus emits SQL" | `sql` only | sql only | The end state — `legacy` deletable |
+- `catalogue`, `engine`, `interp`, `project`, `template`, `translate`
+  → `#[cfg(feature = "sql")]`
+- `promql`, `tsdb` → `#[cfg(feature = "legacy")]`
+- `result` is always present (shared `QueryResult` type)
 
-The Rezolus workspace `Cargo.toml` sets `default-features = false` on
-`metriken-query` so each consuming crate opts into exactly what it needs.
-This is what makes the WASM viewer link without pulling in DuckDB.
+So today, the *legacy* feature exists because **both the rezolus binary
+and the dashboard crate need `metriken_query::Tsdb` / `promql::*`**, not
+because of any WASM viewer.
 
 ---
 
-## Load-bearing vs. scaffolding
+## Architecture (current code)
 
-Concrete file list. Reviewer's heuristic: spend time on load-bearing files;
-skim scaffolding files for "does this look like it produces correct SQL"
-and trust the harness for the bulk validation.
+### Two engines under one crate namespace
 
-**Load-bearing (survives long-term):**
+```
+metriken-query  (re-exports from src/lib.rs)
+  ├─ #[cfg(feature = "sql")]
+  │   ├─ Engine               metriken-query/src/engine.rs:108
+  │   ├─ Engine::new(path)    metriken-query/src/engine.rs:119
+  │   ├─ Engine::query_range  metriken-query/src/engine.rs:190
+  │   ├─ Catalogue,           metriken-query/src/catalogue.rs:94
+  │   │   Catalogue::embedded()   :120
+  │   │   CatalogueEntry, OutputShape, ...
+  │   ├─ translate::try_generate  metriken-query/src/translate.rs (top)
+  │   ├─ project::run         metriken-query/src/project.rs
+  │   └─ delegates execution to metriken-query-sql::DuckDbBackend
+  │
+  └─ #[cfg(feature = "legacy")]
+      ├─ QueryEngine          metriken-query/src/promql/mod.rs:29
+      ├─ QueryEngine::new(tsdb)
+      ├─ QueryEngine::query_range  metriken-query/src/promql/mod.rs:351
+      └─ Tsdb                 metriken-query/src/tsdb/mod.rs
+```
 
-- All of `metriken-query-sql/src/*.rs`
-- `metriken-query/src/result.rs` (the `QueryResult` shape — both paths return it)
-- `metriken-query/src/promql/*` and `metriken-query/src/tsdb/*` for as long
-  as the WASM viewer and live ingest remain on PromQL
+Both engines return the same `QueryResult` type defined in
+`metriken-query/src/result.rs:1`. That's the cross-cut shared between
+sql and legacy paths.
 
-**Scaffolding (deletable when Rezolus emits SQL natively):**
+### SQL pipeline (the new path)
 
-- `metriken-query/src/engine.rs`
-- `metriken-query/src/catalogue.rs`
-- `metriken-query/src/translate.rs`
-- `metriken-query/src/template.rs`
-- `metriken-query/src/interp.rs`
-- `metriken-query/src/project.rs`
-- `metriken-query/queries.toml`
+The 5-step pipeline documented at `metriken-query/src/engine.rs:1-18`:
 
-The module-level doc comments on `engine.rs`, `catalogue.rs`, and
-`translate.rs` already say so. The end-state migration is one commit:
-delete those files, drop the `sql` feature, rename `legacy` → default,
-and update consumers' query-construction code to issue SQL directly.
+> 1. `Catalogue::lookup` — match the query against a registered
+>    template, extract captures.
+> 2. `metriken-query-sql::DuckDbBackend::describe_parquet` — get the
+>    parquet's metric metadata (cached after first request).
+> 3. `crate::translate::try_generate` — emit the wide-form SQL.
+> 4. `metriken-query-sql::DuckDbBackend::run_sql` — execute it.
+> 5. `crate::project::run` — turn Arrow batches back into
+>    `QueryResult`.
 
----
+`DuckDbBackend` types:
 
-## Where to spend attention
-
-If you have an hour:
-
-1. **`metriken-query-sql/src/lib.rs`** (56 LOC) and
-   **`metriken-query-sql/src/backend.rs`** (414 LOC) — the public API and
-   the connection pool. The pool's panic-safe slot evacuation is the
-   only non-trivial concurrency story; read `get_or_init` and
-   `with_connection`.
-2. **`metriken-query-sql/src/udf.rs`** — read the preamble (the duckdb-rs
-   `ListVector::child` gotcha is documented inline) and one h2_*
-   implementation. The 13 `unsafe` blocks are FFI vector writes; all
-   guarded by `metriken-query-sql/tests/lag_repro.rs` (the regression
-   suite for the LAG-on-LIST bug).
-3. **`metriken-query/src/engine.rs`** — entire file (237 LOC). The
-   five-step pipeline is documented at the top.
-4. Pick 2–3 representative entry ids from `metriken-query/queries.toml`
-   and trace them through `translate.rs`. Suggested:
-   - `gauge_bare` — simplest shape
-   - `counter_irate_total` — counter with reset-aware rate
-   - `histogram_quantile_*` — heatmap shape
-5. Run the harness:
-   ```
-   cargo run --release --example sql_vs_promql \
-       --features "legacy,sql" \
-       -- /work/rezolus/site/viewer/data/demo.parquet
-   ```
-   and read the resulting JSON for one identical pair and one divergent pair.
-
-If you have ten minutes: read the four "mental models" below and the
-divergence taxonomy.
-
-If you have all day: also read `translate.rs` end-to-end. The 40+
-resolvers are a switch table; once you've internalised the `Shape` struct
-(lines ~52-74), the rest follows.
+- `pub struct DuckDbBackend` at `metriken-query-sql/src/backend.rs:87`
+- `pub fn run_sql(...)` at `metriken-query-sql/src/backend.rs:192`
+- `pub fn describe_parquet(...)` at `metriken-query-sql/src/backend.rs:254`
 
 ---
 
-## Mental models for the adversarial reviewer
+## File-by-file inventory (with LOC)
 
-**1. Scaffolding has a finish line.** The PromQL → SQL bridge is temporary
-code. The doc comments name it as such. When Rezolus emits SQL natively,
-seven files (`engine.rs`, `catalogue.rs`, `translate.rs`, `template.rs`,
-`interp.rs`, `project.rs`, `queries.toml`) get deleted in one commit. The
-reviewer's job is to spot-check the bridge produces correct SQL, not to
-audit it as a long-lived abstraction.
+### `metriken-query-sql/src/` — 2,368 LOC total
 
-**2. One crate survives; one is plumbing.** `metriken-query-sql` is the
-new engine; everything else added in this branch is plumbing to keep
-existing PromQL consumers working during the migration window. The
-crate split is what makes "delete the scaffolding" mechanically clean.
+| File | LOC | What it owns |
+|---|---:|---|
+| `backend.rs` | 414 | `DuckDbBackend` struct, connection pool, `run_sql` / `describe_parquet` |
+| `udf.rs` | 1,022 | 9 H2 histogram UDFs + 13 `unsafe` FFI blocks (counts below) |
+| `views.rs` | 405 | Parquet introspection + `_src` TEMP TABLE loader |
+| `macros.rs` | 314 | 19 SQL macros (count below) |
+| `observability.rs` | 157 | `BackendStats` |
+| `lib.rs` | 56 | Public surface |
 
-**3. `unsafe` is the cost of admission for FFI.** `udf.rs` has 13 unsafe
-blocks because DuckDB's vscalar UDF API hands you raw output vectors. The
-duckdb-rs `ListVector::child` quirk (documented at the top of the file)
-forced a specific input-read pattern; the regression test in
-`tests/lag_repro.rs` (1021 LOC of diagnostic harness) is there to catch
-re-introductions.
+Counts that need explicit verification:
 
-**4. The harness is the proof.** `examples/sql_vs_promql.rs` (1719 LOC)
-runs every Rezolus plot through both engines and classifies the result.
-The number to read is "~89% identical on single-source rezolus parquets"
-on `yv/sql-testing`; the remaining 11% is well-categorised (see below)
-and dominated by known semantic choices, not bugs.
+- **9 H2 UDFs** — `grep '^\s*conn.register_scalar_function::<H2' metriken-query-sql/src/udf.rs` lists: `H2LowerUdf`, `H2UpperUdf`, `H2MidUdf`, `H2TotalUdf`, `H2DeltaUdf`, `H2QuantileUdf`, `H2QuantilesUdf`, `H2CountInRangeUdf`, `H2CombineUdf`.
+- **13 unsafe blocks** in `udf.rs` — `grep -c '^\s*unsafe ' metriken-query-sql/src/udf.rs` → 13.
+- **19 SQL macros** in `macros.rs` — `grep -c 'CREATE OR REPLACE MACRO' metriken-query-sql/src/macros.rs` → 19.
+  Note: the wasm-side `crates/viewer-sql/src/macros.sql` contains 30
+  `CREATE MACRO` statements (verified separately in the rezolus
+  REVIEWING.md). The two files have different macro inventories;
+  treat them as parallel copies, not byte-identical.
+
+`udf.rs` preamble (`metriken-query-sql/src/udf.rs:1-37`) documents two
+real DuckDB-rs gotchas inline: the `ListVector::child(capacity)` reserve
+that zeros sibling LAG'd LIST inputs past index 2048, and
+`ListVector::get_entry` returning uninitialized memory for NULL parent
+rows. The fix pattern (`child(0).as_slice_with_len(n)`) is followed
+uniformly across the 13 unsafe blocks.
+
+The regression test for the LAG-on-LIST bug is
+`metriken-query-sql/tests/lag_repro.rs` (1,021 LOC). Preamble at line 1:
+
+> "Diagnostic test for the LAG-over-LIST UDF bug. Probes (a)
+> chunk-boundary effects (>2048 rows) and (b) actual h2_delta+h2_total
+> pipeline using metriken-query-sql's real UDFs."
+
+### `metriken-query/src/` — 4,432 LOC total
+
+| File | LOC | Feature | What it owns |
+|---|---:|---|---|
+| `translate.rs` | 2,403 | `sql` | PromQL→SQL emitter; preamble names it "migration scaffolding" |
+| `template.rs` | 948 | `sql` | Capture parser/matcher |
+| `project.rs` | 394 | `sql` | Arrow `RecordBatch` → `QueryResult` |
+| `engine.rs` | 237 | `sql` | `Engine` + 5-step pipeline |
+| `catalogue.rs` | 184 | `sql` | TOML registry loader |
+| `interp.rs` | 133 | `sql` | `output_metric` placeholder interpolation |
+| `lib.rs` | 56 | always | Re-exports + module gating |
+| `result.rs` | 77 | always | `QueryResult`, `Sample`, `MatrixSample`, `HistogramHeatmapResult`, `QueryError` |
+| `promql/` (subdir) | — | `legacy` | `QueryEngine`, streaming evaluator |
+| `tsdb/` (subdir) | — | `legacy` | In-memory store |
+
+`queries.toml` is **1,055 lines, 69 entries** —
+`grep -cE '^\s*id\s*=' metriken-query/queries.toml` → 69.
+
+`translate.rs` preamble (`metriken-query/src/translate.rs:1-50`)
+documents the organisation:
+
+> "1. `try_generate` (top of file) — top-level dispatch on entry id.
+>  2. `Shape` struct and `PerColExpr` / `Aggregation` enums — the
+>     canonical "what to compute" representation. ...
+>  3. `resolve_shape` (~1370) and `resolve_binary` (~140) — the big
+>     switch tables. **65 entry ids** match here today."
+
+The "65 entry ids" wording supersedes prior claims of "40+ shapes".
 
 ---
 
-## Adversarial-reviewer FAQ
+## Known current build issue (rezolus binary)
 
-**Q: Why two crates? Why not put everything in `metriken-query`?**
+`cargo check --bin rezolus` from the rezolus repo currently fails at
+compile time before BPF compilation (we couldn't get past the BPF
+build on this dev box without `clang`, but the static analysis is
+clear). The reason is **type references that no longer exist in
+metriken-query**:
 
-A: Because the `sql` and `legacy` halves have disjoint dependency sets
-and the WASM viewer cannot pull in DuckDB. Splitting them out means
-`metriken-query-sql` can compile with `--features=sql` alone and the
-WASM viewer can pull in `metriken-query` with `--features=legacy` alone
-without DuckDB. The two crates also have asymmetric lifecycles:
-`metriken-query-sql` is meant to survive, `metriken-query` gradually
-hollows out.
+`rezolus/src/viewer/mod.rs` references the following:
 
-**Q: Why is `translate.rs` 2372 lines?**
+| Reference site | Type |
+|---|---|
+| `:1650` | `promql::DispatchConfig` |
+| `:1663` | `promql::DispatchConfig` (struct literal) |
+| `:1676` | `metriken_query::DispatchObserver` |
+| `:1677` | `metriken_query::CatalogueEntry`, `metriken_query::Diff` |
+| `:1695` | `metriken_query::Mode` |
 
-A: Because every PromQL shape Rezolus's dashboard emits today needs a
-matching SQL translator. There are 40+ shapes (count varies by how you
-group entry ids); each has its own multiplier/divisor semantics,
-aggregation choice, reset behaviour, and column-resolution rule. The
-file is a switch table, not a hard-to-follow algorithm. The whole file
-is scaffolding — when Rezolus emits SQL natively, it goes away.
+`grep -rn 'DispatchConfig\|DispatchObserver' /work/metriken/ --include='*.rs'`
+returns **no results** — the types are gone.
+`pub enum Mode` is not defined in metriken at all
+(`grep -rn 'pub enum Mode' /work/metriken/`).
+
+The most likely removal is commit `a25e285` —
+"collapse PromQL evaluator to streaming-only (rezolus subset; ~2300
+line shrink) (#94)" landed 2026-05-01 from
+`yao@iop.systems`. That commit's title matches the shape of the
+deletion.
+
+The previous rezolus REVIEWING.md FAQ explained the build failure as
+"those types still exist in metriken-query, but they're feature-gated
+behind `sql`". That's **wrong**: `CatalogueEntry` is feature-gated;
+the rest (`DispatchConfig`, `DispatchObserver`, `Diff`, `Mode`) are
+gone entirely.
+
+Fixing the rezolus binary build is either:
+
+1. Remove the `dispatch_for_capture` + `LoggingDispatchObserver` code
+   path at `src/viewer/mod.rs:1640-1700` and the calls at `:1727-1731`
+   and `:1756-1760`. The server-backed viewer then runs PromQL only,
+   which matches the current `BACKEND='promql'` constant at
+   `src/viewer/assets/lib/viewer_api.js:7`.
+2. Or restore the dispatch types on the metriken side if shadow-mode
+   evaluation is still wanted.
+
+This is out of scope for the SQL-migration branch itself but blocks
+landing — flag it in the PR description.
+
+---
+
+## Where to spend attention (in 1 hour)
+
+1. **`metriken-query-sql/src/lib.rs`** (56 LOC) + **`backend.rs`** (414).
+   Public API and connection pool. The pool's panic-safe slot evacuation
+   is the only non-trivial concurrency story.
+2. **`metriken-query-sql/src/udf.rs`** (1,022) — read the preamble
+   (lines 1-37) and one `h2_*` UDF impl. The gotcha pattern is
+   documented; the unsafe blocks are uniform.
+3. **`metriken-query/src/engine.rs`** (237) — entire file. The 5-step
+   pipeline doc-comment at the top is the spec.
+4. Pick 2-3 representative entries from `metriken-query/queries.toml`
+   and trace them through `translate.rs`. Suggested: `gauge_bare`,
+   `counter_irate_total`, `histogram_quantile_*`.
+5. Run the harness (see Verification).
+
+If you have ten minutes: the FAQ below.
+
+---
+
+## FAQ
+
+**Q: Why two crates?**
+
+A: Disjoint dependency sets. `metriken-query-sql` pulls in `duckdb-rs`
+and the bundled DuckDB C build; `metriken-query` with `legacy` only
+pulls in `promql-parser`. Splitting them out keeps the legacy build
+small and lets `metriken-query-sql` survive as the long-term engine
+when the catalogue/translate scaffolding gets deleted.
+
+**Q: Why is `translate.rs` 2,403 lines?**
+
+A: Every PromQL shape Rezolus's dashboard emits today needs a matching
+SQL translator. The preamble at `metriken-query/src/translate.rs:31`
+says **65 entry ids** resolve in `resolve_shape`. The file is a switch
+table, not a hard-to-follow algorithm. It is scaffolding — when
+Rezolus emits SQL natively, it goes away (the preamble at line 3-7
+says so explicitly).
 
 **Q: Why is `udf.rs` so much `unsafe`?**
 
-A: FFI vector writes into DuckDB's columnar output. There is no
-zero-cost safe abstraction over `duckdb_vector_get_data()` in
-duckdb-rs today. All 13 unsafe blocks are bounds-checked, all are
-exercised by `tests/lag_repro.rs`, and all follow the same pattern
-(documented at the top of the file). The `ListVector::child(N)`
-gotcha — calling it on an input zeroes a sibling input's child past
-2048 — is real and the documented workaround (`as_slice_with_len`) is
-followed uniformly. See the file preamble.
+A: DuckDB-rs's vscalar UDF API is FFI-shaped — output vectors come
+back as raw pointers you write into. The 13 unsafe blocks are all
+bounds-checked, all follow the documented pattern (preamble lines
+1-37), and all are exercised by `tests/lag_repro.rs`. The
+`ListVector::child(N)` reserve gotcha is real and was the original
+motivation for the regression suite.
 
-**Q: Why does `CatalogueEntry` have a bunch of dead `Option<...>` fields
-(`mode`, `fixture`, `start`, `end`, `step`, `description`)?**
+**Q: Why retain `legacy`?**
 
-A: TOML compatibility. The 69 entries in `queries.toml` carry those
-keys from the pre-migration "dispatcher with Mode" world; deserialising
-with the keys present and ignored avoids a 69-entry TOML rewrite. The
-fields are unused at runtime. **This branch removes them** — see the
-diff to `catalogue.rs` and `queries.toml`.
+A: Two real consumers link it today:
 
-**Q: Why retain the `legacy` feature at all?**
+- The rezolus dashboard crate (`rezolus/crates/dashboard/Cargo.toml:13`
+  enables `features = ["legacy"]`) uses `metriken_query::Tsdb`.
+- The rezolus binary (`rezolus/Cargo.toml:78` enables `features =
+  ["ingest", "lz4"]`; `ingest` brings `legacy` transitively per
+  `metriken-query/Cargo.toml:8`) uses `metriken_query::promql::*` and
+  `metriken_query::Tsdb` for the live-agent ingest path and the
+  server-backed `/api/v1/query_range` endpoint.
 
-A: Two real consumers still need it: (1) Rezolus's WASM viewer cannot
-run DuckDB in the browser (no `wasm32` target for the bundled C build);
-(2) Rezolus's desktop binary `rezolus view <live-agent-url>` polls the
-agent's msgpack endpoint into an in-memory `Tsdb` — there is no
-parquet file to point DuckDB at. Both are tracked in the live-agent
-migration plan; until they're resolved, `legacy` stays.
+The WASM viewer (the static-site browser viewer at
+`rezolus/crates/viewer-sql/`) does **not** link `metriken-query`. The
+prior doc's reasoning that "WASM viewer needs legacy because DuckDB
+doesn't compile to wasm32" no longer matches the code — the static
+viewer is duckdb-wasm-backed.
 
-**Q: What survives a hypothetical v1.0 release?**
+**Q: Why does the harness need `--features "legacy,sql"`?**
 
-A: `metriken-query-sql` plus whatever shrunken form of `metriken-query`
-is needed to bridge until Rezolus emits SQL natively. Best case:
-`metriken-query-sql` is renamed to `metriken-query` and the
-PromQL crate disappears entirely. The crate split is engineered to
-make that mechanically straightforward.
+A: Because it instantiates **both** engines side-by-side. See
+`metriken-query/Cargo.toml:14-16`:
+
+```toml
+[[example]]
+name = "sql_vs_promql"
+required-features = ["legacy", "sql"]
+```
 
 ---
 
 ## Verification
 
-The headline numbers. Re-runnable from this branch.
-
 ### Cargo builds
 
+The Cargo features at `metriken-query/Cargo.toml:5-10` (quoted above)
+admit four sensible configurations. Reviewer can run:
+
 ```
-cargo build -p metriken-query                                             # default = sql+lz4
-cargo build -p metriken-query --no-default-features --features "legacy,ingest"
-cargo build -p metriken-query --all-features
-cargo test --workspace --all-features
+cargo build -p metriken-query                                                # default = sql+lz4
+cargo build -p metriken-query --no-default-features --features "legacy"      # legacy only
+cargo build -p metriken-query --no-default-features --features "ingest,lz4"  # binary's config
+cargo build -p metriken-query --all-features                                 # everything
 ```
 
-All four should pass. The desktop binary in Rezolus builds with
-`legacy,sql,ingest,lz4` (transitive).
+Workspace builds: `cargo build --workspace` and `cargo test --workspace
+--all-features`.
 
 ### PromQL ↔ SQL correctness harness
 
-`metriken-query/examples/sql_vs_promql.rs` runs every Rezolus dashboard
-plot through both engines for every parquet under
-`/work/rezolus/site/viewer/data/`. Output lands in `/tmp/sql_vs_promql_yv/`.
+Located at `metriken-query/examples/sql_vs_promql.rs` (1,719 LOC).
+Required features: `legacy,sql` (from `Cargo.toml:14-16` above).
 
 Run:
 
@@ -308,82 +385,60 @@ cargo run --release --example sql_vs_promql \
     -- /work/rezolus/site/viewer/data/demo.parquet
 ```
 
-Latest numbers (commit `c9b105b`, 11 parquets × 250 plots = 2222 pairs):
+Output lands in `/tmp/sql_vs_promql_yv/` per the example source.
 
-| parquet         | identical | tolerant | divergent |
-|-----------------|----------:|---------:|----------:|
-| demo            |       179 |        1 |        22 |
-| vllm            |       181 |        2 |        19 |
-| cachecannon     |        87 |        0 |       115 |
-| AB_base         |        66 |        0 |       136 |
-| AB_base_pin     |        70 |        0 |       132 |
-| AB_level        |        70 |        0 |       132 |
-| AB_level_pin    |        66 |        0 |       136 |
-| sglang_gemma3   |        34 |        0 |       168 |
-| vllm_gemma3     |        25 |        0 |       177 |
-| disagg-sglang   |        34 |        0 |       168 |
-| sglang-nixl-16c |        37 |        0 |       165 |
-| **total**       |   **849** |    **3** |  **1370** |
-
-The headline reads: **~89% identical on single-source rezolus parquets
-(demo, vllm)**. Multi-source and numeric-encoded parquets diverge for
-known reasons — see the divergence taxonomy below.
+**Reviewer note: the numerical results in the prior version of this
+doc are not re-verified here.** The prior numbers (~89% identical on
+single-source parquets; 849/3/1370 across 11 parquets) were taken from
+`/tmp/sql_vs_promql_yv/summary.json` at commit `c9b105b`. The branch
+has advanced 4 more commits since then (HEAD is `82f41f6`); a re-run
+is needed to refresh the table before the PR is opened. See
+`/work/rezolus/REVIEWING.md` "Known divergence taxonomy" section for
+the cumulative behaviour story.
 
 ### Cross-branch sanity check
 
-`examples/promql_only.rs` runs PromQL alone, so it compiles on both
-`main` and `yv/sql-testing`. On the 193 plots whose PromQL strings exist
-on both branches and produce output, **zero divergences** in the legacy
-evaluator's output between branches. `yv/sql-testing` strictly **expands**
-the supported metric set (the parquet loader now reads Arrow field
-metadata in addition to column names) — a real upgrade, not a regression.
+`metriken-query/examples/promql_only.rs` (169 LOC) runs the PromQL
+evaluator alone and can be invoked on both `main` and `yv/sql-testing`
+for direct A/B. Per its top doc-comment:
+
+> "PromQL-only harness for cross-branch correctness validation."
 
 ---
 
-## Known divergence taxonomy
+## Branch layout
 
-All known divergences fall into these eight categories. The first is an
-architectural gap; the rest are either real bugs (with known fixes) or
-acceptable semantic differences.
+`git rev-list --count main..yv/sql-testing` → **60** commits. Commit
+log (`git log --oneline main..yv/sql-testing`) groups roughly into:
 
-| count | category | what it means |
-|------:|---|---|
-| 985 | sql view missing the metric | Numeric-encoded parquets (`AB_*`, `*_gemma3`, `cachecannon`) store metric names in Arrow field metadata, not column names. Rezolus's dashboard SQL emitter references columns by metric name. PromQL's `Tsdb` reads field metadata; the SQL emitter doesn't (yet). Architectural cliff, not a regression. Static viewer renders these mostly empty too. Likely older test fixtures — worth confirming the team wants them supported. |
-| 167 | `rate_5m` boundary | Wasm-side `rate_5m(c, ts)` macro is `(c - LAG(c, 300)) / 300.0` — positional 300-row lag. On parquets shorter than 300 samples (≤ 5 minutes at 1 Hz), only the last point gets a value. PromQL extrapolates a rate from whatever's in the window. Semantic difference. Fix candidate (range-based window function) documented in `/work/rezolus/REVIEWING.md`. |
-| 55 | larger numerical drift (rel ≥ 1e-3) | **All one root cause, not 55 bugs.** Every case is on `disagg-sglang.parquet` (40) or `sglang-nixl-16c.parquet` (15) — the two demo parquets with multiple `rezolus` sources. PromQL sums across all sources; SQL queries one source view. Ratios are exactly N (number of rezolus sources) or 1/N. See `/work/rezolus/REVIEWING.md` for the dashboard-side fix decision. |
-| 26 | series count differs | Multi-source aggregation gaps. Same root cause as the 55. |
-| 23 | sql produces series, PromQL doesn't | Inverse of category 1, rarer. |
-| 16 | small numerical drift (rel < 1e-3) | irate window-math jitter (sub-millisecond timestamp drift divided into per-second deltas). Acceptable noise for production charts. |
-| 9 | label set mismatch | Multi-source labelling differences (e.g. `source=rezolus` only on PromQL side). |
-| 8 | sql duplicate samples per timestamp | **Real bug**: `cpu-busy-heatmap` and `busy-pct-per-cpu` miss a `sum by (id)` in the SQL form, producing 2× rows per (timestamp, cpu_id). Visible on every parquet with `cpu_usage/<state>/<cpu_id>` columns. Fix is in `crates/dashboard/src/dashboard/cpu.rs`. |
-
-Tolerance settings: `rel_tol = 1e-9`, `abs_tol = 1e-12`, ±2 boundary
-sample tolerance for grid-evaluation artefacts.
-
----
-
-## Branch layout and commit history
-
-The branch is 58 commits ahead of `main`. The commit log groups into
-phases:
-
-- Early phase (pre-rename): cachecannon, irate, hist_irate, wide-form
-  scaffolding, fixtures, golden snapshots.
-- Architectural cleanup: pool DuckDB connections, panic-safe slot
-  evacuation, h2_combine self-join (chunk-boundary panic workaround).
+- Wide-form scaffolding (cachecannon, irate, hist_irate, fixtures,
+  golden snapshots).
+- Architectural simplification: PromQL evaluator collapsed to
+  streaming-only — commit `a25e285` "collapse PromQL evaluator to
+  streaming-only (rezolus subset; ~2300 line shrink) (#94)".
+- DuckDB connection pool: panic-safe slot evacuation, h2_combine
+  self-join (chunk-boundary panic workaround).
 - Wide-form completeness: `counter_rate_bare_generic`, NULL handling,
   per-cpu / per-id resolvers, `rate_5m` range-window fix.
-- Harness: `sql_vs_promql.rs` and `promql_only.rs` (commits `e97eba7`
-  onwards). Multi-source aggregation, infrastructure-label injection,
-  fixture coverage. Final batch closes the `remaining_work.md` buckets.
+- Harness: `sql_vs_promql.rs`, `promql_only.rs`. Multi-source
+  aggregation. Fixture coverage.
+- Review prep (latest): bench CSV deletion, planning docs deletion,
+  REVIEWING.md, `.gitattributes` — commit `82f41f6`.
 
-Don't squash. The stage-by-stage history is genuinely useful for
-landing the branch in pieces if the reviewer prefers stacked PRs.
+`a25e285` is the commit that broke the rezolus binary build by
+removing `DispatchConfig`/`DispatchObserver`/`Diff`/`Mode` — see the
+"Known current build issue" section.
+
+Don't squash. The stage-by-stage history is reading-order for a
+commit-by-commit review.
 
 ---
 
 ## Pointers
 
-- Companion document (Rezolus side): `/work/rezolus/REVIEWING.md`
-- Correctness harness output: `/tmp/sql_vs_promql_yv/`
-- PromQL-only harness output: `/tmp/promql_yv/` and `/tmp/promql_main/`
+- Companion doc (rezolus side): `/work/rezolus/REVIEWING.md`
+- Correctness harness: `metriken-query/examples/sql_vs_promql.rs`
+- LAG-on-LIST regression suite: `metriken-query-sql/tests/lag_repro.rs`
+- Macros (native): `metriken-query-sql/src/macros.rs` (19 macros)
+- Macros (wasm parallel copy): `rezolus/crates/viewer-sql/src/macros.sql` (30 macros)
+- Parity test for the macros: `rezolus/crates/viewer-sql/tests/macros.rs`
