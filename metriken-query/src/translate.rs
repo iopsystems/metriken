@@ -1933,9 +1933,7 @@ fn generate(catalog: &MetricCatalog, shape: &Shape) -> Option<String> {
         // gets inlined by DuckDB the WHERE predicate compiles to a
         // re-evaluation of the per-column UDF (e.g. `irate_lag`) on
         // top of the projection's evaluation. Dropping the filter
-        // saves one UDF call per row per matching column. Confirmed
-        // ~7-12% on `counter_rate_bare_generic` via the `examples/
-        // probe_rate_shape` micro-bench.
+        // saves one UDF call per row per matching column.
         unions.push_str(&format!(
             "{prefix}SELECT timestamp, val_{i} AS v{label_proj} FROM {rates_name}"
         ));
