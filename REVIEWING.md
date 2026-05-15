@@ -35,13 +35,15 @@ concept). Post-collapse, the legacy evaluator has seen only
 ~270 LOC of small edits across `promql/{mod.rs, streaming/*.rs,
 tests.rs}`.
 
-Branch shape: **76** commits, **+14,943 / −397** across **59**
+Branch shape: **78** commits, **+16,093 / −397** across **59**
 files (`git diff --shortstat origin/main...HEAD`,
 `git rev-list --count origin/main..HEAD`). Includes a merge from
 `origin/main` that brought `QueryEngine::columns()`, trimmed
 parquet codecs to zstd-only, and bumped arrow/parquet/chrono.
-A subsequent review pass (described below) adds ~490 LOC of
-test coverage and one small fix in `metriken-query-sql/`.
+The two most recent commits (`5bdef1f` doc refresh + `17895d6`
+multi-source `_src` + `_cgroup_index` + `h2_combine_lol`) ship
+the test coverage and engine extensions described under
+"Crate layout" and "Test coverage" below.
 
 ---
 
@@ -85,13 +87,13 @@ non-default feature flag keeps the question reversible.
 
 ## Crate layout
 
-### `metriken-query-sql/src/` — DuckDB engine (~3,640 LOC, live)
+### `metriken-query-sql/src/` — DuckDB engine (~3,620 LOC, live)
 
 | File | LOC | Owns |
 |---|---:|---|
-| `udf.rs` | 1,187 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 13 `unsafe` blocks). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
-| `backend.rs` | 544 | `DuckDbBackend` connection pool (struct at :87), `run_sql` (:198), `describe_parquet` (:260), `invalidate` (:290). `catch_unwind` boundary (:221) is annotated with the load-bearing ordering invariant; recovery-shape test pins it. `ConnState` carries precomputed `src_sql` + `cgroup_index_sql` (both `Arc<str>`) so panic-rebuild paths re-execute the same setup without re-reading the parquet schema. |
-| `views.rs` | 1,086 | Parquet metric metadata + `_src` and `_cgroup_index` TEMP TABLE builders. `read_introspection` (line 120) is shared by pool init + `describe_parquet`; tolerates missing `sampling_interval_ms` (1 s fallback), `metric_type=histogram` without `grouping_power` (column dropped), and duplicate physical names (first wins). `render_src_sql` handles both single-source (`* EXCLUDE` shortcut) and multi-source captures — for the latter, `canonical_alias` mirrors the wasm viewer's `canonicalAlias` to project rezolus-tagged prefixed columns under canonical dashboard names. `render_cgroup_index_sql` + `create_cgroup_index` build the cgroup-index table the cgroup dashboard SQL JOINs against. |
+| `udf.rs` | 1,187 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 14 `unsafe` blocks). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
+| `backend.rs` | 544 | `DuckDbBackend` connection pool (struct at :98), `run_sql` (:216), `describe_parquet` (:297), `invalidate` (:327). `catch_unwind` boundary (:258) is annotated with the load-bearing ordering invariant; recovery-shape test pins it. `ConnState` carries precomputed `src_sql` + `cgroup_index_sql` (both `Arc<str>`) so panic-rebuild paths re-execute the same setup without re-reading the parquet schema. |
+| `views.rs` | 1,122 | Parquet metric metadata + `_src` and `_cgroup_index` TEMP TABLE builders. `read_introspection` (line 120) is shared by pool init + `describe_parquet`; tolerates missing `sampling_interval_ms` (1 s fallback), `metric_type=histogram` without `grouping_power` (column dropped), and duplicate physical names (first wins). `render_src_sql` handles both single-source (`* EXCLUDE` shortcut) and multi-source captures — for the latter, `canonical_alias` mirrors the wasm viewer's `canonicalAlias` to project rezolus-tagged prefixed columns under canonical dashboard names. `render_cgroup_index_sql` + `create_cgroup_index` build the cgroup-index table the cgroup dashboard SQL JOINs against. |
 | `macros.rs` | 389 | Loads `shared_macros.sql` via `include_str!`, parses it with a quote-aware splitter (semicolons inside `'..'` / `"..."` literals stay in the statement), and registers each `CREATE MACRO` on the connection. Re-exports the file as `SHARED_MACROS` so the wasm side consumes the same bytes. |
 | `shared_macros.sql` | 167 | **20** canonical macros (3 rate/delta primitives + 7 histogram primitives + 9 dashboard helpers + the new `h2_combine_lol` shared cross-backend list-of-lists folder). Single source of truth for both native and wasm. |
 | `observability.rs` | 157 | `BackendStats`. |
@@ -217,7 +219,7 @@ cross-branch A/B for the PromQL evaluator alone against `main`.
 2. **`metriken-query-sql/src/lib.rs`** (57) + **`backend.rs`**
    (509) — public surface and the only non-trivial concurrency
    story (panic-safe slot evacuation; see the `catch_unwind`
-   block at :221 for the ordering invariant).
+   block at :258 for the ordering invariant).
 3. **`udf.rs`** preamble (lines 1–37) + one `h2_*` UDF impl.
    The unsafe pattern is uniform across all 13 blocks.
 4. Run the harness and skim `summary.json`.
