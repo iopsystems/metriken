@@ -1,6 +1,6 @@
 -- Shared SQL macros for the rezolus dashboard.
 --
--- **Single source of truth** for the 19 macros that both the native
+-- **Single source of truth** for the 20 macros that both the native
 -- (duckdb-rs) and the wasm (duckdb-wasm) viewers need. Native loads this
 -- file via `include_str!` in metriken-query-sql/src/macros.rs and splits
 -- on `;` boundaries. Wasm pulls in the same string via the
