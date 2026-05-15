@@ -29,13 +29,16 @@
 //! 2. `Shape` struct and `PerColExpr` / `Aggregation` enums — the
 //!    canonical "what to compute" representation. Most resolvers
 //!    produce one of these.
-//! 3. `resolve_shape` (~1370) and `resolve_binary` (~140) — the big
-//!    switch tables. **65 entry ids** match here today (grep
-//!    `'"\w*" =>'` to enumerate). Each arm unpacks `captures` and
+//! 3. `resolve_shape` (line 1400) and `resolve_binary` (line 175) —
+//!    the big switch tables. 43 entry ids match in `resolve_shape`,
+//!    11 in `resolve_binary`. Each arm unpacks `captures` and
 //!    constructs a `Shape` or `Binary`.
-//! 4. `try_histogram`, `try_pair_match`, `try_chain`,
-//!    `try_avg_over_time` — shape families that need bespoke SQL
-//!    rather than the generic chain/binary emitters.
+//! 4. `try_chain` (5 ids), `try_pair_match` (4), `try_histogram` (5),
+//!    `try_avg_over_time` (1) — shape families that need bespoke SQL
+//!    rather than the generic chain/binary emitters. `try_generate`
+//!    runs these four first (in that order), then falls through to
+//!    `resolve_shape` and `resolve_binary`. Total handlers cover all
+//!    69 catalogue entries; no orphan, no generic fallback.
 //! 5. `generate`, `generate_binary`, `generate_binary_fused`,
 //!    `generate_sum`, `build_lane`, `build_rates_chain` — the SQL
 //!    emitters. These turn `Shape` / `Binary` into wide-form CTEs.

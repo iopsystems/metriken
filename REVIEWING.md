@@ -40,9 +40,12 @@ pre-aggregation that streaming now covers, along with the
 shadow-mode plumbing (no `Dispatch*` types, `with_dispatch`, or
 observer interfaces survive; `grep -ri shadow` finds only stale
 comments and the unrelated `orphan_detector` "shadowed entry"
-concept). Post-collapse, the legacy evaluator has seen only
-~270 LOC of small edits across `promql/{mod.rs, streaming/*.rs,
-tests.rs}`.
+concept). Post-collapse, those paths have seen +744 / −375 LOC
+across 10 follow-up commits (`git log --shortstat a25e285..HEAD --
+metriken-query/src/promql/{mod.rs,streaming,tests.rs}`). The +270
+spike is `1ead064` (`QueryEngine::columns()`, merged in from
+origin/main); per-commit churn elsewhere ranges from a few lines
+to ~135.
 
 Branch shape: **79** commits, **+16,095 / −397** across **59**
 files (`git diff --shortstat origin/main...HEAD`,
@@ -120,7 +123,7 @@ src/
 └── harness/        (harness)   PromQL → wide-form SQL (scaffolding).
     ├── mod.rs      (34)
     ├── engine.rs   (237)       The 5-step pipeline; doc-comment lines 1–18 is the spec.
-    ├── translate.rs (2,402)    PromQL → SQL emitter. resolve_shape (~:1370) is the big switch — 65 entry ids resolve here.
+    ├── translate.rs (2,402)    PromQL → SQL emitter. `try_generate` (`:112`) dispatches all 69 entry IDs across 6 resolvers: `resolve_shape` (`:1400`, 43), `resolve_binary` (`:175`, 11), `try_chain` (`:1005`, 5), `try_histogram` (`:702`, 5), `try_pair_match` (`:874`, 4), `try_avg_over_time` (`:678`, 1).
     ├── template.rs (948)       Capture parser/matcher (29 inline tests).
     ├── project.rs  (395)       Arrow RecordBatch → QueryResult.
     ├── catalogue.rs (183)      TOML registry loader.
