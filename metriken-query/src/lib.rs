@@ -3,9 +3,14 @@
 //! Two feature-gated paths:
 //!
 //! - `legacy` (live): the streaming PromQL evaluator (`promql/`) over
-//!   an in-process `Tsdb`. Linked today by the Rezolus dashboard crate
-//!   (for `Tsdb`) and the Rezolus binary's server-backed
-//!   `/api/v1/query_range` and live-agent ingest paths.
+//!   an in-process `Tsdb`. Active consumers today: Rezolus MCP
+//!   (`src/mcp/`), `crates/report-save`, the Rezolus dashboard crate
+//!   (re-exports `Tsdb` as a schema source), and the viewer's
+//!   live-mode `validate_service_extensions` KPI availability check.
+//!   The server-backed viewer's `/api/v1/query{,_range}` handlers
+//!   run on SQL/DuckDB (see `metriken-query-sql`); the live-agent
+//!   ingest loop populates a `Tsdb` but those handlers return
+//!   `capture_not_found` for live mode.
 //!
 //! - `harness` (off by default): the PromQL→SQL catalogue + translator
 //!   + `Engine` (`harness::*`). **Migration scaffolding**: zero

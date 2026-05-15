@@ -14,8 +14,17 @@ production caller and is off by default — see "What the harness
 is for" below.
 
 The pre-existing PromQL evaluator (`metriken-query::promql` +
-`tsdb`, gated `feature = "legacy"`) stays as the live engine for
-the rezolus binary's server-backed viewer + live-agent ingest.
+`tsdb`, gated `feature = "legacy"`) stays in the binary as the
+live engine for the rezolus MCP module (`src/mcp/`), the
+`crates/report-save` rendering path, the dashboard crate (which
+re-exports `Tsdb` as a schema source), and one viewer side-effect
+— `validate_service_extensions` in `src/viewer/metadata.rs`,
+which runs each KPI's PromQL on the live-agent `Tsdb` to hide
+empty plots. The server-backed viewer's `/api/v1/query{,_range}`
+handlers flipped to SQL/DuckDB in `f9b392b` (Stage 3); the
+live-agent ingest loop still populates a `Tsdb`, but those
+handlers return `capture_not_found` for live mode pending stages
+3-9.
 
 The evaluator now has two modes: a **streaming dispatcher**
 (`promql/streaming/`) that walks expressions window-by-window
@@ -35,15 +44,16 @@ concept). Post-collapse, the legacy evaluator has seen only
 ~270 LOC of small edits across `promql/{mod.rs, streaming/*.rs,
 tests.rs}`.
 
-Branch shape: **78** commits, **+16,093 / −397** across **59**
+Branch shape: **79** commits, **+16,095 / −397** across **59**
 files (`git diff --shortstat origin/main...HEAD`,
 `git rev-list --count origin/main..HEAD`). Includes a merge from
 `origin/main` that brought `QueryEngine::columns()`, trimmed
 parquet codecs to zstd-only, and bumped arrow/parquet/chrono.
-The two most recent commits (`5bdef1f` doc refresh + `17895d6`
-multi-source `_src` + `_cgroup_index` + `h2_combine_lol`) ship
-the test coverage and engine extensions described under
-"Crate layout" and "Test coverage" below.
+The most recent code-touching commit (`17895d6` multi-source
+`_src` + `_cgroup_index` + `h2_combine_lol`) ships the test
+coverage and engine extensions described under "Crate layout"
+and "Test coverage" below. Two follow-up doc refreshes
+(`5bdef1f`, `fe3414d`) updated this file.
 
 ---
 
@@ -91,7 +101,7 @@ non-default feature flag keeps the question reversible.
 
 | File | LOC | Owns |
 |---|---:|---|
-| `udf.rs` | 1,187 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 14 `unsafe` blocks). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
+| `udf.rs` | 1,187 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 13 `unsafe` items — 5 `unsafe {}` blocks + 8 `unsafe fn invoke` declarations). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
 | `backend.rs` | 544 | `DuckDbBackend` connection pool (struct at :98), `run_sql` (:216), `describe_parquet` (:297), `invalidate` (:327). `catch_unwind` boundary (:258) is annotated with the load-bearing ordering invariant; recovery-shape test pins it. `ConnState` carries precomputed `src_sql` + `cgroup_index_sql` (both `Arc<str>`) so panic-rebuild paths re-execute the same setup without re-reading the parquet schema. |
 | `views.rs` | 1,122 | Parquet metric metadata + `_src` and `_cgroup_index` TEMP TABLE builders. `read_introspection` (line 120) is shared by pool init + `describe_parquet`; tolerates missing `sampling_interval_ms` (1 s fallback), `metric_type=histogram` without `grouping_power` (column dropped), and duplicate physical names (first wins). `render_src_sql` handles both single-source (`* EXCLUDE` shortcut) and multi-source captures — for the latter, `canonical_alias` mirrors the wasm viewer's `canonicalAlias` to project rezolus-tagged prefixed columns under canonical dashboard names. `render_cgroup_index_sql` + `create_cgroup_index` build the cgroup-index table the cgroup dashboard SQL JOINs against. |
 | `macros.rs` | 389 | Loads `shared_macros.sql` via `include_str!`, parses it with a quote-aware splitter (semicolons inside `'..'` / `"..."` literals stay in the statement), and registers each `CREATE MACRO` on the connection. Re-exports the file as `SHARED_MACROS` so the wasm side consumes the same bytes. |
@@ -99,7 +109,7 @@ non-default feature flag keeps the question reversible.
 | `observability.rs` | 157 | `BackendStats`. |
 | `lib.rs` | 57 | Public surface. |
 
-### `metriken-query/src/` — legacy PromQL + harness (4,447 LOC)
+### `metriken-query/src/` — legacy PromQL + harness (11,026 LOC total: promql 4,716 + tsdb 1,863 + harness 4,332 + lib/result 115)
 
 ```
 src/
@@ -142,8 +152,8 @@ cargo build -p metriken-query --all-features                    # everything (ha
 
 | Consumer | Features | Uses |
 |---|---|---|
-| Rezolus binary | `ingest, lz4` → `legacy` transitively (`/work/rezolus/Cargo.toml:76`, workspace dep at `:22` is `default-features = false`) | `Tsdb`, `promql::QueryEngine` |
-| Rezolus dashboard crate (`/work/rezolus/crates/dashboard/Cargo.toml:13`) | `legacy` | `Tsdb` only (`data.rs:12`, `lib.rs:8`) |
+| Rezolus binary | `ingest` → `legacy` transitively (`/work/rezolus/Cargo.toml:77`, workspace dep at `:19` is `default-features = false`) | `Tsdb`, `promql::QueryEngine` |
+| Rezolus dashboard crate (gate at `/work/rezolus/crates/dashboard/Cargo.toml:16`, dep at `:22`) | `legacy` | `Tsdb` only (`data.rs:13`, `lib.rs:11`) |
 | Rezolus static viewer (`/work/rezolus/crates/viewer-sql/Cargo.toml`) | — | does not link `metriken-query` |
 
 ### Test infrastructure
@@ -217,7 +227,7 @@ cross-branch A/B for the PromQL evaluator alone against `main`.
    `harness/` subdirectory gets deleted. Everything else is a
    sub-decision.
 2. **`metriken-query-sql/src/lib.rs`** (57) + **`backend.rs`**
-   (509) — public surface and the only non-trivial concurrency
+   (544) — public surface and the only non-trivial concurrency
    story (panic-safe slot evacuation; see the `catch_unwind`
    block at :258 for the ordering invariant).
 3. **`udf.rs`** preamble (lines 1–37) + one `h2_*` UDF impl.
