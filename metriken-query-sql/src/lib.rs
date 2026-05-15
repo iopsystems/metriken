@@ -36,7 +36,7 @@ pub mod views;
 pub use backend::DuckDbBackend;
 pub use macros::SHARED_MACROS;
 pub use observability::{BackendStats, PhaseSnapshot, StatsSnapshot};
-pub use views::{MetricCatalog, MetricSeries};
+pub use views::{MetricCatalog, MetricSeries, view_name_for_source};
 
 /// Errors returned by the engine. The single `Backend` variant covers
 /// all DuckDB-side failures with a free-form message; callers compose

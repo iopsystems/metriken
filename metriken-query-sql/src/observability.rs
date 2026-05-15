@@ -39,12 +39,10 @@ impl PhaseStats {
         // the loop converges in O(log N) iterations on the worst path.
         let mut prev = self.max_ns.load(Ordering::Relaxed);
         while ns > prev {
-            match self.max_ns.compare_exchange_weak(
-                prev,
-                ns,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .max_ns
+                .compare_exchange_weak(prev, ns, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(actual) => prev = actual,
             }

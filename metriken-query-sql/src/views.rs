@@ -117,9 +117,7 @@ pub struct MetricSeries {
 
 /// Read parquet metadata: classify columns, dedupe duplicates, extract
 /// the sampling interval. Pure introspection — no DuckDB side effects.
-pub(crate) fn read_introspection(
-    parquet_path: &str,
-) -> duckdb::Result<(Vec<ColumnInfo>, u64)> {
+pub(crate) fn read_introspection(parquet_path: &str) -> duckdb::Result<(Vec<ColumnInfo>, u64)> {
     let bytes = std::fs::read(parquet_path).map_err(|e| {
         duckdb::Error::DuckDBFailure(
             duckdb::ffi::Error {
@@ -203,9 +201,7 @@ pub(crate) fn build_catalog(columns: &[ColumnInfo]) -> MetricCatalog {
     for (metric, cols) in by_metric {
         // Record `grouping_power` for histogram metrics so wide-form
         // can pass it to h2_quantile / h2_heatmap without recomputing.
-        if let Some(ColumnKind::Histogram { grouping_power }) =
-            cols.first().map(|c| &c.kind)
-        {
+        if let Some(ColumnKind::Histogram { grouping_power }) = cols.first().map(|c| &c.kind) {
             catalog
                 .histogram_p_by_metric
                 .insert(metric.clone(), *grouping_power);
@@ -335,6 +331,130 @@ pub(crate) fn render_src_sql(
     )
 }
 
+/// Render `CREATE OR REPLACE TEMP VIEW _src_<source> AS SELECT ...
+/// FROM read_parquet(...)` statements, one per distinct `source` label
+/// value found across the parquet's column field metadata. Returned as
+/// a single `;`-separated batch suitable for `execute_batch`. Lets
+/// service-extension KPI SQL target `_src_<service_name>` (e.g.
+/// `_src_cachecannon`, `_src_vllm_prefill`) and bind regardless of
+/// whether the parquet ships a single-instance source or multiple
+/// instances of the same source.
+///
+/// Each view projects:
+///   - `timestamp` (snapped to interval, same as `_src`)
+///   - `duration` when present in the parquet
+///   - one column per canonical alias, aliased via [`canonical_alias`].
+///     When multiple physical columns share an alias (multi-instance:
+///     two cachecannon instances both expose `target_rate`), values
+///     are aggregated: `COALESCE(c1, 0) + COALESCE(c2, 0)` for
+///     scalars, `h2_combine_lol([COALESCE(c1, [...]), …])` for
+///     histograms — same shape `_src_rezolus_combined` uses across
+///     multi-rezolus parquets.
+///
+/// View name applies wasm-compatible sanitisation:
+/// non-`[a-zA-Z0-9_]` chars in `<source>` become `_`, so
+/// `vllm-prefill` resolves to `_src_vllm_prefill`.
+///
+/// Returns an empty string when no column carries a `source` label —
+/// pure single-source rezolus parquets already expose everything in
+/// canonical form via `_src` and need no per-source aliasing.
+pub(crate) fn render_per_source_views_sql(
+    parquet_path: &str,
+    interval_ns: u64,
+    columns: &[ColumnInfo],
+) -> String {
+    let half = interval_ns / 2;
+    let parquet_lit = parquet_path.replace('\'', "''");
+    let has_duration = columns.iter().any(|c| c.physical == "duration");
+
+    // Group columns by `source` label value (from field metadata).
+    // Each entry: source → alias → list of (info, alias) sharing that alias.
+    let mut by_source: BTreeMap<&str, BTreeMap<String, Vec<&ColumnInfo>>> = BTreeMap::new();
+    for c in columns {
+        let Some(source) = c.labels.get("source") else {
+            continue;
+        };
+        let alias = canonical_alias(c);
+        by_source
+            .entry(source.as_str())
+            .or_default()
+            .entry(alias)
+            .or_default()
+            .push(c);
+    }
+    if by_source.is_empty() {
+        return String::new();
+    }
+
+    let mut statements: Vec<String> = Vec::with_capacity(by_source.len());
+    for (source, aliases) in &by_source {
+        let view_name = view_name_for_source(source);
+        let mut projections: Vec<String> = Vec::with_capacity(2 + aliases.len());
+        projections.push(format!(
+            "((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp"
+        ));
+        if has_duration {
+            projections.push("duration".to_string());
+        }
+        for (alias, contribs) in aliases {
+            let alias_q = quote_ident(alias);
+            if contribs.len() == 1 {
+                projections.push(format!(
+                    "{} AS {}",
+                    quote_ident(&contribs[0].physical),
+                    alias_q,
+                ));
+            } else {
+                // Multi-instance contributions to the same canonical
+                // alias: aggregate. Histograms combine via `h2_combine_lol`;
+                // scalars sum with COALESCE so NULL-only rows don't poison
+                // the result.
+                let is_histogram = matches!(contribs[0].kind, ColumnKind::Histogram { .. });
+                if is_histogram {
+                    let parts: Vec<String> = contribs
+                        .iter()
+                        .map(|c| format!("COALESCE({}, []::UBIGINT[])", quote_ident(&c.physical)))
+                        .collect();
+                    projections.push(format!(
+                        "h2_combine_lol([{}]) AS {}",
+                        parts.join(", "),
+                        alias_q,
+                    ));
+                } else {
+                    let parts: Vec<String> = contribs
+                        .iter()
+                        .map(|c| format!("COALESCE({}, 0)", quote_ident(&c.physical)))
+                        .collect();
+                    projections.push(format!("({}) AS {}", parts.join(" + "), alias_q));
+                }
+            }
+        }
+        statements.push(format!(
+            "CREATE OR REPLACE TEMP VIEW {view} AS SELECT {projs} FROM read_parquet('{parquet_lit}')",
+            view = view_name,
+            projs = projections.join(", "),
+        ));
+    }
+    statements.join("; ")
+}
+
+/// Wasm-compatible view name for a source. Non-`[a-zA-Z0-9_]` chars
+/// become `_` so `vllm-prefill` resolves to `_src_vllm_prefill` on
+/// both backends. Mirrors `viewNameForSource` in
+/// `site/viewer-sql/lib/duckdb-registry.js`.
+pub fn view_name_for_source(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 5);
+    out.push_str("_src_");
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
 /// Field metadata keys that describe *where* a value came from
 /// rather than *which* series it belongs to. These never appear in
 /// the canonical column name. Mirrors `NON_VALUE_METADATA_KEYS` in
@@ -384,11 +504,7 @@ fn canonical_alias(info: &ColumnInfo) -> String {
     let mut value_labels: Vec<(&str, &str)> = info
         .labels
         .iter()
-        .filter(|(k, _)| {
-            !NON_VALUE_METADATA_KEYS
-                .iter()
-                .any(|nv| *nv == k.as_str())
-        })
+        .filter(|(k, _)| !NON_VALUE_METADATA_KEYS.iter().any(|nv| *nv == k.as_str()))
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     value_labels.sort_by(|a, b| {
@@ -476,9 +592,7 @@ pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
         // For multi-source, skip non-rezolus rows: `_src` doesn't
         // project them, so a JOIN row pointing at a non-existent
         // `_src` column would be unreachable noise.
-        if multi_source
-            && c.labels.get("source").map_or(true, |s| s != "rezolus")
-        {
+        if multi_source && c.labels.get("source").map_or(true, |s| s != "rezolus") {
             continue;
         }
         let col = if multi_source {
@@ -500,9 +614,7 @@ pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
                 // infrastructure keys that `canonical_alias` filters
                 // out — otherwise multi-source rows expose `node` /
                 // `source` keys that the single-source path doesn't.
-                !NON_VALUE_METADATA_KEYS.iter().any(|nv| *nv == k)
-                    && k != "name"
-                    && k != "id"
+                !NON_VALUE_METADATA_KEYS.iter().any(|nv| *nv == k) && k != "name" && k != "id"
             })
             .map(|(k, v)| format!("{}:{}", sql_string_lit(k), sql_string_lit(v)))
             .collect();
@@ -517,7 +629,8 @@ pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
             "({}, {}, {}, {}, {})",
             sql_string_lit(&c.metric),
             sql_string_lit(&col),
-            name.map(sql_string_lit).unwrap_or_else(|| "NULL".to_string()),
+            name.map(sql_string_lit)
+                .unwrap_or_else(|| "NULL".to_string()),
             id.map(sql_string_lit).unwrap_or_else(|| "NULL".to_string()),
             labels_lit,
         ));
@@ -552,10 +665,7 @@ fn sql_string_lit(s: &str) -> String {
 /// Build the `_cgroup_index` TEMP TABLE on `conn`. Executes the
 /// SQL rendered by `render_cgroup_index_sql` — see that function
 /// for the schema and semantics.
-pub(crate) fn create_cgroup_index(
-    conn: &Connection,
-    columns: &[ColumnInfo],
-) -> duckdb::Result<()> {
+pub(crate) fn create_cgroup_index(conn: &Connection, columns: &[ColumnInfo]) -> duckdb::Result<()> {
     let sql = render_cgroup_index_sql(columns);
     // `INSERT` may be empty (no cgroup columns); when it is, the
     // string is just the `CREATE` and `execute` runs one statement.
@@ -630,23 +740,28 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(nonzero, 0, "every _src.timestamp must be a clean multiple of 1e9 ns");
+        assert_eq!(
+            nonzero, 0,
+            "every _src.timestamp must be a clean multiple of 1e9 ns"
+        );
     }
 
     #[test]
     fn counter_basic_catalog_indexes_the_one_metric() {
         let conn = fresh_conn();
-        let catalog =
-            ensure_views(&conn, fixture_path("counter_basic").to_str().unwrap()).unwrap();
-        let series = catalog.series_by_metric.get("requests").expect("requests metric");
+        let catalog = ensure_views(&conn, fixture_path("counter_basic").to_str().unwrap()).unwrap();
+        let series = catalog
+            .series_by_metric
+            .get("requests")
+            .expect("requests metric");
         assert_eq!(series.len(), 1);
     }
 
     #[test]
     fn counter_multi_label_catalog_indexes_four_series() {
         let conn = fresh_conn();
-        let catalog = ensure_views(&conn, fixture_path("counter_multi_label").to_str().unwrap())
-            .unwrap();
+        let catalog =
+            ensure_views(&conn, fixture_path("counter_multi_label").to_str().unwrap()).unwrap();
         let series = catalog
             .series_by_metric
             .get("cpu_usage")
@@ -694,8 +809,8 @@ mod tests {
         use arrow::datatypes::Schema;
         use arrow::record_batch::RecordBatch;
         use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
         use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
 
         let schema = std::sync::Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), columns).expect("RecordBatch");
@@ -737,7 +852,8 @@ mod tests {
         use arrow::array::{ArrayRef, UInt64Array};
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("no_interval.parquet");
-        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000]));
+        let ts: ArrayRef =
+            std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000]));
         let v: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![10u64, 20]));
         write_test_parquet(
             &path,
@@ -763,7 +879,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("no_grouping_power.parquet");
 
-        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000]));
+        let ts: ArrayRef =
+            std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000]));
         let mut lb = ListBuilder::new(UInt64Builder::new()).with_field(Field::new(
             "item",
             DataType::UInt64,
@@ -781,12 +898,8 @@ mod tests {
         md.insert("metric".into(), "latency".into());
         md.insert("metric_type".into(), "histogram".into()); // claims to be a histogram…
         // …but no grouping_power, so we can't actually compute on it.
-        let list_field = Field::new(
-            "latency:buckets",
-            list_array.data_type().clone(),
-            true,
-        )
-        .with_metadata(md);
+        let list_field =
+            Field::new("latency:buckets", list_array.data_type().clone(), true).with_metadata(md);
 
         write_test_parquet(
             &path,
@@ -832,7 +945,10 @@ mod tests {
         );
 
         let (columns, _) = read_introspection(path.to_str().unwrap()).expect("introspect");
-        let requests: Vec<_> = columns.iter().filter(|c| c.physical == "requests").collect();
+        let requests: Vec<_> = columns
+            .iter()
+            .filter(|c| c.physical == "requests")
+            .collect();
         assert_eq!(requests.len(), 1, "dedupe must keep exactly one `requests`");
     }
 
@@ -844,10 +960,8 @@ mod tests {
         // metric. The table must still exist (dashboard SQL JOINs
         // against it unconditionally) but contain zero rows.
         let conn = fresh_conn();
-        let (columns, _) = read_introspection(
-            fixture_path("counter_basic").to_str().unwrap(),
-        )
-        .unwrap();
+        let (columns, _) =
+            read_introspection(fixture_path("counter_basic").to_str().unwrap()).unwrap();
         create_cgroup_index(&conn, &columns).expect("create cgroup index");
         let n: i64 = conn
             .query_row("SELECT count(*) FROM _cgroup_index", [], |r| r.get(0))
@@ -905,21 +1019,20 @@ mod tests {
         // `state` should be in the MAP but `name`/`id` should NOT (they
         // were lifted to top-level columns).
         let state: String = conn
-            .query_row(
-                "SELECT labels['state'] FROM _cgroup_index",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT labels['state'] FROM _cgroup_index", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(state, "user");
         let n_keys: i64 = conn
-            .query_row(
-                "SELECT len(map_keys(labels)) FROM _cgroup_index",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT len(map_keys(labels)) FROM _cgroup_index", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(n_keys, 1, "labels MAP should hold only `state`, not name/id");
+        assert_eq!(
+            n_keys, 1,
+            "labels MAP should hold only `state`, not name/id"
+        );
     }
 
     // ---------- canonical aliasing for multi-source parquets ----------
@@ -934,7 +1047,10 @@ mod tests {
             physical: physical.into(),
             metric: metric.into(),
             kind,
-            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 
@@ -994,7 +1110,10 @@ mod tests {
             ColumnKind::Histogram { grouping_power: 3 },
             &[("op", "read")],
         );
-        assert_eq!(super::canonical_alias(&info), "syscall_latency/read:buckets");
+        assert_eq!(
+            super::canonical_alias(&info),
+            "syscall_latency/read:buckets"
+        );
     }
 
     #[test]
@@ -1009,7 +1128,10 @@ mod tests {
             &[("state", "user"), ("id", "0")],
         )];
         let sql = super::render_src_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
-        assert!(sql.contains("* EXCLUDE (timestamp)"), "single-source: {sql}");
+        assert!(
+            sql.contains("* EXCLUDE (timestamp)"),
+            "single-source: {sql}"
+        );
     }
 
     #[test]
@@ -1049,6 +1171,152 @@ mod tests {
         );
         // No `* EXCLUDE` shortcut on the multi-source path.
         assert!(!sql.contains("EXCLUDE"));
+    }
+
+    #[test]
+    fn view_name_for_source_strips_non_alnum() {
+        // Matches wasm's `viewNameForSource`: hyphens, dots, slashes
+        // map to underscores.
+        assert_eq!(
+            super::view_name_for_source("cachecannon"),
+            "_src_cachecannon"
+        );
+        assert_eq!(
+            super::view_name_for_source("vllm-prefill"),
+            "_src_vllm_prefill"
+        );
+        assert_eq!(
+            super::view_name_for_source("llm.perf.v2"),
+            "_src_llm_perf_v2"
+        );
+        // Already-alphanumeric underscores survive.
+        assert_eq!(super::view_name_for_source("a_b_c"), "_src_a_b_c");
+    }
+
+    #[test]
+    fn render_per_source_views_groups_by_source_label() {
+        let cols = vec![
+            make_info(
+                "0::target_rate",
+                "target_rate",
+                ColumnKind::Gauge,
+                &[("source", "cachecannon"), ("instance", "0")],
+            ),
+            make_info(
+                "0::requests_sent",
+                "requests_sent",
+                ColumnKind::Counter,
+                &[("source", "cachecannon"), ("instance", "0")],
+            ),
+            make_info(
+                "rezolus-client::10x0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[
+                    ("id", "0"),
+                    ("node", "rezolus-client"),
+                    ("source", "rezolus"),
+                    ("unit", "cycles"),
+                ],
+            ),
+        ];
+        let sql = super::render_per_source_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        // View names follow the source label, not the column prefix.
+        assert!(sql.contains(r#"CREATE OR REPLACE TEMP VIEW _src_cachecannon AS"#));
+        assert!(sql.contains(r#"CREATE OR REPLACE TEMP VIEW _src_rezolus AS"#));
+        // Bare canonical aliases project from the prefixed physical names.
+        assert!(sql.contains(r#""0::target_rate" AS "target_rate""#));
+        assert!(sql.contains(r#""0::requests_sent" AS "requests_sent""#));
+        assert!(sql.contains(r#""rezolus-client::10x0" AS "cpu_cycles/0""#));
+        // Timestamp snap projection is present.
+        assert!(sql.contains("AS timestamp"));
+        // Statements are `;`-separated.
+        assert_eq!(sql.matches("CREATE OR REPLACE TEMP VIEW").count(), 2);
+    }
+
+    #[test]
+    fn render_per_source_views_empty_when_no_source_label() {
+        // Columns carry no `source` label — single-source rezolus parquets
+        // historically didn't tag this field, and `_src` already exposes
+        // them in canonical form.
+        let cols = vec![
+            make_info(
+                "cpu_cycles/0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[("id", "0")],
+            ),
+            make_info("memory_total", "memory_total", ColumnKind::Gauge, &[]),
+        ];
+        let sql = super::render_per_source_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(sql.is_empty(), "expected empty SQL: {sql}");
+    }
+
+    #[test]
+    fn render_per_source_views_aggregates_multi_instance_scalars() {
+        // Two cachecannon instances expose `target_rate` under different
+        // prefixes (0:: and 1::). The per-source view sums them with
+        // COALESCE so a missing reading on one instance doesn't poison
+        // the row.
+        let cols = vec![
+            make_info(
+                "0::target_rate",
+                "target_rate",
+                ColumnKind::Gauge,
+                &[("source", "cachecannon"), ("instance", "0")],
+            ),
+            make_info(
+                "1::target_rate",
+                "target_rate",
+                ColumnKind::Gauge,
+                &[("source", "cachecannon"), ("instance", "1")],
+            ),
+        ];
+        let sql = super::render_per_source_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(
+            sql.contains(r#"(COALESCE("0::target_rate", 0) + COALESCE("1::target_rate", 0)) AS "target_rate""#),
+            "expected COALESCE sum aggregation: {sql}",
+        );
+    }
+
+    #[test]
+    fn render_per_source_views_aggregates_multi_instance_histograms() {
+        // Two cachecannon instances expose `response_latency:buckets`
+        // (histograms). Combined via `h2_combine_lol`, matching the
+        // `_src_rezolus_combined` shape used for multi-rezolus parquets.
+        let cols = vec![
+            make_info(
+                "0::response_latency:buckets",
+                "response_latency",
+                ColumnKind::Histogram { grouping_power: 4 },
+                &[("source", "cachecannon"), ("instance", "0")],
+            ),
+            make_info(
+                "1::response_latency:buckets",
+                "response_latency",
+                ColumnKind::Histogram { grouping_power: 4 },
+                &[("source", "cachecannon"), ("instance", "1")],
+            ),
+        ];
+        let sql = super::render_per_source_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(
+            sql.contains(r#"h2_combine_lol([COALESCE("0::response_latency:buckets", []::UBIGINT[]), COALESCE("1::response_latency:buckets", []::UBIGINT[])])"#),
+            "expected h2_combine_lol for histogram aggregation: {sql}",
+        );
+    }
+
+    #[test]
+    fn render_per_source_views_includes_duration_when_present() {
+        let cols = vec![
+            make_info("duration", "duration", ColumnKind::Other, &[]),
+            make_info("0::x", "x", ColumnKind::Gauge, &[("source", "cachecannon")]),
+        ];
+        let sql = super::render_per_source_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        // duration projects under its bare name (not aliased).
+        assert!(
+            sql.contains("duration, "),
+            "expected duration projection: {sql}"
+        );
     }
 
     #[test]
@@ -1098,7 +1366,10 @@ mod tests {
         let path = path.to_str().unwrap();
 
         let described = describe_parquet(path).unwrap();
-        assert_eq!(described.series_by_metric.get("cpu_usage").unwrap().len(), 4);
+        assert_eq!(
+            described.series_by_metric.get("cpu_usage").unwrap().len(),
+            4
+        );
 
         let conn = fresh_conn();
         // No call to ensure_views — only describe_parquet was used.
@@ -1117,6 +1388,9 @@ mod tests {
             described.series_by_metric.keys().collect::<Vec<_>>(),
             ensured.series_by_metric.keys().collect::<Vec<_>>()
         );
-        assert_eq!(described.histogram_p_by_metric, ensured.histogram_p_by_metric);
+        assert_eq!(
+            described.histogram_p_by_metric,
+            ensured.histogram_p_by_metric
+        );
     }
 }

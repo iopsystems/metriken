@@ -185,7 +185,10 @@ mod tests {
         let stmts = super::split_statements(
             "SELECT 1 AS a; -- trailing\nSELECT 2 AS b;\n-- whole line\nSELECT 3 AS c;\n",
         );
-        assert_eq!(stmts, vec!["SELECT 1 AS a", "SELECT 2 AS b", "SELECT 3 AS c"]);
+        assert_eq!(
+            stmts,
+            vec!["SELECT 1 AS a", "SELECT 2 AS b", "SELECT 3 AS c"]
+        );
     }
 
     #[test]

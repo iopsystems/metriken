@@ -37,10 +37,10 @@
 // input bounds-checks the entry against the child capacity (see `list_entry`
 // below); out-of-range entries indicate NULL parents or malformed lists.
 
+use duckdb::Connection;
 use duckdb::core::{DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
-use duckdb::Connection;
 
 const N: u32 = 64;
 const DEFAULT_P: u32 = 3;
@@ -108,11 +108,21 @@ fn h2_mid_p(idx: u32, p: u32) -> u64 {
     lo + (hi - lo) / 2
 }
 
-fn ubig() -> LogicalTypeHandle { LogicalTypeId::UBigint.into() }
-fn dbl()  -> LogicalTypeHandle { LogicalTypeId::Double.into() }
-fn int()  -> LogicalTypeHandle { LogicalTypeId::Integer.into() }
-fn ubig_list() -> LogicalTypeHandle { LogicalTypeHandle::list(&ubig()) }
-fn dbl_list()  -> LogicalTypeHandle { LogicalTypeHandle::list(&dbl()) }
+fn ubig() -> LogicalTypeHandle {
+    LogicalTypeId::UBigint.into()
+}
+fn dbl() -> LogicalTypeHandle {
+    LogicalTypeId::Double.into()
+}
+fn int() -> LogicalTypeHandle {
+    LogicalTypeId::Integer.into()
+}
+fn ubig_list() -> LogicalTypeHandle {
+    LogicalTypeHandle::list(&ubig())
+}
+fn dbl_list() -> LogicalTypeHandle {
+    LogicalTypeHandle::list(&dbl())
+}
 
 /// Bounds-check a list_vector row. Returns `None` for NULL parent rows
 /// (whose `get_entry` is uninitialized) and malformed lists.
@@ -125,7 +135,12 @@ fn list_entry(lv: &ListVector<'_>, r: usize, child_n: usize) -> Option<(usize, u
 /// Read an optional `INTEGER` p column at `idx`, defaulting to `DEFAULT_P` if absent.
 fn read_p(input: &DataChunkHandle, idx: usize, n: usize) -> Vec<u32> {
     if input.num_columns() > idx {
-        input.flat_vector(idx).as_slice_with_len::<i32>(n).iter().map(|&x| x as u32).collect()
+        input
+            .flat_vector(idx)
+            .as_slice_with_len::<i32>(n)
+            .iter()
+            .map(|&x| x as u32)
+            .collect()
     } else {
         vec![DEFAULT_P; n]
     }
@@ -140,12 +155,8 @@ fn read_p(input: &DataChunkHandle, idx: usize, n: usize) -> Vec<u32> {
 /// the writer in pass 2) or `None` for a NULL row. Pass 2 calls `write` with
 /// the planner's `state` and a mutable slice into the child buffer that is
 /// exactly `len` long.
-fn write_list_output<S, P, W>(
-    n: usize,
-    output: &mut dyn WritableVector,
-    mut plan: P,
-    mut write: W,
-) where
+fn write_list_output<S, P, W>(n: usize, output: &mut dyn WritableVector, mut plan: P, mut write: W)
+where
     P: FnMut(usize) -> Option<(usize, S)>,
     W: FnMut(S, &mut [u64]),
 {
@@ -205,7 +216,9 @@ macro_rules! bound_udf {
                     {
                         out_vec.set_null(r);
                     } else {
-                        unsafe { *out_ptr.add(r) = $fn(raw as u32, p); }
+                        unsafe {
+                            *out_ptr.add(r) = $fn(raw as u32, p);
+                        }
                     }
                 }
                 Ok(())
@@ -222,7 +235,7 @@ macro_rules! bound_udf {
 
 bound_udf!(H2LowerUdf, h2_lower_p);
 bound_udf!(H2UpperUdf, h2_upper_p);
-bound_udf!(H2MidUdf,   h2_mid_p);
+bound_udf!(H2MidUdf, h2_mid_p);
 
 // ----- h2_total(buckets) -> UBIGINT (no p needed) -----
 
@@ -249,7 +262,9 @@ impl VScalar for H2TotalUdf {
             for i in 0..len {
                 total = total.wrapping_add(data[off + i]);
             }
-            unsafe { *out_ptr.add(r) = total; }
+            unsafe {
+                *out_ptr.add(r) = total;
+            }
         }
         Ok(())
     }
@@ -296,7 +311,10 @@ impl VScalar for H2DeltaUdf {
         Ok(())
     }
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(vec![ubig_list(), ubig_list()], ubig_list())]
+        vec![ScalarFunctionSignature::exact(
+            vec![ubig_list(), ubig_list()],
+            ubig_list(),
+        )]
     }
 }
 
@@ -370,14 +388,18 @@ impl VScalar for H2QuantileUdf {
             let mut cumul: u64 = 0;
             let mut chosen: usize = len.saturating_sub(1);
             for i in 0..len {
-                if !in_range(i) { continue; }
+                if !in_range(i) {
+                    continue;
+                }
                 cumul = cumul.saturating_add(data[off + i]);
                 if cumul >= target {
                     chosen = i;
                     break;
                 }
             }
-            unsafe { *out_ptr.add(r) = h2_upper_p(chosen as u32, p); }
+            unsafe {
+                *out_ptr.add(r) = h2_upper_p(chosen as u32, p);
+            }
         }
         Ok(())
     }
@@ -427,7 +449,9 @@ impl VScalar for H2CountInRangeUdf {
                     }
                 }
             }
-            unsafe { *out_ptr.add(r) = total; }
+            unsafe {
+                *out_ptr.add(r) = total;
+            }
         }
         Ok(())
     }
@@ -490,7 +514,9 @@ impl VScalar for H2QuantilesUdf {
                         cumul = cumul.saturating_add(bdata[boff + bi]);
                         bi += 1;
                     }
-                    if bi >= blen { bi = blen - 1; }
+                    if bi >= blen {
+                        bi = blen - 1;
+                    }
                     dst[orig_i] = h2_upper_p(bi as u32, p);
                 }
             },
@@ -651,7 +677,9 @@ impl VScalar for IrateLagUdf {
             let p = prev[r];
             // PromQL irate: monotonic uses (c - p), reset uses c.
             let increment = if c >= p { (c - p) as f64 } else { c as f64 };
-            unsafe { *out_ptr.add(r) = increment / dt_secs; }
+            unsafe {
+                *out_ptr.add(r) = increment / dt_secs;
+            }
         }
         Ok(())
     }
@@ -702,14 +730,26 @@ mod tests {
         // Any divergence here means we've fallen out of step with rezolus.
         assert_eq!(bucket_count(7), 7424);
 
-        let lower = [(0, 0), (1, 1), (256, 256), (384, 512), (512, 1024),
-                     (7423, 18_374_686_479_671_623_680u64)];
+        let lower = [
+            (0, 0),
+            (1, 1),
+            (256, 256),
+            (384, 512),
+            (512, 1024),
+            (7423, 18_374_686_479_671_623_680u64),
+        ];
         for (idx, expected) in lower {
             assert_eq!(h2_lower_p(idx, 7), expected, "lower at idx={idx}");
         }
 
-        let upper = [(0, 0), (1, 1), (256, 257), (384, 515), (512, 1031),
-                     (7423, u64::MAX)];
+        let upper = [
+            (0, 0),
+            (1, 1),
+            (256, 257),
+            (384, 515),
+            (512, 1031),
+            (7423, u64::MAX),
+        ];
         for (idx, expected) in upper {
             assert_eq!(h2_upper_p(idx, 7), expected, "upper at idx={idx}");
         }
@@ -773,7 +813,10 @@ mod tests {
                 let lo = h2_lower_p(i, p);
                 let hi = h2_upper_p(i, p);
                 let mid = h2_mid_p(i, p);
-                assert!(lo <= mid && mid <= hi, "p={p} i={i} lo={lo} mid={mid} hi={hi}");
+                assert!(
+                    lo <= mid && mid <= hi,
+                    "p={p} i={i} lo={lo} mid={mid} hi={hi}"
+                );
             }
         }
     }
@@ -787,7 +830,8 @@ mod tests {
     }
 
     fn one_u64(conn: &Connection, sql: &str) -> Option<u64> {
-        conn.query_row(sql, [], |row| row.get::<_, Option<u64>>(0)).expect("query")
+        conn.query_row(sql, [], |row| row.get::<_, Option<u64>>(0))
+            .expect("query")
     }
 
     fn one_list(conn: &Connection, sql: &str) -> Option<Vec<u64>> {
@@ -814,7 +858,10 @@ mod tests {
     #[test]
     fn h2_total_is_sum() {
         let conn = fresh();
-        assert_eq!(one_u64(&conn, "SELECT h2_total([10,20,30,40]::UBIGINT[])"), Some(100));
+        assert_eq!(
+            one_u64(&conn, "SELECT h2_total([10,20,30,40]::UBIGINT[])"),
+            Some(100)
+        );
         assert_eq!(one_u64(&conn, "SELECT h2_total([]::UBIGINT[])"), Some(0));
     }
 
@@ -822,12 +869,18 @@ mod tests {
     fn h2_delta_is_elementwise_saturating_sub() {
         let conn = fresh();
         assert_eq!(
-            one_list(&conn, "SELECT h2_delta([100,200,300]::UBIGINT[], [10,20,30]::UBIGINT[])"),
+            one_list(
+                &conn,
+                "SELECT h2_delta([100,200,300]::UBIGINT[], [10,20,30]::UBIGINT[])"
+            ),
             Some(vec![90, 180, 270])
         );
         // saturating: 5 - 100 == 0, not negative.
         assert_eq!(
-            one_list(&conn, "SELECT h2_delta([5, 10]::UBIGINT[], [100, 5]::UBIGINT[])"),
+            one_list(
+                &conn,
+                "SELECT h2_delta([5, 10]::UBIGINT[], [100, 5]::UBIGINT[])"
+            ),
             Some(vec![0, 5])
         );
     }
@@ -840,7 +893,10 @@ mod tests {
         // `h2_combine([list, list])` (LIST<LIST<UBIGINT>>) shape was
         // dropped to work around the duckdb-rs inner-vector capacity bug.
         assert_eq!(
-            one_list(&conn, "SELECT h2_combine([1,2,3]::UBIGINT[], [10,20,30,40]::UBIGINT[])"),
+            one_list(
+                &conn,
+                "SELECT h2_combine([1,2,3]::UBIGINT[], [10,20,30,40]::UBIGINT[])"
+            ),
             Some(vec![11, 22, 33, 40])
         );
     }
@@ -856,7 +912,10 @@ mod tests {
             "SELECT h2_quantile([10,20,30,40]::UBIGINT[], 0.5, 0::UBIGINT, 18446744073709551615::UBIGINT, 3)",
         ];
         let answers: Vec<_> = sqls.iter().map(|s| one_u64(&conn, s)).collect();
-        assert!(answers.windows(2).all(|w| w[0] == w[1]), "answers: {answers:?}");
+        assert!(
+            answers.windows(2).all(|w| w[0] == w[1]),
+            "answers: {answers:?}"
+        );
     }
 
     #[test]
@@ -864,14 +923,23 @@ mod tests {
         let conn = fresh();
         // [0,0,5,0,10]: q=0 falls in first non-empty bucket (idx 2 → inclusive upper 2),
         // q=1.0 falls in last (idx 4 → inclusive upper 4).
-        assert_eq!(one_u64(&conn, "SELECT h2_quantile([0,0,5,0,10]::UBIGINT[], 0.0)"), Some(2));
-        assert_eq!(one_u64(&conn, "SELECT h2_quantile([0,0,5,0,10]::UBIGINT[], 1.0)"), Some(4));
+        assert_eq!(
+            one_u64(&conn, "SELECT h2_quantile([0,0,5,0,10]::UBIGINT[], 0.0)"),
+            Some(2)
+        );
+        assert_eq!(
+            one_u64(&conn, "SELECT h2_quantile([0,0,5,0,10]::UBIGINT[], 1.0)"),
+            Some(4)
+        );
     }
 
     #[test]
     fn h2_quantile_empty_histogram_is_null() {
         let conn = fresh();
-        assert_eq!(one_u64(&conn, "SELECT h2_quantile([0,0,0]::UBIGINT[], 0.5)"), None);
+        assert_eq!(
+            one_u64(&conn, "SELECT h2_quantile([0,0,0]::UBIGINT[], 0.5)"),
+            None
+        );
     }
 
     #[test]
@@ -881,7 +949,9 @@ mod tests {
         let total = one_u64(&conn, &format!("SELECT h2_total({buckets})")).unwrap();
         let in_range = one_u64(
             &conn,
-            &format!("SELECT h2_count_in_range({buckets}, 0::UBIGINT, 18446744073709551615::UBIGINT)"),
+            &format!(
+                "SELECT h2_count_in_range({buckets}, 0::UBIGINT, 18446744073709551615::UBIGINT)"
+            ),
         )
         .unwrap();
         assert_eq!(in_range, total);
@@ -946,10 +1016,7 @@ mod tests {
         // list-input UDF inherits this. h2_total is the simplest
         // shape to pin the contract on.
         let conn = fresh();
-        assert_eq!(
-            one_u64(&conn, "SELECT h2_total(NULL::UBIGINT[])"),
-            None
-        );
+        assert_eq!(one_u64(&conn, "SELECT h2_total(NULL::UBIGINT[])"), None);
     }
 
     #[test]
@@ -1062,7 +1129,10 @@ mod tests {
                 let q = q_pct as f64 / 100.0;
                 let cur = one_u64(&conn, &format!("SELECT h2_quantile({lit}, {q})"));
                 if let (Some(c), Some(p)) = (cur, prev) {
-                    assert!(c >= p, "trial {trial} q={q_pct}: {p} → {c}, hist={buckets:?}");
+                    assert!(
+                        c >= p,
+                        "trial {trial} q={q_pct}: {p} → {c}, hist={buckets:?}"
+                    );
                 }
                 if cur.is_some() {
                     prev = cur;

@@ -39,9 +39,9 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 
+use crate::SqlError;
 use crate::observability::BackendStats;
 use crate::views::MetricCatalog;
-use crate::SqlError;
 
 /// Per-data-source state: a pool of independent in-memory DuckDB
 /// connections plus the shared (Rust-side) metadata catalog produced
@@ -86,6 +86,13 @@ struct ConnState {
     /// CREATE statement itself is always included so dashboard
     /// SQL JOINing against `_cgroup_index` binds cleanly.
     cgroup_index_sql: Arc<str>,
+    /// Pre-rendered `_src_<source>` per-source view DDL — one
+    /// `CREATE TEMP VIEW` per distinct `source` label value found in
+    /// the parquet's column field metadata. Empty when no column
+    /// carries a `source` label. Lets service-extension KPI SQL
+    /// target `_src_<service_name>` and bind regardless of how many
+    /// instances of the same source the parquet ships.
+    per_source_views_sql: Arc<str>,
     /// Captured at backend-construction time; needed when a slot
     /// post-panic rebuilds, since `pool_size` lives on the backend.
     pool_size: usize,
@@ -171,10 +178,17 @@ impl DuckDbBackend {
         // Pre-render the `_src` and `_cgroup_index` setup SQL once;
         // pool slots and lazy rebuilds reuse these strings instead
         // of re-walking the parquet metadata.
-        let src_sql: Arc<str> =
-            Arc::from(crate::views::render_src_sql(data_source, interval_ns, &columns));
-        let cgroup_index_sql: Arc<str> =
-            Arc::from(crate::views::render_cgroup_index_sql(&columns));
+        let src_sql: Arc<str> = Arc::from(crate::views::render_src_sql(
+            data_source,
+            interval_ns,
+            &columns,
+        ));
+        let cgroup_index_sql: Arc<str> = Arc::from(crate::views::render_cgroup_index_sql(&columns));
+        let per_source_views_sql: Arc<str> = Arc::from(crate::views::render_per_source_views_sql(
+            data_source,
+            interval_ns,
+            &columns,
+        ));
 
         let mut pool: Vec<Mutex<Option<Connection>>> = Vec::with_capacity(self.pool_size);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -184,6 +198,7 @@ impl DuckDbBackend {
                 self.pool_size,
                 &src_sql,
                 &cgroup_index_sql,
+                &per_source_views_sql,
             )?;
             pool.push(Mutex::new(Some(conn)));
         }
@@ -204,6 +219,7 @@ impl DuckDbBackend {
             interval_ns,
             src_sql,
             cgroup_index_sql,
+            per_source_views_sql,
             pool_size: self.pool_size,
         });
         map.insert(data_source.to_string(), state.clone());
@@ -213,11 +229,7 @@ impl DuckDbBackend {
     /// Execute `sql` against `data_source` and return the raw Arrow
     /// `RecordBatch`es DuckDB produces. The caller is responsible for
     /// any projection (e.g. into `QueryResult` shapes).
-    pub fn run_sql(
-        &self,
-        sql: &str,
-        data_source: &str,
-    ) -> Result<Vec<RecordBatch>, SqlError> {
+    pub fn run_sql(&self, sql: &str, data_source: &str) -> Result<Vec<RecordBatch>, SqlError> {
         let t_total = std::time::Instant::now();
         let (state, _cold) = self.get_or_init(data_source)?;
 
@@ -226,12 +238,13 @@ impl DuckDbBackend {
 
         if slot.is_none() {
             // Lazy rebuild after a panic. Reuses the pre-rendered
-            // `_src` + `_cgroup_index` setup SQL so this path doesn't
-            // pay another parquet introspection.
+            // `_src` + `_cgroup_index` + per-source view setup SQL so
+            // this path doesn't pay another parquet introspection.
             let conn = build_slot_connection(
                 state.pool_size,
                 &state.src_sql,
                 &state.cgroup_index_sql,
+                &state.per_source_views_sql,
             )?;
             *slot = Some(conn);
         }
@@ -281,9 +294,7 @@ impl DuckDbBackend {
         // (slot_lock / prepare / execute / extract) are kept in
         // `BackendStats` for future instrumentation; for now we ship
         // top-line latency only. See `observability.rs`.
-        self.stats
-            .total
-            .record(t_total.elapsed().as_nanos() as u64);
+        self.stats.total.record(t_total.elapsed().as_nanos() as u64);
         result
     }
 
@@ -294,10 +305,7 @@ impl DuckDbBackend {
     /// Warm path is a hashmap lookup + Arc clone; cold path pays
     /// one parquet metadata read and does **not** warm the connection
     /// pool.
-    pub fn describe_parquet(
-        &self,
-        data_source: &str,
-    ) -> Result<Arc<MetricCatalog>, SqlError> {
+    pub fn describe_parquet(&self, data_source: &str) -> Result<Arc<MetricCatalog>, SqlError> {
         // Warm path: pool already initialised for this source.
         {
             let map = self.connections.lock().expect("poisoned");
@@ -308,9 +316,7 @@ impl DuckDbBackend {
         // Cold path: pure parquet introspection, no pool warm-up.
         crate::views::describe_parquet(data_source)
             .map(Arc::new)
-            .map_err(|e| {
-                SqlError::Backend(format!("describe_parquet {data_source}: {e}"))
-            })
+            .map_err(|e| SqlError::Backend(format!("describe_parquet {data_source}: {e}")))
     }
 
     /// Evict the cached connection pool for `data_source`. Subsequent
@@ -340,9 +346,10 @@ fn build_slot_connection(
     pool_size: usize,
     src_sql: &str,
     cgroup_index_sql: &str,
+    per_source_views_sql: &str,
 ) -> Result<Connection, SqlError> {
-    let conn = Connection::open_in_memory()
-        .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
+    let conn =
+        Connection::open_in_memory().map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
     // Default prepared-statement cache is 16; bump it so the catalogue
     // (~70 distinct shapes) plus per-label-value variants all fit
     // and stay parsed/planned across repeat queries from the viewer.
@@ -370,6 +377,14 @@ fn build_slot_connection(
     // parquet has no cgroup columns.
     conn.execute_batch(cgroup_index_sql)
         .map_err(|e| SqlError::Backend(format!("create _cgroup_index: {e}")))?;
+    // Per-source views (`_src_<prefix>` for each `<prefix>::`-tagged
+    // application source) are created on multi-source captures so
+    // service-extension KPI SQL binds. Skipped when the parquet is
+    // single-source — the string is empty in that case.
+    if !per_source_views_sql.is_empty() {
+        conn.execute_batch(per_source_views_sql)
+            .map_err(|e| SqlError::Backend(format!("create per-source views: {e}")))?;
+    }
     Ok(conn)
 }
 
@@ -507,8 +522,10 @@ mod tests {
             .run_sql("SELECT * FROM nonexistent_table", path)
             .expect_err("should error");
         let msg = format!("{err:?}");
-        assert!(msg.contains("nonexistent_table") || msg.contains("Catalog"),
-            "expected DuckDB binder error referencing the missing table, got: {msg}");
+        assert!(
+            msg.contains("nonexistent_table") || msg.contains("Catalog"),
+            "expected DuckDB binder error referencing the missing table, got: {msg}"
+        );
     }
 
     #[test]
@@ -534,11 +551,10 @@ mod tests {
         let cat = backend.describe_parquet(path).expect("describe ok");
         assert_eq!(cat.series_by_metric.get("cpu_usage").unwrap().len(), 4);
         // Confirm nothing was inserted into the pool map yet.
-        let pool_warm = backend
-            .connections
-            .lock()
-            .unwrap()
-            .contains_key(path);
-        assert!(!pool_warm, "describe_parquet on a cold source must not warm the pool");
+        let pool_warm = backend.connections.lock().unwrap().contains_key(path);
+        assert!(
+            !pool_warm,
+            "describe_parquet on a cold source must not warm the pool"
+        );
     }
 }
