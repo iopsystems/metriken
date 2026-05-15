@@ -26,19 +26,22 @@ that handles cases streaming can't subsume: binary operators
 with `group_left`/`group_right` and the scalar-passthrough
 backstop. The dispatcher is always-on (no toggle) and runs at
 every recursion level. Commit `a25e285` ("collapse PromQL
-evaluator to streaming-only") removed ~2,300 lines of eager
+evaluator to streaming-only") deleted ~2,700 lines of eager
 pre-aggregation that streaming now covers, along with the
 shadow-mode plumbing (no `Dispatch*` types, `with_dispatch`, or
 observer interfaces survive; `grep -ri shadow` finds only stale
 comments and the unrelated `orphan_detector` "shadowed entry"
-concept). Other changes on this branch are ~270 LOC of small
-edits across `promql/{mod.rs, streaming/*.rs, tests.rs}`.
+concept). Post-collapse, the legacy evaluator has seen only
+~270 LOC of small edits across `promql/{mod.rs, streaming/*.rs,
+tests.rs}`.
 
-Branch shape: **74** commits, **+14,858 / −397** across **58**
+Branch shape: **76** commits, **+14,943 / −397** across **59**
 files (`git diff --shortstat origin/main...HEAD`,
 `git rev-list --count origin/main..HEAD`). Includes a merge from
 `origin/main` that brought `QueryEngine::columns()`, trimmed
 parquet codecs to zstd-only, and bumped arrow/parquet/chrono.
+A subsequent review pass (described below) adds ~490 LOC of
+test coverage and one small fix in `metriken-query-sql/`.
 
 ---
 
@@ -82,15 +85,15 @@ non-default feature flag keeps the question reversible.
 
 ## Crate layout
 
-### `metriken-query-sql/src/` — DuckDB engine (2,380 LOC, live)
+### `metriken-query-sql/src/` — DuckDB engine (~3,640 LOC, live)
 
 | File | LOC | Owns |
 |---|---:|---|
-| `udf.rs` | 1,123 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 13 `unsafe` blocks). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
-| `backend.rs` | 414 | `DuckDbBackend` (line 87), connection pool with panic-safe slot evacuation, `run_sql` (:192), `describe_parquet` (:254). |
-| `views.rs` | 405 | Parquet metric metadata + `_src` TEMP TABLE loader. |
-| `macros.rs` | 224 | Loads `shared_macros.sql` via `include_str!`, splits on `;`, registers each `CREATE MACRO` on the connection. Re-exports the file as `SHARED_MACROS` so the wasm side consumes the same bytes. |
-| `shared_macros.sql` | 145 | **19** canonical macros (3 rate/delta primitives + 7 histogram primitives + 9 dashboard helpers). Single source of truth for both native and wasm. |
+| `udf.rs` | 1,187 | 9 H2 UDFs + `irate_lag` (10 `register_scalar_function`, 13 `unsafe` blocks). Preamble lines 1–37 document two duckdb-rs gotchas — `ListVector::child(N)` zeroes sibling LIST inputs past index 2048; `get_entry` returns uninitialized memory for NULL rows — and the uniform `child(0).as_slice_with_len(n)` fix pattern. Regression suite at `tests/lag_repro.rs` (1,021 LOC). |
+| `backend.rs` | 544 | `DuckDbBackend` connection pool (struct at :87), `run_sql` (:198), `describe_parquet` (:260), `invalidate` (:290). `catch_unwind` boundary (:221) is annotated with the load-bearing ordering invariant; recovery-shape test pins it. `ConnState` carries precomputed `src_sql` + `cgroup_index_sql` (both `Arc<str>`) so panic-rebuild paths re-execute the same setup without re-reading the parquet schema. |
+| `views.rs` | 1,086 | Parquet metric metadata + `_src` and `_cgroup_index` TEMP TABLE builders. `read_introspection` (line 120) is shared by pool init + `describe_parquet`; tolerates missing `sampling_interval_ms` (1 s fallback), `metric_type=histogram` without `grouping_power` (column dropped), and duplicate physical names (first wins). `render_src_sql` handles both single-source (`* EXCLUDE` shortcut) and multi-source captures — for the latter, `canonical_alias` mirrors the wasm viewer's `canonicalAlias` to project rezolus-tagged prefixed columns under canonical dashboard names. `render_cgroup_index_sql` + `create_cgroup_index` build the cgroup-index table the cgroup dashboard SQL JOINs against. |
+| `macros.rs` | 389 | Loads `shared_macros.sql` via `include_str!`, parses it with a quote-aware splitter (semicolons inside `'..'` / `"..."` literals stay in the statement), and registers each `CREATE MACRO` on the connection. Re-exports the file as `SHARED_MACROS` so the wasm side consumes the same bytes. |
+| `shared_macros.sql` | 167 | **20** canonical macros (3 rate/delta primitives + 7 histogram primitives + 9 dashboard helpers + the new `h2_combine_lol` shared cross-backend list-of-lists folder). Single source of truth for both native and wasm. |
 | `observability.rs` | 157 | `BackendStats`. |
 | `lib.rs` | 57 | Public surface. |
 
@@ -158,24 +161,32 @@ cargo build -p metriken-query --all-features                    # everything (ha
 
 ## Test coverage
 
-**231** test items pass across the workspace (`cargo test
---workspace --all-features`), exercising the SQL
-path at three layers:
+**258** test items pass across the workspace (`cargo test
+--workspace --all-features`), exercising the SQL path at every
+layer that has a public surface:
 
 | Layer | Where | Coverage |
 |---|---|---|
-| UDFs | `metriken-query-sql/src/udf.rs` (inline) + `tests/lag_repro.rs` | **27 + 12 = 39** tests. Per-UDF happy-path/boundary/NULL for every public UDF; LAG-on-LIST regression suite; the inline file includes 6 `irate_lag` cases (monotonic/sub-second/reset/NULL/dt=0/zero-rate) since every counter-rate routes through it. |
-| Macros | `metriken-query-sql/src/macros.rs` (inline) | 11 tests — `irate_1s` ×2, `rate_5m` ×2, `cpu_busy_pct`, `ipc`, `ipns`, `hist_p99`, `bps_from_bytes`, `delta_1s`, registration smoke. |
+| UDFs | `metriken-query-sql/src/udf.rs` (inline) + `tests/lag_repro.rs` | **32 + 12 = 44** tests. Per-UDF happy-path/boundary/NULL; LAG-on-LIST regression suite; 6 `irate_lag` cases (monotonic / sub-second / reset / NULL / dt=0 / zero-rate). Recent additions cover `h2_quantiles` with an empty `qs` list, `h2_quantiles` on an all-zero histogram, `h2_quantile` on a single-element histogram, `h2_total` on a NULL list, and `h2_combine` with a NULL argument. |
+| Macros | `metriken-query-sql/src/macros.rs` (inline) | **16** tests — the 11 macro semantics tests (`irate_1s` ×2, `rate_5m` ×2, `cpu_busy_pct`, `ipc`, `ipns`, `hist_p99`, `bps_from_bytes`, `delta_1s`, registration smoke), 3 covering the quote-aware splitter (semicolons inside `'..'` and `"..."`; `--` inside literals; real `--` comments), and 2 cross-backend parity tests for the new `h2_combine_lol` shared macro (matches variadic UDF on two-list input; empty outer list returns empty result). |
+| Pool / panic safety | `metriken-query-sql/src/backend.rs` (inline) + `tests/pool_invalidate.rs` | **5 + 4 = 9** tests. Backend tests: `run_sql` returning Arrow, bad-SQL surfaces as `Err`, `describe_parquet` warm vs. cold path, plus `empty_slot_is_lazily_rebuilt_without_mutex_poisoning` — pins the post-`catch_unwind` recovery shape (slot=`None` → rebuild on next checkout, peer slots untouched). Pool-invalidate tests: unknown source, warm eviction, cold-re-init after invalidate, plus a 4-worker concurrent stress test that runs queries while a peer thread spams `invalidate` (regression for the `Arc<ConnState>` keeps-alive contract on line 281). |
+| Parquet metadata | `metriken-query-sql/src/views.rs` (inline) | **18** tests. The 6 existing snap / catalog / describe tests, 3 malformed-metadata pins (missing `sampling_interval_ms` → 1 s fallback; `metric_type=histogram` without `grouping_power` → column dropped; duplicate physical names → first wins), 3 `_cgroup_index` builder tests (empty parquet → empty index, cgroup column with split name/id/labels MAP, apostrophe-bearing cgroup names handled), and 6 `canonical_alias` / `render_src_sql` tests for the multi-source projection path (named-column pass-through, numeric-encoded rebuild, non-numeric-before-numeric label sort, histogram `:buckets` suffix, single-source `* EXCLUDE` shortcut, multi-source canonical projection drops non-rezolus columns). |
 | Harness translator | `metriken-query/tests/translate_snapshots.rs` | One combined `insta` snapshot covers every catalogue id (all 69) — `entry_id → SQL`. Resolver drift surfaces as a single intra-file diff via `cargo insta review`. |
 | Harness catalogue health | `tests/orphan_detector.rs` | Strict: every entry produces non-empty SQL. `#[ignore]`'d informational: 10 entries shadowed by an earlier, more-general entry in `Catalogue::lookup` — a real audit item. |
 | Harness pipeline | `tests/engine_pipeline.rs` | 5 end-to-end tests against `metriken-query-fixtures` parquets. Tests **the harness**, not a production code path. |
 | Template parser | `harness/template.rs` (inline) | 29 tests covering every capture kind. |
 | Catalogue loader | `harness/catalogue.rs` (inline) | 4 TOML-deserialization tests. |
 
-Not directly tested: per-`OutputShape` variants in `project.rs`
-(covered transitively); `backend.rs`'s panic-safe slot
-evacuation (4 backend tests exercise the type-system contract,
-not an induced panic).
+The panic-safety story is now pinned at the recovery shape
+rather than by inducing a real panic: UDF-callback panics are
+non-unwinding (the `h2_combine` LIST<LIST> note in `udf.rs` is
+the canonical example) and abort the process before
+`catch_unwind` can see them, so reproducing one in a test would
+require a Rust-side bug in duckdb-rs we don't want to encode.
+The recovery test instead stubs the post-panic state (`slot =
+None`) and asserts the next `run_sql` rebuilds it without
+touching peer slots. `project.rs` `OutputShape` variants stay
+covered only transitively.
 
 ---
 
@@ -203,9 +214,10 @@ cross-branch A/B for the PromQL evaluator alone against `main`.
    decide whether `harness::Engine` lands a consumer or the
    `harness/` subdirectory gets deleted. Everything else is a
    sub-decision.
-2. **`metriken-query-sql/src/lib.rs`** (56) + **`backend.rs`**
-   (414) — public surface and the only non-trivial concurrency
-   story (panic-safe slot evacuation).
+2. **`metriken-query-sql/src/lib.rs`** (57) + **`backend.rs`**
+   (509) — public surface and the only non-trivial concurrency
+   story (panic-safe slot evacuation; see the `catch_unwind`
+   block at :221 for the ordering invariant).
 3. **`udf.rs`** preamble (lines 1–37) + one `h2_*` UDF impl.
    The unsafe pattern is uniform across all 13 blocks.
 4. Run the harness and skim `summary.json`.
