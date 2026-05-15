@@ -23,8 +23,9 @@ use duckdb::Connection;
 pub const SHARED_MACROS: &str = include_str!("shared_macros.sql");
 
 /// Register the shared macros against an in-memory DuckDB connection.
-/// Strips `--` line comments (which may contain `;` inside parenthetical
-/// asides), splits on `;` boundaries, and executes each statement.
+/// Strips `--` line comments and splits on top-level `;` boundaries
+/// (semicolons inside `'..'` or `"..."` literals are part of the
+/// statement body, not terminators).
 pub fn register_all(conn: &Connection) -> duckdb::Result<()> {
     for stmt in split_statements(SHARED_MACROS) {
         conn.execute(&stmt, [])?;
@@ -32,25 +33,97 @@ pub fn register_all(conn: &Connection) -> duckdb::Result<()> {
     Ok(())
 }
 
-/// Strip `--` line comments and split on `;` boundaries. Returned
-/// statements are trimmed; empties are dropped. Public so the wasm
-/// parity test scaffold can reuse the splitter (DuckDB's executeBatch
-/// behaves the same way).
+/// Split a SQL script into individual statements.
+///
+/// Two-pass: first strip `--` line comments (a `--` outside string
+/// literals starts a comment that runs to the end of the line); then
+/// split on `;` characters that are outside string literals.
+///
+/// String-literal awareness is required because a macro body like
+/// `SELECT ';' AS x` legitimately contains a semicolon — naive
+/// substring splitting would cut the statement in half. DuckDB
+/// recognises `'..'` (with `''` as an embedded single-quote escape)
+/// and `"..."` for quoted identifiers; we treat both as opaque.
+///
+/// Returned statements are trimmed; empties are dropped.
 fn split_statements(sql: &str) -> Vec<String> {
-    let stripped: String = sql
-        .lines()
-        .map(|line| match line.find("--") {
-            Some(i) => &line[..i],
-            None => line,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    stripped
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let stripped = strip_line_comments(sql);
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = stripped.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => {
+                // `''` inside a single-quoted literal is an embedded
+                // quote, not a terminator. Same for `""` in an
+                // identifier. Both are SQL standard.
+                if chars.peek() == Some(&q) {
+                    current.push(c);
+                    current.push(chars.next().unwrap());
+                } else {
+                    current.push(c);
+                    quote = None;
+                }
+            }
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            None if c == ';' => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_owned());
+                }
+                current.clear();
+            }
+            None => current.push(c),
+        }
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_owned());
+    }
+    out
+}
+
+/// Strip `--` line comments from a SQL script. A `--` inside a string
+/// literal is part of the literal, not a comment marker, so the scan
+/// is quote-aware (mirroring `split_statements` below).
+fn strip_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => {
+                if chars.peek() == Some(&q) {
+                    out.push(c);
+                    out.push(chars.next().unwrap());
+                } else {
+                    out.push(c);
+                    quote = None;
+                }
+            }
+            Some(_) => out.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            None if c == '-' && chars.peek() == Some(&'-') => {
+                // Drop through end-of-line.
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -76,6 +149,43 @@ mod tests {
     fn all_macros_register_without_error() {
         // The fresh() helper does the real work; reaching this line is the test.
         let _conn = fresh();
+    }
+
+    #[test]
+    fn splitter_preserves_semicolons_inside_string_literals() {
+        // Naïve `split(';')` would cut these in half. The 19 macros we
+        // ship today don't trigger this, but pinning the contract
+        // prevents a future addition of e.g. `SELECT 'a; b'` from
+        // silently breaking macro registration.
+        let cases = [
+            "SELECT ';' AS one",
+            "SELECT 'a; b; c' AS two",
+            r#"SELECT "id;col" AS three"#,
+            "SELECT 'embedded ''quote; and'' more' AS four",
+        ];
+        for body in cases {
+            let stmts = super::split_statements(&format!("{body};\n"));
+            assert_eq!(stmts.len(), 1, "{body} produced {stmts:?}");
+            assert_eq!(stmts[0], body);
+        }
+    }
+
+    #[test]
+    fn splitter_treats_dashdash_inside_literals_as_data() {
+        // The comment stripper must not chew into a string literal that
+        // happens to contain `--`. (Comes up in error messages and unit
+        // strings; `--` is otherwise a SQL line comment.)
+        let stmts = super::split_statements("SELECT '-- not a comment' AS x;");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "SELECT '-- not a comment' AS x");
+    }
+
+    #[test]
+    fn splitter_strips_real_dashdash_comments() {
+        let stmts = super::split_statements(
+            "SELECT 1 AS a; -- trailing\nSELECT 2 AS b;\n-- whole line\nSELECT 3 AS c;\n",
+        );
+        assert_eq!(stmts, vec!["SELECT 1 AS a", "SELECT 2 AS b", "SELECT 3 AS c"]);
     }
 
     #[test]
@@ -205,6 +315,61 @@ mod tests {
              SELECT bps_from_bytes(b, ts) FROM t ORDER BY ts",
         );
         assert_eq!(r, vec![None, Some(800.0)]);
+    }
+
+    fn one_list_u64(conn: &Connection, sql: &str) -> Option<Vec<u64>> {
+        use duckdb::types::Value;
+        conn.query_row(sql, [], |row| {
+            let v: Value = row.get(0)?;
+            Ok(match v {
+                Value::Null => None,
+                Value::List(items) | Value::Array(items) => Some(
+                    items
+                        .into_iter()
+                        .map(|x| match x {
+                            Value::UBigInt(n) => n,
+                            _ => 0,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+        })
+        .expect("query")
+    }
+
+    #[test]
+    fn h2_combine_lol_matches_variadic_udf_for_two_lists() {
+        // Cross-backend parity: the native side ships both a variadic
+        // `h2_combine(c1, ..., cN)` UDF (fast path) and the
+        // `h2_combine_lol(lol)` shared macro (used by the dashboard's
+        // `h2_combine_lol([*COLUMNS(...)])` shape). They must agree
+        // for any same input. Test on two ragged lists so the
+        // widest-input-wins/zero-fill rule is exercised.
+        let conn = fresh();
+        let variadic = one_list_u64(
+            &conn,
+            "SELECT h2_combine([1,2,3]::UBIGINT[], [10,20,30,40]::UBIGINT[])",
+        )
+        .expect("variadic non-null");
+        let lol = one_list_u64(
+            &conn,
+            "SELECT h2_combine_lol([[1,2,3]::UBIGINT[], [10,20,30,40]::UBIGINT[]])",
+        )
+        .expect("lol non-null");
+        assert_eq!(variadic, vec![11, 22, 33, 40]);
+        assert_eq!(lol, variadic);
+    }
+
+    #[test]
+    fn h2_combine_lol_with_empty_outer_returns_empty_list() {
+        // Edge case: zero matching columns. `list_max(list_transform([], ...))`
+        // → NULL, and `generate_series(1, NULL)` → empty list, so the
+        // outer list_transform produces an empty result rather than erroring.
+        let conn = fresh();
+        let got = one_list_u64(&conn, "SELECT h2_combine_lol([]::UBIGINT[][])");
+        // Either Some(vec![]) or None is acceptable; both encode "no buckets".
+        assert!(got.as_ref().map_or(true, Vec::is_empty), "got {got:?}");
     }
 
     #[test]

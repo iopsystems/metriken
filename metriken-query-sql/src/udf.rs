@@ -900,6 +900,70 @@ mod tests {
         assert_eq!(multi, vec![p50, p90]);
     }
 
+    // ---------- edge cases on near-empty / single-element inputs ----------
+
+    #[test]
+    fn h2_quantiles_empty_q_list_returns_empty_list() {
+        // Empty `qs` → no quantiles requested → empty result list. The
+        // planner runs the UDF for one row, so we can't return NULL
+        // here (which would mean "no histogram data"); an empty list
+        // is the right "no questions asked" answer.
+        let conn = fresh();
+        let got = one_list(
+            &conn,
+            "SELECT h2_quantiles([10,20,30,40]::UBIGINT[], []::DOUBLE[])",
+        );
+        assert_eq!(got, Some(vec![]));
+    }
+
+    #[test]
+    fn h2_quantiles_all_zero_histogram_is_null_row() {
+        // Mirrors `h2_quantile_empty_histogram_is_null` — an all-zero
+        // histogram has total_count==0; the row is NULL, regardless of
+        // how many quantiles the caller asked for.
+        let conn = fresh();
+        let got = one_list(
+            &conn,
+            "SELECT h2_quantiles([0,0,0]::UBIGINT[], [0.5, 0.9]::DOUBLE[])",
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn h2_quantile_single_element_histogram_returns_that_bucket() {
+        // A one-bucket histogram with a single sample: every quantile
+        // resolves to bucket 0, inclusive upper = 0 (for p=3).
+        let conn = fresh();
+        for q in ["0.0", "0.5", "0.99", "1.0"] {
+            let v = one_u64(&conn, &format!("SELECT h2_quantile([1]::UBIGINT[], {q})"));
+            assert_eq!(v, Some(0), "q={q}");
+        }
+    }
+
+    #[test]
+    fn h2_total_on_null_list_is_null() {
+        // `list_entry` bails to NULL on a NULL parent row — every
+        // list-input UDF inherits this. h2_total is the simplest
+        // shape to pin the contract on.
+        let conn = fresh();
+        assert_eq!(
+            one_u64(&conn, "SELECT h2_total(NULL::UBIGINT[])"),
+            None
+        );
+    }
+
+    #[test]
+    fn h2_combine_null_arg_yields_null_row() {
+        // h2_combine bails to NULL if any input column has a malformed
+        // / NULL entry for the row (planner in `H2CombineUdf::invoke`).
+        let conn = fresh();
+        let got = one_list(
+            &conn,
+            "SELECT h2_combine([1,2,3]::UBIGINT[], NULL::UBIGINT[])",
+        );
+        assert_eq!(got, None);
+    }
+
     #[test]
     fn h2_lower_upper_midpoint_match_pure_functions() {
         let conn = fresh();

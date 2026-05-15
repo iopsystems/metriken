@@ -143,3 +143,25 @@ CREATE OR REPLACE MACRO gpu_mem_used_pct(used, free) AS
 -- Bandwidth in bits per second from a byte counter.
 CREATE OR REPLACE MACRO bps_from_bytes(bytes, ts) AS
     irate_1s(bytes, ts) * 8;
+
+-- h2_combine_lol: combine a LIST<LIST<UBIGINT>> of bucket arrays into
+-- one elementwise-summed array. Used by the dashboard's
+-- `hist_percentile_series_combined` emitter to fold the columns
+-- matched by a regex (e.g. `syscall_latency/[a-z]+:buckets`) into a
+-- single histogram before quantile fan-out.
+--
+-- Why this exists alongside the native variadic UDF: the native side
+-- registers `h2_combine(UBIGINT[], UBIGINT[], ...)` (1..32 variadic
+-- LIST<UBIGINT> signatures); the duckdb-wasm side cannot match that
+-- shape (macros don't support variadic args) and previously shipped
+-- its own `MACRO h2_combine(lol)` that took a LIST<LIST<UBIGINT>>.
+-- That divergence made `h2_combine([*COLUMNS('regex')])` bind on wasm
+-- but error with `h2_combine(UBIGINT[][])` on native. The shared
+-- list-of-lists macro under a distinct name eliminates the parity
+-- hazard while keeping the fast native variadic UDF for direct
+-- column-by-column callers.
+CREATE OR REPLACE MACRO h2_combine_lol(lol) AS
+    list_transform(
+        generate_series(1, list_max(list_transform(lol, h -> length(h::UBIGINT[])))),
+        j -> list_sum(list_transform(lol, h -> coalesce((h::UBIGINT[])[j], 0::UBIGINT)))::UBIGINT
+    );

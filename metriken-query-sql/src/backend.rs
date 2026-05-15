@@ -71,10 +71,21 @@ struct ConnState {
     /// O(1) and lets callers pass `&MetricCatalog` to the translator
     /// without paying the deep-clone cost on every query.
     catalog: Arc<MetricCatalog>,
-    /// Sampling interval (ns), needed when a panicked slot is lazily
-    /// rebuilt — `create_src_table` consumes it directly without
-    /// re-reading the parquet metadata.
+    /// Sampling interval (ns). Kept for observability — the actual
+    /// `_src` setup uses the pre-rendered SQL below.
     interval_ns: u64,
+    /// Pre-rendered `_src` setup SQL. Built once at pool-init time
+    /// from the parquet schema; for multi-source captures it carries
+    /// canonical-alias projections so dashboard SQL's bare regexes
+    /// (`^cpu_usage(/[^:]+)?$` etc.) bind on prefixed parquets.
+    src_sql: Arc<str>,
+    /// Pre-rendered `_cgroup_index` setup SQL. Built once at
+    /// pool-init time so a lazy slot rebuild (post-panic recovery
+    /// path) doesn't have to re-walk the parquet schema. Empty
+    /// only when the parquet carries no cgroup columns — the
+    /// CREATE statement itself is always included so dashboard
+    /// SQL JOINing against `_cgroup_index` binds cleanly.
+    cgroup_index_sql: Arc<str>,
     /// Captured at backend-construction time; needed when a slot
     /// post-panic rebuilds, since `pool_size` lives on the backend.
     pool_size: usize,
@@ -157,12 +168,23 @@ impl DuckDbBackend {
         let (columns, interval_ns) = crate::views::read_introspection(data_source)
             .map_err(|e| SqlError::Backend(format!("read_introspection {data_source}: {e}")))?;
         let catalog = Arc::new(crate::views::build_catalog(&columns));
+        // Pre-render the `_src` and `_cgroup_index` setup SQL once;
+        // pool slots and lazy rebuilds reuse these strings instead
+        // of re-walking the parquet metadata.
+        let src_sql: Arc<str> =
+            Arc::from(crate::views::render_src_sql(data_source, interval_ns, &columns));
+        let cgroup_index_sql: Arc<str> =
+            Arc::from(crate::views::render_cgroup_index_sql(&columns));
 
         let mut pool: Vec<Mutex<Option<Connection>>> = Vec::with_capacity(self.pool_size);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
 
         for _ in 0..self.pool_size {
-            let conn = build_slot_connection(self.pool_size, data_source, interval_ns)?;
+            let conn = build_slot_connection(
+                self.pool_size,
+                &src_sql,
+                &cgroup_index_sql,
+            )?;
             pool.push(Mutex::new(Some(conn)));
         }
 
@@ -180,6 +202,8 @@ impl DuckDbBackend {
             next: AtomicUsize::new(0),
             catalog,
             interval_ns,
+            src_sql,
+            cgroup_index_sql,
             pool_size: self.pool_size,
         });
         map.insert(data_source.to_string(), state.clone());
@@ -201,17 +225,36 @@ impl DuckDbBackend {
         let mut slot = state.pool[idx].lock().expect("slot mutex poisoned");
 
         if slot.is_none() {
-            // Lazy rebuild after a panic. Reuses the cached `interval_ns`
-            // so this path doesn't pay another parquet introspection.
-            let conn = build_slot_connection(state.pool_size, data_source, state.interval_ns)?;
+            // Lazy rebuild after a panic. Reuses the pre-rendered
+            // `_src` + `_cgroup_index` setup SQL so this path doesn't
+            // pay another parquet introspection.
+            let conn = build_slot_connection(
+                state.pool_size,
+                &state.src_sql,
+                &state.cgroup_index_sql,
+            )?;
             *slot = Some(conn);
         }
         let conn_ref = slot.as_ref().expect("just-initialised slot");
 
-        // catch_unwind so a DuckDB intra-query panic (e.g. the
-        // documented LAG-on-list class of bugs in `udf.rs`) doesn't
-        // poison the slot for peer requests; we surface it as an
-        // error and drop this slot's connection.
+        // Catch panics raised inside the Rust code DuckDB calls back
+        // into during query execution (e.g. arrow-conversion bugs).
+        // Note: panics that originate inside a UDF callback cross the
+        // duckdb-rs C++ FFI as non-unwinding and abort the process
+        // before this boundary sees them — see the `h2_combine`
+        // LIST<LIST> note in `udf.rs` for the canonical example.
+        //
+        // **Ordering is load-bearing.** The `catch_unwind` runs inside
+        // the `MutexGuard` (`slot`) scope. If it were moved outside —
+        // letting the panic unwind across the guard's drop — the
+        // slot's `Mutex` would be **poisoned**, every subsequent
+        // checkout of this slot would error, and the only recovery
+        // path would be evicting the entire pool. By catching inside
+        // we keep the `Mutex` clean, clear the slot to `None`, and
+        // peer slots remain unaffected. The post-panic recovery shape
+        // (slot=None → lazy rebuild on next checkout, peer slots
+        // untouched) is pinned by
+        // `tests::empty_slot_is_lazily_rebuilt_without_mutex_poisoning`.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut stmt = conn_ref
                 .prepare_cached(sql)
@@ -288,14 +331,15 @@ impl DuckDbBackend {
 }
 
 /// Build one pool slot's connection: open the in-memory DB, set the
-/// statement-cache capacity, register UDFs/macros, build the
-/// `_src` TEMP TABLE. The caller passes `interval_ns` from a single
-/// hoisted introspection so this function does no parquet metadata
-/// I/O of its own.
+/// statement-cache capacity, register UDFs/macros, build the `_src`
+/// TEMP TABLE, and seed the `_cgroup_index` TEMP TABLE. The caller
+/// passes `interval_ns` and the pre-rendered cgroup-index SQL from
+/// a single hoisted introspection so this function does no parquet
+/// metadata I/O of its own.
 fn build_slot_connection(
     pool_size: usize,
-    data_source: &str,
-    interval_ns: u64,
+    src_sql: &str,
+    cgroup_index_sql: &str,
 ) -> Result<Connection, SqlError> {
     let conn = Connection::open_in_memory()
         .map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
@@ -319,8 +363,13 @@ fn build_slot_connection(
     }
     crate::register_all(&conn)
         .map_err(|e| SqlError::Backend(format!("register UDFs/macros: {e}")))?;
-    crate::views::create_src_table(&conn, data_source, interval_ns)
+    conn.execute(src_sql, [])
         .map_err(|e| SqlError::Backend(format!("create _src table: {e}")))?;
+    // `_cgroup_index` is always created (cgroups dashboard SQL JOINs
+    // against it unconditionally); the INSERT body is empty when the
+    // parquet has no cgroup columns.
+    conn.execute_batch(cgroup_index_sql)
+        .map_err(|e| SqlError::Backend(format!("create _cgroup_index: {e}")))?;
     Ok(conn)
 }
 
@@ -363,6 +412,71 @@ mod tests {
             .join("metriken-query-fixtures")
             .join("fixtures")
             .join(format!("{name}.parquet"))
+    }
+
+    /// Pin the panic-recovery contract that `catch_unwind` exists to
+    /// support: when a slot's `Option<Connection>` is observed as
+    /// `None` (the state `catch_unwind` leaves a panicked slot in),
+    /// the next checkout transparently rebuilds it.
+    ///
+    /// Why test the recovery shape rather than driving a real panic:
+    /// the only known sources of intra-query panics are UDF
+    /// callbacks, whose panics cross the duckdb-rs C++ FFI as
+    /// non-unwinding and abort the process before `catch_unwind` can
+    /// see them (the `h2_combine` LIST<LIST> mode at `udf.rs:525`
+    /// documents this). Panics that `catch_unwind` *can* catch
+    /// originate inside Rust code DuckDB calls back into (e.g. arrow
+    /// conversion bugs); reproducing those deterministically would
+    /// pin us to a specific duckdb-rs version's misbehaviour. So we
+    /// stub the post-panic state and verify the contract instead.
+    #[test]
+    fn empty_slot_is_lazily_rebuilt_without_mutex_poisoning() {
+        let backend = DuckDbBackend::with_pool_size(2);
+        let path = fixture_path("counter_basic");
+        let path = path.to_str().unwrap();
+
+        // Warm the pool and grab the next-counter so we can target
+        // the slot the next round-robin pick will land on.
+        backend.run_sql("SELECT 1", path).expect("warm pool");
+        let state = backend
+            .connections
+            .lock()
+            .expect("poisoned")
+            .get(path)
+            .expect("pool warm")
+            .clone();
+        let next_idx = state.next.load(Ordering::Relaxed) % state.pool.len();
+
+        // Drop the connection in that slot. This is the state
+        // `catch_unwind` leaves behind after a panicking query
+        // (backend.rs `*slot = None`). The mutex itself stays alive
+        // and unpoisoned.
+        *state.pool[next_idx].lock().expect("not poisoned") = None;
+
+        // The very next call must (a) hit that emptied slot, (b)
+        // rebuild it (re-registering UDFs + recreating `_src`), and
+        // (c) return the expected result.
+        let batches = backend
+            .run_sql("SELECT COUNT(*) AS n FROM _src", path)
+            .expect("rebuilt slot serves query");
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 11);
+        assert!(
+            state.pool[next_idx].lock().expect("not poisoned").is_some(),
+            "slot must be populated post-rebuild",
+        );
+
+        // Peer slot still serves too — proving no cross-slot fallout.
+        let peer_idx = (next_idx + 1) % state.pool.len();
+        assert!(state.pool[peer_idx].lock().expect("not poisoned").is_some());
+        backend
+            .run_sql("SELECT COUNT(*) FROM _src", path)
+            .expect("peer slot still healthy");
     }
 
     #[test]

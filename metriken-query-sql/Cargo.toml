@@ -22,3 +22,4 @@ thiserror = "2"
 
 [dev-dependencies]
 histogram.workspace = true
+tempfile.workspace = true

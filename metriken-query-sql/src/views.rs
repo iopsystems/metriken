@@ -240,21 +240,328 @@ pub fn describe_parquet(parquet_path: &str) -> duckdb::Result<MetricCatalog> {
 /// DuckDB's `/` promotes to DOUBLE which loses precision at parquet-
 /// timestamp scale (~1.8e18 ns; DOUBLE has only ~15.95 significant
 /// decimal digits, so the snap would silently become a no-op).
+///
+/// **Multi-source aliasing.** Combined parquets (e.g. cachecannon
+/// emits `cachecannon` + `rezolus` sources) have columns prefixed
+/// `<source>::<column>`; the dashboard SQL expects unprefixed
+/// canonical names like `cpu_usage/<state>/<id>`. When prefixes are
+/// detected we pick the single rezolus source's columns (those with
+/// `source=rezolus` in their Arrow field metadata) and project them
+/// as canonical aliases — same shape the wasm viewer's
+/// `buildSourceViews` produces. Non-rezolus prefixed columns
+/// (application-level cachecannon metrics, sglang router metrics,
+/// etc.) are dropped from `_src`; service-extension KPIs targeting
+/// them remain a deferred carve-out (the service templates are
+/// PromQL-only today, per REVIEWING.md item 1). Multi-rezolus
+/// aggregation across more than one rezolus source is not yet
+/// implemented — captures with 2+ rezolus sources will still error.
 pub(crate) fn create_src_table(
     conn: &Connection,
     parquet_path: &str,
     interval_ns: u64,
+    columns: &[ColumnInfo],
 ) -> duckdb::Result<()> {
+    conn.execute(&render_src_sql(parquet_path, interval_ns, columns), [])?;
+    Ok(())
+}
+
+/// Build the `CREATE OR REPLACE TEMP TABLE _src AS SELECT ...` SQL
+/// for a parquet, with the appropriate column projection given the
+/// parquet's source-prefix shape. Pre-rendered at pool init so lazy
+/// slot rebuilds re-execute the same string without re-walking the
+/// parquet schema.
+pub(crate) fn render_src_sql(
+    parquet_path: &str,
+    interval_ns: u64,
+    columns: &[ColumnInfo],
+) -> String {
     let half = interval_ns / 2;
-    let load_src = format!(
+    let parquet_lit = parquet_path.replace('\'', "''");
+
+    // Single-source path: column names are already canonical. Pull
+    // everything via the existing `* EXCLUDE (timestamp)` shortcut.
+    if !columns.iter().any(|c| c.physical.contains("::")) {
+        return format!(
+            "CREATE OR REPLACE TEMP TABLE _src AS \
+             SELECT \
+                ((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp, \
+                * EXCLUDE (timestamp) \
+             FROM read_parquet('{parquet_lit}')"
+        );
+    }
+
+    // Multi-source path: pick rezolus-tagged columns and project
+    // them under canonical names. De-dupe on canonical alias so
+    // two columns resolving to the same name don't error the CREATE
+    // (matches the wasm viewer's `aliasSeen` dedup).
+    let rezolus_columns: Vec<&ColumnInfo> = columns
+        .iter()
+        .filter(|c| c.labels.get("source").map_or(false, |s| s == "rezolus"))
+        .collect();
+    let mut seen_alias: BTreeSet<String> = BTreeSet::new();
+    let mut projections: Vec<String> = Vec::with_capacity(rezolus_columns.len());
+    for c in &rezolus_columns {
+        let alias = canonical_alias(c);
+        if !seen_alias.insert(alias.clone()) {
+            continue;
+        }
+        projections.push(format!(
+            "{} AS {}",
+            quote_ident(&c.physical),
+            quote_ident(&alias),
+        ));
+    }
+    if projections.is_empty() {
+        // No rezolus columns found — fall back to the raw
+        // projection so dashboard SQL still gets *some* `_src`
+        // table (it'll bind-error on missing metrics, but the
+        // table itself exists). Service-only multi-source parquets
+        // hit this path today.
+        return format!(
+            "CREATE OR REPLACE TEMP TABLE _src AS \
+             SELECT \
+                ((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp, \
+                * EXCLUDE (timestamp) \
+             FROM read_parquet('{parquet_lit}')"
+        );
+    }
+    format!(
         "CREATE OR REPLACE TEMP TABLE _src AS \
          SELECT \
             ((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp, \
-            * EXCLUDE (timestamp) \
-         FROM read_parquet('{}')",
-        parquet_path.replace('\'', "''")
-    );
-    conn.execute(&load_src, [])?;
+            {projs} \
+         FROM read_parquet('{parquet_lit}')",
+        projs = projections.join(", "),
+    )
+}
+
+/// Field metadata keys that describe *where* a value came from
+/// rather than *which* series it belongs to. These never appear in
+/// the canonical column name. Mirrors `NON_VALUE_METADATA_KEYS` in
+/// the wasm viewer's `duckdb-registry.js` so canonical aliasing is
+/// identical on both backends.
+const NON_VALUE_METADATA_KEYS: &[&str] = &[
+    "metric",
+    "metric_type",
+    "unit",
+    "endpoint",
+    "instance",
+    "node",
+    "source",
+    "grouping_power",
+    "max_value_power",
+];
+
+/// Resolve a parquet column to the canonical name the dashboard SQL
+/// expects. Mirrors `canonicalAlias` in
+/// `site/viewer-sql/lib/duckdb-registry.js`. For columns whose
+/// physical name (after the `<source>::` prefix is stripped) is
+/// already canonical, pass through. For numeric-encoded columns
+/// (e.g. `rezolus-client::10x0`), rebuild the name from the
+/// `metric` metadata + value-label values, sorted with non-numeric
+/// values first and numeric IDs last to match the named-column
+/// convention.
+fn canonical_alias(info: &ColumnInfo) -> String {
+    // Strip the `<prefix>::` prefix from physical name.
+    let rest = match info.physical.split_once("::") {
+        Some((_, r)) => r,
+        None => info.physical.as_str(),
+    };
+    let metric = &info.metric;
+
+    // Already-canonical names short-circuit.
+    if rest == metric
+        || rest == format!("{metric}:buckets")
+        || rest.starts_with(&format!("{metric}/"))
+    {
+        return rest.to_string();
+    }
+
+    // Rebuild from value labels. `info.labels` was already stripped
+    // of {metric, metric_type, unit, grouping_power, max_value_power}
+    // by `classify`; we additionally exclude the wasm side's
+    // {endpoint, instance, node, source} infrastructure keys.
+    let mut value_labels: Vec<(&str, &str)> = info
+        .labels
+        .iter()
+        .filter(|(k, _)| {
+            !NON_VALUE_METADATA_KEYS
+                .iter()
+                .any(|nv| *nv == k.as_str())
+        })
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    value_labels.sort_by(|a, b| {
+        let na = a.1.chars().all(|c| c.is_ascii_digit()) && !a.1.is_empty();
+        let nb = b.1.chars().all(|c| c.is_ascii_digit()) && !b.1.is_empty();
+        (na as u8).cmp(&(nb as u8)).then_with(|| a.0.cmp(b.0))
+    });
+
+    let mut name = metric.clone();
+    for (_, v) in &value_labels {
+        name.push('/');
+        name.push_str(v);
+    }
+    if matches!(info.kind, ColumnKind::Histogram { .. }) {
+        name.push_str(":buckets");
+    }
+    name
+}
+
+/// Quote an SQL identifier — wrap in `"` and double any embedded
+/// `"`. Column names from Rezolus parquets can contain `/`, `:`,
+/// and other characters DuckDB's bare-word identifier parser rejects.
+fn quote_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Render the SQL needed to (re)create the `_cgroup_index` TEMP
+/// TABLE on a fresh connection. Combines a `CREATE OR REPLACE
+/// TEMP TABLE` definition with a single bulk `INSERT INTO ...
+/// VALUES (...)` of one row per cgroup_* metric column. Returns
+/// `None` when the parquet carries no cgroup columns (the table
+/// itself is still created so dashboard SQL that JOINs against
+/// it gets an empty result rather than a binder error).
+///
+/// The dashboard's cgroup SQL (`crates/dashboard/src/sql.rs`
+/// `cgroup_irate_total` / `cgroup_irate_by_name` /
+/// `cgroup_ratio_*`) JOINs against `_cgroup_index` on
+/// `(column_name, metric)` and filters on `name` / `labels[k]`,
+/// so we mirror the wasm viewer's index shape exactly — see
+/// `site/viewer-sql/lib/duckdb-registry.js::buildCgroupIndex`
+/// for the source-of-truth schema and dedup rules.
+///
+/// Histogram `:buckets` cgroup columns are intentionally included
+/// (matching wasm); the dashboard's UNPIVOT regex
+/// `^<metric>(/[^:]+)?$` skips them at query time so they sit
+/// in the index unused. Cheaper than maintaining a kind-aware
+/// filter that has to track every histogram metric.
+pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
+    // The CREATE always runs — dashboard SQL needs the table to
+    // exist even on parquets without cgroups (the JOIN returns
+    // zero rows rather than erroring).
+    let create = "CREATE OR REPLACE TEMP TABLE _cgroup_index(\
+            metric VARCHAR, \
+            column_name VARCHAR, \
+            name VARCHAR, \
+            id VARCHAR, \
+            labels MAP(VARCHAR, VARCHAR)\
+         )";
+
+    // `column_name` must match the projection used in `_src` so the
+    // dashboard's `idx.column_name = u.col` JOIN actually binds. With
+    // the single-source path that's `c.physical` (passthrough); with
+    // the multi-source path it's `canonical_alias(c)`. Dedupe on
+    // (metric, canonical column name) to mirror `_src`'s
+    // `seen_alias` dedup — otherwise a metric that appears under
+    // multiple source prefixes lands in the index twice but only
+    // once in `_src`, producing duplicate JOIN rows that double-count
+    // the aggregate.
+    let multi_source = columns.iter().any(|c| c.physical.contains("::"));
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut rows: Vec<String> = Vec::new();
+    for c in columns {
+        if !c.metric.starts_with("cgroup_") {
+            continue;
+        }
+        // For multi-source, skip non-rezolus rows: `_src` doesn't
+        // project them, so a JOIN row pointing at a non-existent
+        // `_src` column would be unreachable noise.
+        if multi_source
+            && c.labels.get("source").map_or(true, |s| s != "rezolus")
+        {
+            continue;
+        }
+        let col = if multi_source {
+            canonical_alias(c)
+        } else {
+            c.physical.clone()
+        };
+        if !seen.insert((c.metric.clone(), col.clone())) {
+            continue;
+        }
+        let name = c.labels.get("name").map(String::as_str);
+        let id = c.labels.get("id").map(String::as_str);
+        let extra_pairs: Vec<String> = c
+            .labels
+            .iter()
+            .filter(|(k, _)| {
+                let k = k.as_str();
+                // Exclude both the lifted-to-top-level labels and the
+                // infrastructure keys that `canonical_alias` filters
+                // out — otherwise multi-source rows expose `node` /
+                // `source` keys that the single-source path doesn't.
+                !NON_VALUE_METADATA_KEYS.iter().any(|nv| *nv == k)
+                    && k != "name"
+                    && k != "id"
+            })
+            .map(|(k, v)| format!("{}:{}", sql_string_lit(k), sql_string_lit(v)))
+            .collect();
+        let labels_lit = if extra_pairs.is_empty() {
+            // Empty MAP literal in DuckDB: MAP() — `MAP{}` parses as
+            // an empty struct and binder-errors on the column type.
+            "MAP([]::VARCHAR[], []::VARCHAR[])".to_string()
+        } else {
+            format!("MAP{{{}}}", extra_pairs.join(","))
+        };
+        rows.push(format!(
+            "({}, {}, {}, {}, {})",
+            sql_string_lit(&c.metric),
+            sql_string_lit(&col),
+            name.map(sql_string_lit).unwrap_or_else(|| "NULL".to_string()),
+            id.map(sql_string_lit).unwrap_or_else(|| "NULL".to_string()),
+            labels_lit,
+        ));
+    }
+
+    if rows.is_empty() {
+        create.to_string()
+    } else {
+        format!(
+            "{create}; INSERT INTO _cgroup_index VALUES {}",
+            rows.join(","),
+        )
+    }
+}
+
+/// SQL single-quoted string literal with embedded `'` doubled
+/// per the SQL standard. Cgroup names and label values come from
+/// parquet metadata and can carry arbitrary characters.
+fn sql_string_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push('\'');
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
+/// Build the `_cgroup_index` TEMP TABLE on `conn`. Executes the
+/// SQL rendered by `render_cgroup_index_sql` — see that function
+/// for the schema and semantics.
+pub(crate) fn create_cgroup_index(
+    conn: &Connection,
+    columns: &[ColumnInfo],
+) -> duckdb::Result<()> {
+    let sql = render_cgroup_index_sql(columns);
+    // `INSERT` may be empty (no cgroup columns); when it is, the
+    // string is just the `CREATE` and `execute` runs one statement.
+    // When both are present, DuckDB's `execute` accepts the `;`-
+    // separated pair as a single batch.
+    conn.execute_batch(&sql)?;
     Ok(())
 }
 
@@ -267,7 +574,7 @@ pub(crate) fn create_src_table(
 /// Used by tests and one-off perf scripts.
 pub fn ensure_views(conn: &Connection, parquet_path: &str) -> duckdb::Result<MetricCatalog> {
     let (columns, interval_ns) = read_introspection(parquet_path)?;
-    create_src_table(conn, parquet_path, interval_ns)?;
+    create_src_table(conn, parquet_path, interval_ns, &columns)?;
     Ok(build_catalog(&columns))
 }
 
@@ -369,6 +676,416 @@ mod tests {
             .expect("request_latency p");
         // metriken-query-fixtures uses gp=4 for the rezolus histogram config.
         assert_eq!(p, 4);
+    }
+
+    // ---------- malformed-metadata behaviour ----------
+    //
+    // These tests construct minimal parquets in a tempdir with the
+    // metadata shapes that real-world writers can emit. They pin the
+    // `read_introspection` contract on inputs the fixture suite doesn't
+    // already exercise.
+
+    fn write_test_parquet(
+        path: &std::path::Path,
+        fields: Vec<arrow::datatypes::Field>,
+        columns: Vec<arrow::array::ArrayRef>,
+        file_kv: &[(&str, &str)],
+    ) {
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::metadata::KeyValue;
+
+        let schema = std::sync::Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).expect("RecordBatch");
+        let kvs: Vec<KeyValue> = file_kv
+            .iter()
+            .map(|(k, v)| KeyValue {
+                key: (*k).to_string(),
+                value: Some((*v).to_string()),
+            })
+            .collect();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(kvs))
+            .build();
+        let file = std::fs::File::create(path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("ArrowWriter");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn ts_field() -> arrow::datatypes::Field {
+        arrow::datatypes::Field::new("timestamp", arrow::datatypes::DataType::UInt64, false)
+    }
+
+    fn counter_field(name: &str, metric: &str) -> arrow::datatypes::Field {
+        let mut md = std::collections::HashMap::new();
+        md.insert("metric".into(), metric.into());
+        md.insert("metric_type".into(), "counter".into());
+        arrow::datatypes::Field::new(name, arrow::datatypes::DataType::UInt64, false)
+            .with_metadata(md)
+    }
+
+    #[test]
+    fn missing_sampling_interval_ms_falls_back_to_one_second() {
+        // The recorder always emits `sampling_interval_ms`, but third-
+        // party producers may not. The loader's fallback is 1s — pin
+        // the value so a future refactor doesn't silently pick another
+        // default (which would shift every snapped timestamp by the
+        // gap between the new and old defaults).
+        use arrow::array::{ArrayRef, UInt64Array};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("no_interval.parquet");
+        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000]));
+        let v: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![10u64, 20]));
+        write_test_parquet(
+            &path,
+            vec![ts_field(), counter_field("requests", "requests")],
+            vec![ts, v],
+            &[], // no file metadata at all
+        );
+
+        let (_columns, interval_ns) =
+            read_introspection(path.to_str().unwrap()).expect("introspect");
+        assert_eq!(interval_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn list_uint64_without_grouping_power_is_classified_as_other_and_dropped() {
+        // A list-of-UInt64 column with no `grouping_power` metadata is
+        // shape-compatible with a histogram but missing the bucket-layout
+        // hint — we can't safely call h2_* UDFs on it. The classifier
+        // marks it `Other`, which `read_introspection` then drops from
+        // the column list.
+        use arrow::array::{ArrayRef, ListBuilder, UInt64Array, UInt64Builder};
+        use arrow::datatypes::{DataType, Field};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("no_grouping_power.parquet");
+
+        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000]));
+        let mut lb = ListBuilder::new(UInt64Builder::new()).with_field(Field::new(
+            "item",
+            DataType::UInt64,
+            true,
+        ));
+        lb.values().append_value(1);
+        lb.values().append_value(2);
+        lb.append(true);
+        lb.values().append_value(3);
+        lb.values().append_value(4);
+        lb.append(true);
+        let list_array: ArrayRef = std::sync::Arc::new(lb.finish());
+
+        let mut md = std::collections::HashMap::new();
+        md.insert("metric".into(), "latency".into());
+        md.insert("metric_type".into(), "histogram".into()); // claims to be a histogram…
+        // …but no grouping_power, so we can't actually compute on it.
+        let list_field = Field::new(
+            "latency:buckets",
+            list_array.data_type().clone(),
+            true,
+        )
+        .with_metadata(md);
+
+        write_test_parquet(
+            &path,
+            vec![ts_field(), list_field],
+            vec![ts, list_array],
+            &[("sampling_interval_ms", "1000")],
+        );
+
+        let (columns, _) = read_introspection(path.to_str().unwrap()).expect("introspect");
+        // The list column was dropped — only ts is gone, and the metric
+        // column never made it through (timestamp is also filtered out
+        // upstream of classify).
+        assert!(
+            !columns.iter().any(|c| c.metric == "latency"),
+            "latency must be dropped without grouping_power; got: {:?}",
+            columns.iter().map(|c| &c.metric).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn duplicate_physical_column_names_dedupe_first_occurrence_wins() {
+        // Some Rezolus writers emit duplicate top-level column names.
+        // DuckDB's `read_parquet` silently keeps only the first; the
+        // loader's `seen_physical` set mirrors that so the catalog
+        // doesn't index columns DuckDB can't see. Pin this against a
+        // synthetic parquet that has two columns named `requests`.
+        use arrow::array::{ArrayRef, UInt64Array};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("dupes.parquet");
+
+        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64]));
+        let v1: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![10u64]));
+        let v2: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![20u64]));
+        write_test_parquet(
+            &path,
+            vec![
+                ts_field(),
+                counter_field("requests", "requests"),
+                counter_field("requests", "requests"),
+            ],
+            vec![ts, v1, v2],
+            &[("sampling_interval_ms", "1000")],
+        );
+
+        let (columns, _) = read_introspection(path.to_str().unwrap()).expect("introspect");
+        let requests: Vec<_> = columns.iter().filter(|c| c.physical == "requests").collect();
+        assert_eq!(requests.len(), 1, "dedupe must keep exactly one `requests`");
+    }
+
+    // ---------- _cgroup_index ----------
+
+    #[test]
+    fn cgroup_index_is_empty_when_parquet_has_no_cgroup_columns() {
+        // counter_basic has only a `requests` counter — no cgroup_*
+        // metric. The table must still exist (dashboard SQL JOINs
+        // against it unconditionally) but contain zero rows.
+        let conn = fresh_conn();
+        let (columns, _) = read_introspection(
+            fixture_path("counter_basic").to_str().unwrap(),
+        )
+        .unwrap();
+        create_cgroup_index(&conn, &columns).expect("create cgroup index");
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM _cgroup_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn cgroup_index_inserts_one_row_per_cgroup_column_with_split_labels() {
+        // Synthetic parquet: one `cgroup_cpu_usage` counter column
+        // labelled with `name`, `id`, and a free-form `state` label.
+        // Expect a single row in `_cgroup_index` whose `name` + `id`
+        // are top-level VARCHARs and whose `state` lands in `labels`.
+        use arrow::array::{ArrayRef, UInt64Array};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cgroup.parquet");
+
+        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64]));
+        let v: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![42u64]));
+        let mut md = std::collections::HashMap::new();
+        md.insert("metric".into(), "cgroup_cpu_usage".into());
+        md.insert("metric_type".into(), "counter".into());
+        md.insert("name".into(), "system.slice/foo".into());
+        md.insert("id".into(), "1234".into());
+        md.insert("state".into(), "user".into());
+        let metric_field = arrow::datatypes::Field::new(
+            "cgroup_cpu_usage/foo",
+            arrow::datatypes::DataType::UInt64,
+            false,
+        )
+        .with_metadata(md);
+        write_test_parquet(
+            &path,
+            vec![ts_field(), metric_field],
+            vec![ts, v],
+            &[("sampling_interval_ms", "1000")],
+        );
+
+        let conn = fresh_conn();
+        let (columns, _) = read_introspection(path.to_str().unwrap()).unwrap();
+        create_cgroup_index(&conn, &columns).expect("create cgroup index");
+
+        let (metric, column_name, name, id): (String, String, String, String) = conn
+            .query_row(
+                "SELECT metric, column_name, name, id FROM _cgroup_index",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(metric, "cgroup_cpu_usage");
+        assert_eq!(column_name, "cgroup_cpu_usage/foo");
+        assert_eq!(name, "system.slice/foo");
+        assert_eq!(id, "1234");
+
+        // `state` should be in the MAP but `name`/`id` should NOT (they
+        // were lifted to top-level columns).
+        let state: String = conn
+            .query_row(
+                "SELECT labels['state'] FROM _cgroup_index",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "user");
+        let n_keys: i64 = conn
+            .query_row(
+                "SELECT len(map_keys(labels)) FROM _cgroup_index",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_keys, 1, "labels MAP should hold only `state`, not name/id");
+    }
+
+    // ---------- canonical aliasing for multi-source parquets ----------
+
+    fn make_info(
+        physical: &str,
+        metric: &str,
+        kind: ColumnKind,
+        labels: &[(&str, &str)],
+    ) -> ColumnInfo {
+        ColumnInfo {
+            physical: physical.into(),
+            metric: metric.into(),
+            kind,
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn canonical_alias_passes_named_column_through() {
+        // Already-canonical name: pass through after stripping the
+        // source prefix.
+        let info = make_info(
+            "rezolus-client::cpu_usage/user/0",
+            "cpu_usage",
+            ColumnKind::Counter,
+            &[("state", "user"), ("id", "0"), ("source", "rezolus")],
+        );
+        assert_eq!(super::canonical_alias(&info), "cpu_usage/user/0");
+    }
+
+    #[test]
+    fn canonical_alias_rebuilds_numeric_encoded_columns() {
+        // Numeric-encoded parquets (rezolus-client::10x0) carry the
+        // canonical name in metadata. Rebuild: metric + sorted
+        // value labels (non-numeric first, numeric last).
+        let info = make_info(
+            "rezolus-client::10x0",
+            "cpu_cycles",
+            ColumnKind::Counter,
+            &[
+                ("id", "0"),
+                ("node", "rezolus-client"),
+                ("source", "rezolus"),
+                ("unit", "cycles"),
+            ],
+        );
+        // {node, source, unit} are infrastructure labels — excluded.
+        // Only {id} survives; numeric values land last.
+        assert_eq!(super::canonical_alias(&info), "cpu_cycles/0");
+    }
+
+    #[test]
+    fn canonical_alias_orders_non_numeric_before_numeric_labels() {
+        // For a metric with both `state` (non-numeric) and `id`
+        // (numeric), the canonical form is `cpu_usage/<state>/<id>` —
+        // numeric values trail.
+        let info = make_info(
+            "src::ord1",
+            "cpu_usage",
+            ColumnKind::Counter,
+            &[("id", "3"), ("state", "user")],
+        );
+        assert_eq!(super::canonical_alias(&info), "cpu_usage/user/3");
+    }
+
+    #[test]
+    fn canonical_alias_appends_buckets_suffix_for_histograms() {
+        let info = make_info(
+            "src::hist1",
+            "syscall_latency",
+            ColumnKind::Histogram { grouping_power: 3 },
+            &[("op", "read")],
+        );
+        assert_eq!(super::canonical_alias(&info), "syscall_latency/read:buckets");
+    }
+
+    #[test]
+    fn render_src_sql_single_source_uses_exclude_shortcut() {
+        // No `::` in any column name → existing `* EXCLUDE (timestamp)`
+        // shortcut. Cheaper than enumerating projections, and the
+        // names are already canonical.
+        let cols = vec![make_info(
+            "cpu_usage/user/0",
+            "cpu_usage",
+            ColumnKind::Counter,
+            &[("state", "user"), ("id", "0")],
+        )];
+        let sql = super::render_src_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(sql.contains("* EXCLUDE (timestamp)"), "single-source: {sql}");
+    }
+
+    #[test]
+    fn render_src_sql_multi_source_projects_rezolus_canonically() {
+        // Cachecannon-shaped: one rezolus source + one application
+        // source. Only the rezolus columns project into `_src`, with
+        // canonical aliases.
+        let cols = vec![
+            make_info(
+                "0::cache_hits",
+                "cache_hits",
+                ColumnKind::Counter,
+                &[("source", "cachecannon"), ("instance", "0")],
+            ),
+            make_info(
+                "rezolus-client::10x0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[
+                    ("id", "0"),
+                    ("node", "rezolus-client"),
+                    ("source", "rezolus"),
+                    ("unit", "cycles"),
+                ],
+            ),
+        ];
+        let sql = super::render_src_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        // Has the canonical alias projection.
+        assert!(
+            sql.contains(r#""rezolus-client::10x0" AS "cpu_cycles/0""#),
+            "expected canonical alias in: {sql}",
+        );
+        // The cachecannon-source column is NOT projected.
+        assert!(
+            !sql.contains("cache_hits"),
+            "cachecannon-source columns should be excluded: {sql}",
+        );
+        // No `* EXCLUDE` shortcut on the multi-source path.
+        assert!(!sql.contains("EXCLUDE"));
+    }
+
+    #[test]
+    fn cgroup_index_handles_apostrophes_in_label_values() {
+        // Cgroup names from user-space can contain apostrophes (e.g.
+        // `john's-shell.scope`). The literal renderer must double them
+        // to avoid binder errors mid-INSERT.
+        use arrow::array::{ArrayRef, UInt64Array};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cgroup_apos.parquet");
+
+        let ts: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1_000_000_000u64]));
+        let v: ArrayRef = std::sync::Arc::new(UInt64Array::from(vec![1u64]));
+        let mut md = std::collections::HashMap::new();
+        md.insert("metric".into(), "cgroup_cpu_usage".into());
+        md.insert("metric_type".into(), "counter".into());
+        md.insert("name".into(), "john's-shell.scope".into());
+        let f = arrow::datatypes::Field::new(
+            "cgroup_cpu_usage/abc",
+            arrow::datatypes::DataType::UInt64,
+            false,
+        )
+        .with_metadata(md);
+        write_test_parquet(
+            &path,
+            vec![ts_field(), f],
+            vec![ts, v],
+            &[("sampling_interval_ms", "1000")],
+        );
+
+        let conn = fresh_conn();
+        let (columns, _) = read_introspection(path.to_str().unwrap()).unwrap();
+        create_cgroup_index(&conn, &columns).expect("create cgroup index");
+        let name: String = conn
+            .query_row("SELECT name FROM _cgroup_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "john's-shell.scope");
     }
 
     #[test]
