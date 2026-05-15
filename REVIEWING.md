@@ -15,9 +15,12 @@ This branch ships two things on the engine side:
 
 The pre-existing PromQL evaluator (`metriken-query::promql` +
 `tsdb`, gated `feature = "legacy"`) is unchanged in its role on
-this branch: it's the live engine for Rezolus MCP, `report-save`,
-the dashboard crate's `Tsdb` re-export, and the viewer's live-mode
-`validate_service_extensions` KPI check. Removing it entirely is
+this branch. Its surviving consumers, post the MCP and
+report-save-column-trim migrations on the rezolus side, are:
+the dashboard crate's `Tsdb` re-export, the viewer's live-mode
+`validate_service_extensions` KPI check, and `report-save`'s
+live-mode query embed (the column-trim half moved to
+`metriken-query-sql::MetricCatalog`). Removing it entirely is
 the topic of the *Removing Tsdb entirely* section in the rezolus
 doc.
 
@@ -42,23 +45,26 @@ scalar-passthrough backstop. The shadow-mode plumbing is gone.
 Today no production caller links it — only `tests/`, the
 `sql_vs_promql` correctness harness, and the orphan-detector
 catalogue health check. Rezolus's dashboard emitter, viewer, and
-static viewer all bypass it entirely.
+static viewer all bypass it entirely. MCP, since the May 2026
+migration, also bypasses it (the rewrite-to-SQL path won; see the
+rezolus doc's _Recently landed_).
 
 Two clean exits, neither chosen on this branch:
 
-- **Land it.** Wire `harness::Engine` into Rezolus MCP — and
-  optionally into `validate_service_extensions` and `report-save`.
-  The MCP migration path (see rezolus doc) becomes "translate
-  PromQL → SQL via `harness::Engine`, run through `DuckDbBackend`"
-  rather than "rewrite MCP queries to SQL by hand". The harness
-  becomes a regression suite for live code.
+- **Land it.** Wire `harness::Engine` into the remaining PromQL
+  holdouts on the rezolus side — `validate_service_extensions` and
+  `report-save`'s live-mode query embed. The harness becomes a
+  regression suite for live code, the catalogue stays alive, and
+  the existing PromQL strings keep working.
 - **Delete it.** The `harness/` subdirectory + `queries.toml` is a
   clean delete: nothing else links it. `metriken-query-sql` stays
   unchanged (the static viewer depends on its UDFs and macros).
+  The remaining holdouts go the rewrite-to-SQL route MCP took.
 
-The harness sitting behind a non-default feature flag keeps the
-question reversible — but only until someone has to take a side
-to merge.
+With MCP off the harness's beat, the population of plausible
+consumers is smaller than before — the land-or-delete decision is
+genuinely between two short paths now, not a hedge against a major
+unknown.
 
 ---
 
@@ -112,20 +118,26 @@ this crate at all.
 
 ## Verification
 
-`metriken-query/examples/sql_vs_promql.rs` runs every catalogue
-entry through both the PromQL evaluator and the SQL pipeline
-against the same parquet, and diffs canonical-JSON results
-plot-by-plot:
+`metriken-query/examples/sql_vs_promql.rs` runs every dashboard
+plot through both the PromQL evaluator (via the harness) and the
+SQL pipeline against the same parquet(s), and diffs canonical-JSON
+results plot-by-plot:
 
 ```bash
-cargo run --release --example sql_vs_promql --features "legacy,harness" \
-  -- /work/rezolus/site/viewer/data/demo.parquet
+cargo run --release --example sql_vs_promql --features "legacy,harness" -- \
+  --dashboard-dir /tmp/dashboard_json \
+  --parquets /work/rezolus/site/viewer/data/demo.parquet \
+  --out /tmp/sql_vs_promql
 ```
 
-Output goes to `/tmp/sql_vs_promql_yv/`; `summary.json` is the
-top-level result. Rerun before opening the PR — it's the only
-thing that catches semantic drift between the two engines on real
-data.
+(Generate the dashboard-dir input with
+`cargo run -p dashboard -- /tmp/dashboard_json` from the rezolus
+tree — it dumps one JSON per section, which the harness walks for
+plot specs.) `summary.json` in the chosen `--out` directory is the
+top-level result; `--max-plots N` caps the run for a quick smoke,
+`--rel-tol` / `--abs-tol` tune the diff. Rerun before opening the
+PR — it's the only thing that catches semantic drift between the
+two engines on real data.
 
 `metriken-query-sql/CAUTION.md` is the running catalog of known
 PromQL ↔ SQL semantic divergences this harness has surfaced.
