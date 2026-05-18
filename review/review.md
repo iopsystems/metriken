@@ -139,10 +139,30 @@ top-level result; `--max-plots N` caps the run for a quick smoke,
 PR — it's the only thing that catches semantic drift between the
 two engines on real data.
 
-`metriken-query-sql/CAUTION.md` is the running catalog of known
-PromQL ↔ SQL semantic divergences this harness has surfaced.
-Check it before being surprised by a "PromQL says X, SQL says Y"
-finding.
+### Known divergences
+
+Across the three real fixtures (`demo.parquet`, `AB_level_pin.parquet`,
+`AB_base.parquet`) the harness reports **698 identical / 1 divergent**
+on the live dashboard SQL path. The remaining divergence and two
+gaps in the scaffolding translator:
+
+- **Sub-tolerance: `numa-local-rate` on `AB_base.parquet`.** `rel ≈
+  2.7e-5` at the last eval point — floating-point residual from the
+  300-second RANGE arithmetic. Loosening `--rel-tol` from 1e-9 to
+  1e-4 moves it into the `within_tolerance` bucket. Not actionable.
+
+- **Wide-form translator** (`metriken-query/src/harness/translate.rs`,
+  behind the off-by-default `harness` feature). Emits SQL that
+  ignores the PromQL `[range]` argument (uses immediate `LAG`
+  regardless of how far back the prior sample is) and doesn't honor
+  the `query_range` step parameter (one output row per raw `_src`
+  timestamp). The translator's only consumers today are the
+  `wide_form_coverage` example and the harness-feature test suite —
+  neither gap surfaces in the dashboard SQL path. Both either land
+  (translator becomes a production caller; fixes follow) or die with
+  the translator under the land-or-delete decision above.
+
+No other PromQL ↔ SQL divergences are known on the dashboard path.
 
 ---
 
