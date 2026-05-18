@@ -233,8 +233,30 @@ impl DuckDbBackend {
         let t_total = std::time::Instant::now();
         let (state, _cold) = self.get_or_init(data_source)?;
 
-        let idx = state.next.fetch_add(1, Ordering::Relaxed) % state.pool.len();
-        let mut slot = state.pool[idx].lock().expect("slot mutex poisoned");
+        // Acquire a slot. Round-robin via `next` gives a starting point;
+        // we then scan all slots non-blockingly and take the first one
+        // that's free. Falls back to blocking on the round-robin pick
+        // only when every slot is busy. This eliminates the "queued
+        // behind a slow slot while peers idle" pathology — a slow query
+        // in slot 3 no longer holds back every 8th incoming task on a
+        // pool-size-8 backend.
+        let start = state.next.fetch_add(1, Ordering::Relaxed) % state.pool.len();
+        let (idx, mut slot) = {
+            let mut acquired = None;
+            for offset in 0..state.pool.len() {
+                let candidate = (start + offset) % state.pool.len();
+                if let Ok(guard) = state.pool[candidate].try_lock() {
+                    acquired = Some((candidate, guard));
+                    break;
+                }
+            }
+            acquired.unwrap_or_else(|| {
+                (
+                    start,
+                    state.pool[start].lock().expect("slot mutex poisoned"),
+                )
+            })
+        };
 
         if slot.is_none() {
             // Lazy rebuild after a panic. Reuses the pre-rendered
