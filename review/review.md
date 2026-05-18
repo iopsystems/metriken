@@ -1,6 +1,6 @@
 # Reviewing `yv/sql-testing` — metriken side
 
-Companion: `/work/rezolus/REVIEWING.md` (consumer side).
+Companion: `/work/rezolus/review/review.md` (consumer side).
 
 This branch ships two things on the engine side:
 

@@ -17,7 +17,7 @@
 # reshapes the result.
 #
 # This whole file plus `catalogue.rs`, `translate.rs`, `template.rs`,
-# `project.rs`, and `interp.rs` is migration scaffolding — see REVIEWING.md.
+# `project.rs`, and `interp.rs` is migration scaffolding — see review/review.md.
 # Deletable in one commit once Rezolus emits SQL natively.
 #
 # ---------- SQL idioms used by templated entries ----------

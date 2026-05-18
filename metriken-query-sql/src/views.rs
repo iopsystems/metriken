@@ -248,7 +248,7 @@ pub fn describe_parquet(parquet_path: &str) -> duckdb::Result<MetricCatalog> {
 /// (application-level cachecannon metrics, sglang router metrics,
 /// etc.) are dropped from `_src`; service-extension KPIs targeting
 /// them remain a deferred carve-out (the service templates are
-/// PromQL-only today, per REVIEWING.md item 1). Multi-rezolus
+/// PromQL-only today, per review/review.md item 1). Multi-rezolus
 /// aggregation across more than one rezolus source is not yet
 /// implemented — captures with 2+ rezolus sources will still error.
 pub(crate) fn create_src_table(

@@ -2,7 +2,7 @@
 //!
 //! **This whole module is migration scaffolding.** It exists to bridge
 //! Rezolus's still-PromQL dashboard emitter to the new SQL backend.
-//! Once Rezolus emits SQL natively (see `/work/rezolus/REVIEWING.md`),
+//! Once Rezolus emits SQL natively (see `/work/rezolus/review/review.md`),
 //! delete this file along with `catalogue.rs`, `template.rs`, `interp.rs`,
 //! `project.rs`, and `queries.toml`.
 //!

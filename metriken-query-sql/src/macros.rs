@@ -12,7 +12,7 @@
 // `rezolus/crates/viewer-sql/tests/macros.rs` exercises the same SQL
 // against an in-memory DuckDB on the native side.
 //
-// See REVIEWING.md (both repos) for the "two macro libraries" hazard
+// See review/review.md (both repos) for the "two macro libraries" hazard
 // (now reduced to "one shared file plus a wasm-only H2 supplement").
 
 use duckdb::Connection;
