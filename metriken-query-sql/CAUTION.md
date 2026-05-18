@@ -56,6 +56,49 @@ carrying the last-known per-series rate forward across gaps. Invasive
 
 ---
 
+## Catalogue: per-name cgroup fan-out drops rows after a column goes NULL
+
+**Affected queries:** per-cgroup fan-out templates driven by
+`sql::cgroup_irate_by_name` (and structurally `sql::cgroup_ratio_by_name`,
+which uses the same UNPIVOT + per-name aggregation pattern) in
+`crates/dashboard/src/sql.rs`. Surfaces on the per-cgroup individual plots
+(e.g. `individual-syscall-poll` — the divergence is per-op, so it shows
+up most prominently on subseries plots where the affected column is the
+*only* column for that name).
+
+**Affected parquets:** any capture that contains a short-lived cgroup
+whose counter column transitions to NULL after the cgroup exits — most
+commonly boot-time one-shot units like
+`/system.slice/systemd-update-utmp-runlevel.service`. Confirmed on
+`AB_level_pin.parquet`; the harness reports it as "PromQL has N
+integer-second timestamps SQL doesn't (>1 boundary tolerance)" on the
+exited cgroup's series.
+
+**Symptom:** PromQL emits one point per evaluation step for the full
+window, SQL emits points only up to (and including) the last sample
+where the counter was non-NULL. After the NULL transition PromQL's
+`[5m]` lookback still finds the prior non-NULL sample and emits a
+carried-forward rate (typically 0 for an exited cgroup whose counter
+stopped advancing); SQL's `UNPIVOT` drops the NULL rows and the
+windowed `irate_lag` has no `(timestamp, name)` row to project on.
+
+**Why:** DuckDB's `UNPIVOT` excludes NULL values by default — the
+exited cgroup's per-op column has NULL after exit, so it never lands
+in the `joined` CTE, so `(timestamp, name)` doesn't appear in the
+output. PromQL evaluates the expression at every step in the
+query-range grid; the `irate(...[5m])` window sees the last
+pre-NULL sample for ~300 s after the cgroup exits and produces a
+rate row. This is the same family as the "combined-recording
+timestamp gaps" entry below — both are PromQL's range-emission
+cadence interacting with sparse SQL inputs.
+
+**Fix when needed:** rewrite the per-name fan-out to drive emission
+off the full `_src` timestamp grid (LEFT JOIN against `_src.timestamp`)
+and carry the last-known rate forward per `(name, col)` pair. Costly
+(touches every cgroup fan-out template) and the practical impact is
+limited to the post-exit tail of one-shot cgroups whose data is
+already zero/stale, so deferred.
+
 ## Catalogue: `cpu_cores` multi-series mismatch on combined parquets
 
 **Affected queries:** entries that JOIN against the `cpu_cores` view —
@@ -80,45 +123,6 @@ CTE — `SELECT timestamp, ANY_VALUE(value) FROM cpu_cores GROUP BY
 timestamp HAVING COUNT(*) = 1` — which matches PromQL's "single matching
 pair only" semantics. Single-source parquets pass through (one row per
 timestamp); multi-source parquets produce zero rows, matching PromQL.
-
----
-
-## Dashboard `rate()` emitter: sub-second window-start offset
-
-**Affected queries:** counter-rate plots whose dashboard SQL uses
-`WINDOW wr AS (ORDER BY timestamp RANGE BETWEEN 300000000000 PRECEDING
-AND CURRENT ROW)` for `rate(metric[5m])` — see e.g. the `delta_counter`
-emitter that produced `numa-local-rate`.
-
-**Symptom:** on parquets whose first raw timestamp carries a sub-second
-offset (e.g. `start_ns = 638_000_716_544` instead of a clean `638e9`),
-PromQL and SQL disagree by ~0.07% at the very last few eval points.
-Observed on `site/viewer/data/demo.parquet`: `numa-local-rate` at
-`t=1768956938`, `promql=190389.24` vs `sql=190251.58`, `rel≈7.2e-4`.
-Only one eval point flagged at our default tolerance (`rel_tol=1e-9`,
-`abs_tol=1e-12`); loosening either by a few orders of magnitude moves
-it into the "tolerant" bucket.
-
-**Why:** PromQL's evaluation point carries the parquet's first
-raw-timestamp offset, so its `[step - 5m, step]` window starts strictly
-greater than the snapped 5-minute-prior sample and excludes it. The
-SQL window's lower bound is the snapped timestamp itself, so the
-matching sample is *included*. The boundary sample contributes one
-extra increment to the SQL average, scaled by the window size — hence
-the small per-point diff at the trailing edge.
-
-The SQL emitter calls this out inline (`crates/dashboard/src/sql.rs` —
-the `delta_counter`/`rate` builders). The comment notes that the
-offset varies parquet-to-parquet and so the divergence isn't fixable
-by tightening the RANGE bound by a constant.
-
-**Fix when needed:** drive emission off `generate_series(start_ns,
-end_ns, step_ns)` with `start_ns` carrying the same sub-second offset
-PromQL uses, or hold the offset in scope when building the SQL and
-emit `RANGE BETWEEN INTERVAL '5 minutes' - <offset_ns> PRECEDING AND
-CURRENT ROW`. Both are invasive (touch every counter-rate emitter)
-and the diff is observable only at the trailing edge — deferred until
-a consumer needs the alignment.
 
 ---
 

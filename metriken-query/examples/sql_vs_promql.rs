@@ -136,7 +136,7 @@ fn parse_args() -> Args {
     a
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PlotSpec {
     id: String,
     section: String,
@@ -373,6 +373,15 @@ struct ParquetSqlState {
     /// dashboards typically want for cross-source aggregations
     /// (Bucket #3 in remaining_work.md).
     is_multi_source: bool,
+    /// Sorted, distinct cgroup `name` label values pulled from the
+    /// parquet's `cgroup_*` field metadata. Empty when the parquet
+    /// carries no cgroup data. Used to substitute the
+    /// `__SELECTED_CGROUPS__` placeholder in cgroup-section plots so
+    /// the harness can compare them instead of skipping. Mirrors the
+    /// runtime contract: the frontend picks cgroup names interactively
+    /// and the dashboard helpers JOIN against `_cgroup_index` to map
+    /// (`metric`, `column_name`) → `name`.
+    cgroup_names: Vec<String>,
 }
 
 /// Mirror `duckdb-registry.js:buildSourceViews` + the picker in
@@ -392,6 +401,148 @@ struct ParquetSqlState {
 /// columns. We sidestep that by reading column types from DESCRIBE
 /// (so artefactual prefixes show ≪ 10% of total columns) and falling
 /// back to single-source mode when that ratio holds.
+/// Materialise a minimal `_cgroup_index` temp table in the harness
+/// connection — same schema and JOIN contract the production
+/// `DuckDbBackend` exposes (`metric`, `column_name`, `name`, `id`,
+/// `labels`) but populated from the parquet's Arrow field metadata
+/// rather than the engine-private rendering path. Dashboard cgroup
+/// SQL JOINs against `idx.column_name = u.col` so `column_name` must
+/// match the projection used in `_src`: physical column name in
+/// single-source mode, canonical alias in multi-source mode.
+///
+/// Returns the sorted, distinct `name` label values across all
+/// `cgroup_*` columns — the harness uses these to substitute
+/// `__SELECTED_CGROUPS__` placeholders below.
+fn setup_cgroup_index(
+    conn: &Connection,
+    parquet_str: &str,
+    field_meta: &HashMap<String, FieldMeta>,
+    multi_source: bool,
+) -> Result<Vec<String>, String> {
+    // The CREATE always runs — dashboard SQL needs the table to exist
+    // even on parquets without cgroups (the JOIN returns zero rows
+    // rather than erroring). Schema matches
+    // `metriken-query-sql/src/views.rs::render_cgroup_index_sql`.
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _cgroup_index(\
+            metric VARCHAR, \
+            column_name VARCHAR, \
+            name VARCHAR, \
+            id VARCHAR, \
+            labels MAP(VARCHAR, VARCHAR)\
+         )",
+        [],
+    )
+    .map_err(|e| format!("create _cgroup_index: {e}"))?;
+    let _ = parquet_str; // unused; harness reads field metadata directly
+
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut rows: Vec<String> = Vec::new();
+    for (physical, meta) in field_meta {
+        if !meta.metric.starts_with("cgroup_") {
+            continue;
+        }
+        // Multi-source mode: only project rezolus-source columns
+        // (the per-source view `_src_<src>` strips other sources).
+        // Field metadata doesn't carry the `source` label directly
+        // — it lives in NON_VALUE_METADATA_KEYS, not in
+        // `value_labels`. Pull it via column-name prefix check
+        // instead: rezolus columns either have no `::` prefix
+        // (single-rezolus parquets) or carry one (multi-rezolus
+        // combined). Multi-source mode here means "the parquet has
+        // ≥1 prefixed column" — but cgroup data is always rezolus,
+        // so the prefix check is the right filter.
+        let column_name = if multi_source {
+            // `<prefix>::<rest>` → canonical alias of `rest`
+            let Some((_, rest)) = physical.split_once("::") else { continue };
+            canonical_alias(rest, Some(meta))
+        } else {
+            physical.clone()
+        };
+        if !seen.insert((meta.metric.clone(), column_name.clone())) {
+            continue;
+        }
+        let mut name_val: Option<&str> = None;
+        let mut id_val: Option<&str> = None;
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        for (k, v) in &meta.value_labels {
+            match k.as_str() {
+                "name" => name_val = Some(v),
+                "id" => id_val = Some(v),
+                _ => extra.push((k, v)),
+            }
+        }
+        if let Some(n) = name_val {
+            names.insert(n.to_string());
+        }
+        let labels_map = if extra.is_empty() {
+            "MAP()".to_string()
+        } else {
+            // DuckDB MAP literal: `MAP { 'k': 'v', ... }` with colons.
+            let entries: Vec<String> = extra
+                .iter()
+                .map(|(k, v)| format!("'{}': '{}'", sql_escape(k), sql_escape(v)))
+                .collect();
+            format!("MAP {{ {} }}", entries.join(", "))
+        };
+        rows.push(format!(
+            "('{}', '{}', {}, {}, {})",
+            sql_escape(&meta.metric),
+            sql_escape(&column_name),
+            name_val.map(|v| format!("'{}'", sql_escape(v))).unwrap_or_else(|| "NULL".to_string()),
+            id_val.map(|v| format!("'{}'", sql_escape(v))).unwrap_or_else(|| "NULL".to_string()),
+            labels_map,
+        ));
+    }
+    if !rows.is_empty() {
+        // Chunk to keep prepared-statement size reasonable on
+        // wide parquets with hundreds of cgroup × metric pairs.
+        for chunk in rows.chunks(256) {
+            let sql = format!(
+                "INSERT INTO _cgroup_index VALUES {}",
+                chunk.join(", ")
+            );
+            conn.execute(&sql, [])
+                .map_err(|e| format!("insert _cgroup_index: {e}\nfirst row: {}", &chunk[0]))?;
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn sql_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Escape RE2-flavoured regex metacharacters so a cgroup name can be
+/// dropped into a PromQL `name=~"<pat>"` body. PromQL parses the
+/// interior as RE2, so backslash must double-escape on the way into
+/// the PromQL string literal. We emit the form that survives the
+/// PromQL string-literal parse and lands as a literal byte in the
+/// resulting regex.
+fn promql_regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for ch in s.chars() {
+        match ch {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                // Double-backslash so the PromQL string literal
+                // decoder yields one backslash and RE2 sees the
+                // escape sequence.
+                out.push('\\');
+                out.push('\\');
+                out.push(ch);
+            }
+            '"' => {
+                // Close the PromQL string literal otherwise — escape it.
+                out.push('\\');
+                out.push('"');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn setup_parquet_sql(
     conn: &Connection,
     parquet: &Path,
@@ -481,10 +632,12 @@ fn setup_parquet_sql(
         );
         conn.execute(&create, [])
             .map_err(|e| format!("create _src_default: {e}"))?;
+        let cgroup_names = setup_cgroup_index(conn, parquet_str, &field_meta, false)?;
         return Ok(ParquetSqlState {
             from_clause: "_src_default".to_string(),
             constant_labels: constant_labels_from_field_meta(parquet, None, false),
             is_multi_source: false,
+            cgroup_names,
         });
     }
     // Hint the recorded sources for picking — but don't filter the
@@ -593,6 +746,7 @@ fn setup_parquet_sql(
         );
         conn.execute(&create, [])
             .map_err(|e| format!("create combined view: {e}"))?;
+        let cgroup_names = setup_cgroup_index(conn, parquet_str, &field_meta, true)?;
         return Ok(ParquetSqlState {
             from_clause: view.to_string(),
             // Multi-source combined: `is_multi_source: true` drops
@@ -602,6 +756,7 @@ fn setup_parquet_sql(
             // reclassified by `Verdict::ExpectedDivergent` (Bucket #3).
             constant_labels: constant_labels_from_field_meta(parquet, None, true),
             is_multi_source: true,
+            cgroup_names,
         });
     }
 
@@ -617,6 +772,7 @@ fn setup_parquet_sql(
         .or_else(|| by_source.keys().next())
         .expect("by_source not empty here");
 
+    let cgroup_names = setup_cgroup_index(conn, parquet_str, &field_meta, true)?;
     Ok(ParquetSqlState {
         from_clause: view_name_for_source(picked),
         // Anchor on the rezolus memory_total field under this prefix.
@@ -626,6 +782,7 @@ fn setup_parquet_sql(
         // unambiguously.
         constant_labels: constant_labels_from_field_meta(parquet, Some(picked), false),
         is_multi_source: false,
+        cgroup_names,
     })
 }
 
@@ -1552,26 +1709,59 @@ fn main() {
                 .join(&parquet_stem)
                 .join(format!("{}.json", safe_filename(&plot.id)));
 
-            // Skip cgroup-placeholder plots in v1 — they need a cgroup
-            // selection materialized which the harness doesn't model
-            // yet. Logged as skipped.
-            if plot.sql.contains("__SELECTED_CGROUPS__")
-                || plot.promql.contains("__SELECTED_CGROUPS__")
-            {
-                let outcome = PairOutcome {
-                    parquet: parquet_str.clone(),
-                    plot_id: plot.id.clone(),
-                    section: plot.section.clone(),
-                    plot_type: plot.plot_type.clone(),
-                    promql: plot.promql.clone(),
-                    verdict: Verdict::SkippedCgroupPlaceholder,
-                };
-                write_json(&outcome_path, &outcome);
-                p_counts.skipped_cgroup += 1;
-                summary.counts.skipped_cgroup += 1;
-                bump_section(&mut summary.per_section, &plot.section, |c| c.skipped_cgroup += 1);
-                continue;
-            }
+            // Cgroup placeholder handling. When the parquet has cgroup
+            // data (`_cgroup_index` populated by `setup_cgroup_index`),
+            // substitute the placeholder with all observed cgroup names
+            // — mirroring the runtime contract where the user picks
+            // names from the cgroup selector and the frontend pushes
+            // them through `setActiveCgroupPattern`. When the parquet
+            // has none, fall back to the original v1 skip.
+            let has_placeholder = plot.sql.contains("__SELECTED_CGROUPS__")
+                || plot.promql.contains("__SELECTED_CGROUPS__");
+            let substituted: Option<PlotSpec> = if has_placeholder {
+                if sql_state.cgroup_names.is_empty() {
+                    let outcome = PairOutcome {
+                        parquet: parquet_str.clone(),
+                        plot_id: plot.id.clone(),
+                        section: plot.section.clone(),
+                        plot_type: plot.plot_type.clone(),
+                        promql: plot.promql.clone(),
+                        verdict: Verdict::SkippedCgroupPlaceholder,
+                    };
+                    write_json(&outcome_path, &outcome);
+                    p_counts.skipped_cgroup += 1;
+                    summary.counts.skipped_cgroup += 1;
+                    bump_section(&mut summary.per_section, &plot.section, |c| c.skipped_cgroup += 1);
+                    continue;
+                }
+                // SQL: `('name1','name2',...)` IN-list — matches
+                // `section_views.js::setSelectedCgroups`.
+                let sql_pat = format!(
+                    "({})",
+                    sql_state
+                        .cgroup_names
+                        .iter()
+                        .map(|n| format!("'{}'", sql_escape(n)))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                // PromQL: regex alternation `\/cg1|\/cg2|...` with
+                // metacharacters escaped. Goes inside `name=~"…"` in
+                // the dashboard PromQL templates.
+                let promql_pat = sql_state
+                    .cgroup_names
+                    .iter()
+                    .map(|n| promql_regex_escape(n))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let mut sub = plot.clone();
+                sub.sql = sub.sql.replace("__SELECTED_CGROUPS__", &sql_pat);
+                sub.promql = sub.promql.replace("__SELECTED_CGROUPS__", &promql_pat);
+                Some(sub)
+            } else {
+                None
+            };
+            let plot = substituted.as_ref().unwrap_or(plot);
 
             // Run PromQL.
             let effective = effective_promql(plot);
