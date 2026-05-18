@@ -1,62 +1,26 @@
 # Known PromQL ↔ SQL discrepancies
 
 This file tracks semantic gaps where the SQL twin produces a different
-result from the PromQL evaluator. Use it whenever a shadow-mode diff
-surfaces in production — if the diff matches one of these patterns, it's
+result from the PromQL evaluator. The live divergence harness is
+`metriken-query/examples/sql_vs_promql.rs` (invocation in
+`review/review.md` "Verification"). When that harness flags a divergent
+plot, check this list — if the diff matches one of these patterns it's
 expected; if not, it's a new bug worth investigating.
 
 Two layers can diverge:
 
-1. **Catalogue templates** — `metriken-query/queries.toml` entries
-   shadow-tested against real Rezolus parquets via
-   `tests/divergence_inspector.rs` and `tests/frontend_coverage.rs`. The
-   `frontend_coverage` gate runs every production query × every parquet
-   under `rezolus/site/viewer/data/`; primary parquets must produce zero
-   divergences.
-2. **Dynamic wide-form generator** — the lower-level SQL-emission layer
-   used outside the catalogue (notebooks / ad-hoc tooling).
+1. **Dashboard SQL emitters** — `rezolus/crates/dashboard/src/sql.rs`
+   helpers that the per-section dashboard generators call to produce
+   each plot's `sql` argument. This is the production path; the
+   `sql_vs_promql` harness compares them plot-by-plot against PromQL.
+2. **Wide-form translator** — `metriken-query/src/harness/translate.rs`,
+   the PromQL→SQL bridge behind the (non-default) `harness` feature.
+   Migration scaffolding; its known gaps appear here for historical
+   completeness but don't surface in the live dashboard path.
 
 ---
 
-## Catalogue: combined-recording timestamp gaps
-
-**Affected queries:** every counter-rate template (`irate(...)`, `rate(...)`,
-`sum(irate(...))`, etc.) — covers ~30 catalogue entries.
-
-**Affected parquets:** combined-recording parquets that contain at least one
-inter-snapshot gap (consecutive snapshots > 1 second apart). Confirmed on
-`AB_base.parquet`, `AB_base_pin.parquet`, `AB_level.parquet` (one gap each).
-The single-source agent recordings in `rezolus/site/viewer/data/` (demo,
-cachecannon, vllm, sglang, vllm_gemma3, AB_level_pin) are gap-free and
-produce identical canonical JSON.
-
-**Symptom:** PromQL emits N+1 points per series, SQL emits N. Values agree
-at every shared timestamp; the canonical JSON arrays differ only in length.
-The `frontend_coverage` test logs these as "AB-gap warnings" but does not
-fail (set `METRIKEN_FRONTEND_COVERAGE_STRICT_AB=1` to upgrade to failure).
-
-**Why:** PromQL `query_range(start, end, step)` evaluates the expression at
-every step from `start` to `end`. When there's no data sample at a given
-step but earlier samples are still inside the `[step - W, step]` window,
-PromQL emits a rate computed from those earlier samples — a
-carried-forward value. The SQL twin emits one row per actual data row in
-`_src`; gaps in the data stream produce gaps in the output. Per-pair time
-normalisation (`(value - LAG(value)) / (timestamp - LAG(timestamp))/1e9`,
-landed during Phase 7.2) ensures the values agree at shared timestamps —
-only the emission cadence differs.
-
-**Fix when needed:** rewrite the rate-computation CTE to drive emission
-off `generate_series(start_ns, end_ns, step_ns)` LEFT JOIN-ed to `_src`,
-carrying the last-known per-series rate forward across gaps. Invasive
-(touches every rate template) and currently uncalled-for in production
-(agent recordings have no gaps); deferred.
-
-**See also:** `metriken-query/queries.toml` header comment (idiom 6),
-`metriken-query/tests/frontend_coverage.rs` test header.
-
----
-
-## Catalogue: per-name cgroup fan-out drops rows after a column goes NULL
+## Dashboard SQL: per-name cgroup fan-out drops rows after a column goes NULL
 
 **Affected queries:** per-cgroup fan-out templates driven by
 `sql::cgroup_irate_by_name` (and structurally `sql::cgroup_ratio_by_name`,
@@ -88,9 +52,10 @@ in the `joined` CTE, so `(timestamp, name)` doesn't appear in the
 output. PromQL evaluates the expression at every step in the
 query-range grid; the `irate(...[5m])` window sees the last
 pre-NULL sample for ~300 s after the cgroup exits and produces a
-rate row. This is the same family as the "combined-recording
-timestamp gaps" entry below — both are PromQL's range-emission
-cadence interacting with sparse SQL inputs.
+rate row. The root cause is PromQL's range-emission cadence
+interacting with sparse SQL inputs — whenever the SQL row count
+drops below the PromQL evaluation-step count, a divergence of this
+shape can appear.
 
 **Fix when needed:** rewrite the per-name fan-out to drive emission
 off the full `_src` timestamp grid (LEFT JOIN against `_src.timestamp`)
@@ -98,6 +63,8 @@ and carry the last-known rate forward per `(name, col)` pair. Costly
 (touches every cgroup fan-out template) and the practical impact is
 limited to the post-exit tail of one-shot cgroups whose data is
 already zero/stale, so deferred.
+
+---
 
 ## Catalogue: `cpu_cores` multi-series mismatch on combined parquets
 
@@ -126,9 +93,10 @@ timestamp); multi-source parquets produce zero rows, matching PromQL.
 
 ---
 
-## Dynamic wide-form `irate` generator
+## Wide-form translator: `irate` generator
 
-The dynamic wide-form generator emits SQL of the form:
+The wide-form translator (`metriken-query/src/harness/translate.rs`,
+gated to the non-default `harness` feature) emits SQL of the form:
 
 ```sql
 WITH dt AS (
@@ -145,9 +113,13 @@ FROM dt
 WINDOW w AS (ORDER BY timestamp)
 ```
 
-This is close to PromQL `irate(metric[range])` but **not** identical. Two
-gaps are accepted for now; document them here so we don't forget when a
-divergence shows up in shadow-mode telemetry.
+This is close to PromQL `irate(metric[range])` but **not** identical.
+Two gaps are accepted for now; the translator's only consumers today
+are `examples/wide_form_coverage.rs` and the
+`tests/{engine_pipeline,translate_snapshots,orphan_detector}.rs`
+suite, so the gaps don't surface in the dashboard path. Documented
+here so the translator's land-or-delete decision (see
+`review/review.md`) can be made with eyes open.
 
 ### Range argument `[5m]` is ignored
 
@@ -195,25 +167,27 @@ arithmetic in the WHERE clause that may defeat predicate pushdown.
 ### When this matters in practice
 
 Both gaps are silent — the SQL returns *a* result, just not the same
-result PromQL would. Shadow-mode dispatch (`Mode::Shadow` in
-`metriken-query/src/dispatch.rs`) will surface them as canonical-JSON
-diffs against the PromQL twin. If a shadow diff lands on a query where
-the only difference is "PromQL has fewer points" or "PromQL skipped a
-gap-spanning sample," it is one of these two gaps and not a semantic
-bug in the SQL generator.
+result PromQL would. Running `wide_form_coverage` against a parquet
+with non-trivial gaps would surface them; the dashboard SQL path
+doesn't use the translator and so won't.
 
 ---
 
 ## Diagnostic tooling
 
-When a new shadow-mode divergence appears, three tools help isolate it:
+When `sql_vs_promql` flags a divergent plot, the artifacts that help
+isolate the cause:
 
-- `cargo run --release --example probe_rate_diff -p metriken-query -- <parquet> '<query>'`
-  prints the first few diverging `(timestamp, value)` pairs side-by-side
-  for a given (parquet, query) pair.
-- `cargo run --release --example shadow_replay -p metriken-query --
-  --parquet <parquet>` walks every production query against one parquet
-  and emits a markdown report (coverage / divergences / per-entry latency).
-- `cargo test --release -p metriken-query --test frontend_coverage --
-  --ignored --nocapture` is the gate test — runs the replay across every
-  parquet and asserts zero primary divergences.
+- `--out <dir>/<parquet_stem>/<plot_id>.json` — full per-plot record
+  with the PromQL and SQL strings, both result arrays, and the
+  `verdict` object (`divergent.reason` carries the first
+  `(timestamp, label, promql, sql)` mismatch).
+- `--out <dir>/<parquet_stem>.divergences.txt` — one-line summary per
+  divergent plot, useful for skimming.
+- `--out <dir>/summary.json` — top-level per-parquet and per-section
+  counts.
+- `--rel-tol` / `--abs-tol` knobs reclassify near-misses into the
+  `within_tolerance` bucket without changing source.
+- `--max-plots N` caps the run for a quick smoke; pair with
+  `--dashboard-dir` pointing at a freshly-generated section JSON
+  directory (`cargo run -p dashboard -- <dir>` in the rezolus tree).
