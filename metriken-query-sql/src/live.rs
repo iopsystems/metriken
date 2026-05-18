@@ -78,6 +78,77 @@ pub enum LiveValue<'a> {
     Histogram(&'a [u64]),
 }
 
+/// Derive the canonical `_src` column name for a metric, matching the
+/// parquet path's `views::canonical_alias`. Public so external bridges
+/// (rezolus's snapshot loop) compute the same name for the same input
+/// metric — a live `_src` ends up shaped identically to a parquet
+/// `_src` for the agent's emit format.
+///
+/// The agent's emit shape:
+///   - `raw_physical` is typically a numeric ID (`"49"`, `"24x0"`) or
+///     an already-canonical name (`"cpu_usage/user/0"`).
+///   - `metric` is the canonical metric name (`"cpu_usage"`,
+///     `"rezolus_cpu_usage"`).
+///   - `labels` are key→value pairs after shape keys are stripped
+///     (`{"state": "user", "id": "0"}`).
+///
+/// Returns:
+///   - `raw_physical` (verbatim, sans `<src>::` prefix) when it's
+///     already in canonical form — `metric`, `metric/...`, or
+///     `metric:buckets`.
+///   - Otherwise `metric/v1/v2/...:buckets?` rebuilt from sorted
+///     value labels (non-numeric values first, numeric values last).
+///
+/// This mirrors `views::canonical_alias` precisely so the same logic
+/// runs on both paths.
+pub fn canonical_column_name(
+    raw_physical: &str,
+    metric: &str,
+    labels: &BTreeMap<String, String>,
+    kind: LiveColumnKind,
+) -> String {
+    // Strip any `<src>::` prefix. Live single-source agents won't
+    // typically emit one, but be defensive.
+    let rest = match raw_physical.split_once("::") {
+        Some((_, r)) => r,
+        None => raw_physical,
+    };
+
+    // Already-canonical short-circuit.
+    if rest == metric
+        || rest == format!("{metric}:buckets")
+        || rest.starts_with(&format!("{metric}/"))
+    {
+        return rest.to_string();
+    }
+
+    // Rebuild from value labels. Infrastructure keys (`node`,
+    // `source`, `endpoint`, `instance`) and shape keys are excluded
+    // by the caller before we get here, so all entries in `labels`
+    // are real value labels.
+    const NON_VALUE_KEYS: &[&str] = &["endpoint", "instance", "node", "source"];
+    let mut value_labels: Vec<(&str, &str)> = labels
+        .iter()
+        .filter(|(k, _)| !NON_VALUE_KEYS.iter().any(|nv| *nv == k.as_str()))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    value_labels.sort_by(|a, b| {
+        let na = a.1.chars().all(|c| c.is_ascii_digit()) && !a.1.is_empty();
+        let nb = b.1.chars().all(|c| c.is_ascii_digit()) && !b.1.is_empty();
+        (na as u8).cmp(&(nb as u8)).then_with(|| a.0.cmp(b.0))
+    });
+
+    let mut name = metric.to_string();
+    for (_, v) in &value_labels {
+        name.push('/');
+        name.push_str(v);
+    }
+    if matches!(kind, LiveColumnKind::Histogram { .. }) {
+        name.push_str(":buckets");
+    }
+    name
+}
+
 /// An in-memory DuckDB database whose `_src` table grows as snapshots
 /// are appended. Cloning the `Arc<LiveSource>` is cheap; all real
 /// state sits behind a `Mutex`.
