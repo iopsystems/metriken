@@ -83,6 +83,45 @@ timestamp); multi-source parquets produce zero rows, matching PromQL.
 
 ---
 
+## Dashboard `rate()` emitter: sub-second window-start offset
+
+**Affected queries:** counter-rate plots whose dashboard SQL uses
+`WINDOW wr AS (ORDER BY timestamp RANGE BETWEEN 300000000000 PRECEDING
+AND CURRENT ROW)` for `rate(metric[5m])` — see e.g. the `delta_counter`
+emitter that produced `numa-local-rate`.
+
+**Symptom:** on parquets whose first raw timestamp carries a sub-second
+offset (e.g. `start_ns = 638_000_716_544` instead of a clean `638e9`),
+PromQL and SQL disagree by ~0.07% at the very last few eval points.
+Observed on `site/viewer/data/demo.parquet`: `numa-local-rate` at
+`t=1768956938`, `promql=190389.24` vs `sql=190251.58`, `rel≈7.2e-4`.
+Only one eval point flagged at our default tolerance (`rel_tol=1e-9`,
+`abs_tol=1e-12`); loosening either by a few orders of magnitude moves
+it into the "tolerant" bucket.
+
+**Why:** PromQL's evaluation point carries the parquet's first
+raw-timestamp offset, so its `[step - 5m, step]` window starts strictly
+greater than the snapped 5-minute-prior sample and excludes it. The
+SQL window's lower bound is the snapped timestamp itself, so the
+matching sample is *included*. The boundary sample contributes one
+extra increment to the SQL average, scaled by the window size — hence
+the small per-point diff at the trailing edge.
+
+The SQL emitter calls this out inline (`crates/dashboard/src/sql.rs` —
+the `delta_counter`/`rate` builders). The comment notes that the
+offset varies parquet-to-parquet and so the divergence isn't fixable
+by tightening the RANGE bound by a constant.
+
+**Fix when needed:** drive emission off `generate_series(start_ns,
+end_ns, step_ns)` with `start_ns` carrying the same sub-second offset
+PromQL uses, or hold the offset in scope when building the SQL and
+emit `RANGE BETWEEN INTERVAL '5 minutes' - <offset_ns> PRECEDING AND
+CURRENT ROW`. Both are invasive (touch every counter-rate emitter)
+and the diff is observable only at the trailing edge — deferred until
+a consumer needs the alignment.
+
+---
+
 ## Dynamic wide-form `irate` generator
 
 The dynamic wide-form generator emits SQL of the form:

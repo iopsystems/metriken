@@ -43,16 +43,18 @@ use metriken_query::{MatrixSample, QueryResult};
 #[cfg(feature = "legacy")]
 use metriken_query::{QueryEngine, Tsdb};
 
-/// Wasm-side macro source file. The static viewer's
-/// `crates/viewer-sql/src/lib.rs::pure_sql_macros()` returns this same
-/// string and the JS host runs it on every duckdb-wasm connection at
-/// boot. Re-using it here means the harness's SQL backend behaves
-/// exactly like what a user sees in the browser — including the no-op
-/// reset semantics of `irate_1s` (the native UDF form would give
-/// different numbers on counter resets).
-const WASM_MACROS_SQL: &str = include_str!(
+/// Wasm-side macros: the H2 SQL replacements for the native UDFs plus
+/// the SHARED_MACROS layer (dashboard-concept helpers like
+/// `cpu_busy_pct`, `ipc`, `irate_1s`). The static viewer's
+/// `crates/viewer-sql/src/lib.rs::pure_sql_macros()` concatenates the
+/// same two sources in the same order; running both here means the
+/// harness's SQL backend behaves exactly like what a user sees in the
+/// browser — including the no-op reset semantics of `irate_1s` (the
+/// native UDF form would give different numbers on counter resets).
+const WASM_H2_MACROS_SQL: &str = include_str!(
     "../../../rezolus/crates/viewer-sql/src/macros.sql"
 );
+const SHARED_MACROS_SQL: &str = metriken_query_sql::SHARED_MACROS;
 
 const USAGE: &str = "Usage: sql_vs_promql --dashboard-dir DIR --parquets P1 [P2 ...] --out DIR\n  \
     [--rel-tol F] [--abs-tol F] [--max-plots N]";
@@ -328,18 +330,22 @@ fn open_wasm_style_conn() -> Result<Connection, String> {
     let conn = Connection::open_in_memory()
         .map_err(|e| format!("open duckdb: {e}"))?;
     conn.set_prepared_statement_cache_capacity(1024);
-    for stmt in WASM_MACROS_SQL.split(";\n") {
-        let body: String = stmt
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
-            continue;
+    // H2 wrappers first, then SHARED_MACROS — same order
+    // `viewer-sql::pure_sql_macros()` uses for the browser.
+    for source in [WASM_H2_MACROS_SQL, SHARED_MACROS_SQL] {
+        for stmt in source.split(";\n") {
+            let body: String = stmt
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            conn.execute(trimmed, [])
+                .map_err(|e| format!("install macro:\n  body={trimmed}\n  err={e}"))?;
         }
-        conn.execute(trimmed, [])
-            .map_err(|e| format!("install macro:\n  body={trimmed}\n  err={e}"))?;
     }
     Ok(conn)
 }
