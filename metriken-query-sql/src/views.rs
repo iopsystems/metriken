@@ -23,7 +23,7 @@ use duckdb::Connection;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
 /// Internal: classify a column from its data type + metadata.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColumnKind {
     Counter,
     Gauge,
@@ -31,7 +31,7 @@ pub(crate) enum ColumnKind {
     Other,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ColumnInfo {
     /// The actual column name in the parquet file.
     pub(crate) physical: String,
@@ -527,7 +527,7 @@ fn canonical_alias(info: &ColumnInfo) -> String {
 /// Quote an SQL identifier — wrap in `"` and double any embedded
 /// `"`. Column names from Rezolus parquets can contain `/`, `:`,
 /// and other characters DuckDB's bare-word identifier parser rejects.
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -649,7 +649,7 @@ pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
 /// SQL single-quoted string literal with embedded `'` doubled
 /// per the SQL standard. Cgroup names and label values come from
 /// parquet metadata and can carry arbitrary characters.
-fn sql_string_lit(s: &str) -> String {
+pub(crate) fn sql_string_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {

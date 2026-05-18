@@ -28,12 +28,14 @@ use thiserror::Error;
 // across the crate boundary by the projector, and `views::ensure_views`
 // is used by perf-investigation scripts in `metriken-query`.
 pub(crate) mod backend;
+pub mod live;
 pub(crate) mod macros;
 pub(crate) mod observability;
 pub mod udf;
 pub mod views;
 
 pub use backend::DuckDbBackend;
+pub use live::{LiveColumn, LiveColumnKind, LiveSource, LiveValue};
 pub use macros::SHARED_MACROS;
 pub use observability::{BackendStats, PhaseSnapshot, StatsSnapshot};
 pub use views::{MetricCatalog, MetricSeries, view_name_for_source};

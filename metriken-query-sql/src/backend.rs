@@ -40,6 +40,7 @@ use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 
 use crate::SqlError;
+use crate::live::LiveSource;
 use crate::observability::BackendStats;
 use crate::views::MetricCatalog;
 
@@ -102,8 +103,28 @@ struct ConnState {
 /// a connection pool per unique `data_source` on first request. Pool
 /// size is fixed at backend construction; tune via
 /// `DuckDbBackend::with_pool_size` or the `METRIKEN_SQL_POOL` env var.
+///
+/// Two kinds of data sources cohabit on the same backend:
+///
+/// - **Parquet sources** — keyed in `connections` by file path or
+///   glob. Lazily warmed on first `run_sql`; each map entry holds the
+///   N-slot pool described above.
+/// - **Live sources** — keyed in `live_sources` by a caller-supplied
+///   string (e.g. `"baseline"`). Created up-front by
+///   [`DuckDbBackend::create_live_source`], single-connection
+///   single-mutex (see [`LiveSource`] docs). When a caller passes a
+///   key that matches a live source to `run_sql` or `describe`, the
+///   request routes there instead of through the parquet path.
+///
+/// The maps are checked separately so the same string can never name
+/// both a live source and a parquet path on the same backend — live
+/// keys are checked first; if no match, the request is treated as a
+/// parquet path. In practice rezolus uses
+/// `CaptureBackend::{Sql, Live}` to assign distinct strings, so
+/// collisions are not possible by construction.
 pub struct DuckDbBackend {
     connections: Mutex<HashMap<String, Arc<ConnState>>>,
+    live_sources: Mutex<HashMap<String, Arc<LiveSource>>>,
     pool_size: usize,
     stats: Arc<BackendStats>,
 }
@@ -136,9 +157,41 @@ impl DuckDbBackend {
     pub fn with_pool_size(n: usize) -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
+            live_sources: Mutex::new(HashMap::new()),
             pool_size: n.max(1),
             stats: Arc::new(BackendStats::default()),
         }
+    }
+
+    /// Register a live data source under `data_source`. The returned
+    /// `Arc<LiveSource>` is the appender handle for the caller's
+    /// ingest loop; subsequent `run_sql(_, data_source)` calls route
+    /// to it. Errors if a live source is already registered under the
+    /// same key — re-registration would silently lose the old
+    /// source's accumulated rows.
+    pub fn create_live_source(
+        &self,
+        data_source: &str,
+        source_name: &str,
+        sampling_interval_ms: u64,
+    ) -> Result<Arc<LiveSource>, SqlError> {
+        let live = LiveSource::new(source_name, sampling_interval_ms)?;
+        let mut map = self.live_sources.lock().expect("poisoned");
+        if map.contains_key(data_source) {
+            return Err(SqlError::Backend(format!(
+                "live source '{data_source}' already registered"
+            )));
+        }
+        map.insert(data_source.to_string(), live.clone());
+        Ok(live)
+    }
+
+    /// Look up a registered live source by `data_source` key. Returns
+    /// `None` for parquet sources. Used by `run_sql` / `describe_parquet`
+    /// / `invalidate` to dispatch on source kind.
+    fn live_source(&self, data_source: &str) -> Option<Arc<LiveSource>> {
+        let map = self.live_sources.lock().expect("poisoned");
+        map.get(data_source).cloned()
     }
 
     /// Per-backend in-process counters. Lock-free; safe to read from
@@ -229,8 +282,23 @@ impl DuckDbBackend {
     /// Execute `sql` against `data_source` and return the raw Arrow
     /// `RecordBatch`es DuckDB produces. The caller is responsible for
     /// any projection (e.g. into `QueryResult` shapes).
+    ///
+    /// Routing: a live source registered under `data_source` (see
+    /// [`Self::create_live_source`]) handles the request; otherwise
+    /// `data_source` is treated as a parquet path and routed through
+    /// the pooled in-memory DBs.
     pub fn run_sql(&self, sql: &str, data_source: &str) -> Result<Vec<RecordBatch>, SqlError> {
         let t_total = std::time::Instant::now();
+
+        // Live sources short-circuit the parquet pool. Their single
+        // shared Connection serializes reads against writes via its
+        // own Mutex — see `live.rs` for the rationale.
+        if let Some(live) = self.live_source(data_source) {
+            let result = live.run_sql(sql);
+            self.stats.total.record(t_total.elapsed().as_nanos() as u64);
+            return result;
+        }
+
         let (state, _cold) = self.get_or_init(data_source)?;
 
         // Acquire a slot. Round-robin via `next` gives a starting point;
@@ -327,7 +395,17 @@ impl DuckDbBackend {
     /// Warm path is a hashmap lookup + Arc clone; cold path pays
     /// one parquet metadata read and does **not** warm the connection
     /// pool.
+    ///
+    /// For live sources, returns a catalog built from the current
+    /// schema state. The catalog changes over time as new metrics
+    /// appear; callers that cache it should refresh after schema
+    /// growth (or just call this each time — it's a hashmap read +
+    /// per-column descriptor clone).
     pub fn describe_parquet(&self, data_source: &str) -> Result<Arc<MetricCatalog>, SqlError> {
+        // Live source short-circuit.
+        if let Some(live) = self.live_source(data_source) {
+            return Ok(Arc::new(live.catalog()));
+        }
         // Warm path: pool already initialised for this source.
         {
             let map = self.connections.lock().expect("poisoned");
@@ -352,9 +430,21 @@ impl DuckDbBackend {
     /// file at pool-init time and is stale by definition. In-flight
     /// queries holding an `Arc<ConnState>` keep their pool slots
     /// alive until they finish; only the cache entry is dropped.
+    ///
+    /// Live sources are also evicted here — the registered key is
+    /// removed from the live-sources map and any `Arc<LiveSource>`
+    /// the caller still holds keeps working in isolation. Use this
+    /// when shutting down the live ingest loop.
     pub fn invalidate(&self, data_source: &str) -> bool {
-        let mut map = self.connections.lock().expect("poisoned");
-        map.remove(data_source).is_some()
+        let live_removed = {
+            let mut map = self.live_sources.lock().expect("poisoned");
+            map.remove(data_source).is_some()
+        };
+        let parquet_removed = {
+            let mut map = self.connections.lock().expect("poisoned");
+            map.remove(data_source).is_some()
+        };
+        live_removed || parquet_removed
     }
 }
 
