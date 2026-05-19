@@ -1,4 +1,5 @@
-//! Embedded-DuckDB implementation of `metriken_query::SqlBackend`.
+//! Embedded-DuckDB query engine — per-`data_source` connection pool with panic-safe
+//! slot eviction.
 //!
 //! `DuckDbBackend` keeps a small **connection pool** per `data_source`
 //! (parquet path or glob). The first request for a given source pays the

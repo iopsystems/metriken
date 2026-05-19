@@ -114,9 +114,10 @@ uninitialized memory for NULL rows) and the uniform
 
 `shared_macros.sql` (re-exported as `SHARED_MACROS`) is the
 single source of truth for the 20 SQL macros that both the native
-engine and the WASM `viewer-sql` register on their connections.
-This is what stops native ↔ WASM emitter drift: the bytes are
-literally the same, parsed by both sides.
+engine and the rezolus WASM viewer (`/work/rezolus/crates/viewer-sql/`)
+register on their connections. This is what stops native ↔ WASM
+emitter drift: the bytes are literally the same, parsed by both
+sides.
 
 ## LiveSource (`live.rs`)
 
@@ -165,29 +166,35 @@ this branch (`17f1107`); the rezolus side consumes it via
 ## Cargo features and consumers
 
 Post-C5: the `metriken-query` crate is deleted. `metriken-query-sql`
-has no feature flags — single configuration, single build. Static
-viewer (`crates/viewer-sql`) and rezolus both link `metriken-query-sql`
-directly.
+has no feature flags — single configuration, single build. The
+rezolus WASM viewer (`/work/rezolus/crates/viewer-sql/`) and
+rezolus itself both link `metriken-query-sql` directly.
+
+## metriken-exposition: deterministic parquet footer
+
+`metriken-exposition/src/parquet.rs:319` sorts file-level
+KV metadata by key before writing the Parquet footer. Output is
+semantically identical to before — Parquet readers don't depend
+on KV order — but the byte layout is now stable run-to-run. Flagged
+here because downstream byte-fingerprint comparisons of recorder
+output will see a one-time shift.
 
 ---
 
 ## Rezolus-side follow-up: full PromQL purge (engine side: no-op)
 
-The rezolus side carries leftover PromQL surface — frontend
-helpers, the dashboard-emitter `plot_promql*` family, plot JSON's
-`promql_query` field, the `Kpi { query, sql }` struct, and the
-`query` fields in `config/templates/*.json`. See the rezolus
-companion (`/work/rezolus/review/review.md::PromQL purge — planned`)
-for the P1-P6 sequence.
+The rezolus-side PromQL purge (P1-P6) has landed: no
+`plot_promql*` family, no `Plot.promql_query`, no `Kpi.query`, no
+template `"query":` strings. See
+`/work/rezolus/review/review.md::PromQL purge — completed (P1-P6)`.
 
-The engine side has no code to delete — `metriken-query-sql`
-already speaks DuckDB SQL exclusively. The only follow-up touching
-this crate is the deferred KPI transcription work:
-`MetricCatalog` should expose per-histogram `grouping_power` so
-the substitution layer can emit `hist_p_p(buckets, ts, q, p)` for
-the ~75 histogram-percentile KPIs that still live as PromQL
-selectors on the rezolus side. That's a small additive change to
-`views.rs` — no impact on the current branch's review.
+The engine side had no code to delete — `metriken-query-sql`
+already speaks DuckDB SQL exclusively. The follow-up KPI
+transcription work (compound expressions + histogram-percentile
+fan-outs) landed in rezolus commits `9b9165f` / `9daefc6` /
+`cd92f18`; 209/218 KPIs ship SQL today. The remaining engine
+plumbing — `MetricCatalog::nodes()` for per-node `_src_node_<X>`
+views — landed in commit `33f5fe2`.
 
 ---
 
