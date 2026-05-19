@@ -115,6 +115,25 @@ pub struct MetricSeries {
     pub labels: BTreeMap<String, String>,
 }
 
+impl MetricCatalog {
+    /// Distinct `node` label values across the catalog, sorted
+    /// lexicographically. Empty for single-node captures (no series
+    /// carries a `node` label). Used by the rezolus viewer to
+    /// validate the `?node=` query param and to render the top-nav
+    /// node picker.
+    pub fn nodes(&self) -> Vec<&str> {
+        let mut set: BTreeSet<&str> = BTreeSet::new();
+        for series_list in self.series_by_metric.values() {
+            for s in series_list {
+                if let Some(node) = s.labels.get("node") {
+                    set.insert(node.as_str());
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+}
+
 /// Read parquet metadata: classify columns, dedupe duplicates, extract
 /// the sampling interval. Pure introspection — no DuckDB side effects.
 pub(crate) fn read_introspection(parquet_path: &str) -> duckdb::Result<(Vec<ColumnInfo>, u64)> {
@@ -436,6 +455,111 @@ pub(crate) fn render_per_source_views_sql(
         ));
     }
     statements.join("; ")
+}
+
+/// Render `CREATE OR REPLACE TEMP VIEW _src_node_<node> AS SELECT ...
+/// FROM read_parquet(...)` statements, one per distinct `node` label
+/// value across the parquet's column field metadata. Mirrors
+/// [`render_per_source_views_sql`] but groups by the `node` label
+/// instead of `source`, and reprojects columns under their canonical
+/// (un-prefixed) names so dashboard SQL can target a single node
+/// without changing the column-name convention.
+///
+/// Returns an empty string when no column carries a `node` label —
+/// single-node captures already expose everything in canonical form
+/// via `_src` and need no per-node aliasing.
+pub(crate) fn render_per_node_views_sql(
+    parquet_path: &str,
+    interval_ns: u64,
+    columns: &[ColumnInfo],
+) -> String {
+    let half = interval_ns / 2;
+    let parquet_lit = parquet_path.replace('\'', "''");
+    let has_duration = columns.iter().any(|c| c.physical == "duration");
+
+    let mut by_node: BTreeMap<&str, BTreeMap<String, Vec<&ColumnInfo>>> = BTreeMap::new();
+    for c in columns {
+        let Some(node) = c.labels.get("node") else {
+            continue;
+        };
+        let alias = canonical_alias(c);
+        by_node
+            .entry(node.as_str())
+            .or_default()
+            .entry(alias)
+            .or_default()
+            .push(c);
+    }
+    if by_node.is_empty() {
+        return String::new();
+    }
+
+    let mut statements: Vec<String> = Vec::with_capacity(by_node.len());
+    for (node, aliases) in &by_node {
+        let view_name = view_name_for_node(node);
+        let mut projections: Vec<String> = Vec::with_capacity(2 + aliases.len());
+        projections.push(format!(
+            "((CAST(timestamp AS BIGINT) + {half}) // {interval_ns}) * {interval_ns} AS timestamp"
+        ));
+        if has_duration {
+            projections.push("duration".to_string());
+        }
+        for (alias, contribs) in aliases {
+            let alias_q = quote_ident(alias);
+            if contribs.len() == 1 {
+                projections.push(format!(
+                    "{} AS {}",
+                    quote_ident(&contribs[0].physical),
+                    alias_q,
+                ));
+            } else {
+                // Multi-instance contributions to the same alias on a
+                // single node (e.g. two cachecannon instances on
+                // `node=alpha` both expose `target_rate`): aggregate.
+                let is_histogram = matches!(contribs[0].kind, ColumnKind::Histogram { .. });
+                if is_histogram {
+                    let parts: Vec<String> = contribs
+                        .iter()
+                        .map(|c| format!("COALESCE({}, []::UBIGINT[])", quote_ident(&c.physical)))
+                        .collect();
+                    projections.push(format!(
+                        "h2_combine_lol([{}]) AS {}",
+                        parts.join(", "),
+                        alias_q,
+                    ));
+                } else {
+                    let parts: Vec<String> = contribs
+                        .iter()
+                        .map(|c| format!("COALESCE({}, 0)", quote_ident(&c.physical)))
+                        .collect();
+                    projections.push(format!("({}) AS {}", parts.join(" + "), alias_q));
+                }
+            }
+        }
+        statements.push(format!(
+            "CREATE OR REPLACE TEMP VIEW {view} AS SELECT {projs} FROM read_parquet('{parquet_lit}')",
+            view = view_name,
+            projs = projections.join(", "),
+        ));
+    }
+    statements.join("; ")
+}
+
+/// Wasm-compatible view name for a node. Non-`[a-zA-Z0-9_]` chars
+/// become `_` so `host-01` resolves to `_src_node_host_01`. Used for
+/// the multi-node carve-out; mirrors the sanitization in
+/// [`view_name_for_source`].
+pub fn view_name_for_node(node: &str) -> String {
+    let mut out = String::with_capacity(node.len() + 10);
+    out.push_str("_src_node_");
+    for ch in node.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 /// Wasm-compatible view name for a source. Non-`[a-zA-Z0-9_]` chars
@@ -1303,6 +1427,106 @@ mod tests {
             sql.contains(r#"h2_combine_lol([COALESCE("0::response_latency:buckets", []::UBIGINT[]), COALESCE("1::response_latency:buckets", []::UBIGINT[])])"#),
             "expected h2_combine_lol for histogram aggregation: {sql}",
         );
+    }
+
+    #[test]
+    fn view_name_for_node_strips_non_alnum() {
+        assert_eq!(super::view_name_for_node("alpha"), "_src_node_alpha");
+        assert_eq!(super::view_name_for_node("host-01"), "_src_node_host_01");
+        assert_eq!(super::view_name_for_node("rack.a.1"), "_src_node_rack_a_1");
+        // Already-alphanumeric underscores survive.
+        assert_eq!(super::view_name_for_node("a_b_c"), "_src_node_a_b_c");
+    }
+
+    #[test]
+    fn render_per_node_views_groups_by_node_label() {
+        let cols = vec![
+            make_info(
+                "alpha::cpu_cycles/0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[("node", "alpha"), ("id", "0")],
+            ),
+            make_info(
+                "beta::cpu_cycles/0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[("node", "beta"), ("id", "0")],
+            ),
+        ];
+        let sql = super::render_per_node_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(sql.contains("_src_node_alpha"), "alpha view present: {sql}");
+        assert!(sql.contains("_src_node_beta"), "beta view present: {sql}");
+        // Each view reprojects under the unprefixed canonical name.
+        assert!(sql.contains(r#""alpha::cpu_cycles/0" AS "cpu_cycles/0""#));
+        assert!(sql.contains(r#""beta::cpu_cycles/0" AS "cpu_cycles/0""#));
+    }
+
+    #[test]
+    fn render_per_node_views_empty_when_no_node_label() {
+        let cols = vec![
+            make_info(
+                "cpu_cycles/0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[("id", "0")],
+            ),
+        ];
+        let sql = super::render_per_node_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(sql.is_empty(), "expected empty SQL: {sql}");
+    }
+
+    #[test]
+    fn render_per_node_views_sanitizes_node_name() {
+        // Slashes / hyphens become underscores so the view name is
+        // a bare SQL identifier.
+        let cols = vec![
+            make_info(
+                "host-01::cpu_cycles/0",
+                "cpu_cycles",
+                ColumnKind::Counter,
+                &[("node", "host-01"), ("id", "0")],
+            ),
+        ];
+        let sql = super::render_per_node_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
+        assert!(sql.contains("_src_node_host_01"), "sanitized view: {sql}");
+    }
+
+    #[test]
+    fn metric_catalog_nodes_dedupes_and_sorts() {
+        let mut cat = MetricCatalog::default();
+        cat.series_by_metric.insert(
+            "cpu_cycles".to_string(),
+            vec![
+                MetricSeries {
+                    physical: "alpha::cpu_cycles/0".into(),
+                    labels: [("node".to_string(), "alpha".to_string())].into_iter().collect(),
+                },
+                MetricSeries {
+                    physical: "beta::cpu_cycles/0".into(),
+                    labels: [("node".to_string(), "beta".to_string())].into_iter().collect(),
+                },
+                MetricSeries {
+                    physical: "alpha::cpu_cycles/1".into(),
+                    labels: [("node".to_string(), "alpha".to_string())].into_iter().collect(),
+                },
+            ],
+        );
+        let nodes = cat.nodes();
+        assert_eq!(nodes, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn metric_catalog_nodes_empty_for_single_node_capture() {
+        let mut cat = MetricCatalog::default();
+        cat.series_by_metric.insert(
+            "cpu_cycles".to_string(),
+            vec![MetricSeries {
+                physical: "cpu_cycles/0".into(),
+                labels: BTreeMap::new(),
+            }],
+        );
+        assert!(cat.nodes().is_empty());
     }
 
     #[test]

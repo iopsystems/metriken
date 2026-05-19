@@ -94,6 +94,7 @@ struct ConnState {
     /// target `_src_<service_name>` and bind regardless of how many
     /// instances of the same source the parquet ships.
     per_source_views_sql: Arc<str>,
+    per_node_views_sql: Arc<str>,
     /// Captured at backend-construction time; needed when a slot
     /// post-panic rebuilds, since `pool_size` lives on the backend.
     pool_size: usize,
@@ -242,6 +243,11 @@ impl DuckDbBackend {
             interval_ns,
             &columns,
         ));
+        let per_node_views_sql: Arc<str> = Arc::from(crate::views::render_per_node_views_sql(
+            data_source,
+            interval_ns,
+            &columns,
+        ));
 
         let mut pool: Vec<Mutex<Option<Connection>>> = Vec::with_capacity(self.pool_size);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -252,6 +258,7 @@ impl DuckDbBackend {
                 &src_sql,
                 &cgroup_index_sql,
                 &per_source_views_sql,
+                &per_node_views_sql,
             )?;
             pool.push(Mutex::new(Some(conn)));
         }
@@ -273,6 +280,7 @@ impl DuckDbBackend {
             src_sql,
             cgroup_index_sql,
             per_source_views_sql,
+            per_node_views_sql,
             pool_size: self.pool_size,
         });
         map.insert(data_source.to_string(), state.clone());
@@ -335,6 +343,7 @@ impl DuckDbBackend {
                 &state.src_sql,
                 &state.cgroup_index_sql,
                 &state.per_source_views_sql,
+                &state.per_node_views_sql,
             )?;
             *slot = Some(conn);
         }
@@ -459,6 +468,7 @@ fn build_slot_connection(
     src_sql: &str,
     cgroup_index_sql: &str,
     per_source_views_sql: &str,
+    per_node_views_sql: &str,
 ) -> Result<Connection, SqlError> {
     let conn =
         Connection::open_in_memory().map_err(|e| SqlError::Backend(format!("open duckdb: {e}")))?;
@@ -496,6 +506,13 @@ fn build_slot_connection(
     if !per_source_views_sql.is_empty() {
         conn.execute_batch(per_source_views_sql)
             .map_err(|e| SqlError::Backend(format!("create per-source views: {e}")))?;
+    }
+    // Per-node views (`_src_node_<X>` for each `node`-labelled column
+    // set) are created on multi-node captures so SQL can target a
+    // single node. Skipped when no column carries a `node` label.
+    if !per_node_views_sql.is_empty() {
+        conn.execute_batch(per_node_views_sql)
+            .map_err(|e| SqlError::Backend(format!("create per-node views: {e}")))?;
     }
     Ok(conn)
 }
