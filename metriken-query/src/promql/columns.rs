@@ -42,10 +42,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
 /// Reduce a rezolus-specific wrapper to its inner metric selector
 /// so the standard PromQL parser can handle it. The wrappers
-/// (`histogram_quantiles([qs], m, [stride])` and
-/// `histogram_heatmap(m, [stride])`) use array-literal / multi-arg
-/// syntax the parser rejects, but their *column set* is just the
-/// inner selector's. Non-rezolus queries pass through unchanged.
+/// (`histogram_quantiles([qs], m, [stride])`, `histogram_heatmap(m,
+/// [stride])`, `histogram_mean(m, [stride])`, `histogram_count(m,
+/// [stride])`) use array-literal / multi-arg syntax the parser
+/// rejects, but their *column set* is just the inner selector's.
+/// Non-rezolus queries pass through unchanged.
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     if let Some(inner) = query
         .strip_prefix("histogram_quantiles(")
@@ -66,12 +67,14 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
         let (selector, _stride) = parse_optional_stride(remaining)?;
         return Ok(selector);
     }
-    if let Some(inner) = query
-        .strip_prefix("histogram_heatmap(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let (selector, _stride) = parse_optional_stride(inner.trim())?;
-        return Ok(selector);
+    for prefix in ["histogram_heatmap(", "histogram_mean(", "histogram_count("] {
+        if let Some(inner) = query
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let (selector, _stride) = parse_optional_stride(inner.trim())?;
+            return Ok(selector);
+        }
     }
     Ok(query)
 }

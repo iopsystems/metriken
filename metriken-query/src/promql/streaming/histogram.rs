@@ -338,6 +338,208 @@ fn apply_quantiles_ref(
     }
 }
 
+/// Streaming `histogram_mean(metric{filter}[, stride])`.
+///
+/// Emits one series, labeled `{__name__: metric_name}`, whose value
+/// at each tick is the count-weighted mean of the (summed, per-tick
+/// delta) histogram: `Σ(bucket_midpoint × bucket_count) / Σcount`.
+/// Bucket midpoints use the inclusive `(start + end) / 2` of each
+/// non-zero bucket's range — the standard histogram mean estimate.
+pub fn mean(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    stride_ns: Option<u64>,
+    metric_name: &str,
+) -> Vec<MatrixSample> {
+    reduce(
+        collection,
+        label_filter,
+        start_ns,
+        end_ns,
+        stride_ns,
+        metric_name,
+        |r| {
+            let mut weighted = 0.0_f64;
+            let mut total = 0.0_f64;
+            for bucket in r.iter() {
+                let count = bucket.count() as f64;
+                let midpoint = (bucket.start() as f64 + bucket.end() as f64) / 2.0;
+                weighted += midpoint * count;
+                total += count;
+            }
+            (total > 0.0).then(|| weighted / total)
+        },
+    )
+}
+
+/// Streaming `histogram_count(metric{filter}[, stride])`.
+///
+/// Emits one series, labeled `{__name__: metric_name}`, whose value
+/// at each tick is the total number of observations in the (summed,
+/// per-tick delta) histogram — i.e. `QuantilesResult::total_count`,
+/// read directly off the merged `Ref` without a quantile walk.
+pub fn count(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    stride_ns: Option<u64>,
+    metric_name: &str,
+) -> Vec<MatrixSample> {
+    reduce(
+        collection,
+        label_filter,
+        start_ns,
+        end_ns,
+        stride_ns,
+        metric_name,
+        |r| {
+            let c = r.total_count();
+            (c > 0).then_some(c as f64)
+        },
+    )
+}
+
+/// Shared per-tick walk for scalar histogram reducers
+/// (`histogram_mean`, `histogram_count`).
+///
+/// Identical tick/stride/multi-series merge logic to [`quantiles`],
+/// but instead of running the quantile reducer it applies `reducer`
+/// to the per-tick merged `Ref` and appends a single `(t_sec, value)`
+/// point. Returns one [`MatrixSample`] labeled
+/// `{__name__: metric_name}`, or an empty `Vec` when no tick yields
+/// a value (empty range, no matching series, all-empty deltas).
+fn reduce(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    stride_ns: Option<u64>,
+    metric_name: &str,
+    reducer: impl Fn(&CumulativeROHistogram32Ref<'_>) -> Option<f64>,
+) -> Vec<MatrixSample> {
+    let mut iters: Vec<_> = collection
+        .iter()
+        .filter(|(labels, _)| label_filter.inner.is_empty() || labels.matches(label_filter))
+        .map(|(_, series)| series.iter().peekable())
+        .collect();
+
+    if iters.is_empty() {
+        return vec![];
+    }
+
+    let config: Option<Config> = iters
+        .iter_mut()
+        .filter_map(|it| it.peek().map(|(_, r)| r.config()))
+        .next();
+    let Some(config) = config else {
+        return vec![];
+    };
+
+    let mut values: Vec<(f64, f64)> = Vec::new();
+    let mut emit = |r: &CumulativeROHistogram32Ref<'_>, t_ns: u64| {
+        if let Some(v) = reducer(r) {
+            values.push((t_ns as f64 / 1e9, v));
+        }
+    };
+
+    let mut scratch_idx: Vec<u32> = Vec::new();
+    let mut scratch_cnt: Vec<u32> = Vec::new();
+
+    let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut stride_last_emit: Option<u64> = None;
+    let mut stride_end_time: u64 = 0;
+
+    loop {
+        let mut min_ts: Option<u64> = None;
+        for it in iters.iter_mut() {
+            while let Some(&(ts, _)) = it.peek() {
+                if ts > end_ns {
+                    it.next();
+                    continue;
+                }
+                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                break;
+            }
+        }
+        let Some(t) = min_ts else { break };
+
+        if t < start_ns {
+            for it in iters.iter_mut() {
+                if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
+                    it.next();
+                }
+            }
+            continue;
+        }
+
+        let mut at_t: Vec<CumulativeROHistogram32Ref<'_>> = Vec::new();
+        for it in iters.iter_mut() {
+            if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
+                let (_, r) = it.next().expect("peek matched");
+                at_t.push(r);
+            }
+        }
+
+        if let Some(stride) = stride_ns {
+            for r in &at_t {
+                accumulate_into(&mut stride_accum, r);
+            }
+            stride_end_time = t;
+
+            let last = match stride_last_emit {
+                Some(t) => t,
+                None => {
+                    stride_last_emit = Some(t);
+                    continue;
+                }
+            };
+            if t >= last && t - last >= stride {
+                if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
+                    let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                        config,
+                        &scratch_idx,
+                        &scratch_cnt,
+                    );
+                    emit(&r, stride_end_time);
+                }
+                stride_last_emit = Some(t);
+            }
+        } else {
+            match at_t.len() {
+                1 => emit(&at_t[0], t),
+                _ => {
+                    merge_into(&at_t, &mut scratch_idx, &mut scratch_cnt);
+                    let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                        config,
+                        &scratch_idx,
+                        &scratch_cnt,
+                    );
+                    emit(&r, t);
+                }
+            }
+        }
+    }
+
+    if stride_ns.is_some()
+        && !stride_accum.is_empty()
+        && flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt)
+    {
+        let r =
+            CumulativeROHistogram32Ref::from_parts_unchecked(config, &scratch_idx, &scratch_cnt);
+        emit(&r, stride_end_time);
+    }
+
+    if values.is_empty() {
+        return vec![];
+    }
+    let mut metric: HashMap<String, String> = HashMap::new();
+    metric.insert("__name__".to_string(), metric_name.to_string());
+    vec![MatrixSample { metric, values }]
+}
+
 /// Streaming `histogram_heatmap(metric{filter}[, stride])`.
 ///
 /// Same per-tick walk as [`quantiles`] (sum across input series's
