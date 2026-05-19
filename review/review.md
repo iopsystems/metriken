@@ -16,11 +16,12 @@ deletion:
    with the parquet path. See "LiveSource" below.
 3. **`metriken-query` deleted.** The legacy PromQL evaluator
    (`tsdb/` + `promql/`) + migration-scaffolding harness
-   (`harness/`) — ~10,914 LOC, plus the `queries.toml` shape
-   catalogue and three feature-gated examples — were removed in
-   C5 of this branch along with the crate itself. The deletion
-   was unblocked by C2-C4 on the rezolus side (see the rezolus
-   doc's `Tsdb removed — historical roadmap` for the sequence).
+   (`harness/`) — ~13K LOC across the three subdirs, plus the
+   `queries.toml` shape catalogue and three feature-gated examples
+   — were removed in C5 of this branch along with the crate itself
+   (~16.7K LOC total). The deletion was unblocked by C2-C4 on the
+   rezolus side (see the rezolus doc's `Tsdb removed — historical
+   roadmap` for the sequence).
 
 The evaluator did get one structural change before this branch:
 commit `a25e285` collapsed it to a streaming-only dispatcher,
@@ -150,9 +151,10 @@ this branch (`17f1107`); the rezolus side consumes it via
   label values ended up with `_src` columns named `49, 50, 51, ...`
   and dashboard SQL targeting `^cpu_usage(/[^:]+)?$` matched nothing.
 - **Test coverage.** L1: 10 tests in `tests/live.rs` (round-trip,
-  schema growth across kinds, NULL semantics, cgroup_index rebuild,
-  per-source view, concurrent read+write, bad-SQL surfacing). L2:
-  5 tests in `live.rs::tests` (cross-engine parity — replay parquet
+  time-range bounds, schema growth across kinds, NULL semantics,
+  cgroup_index rebuild, per-source view, timestamp snap-to-interval,
+  concurrent read+write, bad-SQL surfacing). L2: 5 tests in
+  `live.rs::tests` (cross-engine parity — replay parquet
   rows into a LiveSource and assert byte-identical Arrow output for
   SELECT/COUNT/MIN/MAX/SUM/irate_1s/h2_*). The L2 parity tests are
   the load-bearing regression catch: if live and parquet ever
@@ -169,53 +171,63 @@ directly.
 
 ---
 
+## Rezolus-side follow-up: full PromQL purge (engine side: no-op)
+
+The rezolus side carries leftover PromQL surface — frontend
+helpers, the dashboard-emitter `plot_promql*` family, plot JSON's
+`promql_query` field, the `Kpi { query, sql }` struct, and the
+`query` fields in `config/templates/*.json`. See the rezolus
+companion (`/work/rezolus/review/review.md::PromQL purge — planned`)
+for the P1-P6 sequence.
+
+The engine side has no code to delete — `metriken-query-sql`
+already speaks DuckDB SQL exclusively. The only follow-up touching
+this crate is the deferred KPI transcription work:
+`MetricCatalog` should expose per-histogram `grouping_power` so
+the substitution layer can emit `hist_p_p(buckets, ts, q, p)` for
+the ~75 histogram-percentile KPIs that still live as PromQL
+selectors on the rezolus side. That's a small additive change to
+`views.rs` — no impact on the current branch's review.
+
+---
+
 ## Verification
 
-`metriken-query/examples/sql_vs_promql.rs` runs every dashboard
-plot through both the PromQL evaluator (via the harness) and the
-SQL pipeline against the same parquet(s), and diffs canonical-JSON
-results plot-by-plot:
-
 ```bash
-cargo run --release --example sql_vs_promql --features "legacy,harness" -- \
-  --dashboard-dir /tmp/dashboard_json \
-  --parquets /work/rezolus/site/viewer/data/demo.parquet \
-  --out /tmp/sql_vs_promql
+# Engine-side workspace, all tests
+cargo test --workspace --all-features --all-targets
+
+# Just the engine
+cargo test -p metriken-query-sql
 ```
 
-(Generate the dashboard-dir input with
-`cargo run -p dashboard -- /tmp/dashboard_json` from the rezolus
-tree — it dumps one JSON per section, which the harness walks for
-plot specs.) `summary.json` in the chosen `--out` directory is the
-top-level result; `--max-plots N` caps the run for a quick smoke,
-`--rel-tol` / `--abs-tol` tune the diff. Rerun before opening the
-PR — it's the only thing that catches semantic drift between the
-two engines on real data.
+The load-bearing checks are the L1 + L2 tests inside the engine:
+**L1** (`metriken-query-sql/tests/live.rs`) covers the LiveSource
+externally — round-trip, time-range bounds, schema growth across kinds,
+NULL semantics, cgroup-index rebuild, per-source view, timestamp
+snap-to-interval, concurrent read+write, bad-SQL surfacing. **L2** (`metriken-query-sql/src/live.rs::tests`) is the
+cross-engine parity gate: it replays parquet rows into a `LiveSource`
+and asserts byte-identical Arrow output for SELECT / COUNT / MIN /
+MAX / SUM / `irate_1s` / `h2_*`. If live and parquet ever diverge
+on identical input, this fails first.
 
-### Known divergences
+### Historical: `sql_vs_promql`
 
-Across the three real fixtures (`demo.parquet`, `AB_level_pin.parquet`,
-`AB_base.parquet`) the harness reports **698 identical / 1 divergent**
-on the live dashboard SQL path. The remaining divergence and two
-gaps in the scaffolding translator:
+Pre-C5, the `metriken-query/examples/sql_vs_promql.rs` harness ran
+every dashboard plot through both the PromQL evaluator (via the
+harness translator) and the SQL pipeline against the same parquets,
+diffing canonical-JSON results plot-by-plot. Final run before
+deletion across `demo.parquet`, `AB_level_pin.parquet`, and
+`AB_base.parquet`: **698 identical / 1 divergent / 0 errors**. The
+only divergence was `numa-local-rate` on `AB_base.parquet`,
+`rel ≈ 2.7e-5` at the last eval point — floating-point residual from
+the 300-second RANGE arithmetic; sub-tolerance under any sane
+`--rel-tol`. The harness, its translator, and the example were
+deleted in C5 along with the rest of `metriken-query`; the L2 parity
+tests are now the regression catch.
 
-- **Sub-tolerance: `numa-local-rate` on `AB_base.parquet`.** `rel ≈
-  2.7e-5` at the last eval point — floating-point residual from the
-  300-second RANGE arithmetic. Loosening `--rel-tol` from 1e-9 to
-  1e-4 moves it into the `within_tolerance` bucket. Not actionable.
-
-- **Wide-form translator** (`metriken-query/src/harness/translate.rs`,
-  behind the off-by-default `harness` feature). Emits SQL that
-  ignores the PromQL `[range]` argument (uses immediate `LAG`
-  regardless of how far back the prior sample is) and doesn't honor
-  the `query_range` step parameter (one output row per raw `_src`
-  timestamp). The translator's only consumers today are the
-  `wide_form_coverage` example and the harness-feature test suite —
-  neither gap surfaces in the dashboard SQL path. Both either land
-  (translator becomes a production caller; fixes follow) or die with
-  the translator under the land-or-delete decision above.
-
-No other PromQL ↔ SQL divergences are known on the dashboard path.
+No PromQL ↔ SQL divergences other than the sub-tolerance one above
+were known on the dashboard path at the moment of deletion.
 
 ---
 
@@ -233,8 +245,7 @@ No other PromQL ↔ SQL divergences are known on the dashboard path.
 4. **`views.rs::render_per_source_views_sql`** — the multi-source
    projection that makes service-extension `{{view}}` templates
    bind across `vllm`, `sglang`, `valkey`, etc.
-5. **Run `sql_vs_promql` once before C5** against demo /
-   AB_level_pin / AB_base; record the final divergence count for
-   posterity, then watch the harness + evaluator + diff tool all
-   delete together. Skip `harness/translate.rs` internals — they're
-   leaving.
+5. **L2 parity tests** in `live.rs::tests` — the cross-engine
+   regression catch now that `sql_vs_promql` is gone. Run alongside
+   the L1 external tests in `tests/live.rs`; any drift between
+   parquet-pool and live-source semantics fails here first.
