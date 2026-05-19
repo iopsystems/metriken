@@ -1,6 +1,6 @@
 # Metriken — Architecture
 
-Metriken is two systems separated by a Parquet file in the middle. On the left, an application produces metrics; on the right, a dashboard reads them back and asks questions.
+Metriken is two systems separated by a Parquet file in the middle — or, in the live-agent case, by a `LiveSource` ingest: same wide-column shape, no parquet on disk. On the left, an application produces metrics; on the right, a dashboard reads them back and asks questions.
 
 ```
                     ┌────────────────────────────────────────────────────────┐
@@ -50,50 +50,41 @@ Metriken is two systems separated by a Parquet file in the middle. On the left, 
                     │                   READ SIDE  (query / dashboard)                   │
                     └─────────────────────────────────────────────────────────────────────┘
 
-                                                  Parquet file
-                                                       │
-                          ┌────────────────────────────┴────────────────────────────┐
-                          │                                                         │
-                          ▼                                                         ▼
-              ┌────────────────────────┐                       ┌───────────────────────────────┐
-              │   LEGACY PATH          │                       │   SQL HARNESS PATH            │
-              │   (default; live)      │                       │   (feature = "harness";       │
-              │                        │                       │    migration scaffolding,     │
-              │ Tsdb::load(path)       │                       │    no prod callers today)     │
-              │  ├─ CounterCollection  │                       │                               │
-              │  ├─ GaugeCollection    │                       │ Engine::new(path)             │
-              │  └─ HistogramCollection│                       │  │                            │
-              │     (per-series        │                       │  │  query_range(promql,…)     │
-              │      Arrow-backed      │                       │  ▼                            │
-              │      time series)      │                       │ Catalogue::lookup ──► picks   │
-              │        │               │                       │   one of ~69 known PromQL     │
-              │        │               │                       │   shapes, extracts captures   │
-              │        ▼               │                       │  │                            │
-              │ QueryEngine            │                       │  ▼                            │
-              │ (promql/streaming/*    │                       │ translate::try_generate       │
-              │  iterator pipelines:   │                       │   ── emits wide-form SQL ──►  │
-              │  irate, rate, deriv,   │                       │                               │
-              │  sum-by, histogram     │                       │  ┌─────────────────────────┐  │
-              │  quantile, …)          │                       │  │  metriken-query-sql     │  │
-              │        │               │                       │  │  DuckDbBackend          │  │
-              │        ▼               │                       │  │   ├─ in-mem conn pool   │  │
-              │   QueryResult          │                       │  │   ├─ _src TEMP TABLE    │  │
-              │   {Vector|Matrix|      │                       │  │   ├─ H2 histogram UDFs  │  │
-              │    Scalar|Heatmap}     │                       │  │   │  (h2_lower/upper/   │  │
-              │                        │                       │  │   │   quantile/delta…)  │  │
-              │                        │                       │  │   └─ shared_macros.sql  │  │
-              │                        │                       │  │      (irate_1s, rate_5m,│  │
-              │                        │                       │  │       hist_p99, …)      │  │
-              │                        │                       │  └────────────┬────────────┘  │
-              │                        │                       │               │ Arrow batches │
-              │                        │                       │               ▼               │
-              │                        │                       │     harness::project::run     │
-              │                        │                       │     (positional → Matrix or   │
-              │                        │                       │      HistogramHeatmap)        │
-              │                        │                       │               │               │
-              │                        │                       │               ▼               │
-              │                        │                       │           QueryResult         │
-              └────────────────────────┘                       └───────────────────────────────┘
+              Parquet file on disk                       Live agent snapshots
+                       │                                           │
+                       │ read_parquet(...)                          │ append per snapshot
+                       │ (one slot per pool slot)                   │ ALTER TABLE _src ADD COLUMN
+                       ▼                                            ▼
+              ┌────────────────────────────────────────────────────────────────┐
+              │           metriken-query-sql ── DuckDbBackend                  │
+              │                                                                │
+              │  parquet path:                       live path:                │
+              │  ├─ ConnState pool                   ├─ LiveSource             │
+              │  │  (N independent in-mem DBs)       │  (one shared            │
+              │  ├─ _src TEMP TABLE per slot         │   Mutex<Connection>)    │
+              │  ├─ _cgroup_index TEMP TABLE         ├─ _src TABLE (grows)     │
+              │  ├─ _src_<source> TEMP VIEWs         ├─ _cgroup_index          │
+              │  └─ MetricCatalog from               │  (rebuilt on cgroup     │
+              │     parquet field metadata           │   column add)           │
+              │                                      ├─ _src_<source> as       │
+              │                                      │   SELECT * (passthrough)│
+              │                                      └─ MetricCatalog          │
+              │                                                                │
+              │  Shared on every connection:                                   │
+              │  ├─ H2 histogram UDFs (h2_lower/upper/quantile/delta/...)      │
+              │  └─ shared_macros.sql (irate_1s, rate_5m, hist_p99, ...)       │
+              │                                                                │
+              │            run_sql(sql, data_source) ──► Arrow batches         │
+              └────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+                            crates/prom-matrix or harness::project
+                            (Arrow → Matrix/Heatmap shape consumers
+                             on the rezolus + WASM viewer side)
+
+(The metriken-query crate — legacy PromQL evaluator + harness — is
+deleted in C5 of this branch. The diagram above is the post-deletion
+end state.)
 ```
 
 ## Crate map
@@ -112,8 +103,8 @@ metriken-derive    ── #[metric] proc-macro. Lowers to a
 
 metriken           ── user-facing API. Counter, Gauge, AtomicHistogram,
                      RwLockHistogram, CounterGroup, ShardedCounterGroup,
-                     Lazy<T>. Re-exports the macro and the registry
-                     accessors from -core.
+                     GaugeGroup, HistogramGroup, Lazy<T>. Re-exports
+                     the macro and the registry accessors from -core.
 
 metriken-exposition── reads the registry; produces Snapshot{V1,V2}.
                      Output drivers (feature-gated):
@@ -124,18 +115,27 @@ metriken-exposition── reads the registry; produces Snapshot{V1,V2}.
                      MsgpackToParquet converts streamed snapshots into
                      a single Parquet file after the fact.
 
-metriken-query     ── consumer side. Two backends behind one
-                     QueryResult type:
-                       tsdb/ + promql/   – the live PromQL evaluator.
-                       harness/          – PromQL→SQL translator that
-                                            delegates execution to…
+metriken-query     ── DELETED IN C5 OF THIS BRANCH. Was the consumer-
+                     side PromQL evaluator (tsdb/ + promql/) plus
+                     a PromQL→SQL translator harness (harness/) that
+                     never gained a production caller. Its last
+                     consumer (rezolus's validate_service_extensions)
+                     migrates to SQL in C3.
 
-metriken-query-sql ── …DuckDbBackend. Owns a per-data-source pool of
-                     in-memory DuckDB connections, registers the H2
-                     histogram UDFs and the shared SQL macro library,
-                     and builds a MetricCatalog from the parquet's
-                     Arrow field metadata so wide-form SQL can select
-                     by canonical metric name + labels.
+metriken-query-sql ── The query engine.
+                       parquet path: DuckDbBackend owns a per-data-
+                       source pool of in-memory DuckDB connections,
+                       each materialising _src + _cgroup_index +
+                       _src_<source> per-source views from the
+                       parquet's Arrow field metadata.
+                       live path: LiveSource owns a single shared
+                       Mutex<Connection> whose _src grows via
+                       ALTER + INSERT per agent snapshot.
+                       Registers H2 histogram UDFs + shared SQL macro
+                       library on every connection. Exposes
+                       MetricCatalog via both source kinds so wide-
+                       form SQL selects by canonical metric name +
+                       labels regardless of where the data came from.
 
 metriken-query-
    -fixtures       ── series-shaped builder on top of
@@ -149,6 +149,6 @@ metriken-query-
 
 **The wire format is wide.** Each labeled time series is its own Parquet column. The metric's canonical name and label pairs live in Arrow field metadata. Histograms are stored as `List<UInt64>` (the bucket counts), with `grouping_power` / `max_value_power` in the column metadata. This shape is what lets the SQL side address series via `_src."col_name"` and project rates with windowed `LAG` instead of doing a self-join on a long-form `(t, metric, labels..., value)` table.
 
-**Two query backends, one result type.** The legacy PromQL evaluator (in `promql/streaming/*`) builds iterator pipelines over an in-memory `Tsdb`. It's the live path today — Rezolus and its viewers depend on it. The SQL harness (in `harness/*`) is migration scaffolding: a registry of ~69 known PromQL shapes (`queries.toml`), each with a template-matcher + a wide-form SQL emitter + a positional projector that turns DuckDB's Arrow output back into the same `QueryResult`. The harness exists so it can be exercised side-by-side via `examples/sql_vs_promql.rs` until the dashboards emit SQL natively; the whole directory is a clean delete once that happens.
+**One query backend, two ingest paths.** Post-this-branch (C5), `metriken-query` is gone — the legacy PromQL evaluator (`promql/streaming/*`) and the SQL harness (`harness/*`) both delete. Rezolus and the static viewer now drive SQL through `metriken-query-sql::DuckDbBackend` directly, with the parquet path materializing `_src` from `read_parquet(...)` and the live path appending to a `LiveSource` that owns a single mutable `_src` table. The SQL macros (`shared_macros.sql`, re-exported as `SHARED_MACROS`) are byte-identical across native and WASM consumers because `include_str!` pulls the same file into both. The PromQL evaluator's role lived only long enough to backstop `validate_service_extensions` while service-extension KPI templates accumulated SQL coverage; once 128/218 templates carried SQL and LiveSource bridged the live-agent path, the deletion plan executed.
 
 **H2 histograms cross the boundary intact.** Rezolus's H2 (base-2) histogram layout is the one representation that survives the trip from producer to query. On the producer side, `metriken::AtomicHistogram` wraps the canonical `histogram` crate's layout. On the SQL side, `metriken-query-sql/src/udf.rs` reimplements that same bucket math as DuckDB scalar UDFs (`h2_lower`, `h2_upper`, `h2_quantile`, `h2_delta`, …) so SQL queries can do quantiles and per-period deltas directly over the `List<UInt64>` bucket columns without unpacking. The bucket-math is the contract; both sides verify against it.
