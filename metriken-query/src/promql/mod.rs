@@ -432,10 +432,20 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         let end_ns = (end * 1e9) as u64;
         let result = match func {
             "histogram_mean" => streaming::histogram::mean(
-                collection, &labels, start_ns, end_ns, stride_ns, &metric_name,
+                collection,
+                &labels,
+                start_ns,
+                end_ns,
+                stride_ns,
+                &metric_name,
             ),
             _ => streaming::histogram::count(
-                collection, &labels, start_ns, end_ns, stride_ns, &metric_name,
+                collection,
+                &labels,
+                start_ns,
+                end_ns,
+                stride_ns,
+                &metric_name,
             ),
         };
         if result.is_empty() {

@@ -68,10 +68,7 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
         return Ok(selector);
     }
     for prefix in ["histogram_heatmap(", "histogram_mean(", "histogram_count("] {
-        if let Some(inner) = query
-            .strip_prefix(prefix)
-            .and_then(|s| s.strip_suffix(')'))
-        {
+        if let Some(inner) = query.strip_prefix(prefix).and_then(|s| s.strip_suffix(')')) {
             let (selector, _stride) = parse_optional_stride(inner.trim())?;
             return Ok(selector);
         }

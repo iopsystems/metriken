@@ -1267,7 +1267,9 @@ fn test_columns_histogram_mean_resolves_buckets_column() {
     let tsdb = Arc::new(create_columns_histogram_tsdb());
     let engine = QueryEngine::new(tsdb);
 
-    let cols = engine.columns("histogram_mean(tcp_packet_latency)").unwrap();
+    let cols = engine
+        .columns("histogram_mean(tcp_packet_latency)")
+        .unwrap();
     assert_eq!(
         cols,
         ["tcp_packet_latency:buckets".to_string()]
@@ -1393,7 +1395,12 @@ fn test_histogram_count_label_filter_selects_single_series() {
     let engine = QueryEngine::new(tsdb);
 
     let result = engine
-        .query_range(r#"histogram_count(req_latency{cpu="0"})"#, 1000.0, 1003.0, 1.0)
+        .query_range(
+            r#"histogram_count(req_latency{cpu="0"})"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
         .unwrap();
 
     let QueryResult::Matrix { result } = result else {
