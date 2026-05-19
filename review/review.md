@@ -2,34 +2,25 @@
 
 Companion: `/work/rezolus/review/review.md` (consumer side).
 
-This branch ships three things on the engine side:
+This branch ships two engine-side deliverables and one big
+deletion:
 
-1. **`metriken-query-sql`** — a DuckDB-backed query engine
+1. **`metriken-query-sql`** — the DuckDB-backed query engine
    (connection pool, H2 histogram UDFs, shared dashboard macros).
-   It's live: the Rezolus static viewer's macro/UDF tests link it,
-   and the server-backed viewer routes `/api/v1/query{,_range}`
-   through it for *both* file mode and live mode.
-2. **`LiveSource`** — a single-`Connection` in-memory DuckDB ingest
-   that grows `_src` snapshot-by-snapshot via `ALTER + INSERT`.
-   Lets rezolus's live-agent path share the SQL pipeline with the
-   parquet path. See "LiveSource" below.
-3. **A PromQL → SQL harness** behind a non-default `harness`
-   feature. No production caller. The land-or-delete question has
-   converged on **delete** now that LiveSource shipped — see
-   *Harness fate* below.
-
-The pre-existing PromQL evaluator (`metriken-query::promql` +
-`tsdb`, gated `feature = "legacy"`) is unchanged in its role on
-this branch. Its surviving consumers, post the MCP and
-report-save-column-trim migrations on the rezolus side, are:
-the dashboard crate's `Tsdb` re-export, the viewer's live-mode
-`validate_service_extensions` KPI check, and `report-save`'s
-live-mode query embed (the column-trim half moved to
-`metriken-query-sql::MetricCatalog`). Removing it entirely is the
-topic of the *Removing Tsdb entirely* section in the rezolus doc
-— now mid-execution in this same branch's C2-C5 commits; the
-engine-side fallout (delete `metriken-query/src/{promql, tsdb,
-harness}`) is C5.
+   The Rezolus static viewer's macro/UDF tests link it, and the
+   server-backed viewer routes `/api/v1/query{,_range}` through
+   it for *both* file mode and live mode.
+2. **`LiveSource`** — a single-`Connection` in-memory DuckDB
+   ingest that grows `_src` snapshot-by-snapshot via `ALTER +
+   INSERT`. Lets rezolus's live-agent path share the SQL pipeline
+   with the parquet path. See "LiveSource" below.
+3. **`metriken-query` deleted.** The legacy PromQL evaluator
+   (`tsdb/` + `promql/`) + migration-scaffolding harness
+   (`harness/`) — ~10,914 LOC, plus the `queries.toml` shape
+   catalogue and three feature-gated examples — were removed in
+   C5 of this branch along with the crate itself. The deletion
+   was unblocked by C2-C4 on the rezolus side (see the rezolus
+   doc's `Tsdb removed — historical roadmap` for the sequence).
 
 The evaluator did get one structural change before this branch:
 commit `a25e285` collapsed it to a streaming-only dispatcher,
@@ -41,7 +32,7 @@ scalar-passthrough backstop. The shadow-mode plumbing is gone.
 
 ---
 
-## Harness fate — deleting in C5
+## Harness fate — deleted in C5
 
 `metriken-query/src/harness/translate.rs` opens with:
 
@@ -72,11 +63,11 @@ Tsdb entirely" items B and A respectively — both are SQL-rewrite
 work, not harness wiring. So the harness has no remaining
 plausible consumer.
 
-**Decision: delete.** C5 of this branch removes
+**Outcome: deleted.** C5 of this branch removed
 `metriken-query/src/harness/`, `queries.toml`, and the three
 examples (`sql_vs_promql.rs`, `wide_form_coverage.rs`,
 `enumerate_rezolus_queries.rs`) together with the rest of the
-legacy modules.
+legacy modules and the entire `metriken-query` crate.
 
 ---
 
@@ -171,20 +162,10 @@ this branch (`17f1107`); the rezolus side consumes it via
 
 ## Cargo features and consumers
 
-| Feature | What it pulls in | Consumers | Fate |
-|---|---|---|---|
-| `legacy` (default) | The streaming PromQL evaluator + `Tsdb` | The live PromQL surface enumerated in the rezolus doc. | Deleted in C5. |
-| `ingest` | `legacy` + `metriken-exposition` (parquet→Tsdb) | The Rezolus binary (live-agent ingest path). | Deleted in C5. |
-| `harness` (off) | The PromQL→SQL translator + `harness::Engine` | None today. | Deleted in C5. |
-| `lz4` (default) | `parquet/lz4` | — | Survives. |
-
-`legacy` and `harness` share only `result.rs`. Each combination
-builds clean. The Rezolus binary uses `ingest` with
-`default-features = false` (so no `lz4` from this dep); the
-dashboard crate uses `legacy`; the static viewer doesn't link
-this crate at all. After C5 the only surviving consumers of
-anything in `metriken-query` will be tests of the `metriken-query-sql`
-crate (which doesn't depend on `metriken-query`).
+Post-C5: the `metriken-query` crate is deleted. `metriken-query-sql`
+has no feature flags — single configuration, single build. Static
+viewer (`crates/viewer-sql`) and rezolus both link `metriken-query-sql`
+directly.
 
 ---
 
