@@ -368,13 +368,20 @@ fn concurrent_reader_sees_consistent_state_while_appender_writes() {
     // value), and observed MAX(timestamp) must be non-decreasing.
     let live = LiveSource::new("rezolus", 1000).expect("new");
     let stop = Arc::new(AtomicBool::new(false));
+    let c = column("requests", "requests", LiveColumnKind::Counter);
+
+    // Seed the `requests` column on the main thread so the reader can't
+    // race the writer's first append and see "column not found" — the
+    // table is created without it.
+    live.append(1_000_000_000, None, &[(c.clone(), LiveValue::Counter(10))])
+        .expect("seed append");
 
     let writer = {
         let live = live.clone();
         let stop = stop.clone();
+        let c = c.clone();
         thread::spawn(move || {
-            let c = column("requests", "requests", LiveColumnKind::Counter);
-            for i in 1u64..=50 {
+            for i in 2u64..=50 {
                 live.append(
                     i * 1_000_000_000,
                     None,
