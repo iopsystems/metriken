@@ -341,10 +341,10 @@ fn apply_quantiles_ref(
 /// Streaming `histogram_mean(metric{filter}[, stride])`.
 ///
 /// Emits one series, labeled `{__name__: metric_name}`, whose value
-/// at each tick is the count-weighted mean of the (summed, per-tick
-/// delta) histogram: `Σ(bucket_midpoint × bucket_count) / Σcount`.
-/// Bucket midpoints use the inclusive `(start + end) / 2` of each
-/// non-zero bucket's range — the standard histogram mean estimate.
+/// at each tick is the bucket-midpoint mean of the (summed, per-tick
+/// delta) histogram. Read off the merged `Ref`'s cached `mean()`
+/// field — populated once at Ref construction by the histogram
+/// crate, so the per-tick read here is O(1).
 pub fn mean(
     collection: &HistogramCollection,
     label_filter: &Labels,
@@ -360,17 +360,7 @@ pub fn mean(
         end_ns,
         stride_ns,
         metric_name,
-        |r| {
-            let mut weighted = 0.0_f64;
-            let mut total = 0.0_f64;
-            for bucket in r.iter() {
-                let count = bucket.count() as f64;
-                let midpoint = (bucket.start() as f64 + bucket.end() as f64) / 2.0;
-                weighted += midpoint * count;
-                total += count;
-            }
-            (total > 0.0).then(|| weighted / total)
-        },
+        |r| r.mean(),
     )
 }
 
