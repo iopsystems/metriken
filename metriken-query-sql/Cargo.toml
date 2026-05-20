@@ -16,7 +16,13 @@ publish = false
 [dependencies]
 arrow.workspace = true
 bytes = "1"
-duckdb = { version = "1.1.1", features = ["bundled", "vscalar"] }
+# `parquet` statically links DuckDB's parquet extension into libduckdb
+# instead of leaving it as an autoload-at-runtime extension. Without
+# this, the first `read_parquet(...)` triggers DuckDB's extension
+# installer which fails on Windows CI ("Could not move file: Access is
+# denied") and on any sandbox where the extension cache dir isn't
+# writable. Statically linked it Just Works on every platform.
+duckdb = { version = "1.1.1", features = ["bundled", "vscalar", "parquet"] }
 parquet = { workspace = true, default-features = false, features = ["arrow", "snap", "brotli", "flate2", "flate2-rust_backened", "zstd"] }
 thiserror = "2"
 
