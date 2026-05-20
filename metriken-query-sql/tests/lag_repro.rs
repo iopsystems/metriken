@@ -682,39 +682,113 @@ fn large_dataset_dbg() {
 // uses the FFI bypass that production UDFs share (see `read_list_child_no_reserve`
 // at the top of this file and in `src/udf.rs`); on Linux this matches the
 // prior `child(0).as_slice_with_len` workaround, and on macOS / Windows it
-// avoids the `duckdb_list_vector_reserve(0)` side effects that broke the
-// previous workaround. This test enforces "delta = [2, 2] for every row past
-// row 0" cross-platform.
+// is the new code path that doesn't call `duckdb_list_vector_reserve` at all.
+// This test enforces "delta = [2, 2] for every row past row 0" cross-platform.
+//
+// Helper that decodes a `LIST<UBIGINT>` column result into `Vec<u64>`.
+fn decode_list_u64(v: Option<duckdb::types::Value>) -> Option<Vec<u64>> {
+    v.map(|val| match val {
+        duckdb::types::Value::List(items) => items
+            .into_iter()
+            .map(|x| match x {
+                duckdb::types::Value::UBigInt(u) => u,
+                _ => 0,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 #[test]
 fn fixed_delta_works() {
     for &n in &[100usize, 2048, 3000, 5000] {
         let conn = make_conn(n);
-        let mut s = conn
-            .prepare(
-                "SELECT ts, dbg_delta_noreserve(buckets, LAG(buckets) OVER (ORDER BY ts)) AS d \
-                 FROM t ORDER BY ts",
-            )
-            .unwrap();
-        let rows: Vec<(u64, Option<Vec<u64>>)> = s
+
+        // 1) Sanity probe: read LAG(buckets) directly via SQL, no UDF in the
+        //    loop. If DuckDB's LAG itself is sane cross-platform, row r > 0
+        //    must return exactly `[2(r-1), 2(r-1)+1]`. If THIS already drifts,
+        //    the bug is in DuckDB's window-function materialization, not in
+        //    our FFI bridge.
+        let lag_rows: Vec<(u64, Option<Vec<u64>>)> = conn
+            .prepare("SELECT ts, LAG(buckets) OVER (ORDER BY ts) AS prev FROM t ORDER BY ts")
+            .unwrap()
             .query_map([], |row| {
                 let ts: u64 = row.get(0)?;
                 let v: Option<duckdb::types::Value> = row.get(1)?;
-                let lst = v.map(|val| match val {
-                    duckdb::types::Value::List(items) => items
-                        .into_iter()
-                        .map(|x| match x {
-                            duckdb::types::Value::UBigInt(u) => u,
-                            _ => 0,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                });
-                Ok((ts, lst))
+                Ok((ts, decode_list_u64(v)))
             })
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        let mut wrong = 0usize;
+        let mut lag_wrong: Vec<(usize, Option<Vec<u64>>)> = Vec::new();
+        for (i, (_ts, lst)) in lag_rows.iter().enumerate() {
+            let expected: Option<Vec<u64>> = if i == 0 {
+                None
+            } else {
+                let r = (i - 1) as u64;
+                Some(vec![2 * r, 2 * r + 1])
+            };
+            if *lst != expected {
+                lag_wrong.push((i, lst.clone()));
+            }
+        }
+
+        // 2) Pure-SQL delta probe (no UDF in the loop, no FFI read path).
+        //    Uses DuckDB's list_transform + list indexing — exactly what
+        //    the WASM viewer ships as its h2_delta substitute. If this
+        //    drifts on macOS, the issue is in DuckDB itself (LAG output
+        //    or list-element addressing); if it's clean here and only
+        //    our UDF drifts, the issue is the FFI bridge.
+        let sql_delta_rows: Vec<(u64, Option<Vec<u64>>)> = conn
+            .prepare(
+                "SELECT ts, \
+                   CASE WHEN prev IS NULL THEN NULL ELSE \
+                     list_transform( \
+                       generate_series(1, least(length(buckets), length(prev))), \
+                       i -> CASE WHEN buckets[i] >= prev[i] \
+                                 THEN buckets[i] - prev[i] \
+                                 ELSE 0::UBIGINT END \
+                     ) END AS d \
+                 FROM (SELECT ts, buckets, LAG(buckets) OVER (ORDER BY ts) AS prev FROM t) \
+                 ORDER BY ts",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                let ts: u64 = row.get(0)?;
+                let v: Option<duckdb::types::Value> = row.get(1)?;
+                Ok((ts, decode_list_u64(v)))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut sql_wrong: Vec<(usize, Option<Vec<u64>>)> = Vec::new();
+        for (i, (_ts, lst)) in sql_delta_rows.iter().enumerate() {
+            let ok = if i == 0 {
+                lst.is_none() || matches!(lst, Some(v) if v.is_empty())
+            } else {
+                lst.as_deref() == Some(&[2u64, 2u64][..])
+            };
+            if !ok {
+                sql_wrong.push((i, lst.clone()));
+            }
+        }
+
+        // 3) The actual fix probe: delta via our reserve-free FFI UDF.
+        let rows: Vec<(u64, Option<Vec<u64>>)> = conn
+            .prepare(
+                "SELECT ts, dbg_delta_noreserve(buckets, LAG(buckets) OVER (ORDER BY ts)) AS d \
+                 FROM t ORDER BY ts",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                let ts: u64 = row.get(0)?;
+                let v: Option<duckdb::types::Value> = row.get(1)?;
+                Ok((ts, decode_list_u64(v)))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut wrong: Vec<(usize, Option<Vec<u64>>)> = Vec::new();
         for (i, (_ts, lst)) in rows.iter().enumerate() {
             // Row 0: LAG is NULL — accept None / Some([]).
             // Other rows: must be exactly [2, 2].
@@ -724,16 +798,97 @@ fn fixed_delta_works() {
                 lst.as_deref() == Some(&[2u64, 2u64][..])
             };
             if !ok {
-                wrong += 1;
-                if wrong <= 3 {
+                wrong.push((i, lst.clone()));
+                if wrong.len() <= 3 {
                     eprintln!("    n={n} row={i} got={:?}", lst);
                 }
             }
         }
-        eprintln!("[fixed_delta] n={n}: total={} wrong={}", rows.len(), wrong);
-        assert_eq!(
-            wrong, 0,
-            "fixed h2_delta should produce no wrong rows for n={n}"
+        eprintln!(
+            "[fixed_delta] n={n}: lag_wrong={}/{}  sql_delta_wrong={}/{}  udf_delta_wrong={}/{}",
+            lag_wrong.len(),
+            lag_rows.len(),
+            sql_wrong.len(),
+            sql_delta_rows.len(),
+            wrong.len(),
+            rows.len(),
+        );
+
+        // Build rich per-row diagnostics. nextest captures eprintln by
+        // default, so the panic message is the only output that's
+        // guaranteed to surface in CI logs — pack everything informative
+        // into it.
+        let lag_expected = |i: usize| -> Option<Vec<u64>> {
+            if i == 0 {
+                None
+            } else {
+                let r = (i - 1) as u64;
+                Some(vec![2 * r, 2 * r + 1])
+            }
+        };
+        let delta_expected = |i: usize| -> Option<Vec<u64>> {
+            if i == 0 {
+                None
+            } else {
+                Some(vec![2, 2])
+            }
+        };
+        let fmt_lag_rows = |rows: &[(usize, Option<Vec<u64>>)]| -> String {
+            rows.iter()
+                .take(5)
+                .map(|(i, got)| format!("row {i}: got={got:?}, expected={:?}", lag_expected(*i)))
+                .collect::<Vec<_>>()
+                .join("\n      ")
+        };
+        let fmt_delta_rows = |rows: &[(usize, Option<Vec<u64>>)]| -> String {
+            rows.iter()
+                .take(5)
+                .map(|(i, got)| format!("row {i}: got={got:?}, expected={:?}", delta_expected(*i)))
+                .collect::<Vec<_>>()
+                .join("\n      ")
+        };
+
+        // Find first failing row in each probe — chunking boundaries
+        // (2048, 4096, …) are diagnostic: if first wrong row is exactly
+        // STANDARD_VECTOR_SIZE = 2048, the bug is chunk-boundary related.
+        let first_lag = lag_wrong.first().map(|(i, _)| *i);
+        let first_sql = sql_wrong.first().map(|(i, _)| *i);
+        let first_udf = wrong.first().map(|(i, _)| *i);
+        let vec_size = unsafe { duckdb_vector_size() };
+
+        assert!(
+            lag_wrong.is_empty() && sql_wrong.is_empty() && wrong.is_empty(),
+            "\n\
+             ==== fixed_delta_works FAILED (n={n}) ====\n\
+             host: os={}, arch={}, duckdb_vector_size={vec_size}\n\
+             \n\
+             [Probe 1] DuckDB LAG raw output ({}/{} wrong, first wrong row: {:?})\n\
+                {}\n\
+             [Probe 2] Pure-SQL delta via list_transform ({}/{} wrong, first wrong row: {:?})\n\
+                {}\n\
+             [Probe 3] UDF delta via dbg_delta_noreserve (FFI bypass) ({}/{} wrong, first wrong row: {:?})\n\
+                {}\n\
+             \n\
+             Triage:\n\
+             - If probe 1 fails: DuckDB's LAG window-function materialization is broken on this platform.\n\
+             - If probe 1 passes but probe 2 fails: DuckDB's list_transform / indexing over LAG'd lists is broken.\n\
+             - If probes 1+2 pass but probe 3 fails: our FFI read path in read_list_child_no_reserve is broken.\n\
+             - If first wrong row == duckdb_vector_size ({vec_size}) or a multiple of it: chunk-boundary bug.\n\
+            ",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            lag_wrong.len(),
+            lag_rows.len(),
+            first_lag,
+            fmt_lag_rows(&lag_wrong),
+            sql_wrong.len(),
+            sql_delta_rows.len(),
+            first_sql,
+            fmt_lag_rows(&sql_wrong),
+            wrong.len(),
+            rows.len(),
+            first_udf,
+            fmt_delta_rows(&wrong),
         );
     }
 }
