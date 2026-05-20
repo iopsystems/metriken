@@ -1263,6 +1263,167 @@ fn test_columns_histogram_heatmap_with_label_filter() {
 }
 
 #[test]
+fn test_columns_histogram_mean_resolves_buckets_column() {
+    let tsdb = Arc::new(create_columns_histogram_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let cols = engine
+        .columns("histogram_mean(tcp_packet_latency)")
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+fn test_columns_histogram_count_with_label_filter() {
+    let tsdb = Arc::new(create_columns_histogram_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let cols = engine
+        .columns(r#"histogram_count(tcp_packet_latency{cpu="0"})"#)
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
+// Cumulative-since-start histograms (the ingest delta path requires
+// monotonic snapshots). Two label series (`cpu` 0/1), each with
+// cumulative observation counts [0, 5, 12] all landing in the exact
+// bucket for value 10 (values < 32 are exact under grouping_power 4,
+// so the bucket midpoint is exactly 10.0). Per-period deltas are
+// therefore 5 then 7 observations per series; collapsed across both
+// series that's 10 then 14 per tick, all at mean 10.0.
+fn create_hist_exec_tsdb() -> Tsdb {
+    use histogram::Histogram;
+    use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    let cumulative = [0u64, 5, 12];
+
+    for (step, &count) in cumulative.iter().enumerate() {
+        let time = base_time + Duration::from_secs(step as u64);
+        let mut histograms = Vec::new();
+        for cpu in ["0", "1"] {
+            let mut h = Histogram::new(4, 16).unwrap();
+            for _ in 0..count {
+                h.increment(10).unwrap();
+            }
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), "req_latency".to_string());
+            meta.insert("cpu".to_string(), cpu.to_string());
+            histograms.push(SnapHist {
+                name: "req_latency".to_string(),
+                value: h,
+                metadata: meta,
+            });
+        }
+        tsdb.ingest(Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms,
+        }));
+    }
+
+    tsdb
+}
+
+#[test]
+fn test_histogram_count_collapses_series_and_sums_counts() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_count(req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    assert_eq!(result.len(), 1, "series collapse to one __name__ series");
+    assert_eq!(
+        result[0].metric.get("__name__").map(String::as_str),
+        Some("req_latency")
+    );
+    assert!(
+        !result[0].metric.contains_key("quantile"),
+        "count has no quantile label"
+    );
+    let counts: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    // Per-period deltas 5 then 7, summed across cpu 0/1 → 10 then 14.
+    assert_eq!(counts, vec![10.0, 14.0]);
+}
+
+#[test]
+fn test_histogram_mean_is_bucket_weighted_midpoint() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_mean(req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].metric.get("__name__").map(String::as_str),
+        Some("req_latency")
+    );
+    // Every observation is value 10, an exact bucket → mean is 10.0.
+    for (_, v) in &result[0].values {
+        assert!((v - 10.0).abs() < 1e-9, "mean should be 10.0, got {v}");
+    }
+    assert!(!result[0].values.is_empty());
+}
+
+#[test]
+fn test_histogram_count_label_filter_selects_single_series() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"histogram_count(req_latency{cpu="0"})"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let counts: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    // Only cpu=0 → unsummed per-period deltas 5 then 7.
+    assert_eq!(counts, vec![5.0, 7.0]);
+}
+
+#[test]
+fn test_histogram_mean_metric_not_found() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range("histogram_mean(does_not_exist)", 1000.0, 1003.0, 1.0);
+    match result {
+        Err(QueryError::MetricNotFound(_)) => {}
+        other => panic!("expected MetricNotFound, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_columns_returns_parse_error_for_invalid_syntax() {
     let tsdb = Arc::new(create_columns_tsdb());
     let engine = QueryEngine::new(tsdb);

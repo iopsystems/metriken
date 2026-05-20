@@ -404,6 +404,58 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
+    /// Handle `histogram_mean(metric{matchers}[, stride])` and
+    /// `histogram_count(metric{matchers}[, stride])` queries.
+    ///
+    /// Both collapse every matching label-keyed series into a single
+    /// output series labeled `{__name__: metric_name}` — `mean` emits
+    /// the count-weighted bucket-midpoint mean per tick, `count` the
+    /// total observation count per tick. Same single-metric-arg
+    /// pre-parser shape as `histogram_heatmap`, reusing the streaming
+    /// per-tick walk so peak memory is independent of series count.
+    fn handle_histogram_scalar(
+        &self,
+        func: &str,
+        query_str: &str,
+        start: f64,
+        end: f64,
+    ) -> Result<QueryResult, QueryError> {
+        let inner = &query_str[func.len() + 1..query_str.len() - 1];
+        let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
+        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
+            return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        };
+
+        let start_ns = (start * 1e9) as u64;
+        let end_ns = (end * 1e9) as u64;
+        let result = match func {
+            "histogram_mean" => streaming::histogram::mean(
+                collection,
+                &labels,
+                start_ns,
+                end_ns,
+                stride_ns,
+                &metric_name,
+            ),
+            _ => streaming::histogram::count(
+                collection,
+                &labels,
+                start_ns,
+                end_ns,
+                stride_ns,
+                &metric_name,
+            ),
+        };
+        if result.is_empty() {
+            return Err(QueryError::MetricNotFound(format!(
+                "No histogram data found for {metric_name}"
+            )));
+        }
+        Ok(QueryResult::Matrix { result })
+    }
+
     pub fn query_range(
         &self,
         query_str: &str,
@@ -420,6 +472,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         // Handle histogram_heatmap specially
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self.handle_histogram_heatmap(query_str, start, end);
+        }
+
+        // Scalar histogram reducers (rezolus extensions, same
+        // single-metric-arg shape as histogram_heatmap).
+        if query_str.starts_with("histogram_mean(") && query_str.ends_with(")") {
+            return self.handle_histogram_scalar("histogram_mean", query_str, start, end);
+        }
+        if query_str.starts_with("histogram_count(") && query_str.ends_with(")") {
+            return self.handle_histogram_scalar("histogram_count", query_str, start, end);
         }
 
         // Parse the query into an AST and evaluate. The streaming
