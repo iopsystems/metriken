@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use arrow::array::Array; // for is_null
-use metriken_query_sql::{LiveColumn, LiveColumnKind, LiveSource, LiveValue};
+use metriken_query::{LiveColumn, LiveColumnKind, LiveSource, LiveValue};
 
 fn column(physical: &str, metric: &str, kind: LiveColumnKind) -> LiveColumn {
     LiveColumn {

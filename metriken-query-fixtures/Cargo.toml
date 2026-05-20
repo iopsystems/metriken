@@ -3,7 +3,7 @@ name = "metriken-query-fixtures"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Synthetic Parquet fixtures for metriken-query-sql tests and parity benchmarks"
+description = "Synthetic Parquet fixtures for metriken-query tests and parity benchmarks"
 
 [dependencies]
 histogram.workspace = true

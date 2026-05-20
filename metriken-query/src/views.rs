@@ -185,10 +185,10 @@ pub(crate) fn read_introspection(parquet_path: &str) -> duckdb::Result<(Vec<Colu
         .collect();
 
     // Sampling interval (ns), pulled from the parquet file-level kv. The
-    // metriken-query loader snaps every parquet timestamp to the nearest
-    // multiple of this interval (`tsdb/mod.rs:50-58`), so the SQL side has
-    // to do the same — otherwise shadow-mode comparison against PromQL diffs
-    // on the timestamp axis even when values agree exactly.
+    // legacy PromQL loader (pre-DuckDB metriken-query 0.10.x) snapped every
+    // parquet timestamp to the nearest multiple of this interval, so the
+    // SQL side does the same — otherwise shadow-mode comparison against
+    // PromQL diffed on the timestamp axis even when values agreed exactly.
     let interval_ns: u64 = meta
         .metadata()
         .file_metadata()

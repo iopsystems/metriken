@@ -56,7 +56,7 @@ Metriken is two systems separated by a Parquet file in the middle — or, in the
                        │ (one slot per pool slot)                   │ ALTER TABLE _src ADD COLUMN
                        ▼                                            ▼
               ┌────────────────────────────────────────────────────────────────┐
-              │           metriken-query-sql ── DuckDbBackend                  │
+              │           metriken-query ── DuckDbBackend                      │
               │                                                                │
               │  parquet path:                       live path:                │
               │  ├─ ConnState pool                   ├─ LiveSource             │
@@ -82,9 +82,9 @@ Metriken is two systems separated by a Parquet file in the middle — or, in the
                             (Arrow → Matrix/Heatmap shape consumers
                              on the rezolus + WASM viewer side)
 
-(The metriken-query crate — legacy PromQL evaluator + harness — is
-deleted in C5 of this branch. The diagram above is the post-deletion
-end state.)
+(The pre-DuckDB metriken-query 0.10.x line — PromQL evaluator + harness —
+was deleted in C5 of this branch. The current `metriken-query` is the
+DuckDB-backed 0.11.x crate shown above, which took over the name.)
 ```
 
 ## Crate map
@@ -115,14 +115,13 @@ metriken-exposition── reads the registry; produces Snapshot{V1,V2}.
                      MsgpackToParquet converts streamed snapshots into
                      a single Parquet file after the fact.
 
-metriken-query     ── DELETED IN C5. Was the consumer-side PromQL
-                     evaluator (tsdb/ + promql/) plus a PromQL→SQL
-                     translator harness (harness/) that never gained
-                     a production caller. Its last consumer
-                     (rezolus's validate_service_extensions)
-                     migrated to SQL in C3.
-
-metriken-query-sql ── The query engine.
+metriken-query     ── The query engine (formerly the PromQL evaluator;
+                     republished as 0.11.0, DuckDB-backed, with a
+                     completely new public API). The pre-DuckDB
+                     0.10.x line (tsdb/ + promql/ + harness/) was
+                     deleted in C5; its last in-tree consumer
+                     (rezolus's validate_service_extensions) had
+                     already migrated to SQL in C3.
                        parquet path: DuckDbBackend owns a per-data-
                        source pool of in-memory DuckDB connections,
                        each materialising _src + _cgroup_index +
@@ -149,6 +148,6 @@ metriken-query-
 
 **The wire format is wide.** Each labeled time series is its own Parquet column. The metric's canonical name and label pairs live in Arrow field metadata. Histograms are stored as `List<UInt64>` (the bucket counts), with `grouping_power` / `max_value_power` in the column metadata. This shape is what lets the SQL side address series via `_src."col_name"` and project rates with windowed `LAG` instead of doing a self-join on a long-form `(t, metric, labels..., value)` table.
 
-**One query backend, two ingest paths.** Post-C5 `metriken-query` is gone — the legacy PromQL evaluator (`promql/streaming/*`) and the SQL harness (`harness/*`) have been deleted. Rezolus and the static viewer drive SQL through `metriken-query-sql::DuckDbBackend` directly, with the parquet path materializing `_src` from `read_parquet(...)` and the live path appending to a `LiveSource` that owns a single mutable `_src` table. The SQL macros (`shared_macros.sql`, re-exported as `SHARED_MACROS`) are byte-identical across native and WASM consumers because `include_str!` pulls the same file into both. The PromQL evaluator's role lived only long enough to backstop `validate_service_extensions` while service-extension KPI templates accumulated SQL coverage; once 128/218 templates carried SQL and LiveSource bridged the live-agent path, the deletion plan executed.
+**One query backend, two ingest paths.** Post-C5 the pre-DuckDB `metriken-query` (PromQL evaluator at `promql/streaming/*` plus the `harness/*` translator) is gone, and the new `metriken-query` (0.11.0, this crate) is its DuckDB-backed replacement. Rezolus and the static viewer drive SQL through `metriken_query::DuckDbBackend` directly, with the parquet path materializing `_src` from `read_parquet(...)` and the live path appending to a `LiveSource` that owns a single mutable `_src` table. The SQL macros (`shared_macros.sql`, re-exported as `SHARED_MACROS`) are byte-identical across native and WASM consumers because `include_str!` pulls the same file into both. The legacy PromQL evaluator's role lived only long enough to backstop `validate_service_extensions` while service-extension KPI templates accumulated SQL coverage; once 128/218 templates carried SQL and LiveSource bridged the live-agent path, the deletion plan executed.
 
-**H2 histograms cross the boundary intact.** Rezolus's H2 (base-2) histogram layout is the one representation that survives the trip from producer to query. On the producer side, `metriken::AtomicHistogram` wraps the canonical `histogram` crate's layout. On the SQL side, `metriken-query-sql/src/udf.rs` reimplements that same bucket math as DuckDB scalar UDFs (`h2_lower`, `h2_upper`, `h2_quantile`, `h2_delta`, …) so SQL queries can do quantiles and per-period deltas directly over the `List<UInt64>` bucket columns without unpacking. The bucket-math is the contract; both sides verify against it.
+**H2 histograms cross the boundary intact.** Rezolus's H2 (base-2) histogram layout is the one representation that survives the trip from producer to query. On the producer side, `metriken::AtomicHistogram` wraps the canonical `histogram` crate's layout. On the SQL side, `metriken-query/src/udf.rs` reimplements that same bucket math as DuckDB scalar UDFs (`h2_lower`, `h2_upper`, `h2_quantile`, `h2_delta`, …) so SQL queries can do quantiles and per-period deltas directly over the `List<UInt64>` bucket columns without unpacking. The bucket-math is the contract; both sides verify against it.

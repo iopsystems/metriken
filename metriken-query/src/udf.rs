@@ -1298,8 +1298,8 @@ mod tests {
     fn irate_lag_reset_uses_post_reset_value_as_increment() {
         let conn = fresh();
         // curr=5, prev=100 (reset!), dt=1s → 5/1.0 = 5.0 (NOT (5-100))
-        // Matches PromQL `irate` reset semantics, same as metriken-query
-        // streaming/irate.rs:60-70.
+        // Matches PromQL `irate` reset semantics, same as the
+        // legacy PromQL evaluator's streaming/irate.rs:60-70.
         assert_eq!(
             one_f64(
                 &conn,

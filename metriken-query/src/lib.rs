@@ -15,9 +15,9 @@
 //! The crate's public API is two methods on [`DuckDbBackend`]:
 //! [`DuckDbBackend::run_sql`] (SQL string + parquet path → Arrow) and
 //! [`DuckDbBackend::describe_parquet`] (parquet path → per-metric
-//! catalog). Callers (today: `metriken-query`'s translator; in the next
-//! phase: Rezolus directly) own SQL generation and any projection of
-//! the Arrow output.
+//! catalog). Callers own SQL generation and any projection of the Arrow
+//! output (Rezolus uses `crates/prom-matrix/` for the native + WASM
+//! Prometheus-matrix envelope).
 
 use duckdb::Connection;
 use thiserror::Error;
@@ -25,8 +25,8 @@ use thiserror::Error;
 // `backend`, `macros`, and `observability` are implementation
 // details — their public types are re-exported below. `udf` and
 // `views` stay `pub`: `udf::h2_lower` / `udf::h2_upper` are called
-// across the crate boundary by the projector, and `views::ensure_views`
-// is used by perf-investigation scripts in `metriken-query`.
+// across the crate boundary by external projectors, and
+// `views::ensure_views` is used by perf-investigation scripts.
 pub(crate) mod backend;
 pub mod live;
 pub(crate) mod macros;

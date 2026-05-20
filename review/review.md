@@ -3,25 +3,29 @@
 Companion: `/work/rezolus/review/review.md` (consumer side).
 
 This branch ships two engine-side deliverables and one big
-deletion:
+deletion-then-republish:
 
-1. **`metriken-query-sql`** — the DuckDB-backed query engine
-   (connection pool, H2 histogram UDFs, shared dashboard macros).
-   The Rezolus static viewer's macro/UDF tests link it, and the
-   server-backed viewer routes `/api/v1/query{,_range}` through
-   it for *both* file mode and live mode.
+1. **`metriken-query` 0.11.0 (new DuckDB-backed crate)** — the
+   DuckDB-backed query engine (connection pool, H2 histogram UDFs,
+   shared dashboard macros). The Rezolus static viewer's macro/UDF
+   tests link it, and the server-backed viewer routes
+   `/api/v1/query{,_range}` through it for *both* file mode and live
+   mode. The crate took the name of the deleted PromQL crate (see
+   item 3); the API is completely different — see the "Public
+   surface" section below.
 2. **`LiveSource`** — a single-`Connection` in-memory DuckDB
    ingest that grows `_src` snapshot-by-snapshot via `ALTER +
    INSERT`. Lets rezolus's live-agent path share the SQL pipeline
    with the parquet path. See "LiveSource" below.
-3. **`metriken-query` deleted.** The legacy PromQL evaluator
-   (`tsdb/` + `promql/`) + migration-scaffolding harness
+3. **Pre-DuckDB `metriken-query` 0.10.x deleted.** The legacy PromQL
+   evaluator (`tsdb/` + `promql/`) + migration-scaffolding harness
    (`harness/`) — ~13K LOC across the three subdirs, plus the
    `queries.toml` shape catalogue and three feature-gated examples
    — were removed in C5 of this branch along with the crate itself
    (~16.7K LOC total). The deletion was unblocked by C2-C4 on the
    rezolus side (see the rezolus doc's `Tsdb removed — historical
-   roadmap` for the sequence).
+   roadmap` for the sequence). The crate name then went to the new
+   DuckDB-backed engine in item 1.
 
 The evaluator did get one structural change before this branch:
 commit `a25e285` collapsed it to a streaming-only dispatcher,
@@ -72,9 +76,9 @@ legacy modules and the entire `metriken-query` crate.
 
 ---
 
-## `metriken-query-sql` — the engine
+## `metriken-query` — the engine
 
-Lives under `metriken-query-sql/src/`. Public surface in `lib.rs`
+Lives under `metriken-query/src/`. Public surface in `lib.rs`
 (small). Modules: `backend.rs` (pool + dispatch), `live.rs`
 (LiveSource), `views.rs` (parquet introspection + `MetricCatalog`
 + `render_*_sql`), `udf.rs` (H2 UDFs), `macros.rs` (loader;
@@ -165,10 +169,11 @@ this branch (`17f1107`); the rezolus side consumes it via
 
 ## Cargo features and consumers
 
-Post-C5: the `metriken-query` crate is deleted. `metriken-query-sql`
-has no feature flags — single configuration, single build. The
-rezolus WASM viewer (`/work/rezolus/crates/viewer-sql/`) and
-rezolus itself both link `metriken-query-sql` directly.
+Post-C5: the pre-DuckDB `metriken-query` (0.10.x line) is deleted;
+the new DuckDB-backed `metriken-query` (this crate, 0.11.0) takes
+its name. It has no feature flags — single configuration, single
+build. The rezolus WASM viewer (`/work/rezolus/crates/viewer-sql/`)
+and rezolus itself both link `metriken-query` directly.
 
 ## metriken-exposition: deterministic parquet footer
 
@@ -188,7 +193,7 @@ The rezolus-side PromQL purge (P1-P6) has landed: no
 template `"query":` strings. See
 `/work/rezolus/review/review.md::PromQL purge — completed (P1-P6)`.
 
-The engine side had no code to delete — `metriken-query-sql`
+The engine side had no code to delete — `metriken-query`
 already speaks DuckDB SQL exclusively. The follow-up KPI
 transcription work (compound expressions + histogram-percentile
 fan-outs) landed in rezolus commits `9b9165f` / `9daefc6` /
@@ -205,14 +210,14 @@ views — landed in commit `33f5fe2`.
 cargo test --workspace --all-features --all-targets
 
 # Just the engine
-cargo test -p metriken-query-sql
+cargo test -p metriken-query
 ```
 
 The load-bearing checks are the L1 + L2 tests inside the engine:
-**L1** (`metriken-query-sql/tests/live.rs`) covers the LiveSource
+**L1** (`metriken-query/tests/live.rs`) covers the LiveSource
 externally — round-trip, time-range bounds, schema growth across kinds,
 NULL semantics, cgroup-index rebuild, per-source view, timestamp
-snap-to-interval, concurrent read+write, bad-SQL surfacing. **L2** (`metriken-query-sql/src/live.rs::tests`) is the
+snap-to-interval, concurrent read+write, bad-SQL surfacing. **L2** (`metriken-query/src/live.rs::tests`) is the
 cross-engine parity gate: it replays parquet rows into a `LiveSource`
 and asserts byte-identical Arrow output for SELECT / COUNT / MIN /
 MAX / SUM / `irate_1s` / `h2_*`. If live and parquet ever diverge
@@ -240,7 +245,7 @@ were known on the dashboard path at the moment of deletion.
 
 ## Where to spend attention
 
-1. **`metriken-query-sql/src/lib.rs` + `backend.rs`** — public
+1. **`metriken-query/src/lib.rs` + `backend.rs`** — public
    surface and the non-trivial concurrency story (panic-safe slot
    evacuation, `try_lock` fast-path slot acquisition).
 2. **`live.rs`** — the largest new module on this branch; the

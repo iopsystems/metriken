@@ -2,9 +2,9 @@
 --
 -- **Single source of truth** for the 20 macros that both the native
 -- (duckdb-rs) and the wasm (duckdb-wasm) viewers need. Native loads this
--- file via `include_str!` in metriken-query-sql/src/macros.rs and splits
+-- file via `include_str!` in metriken-query/src/macros.rs and splits
 -- on `;` boundaries. Wasm pulls in the same string via the
--- `metriken_query_sql::SHARED_MACROS` constant (re-exported from this
+-- `metriken_query::SHARED_MACROS` constant (re-exported from this
 -- crate) and concatenates it with its own H2 replacement macros (the
 -- macros that stand in for the Rust vscalar UDFs duckdb-wasm can't run).
 --

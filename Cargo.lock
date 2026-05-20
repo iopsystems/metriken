@@ -1289,16 +1289,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "metriken-query-fixtures"
-version = "0.1.0"
-dependencies = [
- "histogram",
- "metriken-exposition",
-]
-
-[[package]]
-name = "metriken-query-sql"
-version = "0.1.0"
+name = "metriken-query"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -1307,6 +1299,14 @@ dependencies = [
  "parquet",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "metriken-query-fixtures"
+version = "0.1.0"
+dependencies = [
+ "histogram",
+ "metriken-exposition",
 ]
 
 [[package]]

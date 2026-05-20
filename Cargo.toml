@@ -6,8 +6,8 @@ members = [
     "metriken-core",
     "metriken-derive",
     "metriken-exposition",
-    "metriken-query-fixtures",
-    "metriken-query-sql"
+    "metriken-query",
+    "metriken-query-fixtures"
 ]
 
 [workspace.dependencies]

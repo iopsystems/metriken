@@ -1,6 +1,6 @@
 //! Diagnostic test for the LAG-over-LIST UDF bug.
 //! Probes (a) chunk-boundary effects (>2048 rows) and (b) actual h2_delta+h2_total
-//! pipeline using metriken-query-sql's real UDFs.
+//! pipeline using metriken-query's real UDFs.
 //!
 //! Loop-with-index patterns are intentional — they mirror the production
 //! UDF code under test and make the diagnostics easier to map back to
@@ -20,7 +20,7 @@ use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
 
-/// Local copies of the helpers in `metriken_query_sql::udf` for the
+/// Local copies of the helpers in `metriken_query::udf` for the
 /// diagnostic suite. See `src/udf.rs` for the safety contracts.
 unsafe fn read_list_child_no_reserve<'a, T: Copy>(
     lv: &'a ListVector<'a>,
@@ -664,7 +664,7 @@ fn make_conn(rows: usize) -> Connection {
         .unwrap();
     conn.register_scalar_function::<DbgDeltaNoReserve>("dbg_delta_noreserve")
         .unwrap();
-    metriken_query_sql::udf::register_all(&conn).unwrap();
+    metriken_query::udf::register_all(&conn).unwrap();
     conn.execute_batch(&format!(
         r#"
         CREATE TABLE t AS

@@ -539,14 +539,13 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-// `run_matrix`, `downcast_f64`, and `run_heatmap` moved to
-// `metriken-query/src/project.rs` as part of the Phase A boundary
-// flip. The DuckDB engine now exposes `run_sql` returning raw
-// `Vec<RecordBatch>`; projection into the `metriken-query`-side
-// `QueryResult::{Matrix, HistogramHeatmap}` shapes is a translator
-// concern. The H2 bucket-bound helpers (`udf::h2_lower`, `udf::h2_upper`)
-// remain `pub` and are called from `project.rs` across the crate
-// boundary — pure functions over `(idx, p)`, no leak.
+// `run_matrix`, `downcast_f64`, and `run_heatmap` are gone. The DuckDB
+// engine exposes `run_sql` returning raw `Vec<RecordBatch>`; projection
+// into any consumer shape (e.g. Rezolus's Prometheus-matrix envelope
+// in `crates/prom-matrix/`) is a caller concern. The H2 bucket-bound
+// helpers (`udf::h2_lower`, `udf::h2_upper`) remain `pub` and are
+// called by external projectors — pure functions over `(idx, p)`, no
+// leak.
 
 #[cfg(test)]
 mod tests {
