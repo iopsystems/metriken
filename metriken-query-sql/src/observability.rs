@@ -53,7 +53,7 @@ impl PhaseStats {
         let count = self.count.load(Ordering::Relaxed);
         let sum_ns = self.sum_ns.load(Ordering::Relaxed);
         let max_ns = self.max_ns.load(Ordering::Relaxed);
-        let mean_ns = if count > 0 { sum_ns / count } else { 0 };
+        let mean_ns = sum_ns.checked_div(count).unwrap_or(0);
         PhaseSnapshot {
             count,
             sum_ns,

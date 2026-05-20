@@ -173,7 +173,8 @@ impl FixtureBuilder {
             .iter()
             .map(|s| (s, s.points.iter().copied().collect()))
             .collect();
-        let histogram_lookup: Vec<(&HistogramSeries, BTreeMap<u64, Option<Vec<u64>>>)> = self
+        type HistogramLookup<'a> = Vec<(&'a HistogramSeries, BTreeMap<u64, Option<Vec<u64>>>)>;
+        let histogram_lookup: HistogramLookup = self
             .histograms
             .iter()
             .map(|s| (s, s.points.iter().cloned().collect()))

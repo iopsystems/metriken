@@ -1,6 +1,15 @@
 //! Diagnostic test for the LAG-over-LIST UDF bug.
 //! Probes (a) chunk-boundary effects (>2048 rows) and (b) actual h2_delta+h2_total
 //! pipeline using metriken-query-sql's real UDFs.
+//!
+//! Loop-with-index patterns are intentional — they mirror the production
+//! UDF code under test and make the diagnostics easier to map back to
+//! the actual implementations.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::manual_memcpy,
+    clippy::type_complexity
+)]
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::ffi::duckdb_vector_size;

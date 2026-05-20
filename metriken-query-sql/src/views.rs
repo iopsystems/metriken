@@ -788,7 +788,10 @@ pub(crate) fn sql_string_lit(s: &str) -> String {
 
 /// Build the `_cgroup_index` TEMP TABLE on `conn`. Executes the
 /// SQL rendered by `render_cgroup_index_sql` — see that function
-/// for the schema and semantics.
+/// for the schema and semantics. Test-only: production callers
+/// invoke `render_cgroup_index_sql` and `execute_batch` directly so
+/// they can compose multiple TEMP TABLE statements per slot.
+#[cfg(test)]
 pub(crate) fn create_cgroup_index(conn: &Connection, columns: &[ColumnInfo]) -> duckdb::Result<()> {
     let sql = render_cgroup_index_sql(columns);
     // `INSERT` may be empty (no cgroup columns); when it is, the

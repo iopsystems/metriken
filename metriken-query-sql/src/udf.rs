@@ -44,6 +44,7 @@ use duckdb::Connection;
 
 const N: u32 = 64;
 const DEFAULT_P: u32 = 3;
+#[allow(dead_code)] // documented upper bound; consumers compute exact size from per-metric p
 const MAX_BUCKET_COUNT: usize = ((N - 2 + 1) * (1u32 << 14)) as usize; // generous upper
 
 /// Total number of buckets in an H2 histogram with grouping power `p` and
@@ -590,9 +591,9 @@ impl VScalar for H2CombineUdf {
                 // bailing to NULL if any column has a malformed entry.
                 let mut entries = Vec::with_capacity(ncols);
                 let mut max_len = 0usize;
-                for c in 0..ncols {
+                for (c, &col_len) in col_lens.iter().enumerate() {
                     let lv = input.list_vector(c);
-                    let (off, len) = list_entry(&lv, r, col_lens[c])?;
+                    let (off, len) = list_entry(&lv, r, col_len)?;
                     if len > max_len {
                         max_len = len;
                     }

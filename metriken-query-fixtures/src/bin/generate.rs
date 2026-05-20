@@ -170,16 +170,18 @@ fn counter_multi_label(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// metric via a `WHERE source = '...'` predicate.
 fn gauge_multi_source(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = FixtureBuilder::new().file_metadata("source", "fixture-gauge-multi-source");
-    let mut col = 0u32;
     // `target_rate` (gauge) per source × instance — three series so the
     // source-only filter still keeps multiple series and the source+instance
     // filter narrows to one. Mirrors cachecannon/valkey shape where the same
     // metric name is exposed by every service capture.
-    for (source, instance, value) in [
+    for (col, (source, instance, value)) in [
         ("cachecannon", "0", 100i64),
         ("cachecannon", "1", 110),
         ("valkey", "0", 200),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let points: Vec<(u64, i64)> = (0..=10).map(|s| (ts_secs(s), value + (s as i64))).collect();
         builder = builder.add_gauge(GaugeSeries {
             column_name: format!("target_rate__{col}"),
@@ -187,7 +189,6 @@ fn gauge_multi_source(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             labels: labels(&[("source", source), ("instance", instance)]),
             points,
         });
-        col += 1;
     }
     builder.write(&dir.join("gauge_multi_source.parquet"))
 }
@@ -433,8 +434,7 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // BPF self-monitoring counters — one column per `sampler`, two samplers,
     // monotonic. Drives the Group J Rezolus self-monitoring catalogue
     // entries (rezolus_bpf_run_time + rezolus_bpf_run_count).
-    let mut col = 0u32;
-    for sampler in ["cpu", "syscall"] {
+    for (col, sampler) in ["cpu", "syscall"].into_iter().enumerate() {
         let run_time_rate: u64 = 50_000_000; // ns/s of BPF time
         let run_count_rate: u64 = 1_000; // events/s
         let run_time: Vec<(u64, u64)> = (0..=20).map(|s| (ts_secs(s), s * run_time_rate)).collect();
@@ -452,7 +452,6 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             labels: labels(&[("sampler", sampler)]),
             points: run_count,
         });
-        col += 1;
     }
 
     // Per-CPU performance counters used by the IPC / IPNS dashboard

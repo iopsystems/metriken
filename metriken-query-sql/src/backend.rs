@@ -75,6 +75,7 @@ struct ConnState {
     catalog: Arc<MetricCatalog>,
     /// Sampling interval (ns). Kept for observability — the actual
     /// `_src` setup uses the pre-rendered SQL below.
+    #[allow(dead_code)]
     interval_ns: u64,
     /// Pre-rendered `_src` setup SQL. Built once at pool-init time
     /// from the parquet schema; for multi-source captures it carries
