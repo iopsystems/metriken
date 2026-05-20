@@ -37,10 +37,10 @@
 // input bounds-checks the entry against the child capacity (see `list_entry`
 // below); out-of-range entries indicate NULL parents or malformed lists.
 
-use duckdb::Connection;
 use duckdb::core::{DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
+use duckdb::Connection;
 
 const N: u32 = 64;
 const DEFAULT_P: u32 = 3;

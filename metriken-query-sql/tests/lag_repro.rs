@@ -84,8 +84,7 @@ impl VScalar for DbgDeltaNoReserve {
         for r in 0..n {
             let e1 = in1.get_entry(r);
             let e0 = in0.get_entry(r);
-            let valid = e1.0.saturating_add(e1.1) <= in1_n
-                && e0.0.saturating_add(e0.1) <= in0_n;
+            let valid = e1.0.saturating_add(e1.1) <= in1_n && e0.0.saturating_add(e0.1) <= in0_n;
             let plan = valid.then(|| (e1.1.min(e0.1), e1.0, e0.0));
             let len = plan.as_ref().map_or(0, |(l, _, _)| *l);
             plans.push((total, plan));
@@ -104,8 +103,7 @@ impl VScalar for DbgDeltaNoReserve {
                 }
                 Some((len, off1, off0)) => {
                     for i in 0..len {
-                        out_data[off + i] =
-                            in1_data[off1 + i].saturating_sub(in0_data[off0 + i]);
+                        out_data[off + i] = in1_data[off1 + i].saturating_sub(in0_data[off0 + i]);
                     }
                     out_lv.set_entry(r, off, len);
                 }
@@ -311,8 +309,7 @@ impl VScalar for DbgDeltaOversizeUdf {
         for r in 0..n {
             let e1 = in1.get_entry(r);
             let e0 = in0.get_entry(r);
-            let valid = e1.0.saturating_add(e1.1) <= in1_n
-                && e0.0.saturating_add(e0.1) <= in0_n;
+            let valid = e1.0.saturating_add(e1.1) <= in1_n && e0.0.saturating_add(e0.1) <= in0_n;
             let plan = valid.then(|| (e1.1.min(e0.1), e1.0, e0.0));
             let len = plan.as_ref().map_or(0, |(l, _, _)| *l);
             plans.push((total, plan));
@@ -337,8 +334,7 @@ impl VScalar for DbgDeltaOversizeUdf {
                 }
                 Some((len, off1, off0)) => {
                     for i in 0..len {
-                        out_data[off + i] =
-                            in1_data[off1 + i].saturating_sub(in0_data[off0 + i]);
+                        out_data[off + i] = in1_data[off1 + i].saturating_sub(in0_data[off0 + i]);
                     }
                     out_lv.set_entry(r, off, len);
                 }
@@ -383,8 +379,7 @@ impl VScalar for DbgDeltaRefetchUdf {
         for r in 0..n {
             let e1 = in1.get_entry(r);
             let e0 = in0.get_entry(r);
-            let valid = e1.0.saturating_add(e1.1) <= in1_n
-                && e0.0.saturating_add(e0.1) <= in0_n;
+            let valid = e1.0.saturating_add(e1.1) <= in1_n && e0.0.saturating_add(e0.1) <= in0_n;
             let plan = valid.then(|| (e1.1.min(e0.1), e1.0, e0.0));
             let len = plan.as_ref().map_or(0, |(l, _, _)| *l);
             plans.push((total, plan));
@@ -406,8 +401,7 @@ impl VScalar for DbgDeltaRefetchUdf {
                     let mut child = out_lv.child(total);
                     let slice = child.as_mut_slice_with_len::<u64>(total);
                     for i in 0..len {
-                        slice[off + i] =
-                            in1_data[off1 + i].saturating_sub(in0_data[off0 + i]);
+                        slice[off + i] = in1_data[off1 + i].saturating_sub(in0_data[off0 + i]);
                     }
                     out_lv.set_entry(r, off, len);
                 }
@@ -445,11 +439,11 @@ impl VScalar for DbgDeltaUdf {
         let in0_n = in0.len();
         let in1_data = in1.child(in1_n).as_slice_with_len::<u64>(in1_n).to_vec();
         let in0_data = in0.child(in0_n).as_slice_with_len::<u64>(in0_n).to_vec();
-        eprintln!(
-            "[dbg_delta] n={n} in1_n={in1_n} in0_n={in0_n}",
-        );
+        eprintln!("[dbg_delta] n={n} in1_n={in1_n} in0_n={in0_n}",);
         // Print samples around the suspect boundary.
-        let idxs = [0usize, 1, 2044, 2045, 2046, 2047, 2048, 2049, 2050, 2051, 4090, 4091, 4092, 4093];
+        let idxs = [
+            0usize, 1, 2044, 2045, 2046, 2047, 2048, 2049, 2050, 2051, 4090, 4091, 4092, 4093,
+        ];
         for &i in &idxs {
             if i < in0_n {
                 eprintln!(
@@ -593,15 +587,24 @@ impl VScalar for DbgListUdf {
 
 fn make_conn(rows: usize) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.register_scalar_function::<DbgListUdf>("dbg_list").unwrap();
-    conn.register_scalar_function::<DbgDeltaUdf>("dbg_delta").unwrap();
-    conn.register_scalar_function::<DbgDeltaRefetchUdf>("dbg_delta_refetch").unwrap();
-    conn.register_scalar_function::<DbgDeltaOversizeUdf>("dbg_delta_oversize").unwrap();
-    conn.register_scalar_function::<DbgListPassthroughUdf>("dbg_passthrough").unwrap();
-    conn.register_scalar_function::<DbgReadFirstOnly>("dbg_read_first_only").unwrap();
-    conn.register_scalar_function::<DbgIgnoreSecond>("dbg_ignore_second").unwrap();
-    conn.register_scalar_function::<DbgRawRead>("dbg_raw_read").unwrap();
-    conn.register_scalar_function::<DbgDeltaNoReserve>("dbg_delta_noreserve").unwrap();
+    conn.register_scalar_function::<DbgListUdf>("dbg_list")
+        .unwrap();
+    conn.register_scalar_function::<DbgDeltaUdf>("dbg_delta")
+        .unwrap();
+    conn.register_scalar_function::<DbgDeltaRefetchUdf>("dbg_delta_refetch")
+        .unwrap();
+    conn.register_scalar_function::<DbgDeltaOversizeUdf>("dbg_delta_oversize")
+        .unwrap();
+    conn.register_scalar_function::<DbgListPassthroughUdf>("dbg_passthrough")
+        .unwrap();
+    conn.register_scalar_function::<DbgReadFirstOnly>("dbg_read_first_only")
+        .unwrap();
+    conn.register_scalar_function::<DbgIgnoreSecond>("dbg_ignore_second")
+        .unwrap();
+    conn.register_scalar_function::<DbgRawRead>("dbg_raw_read")
+        .unwrap();
+    conn.register_scalar_function::<DbgDeltaNoReserve>("dbg_delta_noreserve")
+        .unwrap();
     metriken_query_sql::udf::register_all(&conn).unwrap();
     conn.execute_batch(&format!(
         r#"
@@ -690,7 +693,10 @@ fn fixed_delta_works() {
             }
         }
         eprintln!("[fixed_delta] n={n}: total={} wrong={}", rows.len(), wrong);
-        assert_eq!(wrong, 0, "fixed h2_delta should produce no wrong rows for n={n}");
+        assert_eq!(
+            wrong, 0,
+            "fixed h2_delta should produce no wrong rows for n={n}"
+        );
     }
 }
 
@@ -719,17 +725,31 @@ fn lag_workarounds() {
     let cases: &[(&str, &str)] = &[
         ("D1: list_value(1::UBIGINT) constant", "[1::UBIGINT]"),
         ("D2: same column twice (no LAG)", "buckets"),
-        ("D3: LAG over scalar then list it", "[LAG(ts) OVER (ORDER BY ts)]"),
-        ("D4: LAG(buckets) cast roundtrip", "CAST(LAG(buckets) OVER (ORDER BY ts) AS UBIGINT[])"),
-        ("D5: list_concat(LAG(...), [])", "list_concat(LAG(buckets) OVER (ORDER BY ts), CAST([] AS UBIGINT[]))"),
-        ("D6: vanilla LAG(buckets)", "LAG(buckets) OVER (ORDER BY ts)"),
+        (
+            "D3: LAG over scalar then list it",
+            "[LAG(ts) OVER (ORDER BY ts)]",
+        ),
+        (
+            "D4: LAG(buckets) cast roundtrip",
+            "CAST(LAG(buckets) OVER (ORDER BY ts) AS UBIGINT[])",
+        ),
+        (
+            "D5: list_concat(LAG(...), [])",
+            "list_concat(LAG(buckets) OVER (ORDER BY ts), CAST([] AS UBIGINT[]))",
+        ),
+        (
+            "D6: vanilla LAG(buckets)",
+            "LAG(buckets) OVER (ORDER BY ts)",
+        ),
     ];
     for (label, expr) in cases {
         let q = format!("SELECT dbg_ignore_second(buckets, {expr}) FROM t ORDER BY ts");
         eprintln!("\n-- {label}: {expr} --");
         match conn.prepare(&q) {
             Ok(mut s) => match s.query_map([], |_| Ok(())) {
-                Ok(it) => it.for_each(|r| { let _ = r; }),
+                Ok(it) => it.for_each(|r| {
+                    let _ = r;
+                }),
                 Err(e) => eprintln!("    EXEC ERR: {e}"),
             },
             Err(e) => eprintln!("    PREPARE ERR: {e}"),
@@ -970,7 +990,11 @@ fn h2_delta_output_only() {
                 wrong.push((i, *ts, lst.clone(), expected));
             }
         }
-        eprintln!("[h2_delta only] n={n}: total={} wrong={}", rows.len(), wrong.len());
+        eprintln!(
+            "[h2_delta only] n={n}: total={} wrong={}",
+            rows.len(),
+            wrong.len()
+        );
         for w in wrong.iter().take(5) {
             eprintln!("    row={} ts={} got={:?} want={:?}", w.0, w.1, w.2, w.3);
         }

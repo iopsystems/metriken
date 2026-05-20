@@ -1021,7 +1021,7 @@ mod tests {
         let mut md = std::collections::HashMap::new();
         md.insert("metric".into(), "latency".into());
         md.insert("metric_type".into(), "histogram".into()); // claims to be a histogram…
-        // …but no grouping_power, so we can't actually compute on it.
+                                                             // …but no grouping_power, so we can't actually compute on it.
         let list_field =
             Field::new("latency:buckets", list_array.data_type().clone(), true).with_metadata(md);
 
@@ -1464,14 +1464,12 @@ mod tests {
 
     #[test]
     fn render_per_node_views_empty_when_no_node_label() {
-        let cols = vec![
-            make_info(
-                "cpu_cycles/0",
-                "cpu_cycles",
-                ColumnKind::Counter,
-                &[("id", "0")],
-            ),
-        ];
+        let cols = vec![make_info(
+            "cpu_cycles/0",
+            "cpu_cycles",
+            ColumnKind::Counter,
+            &[("id", "0")],
+        )];
         let sql = super::render_per_node_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
         assert!(sql.is_empty(), "expected empty SQL: {sql}");
     }
@@ -1480,14 +1478,12 @@ mod tests {
     fn render_per_node_views_sanitizes_node_name() {
         // Slashes / hyphens become underscores so the view name is
         // a bare SQL identifier.
-        let cols = vec![
-            make_info(
-                "host-01::cpu_cycles/0",
-                "cpu_cycles",
-                ColumnKind::Counter,
-                &[("node", "host-01"), ("id", "0")],
-            ),
-        ];
+        let cols = vec![make_info(
+            "host-01::cpu_cycles/0",
+            "cpu_cycles",
+            ColumnKind::Counter,
+            &[("node", "host-01"), ("id", "0")],
+        )];
         let sql = super::render_per_node_views_sql("/tmp/foo.parquet", 1_000_000_000, &cols);
         assert!(sql.contains("_src_node_host_01"), "sanitized view: {sql}");
     }
@@ -1500,15 +1496,21 @@ mod tests {
             vec![
                 MetricSeries {
                     physical: "alpha::cpu_cycles/0".into(),
-                    labels: [("node".to_string(), "alpha".to_string())].into_iter().collect(),
+                    labels: [("node".to_string(), "alpha".to_string())]
+                        .into_iter()
+                        .collect(),
                 },
                 MetricSeries {
                     physical: "beta::cpu_cycles/0".into(),
-                    labels: [("node".to_string(), "beta".to_string())].into_iter().collect(),
+                    labels: [("node".to_string(), "beta".to_string())]
+                        .into_iter()
+                        .collect(),
                 },
                 MetricSeries {
                     physical: "alpha::cpu_cycles/1".into(),
-                    labels: [("node".to_string(), "alpha".to_string())].into_iter().collect(),
+                    labels: [("node".to_string(), "alpha".to_string())]
+                        .into_iter()
+                        .collect(),
                 },
             ],
         );

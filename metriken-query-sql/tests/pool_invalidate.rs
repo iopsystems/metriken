@@ -2,8 +2,8 @@
 //! next request to re-read the parquet from disk.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use metriken_query_sql::DuckDbBackend;
 

@@ -54,13 +54,17 @@ fn gpu_basic(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         column_name: "gpu_pcie_throughput__rx".into(),
         metric: "gpu_pcie_throughput".into(),
         labels: labels(&[("id", "0"), ("direction", "receive")]),
-        points: (0..=10).map(|s| (ts_secs(s), 1_000_000 + (s as i64) * 100)).collect(),
+        points: (0..=10)
+            .map(|s| (ts_secs(s), 1_000_000 + (s as i64) * 100))
+            .collect(),
     });
     builder = builder.add_gauge(GaugeSeries {
         column_name: "gpu_pcie_throughput__tx".into(),
         metric: "gpu_pcie_throughput".into(),
         labels: labels(&[("id", "0"), ("direction", "transmit")]),
-        points: (0..=10).map(|s| (ts_secs(s), 500_000 + (s as i64) * 50)).collect(),
+        points: (0..=10)
+            .map(|s| (ts_secs(s), 500_000 + (s as i64) * 50))
+            .collect(),
     });
     // PCIe bandwidth — single series, no direction label. Production parquets
     // (vllm_gemma3, sglang_gemma3) have this exact shape.
@@ -68,20 +72,26 @@ fn gpu_basic(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         column_name: "gpu_pcie_bandwidth".into(),
         metric: "gpu_pcie_bandwidth".into(),
         labels: labels(&[("id", "0")]),
-        points: (0..=10).map(|s| (ts_secs(s), 16_000_000 + (s as i64) * 1000)).collect(),
+        points: (0..=10)
+            .map(|s| (ts_secs(s), 16_000_000 + (s as i64) * 1000))
+            .collect(),
     });
     // GPU memory used/free for `gauge_a_over_a_plus_b` shape.
     builder = builder.add_gauge(GaugeSeries {
         column_name: "gpu_memory__used".into(),
         metric: "gpu_memory".into(),
         labels: labels(&[("id", "0"), ("state", "used")]),
-        points: (0..=10).map(|s| (ts_secs(s), 8_000_000_000 + (s as i64) * 1_000_000)).collect(),
+        points: (0..=10)
+            .map(|s| (ts_secs(s), 8_000_000_000 + (s as i64) * 1_000_000))
+            .collect(),
     });
     builder = builder.add_gauge(GaugeSeries {
         column_name: "gpu_memory__free".into(),
         metric: "gpu_memory".into(),
-        labels: labels(&[("id", "0"), ("state", "free"), ]),
-        points: (0..=10).map(|s| (ts_secs(s), 24_000_000_000 - (s as i64) * 1_000_000)).collect(),
+        labels: labels(&[("id", "0"), ("state", "free")]),
+        points: (0..=10)
+            .map(|s| (ts_secs(s), 24_000_000_000 - (s as i64) * 1_000_000))
+            .collect(),
     });
     builder.write(&dir.join("gpu_basic.parquet"))
 }
@@ -170,8 +180,7 @@ fn gauge_multi_source(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         ("cachecannon", "1", 110),
         ("valkey", "0", 200),
     ] {
-        let points: Vec<(u64, i64)> =
-            (0..=10).map(|s| (ts_secs(s), value + (s as i64))).collect();
+        let points: Vec<(u64, i64)> = (0..=10).map(|s| (ts_secs(s), value + (s as i64))).collect();
         builder = builder.add_gauge(GaugeSeries {
             column_name: format!("target_rate__{col}"),
             metric: "target_rate".into(),
@@ -210,8 +219,9 @@ fn gauge_basic(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let negative: Vec<(u64, i64)> = (0..=10).map(|s| (ts_secs(s), (s as i64) - 5)).collect();
     // memory_available drifts down then up — non-trivial used-memory % so
     // the golden snapshot is informative, not all-zeros.
-    let memory_avail: Vec<(u64, i64)> =
-        (0..=10).map(|s| (ts_secs(s), 1024 - (s as i64) * 32)).collect();
+    let memory_avail: Vec<(u64, i64)> = (0..=10)
+        .map(|s| (ts_secs(s), 1024 - (s as i64) * 32))
+        .collect();
 
     FixtureBuilder::new()
         .file_metadata("source", "fixture-gauge-basic")
@@ -427,12 +437,9 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for sampler in ["cpu", "syscall"] {
         let run_time_rate: u64 = 50_000_000; // ns/s of BPF time
         let run_count_rate: u64 = 1_000; // events/s
-        let run_time: Vec<(u64, u64)> = (0..=20)
-            .map(|s| (ts_secs(s), s * run_time_rate))
-            .collect();
-        let run_count: Vec<(u64, u64)> = (0..=20)
-            .map(|s| (ts_secs(s), s * run_count_rate))
-            .collect();
+        let run_time: Vec<(u64, u64)> = (0..=20).map(|s| (ts_secs(s), s * run_time_rate)).collect();
+        let run_count: Vec<(u64, u64)> =
+            (0..=20).map(|s| (ts_secs(s), s * run_count_rate)).collect();
         builder = builder.add_counter(CounterSeries {
             column_name: format!("rezolus_bpf_run_time__{col}"),
             metric: "rezolus_bpf_run_time".into(),
@@ -462,8 +469,7 @@ fn rezolus_minimal(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     ];
     for (metric, r0, r1) in perf_rates {
         for (id, rate) in ["0", "1"].iter().zip([*r0, *r1]) {
-            let points: Vec<(u64, u64)> =
-                (0..=20).map(|s| (ts_secs(s), s * rate)).collect();
+            let points: Vec<(u64, u64)> = (0..=20).map(|s| (ts_secs(s), s * rate)).collect();
             builder = builder.add_counter(CounterSeries {
                 column_name: format!("{metric}__{col}"),
                 metric: (*metric).to_string(),

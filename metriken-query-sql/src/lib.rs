@@ -35,10 +35,10 @@ pub mod udf;
 pub mod views;
 
 pub use backend::DuckDbBackend;
-pub use live::{LiveColumn, LiveColumnKind, LiveSource, LiveValue, canonical_column_name};
+pub use live::{canonical_column_name, LiveColumn, LiveColumnKind, LiveSource, LiveValue};
 pub use macros::SHARED_MACROS;
 pub use observability::{BackendStats, PhaseSnapshot, StatsSnapshot};
-pub use views::{MetricCatalog, MetricSeries, view_name_for_node, view_name_for_source};
+pub use views::{view_name_for_node, view_name_for_source, MetricCatalog, MetricSeries};
 
 /// Errors returned by the engine. The single `Backend` variant covers
 /// all DuckDB-side failures with a free-form message; callers compose

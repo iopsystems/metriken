@@ -26,8 +26,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use histogram::Histogram as H2Histogram;
 use metriken_exposition::{
-    Counter, Gauge, Histogram as ExpoHistogram, ParquetOptions, ParquetSchema, Snapshot,
-    SnapshotV2,
+    Counter, Gauge, Histogram as ExpoHistogram, ParquetOptions, ParquetSchema, Snapshot, SnapshotV2,
 };
 
 /// Default sampling interval matches the loader default at `tsdb/mod.rs:112`.

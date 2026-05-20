@@ -32,11 +32,11 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 
-use crate::SqlError;
 use crate::views::{
-    ColumnInfo, ColumnKind, MetricCatalog, build_catalog, quote_ident, render_cgroup_index_sql,
-    view_name_for_source,
+    build_catalog, quote_ident, render_cgroup_index_sql, view_name_for_source, ColumnInfo,
+    ColumnKind, MetricCatalog,
 };
+use crate::SqlError;
 
 /// Public column descriptor for live ingest. Mirrors the crate-private
 /// `views::ColumnInfo`; external callers (rezolus's snapshot loop)
@@ -382,11 +382,9 @@ impl LiveSource {
         let inner = self.inner.lock().expect("LiveSource mutex poisoned");
         let row: (Option<i64>, Option<i64>) = inner
             .conn
-            .query_row(
-                "SELECT MIN(timestamp), MAX(timestamp) FROM _src",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT MIN(timestamp), MAX(timestamp) FROM _src", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .map_err(|e| SqlError::Backend(format!("time_range_ns: {e}")))?;
         Ok(match row {
             (Some(min), Some(max)) => Some((min as u64, max as u64)),
@@ -535,8 +533,8 @@ mod tests {
     /// prefixes); rezolus live agents emit single-source data so this
     /// matches the production shape.
     fn replay_parquet_into_live(parquet_path: &str) -> Arc<LiveSource> {
-        let (col_infos, interval_ns) = crate::views::read_introspection(parquet_path)
-            .expect("introspect parquet");
+        let (col_infos, interval_ns) =
+            crate::views::read_introspection(parquet_path).expect("introspect parquet");
         let live_columns: BTreeMap<String, LiveColumn> = col_infos
             .iter()
             .filter_map(|info| live_column_from_info(info).map(|lc| (lc.physical.clone(), lc)))
@@ -547,10 +545,7 @@ mod tests {
         // Use a fresh backend to read the parquet's rows.
         let backend = DuckDbBackend::with_pool_size(1);
         let batches = backend
-            .run_sql(
-                "SELECT * FROM _src ORDER BY timestamp",
-                parquet_path,
-            )
+            .run_sql("SELECT * FROM _src ORDER BY timestamp", parquet_path)
             .expect("read parquet rows");
 
         for batch in &batches {
@@ -613,7 +608,13 @@ mod tests {
                         .downcast_ref::<UInt64Array>()
                         .expect("histogram inner UBIGINT");
                     let buckets: Vec<u64> = (0..inner_arr.len())
-                        .map(|i| if inner_arr.is_null(i) { 0 } else { inner_arr.value(i) })
+                        .map(|i| {
+                            if inner_arr.is_null(i) {
+                                0
+                            } else {
+                                inner_arr.value(i)
+                            }
+                        })
                         .collect();
                     histograms.push((name.clone(), buckets));
                 }
@@ -796,6 +797,10 @@ mod tests {
         // are SELECT *; on the live path, columns are BTreeMap-ordered
         // which equals lex order; on the parquet path, columns are
         // parquet-schema order. If they differ, we'd want to know).
-        parity_query(&path, &live, "SELECT * FROM _src ORDER BY timestamp LIMIT 5");
+        parity_query(
+            &path,
+            &live,
+            "SELECT * FROM _src ORDER BY timestamp LIMIT 5",
+        );
     }
 }

@@ -40,10 +40,10 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 
-use crate::SqlError;
 use crate::live::LiveSource;
 use crate::observability::BackendStats;
 use crate::views::MetricCatalog;
+use crate::SqlError;
 
 /// Per-data-source state: a pool of independent in-memory DuckDB
 /// connections plus the shared (Rust-side) metadata catalog produced

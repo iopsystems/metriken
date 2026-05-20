@@ -13,8 +13,8 @@
 //!    row, and writes are not lost.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -314,9 +314,7 @@ fn timestamp_snaps_to_sampling_interval() {
     )
     .expect("append");
 
-    let batches = live
-        .run_sql("SELECT timestamp FROM _src")
-        .expect("query");
+    let batches = live.run_sql("SELECT timestamp FROM _src").expect("query");
     let ts = batches[0]
         .column(0)
         .as_any()
@@ -345,12 +343,8 @@ fn missing_columns_in_a_row_get_null() {
         ],
     )
     .expect("append 1");
-    live.append(
-        2_000_000_000,
-        None,
-        &[(a.clone(), LiveValue::Counter(10))],
-    )
-    .expect("append 2 — b dropped");
+    live.append(2_000_000_000, None, &[(a.clone(), LiveValue::Counter(10))])
+        .expect("append 2 — b dropped");
 
     let batches = live
         .run_sql("SELECT timestamp, a, b FROM _src ORDER BY timestamp")
