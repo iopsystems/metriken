@@ -311,7 +311,7 @@ pub(crate) fn render_src_sql(
     // (matches the wasm viewer's `aliasSeen` dedup).
     let rezolus_columns: Vec<&ColumnInfo> = columns
         .iter()
-        .filter(|c| c.labels.get("source").map_or(false, |s| s == "rezolus"))
+        .filter(|c| c.labels.get("source").is_some_and(|s| s == "rezolus"))
         .collect();
     let mut seen_alias: BTreeSet<String> = BTreeSet::new();
     let mut projections: Vec<String> = Vec::with_capacity(rezolus_columns.len());
@@ -628,7 +628,7 @@ fn canonical_alias(info: &ColumnInfo) -> String {
     let mut value_labels: Vec<(&str, &str)> = info
         .labels
         .iter()
-        .filter(|(k, _)| !NON_VALUE_METADATA_KEYS.iter().any(|nv| *nv == k.as_str()))
+        .filter(|(k, _)| !NON_VALUE_METADATA_KEYS.contains(&k.as_str()))
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     value_labels.sort_by(|a, b| {
@@ -716,7 +716,7 @@ pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
         // For multi-source, skip non-rezolus rows: `_src` doesn't
         // project them, so a JOIN row pointing at a non-existent
         // `_src` column would be unreachable noise.
-        if multi_source && c.labels.get("source").map_or(true, |s| s != "rezolus") {
+        if multi_source && c.labels.get("source").is_none_or(|s| s != "rezolus") {
             continue;
         }
         let col = if multi_source {
@@ -738,7 +738,7 @@ pub(crate) fn render_cgroup_index_sql(columns: &[ColumnInfo]) -> String {
                 // infrastructure keys that `canonical_alias` filters
                 // out — otherwise multi-source rows expose `node` /
                 // `source` keys that the single-source path doesn't.
-                !NON_VALUE_METADATA_KEYS.iter().any(|nv| *nv == k) && k != "name" && k != "id"
+                !NON_VALUE_METADATA_KEYS.contains(&k) && k != "name" && k != "id"
             })
             .map(|(k, v)| format!("{}:{}", sql_string_lit(k), sql_string_lit(v)))
             .collect();

@@ -129,7 +129,7 @@ pub fn canonical_column_name(
     const NON_VALUE_KEYS: &[&str] = &["endpoint", "instance", "node", "source"];
     let mut value_labels: Vec<(&str, &str)> = labels
         .iter()
-        .filter(|(k, _)| !NON_VALUE_KEYS.iter().any(|nv| *nv == k.as_str()))
+        .filter(|(k, _)| !NON_VALUE_KEYS.contains(&k.as_str()))
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     value_labels.sort_by(|a, b| {

@@ -688,7 +688,7 @@ fn fixed_delta_works() {
             // Row 0: LAG is NULL — accept None / Some([]).
             // Other rows: must be exactly [2, 2].
             let ok = if i == 0 {
-                matches!(lst, None) || matches!(lst, Some(v) if v.is_empty())
+                lst.is_none() || matches!(lst, Some(v) if v.is_empty())
             } else {
                 lst.as_deref() == Some(&[2u64, 2u64][..])
             };

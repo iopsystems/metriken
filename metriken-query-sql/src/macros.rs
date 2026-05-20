@@ -372,7 +372,7 @@ mod tests {
         let conn = fresh();
         let got = one_list_u64(&conn, "SELECT h2_combine_lol([]::UBIGINT[][])");
         // Either Some(vec![]) or None is acceptable; both encode "no buckets".
-        assert!(got.as_ref().map_or(true, Vec::is_empty), "got {got:?}");
+        assert!(got.as_ref().is_none_or(Vec::is_empty), "got {got:?}");
     }
 
     #[test]
