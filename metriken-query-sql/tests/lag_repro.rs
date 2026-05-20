@@ -11,11 +11,28 @@
     clippy::type_complexity
 )]
 
-use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
-use duckdb::ffi::duckdb_vector_size;
+use duckdb::core::{ArrayVector, DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
+use duckdb::ffi::{duckdb_vector, duckdb_vector_get_data, duckdb_vector_size};
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
+
+/// Local copy of `metriken_query_sql::udf::read_list_child_no_reserve` for the
+/// diagnostic suite — bypasses `ListVector::child(capacity)`'s unconditional
+/// `duckdb_list_vector_reserve` call by going through `array_child()` (which
+/// calls `duckdb_list_vector_get_child` without reserve) + `transmute_copy`
+/// to extract the child duckdb_vector pointer + raw `duckdb_vector_get_data`
+/// to reach the storage. See the helper's docs in `src/udf.rs` for the
+/// safety contract.
+unsafe fn read_list_child_no_reserve<'a, T: Copy>(
+    lv: &'a ListVector<'a>,
+    child_len: usize,
+) -> &'a [T] {
+    let av: ArrayVector<'_> = lv.array_child();
+    let child_ptr: duckdb_vector = unsafe { std::mem::transmute_copy(&av) };
+    let data = unsafe { duckdb_vector_get_data(child_ptr) } as *const T;
+    unsafe { std::slice::from_raw_parts(data, child_len) }
+}
 
 /// Two-arg UDF that reads ONLY arg 0, ignoring arg 1.
 /// Used to test: does merely calling `input.list_vector(1)` for a LAG'd
@@ -67,9 +84,10 @@ impl VScalar for DbgReadFirstOnly {
     }
 }
 
-/// h2_delta clone that does NOT call reserve on input children (uses child(0)
-/// followed by as_slice_with_len(in_n)). If this produces correct results for
-/// all rows, the workaround is confirmed.
+/// h2_delta clone that reads input children via the reserve-free FFI bypass
+/// (`array_child()` + raw `duckdb_vector_get_data`). If this produces correct
+/// results for all rows on every CI platform, the cross-platform bug from
+/// `ListVector::child(capacity)`'s unconditional reserve call is avoided.
 pub struct DbgDeltaNoReserve;
 impl VScalar for DbgDeltaNoReserve {
     type State = ();
@@ -83,10 +101,14 @@ impl VScalar for DbgDeltaNoReserve {
         let in0 = input.list_vector(1);
         let in1_n = in1.len();
         let in0_n = in0.len();
-        // KEY DIFFERENCE: child(0) instead of child(in_n) — avoids the
-        // reserve-zeroes-data bug.
-        let in1_data = in1.child(0).as_slice_with_len::<u64>(in1_n).to_vec();
-        let in0_data = in0.child(0).as_slice_with_len::<u64>(in0_n).to_vec();
+        // KEY DIFFERENCE: bypass ListVector::child() entirely so no
+        // duckdb_list_vector_reserve is called on input vectors. This is
+        // what the prior `child(0).as_slice_with_len` workaround was trying
+        // to do — that approach worked on Linux (where reserve(0) is a true
+        // no-op) but failed on macOS / Windows CI. The new path goes
+        // through ListVector::array_child() (no reserve) + raw FFI.
+        let in1_data = read_list_child_no_reserve::<u64>(&in1, in1_n).to_vec();
+        let in0_data = read_list_child_no_reserve::<u64>(&in0, in0_n).to_vec();
 
         let mut total = 0usize;
         let mut plans: Vec<(usize, Option<(usize, usize, usize)>)> = Vec::with_capacity(n);
@@ -656,13 +678,13 @@ fn large_dataset_dbg() {
         .for_each(drop);
 }
 
-// Diagnostic test for the LAG-over-LIST workaround. The other tests in this
-// file are eprintln-only probes; this one has a strict assert. The workaround
-// has only been validated on Unix duckdb-rs targets — Windows shows different
-// LAG/LIST child-vector behaviour we haven't pinned down. Rezolus (the only
-// production consumer of these UDFs) ships Linux/macOS, so skip on Windows
-// rather than block the workspace test run.
-#[cfg(not(target_os = "windows"))]
+// Strict-assert probe of the LAG-over-LIST fix. `dbg_delta_noreserve` now
+// uses the FFI bypass that production UDFs share (see `read_list_child_no_reserve`
+// at the top of this file and in `src/udf.rs`); on Linux this matches the
+// prior `child(0).as_slice_with_len` workaround, and on macOS / Windows it
+// avoids the `duckdb_list_vector_reserve(0)` side effects that broke the
+// previous workaround. This test enforces "delta = [2, 2] for every row past
+// row 0" cross-platform.
 #[test]
 fn fixed_delta_works() {
     for &n in &[100usize, 2048, 3000, 5000] {

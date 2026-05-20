@@ -37,7 +37,8 @@
 // input bounds-checks the entry against the child capacity (see `list_entry`
 // below); out-of-range entries indicate NULL parents or malformed lists.
 
-use duckdb::core::{DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
+use duckdb::core::{ArrayVector, DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
+use duckdb::ffi::{duckdb_vector, duckdb_vector_get_data};
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
@@ -46,6 +47,69 @@ const N: u32 = 64;
 const DEFAULT_P: u32 = 3;
 #[allow(dead_code)] // documented upper bound; consumers compute exact size from per-metric p
 const MAX_BUCKET_COUNT: usize = ((N - 2 + 1) * (1u32 << 14)) as usize; // generous upper
+
+/// Read the child storage of a LIST<T> input vector as `&[T]` without
+/// triggering `duckdb_list_vector_reserve`.
+///
+/// **Why this exists.** `ListVector::child(capacity)` in duckdb-rs
+/// unconditionally calls `duckdb_list_vector_reserve(parent, capacity)`,
+/// even for `capacity = 0`. On Linux that reserve is a true no-op for
+/// `capacity == 0`, so reading via `lv.child(0).as_slice_with_len(n)` is
+/// safe; on macOS / Windows it apparently isn't, and the surrounding
+/// chunk's data (including sibling LAG'd LIST inputs) can be corrupted
+/// past row 2048. The symptom is wrong `h2_delta` / quantile / heatmap
+/// values for any plot whose query carries a `LAG(buckets) OVER (...)`.
+///
+/// **The fix.** `ListVector::array_child()` calls
+/// `duckdb_list_vector_get_child` directly without reserve, returning an
+/// `ArrayVector` wrapping the child duckdb_vector. The wrapping is
+/// type-fluid (an `ArrayVector` over a non-ARRAY child is structurally
+/// nonsensical, but we never call array-specific methods on it), and its
+/// only sized field is the `duckdb_vector` pointer. `transmute_copy`
+/// reads that pointer, and `duckdb_vector_get_data` reaches the raw
+/// child storage — exactly what `lv.child(0).as_slice_with_len(n)` does
+/// on Linux, minus the reserve call.
+///
+/// # Safety
+/// - `lv` must be a valid `ListVector` from the current `invoke` call's
+///   input chunk.
+/// - `child_len` must not exceed the actual child child-storage length
+///   (callers pass `lv.len()`).
+/// - The slice is only valid for the duration of `invoke` — the parent
+///   chunk owns the underlying storage. Callers copy out via `.to_vec()`.
+/// - This relies on duckdb-rs's `ArrayVector` having a `repr(Rust)`
+///   single-pointer layout: `{ ptr: duckdb_vector, _phantom: PhantomData }`.
+///   The runtime layout assertion in `udf_helpers_layout_invariants`
+///   catches any drift across duckdb-rs version bumps.
+unsafe fn read_list_child_no_reserve<'a, T: Copy>(
+    lv: &'a ListVector<'a>,
+    child_len: usize,
+) -> &'a [T] {
+    let av: ArrayVector<'_> = lv.array_child();
+    // ArrayVector::ptr is the child's duckdb_vector; size_of::<duckdb_vector>() == 8 (pointer).
+    let child_ptr: duckdb_vector = unsafe { std::mem::transmute_copy(&av) };
+    let data = unsafe { duckdb_vector_get_data(child_ptr) } as *const T;
+    unsafe { std::slice::from_raw_parts(data, child_len) }
+}
+
+#[cfg(test)]
+#[test]
+fn udf_helpers_layout_invariants() {
+    // Guards the `transmute_copy` in `read_list_child_no_reserve`: if
+    // duckdb-rs ever reshapes `ArrayVector` (e.g. adds a leading non-ZST
+    // field), this assertion fires loudly instead of silently reading
+    // the wrong bytes.
+    assert!(
+        std::mem::size_of::<ArrayVector<'_>>() >= std::mem::size_of::<duckdb_vector>(),
+        "ArrayVector must be at least pointer-sized for read_list_child_no_reserve"
+    );
+    // PhantomData is ZST so the struct should be exactly pointer-sized.
+    assert_eq!(
+        std::mem::size_of::<ArrayVector<'_>>(),
+        std::mem::size_of::<duckdb_vector>(),
+        "ArrayVector layout changed — re-audit read_list_child_no_reserve"
+    );
+}
 
 /// Total number of buckets in an H2 histogram with grouping power `p` and
 /// `n = 64`. `pub` so callers (e.g. the heatmap projector in `backend.rs`)
@@ -251,7 +315,7 @@ impl VScalar for H2TotalUdf {
         let n = input.len();
         let in_lv = input.list_vector(0);
         let child_n = in_lv.len();
-        let data = in_lv.child(0).as_slice_with_len::<u64>(child_n).to_vec();
+        let data = read_list_child_no_reserve::<u64>(&in_lv, child_n).to_vec();
         let mut out_vec = output.flat_vector();
         let out_ptr = out_vec.as_mut_ptr::<u64>();
         for r in 0..n {
@@ -289,8 +353,8 @@ impl VScalar for H2DeltaUdf {
         let in0 = input.list_vector(1);
         let in1_n = in1.len();
         let in0_n = in0.len();
-        let in1_data = in1.child(0).as_slice_with_len::<u64>(in1_n).to_vec();
-        let in0_data = in0.child(0).as_slice_with_len::<u64>(in0_n).to_vec();
+        let in1_data = read_list_child_no_reserve::<u64>(&in1, in1_n).to_vec();
+        let in0_data = read_list_child_no_reserve::<u64>(&in0, in0_n).to_vec();
 
         write_list_output(
             n,
@@ -338,7 +402,7 @@ impl VScalar for H2QuantileUdf {
         let ncols = input.num_columns();
         let in_lv = input.list_vector(0);
         let child_n = in_lv.len();
-        let data = in_lv.child(0).as_slice_with_len::<u64>(child_n).to_vec();
+        let data = read_list_child_no_reserve::<u64>(&in_lv, child_n).to_vec();
         let qs = input.flat_vector(1).as_slice_with_len::<f64>(n).to_vec();
 
         // 4-/5-arg overloads carry (lo, hi); fold the no-range case into
@@ -427,7 +491,7 @@ impl VScalar for H2CountInRangeUdf {
         let n = input.len();
         let in_lv = input.list_vector(0);
         let child_n = in_lv.len();
-        let data = in_lv.child(0).as_slice_with_len::<u64>(child_n).to_vec();
+        let data = read_list_child_no_reserve::<u64>(&in_lv, child_n).to_vec();
         let los = input.flat_vector(1).as_slice_with_len::<u64>(n).to_vec();
         let his = input.flat_vector(2).as_slice_with_len::<u64>(n).to_vec();
         let ps = read_p(input, 3, n);
@@ -479,8 +543,8 @@ impl VScalar for H2QuantilesUdf {
         let in_qs = input.list_vector(1);
         let bch = in_lv.len();
         let qch = in_qs.len();
-        let bdata = in_lv.child(0).as_slice_with_len::<u64>(bch).to_vec();
-        let qdata = in_qs.child(0).as_slice_with_len::<f64>(qch).to_vec();
+        let bdata = read_list_child_no_reserve::<u64>(&in_lv, bch).to_vec();
+        let qdata = read_list_child_no_reserve::<f64>(&in_qs, qch).to_vec();
         let ps = read_p(input, 2, n);
 
         write_list_output(
@@ -576,7 +640,7 @@ impl VScalar for H2CombineUdf {
         for c in 0..ncols {
             let lv = input.list_vector(c);
             let leaf_n = lv.len();
-            col_data.push(lv.child(0).as_slice_with_len::<u64>(leaf_n).to_vec());
+            col_data.push(read_list_child_no_reserve::<u64>(&lv, leaf_n).to_vec());
             col_lens.push(leaf_n);
         }
 
