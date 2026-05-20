@@ -38,7 +38,9 @@
 // below); out-of-range entries indicate NULL parents or malformed lists.
 
 use duckdb::core::{ArrayVector, DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
-use duckdb::ffi::{duckdb_vector, duckdb_vector_get_data};
+use duckdb::ffi::{
+    duckdb_validity_row_is_valid, duckdb_vector, duckdb_vector_get_data, duckdb_vector_get_validity,
+};
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
@@ -189,10 +191,46 @@ fn dbl_list() -> LogicalTypeHandle {
     LogicalTypeHandle::list(&dbl())
 }
 
+/// Returns true if the given row is NULL in this list vector.
+///
+/// Uses DuckDB's validity bitmap directly because `ListVector::get_entry`
+/// reads from raw `duckdb_list_entry` memory and returns *uninitialized*
+/// `(off, len)` for NULL parent rows. The previous bounds-check-only
+/// approach in `list_entry` worked on Linux (uninit happened to fail the
+/// bounds check) but on macOS the uninit values often pass it — producing
+/// silent wrong output (e.g. `h2_delta` returns `[0,0]` for a NULL LAG'd
+/// input instead of NULL). Reaching for the validity bitmap is the
+/// reliable cross-platform answer.
+///
+/// # Safety
+/// - `lv` must be a valid `ListVector` from the current `invoke` call.
+/// - Same layout assumption as `read_list_child_no_reserve`: the first
+///   `size_of::<duckdb_vector>()` bytes of `&ListVector` must contain the
+///   parent's `duckdb_vector` pointer. The runtime invariant in
+///   `udf_helpers_layout_invariants` guards against `ArrayVector` drift;
+///   `ListVector` shares the same `{ ptr, capacity, _phantom }` layout
+///   via its single `FlatVector` field, so the invariant covers both.
+#[inline]
+unsafe fn list_row_is_null(lv: &ListVector<'_>, row: usize) -> bool {
+    let parent_ptr: duckdb_vector = unsafe { std::mem::transmute_copy(lv) };
+    let validity = unsafe { duckdb_vector_get_validity(parent_ptr) };
+    // A NULL validity pointer means "every row is valid" — DuckDB elides
+    // the bitmap allocation when the vector has no nulls.
+    if validity.is_null() {
+        return false;
+    }
+    !unsafe { duckdb_validity_row_is_valid(validity, row as u64) }
+}
+
 /// Bounds-check a list_vector row. Returns `None` for NULL parent rows
-/// (whose `get_entry` is uninitialized) and malformed lists.
+/// (detected via the validity bitmap, not by inferring NULL from
+/// out-of-range uninit entry data — that inference is platform-dependent)
+/// and for malformed lists whose `(off, len)` walks off the child.
 #[inline]
 fn list_entry(lv: &ListVector<'_>, r: usize, child_n: usize) -> Option<(usize, usize)> {
+    if unsafe { list_row_is_null(lv, r) } {
+        return None;
+    }
     let (off, len) = lv.get_entry(r);
     (off.saturating_add(len) <= child_n).then_some((off, len))
 }

@@ -12,18 +12,16 @@
 )]
 
 use duckdb::core::{ArrayVector, DataChunkHandle, ListVector, LogicalTypeHandle, LogicalTypeId};
-use duckdb::ffi::{duckdb_vector, duckdb_vector_get_data, duckdb_vector_size};
+use duckdb::ffi::{
+    duckdb_validity_row_is_valid, duckdb_vector, duckdb_vector_get_data,
+    duckdb_vector_get_validity, duckdb_vector_size,
+};
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::Connection;
 
-/// Local copy of `metriken_query_sql::udf::read_list_child_no_reserve` for the
-/// diagnostic suite — bypasses `ListVector::child(capacity)`'s unconditional
-/// `duckdb_list_vector_reserve` call by going through `array_child()` (which
-/// calls `duckdb_list_vector_get_child` without reserve) + `transmute_copy`
-/// to extract the child duckdb_vector pointer + raw `duckdb_vector_get_data`
-/// to reach the storage. See the helper's docs in `src/udf.rs` for the
-/// safety contract.
+/// Local copies of the helpers in `metriken_query_sql::udf` for the
+/// diagnostic suite. See `src/udf.rs` for the safety contracts.
 unsafe fn read_list_child_no_reserve<'a, T: Copy>(
     lv: &'a ListVector<'a>,
     child_len: usize,
@@ -32,6 +30,15 @@ unsafe fn read_list_child_no_reserve<'a, T: Copy>(
     let child_ptr: duckdb_vector = unsafe { std::mem::transmute_copy(&av) };
     let data = unsafe { duckdb_vector_get_data(child_ptr) } as *const T;
     unsafe { std::slice::from_raw_parts(data, child_len) }
+}
+
+unsafe fn list_row_is_null(lv: &ListVector<'_>, row: usize) -> bool {
+    let parent_ptr: duckdb_vector = unsafe { std::mem::transmute_copy(lv) };
+    let validity = unsafe { duckdb_vector_get_validity(parent_ptr) };
+    if validity.is_null() {
+        return false;
+    }
+    !unsafe { duckdb_validity_row_is_valid(validity, row as u64) }
 }
 
 /// Two-arg UDF that reads ONLY arg 0, ignoring arg 1.
@@ -113,6 +120,13 @@ impl VScalar for DbgDeltaNoReserve {
         let mut total = 0usize;
         let mut plans: Vec<(usize, Option<(usize, usize, usize)>)> = Vec::with_capacity(n);
         for r in 0..n {
+            // NULL check via validity bitmap — get_entry returns uninit
+            // (off, len) for NULL parent rows and on macOS the uninit
+            // values often pass the bounds check, producing wrong output.
+            if list_row_is_null(&in1, r) || list_row_is_null(&in0, r) {
+                plans.push((total, None));
+                continue;
+            }
             let e1 = in1.get_entry(r);
             let e0 = in0.get_entry(r);
             let valid = e1.0.saturating_add(e1.1) <= in1_n && e0.0.saturating_add(e0.1) <= in0_n;
@@ -338,6 +352,13 @@ impl VScalar for DbgDeltaOversizeUdf {
         let mut total = 0usize;
         let mut plans: Vec<(usize, Option<(usize, usize, usize)>)> = Vec::with_capacity(n);
         for r in 0..n {
+            // NULL check via validity bitmap — get_entry returns uninit
+            // (off, len) for NULL parent rows and on macOS the uninit
+            // values often pass the bounds check, producing wrong output.
+            if list_row_is_null(&in1, r) || list_row_is_null(&in0, r) {
+                plans.push((total, None));
+                continue;
+            }
             let e1 = in1.get_entry(r);
             let e0 = in0.get_entry(r);
             let valid = e1.0.saturating_add(e1.1) <= in1_n && e0.0.saturating_add(e0.1) <= in0_n;
@@ -408,6 +429,13 @@ impl VScalar for DbgDeltaRefetchUdf {
         let mut total = 0usize;
         let mut plans: Vec<(usize, Option<(usize, usize, usize)>)> = Vec::with_capacity(n);
         for r in 0..n {
+            // NULL check via validity bitmap — get_entry returns uninit
+            // (off, len) for NULL parent rows and on macOS the uninit
+            // values often pass the bounds check, producing wrong output.
+            if list_row_is_null(&in1, r) || list_row_is_null(&in0, r) {
+                plans.push((total, None));
+                continue;
+            }
             let e1 = in1.get_entry(r);
             let e0 = in0.get_entry(r);
             let valid = e1.0.saturating_add(e1.1) <= in1_n && e0.0.saturating_add(e0.1) <= in0_n;
