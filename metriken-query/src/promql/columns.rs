@@ -13,7 +13,9 @@ use std::ops::Deref;
 use promql_parser::label::Matcher;
 use promql_parser::parser::{self, Expr};
 
-use crate::promql::{extract_filter_labels, parse_optional_stride, QueryEngine, QueryError};
+use crate::promql::{
+    extract_filter_labels, parse_histogram_call, parse_optional_stride, QueryEngine, QueryError,
+};
 use crate::tsdb::Tsdb;
 
 impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
@@ -65,13 +67,18 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
         let (selector, _stride) = parse_optional_stride(remaining)?;
         return Ok(selector);
     }
-    for prefix in [
-        "histogram_heatmap(",
-        "histogram_mean(",
-        "histogram_count(",
-        "histogram_irate(",
-    ] {
-        if let Some(inner) = query.strip_prefix(prefix).and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = query
+        .strip_prefix("histogram_heatmap(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let (selector, _stride) = parse_optional_stride(inner.trim())?;
+        return Ok(selector);
+    }
+    // The scalar reducers accept an optional `[by/without (..)]` clause
+    // before the body; defer to the shared parser so the column scan
+    // sees the same surface syntax `query_range` does.
+    for func in ["histogram_mean", "histogram_count", "histogram_irate"] {
+        if let Some((inner, _group_by)) = parse_histogram_call(func, query)? {
             let (selector, _stride) = parse_optional_stride(inner.trim())?;
             return Ok(selector);
         }

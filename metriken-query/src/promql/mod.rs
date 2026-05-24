@@ -123,42 +123,110 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Strip an outer `sum(...)` / `sum by (..)(...)` / `sum without (..)(...)`
-/// wrapper if the inner call is `histogram_irate(...)`. The wrapper is a
-/// no-op since `histogram_irate` already collapses to one series; this lets
-/// `sum(histogram_irate(m))` parse even though promql-parser doesn't know
-/// the function name.
-fn strip_outer_sum_around_histogram_irate(query: &str) -> Option<&str> {
-    let rest = query.trim().strip_prefix("sum")?.trim_start();
+/// Owned grouping spec for the rezolus histogram reducers, parsed
+/// from `by (..)` / `without (..)` modifiers in `query_range`.
+/// Borrowed as a `streaming::GroupBy<'_>` at call sites.
+#[derive(Debug, Default, Clone)]
+pub(crate) enum HistogramGroupBy {
+    #[default]
+    None,
+    By(Vec<String>),
+    Without(Vec<String>),
+}
 
-    let body = if let Some(r) = rest.strip_prefix("by") {
-        let r = r.trim_start().strip_prefix('(')?;
-        let close = find_top_level_close_paren(r)?;
-        r[close + 1..].trim_start()
-    } else if let Some(r) = rest.strip_prefix("without") {
-        let r = r.trim_start().strip_prefix('(')?;
-        let close = find_top_level_close_paren(r)?;
-        r[close + 1..].trim_start()
-    } else {
-        rest
-    };
-
-    let body = body.strip_prefix('(')?;
-    let close = find_top_level_close_paren(body)?;
-    if close != body.len() - 1 {
-        return None;
-    }
-    let inner = body[..close].trim();
-    if inner.starts_with("histogram_irate(") && inner.ends_with(')') {
-        Some(inner)
-    } else {
-        None
+impl HistogramGroupBy {
+    pub(crate) fn as_ref(&self) -> streaming::GroupBy<'_> {
+        match self {
+            HistogramGroupBy::None => streaming::GroupBy::Include(&[]),
+            HistogramGroupBy::By(ls) => streaming::GroupBy::Include(ls),
+            HistogramGroupBy::Without(ls) => streaming::GroupBy::Exclude(ls),
+        }
     }
 }
 
-/// Find the `)` that closes the open paren whose content starts at byte 0
-/// of `s` (depth begins at 1). `None` if unbalanced.
-fn find_top_level_close_paren(s: &str) -> Option<usize> {
+/// Parse a rezolus histogram call of shape
+/// `<func> [by (labels) | without (labels)] (...body...)` and return
+/// the inner body (without the outer parens) plus the grouping.
+/// Returns `Ok(None)` if `query` doesn't start with `<func>`.
+pub(crate) fn parse_histogram_call<'a>(
+    func: &str,
+    query: &'a str,
+) -> Result<Option<(&'a str, HistogramGroupBy)>, QueryError> {
+    let Some(after_name) = query.strip_prefix(func) else {
+        return Ok(None);
+    };
+    // Reject prefix matches against longer function names (e.g. don't
+    // let "histogram_count_extra(" match func="histogram_count").
+    let next = after_name.chars().next();
+    if !matches!(next, Some('(') | Some(' ') | Some('\t')) {
+        return Ok(None);
+    }
+    let rest = after_name.trim_start();
+
+    let (group_by, after_modifier) = if let Some(r) = rest.strip_prefix("by") {
+        let r = r.trim_start();
+        let inside = r
+            .strip_prefix('(')
+            .ok_or_else(|| QueryError::ParseError(format!("{func}: expected '(' after 'by'")))?;
+        let close = find_close_paren(inside).ok_or_else(|| {
+            QueryError::ParseError(format!("{func}: unbalanced parens in 'by' clause"))
+        })?;
+        let labels = parse_label_list(&inside[..close])?;
+        (
+            HistogramGroupBy::By(labels),
+            inside[close + 1..].trim_start(),
+        )
+    } else if let Some(r) = rest.strip_prefix("without") {
+        let r = r.trim_start();
+        let inside = r.strip_prefix('(').ok_or_else(|| {
+            QueryError::ParseError(format!("{func}: expected '(' after 'without'"))
+        })?;
+        let close = find_close_paren(inside).ok_or_else(|| {
+            QueryError::ParseError(format!("{func}: unbalanced parens in 'without' clause"))
+        })?;
+        let labels = parse_label_list(&inside[..close])?;
+        (
+            HistogramGroupBy::Without(labels),
+            inside[close + 1..].trim_start(),
+        )
+    } else {
+        (HistogramGroupBy::None, rest)
+    };
+
+    let body = after_modifier.strip_prefix('(').ok_or_else(|| {
+        QueryError::ParseError(format!("{func}: expected '(' after function name"))
+    })?;
+    if !body.ends_with(')') {
+        return Err(QueryError::ParseError(format!(
+            "{func}: missing closing ')'"
+        )));
+    }
+    let inner = &body[..body.len() - 1];
+    Ok(Some((inner, group_by)))
+}
+
+/// Parse a comma-separated list of label identifiers. Empty entries
+/// are skipped (`by ()` is allowed, meaning "no labels").
+fn parse_label_list(s: &str) -> Result<Vec<String>, QueryError> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(QueryError::ParseError(format!(
+                "invalid label name in grouping clause: {p}"
+            )));
+        }
+        out.push(p.to_string());
+    }
+    Ok(out)
+}
+
+/// Find the `)` that closes the open paren whose content starts at
+/// byte 0 of `s` (depth begins at 1). `None` if unbalanced.
+fn find_close_paren(s: &str) -> Option<usize> {
     let mut depth: usize = 1;
     for (i, ch) in s.char_indices() {
         match ch {
@@ -456,16 +524,16 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle `histogram_irate(metric{matchers})`. Same metric-selector
-    /// shape as `histogram_count` / `histogram_mean`, but rejects a
-    /// trailing stride — see [`streaming::histogram::irate`].
+    /// Handle `histogram_irate(metric{matchers}) [by/without (..)]`.
+    /// Same shape as `histogram_count` / `histogram_mean`, but rejects
+    /// a trailing stride — see [`streaming::histogram::irate`].
     fn handle_histogram_irate(
         &self,
-        query_str: &str,
+        inner: &str,
+        group_by: HistogramGroupBy,
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
-        let inner = &query_str["histogram_irate(".len()..query_str.len() - 1];
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         if stride_ns.is_some() {
             return Err(QueryError::ParseError(
@@ -480,8 +548,14 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
-        let result =
-            streaming::histogram::irate(collection, &labels, start_ns, end_ns, &metric_name);
+        let result = streaming::histogram::irate(
+            collection,
+            &labels,
+            group_by.as_ref(),
+            start_ns,
+            end_ns,
+            &metric_name,
+        );
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
                 "No histogram data found for {metric_name}"
@@ -490,23 +564,19 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         Ok(QueryResult::Matrix { result })
     }
 
-    /// Handle `histogram_mean(metric{matchers}[, stride])` and
-    /// `histogram_count(metric{matchers}[, stride])` queries.
-    ///
-    /// Both collapse every matching label-keyed series into a single
-    /// output series labeled `{__name__: metric_name}` — `mean` emits
-    /// the count-weighted bucket-midpoint mean per tick, `count` the
-    /// total observation count per tick. Same single-metric-arg
-    /// pre-parser shape as `histogram_heatmap`, reusing the streaming
-    /// per-tick walk so peak memory is independent of series count.
+    /// Handle `histogram_mean(metric{matchers}[, stride]) [by/without (..)]`
+    /// and `histogram_count(metric{matchers}[, stride]) [by/without (..)]`.
+    /// With no grouping, every matching series collapses into one
+    /// `{__name__: metric_name}` output; with `by`/`without`, one series
+    /// per distinct projected-label tuple.
     fn handle_histogram_scalar(
         &self,
         func: &str,
-        query_str: &str,
+        inner: &str,
+        group_by: HistogramGroupBy,
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
-        let inner = &query_str[func.len() + 1..query_str.len() - 1];
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
@@ -516,10 +586,12 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
+        let group = group_by.as_ref();
         let result = match func {
             "histogram_mean" => streaming::histogram::mean(
                 collection,
                 &labels,
+                group,
                 start_ns,
                 end_ns,
                 stride_ns,
@@ -528,6 +600,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             _ => streaming::histogram::count(
                 collection,
                 &labels,
+                group,
                 start_ns,
                 end_ns,
                 stride_ns,
@@ -560,21 +633,17 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
 
-        // Scalar histogram reducers (rezolus extensions, same
-        // single-metric-arg shape as histogram_heatmap).
-        if query_str.starts_with("histogram_mean(") && query_str.ends_with(")") {
-            return self.handle_histogram_scalar("histogram_mean", query_str, start, end);
+        // Scalar histogram reducers (rezolus extensions). Each accepts
+        // an optional aggregation-modifier clause `[by/without (..)]`
+        // between the function name and the metric body, mirroring the
+        // PromQL aggregation-operator syntax.
+        for func in ["histogram_mean", "histogram_count"] {
+            if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
+                return self.handle_histogram_scalar(func, inner, group_by, start, end);
+            }
         }
-        if query_str.starts_with("histogram_count(") && query_str.ends_with(")") {
-            return self.handle_histogram_scalar("histogram_count", query_str, start, end);
-        }
-
-        // promql-parser doesn't know `histogram_irate`, so peel a
-        // no-op outer `sum`/`sum by`/`sum without` wrapper here so
-        // the dashboard idiom `sum(histogram_irate(m))` parses.
-        let effective = strip_outer_sum_around_histogram_irate(query_str).unwrap_or(query_str);
-        if effective.starts_with("histogram_irate(") && effective.ends_with(")") {
-            return self.handle_histogram_irate(effective, start, end);
+        if let Some((inner, group_by)) = parse_histogram_call("histogram_irate", query_str)? {
+            return self.handle_histogram_irate(inner, group_by, start, end);
         }
 
         // Parse the query into an AST and evaluate. The streaming

@@ -10,16 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### metriken-query 0.10.6
 
 - Add `histogram_irate(m)` — per-step rate of a histogram's
-  cumulative sample count, returned as a single-series instant
-  vector labeled `{__name__: metric_name}`. Lets dashboards derive
-  a fallback event-rate line for histograms that have no
-  standalone counter (`scheduler_runqueue_latency`,
+  cumulative sample count, returned as an instant vector. Lets
+  dashboards derive a fallback event-rate line for histograms
+  that have no standalone counter (`scheduler_runqueue_latency`,
   `scheduler_offcpu`, `scheduler_running`, `tcp_packet_latency`).
-  Composes with `sum(...)`, `sum by (..)(...)`, and
-  `sum without (..)(...)` directly. Replaces the
-  `sum(irate(histogram_count(m)[5m]))` idiom suggested for
-  `histogram_count` in 0.10.5, which never parsed — PromQL
-  disallows range vectors on function-call results.
+  Replaces the `sum(irate(histogram_count(m)[5m]))` idiom
+  suggested for `histogram_count` in 0.10.5, which never parsed —
+  PromQL disallows range vectors on function-call results.
+- Add an optional `by (..)` / `without (..)` aggregation modifier
+  to `histogram_irate`, `histogram_count`, and `histogram_mean`,
+  matching standard PromQL aggregation-operator syntax. With no
+  modifier, every matching series collapses into one
+  `{__name__: metric_name}` output (today's behaviour); with
+  `by`/`without`, one series per distinct projected-label tuple.
+  Lets `histogram_mean by (source) (m)` return one mean per
+  source in a single query — previously required N filtered
+  queries.
 
 ### metriken-query 0.10.2
 
