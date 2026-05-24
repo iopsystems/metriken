@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.10.6
+
+- Add `histogram_irate(m)` — per-step rate of a histogram's
+  cumulative sample count, returned as a single-series instant
+  vector labeled `{__name__: metric_name}`. Lets dashboards derive
+  a fallback event-rate line for histograms that have no
+  standalone counter (`scheduler_runqueue_latency`,
+  `scheduler_offcpu`, `scheduler_running`, `tcp_packet_latency`).
+  Composes with `sum(...)`, `sum by (..)(...)`, and
+  `sum without (..)(...)` directly. Replaces the
+  `sum(irate(histogram_count(m)[5m]))` idiom suggested for
+  `histogram_count` in 0.10.5, which never parsed — PromQL
+  disallows range vectors on function-call results.
+
 ### metriken-query 0.10.2
 
 - Restore the matcher-less single-right binary broadcast. Queries

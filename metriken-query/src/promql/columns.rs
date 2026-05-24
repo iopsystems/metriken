@@ -44,9 +44,10 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 /// so the standard PromQL parser can handle it. The wrappers
 /// (`histogram_quantiles([qs], m, [stride])`, `histogram_heatmap(m,
 /// [stride])`, `histogram_mean(m, [stride])`, `histogram_count(m,
-/// [stride])`) use array-literal / multi-arg syntax the parser
-/// rejects, but their *column set* is just the inner selector's.
-/// Non-rezolus queries pass through unchanged.
+/// [stride])`, `histogram_irate(m)`) use array-literal / multi-arg
+/// syntax or names the parser doesn't recognise, but their *column
+/// set* is just the inner selector's. Non-rezolus queries pass
+/// through unchanged.
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     if let Some(inner) = query
         .strip_prefix("histogram_quantiles(")
@@ -67,7 +68,12 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
         let (selector, _stride) = parse_optional_stride(remaining)?;
         return Ok(selector);
     }
-    for prefix in ["histogram_heatmap(", "histogram_mean(", "histogram_count("] {
+    for prefix in [
+        "histogram_heatmap(",
+        "histogram_mean(",
+        "histogram_count(",
+        "histogram_irate(",
+    ] {
         if let Some(inner) = query.strip_prefix(prefix).and_then(|s| s.strip_suffix(')')) {
             let (selector, _stride) = parse_optional_stride(inner.trim())?;
             return Ok(selector);

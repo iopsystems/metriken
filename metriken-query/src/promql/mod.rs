@@ -123,6 +123,66 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// If `query` is `sum(histogram_irate(...))`, `sum by (..)(histogram_irate(...))`,
+/// or `sum without (..)(histogram_irate(...))`, return the inner
+/// `histogram_irate(...)` call. Otherwise return `None`.
+///
+/// `histogram_irate` already collapses every input series into one
+/// `{__name__: metric_name}` output, so any outer `sum`/`sum by`/
+/// `sum without` over it is functionally a no-op and the dashboard
+/// idiom `sum(histogram_irate(m))` (written for symmetry with
+/// `sum(irate(counter[5m]))`) reduces to the inner call.
+fn strip_outer_sum_around_histogram_irate(query: &str) -> Option<&str> {
+    let q = query.trim();
+    let rest = q.strip_prefix("sum")?;
+    let rest = rest.trim_start();
+
+    // Optional `by (labels)` / `without (labels)` modifier.
+    let body = if let Some(r) = rest.strip_prefix("by") {
+        let r = r.trim_start().strip_prefix('(')?;
+        let close = find_top_level_close_paren(r)?;
+        r[close + 1..].trim_start()
+    } else if let Some(r) = rest.strip_prefix("without") {
+        let r = r.trim_start().strip_prefix('(')?;
+        let close = find_top_level_close_paren(r)?;
+        r[close + 1..].trim_start()
+    } else {
+        rest
+    };
+
+    let body = body.strip_prefix('(')?;
+    let close = find_top_level_close_paren(body)?;
+    if close != body.len() - 1 {
+        return None;
+    }
+    let inner = body[..close].trim();
+    if inner.starts_with("histogram_irate(") && inner.ends_with(')') {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// Find the byte offset of the `)` that closes the open paren whose
+/// content begins at position 0 of `s` (i.e. depth starts at 1).
+/// Returns `None` if unbalanced.
+fn find_top_level_close_paren(s: &str) -> Option<usize> {
+    let mut depth: usize = 1;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Collapse a matrix result into a vector by taking the latest
 /// point of each series. Used by `query()` to convert a degenerate
 /// range query (`start = end = time`) into instant-query shape.
@@ -404,6 +464,44 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
+    /// Handle `histogram_irate(metric{matchers})` queries.
+    ///
+    /// Per-step rate of the histogram's cumulative sample count, as a
+    /// single-series instant vector. Same metric-selector pre-parser
+    /// shape as `histogram_count` / `histogram_mean`, but no
+    /// window/stride argument — see `streaming::histogram::irate` for
+    /// the rationale.
+    fn handle_histogram_irate(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+    ) -> Result<QueryResult, QueryError> {
+        let inner = &query_str["histogram_irate(".len()..query_str.len() - 1];
+        let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
+        if stride_ns.is_some() {
+            return Err(QueryError::ParseError(
+                "histogram_irate does not accept a window/stride argument".to_string(),
+            ));
+        }
+        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
+            return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        };
+
+        let start_ns = (start * 1e9) as u64;
+        let end_ns = (end * 1e9) as u64;
+        let result =
+            streaming::histogram::irate(collection, &labels, start_ns, end_ns, &metric_name);
+        if result.is_empty() {
+            return Err(QueryError::MetricNotFound(format!(
+                "No histogram data found for {metric_name}"
+            )));
+        }
+        Ok(QueryResult::Matrix { result })
+    }
+
     /// Handle `histogram_mean(metric{matchers}[, stride])` and
     /// `histogram_count(metric{matchers}[, stride])` queries.
     ///
@@ -481,6 +579,19 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
         if query_str.starts_with("histogram_count(") && query_str.ends_with(")") {
             return self.handle_histogram_scalar("histogram_count", query_str, start, end);
+        }
+
+        // `histogram_irate` is a rezolus extension — promql-parser
+        // doesn't know the name, so a nested form like
+        // `sum(histogram_irate(m))` never reaches the dispatcher.
+        // Since `histogram_irate` already collapses every matching
+        // series into a single output, the outer `sum(...)` (or
+        // `sum by (..)(...)` / `sum without (..)(...)`) wrapper is
+        // functionally a no-op; strip it here so the idiomatic
+        // dashboard form parses.
+        let effective = strip_outer_sum_around_histogram_irate(query_str).unwrap_or(query_str);
+        if effective.starts_with("histogram_irate(") && effective.ends_with(")") {
+            return self.handle_histogram_irate(effective, start, end);
         }
 
         // Parse the query into an AST and evaluate. The streaming

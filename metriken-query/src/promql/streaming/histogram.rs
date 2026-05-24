@@ -530,6 +530,123 @@ fn reduce(
     vec![MatrixSample { metric, values }]
 }
 
+/// Streaming `histogram_irate(metric{filter})`.
+///
+/// Per-step rate of the cumulative sample count, returned as a
+/// single-series instant vector labeled `{__name__: metric_name}`.
+/// At each tick `t`, the emitted value is
+/// `count_delta(t) / (t - t_prev)` where `count_delta(t)` is the
+/// sum of `total_count()` over every series-at-`t` (the stored
+/// per-tick deltas already collapse across input series).
+///
+/// First tick (no prior sample) emits nothing — the rate is
+/// undefined without a prior timestamp. Subsequent ticks with an
+/// empty delta emit `0` rather than being skipped (idle window
+/// has a well-defined zero rate; this differs from `histogram_mean`,
+/// which is null on empty because mean of nothing is undefined).
+///
+/// No window/stride argument: the spec'd idiom
+/// `sum(irate(histogram_count(m)[5m]))` doesn't parse — PromQL
+/// disallows range vectors on function-call results — and metriken
+/// already evaluates one delta histogram per source tick, so a
+/// range argument would always cover exactly one sample. Dropping
+/// it sidesteps the grammar problem.
+///
+/// The per-step delta count is `u64` and therefore never negative.
+/// Conceptually, a lock-free snapshot undercount in the upstream
+/// counter (next snapshot recovers and looks like a drop) would
+/// produce a transient negative delta in cumulative-count form;
+/// at ingest time `delta_to_32_or_empty` already absorbs that into
+/// an empty delta, so the irate value at that tick falls out as
+/// `0`. Acceptable for the fallback-rate role.
+pub fn irate(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+    metric_name: &str,
+) -> Vec<MatrixSample> {
+    let mut iters: Vec<_> = collection
+        .iter()
+        .filter(|(labels, _)| label_filter.inner.is_empty() || labels.matches(label_filter))
+        .map(|(_, series)| series.iter().peekable())
+        .collect();
+
+    if iters.is_empty() {
+        return vec![];
+    }
+
+    let mut values: Vec<(f64, f64)> = Vec::new();
+    // Tracks the timestamp of the previous sample we saw — either
+    // an in-window tick we already emitted against, or a pre-window
+    // tick we skipped. The latter case lets the first in-window
+    // tick still produce a rate, mirroring how a PromQL rate query
+    // looks backward past the window edge for context.
+    let mut prev_t_ns: Option<u64> = None;
+
+    loop {
+        let mut min_ts: Option<u64> = None;
+        for it in iters.iter_mut() {
+            while let Some(&(ts, _)) = it.peek() {
+                if ts > end_ns {
+                    it.next();
+                    continue;
+                }
+                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                break;
+            }
+        }
+        let Some(t) = min_ts else { break };
+
+        // Pull every series with a sample at t. We only need the
+        // total count per series, summed; the bucket-merge needed
+        // by the quantile/mean paths is skipped.
+        let mut count: u64 = 0;
+        for it in iters.iter_mut() {
+            if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
+                let (_, r) = it.next().expect("peek matched");
+                count = count.saturating_add(r.total_count());
+            }
+        }
+
+        if t < start_ns {
+            // Pre-window tick: don't emit, but remember the
+            // timestamp so the first in-window tick has a `prev`
+            // to rate against.
+            prev_t_ns = Some(t);
+            continue;
+        }
+
+        match prev_t_ns {
+            None => {
+                // First observed tick in the entire series — no
+                // prior timestamp, rate is undefined.
+            }
+            Some(prev) => {
+                let dt_ns = t.saturating_sub(prev);
+                if dt_ns > 0 {
+                    let dt_sec = dt_ns as f64 / 1e9;
+                    // `count` is u64 so already non-negative; the
+                    // .max(0.0) is a defensive clamp documenting
+                    // the conceptual cumulative-form behaviour
+                    // (negative delta → 0). See function-level
+                    // doc-comment.
+                    let rate = (count as f64).max(0.0) / dt_sec;
+                    values.push((t as f64 / 1e9, rate));
+                }
+            }
+        }
+        prev_t_ns = Some(t);
+    }
+
+    if values.is_empty() {
+        return vec![];
+    }
+    let mut metric: HashMap<String, String> = HashMap::new();
+    metric.insert("__name__".to_string(), metric_name.to_string());
+    vec![MatrixSample { metric, values }]
+}
+
 /// Streaming `histogram_heatmap(metric{filter}[, stride])`.
 ///
 /// Same per-tick walk as [`quantiles`] (sum across input series's

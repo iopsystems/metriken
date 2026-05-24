@@ -1423,6 +1423,280 @@ fn test_histogram_mean_metric_not_found() {
     }
 }
 
+/// Build a TSDB where every snapshot increments the cumulative count
+/// by a fixed `step_increment` per second. Returns the tsdb plus the
+/// expected per-cpu count delta (across both CPUs, summed) that
+/// `histogram_irate` should see per tick.
+///
+/// All observations land in the exact bucket for value 10 (values
+/// < 32 are exact under grouping_power 4), matching the rest of the
+/// histogram exec fixtures.
+fn create_hist_irate_tsdb(cumulative_per_cpu: &[u64]) -> Tsdb {
+    use histogram::Histogram;
+    use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    for (step, &count) in cumulative_per_cpu.iter().enumerate() {
+        let time = base_time + Duration::from_secs(step as u64);
+        let mut histograms = Vec::new();
+        for cpu in ["0", "1"] {
+            let mut h = Histogram::new(4, 16).unwrap();
+            for _ in 0..count {
+                h.increment(10).unwrap();
+            }
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), "req_latency".to_string());
+            meta.insert("cpu".to_string(), cpu.to_string());
+            histograms.push(SnapHist {
+                name: "req_latency".to_string(),
+                value: h,
+                metadata: meta,
+            });
+        }
+        tsdb.ingest(Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms,
+        }));
+    }
+
+    tsdb
+}
+
+#[test]
+fn test_histogram_irate_steady_rate_is_constant() {
+    // Cumulative per cpu: [0, 10, 20, 30, 40] → per-tick deltas of 10
+    // per cpu = 20 per tick collapsed. At a 1s step, rate is 20.0
+    // every tick from the second observed delta onward. The first
+    // delta (t=1001) has no prior, so no point.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    assert_eq!(result.len(), 1, "irate collapses to one __name__ series");
+    assert_eq!(
+        result[0].metric.get("__name__").map(String::as_str),
+        Some("req_latency")
+    );
+
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    // Stored deltas land at t=1001..=1004 (the loader drops the
+    // initial cumulative=0 snapshot since it has no predecessor).
+    // The first delta tick (t=1001) has no prior, so it's skipped;
+    // the remaining three emit a constant rate of 20 events/sec.
+    assert_eq!(values.len(), 3, "first observed delta yields null");
+    for v in values {
+        assert!(
+            (v - 20.0).abs() < 1e-9,
+            "steady rate should be 20.0, got {v}"
+        );
+    }
+}
+
+#[test]
+fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
+    // Cumulative per cpu: [0, 0, 50, 50, 50]
+    //   - delta at t=1001: 0 (loader stores explicit empty)
+    //   - delta at t=1002: 50 (burst)
+    //   - delta at t=1003: 0 (idle)
+    //   - delta at t=1004: 0 (idle)
+    // Summed across both cpus that's 0, 100, 0, 0.
+    //
+    // irate skips t=1001 (no prior), then:
+    //   t=1002: 100 / 1s = 100  (spike)
+    //   t=1003:   0 / 1s = 0    (idle)
+    //   t=1004:   0 / 1s = 0    (idle)
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 0, 50, 50, 50]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 3);
+    assert!((values[0] - 100.0).abs() < 1e-9, "spike, got {}", values[0]);
+    assert_eq!(values[1], 0.0, "idle window emits zero rate");
+    assert_eq!(values[2], 0.0, "idle window emits zero rate");
+}
+
+#[test]
+fn test_histogram_irate_counter_drop_clamps_to_zero() {
+    // Cumulative per cpu: [0, 10, 5, 15]
+    //   - delta at t=1001: +10 per cpu = 20 collapsed
+    //   - delta at t=1002: cv=5 < pv=10 → loader records an empty
+    //     delta (delta_to_32_or_empty falls back on underflow),
+    //     count is 0
+    //   - delta at t=1003: cv=15, pv=5 → +10 per cpu = 20 collapsed
+    //
+    // irate:
+    //   t=1001: skip (no prior)
+    //   t=1002: count=0 / 1s = 0  (clamp manifests as 0 here — the
+    //                              "negative delta" was absorbed at
+    //                              ingest)
+    //   t=1003: 20 / 1s = 20
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 5, 15]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1004.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 2);
+    assert_eq!(
+        values[0], 0.0,
+        "drop in cumulative count clamps to zero, got {}",
+        values[0]
+    );
+    assert!(
+        (values[1] - 20.0).abs() < 1e-9,
+        "recovery after drop, got {}",
+        values[1]
+    );
+}
+
+#[test]
+fn test_histogram_irate_first_step_is_null() {
+    // Only two cumulative snapshots → loader produces one delta
+    // (at t=1001). irate has no prior for that delta → empty result
+    // → MetricNotFound (the engine surfaces an empty matrix as
+    // MetricNotFound for parity with the other histogram_* helpers).
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 5]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range("histogram_irate(req_latency)", 1000.0, 1002.0, 1.0);
+    match result {
+        Err(QueryError::MetricNotFound(_)) => {}
+        other => panic!("expected MetricNotFound (single delta → null), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_histogram_irate_label_filter_selects_single_series() {
+    // Same fixture as the steady-rate test but filtered to cpu=0,
+    // so the per-tick count is 10 (single cpu) and rate is 10.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"histogram_irate(req_latency{cpu="0"})"#,
+            1000.0,
+            1004.0,
+            1.0,
+        )
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 2);
+    for v in values {
+        assert!((v - 10.0).abs() < 1e-9, "expected 10.0, got {v}");
+    }
+}
+
+#[test]
+fn test_histogram_irate_composes_inside_sum_and_sum_by() {
+    // Both forms should evaluate to the same single-series result as
+    // the bare histogram_irate call, since the function already
+    // collapses every matching input series into one
+    // `{__name__: metric_name}` output. The outer `sum`/`sum by` is
+    // syntactically present for symmetry with `sum(irate(c[5m]))`
+    // and must parse and execute cleanly.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let bare = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+    let summed = engine
+        .query_range("sum(histogram_irate(req_latency))", 1000.0, 1005.0, 1.0)
+        .unwrap();
+    let summed_by = engine
+        .query_range(
+            "sum by (cpu)(histogram_irate(req_latency))",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+    let summed_without = engine
+        .query_range(
+            "sum without (cpu)(histogram_irate(req_latency))",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+
+    let values_of = |r: &QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+
+    let bare_v = values_of(&bare);
+    assert_eq!(values_of(&summed), bare_v, "sum is a no-op wrapper");
+    assert_eq!(values_of(&summed_by), bare_v, "sum by (cpu) is a no-op");
+    assert_eq!(
+        values_of(&summed_without),
+        bare_v,
+        "sum without (cpu) is a no-op"
+    );
+}
+
+#[test]
+fn test_histogram_irate_rejects_stride_argument() {
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range("histogram_irate(req_latency, 5)", 1000.0, 1003.0, 1.0);
+    match result {
+        Err(QueryError::ParseError(msg)) => {
+            assert!(msg.contains("stride") || msg.contains("window"));
+        }
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_columns_histogram_irate_resolves_buckets_column() {
+    let tsdb = Arc::new(create_columns_histogram_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let cols = engine
+        .columns("histogram_irate(tcp_packet_latency)")
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
 #[test]
 fn test_columns_returns_parse_error_for_invalid_syntax() {
     let tsdb = Arc::new(create_columns_tsdb());
