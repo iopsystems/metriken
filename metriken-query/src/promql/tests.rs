@@ -1423,14 +1423,10 @@ fn test_histogram_mean_metric_not_found() {
     }
 }
 
-/// Build a TSDB where every snapshot increments the cumulative count
-/// by a fixed `step_increment` per second. Returns the tsdb plus the
-/// expected per-cpu count delta (across both CPUs, summed) that
-/// `histogram_irate` should see per tick.
-///
-/// All observations land in the exact bucket for value 10 (values
-/// < 32 are exact under grouping_power 4), matching the rest of the
-/// histogram exec fixtures.
+/// Two-cpu histogram TSDB driven by an explicit cumulative-count
+/// sequence; one snapshot per second starting at t=1000. All
+/// observations land in the exact bucket for value 10 (values < 32
+/// are exact under grouping_power 4).
 fn create_hist_irate_tsdb(cumulative_per_cpu: &[u64]) -> Tsdb {
     use histogram::Histogram;
     use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
@@ -1470,10 +1466,9 @@ fn create_hist_irate_tsdb(cumulative_per_cpu: &[u64]) -> Tsdb {
 
 #[test]
 fn test_histogram_irate_steady_rate_is_constant() {
-    // Cumulative per cpu: [0, 10, 20, 30, 40] → per-tick deltas of 10
-    // per cpu = 20 per tick collapsed. At a 1s step, rate is 20.0
-    // every tick from the second observed delta onward. The first
-    // delta (t=1001) has no prior, so no point.
+    // Per-cpu deltas of +10/sec → 20/sec collapsed. The first delta
+    // (t=1001) has no prior, so the remaining three ticks each emit
+    // rate 20.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1491,10 +1486,6 @@ fn test_histogram_irate_steady_rate_is_constant() {
     );
 
     let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
-    // Stored deltas land at t=1001..=1004 (the loader drops the
-    // initial cumulative=0 snapshot since it has no predecessor).
-    // The first delta tick (t=1001) has no prior, so it's skipped;
-    // the remaining three emit a constant rate of 20 events/sec.
     assert_eq!(values.len(), 3, "first observed delta yields null");
     for v in values {
         assert!(
@@ -1506,17 +1497,8 @@ fn test_histogram_irate_steady_rate_is_constant() {
 
 #[test]
 fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
-    // Cumulative per cpu: [0, 0, 50, 50, 50]
-    //   - delta at t=1001: 0 (loader stores explicit empty)
-    //   - delta at t=1002: 50 (burst)
-    //   - delta at t=1003: 0 (idle)
-    //   - delta at t=1004: 0 (idle)
-    // Summed across both cpus that's 0, 100, 0, 0.
-    //
-    // irate skips t=1001 (no prior), then:
-    //   t=1002: 100 / 1s = 100  (spike)
-    //   t=1003:   0 / 1s = 0    (idle)
-    //   t=1004:   0 / 1s = 0    (idle)
+    // Collapsed per-tick deltas: 0, 100, 0, 0. After skipping the
+    // priorless first tick, irate emits 100 then 0 then 0.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 0, 50, 50, 50]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1536,19 +1518,9 @@ fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
 
 #[test]
 fn test_histogram_irate_counter_drop_clamps_to_zero() {
-    // Cumulative per cpu: [0, 10, 5, 15]
-    //   - delta at t=1001: +10 per cpu = 20 collapsed
-    //   - delta at t=1002: cv=5 < pv=10 → loader records an empty
-    //     delta (delta_to_32_or_empty falls back on underflow),
-    //     count is 0
-    //   - delta at t=1003: cv=15, pv=5 → +10 per cpu = 20 collapsed
-    //
-    // irate:
-    //   t=1001: skip (no prior)
-    //   t=1002: count=0 / 1s = 0  (clamp manifests as 0 here — the
-    //                              "negative delta" was absorbed at
-    //                              ingest)
-    //   t=1003: 20 / 1s = 20
+    // cv=5 < pv=10 at t=1002 → delta_to_32_or_empty absorbs the
+    // underflow into an empty delta, so irate emits 0 (not a
+    // negative rate). t=1003 recovers with delta=20.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 5, 15]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1575,10 +1547,8 @@ fn test_histogram_irate_counter_drop_clamps_to_zero() {
 
 #[test]
 fn test_histogram_irate_first_step_is_null() {
-    // Only two cumulative snapshots → loader produces one delta
-    // (at t=1001). irate has no prior for that delta → empty result
-    // → MetricNotFound (the engine surfaces an empty matrix as
-    // MetricNotFound for parity with the other histogram_* helpers).
+    // Single delta → no prior tick to rate against → empty matrix,
+    // which the histogram_* helpers surface as MetricNotFound.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 5]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1591,8 +1561,7 @@ fn test_histogram_irate_first_step_is_null() {
 
 #[test]
 fn test_histogram_irate_label_filter_selects_single_series() {
-    // Same fixture as the steady-rate test but filtered to cpu=0,
-    // so the per-tick count is 10 (single cpu) and rate is 10.
+    // Filter to one cpu → per-tick count is 10 (not 20) → rate 10.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1617,12 +1586,8 @@ fn test_histogram_irate_label_filter_selects_single_series() {
 
 #[test]
 fn test_histogram_irate_composes_inside_sum_and_sum_by() {
-    // Both forms should evaluate to the same single-series result as
-    // the bare histogram_irate call, since the function already
-    // collapses every matching input series into one
-    // `{__name__: metric_name}` output. The outer `sum`/`sum by` is
-    // syntactically present for symmetry with `sum(irate(c[5m]))`
-    // and must parse and execute cleanly.
+    // histogram_irate already collapses to one series, so every
+    // outer sum form must reduce to the same values as the bare call.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 

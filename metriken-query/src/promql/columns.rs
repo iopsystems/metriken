@@ -40,14 +40,11 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
     }
 }
 
-/// Reduce a rezolus-specific wrapper to its inner metric selector
-/// so the standard PromQL parser can handle it. The wrappers
-/// (`histogram_quantiles([qs], m, [stride])`, `histogram_heatmap(m,
-/// [stride])`, `histogram_mean(m, [stride])`, `histogram_count(m,
-/// [stride])`, `histogram_irate(m)`) use array-literal / multi-arg
-/// syntax or names the parser doesn't recognise, but their *column
-/// set* is just the inner selector's. Non-rezolus queries pass
-/// through unchanged.
+/// Reduce a rezolus-specific wrapper to its inner metric selector so
+/// the standard PromQL parser can handle it. The wrappers use array
+/// literals, multi-arg shapes, or names the parser doesn't recognise,
+/// but their *column set* is just the inner selector's. Non-rezolus
+/// queries pass through unchanged.
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     if let Some(inner) = query
         .strip_prefix("histogram_quantiles(")

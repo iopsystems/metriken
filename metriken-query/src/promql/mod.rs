@@ -123,21 +123,14 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// If `query` is `sum(histogram_irate(...))`, `sum by (..)(histogram_irate(...))`,
-/// or `sum without (..)(histogram_irate(...))`, return the inner
-/// `histogram_irate(...)` call. Otherwise return `None`.
-///
-/// `histogram_irate` already collapses every input series into one
-/// `{__name__: metric_name}` output, so any outer `sum`/`sum by`/
-/// `sum without` over it is functionally a no-op and the dashboard
-/// idiom `sum(histogram_irate(m))` (written for symmetry with
-/// `sum(irate(counter[5m]))`) reduces to the inner call.
+/// Strip an outer `sum(...)` / `sum by (..)(...)` / `sum without (..)(...)`
+/// wrapper if the inner call is `histogram_irate(...)`. The wrapper is a
+/// no-op since `histogram_irate` already collapses to one series; this lets
+/// `sum(histogram_irate(m))` parse even though promql-parser doesn't know
+/// the function name.
 fn strip_outer_sum_around_histogram_irate(query: &str) -> Option<&str> {
-    let q = query.trim();
-    let rest = q.strip_prefix("sum")?;
-    let rest = rest.trim_start();
+    let rest = query.trim().strip_prefix("sum")?.trim_start();
 
-    // Optional `by (labels)` / `without (labels)` modifier.
     let body = if let Some(r) = rest.strip_prefix("by") {
         let r = r.trim_start().strip_prefix('(')?;
         let close = find_top_level_close_paren(r)?;
@@ -163,9 +156,8 @@ fn strip_outer_sum_around_histogram_irate(query: &str) -> Option<&str> {
     }
 }
 
-/// Find the byte offset of the `)` that closes the open paren whose
-/// content begins at position 0 of `s` (i.e. depth starts at 1).
-/// Returns `None` if unbalanced.
+/// Find the `)` that closes the open paren whose content starts at byte 0
+/// of `s` (depth begins at 1). `None` if unbalanced.
 fn find_top_level_close_paren(s: &str) -> Option<usize> {
     let mut depth: usize = 1;
     for (i, ch) in s.char_indices() {
@@ -464,13 +456,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle `histogram_irate(metric{matchers})` queries.
-    ///
-    /// Per-step rate of the histogram's cumulative sample count, as a
-    /// single-series instant vector. Same metric-selector pre-parser
-    /// shape as `histogram_count` / `histogram_mean`, but no
-    /// window/stride argument — see `streaming::histogram::irate` for
-    /// the rationale.
+    /// Handle `histogram_irate(metric{matchers})`. Same metric-selector
+    /// shape as `histogram_count` / `histogram_mean`, but rejects a
+    /// trailing stride — see [`streaming::histogram::irate`].
     fn handle_histogram_irate(
         &self,
         query_str: &str,
@@ -581,14 +569,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_scalar("histogram_count", query_str, start, end);
         }
 
-        // `histogram_irate` is a rezolus extension — promql-parser
-        // doesn't know the name, so a nested form like
-        // `sum(histogram_irate(m))` never reaches the dispatcher.
-        // Since `histogram_irate` already collapses every matching
-        // series into a single output, the outer `sum(...)` (or
-        // `sum by (..)(...)` / `sum without (..)(...)`) wrapper is
-        // functionally a no-op; strip it here so the idiomatic
-        // dashboard form parses.
+        // promql-parser doesn't know `histogram_irate`, so peel a
+        // no-op outer `sum`/`sum by`/`sum without` wrapper here so
+        // the dashboard idiom `sum(histogram_irate(m))` parses.
         let effective = strip_outer_sum_around_histogram_irate(query_str).unwrap_or(query_str);
         if effective.starts_with("histogram_irate(") && effective.ends_with(")") {
             return self.handle_histogram_irate(effective, start, end);
