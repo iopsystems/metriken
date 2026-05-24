@@ -1423,6 +1423,338 @@ fn test_histogram_mean_metric_not_found() {
     }
 }
 
+/// Two-cpu histogram TSDB driven by an explicit cumulative-count
+/// sequence; one snapshot per second starting at t=1000. All
+/// observations land in the exact bucket for value 10 (values < 32
+/// are exact under grouping_power 4).
+fn create_hist_irate_tsdb(cumulative_per_cpu: &[u64]) -> Tsdb {
+    use histogram::Histogram;
+    use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
+
+    let mut tsdb = Tsdb::default();
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+
+    for (step, &count) in cumulative_per_cpu.iter().enumerate() {
+        let time = base_time + Duration::from_secs(step as u64);
+        let mut histograms = Vec::new();
+        for cpu in ["0", "1"] {
+            let mut h = Histogram::new(4, 16).unwrap();
+            for _ in 0..count {
+                h.increment(10).unwrap();
+            }
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), "req_latency".to_string());
+            meta.insert("cpu".to_string(), cpu.to_string());
+            histograms.push(SnapHist {
+                name: "req_latency".to_string(),
+                value: h,
+                metadata: meta,
+            });
+        }
+        tsdb.ingest(Snapshot::V2(SnapshotV2 {
+            systemtime: time,
+            duration: Duration::from_secs(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms,
+        }));
+    }
+
+    tsdb
+}
+
+#[test]
+fn test_histogram_irate_steady_rate_is_constant() {
+    // Per-cpu deltas of +10/sec → 20/sec collapsed. The first delta
+    // (t=1001) has no prior, so the remaining three ticks each emit
+    // rate 20.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    assert_eq!(result.len(), 1, "irate collapses to one __name__ series");
+    assert_eq!(
+        result[0].metric.get("__name__").map(String::as_str),
+        Some("req_latency")
+    );
+
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 3, "first observed delta yields null");
+    for v in values {
+        assert!(
+            (v - 20.0).abs() < 1e-9,
+            "steady rate should be 20.0, got {v}"
+        );
+    }
+}
+
+#[test]
+fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
+    // Collapsed per-tick deltas: 0, 100, 0, 0. After skipping the
+    // priorless first tick, irate emits 100 then 0 then 0.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 0, 50, 50, 50]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 3);
+    assert!((values[0] - 100.0).abs() < 1e-9, "spike, got {}", values[0]);
+    assert_eq!(values[1], 0.0, "idle window emits zero rate");
+    assert_eq!(values[2], 0.0, "idle window emits zero rate");
+}
+
+#[test]
+fn test_histogram_irate_counter_drop_clamps_to_zero() {
+    // cv=5 < pv=10 at t=1002 → delta_to_32_or_empty absorbs the
+    // underflow into an empty delta, so irate emits 0 (not a
+    // negative rate). t=1003 recovers with delta=20.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 5, 15]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1004.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 2);
+    assert_eq!(
+        values[0], 0.0,
+        "drop in cumulative count clamps to zero, got {}",
+        values[0]
+    );
+    assert!(
+        (values[1] - 20.0).abs() < 1e-9,
+        "recovery after drop, got {}",
+        values[1]
+    );
+}
+
+#[test]
+fn test_histogram_irate_first_step_is_null() {
+    // Single delta → no prior tick to rate against → empty matrix,
+    // which the histogram_* helpers surface as MetricNotFound.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 5]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range("histogram_irate(req_latency)", 1000.0, 1002.0, 1.0);
+    match result {
+        Err(QueryError::MetricNotFound(_)) => {}
+        other => panic!("expected MetricNotFound (single delta → null), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_histogram_irate_label_filter_selects_single_series() {
+    // Filter to one cpu → per-tick count is 10 (not 20) → rate 10.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"histogram_irate(req_latency{cpu="0"})"#,
+            1000.0,
+            1004.0,
+            1.0,
+        )
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(values.len(), 2);
+    for v in values {
+        assert!((v - 10.0).abs() < 1e-9, "expected 10.0, got {v}");
+    }
+}
+
+#[test]
+fn test_histogram_irate_by_groups_per_cpu() {
+    // Per-cpu deltas of +10/sec; bare call collapses to 20, by(cpu) keeps 10 each.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            "histogram_irate by (cpu) (req_latency)",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+    let QueryResult::Matrix { mut result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
+    assert_eq!(result.len(), 2, "one series per cpu");
+    for series in &result {
+        assert_eq!(
+            series.metric.get("__name__").map(String::as_str),
+            Some("req_latency")
+        );
+        assert!(series.metric.contains_key("cpu"));
+        let values: Vec<f64> = series.values.iter().map(|(_, v)| *v).collect();
+        assert_eq!(values.len(), 3, "first delta is null");
+        for v in values {
+            assert!((v - 10.0).abs() < 1e-9, "expected 10.0 per cpu, got {v}");
+        }
+    }
+    assert_eq!(result[0].metric.get("cpu").map(String::as_str), Some("0"));
+    assert_eq!(result[1].metric.get("cpu").map(String::as_str), Some("1"));
+}
+
+#[test]
+fn test_histogram_irate_without_drops_named_label() {
+    // cpu is the only label, so `without (cpu)` collapses to one group.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let bare = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+    let without = engine
+        .query_range(
+            "histogram_irate without (cpu) (req_latency)",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+
+    let values_of = |r: &QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+    assert_eq!(values_of(&bare), values_of(&without));
+}
+
+#[test]
+fn test_histogram_count_by_emits_per_group_series() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            "histogram_count by (cpu) (req_latency)",
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+    let QueryResult::Matrix { mut result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
+    assert_eq!(result.len(), 2);
+    let counts_0: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    let counts_1: Vec<f64> = result[1].values.iter().map(|(_, v)| *v).collect();
+    assert_eq!(counts_0, vec![5.0, 7.0]);
+    assert_eq!(counts_1, vec![5.0, 7.0]);
+}
+
+#[test]
+fn test_histogram_mean_by_preserves_mean_per_group() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_mean by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    assert_eq!(result.len(), 2);
+    for series in &result {
+        for (_, v) in &series.values {
+            assert!((v - 10.0).abs() < 1e-9);
+        }
+    }
+}
+
+#[test]
+fn test_histogram_irate_rejects_invalid_label_in_grouping() {
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range(
+        r#"histogram_irate by ("cpu") (req_latency)"#,
+        1000.0,
+        1003.0,
+        1.0,
+    );
+    match result {
+        Err(QueryError::ParseError(msg)) => {
+            assert!(msg.contains("invalid label name"), "got: {msg}");
+        }
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_histogram_irate_rejects_stride_argument() {
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20]));
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range("histogram_irate(req_latency, 5)", 1000.0, 1003.0, 1.0);
+    match result {
+        Err(QueryError::ParseError(msg)) => {
+            assert!(msg.contains("stride") || msg.contains("window"));
+        }
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_columns_histogram_irate_resolves_buckets_column() {
+    let tsdb = Arc::new(create_columns_histogram_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let cols = engine
+        .columns("histogram_irate(tcp_packet_latency)")
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+fn test_columns_resolves_histogram_with_by_grouping() {
+    let tsdb = Arc::new(create_columns_histogram_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let cols = engine
+        .columns("histogram_irate by (cpu) (tcp_packet_latency)")
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
 #[test]
 fn test_columns_returns_parse_error_for_invalid_syntax() {
     let tsdb = Arc::new(create_columns_tsdb());

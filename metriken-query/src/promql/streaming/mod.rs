@@ -47,6 +47,7 @@ mod rate;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use aggregate::derive_group_labels;
 pub use aggregate::{aggregate, sum_by, AggOp, GroupBy, MergeReduce};
 pub use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec, ScalarBroadcast};
 pub use deriv::StreamingDeriv;

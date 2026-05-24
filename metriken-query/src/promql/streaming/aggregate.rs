@@ -70,7 +70,7 @@ pub fn aggregate<'a>(input: SeriesSet<'a>, op: AggOp, group_by: GroupBy<'_>) -> 
         .collect()
 }
 
-fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Labels {
+pub(crate) fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Labels {
     let mut out = Labels::default();
     match group_by {
         GroupBy::Include(by) => {

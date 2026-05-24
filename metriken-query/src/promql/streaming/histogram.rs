@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult};
 
+use crate::promql::streaming::{derive_group_labels, GroupBy};
 use crate::promql::MatrixSample;
 use crate::tsdb::{HistogramCollection, Labels};
 
@@ -338,16 +339,13 @@ fn apply_quantiles_ref(
     }
 }
 
-/// Streaming `histogram_mean(metric{filter}[, stride])`.
-///
-/// Emits one series, labeled `{__name__: metric_name}`, whose value
-/// at each tick is the bucket-midpoint mean of the (summed, per-tick
-/// delta) histogram. Read off the merged `Ref`'s cached `mean()`
-/// field — populated once at Ref construction by the histogram
-/// crate, so the per-tick read here is O(1).
+/// Bucket-midpoint mean per `(group, tick)`. The per-tick read uses
+/// the `Ref`'s cached `mean()` field — populated once at construction,
+/// so it's O(1) regardless of bucket count.
 pub fn mean(
     collection: &HistogramCollection,
     label_filter: &Labels,
+    group_by: GroupBy<'_>,
     start_ns: u64,
     end_ns: u64,
     stride_ns: Option<u64>,
@@ -356,6 +354,7 @@ pub fn mean(
     reduce(
         collection,
         label_filter,
+        group_by,
         start_ns,
         end_ns,
         stride_ns,
@@ -364,15 +363,12 @@ pub fn mean(
     )
 }
 
-/// Streaming `histogram_count(metric{filter}[, stride])`.
-///
-/// Emits one series, labeled `{__name__: metric_name}`, whose value
-/// at each tick is the total number of observations in the (summed,
-/// per-tick delta) histogram — i.e. `QuantilesResult::total_count`,
-/// read directly off the merged `Ref` without a quantile walk.
+/// Total observation count per `(group, tick)` — `total_count()` off
+/// the merged `Ref`, no quantile walk.
 pub fn count(
     collection: &HistogramCollection,
     label_filter: &Labels,
+    group_by: GroupBy<'_>,
     start_ns: u64,
     end_ns: u64,
     stride_ns: Option<u64>,
@@ -381,6 +377,7 @@ pub fn count(
     reduce(
         collection,
         label_filter,
+        group_by,
         start_ns,
         end_ns,
         stride_ns,
@@ -392,30 +389,31 @@ pub fn count(
     )
 }
 
-/// Shared per-tick walk for scalar histogram reducers
-/// (`histogram_mean`, `histogram_count`).
-///
-/// Identical tick/stride/multi-series merge logic to [`quantiles`],
-/// but instead of running the quantile reducer it applies `reducer`
-/// to the per-tick merged `Ref` and appends a single `(t_sec, value)`
-/// point. Returns one [`MatrixSample`] labeled
-/// `{__name__: metric_name}`, or an empty `Vec` when no tick yields
-/// a value (empty range, no matching series, all-empty deltas).
+/// Per-tick / per-group merge driver shared by [`mean`] and [`count`].
+/// Mirrors [`quantiles`] but applies `reducer` to the merged group `Ref`.
+#[allow(clippy::too_many_arguments)]
 fn reduce(
     collection: &HistogramCollection,
     label_filter: &Labels,
+    group_by: GroupBy<'_>,
     start_ns: u64,
     end_ns: u64,
     stride_ns: Option<u64>,
     metric_name: &str,
     reducer: impl Fn(&CumulativeROHistogram32Ref<'_>) -> Option<f64>,
 ) -> Vec<MatrixSample> {
+    let mut group_keys: Vec<Labels> = Vec::new();
+    let mut series_group: Vec<usize> = Vec::new();
     let mut iters: Vec<_> = collection
         .iter()
         .filter(|(labels, _)| label_filter.inner.is_empty() || labels.matches(label_filter))
-        .map(|(_, series)| series.iter().peekable())
+        .map(|(labels, series)| {
+            let key = derive_group_labels(labels, group_by);
+            series_group.push(assign_group_index(&mut group_keys, key));
+            series.iter().peekable()
+        })
         .collect();
-
+    let g_count = group_keys.len();
     if iters.is_empty() {
         return vec![];
     }
@@ -428,17 +426,13 @@ fn reduce(
         return vec![];
     };
 
-    let mut values: Vec<(f64, f64)> = Vec::new();
-    let mut emit = |r: &CumulativeROHistogram32Ref<'_>, t_ns: u64| {
-        if let Some(v) = reducer(r) {
-            values.push((t_ns as f64 / 1e9, v));
-        }
-    };
-
+    let mut values_per_group: Vec<Vec<(f64, f64)>> = (0..g_count).map(|_| Vec::new()).collect();
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u32> = Vec::new();
 
-    let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
+    // Persists across ticks in stride mode; cleared each tick otherwise.
+    let mut accum_per_group: Vec<BTreeMap<u32, u64>> =
+        (0..g_count).map(|_| BTreeMap::new()).collect();
     let mut stride_last_emit: Option<u64> = None;
     let mut stride_end_time: u64 = 0;
 
@@ -465,20 +459,21 @@ fn reduce(
             continue;
         }
 
-        let mut at_t: Vec<CumulativeROHistogram32Ref<'_>> = Vec::new();
-        for it in iters.iter_mut() {
+        if stride_ns.is_none() {
+            for accum in accum_per_group.iter_mut() {
+                accum.clear();
+            }
+        }
+
+        for (i, it) in iters.iter_mut().enumerate() {
             if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
                 let (_, r) = it.next().expect("peek matched");
-                at_t.push(r);
+                accumulate_into(&mut accum_per_group[series_group[i]], &r);
             }
         }
 
         if let Some(stride) = stride_ns {
-            for r in &at_t {
-                accumulate_into(&mut stride_accum, r);
-            }
             stride_end_time = t;
-
             let last = match stride_last_emit {
                 Some(t) => t,
                 None => {
@@ -487,47 +482,187 @@ fn reduce(
                 }
             };
             if t >= last && t - last >= stride {
-                if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
-                    let r = CumulativeROHistogram32Ref::from_parts_unchecked(
-                        config,
-                        &scratch_idx,
-                        &scratch_cnt,
-                    );
-                    emit(&r, stride_end_time);
+                for g in 0..g_count {
+                    if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
+                        let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                            config,
+                            &scratch_idx,
+                            &scratch_cnt,
+                        );
+                        if let Some(v) = reducer(&r) {
+                            values_per_group[g].push((stride_end_time as f64 / 1e9, v));
+                        }
+                    }
                 }
                 stride_last_emit = Some(t);
             }
         } else {
-            match at_t.len() {
-                1 => emit(&at_t[0], t),
-                _ => {
-                    merge_into(&at_t, &mut scratch_idx, &mut scratch_cnt);
+            for g in 0..g_count {
+                if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
                     let r = CumulativeROHistogram32Ref::from_parts_unchecked(
                         config,
                         &scratch_idx,
                         &scratch_cnt,
                     );
-                    emit(&r, t);
+                    if let Some(v) = reducer(&r) {
+                        values_per_group[g].push((t as f64 / 1e9, v));
+                    }
                 }
             }
         }
     }
 
-    if stride_ns.is_some()
-        && !stride_accum.is_empty()
-        && flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt)
-    {
-        let r =
-            CumulativeROHistogram32Ref::from_parts_unchecked(config, &scratch_idx, &scratch_cnt);
-        emit(&r, stride_end_time);
+    if stride_ns.is_some() {
+        for g in 0..g_count {
+            if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
+                let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                    config,
+                    &scratch_idx,
+                    &scratch_cnt,
+                );
+                if let Some(v) = reducer(&r) {
+                    values_per_group[g].push((stride_end_time as f64 / 1e9, v));
+                }
+            }
+        }
     }
 
-    if values.is_empty() {
+    build_grouped_output(metric_name, group_keys, values_per_group)
+}
+
+/// Linear scan beats hashing at the group cardinalities we see.
+fn assign_group_index(group_keys: &mut Vec<Labels>, key: Labels) -> usize {
+    match group_keys.iter().position(|k| k == &key) {
+        Some(i) => i,
+        None => {
+            group_keys.push(key);
+            group_keys.len() - 1
+        }
+    }
+}
+
+fn build_grouped_output(
+    metric_name: &str,
+    group_keys: Vec<Labels>,
+    values_per_group: Vec<Vec<(f64, f64)>>,
+) -> Vec<MatrixSample> {
+    let mut samples = Vec::new();
+    for (key, values) in group_keys.into_iter().zip(values_per_group) {
+        if values.is_empty() {
+            continue;
+        }
+        let mut metric: HashMap<String, String> = HashMap::new();
+        metric.insert("__name__".to_string(), metric_name.to_string());
+        for (k, v) in key.inner {
+            metric.insert(k, v);
+        }
+        samples.push(MatrixSample { metric, values });
+    }
+    samples
+}
+
+/// Per-step rate of the cumulative sample count, per group.
+/// `sum(total_count over group) / (t - t_prev_for_group)` each tick.
+///
+/// First tick → no point. Idle tick → `0` (differs from
+/// `histogram_mean`, which is null on empty).
+///
+/// No window argument: `sum(irate(histogram_count(m)[5m]))` doesn't
+/// parse — PromQL disallows range vectors on function-call results —
+/// and metriken stores one delta per tick anyway, so a range would
+/// always cover exactly one sample.
+///
+/// Negative-delta clamp: a lock-free snapshot undercount in the
+/// upstream counter is absorbed into an empty delta at ingest
+/// (`delta_to_32_or_empty`), so the rate naturally falls out as 0.
+pub fn irate(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    group_by: GroupBy<'_>,
+    start_ns: u64,
+    end_ns: u64,
+    metric_name: &str,
+) -> Vec<MatrixSample> {
+    let mut group_keys: Vec<Labels> = Vec::new();
+    let mut series_group: Vec<usize> = Vec::new();
+    let mut iters: Vec<_> = collection
+        .iter()
+        .filter(|(labels, _)| label_filter.inner.is_empty() || labels.matches(label_filter))
+        .map(|(labels, series)| {
+            let key = derive_group_labels(labels, group_by);
+            series_group.push(assign_group_index(&mut group_keys, key));
+            series.iter().peekable()
+        })
+        .collect();
+    let g_count = group_keys.len();
+    if iters.is_empty() {
         return vec![];
     }
-    let mut metric: HashMap<String, String> = HashMap::new();
-    metric.insert("__name__".to_string(), metric_name.to_string());
-    vec![MatrixSample { metric, values }]
+
+    let mut values_per_group: Vec<Vec<(f64, f64)>> = (0..g_count).map(|_| Vec::new()).collect();
+    // Updated even for pre-window ticks, so the first in-window tick
+    // can rate against the last pre-window sample.
+    let mut prev_t_per_group: Vec<Option<u64>> = vec![None; g_count];
+    let mut tick_count_per_group: Vec<u64> = vec![0; g_count];
+    let mut tick_has_data: Vec<bool> = vec![false; g_count];
+
+    loop {
+        let mut min_ts: Option<u64> = None;
+        for it in iters.iter_mut() {
+            while let Some(&(ts, _)) = it.peek() {
+                if ts > end_ns {
+                    it.next();
+                    continue;
+                }
+                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                break;
+            }
+        }
+        let Some(t) = min_ts else { break };
+
+        for c in tick_count_per_group.iter_mut() {
+            *c = 0;
+        }
+        for h in tick_has_data.iter_mut() {
+            *h = false;
+        }
+
+        for (i, it) in iters.iter_mut().enumerate() {
+            if matches!(it.peek(), Some(&(ts, _)) if ts == t) {
+                let (_, r) = it.next().expect("peek matched");
+                let g = series_group[i];
+                tick_count_per_group[g] = tick_count_per_group[g].saturating_add(r.total_count());
+                tick_has_data[g] = true;
+            }
+        }
+
+        if t < start_ns {
+            for (g, &has) in tick_has_data.iter().enumerate() {
+                if has {
+                    prev_t_per_group[g] = Some(t);
+                }
+            }
+            continue;
+        }
+
+        for g in 0..g_count {
+            if !tick_has_data[g] {
+                continue;
+            }
+            if let Some(prev) = prev_t_per_group[g] {
+                let dt_ns = t.saturating_sub(prev);
+                if dt_ns > 0 {
+                    // .max(0.0) documents the cumulative-form clamp;
+                    // count is u64 so already non-negative.
+                    let rate = (tick_count_per_group[g] as f64).max(0.0) / (dt_ns as f64 / 1e9);
+                    values_per_group[g].push((t as f64 / 1e9, rate));
+                }
+            }
+            prev_t_per_group[g] = Some(t);
+        }
+    }
+
+    build_grouped_output(metric_name, group_keys, values_per_group)
 }
 
 /// Streaming `histogram_heatmap(metric{filter}[, stride])`.

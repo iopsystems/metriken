@@ -123,6 +123,111 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Owned counterpart to `streaming::GroupBy<'_>` — held on the
+/// handler stack between parse and dispatch, then borrowed.
+#[derive(Debug, Default, Clone)]
+pub(crate) enum HistogramGroupBy {
+    #[default]
+    None,
+    By(Vec<String>),
+    Without(Vec<String>),
+}
+
+impl HistogramGroupBy {
+    pub(crate) fn as_ref(&self) -> streaming::GroupBy<'_> {
+        match self {
+            HistogramGroupBy::None => streaming::GroupBy::Include(&[]),
+            HistogramGroupBy::By(ls) => streaming::GroupBy::Include(ls),
+            HistogramGroupBy::Without(ls) => streaming::GroupBy::Exclude(ls),
+        }
+    }
+}
+
+/// Parse `<func> [by (labels) | without (labels)] (body)`. `Ok(None)`
+/// if the prefix doesn't match.
+pub(crate) fn parse_histogram_call<'a>(
+    func: &str,
+    query: &'a str,
+) -> Result<Option<(&'a str, HistogramGroupBy)>, QueryError> {
+    let Some(after_name) = query.strip_prefix(func) else {
+        return Ok(None);
+    };
+    // Guard against prefix collisions with longer function names.
+    if !matches!(after_name.chars().next(), Some('(' | ' ' | '\t')) {
+        return Ok(None);
+    }
+    let rest = after_name.trim_start();
+
+    let (group_by, after_modifier) = if let Some(r) = rest.strip_prefix("by") {
+        let (labels, after) = parse_grouping_clause(func, r.trim_start(), "by")?;
+        (HistogramGroupBy::By(labels), after)
+    } else if let Some(r) = rest.strip_prefix("without") {
+        let (labels, after) = parse_grouping_clause(func, r.trim_start(), "without")?;
+        (HistogramGroupBy::Without(labels), after)
+    } else {
+        (HistogramGroupBy::None, rest)
+    };
+
+    let body = after_modifier.strip_prefix('(').ok_or_else(|| {
+        QueryError::ParseError(format!("{func}: expected '(' after function name"))
+    })?;
+    if !body.ends_with(')') {
+        return Err(QueryError::ParseError(format!(
+            "{func}: missing closing ')'"
+        )));
+    }
+    Ok(Some((&body[..body.len() - 1], group_by)))
+}
+
+fn parse_grouping_clause<'a>(
+    func: &str,
+    s: &'a str,
+    keyword: &str,
+) -> Result<(Vec<String>, &'a str), QueryError> {
+    let inside = s
+        .strip_prefix('(')
+        .ok_or_else(|| QueryError::ParseError(format!("{func}: expected '(' after '{keyword}'")))?;
+    let close = find_close_paren(inside).ok_or_else(|| {
+        QueryError::ParseError(format!("{func}: unbalanced parens in '{keyword}' clause"))
+    })?;
+    let labels = parse_label_list(&inside[..close])?;
+    Ok((labels, inside[close + 1..].trim_start()))
+}
+
+fn parse_label_list(s: &str) -> Result<Vec<String>, QueryError> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(QueryError::ParseError(format!(
+                "invalid label name in grouping clause: {p}"
+            )));
+        }
+        out.push(p.to_string());
+    }
+    Ok(out)
+}
+
+fn find_close_paren(s: &str) -> Option<usize> {
+    let mut depth: usize = 1;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Collapse a matrix result into a vector by taking the latest
 /// point of each series. Used by `query()` to convert a degenerate
 /// range query (`start = end = time`) into instant-query shape.
@@ -404,23 +509,52 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle `histogram_mean(metric{matchers}[, stride])` and
-    /// `histogram_count(metric{matchers}[, stride])` queries.
-    ///
-    /// Both collapse every matching label-keyed series into a single
-    /// output series labeled `{__name__: metric_name}` — `mean` emits
-    /// the count-weighted bucket-midpoint mean per tick, `count` the
-    /// total observation count per tick. Same single-metric-arg
-    /// pre-parser shape as `histogram_heatmap`, reusing the streaming
-    /// per-tick walk so peak memory is independent of series count.
-    fn handle_histogram_scalar(
+    /// Rejects a trailing stride — see [`streaming::histogram::irate`].
+    fn handle_histogram_irate(
         &self,
-        func: &str,
-        query_str: &str,
+        inner: &str,
+        group_by: HistogramGroupBy,
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
-        let inner = &query_str[func.len() + 1..query_str.len() - 1];
+        let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
+        if stride_ns.is_some() {
+            return Err(QueryError::ParseError(
+                "histogram_irate does not accept a window/stride argument".to_string(),
+            ));
+        }
+        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
+            return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        };
+
+        let start_ns = (start * 1e9) as u64;
+        let end_ns = (end * 1e9) as u64;
+        let result = streaming::histogram::irate(
+            collection,
+            &labels,
+            group_by.as_ref(),
+            start_ns,
+            end_ns,
+            &metric_name,
+        );
+        if result.is_empty() {
+            return Err(QueryError::MetricNotFound(format!(
+                "No histogram data found for {metric_name}"
+            )));
+        }
+        Ok(QueryResult::Matrix { result })
+    }
+
+    fn handle_histogram_scalar(
+        &self,
+        func: &str,
+        inner: &str,
+        group_by: HistogramGroupBy,
+        start: f64,
+        end: f64,
+    ) -> Result<QueryResult, QueryError> {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
@@ -430,10 +564,12 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
 
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
+        let group = group_by.as_ref();
         let result = match func {
             "histogram_mean" => streaming::histogram::mean(
                 collection,
                 &labels,
+                group,
                 start_ns,
                 end_ns,
                 stride_ns,
@@ -442,6 +578,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             _ => streaming::histogram::count(
                 collection,
                 &labels,
+                group,
                 start_ns,
                 end_ns,
                 stride_ns,
@@ -474,13 +611,13 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
 
-        // Scalar histogram reducers (rezolus extensions, same
-        // single-metric-arg shape as histogram_heatmap).
-        if query_str.starts_with("histogram_mean(") && query_str.ends_with(")") {
-            return self.handle_histogram_scalar("histogram_mean", query_str, start, end);
+        for func in ["histogram_mean", "histogram_count"] {
+            if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
+                return self.handle_histogram_scalar(func, inner, group_by, start, end);
+            }
         }
-        if query_str.starts_with("histogram_count(") && query_str.ends_with(")") {
-            return self.handle_histogram_scalar("histogram_count", query_str, start, end);
+        if let Some((inner, group_by)) = parse_histogram_call("histogram_irate", query_str)? {
+            return self.handle_histogram_irate(inner, group_by, start, end);
         }
 
         // Parse the query into an AST and evaluate. The streaming
