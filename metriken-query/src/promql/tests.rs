@@ -1586,8 +1586,7 @@ fn test_histogram_irate_label_filter_selects_single_series() {
 
 #[test]
 fn test_histogram_irate_by_groups_per_cpu() {
-    // Per-cpu deltas of +10/sec → bare call collapses to 20/sec;
-    // `by (cpu)` keeps cpu=0 and cpu=1 separate, each at 10/sec.
+    // Per-cpu deltas of +10/sec; bare call collapses to 20, by(cpu) keeps 10 each.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1622,8 +1621,7 @@ fn test_histogram_irate_by_groups_per_cpu() {
 
 #[test]
 fn test_histogram_irate_without_drops_named_label() {
-    // `without (cpu)` strips cpu, collapsing both series into one
-    // group → same as the bare call (no other labels distinguish them).
+    // cpu is the only label, so `without (cpu)` collapses to one group.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1651,8 +1649,6 @@ fn test_histogram_irate_without_drops_named_label() {
 
 #[test]
 fn test_histogram_count_by_emits_per_group_series() {
-    // bare histogram_count collapses both cpus to one series (10, 14);
-    // by (cpu) emits one series per cpu (5, 7 each).
     let tsdb = Arc::new(create_hist_exec_tsdb());
     let engine = QueryEngine::new(tsdb);
 
@@ -1677,8 +1673,6 @@ fn test_histogram_count_by_emits_per_group_series() {
 
 #[test]
 fn test_histogram_mean_by_preserves_mean_per_group() {
-    // Every observation lands in the bucket for value 10, so each
-    // per-cpu mean should also be 10.
     let tsdb = Arc::new(create_hist_exec_tsdb());
     let engine = QueryEngine::new(tsdb);
 

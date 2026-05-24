@@ -123,9 +123,8 @@ fn split_last_top_level_comma(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Owned grouping spec for the rezolus histogram reducers, parsed
-/// from `by (..)` / `without (..)` modifiers in `query_range`.
-/// Borrowed as a `streaming::GroupBy<'_>` at call sites.
+/// Owned counterpart to `streaming::GroupBy<'_>` — held on the
+/// handler stack between parse and dispatch, then borrowed.
 #[derive(Debug, Default, Clone)]
 pub(crate) enum HistogramGroupBy {
     #[default]
@@ -144,10 +143,8 @@ impl HistogramGroupBy {
     }
 }
 
-/// Parse a rezolus histogram call of shape
-/// `<func> [by (labels) | without (labels)] (...body...)` and return
-/// the inner body (without the outer parens) plus the grouping.
-/// Returns `Ok(None)` if `query` doesn't start with `<func>`.
+/// Parse `<func> [by (labels) | without (labels)] (body)`. `Ok(None)`
+/// if the prefix doesn't match.
 pub(crate) fn parse_histogram_call<'a>(
     func: &str,
     query: &'a str,
@@ -155,40 +152,18 @@ pub(crate) fn parse_histogram_call<'a>(
     let Some(after_name) = query.strip_prefix(func) else {
         return Ok(None);
     };
-    // Reject prefix matches against longer function names (e.g. don't
-    // let "histogram_count_extra(" match func="histogram_count").
-    let next = after_name.chars().next();
-    if !matches!(next, Some('(') | Some(' ') | Some('\t')) {
+    // Guard against prefix collisions with longer function names.
+    if !matches!(after_name.chars().next(), Some('(' | ' ' | '\t')) {
         return Ok(None);
     }
     let rest = after_name.trim_start();
 
     let (group_by, after_modifier) = if let Some(r) = rest.strip_prefix("by") {
-        let r = r.trim_start();
-        let inside = r
-            .strip_prefix('(')
-            .ok_or_else(|| QueryError::ParseError(format!("{func}: expected '(' after 'by'")))?;
-        let close = find_close_paren(inside).ok_or_else(|| {
-            QueryError::ParseError(format!("{func}: unbalanced parens in 'by' clause"))
-        })?;
-        let labels = parse_label_list(&inside[..close])?;
-        (
-            HistogramGroupBy::By(labels),
-            inside[close + 1..].trim_start(),
-        )
+        let (labels, after) = parse_grouping_clause(func, r.trim_start(), "by")?;
+        (HistogramGroupBy::By(labels), after)
     } else if let Some(r) = rest.strip_prefix("without") {
-        let r = r.trim_start();
-        let inside = r.strip_prefix('(').ok_or_else(|| {
-            QueryError::ParseError(format!("{func}: expected '(' after 'without'"))
-        })?;
-        let close = find_close_paren(inside).ok_or_else(|| {
-            QueryError::ParseError(format!("{func}: unbalanced parens in 'without' clause"))
-        })?;
-        let labels = parse_label_list(&inside[..close])?;
-        (
-            HistogramGroupBy::Without(labels),
-            inside[close + 1..].trim_start(),
-        )
+        let (labels, after) = parse_grouping_clause(func, r.trim_start(), "without")?;
+        (HistogramGroupBy::Without(labels), after)
     } else {
         (HistogramGroupBy::None, rest)
     };
@@ -201,12 +176,24 @@ pub(crate) fn parse_histogram_call<'a>(
             "{func}: missing closing ')'"
         )));
     }
-    let inner = &body[..body.len() - 1];
-    Ok(Some((inner, group_by)))
+    Ok(Some((&body[..body.len() - 1], group_by)))
 }
 
-/// Parse a comma-separated list of label identifiers. Empty entries
-/// are skipped (`by ()` is allowed, meaning "no labels").
+fn parse_grouping_clause<'a>(
+    func: &str,
+    s: &'a str,
+    keyword: &str,
+) -> Result<(Vec<String>, &'a str), QueryError> {
+    let inside = s
+        .strip_prefix('(')
+        .ok_or_else(|| QueryError::ParseError(format!("{func}: expected '(' after '{keyword}'")))?;
+    let close = find_close_paren(inside).ok_or_else(|| {
+        QueryError::ParseError(format!("{func}: unbalanced parens in '{keyword}' clause"))
+    })?;
+    let labels = parse_label_list(&inside[..close])?;
+    Ok((labels, inside[close + 1..].trim_start()))
+}
+
 fn parse_label_list(s: &str) -> Result<Vec<String>, QueryError> {
     let mut out = Vec::new();
     for part in s.split(',') {
@@ -224,8 +211,6 @@ fn parse_label_list(s: &str) -> Result<Vec<String>, QueryError> {
     Ok(out)
 }
 
-/// Find the `)` that closes the open paren whose content starts at
-/// byte 0 of `s` (depth begins at 1). `None` if unbalanced.
 fn find_close_paren(s: &str) -> Option<usize> {
     let mut depth: usize = 1;
     for (i, ch) in s.char_indices() {
@@ -524,9 +509,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Handle `histogram_irate(metric{matchers}) [by/without (..)]`.
-    /// Same shape as `histogram_count` / `histogram_mean`, but rejects
-    /// a trailing stride — see [`streaming::histogram::irate`].
+    /// Rejects a trailing stride — see [`streaming::histogram::irate`].
     fn handle_histogram_irate(
         &self,
         inner: &str,
@@ -564,11 +547,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         Ok(QueryResult::Matrix { result })
     }
 
-    /// Handle `histogram_mean(metric{matchers}[, stride]) [by/without (..)]`
-    /// and `histogram_count(metric{matchers}[, stride]) [by/without (..)]`.
-    /// With no grouping, every matching series collapses into one
-    /// `{__name__: metric_name}` output; with `by`/`without`, one series
-    /// per distinct projected-label tuple.
     fn handle_histogram_scalar(
         &self,
         func: &str,
@@ -633,10 +611,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
 
-        // Scalar histogram reducers (rezolus extensions). Each accepts
-        // an optional aggregation-modifier clause `[by/without (..)]`
-        // between the function name and the metric body, mirroring the
-        // PromQL aggregation-operator syntax.
         for func in ["histogram_mean", "histogram_count"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
                 return self.handle_histogram_scalar(func, inner, group_by, start, end);

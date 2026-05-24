@@ -339,14 +339,9 @@ fn apply_quantiles_ref(
     }
 }
 
-/// Streaming `histogram_mean(metric{filter}[, stride]) [by/without (..)]`.
-///
-/// With no grouping modifier, emits one series labeled
-/// `{__name__: metric_name}` whose value at each tick is the
-/// bucket-midpoint mean of the (summed, per-tick delta) histogram.
-/// With `by`/`without`, emits one such series per distinct projected
-/// label tuple. Read off the merged `Ref`'s cached `mean()` field —
-/// populated once at Ref construction, so the per-tick read is O(1).
+/// Bucket-midpoint mean per `(group, tick)`. The per-tick read uses
+/// the `Ref`'s cached `mean()` field — populated once at construction,
+/// so it's O(1) regardless of bucket count.
 pub fn mean(
     collection: &HistogramCollection,
     label_filter: &Labels,
@@ -368,10 +363,7 @@ pub fn mean(
     )
 }
 
-/// Streaming `histogram_count(metric{filter}[, stride]) [by/without (..)]`.
-///
-/// Same shape as [`mean`] but emits the total observation count per
-/// (group, tick) — `QuantilesResult::total_count` read directly off
+/// Total observation count per `(group, tick)` — `total_count()` off
 /// the merged `Ref`, no quantile walk.
 pub fn count(
     collection: &HistogramCollection,
@@ -397,13 +389,8 @@ pub fn count(
     )
 }
 
-/// Shared per-tick walk for scalar histogram reducers
-/// (`histogram_mean`, `histogram_count`).
-///
-/// Same tick/stride/multi-series merge logic as [`quantiles`], but
-/// applies `reducer` to each per-group merged `Ref` and emits one
-/// `(t_sec, value)` point per group per tick. Returns one
-/// [`MatrixSample`] per non-empty group.
+/// Per-tick / per-group merge driver shared by [`mean`] and [`count`].
+/// Mirrors [`quantiles`] but applies `reducer` to the merged group `Ref`.
 #[allow(clippy::too_many_arguments)]
 fn reduce(
     collection: &HistogramCollection,
@@ -443,10 +430,7 @@ fn reduce(
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u32> = Vec::new();
 
-    // Per-group bucket accumulator. In no-stride mode it's reset every
-    // tick; in stride mode it persists across ticks within the stride
-    // window. One BTreeMap per group — peak grows with group count
-    // but stays independent of input series cardinality.
+    // Persists across ticks in stride mode; cleared each tick otherwise.
     let mut accum_per_group: Vec<BTreeMap<u32, u64>> =
         (0..g_count).map(|_| BTreeMap::new()).collect();
     let mut stride_last_emit: Option<u64> = None;
@@ -475,8 +459,6 @@ fn reduce(
             continue;
         }
 
-        // In no-stride mode each tick's per-group accumulator is
-        // independent; clear before refilling.
         if stride_ns.is_none() {
             for accum in accum_per_group.iter_mut() {
                 accum.clear();
@@ -548,10 +530,7 @@ fn reduce(
     build_grouped_output(metric_name, group_keys, values_per_group)
 }
 
-/// Look up `key` in `group_keys`; insert and return a new index if
-/// absent. Used during series-list build to assign each input series
-/// to a group slot without a hashmap (group cardinality is small —
-/// linear scan beats hashing for the typical few-groups case).
+/// Linear scan beats hashing at the group cardinalities we see.
 fn assign_group_index(group_keys: &mut Vec<Labels>, key: Labels) -> usize {
     match group_keys.iter().position(|k| k == &key) {
         Some(i) => i,
@@ -562,9 +541,6 @@ fn assign_group_index(group_keys: &mut Vec<Labels>, key: Labels) -> usize {
     }
 }
 
-/// Assemble per-group `(timestamps, values)` into one [`MatrixSample`]
-/// each, dropping empty groups and writing `__name__` plus the group
-/// key labels into the output metric.
 fn build_grouped_output(
     metric_name: &str,
     group_keys: Vec<Labels>,
@@ -585,28 +561,20 @@ fn build_grouped_output(
     samples
 }
 
-/// Streaming `histogram_irate(metric{filter}) [by/without (..)]`.
+/// Per-step rate of the cumulative sample count, per group.
+/// `sum(total_count over group) / (t - t_prev_for_group)` each tick.
 ///
-/// Per-step rate of the cumulative sample count. With no grouping
-/// modifier every matching series collapses into one output
-/// `{__name__: metric_name}`; with `by`/`without` one series is
-/// emitted per distinct projected-label tuple.
-///
-/// At each tick `t`, each group's value is
-/// `sum(total_count over group) / (t - t_prev_for_group)`.
-///
-/// First tick → no point. Idle tick (empty delta) → `0` (differs
-/// from `histogram_mean`, which is null on empty).
+/// First tick → no point. Idle tick → `0` (differs from
+/// `histogram_mean`, which is null on empty).
 ///
 /// No window argument: `sum(irate(histogram_count(m)[5m]))` doesn't
 /// parse — PromQL disallows range vectors on function-call results —
 /// and metriken stores one delta per tick anyway, so a range would
 /// always cover exactly one sample.
 ///
-/// A lock-free snapshot undercount in the upstream counter would
-/// produce a negative delta in cumulative form; the ingest layer's
-/// `delta_to_32_or_empty` already turns that into an empty delta,
-/// so the irate value naturally falls out as 0.
+/// Negative-delta clamp: a lock-free snapshot undercount in the
+/// upstream counter is absorbed into an empty delta at ingest
+/// (`delta_to_32_or_empty`), so the rate naturally falls out as 0.
 pub fn irate(
     collection: &HistogramCollection,
     label_filter: &Labels,
@@ -631,12 +599,10 @@ pub fn irate(
         return vec![];
     }
 
-    // Per-group state, indexed by group_idx.
     let mut values_per_group: Vec<Vec<(f64, f64)>> = (0..g_count).map(|_| Vec::new()).collect();
-    // Updated even for pre-window ticks so the first in-window tick
-    // can still produce a rate against the last pre-window sample.
+    // Updated even for pre-window ticks, so the first in-window tick
+    // can rate against the last pre-window sample.
     let mut prev_t_per_group: Vec<Option<u64>> = vec![None; g_count];
-    // Per-tick scratch reused every iteration; sized once.
     let mut tick_count_per_group: Vec<u64> = vec![0; g_count];
     let mut tick_has_data: Vec<bool> = vec![false; g_count];
 
@@ -686,8 +652,8 @@ pub fn irate(
             if let Some(prev) = prev_t_per_group[g] {
                 let dt_ns = t.saturating_sub(prev);
                 if dt_ns > 0 {
-                    // count is u64 so already non-negative; .max(0.0)
-                    // documents the cumulative-form negative-delta clamp.
+                    // .max(0.0) documents the cumulative-form clamp;
+                    // count is u64 so already non-negative.
                     let rate = (tick_count_per_group[g] as f64).max(0.0) / (dt_ns as f64 / 1e9);
                     values_per_group[g].push((t as f64 / 1e9, rate));
                 }

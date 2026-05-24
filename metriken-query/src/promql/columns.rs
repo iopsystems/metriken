@@ -74,9 +74,6 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
         let (selector, _stride) = parse_optional_stride(inner.trim())?;
         return Ok(selector);
     }
-    // The scalar reducers accept an optional `[by/without (..)]` clause
-    // before the body; defer to the shared parser so the column scan
-    // sees the same surface syntax `query_range` does.
     for func in ["histogram_mean", "histogram_count", "histogram_irate"] {
         if let Some((inner, _group_by)) = parse_histogram_call(func, query)? {
             let (selector, _stride) = parse_optional_stride(inner.trim())?;
