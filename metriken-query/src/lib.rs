@@ -22,9 +22,11 @@
 //! let result = engine.query_range("rate(http_requests[5m])", start, end, step);
 //! ```
 
+mod parquet_query_engine;
 pub mod promql;
 pub mod tsdb;
 
 pub use bytes::Bytes;
+pub use parquet_query_engine::ParquetQueryEngine;
 pub use promql::{QueryEngine, QueryError, QueryResult};
 pub use tsdb::Tsdb;
