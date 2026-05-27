@@ -12,14 +12,16 @@
 //! use std::sync::Arc;
 //! use std::path::Path;
 //!
-//! // Load a parquet file
-//! let tsdb = Arc::new(Tsdb::load(Path::new("metrics.parquet")).unwrap());
+//! # async fn run() {
+//! // Load a parquet file (requires a tokio runtime)
+//! let tsdb = Arc::new(Tsdb::load(Path::new("metrics.parquet")).await.unwrap());
 //!
 //! // Create a query engine
 //! let engine = QueryEngine::new(tsdb);
 //!
 //! // Execute a range query
 //! let result = engine.query_range("rate(http_requests[5m])", start, end, step);
+//! # }
 //! ```
 
 pub mod promql;

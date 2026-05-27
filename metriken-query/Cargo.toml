@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror = "2"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [features]
 default = ["ingest", "lz4"]

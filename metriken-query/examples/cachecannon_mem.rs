@@ -179,7 +179,8 @@ fn measure<F: FnOnce()>(f: F) -> (usize, usize) {
     (peak_delta, allocated)
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let Some(path) = fixture_path() else {
         eprintln!(
             "set CACHECANNON_PARQUET=/path/to/cachecannon.parquet (or check out rezolus \
@@ -190,7 +191,7 @@ fn main() {
 
     println!("loading {path:?}");
     let load = snap();
-    let tsdb = Arc::new(Tsdb::load(&path).expect("load parquet"));
+    let tsdb = Arc::new(Tsdb::load(&path).await.expect("load parquet"));
     let after_load = snap();
     println!(
         "tsdb resident: {} (allocated during load: {})\n",

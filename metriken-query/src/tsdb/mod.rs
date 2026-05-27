@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io::Write;
 use std::ops::*;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
 use bytes::Bytes;
@@ -10,6 +11,14 @@ use duckdb::types::Value as DuckValue;
 use histogram::{CumulativeROHistogram, Histogram};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use serde::Serialize;
+use tokio::task::JoinSet;
+
+/// How many DuckDB connections (and therefore concurrent column fetches) the
+/// load path runs in parallel. DuckDB connections are single-threaded, so this
+/// caps how many SELECTs can be in flight at once. 4 is a balance between
+/// parallelism and not over-subscribing DuckDB's internal parquet-reader
+/// threads.
+const DEFAULT_POOL_SIZE: usize = 4;
 
 mod collection;
 mod heatmap;
@@ -65,11 +74,384 @@ fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
 /// because some SQL parsers treat them as string terminators; every
 /// other character is permitted inside ANSI/DuckDB quoted identifiers as
 /// long as embedded double quotes are doubled.
-fn quote_ident(name: &str) -> Result<String, Box<dyn Error>> {
+fn quote_ident(name: &str) -> Result<String, FetchError> {
     if name.as_bytes().contains(&0) {
-        return Err(format!("column name contains NUL byte: {name:?}").into());
+        return Err(FetchError::BadIdentifier(format!(
+            "column name contains NUL byte: {name:?}"
+        )));
     }
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
+/// Error type for the per-column fetch path. Concrete (rather than
+/// `Box<dyn Error>`) so it satisfies `Send + Sync + 'static` for
+/// `JoinSet::spawn_blocking`.
+#[derive(Debug, thiserror::Error)]
+enum FetchError {
+    #[error("duckdb error: {0}")]
+    Duckdb(#[from] duckdb::Error),
+    #[error("bad column identifier: {0}")]
+    BadIdentifier(String),
+    #[error("histogram bucket element was not UBIGINT")]
+    BadHistogramBucket,
+}
+
+/// Small fixed-size pool of in-memory DuckDB connections. Connections are
+/// stateless wrt parquet (every query is `read_parquet(?)`), so any
+/// available connection can serve any column fetch. Acquire/release runs
+/// inside `spawn_blocking`, so a `std::sync::Mutex` is correct — no async
+/// awaiting while the mutex is held.
+struct ConnPool {
+    inner: Mutex<Vec<duckdb::Connection>>,
+}
+
+impl ConnPool {
+    fn new(size: usize) -> Result<Self, duckdb::Error> {
+        let conns: Result<Vec<_>, _> = (0..size)
+            .map(|_| duckdb::Connection::open_in_memory())
+            .collect();
+        Ok(Self {
+            inner: Mutex::new(conns?),
+        })
+    }
+
+    /// Pop a connection from the pool. Callers must `release` it back
+    /// when done. Pool exhaustion is impossible by construction —
+    /// `run_pool_load` caps in-flight tasks at the pool size.
+    fn acquire(&self) -> duckdb::Connection {
+        self.inner
+            .lock()
+            .expect("conn pool mutex poisoned")
+            .pop()
+            .expect("conn pool exhausted — should be bounded by JoinSet size")
+    }
+
+    fn release(&self, conn: duckdb::Connection) {
+        self.inner
+            .lock()
+            .expect("conn pool mutex poisoned")
+            .push(conn);
+    }
+}
+
+/// Untyped per-column rows returned from a worker task. Pairs with the
+/// matching `ColumnTarget` so the post-fetch sync pass knows how to
+/// fold each batch into the in-memory series.
+enum RawRows {
+    Counter(Vec<(u64, u64)>),
+    Gauge(Vec<(u64, i64)>),
+    Histogram(Vec<(u64, Option<Vec<u64>>)>),
+}
+
+fn fetch_counter_column(
+    conn: &mut duckdb::Connection,
+    parquet_path: &str,
+    column_name: &str,
+) -> Result<Vec<(u64, u64)>, FetchError> {
+    let col = quote_ident(column_name)?;
+    let sql = format!(
+        "SELECT timestamp, {col} FROM read_parquet(?) \
+         WHERE timestamp IS NOT NULL AND {col} IS NOT NULL \
+         ORDER BY timestamp"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([parquet_path], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn fetch_gauge_column(
+    conn: &mut duckdb::Connection,
+    parquet_path: &str,
+    column_name: &str,
+) -> Result<Vec<(u64, i64)>, FetchError> {
+    let col = quote_ident(column_name)?;
+    let sql = format!(
+        "SELECT timestamp, {col} FROM read_parquet(?) \
+         WHERE timestamp IS NOT NULL AND {col} IS NOT NULL \
+         ORDER BY timestamp"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([parquet_path], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn fetch_histogram_column(
+    conn: &mut duckdb::Connection,
+    parquet_path: &str,
+    column_name: &str,
+) -> Result<Vec<(u64, Option<Vec<u64>>)>, FetchError> {
+    let col = quote_ident(column_name)?;
+    // Null bucket lists are kept (not WHERE-filtered) so the post-fetch
+    // pass still emits an explicit empty delta against `prev` at those
+    // timestamps — matches the prior loader and keeps offset-based
+    // timestamp axes aligned.
+    let sql = format!(
+        "SELECT timestamp, {col} FROM read_parquet(?) \
+         WHERE timestamp IS NOT NULL \
+         ORDER BY timestamp"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([parquet_path], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, DuckValue>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (ts, val) = r?;
+        let buckets = match val {
+            DuckValue::List(elems) => {
+                let mut buckets = Vec::with_capacity(elems.len());
+                for v in elems {
+                    match v {
+                        DuckValue::UBigInt(x) => buckets.push(x),
+                        DuckValue::Null => buckets.push(0),
+                        _ => return Err(FetchError::BadHistogramBucket),
+                    }
+                }
+                Some(buckets)
+            }
+            _ => None,
+        };
+        out.push((ts, buckets));
+    }
+    Ok(out)
+}
+
+fn fetch_dispatch(
+    conn: &mut duckdb::Connection,
+    parquet_path: &str,
+    target: &ColumnTarget,
+) -> Result<RawRows, FetchError> {
+    match target {
+        ColumnTarget::Counter { column_name, .. } => {
+            fetch_counter_column(conn, parquet_path, column_name).map(RawRows::Counter)
+        }
+        ColumnTarget::Gauge { column_name, .. } => {
+            fetch_gauge_column(conn, parquet_path, column_name).map(RawRows::Gauge)
+        }
+        ColumnTarget::Histogram { column_name, .. } => {
+            fetch_histogram_column(conn, parquet_path, column_name).map(RawRows::Histogram)
+        }
+        ColumnTarget::Skip => panic!("Skip targets must be filtered out before dispatch"),
+    }
+}
+
+/// Fold one fetched column's raw rows into the in-memory `Tsdb`.
+/// Mirrors the per-arm logic of the old synchronous loader exactly —
+/// only the data source is different.
+fn populate_target(data: &mut Tsdb, target: ColumnTarget, rows: RawRows, interval_ns: u64) {
+    match (target, rows) {
+        (
+            ColumnTarget::Counter {
+                name,
+                labels,
+                column_name,
+            },
+            RawRows::Counter(rows),
+        ) => {
+            data.columns
+                .entry(name.clone())
+                .or_default()
+                .insert(labels.clone(), column_name);
+            let series = data
+                .counters
+                .entry(name)
+                .or_default()
+                .entry(labels)
+                .or_default();
+            for (ts_raw, v) in rows {
+                series.insert(snap_timestamp(ts_raw, interval_ns), v);
+            }
+        }
+        (
+            ColumnTarget::Gauge {
+                name,
+                labels,
+                column_name,
+            },
+            RawRows::Gauge(rows),
+        ) => {
+            data.columns
+                .entry(name.clone())
+                .or_default()
+                .insert(labels.clone(), column_name);
+            let series = data
+                .gauges
+                .entry(name)
+                .or_default()
+                .entry(labels)
+                .or_default();
+            for (ts_raw, v) in rows {
+                series.insert(snap_timestamp(ts_raw, interval_ns), v);
+            }
+        }
+        (
+            ColumnTarget::Histogram {
+                name,
+                labels,
+                column_name,
+                grouping_power,
+                max_value_power,
+                config,
+            },
+            RawRows::Histogram(rows),
+        ) => {
+            data.columns
+                .entry(name.clone())
+                .or_default()
+                .insert(labels.clone(), column_name);
+            let series = data
+                .histograms
+                .entry(name)
+                .or_default()
+                .entry(labels)
+                .or_default();
+
+            let mut prev: Option<CumulativeROHistogram> = None;
+            for (ts_raw, buckets) in rows {
+                let ts = snap_timestamp(ts_raw, interval_ns);
+                let curr = buckets.and_then(|b| {
+                    Histogram::from_buckets(grouping_power, max_value_power, b)
+                        .ok()
+                        .map(|h| CumulativeROHistogram::from(&h))
+                });
+                match (prev.as_ref(), curr.as_ref()) {
+                    (Some(p), Some(c)) => series.insert(ts, delta_to_32_or_empty(p, c)),
+                    (Some(_), None) => {
+                        if let Some(cfg) = config {
+                            series.insert(ts, empty_delta_32(cfg));
+                        }
+                    }
+                    _ => {}
+                }
+                if curr.is_some() {
+                    prev = curr;
+                }
+            }
+        }
+        _ => panic!("fetch_dispatch must return RawRows matching the ColumnTarget kind"),
+    }
+}
+
+/// Extract file-level kv metadata and populate `data`'s metadata fields.
+fn populate_metadata(data: &mut Tsdb, meta: &ArrowReaderMetadata) {
+    let mut kv = HashMap::new();
+    if let Some(entries) = meta.metadata().file_metadata().key_value_metadata() {
+        for entry in entries {
+            kv.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+        }
+    }
+    data.sampling_interval_ms = kv
+        .get("sampling_interval_ms")
+        .map(|v| v.parse::<u64>().expect("bad interval"))
+        .unwrap_or(1000);
+    data.source = kv
+        .get("source")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    data.version = kv
+        .get("version")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    data.file_metadata = kv;
+}
+
+/// Classify each parquet column into a `ColumnTarget` based on its
+/// Arrow field metadata. DuckDB doesn't surface per-field metadata
+/// through SQL, so this stays on the `parquet` crate path.
+fn classify_columns(meta: &ArrowReaderMetadata) -> Result<Vec<ColumnTarget>, Box<dyn Error>> {
+    let schema = meta.schema();
+    let ts_col_idx = schema
+        .index_of("timestamp")
+        .map_err(|_| "missing 'timestamp' column")?;
+
+    Ok(schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(col_idx, field)| {
+            if col_idx == ts_col_idx {
+                return ColumnTarget::Skip;
+            }
+            let mut field_meta = field.metadata().clone();
+            let column_name = field.name().to_string();
+            let name = if let Some(n) = field_meta.get("metric").cloned() {
+                n
+            } else {
+                column_name
+                    .strip_suffix(":buckets")
+                    .unwrap_or(&column_name)
+                    .to_string()
+            };
+            let grouping_power: Option<u8> = field_meta
+                .remove("grouping_power")
+                .and_then(|v| v.parse().ok());
+            let max_value_power: Option<u8> = field_meta
+                .remove("max_value_power")
+                .and_then(|v| v.parse().ok());
+
+            let mut labels = Labels::default();
+            for (k, v) in field_meta.iter() {
+                match k.as_str() {
+                    // Internal metadata — not user-facing labels
+                    "metric" | "metric_type" | "unit" => continue,
+                    _ => {
+                        labels.inner.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+
+            match field.data_type() {
+                DataType::UInt64 => ColumnTarget::Counter {
+                    name,
+                    labels,
+                    column_name,
+                },
+                DataType::Int64 => ColumnTarget::Gauge {
+                    name,
+                    labels,
+                    column_name,
+                },
+                DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
+                    let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
+                        return ColumnTarget::Skip;
+                    };
+                    let config = ::histogram::Config::new(gp, mvp).ok();
+                    ColumnTarget::Histogram {
+                        name,
+                        labels,
+                        column_name,
+                        grouping_power: gp,
+                        max_value_power: mvp,
+                        config,
+                    }
+                }
+                _ => ColumnTarget::Skip,
+            }
+        })
+        .collect())
+}
+
+/// Spawn one column-fetch task onto the JoinSet. Factored out so both
+/// the priming and the replenish sites in `run_pool_load` use the
+/// exact same closure shape.
+fn spawn_fetch(
+    set: &mut JoinSet<Result<(ColumnTarget, RawRows), FetchError>>,
+    target: ColumnTarget,
+    pool: Arc<ConnPool>,
+    parquet_path: Arc<str>,
+    tempfile_keepalive: Option<Arc<tempfile::NamedTempFile>>,
+) {
+    set.spawn_blocking(move || {
+        let _keepalive = tempfile_keepalive;
+        let mut conn = pool.acquire();
+        let result = fetch_dispatch(&mut conn, &parquet_path, &target);
+        pool.release(conn);
+        result.map(|rows| (target, rows))
+    });
 }
 
 #[derive(Default, Clone)]
@@ -95,290 +477,138 @@ pub struct Tsdb {
 }
 
 impl Tsdb {
-    pub fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let raw = std::fs::read(path)?;
+    /// Load a parquet file into an in-memory TSDB. DuckDB reads the file
+    /// directly from `path` (no extra in-memory copy) and per-column
+    /// SELECTs run on a small connection pool concurrently. Requires a
+    /// tokio runtime to await.
+    pub async fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
         let filename = path
             .file_name()
-            .map(|v| v.to_str().unwrap_or("unknown"))
+            .and_then(|v| v.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let mut data = Self::load_from_bytes(Bytes::from(raw))?;
+        let path_str: Arc<str> =
+            Arc::from(path.to_str().ok_or("path is not valid UTF-8")?);
+
+        // Footer read is small (KB) but still blocking I/O; off the
+        // async runtime. `parquet::errors::ParquetError` has a From
+        // impl for io::Error, so both possible failure modes
+        // collapse into one concrete error type that `?` can box.
+        let path_owned = path.to_owned();
+        let meta = tokio::task::spawn_blocking(
+            move || -> Result<_, parquet::errors::ParquetError> {
+                let file = std::fs::File::open(&path_owned)?;
+                let m = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+                Ok(m)
+            },
+        )
+        .await??;
+
+        let mut data = Tsdb::default();
+        populate_metadata(&mut data, &meta);
+        let targets = classify_columns(&meta)?;
+
+        Self::run_pool_load(&mut data, path_str, targets, None).await?;
         data.filename = filename;
         Ok(data)
     }
 
-    pub fn load_from_bytes(bytes: Bytes) -> Result<Self, Box<dyn Error>> {
+    /// Load from an in-memory parquet buffer. DuckDB requires a
+    /// filesystem path, so the bytes are materialized to a tempfile
+    /// that's held alive until every column fetch finishes. Requires a
+    /// tokio runtime to await.
+    pub async fn load_from_bytes(bytes: Bytes) -> Result<Self, Box<dyn Error>> {
+        // Schema discovery is cheap and can happen on `bytes` directly
+        // before we move them into the tempfile-writing task.
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
         let mut data = Tsdb::default();
+        populate_metadata(&mut data, &meta);
+        let targets = classify_columns(&meta)?;
 
-        // Parse the footer once for schema/labels inspection. We continue to
-        // read per-column Arrow field metadata via the `parquet` crate because
-        // DuckDB doesn't expose it through SQL; data fetch is delegated to
-        // DuckDB below.
-        let arrow_reader_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
-        let arrow_schema = arrow_reader_meta.schema().clone();
-        let pq_metadata = arrow_reader_meta.metadata();
+        // Tempfile creation involves blocking syscalls; do them on the
+        // blocking pool.
+        let tempfile = tokio::task::spawn_blocking(move || -> Result<_, std::io::Error> {
+            let mut tmp = tempfile::NamedTempFile::new()?;
+            tmp.as_file_mut().write_all(&bytes)?;
+            tmp.as_file_mut().sync_all()?;
+            Ok(tmp)
+        })
+        .await??;
 
-        let mut metadata = HashMap::new();
-        if let Some(kv) = pq_metadata.file_metadata().key_value_metadata() {
-            for entry in kv {
-                metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
-            }
-        }
+        let parquet_path: Arc<str> = Arc::from(
+            tempfile
+                .path()
+                .to_str()
+                .ok_or("tempfile path is not valid UTF-8")?
+                .to_string()
+                .as_str(),
+        );
+        let tempfile = Arc::new(tempfile);
 
-        data.sampling_interval_ms = metadata
-            .get("sampling_interval_ms")
-            .map(|v| v.parse::<u64>().expect("bad interval"))
-            .unwrap_or(1000);
-        data.source = metadata
-            .get("source")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        data.version = metadata
-            .get("version")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        data.file_metadata = metadata;
-
-        let interval_ns = data.sampling_interval_ms * 1_000_000;
-
-        let ts_col_idx = arrow_schema
-            .index_of("timestamp")
-            .map_err(|_| "missing 'timestamp' column")?;
-
-        // Precompute targets so the hot loop doesn't re-parse schema
-        // metadata per batch.
-        let targets: Vec<ColumnTarget> = arrow_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(col_idx, field)| {
-                if col_idx == ts_col_idx {
-                    return ColumnTarget::Skip;
-                }
-                let mut meta = field.metadata().clone();
-                let column_name = field.name().to_string();
-                let name = if let Some(n) = meta.get("metric").cloned() {
-                    n
-                } else {
-                    column_name
-                        .strip_suffix(":buckets")
-                        .unwrap_or(&column_name)
-                        .to_string()
-                };
-                let grouping_power: Option<u8> =
-                    meta.remove("grouping_power").and_then(|v| v.parse().ok());
-                let max_value_power: Option<u8> =
-                    meta.remove("max_value_power").and_then(|v| v.parse().ok());
-
-                let mut labels = Labels::default();
-                for (k, v) in meta.iter() {
-                    match k.as_str() {
-                        // Internal metadata — not user-facing labels
-                        "metric" | "metric_type" | "unit" => continue,
-                        _ => {
-                            labels.inner.insert(k.to_string(), v.to_string());
-                        }
-                    }
-                }
-
-                match field.data_type() {
-                    DataType::UInt64 => ColumnTarget::Counter {
-                        name,
-                        labels,
-                        column_name,
-                    },
-                    DataType::Int64 => ColumnTarget::Gauge {
-                        name,
-                        labels,
-                        column_name,
-                    },
-                    DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
-                        let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
-                            return ColumnTarget::Skip;
-                        };
-                        let config = ::histogram::Config::new(gp, mvp).ok();
-                        ColumnTarget::Histogram {
-                            name,
-                            labels,
-                            column_name,
-                            grouping_power: gp,
-                            max_value_power: mvp,
-                            config,
-                        }
-                    }
-                    _ => ColumnTarget::Skip,
-                }
-            })
-            .collect();
-
-        // DuckDB needs a filesystem path for `read_parquet`. Materialize the
-        // input bytes to a tempfile so the loader has a single code path for
-        // both `load(path)` (which round-trips through bytes) and direct
-        // `load_from_bytes` callers. The schema work above already happened
-        // on `bytes` directly, so the tempfile is only used for the data
-        // fetch below.
-        let mut tmp = tempfile::NamedTempFile::new()?;
-        tmp.as_file_mut().write_all(&bytes)?;
-        tmp.as_file_mut().sync_all()?;
-        let parquet_path = tmp
-            .path()
-            .to_str()
-            .ok_or("tempfile path is not valid UTF-8")?
-            .to_string();
-
-        let conn = duckdb::Connection::open_in_memory()?;
-
-        // One SELECT per non-Skip column, returning (timestamp, value) pairs.
-        // Pairing timestamp with the value in the same query removes the
-        // row-index alignment dance the prior `parquet` code carried across
-        // batches. `ORDER BY timestamp` keeps inserts in ascending order so
-        // `Series::insert` stays on its O(1) append fast path (and is
-        // load-bearing for histograms, where deltas are computed against the
-        // immediately preceding snapshot via the stack-local `prev`).
-        for target in targets.iter() {
-            match target {
-                ColumnTarget::Skip => continue,
-                ColumnTarget::Counter {
-                    name,
-                    labels,
-                    column_name,
-                } => {
-                    data.columns
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(labels.clone(), column_name.clone());
-                    let series = data
-                        .counters
-                        .entry(name.clone())
-                        .or_default()
-                        .entry(labels.clone())
-                        .or_default();
-
-                    let col = quote_ident(column_name)?;
-                    let sql = format!(
-                        "SELECT timestamp, {col} FROM read_parquet(?) \
-                         WHERE timestamp IS NOT NULL AND {col} IS NOT NULL \
-                         ORDER BY timestamp"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows = stmt.query_map([&parquet_path], |row| {
-                        Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
-                    })?;
-                    for r in rows {
-                        let (ts_raw, v) = r?;
-                        series.insert(snap_timestamp(ts_raw, interval_ns), v);
-                    }
-                }
-                ColumnTarget::Gauge {
-                    name,
-                    labels,
-                    column_name,
-                } => {
-                    data.columns
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(labels.clone(), column_name.clone());
-                    let series = data
-                        .gauges
-                        .entry(name.clone())
-                        .or_default()
-                        .entry(labels.clone())
-                        .or_default();
-
-                    let col = quote_ident(column_name)?;
-                    let sql = format!(
-                        "SELECT timestamp, {col} FROM read_parquet(?) \
-                         WHERE timestamp IS NOT NULL AND {col} IS NOT NULL \
-                         ORDER BY timestamp"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows = stmt.query_map([&parquet_path], |row| {
-                        Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?))
-                    })?;
-                    for r in rows {
-                        let (ts_raw, v) = r?;
-                        series.insert(snap_timestamp(ts_raw, interval_ns), v);
-                    }
-                }
-                ColumnTarget::Histogram {
-                    name,
-                    labels,
-                    column_name,
-                    grouping_power,
-                    max_value_power,
-                    config,
-                } => {
-                    let gp = *grouping_power;
-                    let mvp = *max_value_power;
-                    let cfg = *config;
-                    data.columns
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(labels.clone(), column_name.clone());
-                    let series = data
-                        .histograms
-                        .entry(name.clone())
-                        .or_default()
-                        .entry(labels.clone())
-                        .or_default();
-
-                    // Null bucket lists are kept (not WHERE-filtered) so a
-                    // missing snapshot still produces an explicit empty
-                    // delta against `prev` — matches the prior loader and
-                    // keeps offset-based timestamp axes aligned.
-                    let col = quote_ident(column_name)?;
-                    let sql = format!(
-                        "SELECT timestamp, {col} FROM read_parquet(?) \
-                         WHERE timestamp IS NOT NULL \
-                         ORDER BY timestamp"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows = stmt.query_map([&parquet_path], |row| {
-                        Ok((row.get::<_, u64>(0)?, row.get::<_, DuckValue>(1)?))
-                    })?;
-
-                    let mut prev: Option<CumulativeROHistogram> = None;
-                    for r in rows {
-                        let (ts_raw, val) = r?;
-                        let ts = snap_timestamp(ts_raw, interval_ns);
-
-                        let curr = match val {
-                            DuckValue::List(elems) => {
-                                let buckets: Vec<u64> = elems
-                                    .iter()
-                                    .map(|v| match v {
-                                        DuckValue::UBigInt(x) => *x,
-                                        DuckValue::Null => 0,
-                                        _ => panic!("histogram inner is not UBIGINT"),
-                                    })
-                                    .collect();
-                                Histogram::from_buckets(gp, mvp, buckets)
-                                    .ok()
-                                    .map(|h| CumulativeROHistogram::from(&h))
-                            }
-                            _ => None,
-                        };
-
-                        match (prev.as_ref(), curr.as_ref()) {
-                            (Some(prev_cumu), Some(curr_cumu)) => {
-                                series.insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
-                            }
-                            (Some(_), None) => {
-                                if let Some(cfg) = cfg {
-                                    series.insert(ts, empty_delta_32(cfg));
-                                }
-                            }
-                            _ => {}
-                        }
-                        if curr.is_some() {
-                            prev = curr;
-                        }
-                    }
-                }
-            }
-        }
-
+        Self::run_pool_load(&mut data, parquet_path, targets, Some(tempfile)).await?;
         Ok(data)
+    }
+
+    /// Drive the per-column fetch loop. A small pool of DuckDB
+    /// connections is created and reused across columns; a JoinSet
+    /// keeps at most `DEFAULT_POOL_SIZE` tasks in flight at any time so
+    /// the pool can never be exhausted. Each completed task's rows are
+    /// folded into `data` synchronously before the next task is
+    /// scheduled.
+    async fn run_pool_load(
+        data: &mut Tsdb,
+        parquet_path: Arc<str>,
+        targets: Vec<ColumnTarget>,
+        tempfile_keepalive: Option<Arc<tempfile::NamedTempFile>>,
+    ) -> Result<(), Box<dyn Error>> {
+        let interval_ns = data.sampling_interval_ms * 1_000_000;
+        let pool = Arc::new(ConnPool::new(DEFAULT_POOL_SIZE)?);
+
+        // Drop Skip targets up front; reverse so `pop()` yields the
+        // remaining targets in their original (schema) order. Order
+        // doesn't affect correctness — fetches are independent across
+        // columns and histogram `prev` lives inside one column — but
+        // keeping schema order makes any debug output predictable.
+        let mut targets: Vec<ColumnTarget> = targets
+            .into_iter()
+            .filter(|t| !matches!(t, ColumnTarget::Skip))
+            .collect();
+        targets.reverse();
+
+        let mut set: JoinSet<Result<(ColumnTarget, RawRows), FetchError>> = JoinSet::new();
+
+        // Prime: spawn up to POOL_SIZE tasks immediately.
+        for _ in 0..DEFAULT_POOL_SIZE.min(targets.len()) {
+            let target = targets.pop().expect("min ensures non-empty");
+            spawn_fetch(
+                &mut set,
+                target,
+                pool.clone(),
+                parquet_path.clone(),
+                tempfile_keepalive.clone(),
+            );
+        }
+
+        // Drain: as each task finishes, fold its rows in and replenish
+        // from the remaining targets. JoinSet hands back results in
+        // completion order, not submission order — fine, populate_target
+        // is independent across columns.
+        while let Some(join_result) = set.join_next().await {
+            let (target, rows) = join_result??;
+            populate_target(data, target, rows, interval_ns);
+
+            if let Some(next) = targets.pop() {
+                spawn_fetch(
+                    &mut set,
+                    next,
+                    pool.clone(),
+                    parquet_path.clone(),
+                    tempfile_keepalive.clone(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn set_sampling_interval_ms(&mut self, ms: u64) {

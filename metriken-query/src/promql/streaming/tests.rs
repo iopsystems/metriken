@@ -387,8 +387,8 @@ fn count_points(result: &QueryResult) -> usize {
 ///
 /// Per-query wall-clock is printed with `--nocapture` so the test
 /// also doubles as a quick perf sanity-check on local dev.
-#[test]
-fn cachecannon_smoke_test() {
+#[tokio::test]
+async fn cachecannon_smoke_test() {
     let Some(path) = cachecannon_parquet_path() else {
         eprintln!(
             "skipping cachecannon smoke test: set CACHECANNON_PARQUET=/path/to/cachecannon.parquet \
@@ -397,7 +397,7 @@ fn cachecannon_smoke_test() {
         return;
     };
 
-    let tsdb = match crate::Tsdb::load(&path) {
+    let tsdb = match crate::Tsdb::load(&path).await {
         Ok(t) => Arc::new(t),
         Err(e) => {
             eprintln!("skipping cachecannon smoke test: failed to load {path:?}: {e}");
