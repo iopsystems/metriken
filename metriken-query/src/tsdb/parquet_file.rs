@@ -158,6 +158,7 @@ impl ParquetFile {
         // Process the pre-range init row group if present. All rows fall before
         // `start_ns`, so the range filter prevents any insertion. Histograms
         // update `prev` on each row so the first in-range delta is computable.
+        // Counters and gauges have nothing to initialise, so they are skipped.
         if let Some(rg_idx) = init_rg {
             read_timestamps_into(
                 &self.file,
@@ -169,7 +170,7 @@ impl ParquetFile {
                 &mut timestamps,
             )?;
             for (col_idx, target) in targets.iter_mut().enumerate() {
-                if col_idx == ts_col_idx || matches!(target, ColumnTarget::Skip) {
+                if !matches!(target, ColumnTarget::Histogram { .. }) {
                     continue;
                 }
                 let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
