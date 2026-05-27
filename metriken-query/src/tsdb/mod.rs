@@ -110,20 +110,27 @@ impl Tsdb {
             }
         }
 
-        let mut data = Tsdb::default();
-        data.sampling_interval_ms = metadata
+        let sampling_interval_ms = metadata
             .get("sampling_interval_ms")
             .map(|v| v.parse::<u64>().expect("bad interval"))
             .unwrap_or(1000);
-        data.source = metadata
+        let source = metadata
             .get("source")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        data.version = metadata
+        let version = metadata
             .get("version")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        data.file_metadata = metadata;
+
+        let mut data = Tsdb {
+            sampling_interval_ms,
+            source,
+            version,
+            filename,
+            file_metadata: metadata,
+            ..Tsdb::default()
+        };
 
         let interval_ns = data.sampling_interval_ms * 1_000_000;
 
@@ -365,7 +372,6 @@ impl Tsdb {
             }
         }
 
-        data.filename = filename;
         Ok(data)
     }
 
