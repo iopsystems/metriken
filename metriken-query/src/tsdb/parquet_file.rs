@@ -169,10 +169,11 @@ impl ParquetFile {
                 interval_ns,
                 &mut timestamps,
             )?;
-            for (col_idx, target) in targets.iter_mut().enumerate() {
-                if !matches!(target, ColumnTarget::Histogram { .. }) {
-                    continue;
-                }
+            for (col_idx, target) in targets
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, t)| matches!(t, ColumnTarget::Histogram { .. }))
+            {
                 let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
                     self.file.try_clone()?,
                     self.meta.clone(),
