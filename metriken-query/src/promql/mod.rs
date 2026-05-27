@@ -143,6 +143,95 @@ impl HistogramGroupBy {
     }
 }
 
+/// Detect `sum [by/without (...)] (<histogram_func>(...))` and rewrite
+/// to the native `<histogram_func> [by/without (...)] (...)` form.
+///
+/// `histogram_irate`/`histogram_mean`/`histogram_count` aren't standard
+/// PromQL function names, so the promql-parser crate rejects them
+/// outright — even when wrapped in a standard aggregator.  Rather than
+/// teach the parser these names, the wrapping `sum` is unwrapped at
+/// the string level here and passed through the existing top-level
+/// dispatcher.  Returns `None` if the input doesn't match the pattern.
+///
+/// Restricted to `sum` because the internal histogram grouping already
+/// reduces across label sets via `total_count` / mean / per-step rate;
+/// `sum` is therefore a pass-through.  Other aggregators (`avg`, `min`,
+/// `max`, `count`) would require post-pipeline reduction over the
+/// per-group output and are intentionally left untouched.
+fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
+    let query = query.trim();
+    let after_sum = query.strip_prefix("sum")?;
+    // Guard against names with `sum` as a prefix (e.g. `summary_foo`).
+    if !matches!(after_sum.chars().next(), Some('(' | ' ' | '\t')) {
+        return None;
+    }
+    let rest = after_sum.trim_start();
+
+    // Outer aggregation modifier on the wrapping `sum`.
+    let (grouping_clause, after_modifier) = if let Some(r) = rest.strip_prefix("by") {
+        let (after, clause) = take_grouping_clause(r.trim_start(), "by")?;
+        (Some(clause), after)
+    } else if let Some(r) = rest.strip_prefix("without") {
+        let (after, clause) = take_grouping_clause(r.trim_start(), "without")?;
+        (Some(clause), after)
+    } else {
+        (None, rest)
+    };
+
+    // Body of the outer `sum`: must be `(<inner>)` with balanced parens.
+    let after_open = after_modifier.strip_prefix('(')?;
+    let close = find_close_paren(after_open)?;
+    if after_open[close + 1..]
+        .trim_start()
+        .chars()
+        .next()
+        .is_some()
+    {
+        return None; // trailing tokens — not the shape we rewrite.
+    }
+    let inner = after_open[..close].trim();
+
+    // Inner must be exactly one of the histogram_* function calls.
+    let inner_func = ["histogram_irate", "histogram_mean", "histogram_count"]
+        .iter()
+        .find(|f| inner.starts_with(*f))?;
+    let after_name = inner.strip_prefix(*inner_func)?;
+    if !matches!(after_name.chars().next(), Some('(' | ' ' | '\t')) {
+        return None;
+    }
+
+    // Refuse to rewrite if the inner call already carries its own
+    // grouping modifier — combining two would be ambiguous and the
+    // existing dispatcher rejects it for the same reason.
+    let inner_after_name = after_name.trim_start();
+    if inner_after_name.starts_with("by") || inner_after_name.starts_with("without") {
+        let next = inner_after_name
+            .chars()
+            .nth("by".len().max("without".len()))
+            .unwrap_or(' ');
+        if matches!(next, '(' | ' ' | '\t') {
+            return None;
+        }
+    }
+
+    match grouping_clause {
+        Some(clause) => Some(format!("{inner_func} {clause} {inner_after_name}")),
+        None => Some(inner.to_string()),
+    }
+}
+
+/// Consume a `by (..)` / `without (..)` clause from the start of `s`,
+/// returning `(rest_after_clause, "by (..)" | "without (..)")`.  The
+/// returned clause string keeps the keyword so callers can splice it
+/// directly into a rewritten query.
+fn take_grouping_clause<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, String)> {
+    let inside = s.strip_prefix('(')?;
+    let close = find_close_paren(inside)?;
+    let labels = &inside[..close];
+    let after = inside[close + 1..].trim_start();
+    Some((after, format!("{keyword} ({labels})")))
+}
+
 /// Parse `<func> [by (labels) | without (labels)] (body)`. `Ok(None)`
 /// if the prefix doesn't match.
 pub(crate) fn parse_histogram_call<'a>(
@@ -610,6 +699,18 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
+
+        // Recognise `sum [by/without (...)] (<histogram_func>(...))` and
+        // rewrite to the native grouped form before the histogram
+        // dispatchers below match.  `sum` is the only aggregator with a
+        // direct native equivalent — `histogram_irate`/`mean`/`count`
+        // already collapse across label sets in their internal grouping
+        // pass, so `sum [grouping] (...)` is semantically identical to
+        // `<func> [grouping] (...)`.  Other aggregators (`avg`, `min`,
+        // `max`, `count`) would require post-pipeline reduction and are
+        // not rewritten here.
+        let rewritten = unwrap_sum_around_histogram(query_str);
+        let query_str: &str = rewritten.as_deref().unwrap_or(query_str);
 
         for func in ["histogram_mean", "histogram_count"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
