@@ -58,6 +58,20 @@ fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
     }
 }
 
+/// Quote a parquet column name for inclusion in a DuckDB SQL statement.
+/// SQL identifiers can't be bound as parameters, so callers building
+/// queries over schema-derived column names must route every name
+/// through here rather than interpolating raw. NUL bytes are rejected
+/// because some SQL parsers treat them as string terminators; every
+/// other character is permitted inside ANSI/DuckDB quoted identifiers as
+/// long as embedded double quotes are doubled.
+fn quote_ident(name: &str) -> Result<String, Box<dyn Error>> {
+    if name.as_bytes().contains(&0) {
+        return Err(format!("column name contains NUL byte: {name:?}").into());
+    }
+    Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
 #[derive(Default, Clone)]
 pub struct Tsdb {
     sampling_interval_ms: u64,
@@ -240,11 +254,11 @@ impl Tsdb {
                         .entry(labels.clone())
                         .or_default();
 
+                    let col = quote_ident(column_name)?;
                     let sql = format!(
-                        r#"SELECT timestamp, "{col}" FROM read_parquet(?)
-                           WHERE timestamp IS NOT NULL AND "{col}" IS NOT NULL
-                           ORDER BY timestamp"#,
-                        col = column_name.replace('"', "\"\"")
+                        "SELECT timestamp, {col} FROM read_parquet(?) \
+                         WHERE timestamp IS NOT NULL AND {col} IS NOT NULL \
+                         ORDER BY timestamp"
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let rows = stmt.query_map([&parquet_path], |row| {
@@ -271,11 +285,11 @@ impl Tsdb {
                         .entry(labels.clone())
                         .or_default();
 
+                    let col = quote_ident(column_name)?;
                     let sql = format!(
-                        r#"SELECT timestamp, "{col}" FROM read_parquet(?)
-                           WHERE timestamp IS NOT NULL AND "{col}" IS NOT NULL
-                           ORDER BY timestamp"#,
-                        col = column_name.replace('"', "\"\"")
+                        "SELECT timestamp, {col} FROM read_parquet(?) \
+                         WHERE timestamp IS NOT NULL AND {col} IS NOT NULL \
+                         ORDER BY timestamp"
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let rows = stmt.query_map([&parquet_path], |row| {
@@ -312,11 +326,11 @@ impl Tsdb {
                     // missing snapshot still produces an explicit empty
                     // delta against `prev` — matches the prior loader and
                     // keeps offset-based timestamp axes aligned.
+                    let col = quote_ident(column_name)?;
                     let sql = format!(
-                        r#"SELECT timestamp, "{col}" FROM read_parquet(?)
-                           WHERE timestamp IS NOT NULL
-                           ORDER BY timestamp"#,
-                        col = column_name.replace('"', "\"\"")
+                        "SELECT timestamp, {col} FROM read_parquet(?) \
+                         WHERE timestamp IS NOT NULL \
+                         ORDER BY timestamp"
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let rows = stmt.query_map([&parquet_path], |row| {
