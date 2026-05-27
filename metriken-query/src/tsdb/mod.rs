@@ -1,16 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
+use std::io::Write;
 use std::ops::*;
 use std::path::Path;
 
-use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
+use duckdb::types::Value as DuckValue;
 use histogram::{CumulativeROHistogram, Histogram};
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use serde::Serialize;
 
 mod collection;
@@ -25,10 +23,9 @@ pub use series::*;
 use series::{delta_to_32_or_empty, empty_delta_32};
 
 /// Per-column dispatch target precomputed from the parquet schema.
-/// Histogram targets carry the rolling `prev` cumulative so per-period
-/// deltas work across batches. `column_name` is the parquet field
-/// name, preserved so callers can map a resolved series back to its
-/// on-disk column without re-parsing the schema.
+/// `column_name` is the parquet field name, preserved so callers can map
+/// a resolved series back to its on-disk column without re-parsing the
+/// schema.
 enum ColumnTarget {
     Skip,
     Counter {
@@ -48,7 +45,6 @@ enum ColumnTarget {
         grouping_power: u8,
         max_value_power: u8,
         config: Option<::histogram::Config>,
-        prev: Option<CumulativeROHistogram>,
     },
 }
 
@@ -100,14 +96,13 @@ impl Tsdb {
     pub fn load_from_bytes(bytes: Bytes) -> Result<Self, Box<dyn Error>> {
         let mut data = Tsdb::default();
 
-        // Parse the footer once and reuse for every per-(row-group, column)
-        // reader below — `try_new` re-parses on every call (multi-second on
-        // wide files).
+        // Parse the footer once for schema/labels inspection. We continue to
+        // read per-column Arrow field metadata via the `parquet` crate because
+        // DuckDB doesn't expose it through SQL; data fetch is delegated to
+        // DuckDB below.
         let arrow_reader_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
         let arrow_schema = arrow_reader_meta.schema().clone();
-        let pq_metadata = arrow_reader_meta.metadata().clone();
-        let parquet_schema = pq_metadata.file_metadata().schema_descr_ptr();
-        let num_row_groups = pq_metadata.num_row_groups();
+        let pq_metadata = arrow_reader_meta.metadata();
 
         let mut metadata = HashMap::new();
         if let Some(kv) = pq_metadata.file_metadata().key_value_metadata() {
@@ -138,7 +133,7 @@ impl Tsdb {
 
         // Precompute targets so the hot loop doesn't re-parse schema
         // metadata per batch.
-        let mut targets: Vec<ColumnTarget> = arrow_schema
+        let targets: Vec<ColumnTarget> = arrow_schema
             .fields()
             .iter()
             .enumerate()
@@ -195,7 +190,6 @@ impl Tsdb {
                             grouping_power: gp,
                             max_value_power: mvp,
                             config,
-                            prev: None,
                         }
                     }
                     _ => ColumnTarget::Skip,
@@ -203,172 +197,167 @@ impl Tsdb {
             })
             .collect();
 
-        // Decode one column at a time within each row group; peak resident
-        // is bounded by one decoded Arrow array.
-        let mut timestamps: Vec<Option<u64>> = Vec::new();
-        for rg_idx in 0..num_row_groups {
-            let ts_reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
-                bytes.clone(),
-                arrow_reader_meta.clone(),
-            )
-            .with_row_groups(vec![rg_idx])
-            .with_projection(ProjectionMask::roots(&parquet_schema, [ts_col_idx]))
-            .build()?;
-            timestamps.clear();
-            for batch in ts_reader.flatten() {
-                let ts_arr = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or("timestamp column is not UInt64")?;
-                timestamps.reserve(ts_arr.len());
-                for v in ts_arr.iter() {
-                    timestamps.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
-                }
-            }
+        // DuckDB needs a filesystem path for `read_parquet`. Materialize the
+        // input bytes to a tempfile so the loader has a single code path for
+        // both `load(path)` (which round-trips through bytes) and direct
+        // `load_from_bytes` callers. The schema work above already happened
+        // on `bytes` directly, so the tempfile is only used for the data
+        // fetch below.
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        tmp.as_file_mut().write_all(&bytes)?;
+        tmp.as_file_mut().sync_all()?;
+        let parquet_path = tmp
+            .path()
+            .to_str()
+            .ok_or("tempfile path is not valid UTF-8")?
+            .to_string();
 
-            for (col_idx, target) in targets.iter_mut().enumerate() {
-                if col_idx == ts_col_idx {
-                    continue;
-                }
-                if matches!(target, ColumnTarget::Skip) {
-                    continue;
-                }
+        let conn = duckdb::Connection::open_in_memory()?;
 
-                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
-                    bytes.clone(),
-                    arrow_reader_meta.clone(),
-                )
-                .with_row_groups(vec![rg_idx])
-                .with_projection(ProjectionMask::roots(&parquet_schema, [col_idx]))
-                .build()?;
+        // One SELECT per non-Skip column, returning (timestamp, value) pairs.
+        // Pairing timestamp with the value in the same query removes the
+        // row-index alignment dance the prior `parquet` code carried across
+        // batches. `ORDER BY timestamp` keeps inserts in ascending order so
+        // `Series::insert` stays on its O(1) append fast path (and is
+        // load-bearing for histograms, where deltas are computed against the
+        // immediately preceding snapshot via the stack-local `prev`).
+        for target in targets.iter() {
+            match target {
+                ColumnTarget::Skip => continue,
+                ColumnTarget::Counter {
+                    name,
+                    labels,
+                    column_name,
+                } => {
+                    data.columns
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(labels.clone(), column_name.clone());
+                    let series = data
+                        .counters
+                        .entry(name.clone())
+                        .or_default()
+                        .entry(labels.clone())
+                        .or_default();
 
-                match target {
-                    ColumnTarget::Skip => unreachable!(),
-                    ColumnTarget::Counter {
-                        name,
-                        labels,
-                        column_name,
-                    } => {
-                        data.columns
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(labels.clone(), column_name.clone());
-                        let series = data
-                            .counters
-                            .entry(name.clone())
-                            .or_default()
-                            .entry(labels.clone())
-                            .or_default();
-                        let mut row = 0usize;
-                        for batch in reader.flatten() {
-                            let arr = batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .expect("counter column is not UInt64");
-                            for v in arr.iter() {
-                                if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                                    series.insert(*ts, v);
-                                }
-                                row += 1;
-                            }
-                        }
+                    let sql = format!(
+                        r#"SELECT timestamp, "{col}" FROM read_parquet(?)
+                           WHERE timestamp IS NOT NULL AND "{col}" IS NOT NULL
+                           ORDER BY timestamp"#,
+                        col = column_name.replace('"', "\"\"")
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map([&parquet_path], |row| {
+                        Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+                    })?;
+                    for r in rows {
+                        let (ts_raw, v) = r?;
+                        series.insert(snap_timestamp(ts_raw, interval_ns), v);
                     }
-                    ColumnTarget::Gauge {
-                        name,
-                        labels,
-                        column_name,
-                    } => {
-                        data.columns
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(labels.clone(), column_name.clone());
-                        let series = data
-                            .gauges
-                            .entry(name.clone())
-                            .or_default()
-                            .entry(labels.clone())
-                            .or_default();
-                        let mut row = 0usize;
-                        for batch in reader.flatten() {
-                            let arr = batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .expect("gauge column is not Int64");
-                            for v in arr.iter() {
-                                if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                                    series.insert(*ts, v);
-                                }
-                                row += 1;
-                            }
-                        }
+                }
+                ColumnTarget::Gauge {
+                    name,
+                    labels,
+                    column_name,
+                } => {
+                    data.columns
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(labels.clone(), column_name.clone());
+                    let series = data
+                        .gauges
+                        .entry(name.clone())
+                        .or_default()
+                        .entry(labels.clone())
+                        .or_default();
+
+                    let sql = format!(
+                        r#"SELECT timestamp, "{col}" FROM read_parquet(?)
+                           WHERE timestamp IS NOT NULL AND "{col}" IS NOT NULL
+                           ORDER BY timestamp"#,
+                        col = column_name.replace('"', "\"\"")
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map([&parquet_path], |row| {
+                        Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?))
+                    })?;
+                    for r in rows {
+                        let (ts_raw, v) = r?;
+                        series.insert(snap_timestamp(ts_raw, interval_ns), v);
                     }
-                    ColumnTarget::Histogram {
-                        ref name,
-                        ref labels,
-                        ref column_name,
-                        grouping_power,
-                        max_value_power,
-                        ref config,
-                        ref mut prev,
-                    } => {
-                        let gp = *grouping_power;
-                        let mvp = *max_value_power;
-                        let cfg = *config;
-                        data.columns
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(labels.clone(), column_name.clone());
-                        let series = data
-                            .histograms
-                            .entry(name.clone())
-                            .or_default()
-                            .entry(labels.clone())
-                            .or_default();
+                }
+                ColumnTarget::Histogram {
+                    name,
+                    labels,
+                    column_name,
+                    grouping_power,
+                    max_value_power,
+                    config,
+                } => {
+                    let gp = *grouping_power;
+                    let mvp = *max_value_power;
+                    let cfg = *config;
+                    data.columns
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(labels.clone(), column_name.clone());
+                    let series = data
+                        .histograms
+                        .entry(name.clone())
+                        .or_default()
+                        .entry(labels.clone())
+                        .or_default();
 
-                        let mut row = 0usize;
-                        for batch in reader.flatten() {
-                            let list = batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<ListArray>()
-                                .expect("histogram column is not List");
-                            for value in list.iter() {
-                                let Some(Some(ts)) = timestamps.get(row).copied() else {
-                                    row += 1;
-                                    continue;
-                                };
+                    // Null bucket lists are kept (not WHERE-filtered) so a
+                    // missing snapshot still produces an explicit empty
+                    // delta against `prev` — matches the prior loader and
+                    // keeps offset-based timestamp axes aligned.
+                    let sql = format!(
+                        r#"SELECT timestamp, "{col}" FROM read_parquet(?)
+                           WHERE timestamp IS NOT NULL
+                           ORDER BY timestamp"#,
+                        col = column_name.replace('"', "\"\"")
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map([&parquet_path], |row| {
+                        Ok((row.get::<_, u64>(0)?, row.get::<_, DuckValue>(1)?))
+                    })?;
 
-                                let curr = value.and_then(|list_value| {
-                                    let arr = list_value
-                                        .as_any()
-                                        .downcast_ref::<UInt64Array>()
-                                        .expect("histogram inner is not UInt64");
-                                    let buckets: Vec<u64> = arr.iter().flatten().collect();
-                                    Histogram::from_buckets(gp, mvp, buckets)
-                                        .ok()
-                                        .map(|h| CumulativeROHistogram::from(&h))
-                                });
+                    let mut prev: Option<CumulativeROHistogram> = None;
+                    for r in rows {
+                        let (ts_raw, val) = r?;
+                        let ts = snap_timestamp(ts_raw, interval_ns);
 
-                                match (prev.as_ref(), curr.as_ref()) {
-                                    (Some(prev_cumu), Some(curr_cumu)) => {
-                                        series
-                                            .insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
-                                    }
-                                    (Some(_), None) => {
-                                        if let Some(cfg) = cfg {
-                                            series.insert(ts, empty_delta_32(cfg));
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                if curr.is_some() {
-                                    *prev = curr;
-                                }
-                                row += 1;
+                        let curr = match val {
+                            DuckValue::List(elems) => {
+                                let buckets: Vec<u64> = elems
+                                    .iter()
+                                    .map(|v| match v {
+                                        DuckValue::UBigInt(x) => *x,
+                                        DuckValue::Null => 0,
+                                        _ => panic!("histogram inner is not UBIGINT"),
+                                    })
+                                    .collect();
+                                Histogram::from_buckets(gp, mvp, buckets)
+                                    .ok()
+                                    .map(|h| CumulativeROHistogram::from(&h))
                             }
+                            _ => None,
+                        };
+
+                        match (prev.as_ref(), curr.as_ref()) {
+                            (Some(prev_cumu), Some(curr_cumu)) => {
+                                series.insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
+                            }
+                            (Some(_), None) => {
+                                if let Some(cfg) = cfg {
+                                    series.insert(ts, empty_delta_32(cfg));
+                                }
+                            }
+                            _ => {}
+                        }
+                        if curr.is_some() {
+                            prev = curr;
                         }
                     }
                 }

@@ -14,16 +14,15 @@ repository = "https://github.com/iopsystems/metriken"
 [dependencies]
 arrow.workspace = true
 bytes = "1"
+duckdb = { version = "1.10503.1", features = ["bundled"] }
 histogram.workspace = true
 metriken-exposition = { version = "0.16.1", path = "../metriken-exposition", default-features = false, optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "2"
-
-[dev-dependencies]
 tempfile.workspace = true
+thiserror = "2"
 
 [features]
 default = ["ingest", "lz4"]
