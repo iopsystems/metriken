@@ -86,13 +86,285 @@ pub struct Tsdb {
 
 impl Tsdb {
     pub fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let raw = std::fs::read(path)?;
         let filename = path
             .file_name()
-            .map(|v| v.to_str().unwrap_or("unknown"))
+            .and_then(|v| v.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let mut data = Self::load_from_bytes(Bytes::from(raw))?;
+
+        // Open the file once for the footer read, then keep the handle open
+        // so per-(row-group, column) readers can clone it cheaply with
+        // try_clone() — each clone gets its own cursor but shares the same
+        // underlying fd, avoiding a full in-memory copy of the file.
+        let file = std::fs::File::open(path)?;
+        let arrow_reader_meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let arrow_schema = arrow_reader_meta.schema().clone();
+        let pq_metadata = arrow_reader_meta.metadata().clone();
+        let parquet_schema = pq_metadata.file_metadata().schema_descr_ptr();
+        let num_row_groups = pq_metadata.num_row_groups();
+
+        let mut metadata = HashMap::new();
+        if let Some(kv) = pq_metadata.file_metadata().key_value_metadata() {
+            for entry in kv {
+                metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+            }
+        }
+
+        let mut data = Tsdb::default();
+        data.sampling_interval_ms = metadata
+            .get("sampling_interval_ms")
+            .map(|v| v.parse::<u64>().expect("bad interval"))
+            .unwrap_or(1000);
+        data.source = metadata
+            .get("source")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        data.version = metadata
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        data.file_metadata = metadata;
+
+        let interval_ns = data.sampling_interval_ms * 1_000_000;
+
+        let ts_col_idx = arrow_schema
+            .index_of("timestamp")
+            .map_err(|_| "missing 'timestamp' column")?;
+
+        let mut targets: Vec<ColumnTarget> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(col_idx, field)| {
+                if col_idx == ts_col_idx {
+                    return ColumnTarget::Skip;
+                }
+                let mut meta = field.metadata().clone();
+                let column_name = field.name().to_string();
+                let name = if let Some(n) = meta.get("metric").cloned() {
+                    n
+                } else {
+                    column_name
+                        .strip_suffix(":buckets")
+                        .unwrap_or(&column_name)
+                        .to_string()
+                };
+                let grouping_power: Option<u8> =
+                    meta.remove("grouping_power").and_then(|v| v.parse().ok());
+                let max_value_power: Option<u8> =
+                    meta.remove("max_value_power").and_then(|v| v.parse().ok());
+
+                let mut labels = Labels::default();
+                for (k, v) in meta.iter() {
+                    match k.as_str() {
+                        "metric" | "metric_type" | "unit" => continue,
+                        _ => {
+                            labels.inner.insert(k.to_string(), v.to_string());
+                        }
+                    }
+                }
+
+                match field.data_type() {
+                    DataType::UInt64 => ColumnTarget::Counter {
+                        name,
+                        labels,
+                        column_name,
+                    },
+                    DataType::Int64 => ColumnTarget::Gauge {
+                        name,
+                        labels,
+                        column_name,
+                    },
+                    DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
+                        let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
+                            return ColumnTarget::Skip;
+                        };
+                        let config = ::histogram::Config::new(gp, mvp).ok();
+                        ColumnTarget::Histogram {
+                            name,
+                            labels,
+                            column_name,
+                            grouping_power: gp,
+                            max_value_power: mvp,
+                            config,
+                            prev: None,
+                        }
+                    }
+                    _ => ColumnTarget::Skip,
+                }
+            })
+            .collect();
+
+        let mut timestamps: Vec<Option<u64>> = Vec::new();
+        for rg_idx in 0..num_row_groups {
+            let ts_reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                file.try_clone()?,
+                arrow_reader_meta.clone(),
+            )
+            .with_row_groups(vec![rg_idx])
+            .with_projection(ProjectionMask::roots(&parquet_schema, [ts_col_idx]))
+            .build()?;
+            timestamps.clear();
+            for batch in ts_reader.flatten() {
+                let ts_arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or("timestamp column is not UInt64")?;
+                timestamps.reserve(ts_arr.len());
+                for v in ts_arr.iter() {
+                    timestamps.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
+                }
+            }
+
+            for (col_idx, target) in targets.iter_mut().enumerate() {
+                if col_idx == ts_col_idx {
+                    continue;
+                }
+                if matches!(target, ColumnTarget::Skip) {
+                    continue;
+                }
+
+                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    file.try_clone()?,
+                    arrow_reader_meta.clone(),
+                )
+                .with_row_groups(vec![rg_idx])
+                .with_projection(ProjectionMask::roots(&parquet_schema, [col_idx]))
+                .build()?;
+
+                match target {
+                    ColumnTarget::Skip => unreachable!(),
+                    ColumnTarget::Counter {
+                        name,
+                        labels,
+                        column_name,
+                    } => {
+                        data.columns
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(labels.clone(), column_name.clone());
+                        let series = data
+                            .counters
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(labels.clone())
+                            .or_default();
+                        let mut row = 0usize;
+                        for batch in reader.flatten() {
+                            let arr = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .expect("counter column is not UInt64");
+                            for v in arr.iter() {
+                                if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
+                                    series.insert(*ts, v);
+                                }
+                                row += 1;
+                            }
+                        }
+                    }
+                    ColumnTarget::Gauge {
+                        name,
+                        labels,
+                        column_name,
+                    } => {
+                        data.columns
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(labels.clone(), column_name.clone());
+                        let series = data
+                            .gauges
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(labels.clone())
+                            .or_default();
+                        let mut row = 0usize;
+                        for batch in reader.flatten() {
+                            let arr = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("gauge column is not Int64");
+                            for v in arr.iter() {
+                                if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
+                                    series.insert(*ts, v);
+                                }
+                                row += 1;
+                            }
+                        }
+                    }
+                    ColumnTarget::Histogram {
+                        ref name,
+                        ref labels,
+                        ref column_name,
+                        grouping_power,
+                        max_value_power,
+                        ref config,
+                        ref mut prev,
+                    } => {
+                        let gp = *grouping_power;
+                        let mvp = *max_value_power;
+                        let cfg = *config;
+                        data.columns
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(labels.clone(), column_name.clone());
+                        let series = data
+                            .histograms
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(labels.clone())
+                            .or_default();
+
+                        let mut row = 0usize;
+                        for batch in reader.flatten() {
+                            let list = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<ListArray>()
+                                .expect("histogram column is not List");
+                            for value in list.iter() {
+                                let Some(Some(ts)) = timestamps.get(row).copied() else {
+                                    row += 1;
+                                    continue;
+                                };
+
+                                let curr = value.and_then(|list_value| {
+                                    let arr = list_value
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .expect("histogram inner is not UInt64");
+                                    let buckets: Vec<u64> = arr.iter().flatten().collect();
+                                    Histogram::from_buckets(gp, mvp, buckets)
+                                        .ok()
+                                        .map(|h| CumulativeROHistogram::from(&h))
+                                });
+
+                                match (prev.as_ref(), curr.as_ref()) {
+                                    (Some(prev_cumu), Some(curr_cumu)) => {
+                                        series
+                                            .insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
+                                    }
+                                    (Some(_), None) => {
+                                        if let Some(cfg) = cfg {
+                                            series.insert(ts, empty_delta_32(cfg));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                if curr.is_some() {
+                                    *prev = curr;
+                                }
+                                row += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         data.filename = filename;
         Ok(data)
     }
