@@ -1711,9 +1711,8 @@ fn test_histogram_irate_rejects_invalid_label_in_grouping() {
 
 #[test]
 fn test_sum_wrapping_histogram_irate_matches_bare() {
-    // sum(histogram_irate(m)) is semantically identical to the bare
-    // call: both collapse across all label sets into one series.
-    // This is the contract the rezolus dashboards rely on.
+    // The rezolus 0.10.6 dashboard contract: sum(histogram_irate(m))
+    // must compose, not just parse.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1736,7 +1735,6 @@ fn test_sum_wrapping_histogram_irate_matches_bare() {
 
 #[test]
 fn test_sum_by_wrapping_histogram_irate_matches_native_grouping() {
-    // sum by (cpu) (histogram_irate(m)) ≡ histogram_irate by (cpu) (m).
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 
@@ -1866,8 +1864,7 @@ fn test_sum_by_wrapping_histogram_mean_matches_native_grouping() {
 
 #[test]
 fn test_sum_wrapping_histogram_irate_with_label_matcher() {
-    // Label matcher braces inside the inner selector must not confuse
-    // the string-level rewriter.
+    // Guards the string-level rewriter against `{}` in the inner selector.
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
     let engine = QueryEngine::new(tsdb);
 
