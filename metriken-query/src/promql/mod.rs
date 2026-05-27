@@ -143,6 +143,87 @@ impl HistogramGroupBy {
     }
 }
 
+/// Rewrite `sum [by/without (...)] (<histogram_func>(...))` to the
+/// native `<histogram_func> [by/without (...)] (...)` form.
+///
+/// `histogram_irate`/`histogram_mean` aren't standard PromQL names, so
+/// promql-parser rejects them — even wrapped in a known aggregator —
+/// before the engine sees the query. The wrapping `sum` is a
+/// pass-through against the histogram pipeline's internal grouping
+/// (already collapses across label sets), so unwrapping here lets the
+/// existing top-level dispatcher take over. `avg`/`min`/`max` would
+/// need per-group post-reduction and are intentionally left alone.
+fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
+    let query = query.trim();
+    let after_sum = query.strip_prefix("sum")?;
+    // Reject identifier prefixes like `summary_foo`.
+    if !matches!(after_sum.chars().next(), Some('(' | ' ' | '\t')) {
+        return None;
+    }
+    let rest = after_sum.trim_start();
+
+    let (grouping_clause, after_modifier) = if let Some(r) = rest.strip_prefix("by") {
+        let (after, clause) = take_grouping_clause(r.trim_start(), "by")?;
+        (Some(clause), after)
+    } else if let Some(r) = rest.strip_prefix("without") {
+        let (after, clause) = take_grouping_clause(r.trim_start(), "without")?;
+        (Some(clause), after)
+    } else {
+        (None, rest)
+    };
+
+    let after_open = after_modifier.strip_prefix('(')?;
+    let close = find_close_paren(after_open)?;
+    // Anything after the closing paren means the `sum` is part of a
+    // larger expression (binary op, another wrapper) we can't safely
+    // rewrite from string level.
+    if after_open[close + 1..]
+        .trim_start()
+        .chars()
+        .next()
+        .is_some()
+    {
+        return None;
+    }
+    let inner = after_open[..close].trim();
+
+    let inner_func = ["histogram_irate", "histogram_mean", "histogram_count"]
+        .iter()
+        .find(|f| inner.starts_with(*f))?;
+    let after_name = inner.strip_prefix(*inner_func)?;
+    if !matches!(after_name.chars().next(), Some('(' | ' ' | '\t')) {
+        return None;
+    }
+
+    // Two grouping modifiers would be ambiguous; bail and let the
+    // dispatcher emit its own error.
+    let inner_after_name = after_name.trim_start();
+    if inner_after_name.starts_with("by") || inner_after_name.starts_with("without") {
+        let next = inner_after_name
+            .chars()
+            .nth("by".len().max("without".len()))
+            .unwrap_or(' ');
+        if matches!(next, '(' | ' ' | '\t') {
+            return None;
+        }
+    }
+
+    match grouping_clause {
+        Some(clause) => Some(format!("{inner_func} {clause} {inner_after_name}")),
+        None => Some(inner.to_string()),
+    }
+}
+
+/// Consume a `by (..)` / `without (..)` clause, returning the rest of
+/// the input and the clause re-stringified so callers can splice it.
+fn take_grouping_clause<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, String)> {
+    let inside = s.strip_prefix('(')?;
+    let close = find_close_paren(inside)?;
+    let labels = &inside[..close];
+    let after = inside[close + 1..].trim_start();
+    Some((after, format!("{keyword} ({labels})")))
+}
+
 /// Parse `<func> [by (labels) | without (labels)] (body)`. `Ok(None)`
 /// if the prefix doesn't match.
 pub(crate) fn parse_histogram_call<'a>(
@@ -610,6 +691,12 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
+
+        // Unwrap `sum [by/without (...)] (<histogram_func>(...))` —
+        // promql-parser doesn't know our `histogram_irate`/`mean`
+        // names, so wrapped forms would otherwise fail at parse time.
+        let rewritten = unwrap_sum_around_histogram(query_str);
+        let query_str: &str = rewritten.as_deref().unwrap_or(query_str);
 
         for func in ["histogram_mean", "histogram_count"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {

@@ -1710,6 +1710,192 @@ fn test_histogram_irate_rejects_invalid_label_in_grouping() {
 }
 
 #[test]
+fn test_sum_wrapping_histogram_irate_matches_bare() {
+    // The rezolus 0.10.6 dashboard contract: sum(histogram_irate(m))
+    // must compose, not just parse.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let bare = engine
+        .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
+        .unwrap();
+    let wrapped = engine
+        .query_range("sum(histogram_irate(req_latency))", 1000.0, 1005.0, 1.0)
+        .unwrap();
+
+    let values_of = |r: &QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+    assert_eq!(values_of(&bare), values_of(&wrapped));
+}
+
+#[test]
+fn test_sum_by_wrapping_histogram_irate_matches_native_grouping() {
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let native = engine
+        .query_range(
+            "histogram_irate by (cpu) (req_latency)",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+    let wrapped = engine
+        .query_range(
+            "sum by (cpu) (histogram_irate(req_latency))",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+
+    let sorted_pairs = |r: QueryResult| -> Vec<(String, Vec<f64>)> {
+        let QueryResult::Matrix { mut result } = r else {
+            panic!("expected Matrix");
+        };
+        result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
+        result
+            .into_iter()
+            .map(|s| {
+                (
+                    s.metric.get("cpu").cloned().unwrap_or_default(),
+                    s.values.iter().map(|(_, v)| *v).collect(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(sorted_pairs(native), sorted_pairs(wrapped));
+}
+
+#[test]
+fn test_sum_without_wrapping_histogram_irate_matches_native_grouping() {
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let native = engine
+        .query_range(
+            "histogram_irate without (cpu) (req_latency)",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+    let wrapped = engine
+        .query_range(
+            "sum without (cpu) (histogram_irate(req_latency))",
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+
+    let values_of = |r: QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+    assert_eq!(values_of(native), values_of(wrapped));
+}
+
+#[test]
+fn test_sum_wrapping_histogram_count_matches_bare() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let bare = engine
+        .query_range("histogram_count(req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+    let wrapped = engine
+        .query_range("sum(histogram_count(req_latency))", 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let values_of = |r: QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+    assert_eq!(values_of(bare), values_of(wrapped));
+}
+
+#[test]
+fn test_sum_by_wrapping_histogram_mean_matches_native_grouping() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let native = engine
+        .query_range("histogram_mean by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+    let wrapped = engine
+        .query_range(
+            "sum by (cpu) (histogram_mean(req_latency))",
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let sorted_pairs = |r: QueryResult| -> Vec<(String, Vec<f64>)> {
+        let QueryResult::Matrix { mut result } = r else {
+            panic!("expected Matrix");
+        };
+        result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
+        result
+            .into_iter()
+            .map(|s| {
+                (
+                    s.metric.get("cpu").cloned().unwrap_or_default(),
+                    s.values.iter().map(|(_, v)| *v).collect(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(sorted_pairs(native), sorted_pairs(wrapped));
+}
+
+#[test]
+fn test_sum_wrapping_histogram_irate_with_label_matcher() {
+    // Guards the string-level rewriter against `{}` in the inner selector.
+    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(tsdb);
+
+    let bare = engine
+        .query_range(
+            r#"histogram_irate(req_latency{cpu="0"})"#,
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+    let wrapped = engine
+        .query_range(
+            r#"sum(histogram_irate(req_latency{cpu="0"}))"#,
+            1000.0,
+            1005.0,
+            1.0,
+        )
+        .unwrap();
+
+    let values_of = |r: &QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+    assert_eq!(values_of(&bare), values_of(&wrapped));
+}
+
+#[test]
 fn test_histogram_irate_rejects_stride_argument() {
     let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20]));
     let engine = QueryEngine::new(tsdb);
