@@ -17,11 +17,13 @@ use serde::Serialize;
 mod collection;
 mod heatmap;
 mod labels;
+mod parquet_file;
 mod series;
 
 pub use collection::*;
 pub use heatmap::Heatmap;
 pub use labels::Labels;
+pub(crate) use parquet_file::ParquetFile;
 pub use series::*;
 use series::{delta_to_32_or_empty, empty_delta_32};
 
@@ -131,12 +133,24 @@ fn build_targets(arrow_schema: &Schema, ts_col_idx: usize) -> Vec<ColumnTarget> 
 }
 
 /// Insert one column's decoded batches into `data`.
+///
+/// When `range` is `Some((start_ns, end_ns))`, rows outside the window are
+/// not inserted. For histograms `prev` is updated on every row regardless —
+/// this is what makes the "read one row early" strategy work: calling this
+/// function on a pre-range row group (where all rows fall before `start_ns`)
+/// primes `prev` without inserting any data points.
 fn process_column(
     target: &mut ColumnTarget,
     batches: impl Iterator<Item = RecordBatch>,
     timestamps: &[Option<u64>],
     data: &mut Tsdb,
+    range: Option<(u64, u64)>,
 ) -> Result<(), Box<dyn Error>> {
+    let in_range = |ts: u64| match range {
+        None => true,
+        Some((start, end)) => ts >= start && ts <= end,
+    };
+
     match target {
         ColumnTarget::Skip => unreachable!(),
         ColumnTarget::Counter {
@@ -163,7 +177,9 @@ fn process_column(
                     .expect("counter column is not UInt64");
                 for v in arr.iter() {
                     if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                        series.insert(*ts, v);
+                        if in_range(*ts) {
+                            series.insert(*ts, v);
+                        }
                     }
                     row += 1;
                 }
@@ -193,7 +209,9 @@ fn process_column(
                     .expect("gauge column is not Int64");
                 for v in arr.iter() {
                     if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                        series.insert(*ts, v);
+                        if in_range(*ts) {
+                            series.insert(*ts, v);
+                        }
                     }
                     row += 1;
                 }
@@ -246,17 +264,21 @@ fn process_column(
                             .map(|h| CumulativeROHistogram::from(&h))
                     });
 
-                    match (prev.as_ref(), curr.as_ref()) {
-                        (Some(prev_cumu), Some(curr_cumu)) => {
-                            series.insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
-                        }
-                        (Some(_), None) => {
-                            if let Some(cfg) = cfg {
-                                series.insert(ts, empty_delta_32(cfg));
+                    if in_range(ts) {
+                        match (prev.as_ref(), curr.as_ref()) {
+                            (Some(prev_cumu), Some(curr_cumu)) => {
+                                series.insert(ts, delta_to_32_or_empty(prev_cumu, curr_cumu));
                             }
+                            (Some(_), None) => {
+                                if let Some(cfg) = cfg {
+                                    series.insert(ts, empty_delta_32(cfg));
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    // Always update prev so the next delta is computable even
+                    // when this row was pre-range (histogram init pass).
                     if curr.is_some() {
                         *prev = curr;
                     }
@@ -271,19 +293,19 @@ fn process_column(
 
 #[derive(Default, Clone)]
 pub struct Tsdb {
-    sampling_interval_ms: u64,
-    source: String,
-    version: String,
-    filename: String,
-    file_metadata: HashMap<String, String>,
-    counters: HashMap<String, CounterCollection>,
-    gauges: HashMap<String, GaugeCollection>,
-    histograms: HashMap<String, HistogramCollection>,
+    pub(crate) sampling_interval_ms: u64,
+    pub(crate) source: String,
+    pub(crate) version: String,
+    pub(crate) filename: String,
+    pub(crate) file_metadata: HashMap<String, String>,
+    pub(crate) counters: HashMap<String, CounterCollection>,
+    pub(crate) gauges: HashMap<String, GaugeCollection>,
+    pub(crate) histograms: HashMap<String, HistogramCollection>,
     /// Parquet column name for each loaded `(metric_name, labels)`
     /// pair: populated from `field.name()` on the parquet load path,
     /// synthesized on the ingest path. Consumed by
     /// `QueryEngine::columns()`.
-    columns: HashMap<String, HashMap<Labels, String>>,
+    pub(crate) columns: HashMap<String, HashMap<Labels, String>>,
     /// Most-recent cumulative per series; `ingest` differences against the
     /// next snapshot to produce the per-period delta. Unused on the parquet
     /// load path (which differences in-place).
@@ -378,7 +400,7 @@ impl Tsdb {
                 .with_projection(ProjectionMask::roots(&parquet_schema, [col_idx]))
                 .build()?;
 
-                process_column(target, reader.flatten(), &timestamps, &mut data)?;
+                process_column(target, reader.flatten(), &timestamps, &mut data, None)?;
             }
         }
 
@@ -463,7 +485,7 @@ impl Tsdb {
                 .with_projection(ProjectionMask::roots(&parquet_schema, [col_idx]))
                 .build()?;
 
-                process_column(target, reader.flatten(), &timestamps, &mut data)?;
+                process_column(target, reader.flatten(), &timestamps, &mut data, None)?;
             }
         }
 
