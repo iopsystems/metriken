@@ -34,9 +34,10 @@ use series::{delta_to_32_or_empty, empty_delta_32};
 /// Per-column dispatch target precomputed from the parquet schema.
 /// `column_name` is the parquet field name, preserved so callers can map
 /// a resolved series back to its on-disk column without re-parsing the
-/// schema.
+/// schema. Columns that don't map to a fetchable kind (the timestamp
+/// column itself, anything with an unrecognized data type) are dropped
+/// during classification rather than carried as a variant.
 enum ColumnTarget {
-    Skip,
     Counter {
         name: String,
         labels: Labels,
@@ -107,6 +108,7 @@ struct ConnPool {
 
 impl ConnPool {
     fn new(size: usize) -> Result<Self, duckdb::Error> {
+        // In-memory: we run SELECTs against `read_parquet(?)`, no persistent DuckDB tables.
         let conns: Result<Vec<_>, _> = (0..size)
             .map(|_| duckdb::Connection::open_in_memory())
             .collect();
@@ -134,13 +136,33 @@ impl ConnPool {
     }
 }
 
-/// Untyped per-column rows returned from a worker task. Pairs with the
-/// matching `ColumnTarget` so the post-fetch sync pass knows how to
-/// fold each batch into the in-memory series.
-enum RawRows {
-    Counter(Vec<(u64, u64)>),
-    Gauge(Vec<(u64, i64)>),
-    Histogram(Vec<(u64, Option<Vec<u64>>)>),
+/// Result of a single per-column fetch task. Bundles the column's
+/// schema-derived metadata with the rows pulled from DuckDB so the
+/// post-fetch sync pass can fold both into the in-memory series with
+/// an exhaustive match — no risk of pairing a `Counter` target with
+/// `Histogram` rows by accident.
+enum FetchResult {
+    Counter {
+        name: String,
+        labels: Labels,
+        column_name: String,
+        rows: Vec<(u64, u64)>,
+    },
+    Gauge {
+        name: String,
+        labels: Labels,
+        column_name: String,
+        rows: Vec<(u64, i64)>,
+    },
+    Histogram {
+        name: String,
+        labels: Labels,
+        column_name: String,
+        grouping_power: u8,
+        max_value_power: u8,
+        config: Option<::histogram::Config>,
+        rows: Vec<(u64, Option<Vec<u64>>)>,
+    },
 }
 
 fn fetch_counter_column(
@@ -220,38 +242,75 @@ fn fetch_histogram_column(
     Ok(out)
 }
 
+/// Run the appropriate fetch helper for `target` and bundle its rows
+/// with `target`'s metadata into a `FetchResult`. Taking `target` by
+/// value lets us repackage its fields into the result without cloning.
 fn fetch_dispatch(
     conn: &mut duckdb::Connection,
     parquet_path: &str,
-    target: &ColumnTarget,
-) -> Result<RawRows, FetchError> {
+    target: ColumnTarget,
+) -> Result<FetchResult, FetchError> {
     match target {
-        ColumnTarget::Counter { column_name, .. } => {
-            fetch_counter_column(conn, parquet_path, column_name).map(RawRows::Counter)
-        }
-        ColumnTarget::Gauge { column_name, .. } => {
-            fetch_gauge_column(conn, parquet_path, column_name).map(RawRows::Gauge)
-        }
-        ColumnTarget::Histogram { column_name, .. } => {
-            fetch_histogram_column(conn, parquet_path, column_name).map(RawRows::Histogram)
-        }
-        ColumnTarget::Skip => panic!("Skip targets must be filtered out before dispatch"),
-    }
-}
-
-/// Fold one fetched column's raw rows into the in-memory `Tsdb`.
-/// Mirrors the per-arm logic of the old synchronous loader exactly —
-/// only the data source is different.
-fn populate_target(data: &mut Tsdb, target: ColumnTarget, rows: RawRows, interval_ns: u64) {
-    match (target, rows) {
-        (
-            ColumnTarget::Counter {
+        ColumnTarget::Counter {
+            name,
+            labels,
+            column_name,
+        } => {
+            let rows = fetch_counter_column(conn, parquet_path, &column_name)?;
+            Ok(FetchResult::Counter {
                 name,
                 labels,
                 column_name,
-            },
-            RawRows::Counter(rows),
-        ) => {
+                rows,
+            })
+        }
+        ColumnTarget::Gauge {
+            name,
+            labels,
+            column_name,
+        } => {
+            let rows = fetch_gauge_column(conn, parquet_path, &column_name)?;
+            Ok(FetchResult::Gauge {
+                name,
+                labels,
+                column_name,
+                rows,
+            })
+        }
+        ColumnTarget::Histogram {
+            name,
+            labels,
+            column_name,
+            grouping_power,
+            max_value_power,
+            config,
+        } => {
+            let rows = fetch_histogram_column(conn, parquet_path, &column_name)?;
+            Ok(FetchResult::Histogram {
+                name,
+                labels,
+                column_name,
+                grouping_power,
+                max_value_power,
+                config,
+                rows,
+            })
+        }
+    }
+}
+
+/// Fold one fetched column's rows into the in-memory `Tsdb`. The match
+/// is exhaustive over `FetchResult`'s variants by construction — each
+/// variant pairs the target metadata with its matching row type, so
+/// there's no way to land here with a mismatched kind.
+fn apply_fetch_result(data: &mut Tsdb, result: FetchResult, interval_ns: u64) {
+    match result {
+        FetchResult::Counter {
+            name,
+            labels,
+            column_name,
+            rows,
+        } => {
             data.columns
                 .entry(name.clone())
                 .or_default()
@@ -266,14 +325,12 @@ fn populate_target(data: &mut Tsdb, target: ColumnTarget, rows: RawRows, interva
                 series.insert(snap_timestamp(ts_raw, interval_ns), v);
             }
         }
-        (
-            ColumnTarget::Gauge {
-                name,
-                labels,
-                column_name,
-            },
-            RawRows::Gauge(rows),
-        ) => {
+        FetchResult::Gauge {
+            name,
+            labels,
+            column_name,
+            rows,
+        } => {
             data.columns
                 .entry(name.clone())
                 .or_default()
@@ -288,17 +345,15 @@ fn populate_target(data: &mut Tsdb, target: ColumnTarget, rows: RawRows, interva
                 series.insert(snap_timestamp(ts_raw, interval_ns), v);
             }
         }
-        (
-            ColumnTarget::Histogram {
-                name,
-                labels,
-                column_name,
-                grouping_power,
-                max_value_power,
-                config,
-            },
-            RawRows::Histogram(rows),
-        ) => {
+        FetchResult::Histogram {
+            name,
+            labels,
+            column_name,
+            grouping_power,
+            max_value_power,
+            config,
+            rows,
+        } => {
             data.columns
                 .entry(name.clone())
                 .or_default()
@@ -332,7 +387,6 @@ fn populate_target(data: &mut Tsdb, target: ColumnTarget, rows: RawRows, interva
                 }
             }
         }
-        _ => panic!("fetch_dispatch must return RawRows matching the ColumnTarget kind"),
     }
 }
 
@@ -372,9 +426,9 @@ fn classify_columns(meta: &ArrowReaderMetadata) -> Result<Vec<ColumnTarget>, Box
         .fields()
         .iter()
         .enumerate()
-        .map(|(col_idx, field)| {
+        .filter_map(|(col_idx, field)| {
             if col_idx == ts_col_idx {
-                return ColumnTarget::Skip;
+                return None;
             }
             let mut field_meta = field.metadata().clone();
             let column_name = field.name().to_string();
@@ -405,31 +459,29 @@ fn classify_columns(meta: &ArrowReaderMetadata) -> Result<Vec<ColumnTarget>, Box
             }
 
             match field.data_type() {
-                DataType::UInt64 => ColumnTarget::Counter {
+                DataType::UInt64 => Some(ColumnTarget::Counter {
                     name,
                     labels,
                     column_name,
-                },
-                DataType::Int64 => ColumnTarget::Gauge {
+                }),
+                DataType::Int64 => Some(ColumnTarget::Gauge {
                     name,
                     labels,
                     column_name,
-                },
+                }),
                 DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
-                    let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
-                        return ColumnTarget::Skip;
-                    };
+                    let (gp, mvp) = (grouping_power?, max_value_power?);
                     let config = ::histogram::Config::new(gp, mvp).ok();
-                    ColumnTarget::Histogram {
+                    Some(ColumnTarget::Histogram {
                         name,
                         labels,
                         column_name,
                         grouping_power: gp,
                         max_value_power: mvp,
                         config,
-                    }
+                    })
                 }
-                _ => ColumnTarget::Skip,
+                _ => None,
             }
         })
         .collect())
@@ -439,7 +491,7 @@ fn classify_columns(meta: &ArrowReaderMetadata) -> Result<Vec<ColumnTarget>, Box
 /// the priming and the replenish sites in `run_pool_load` use the
 /// exact same closure shape.
 fn spawn_fetch(
-    set: &mut JoinSet<Result<(ColumnTarget, RawRows), FetchError>>,
+    set: &mut JoinSet<Result<FetchResult, FetchError>>,
     target: ColumnTarget,
     pool: Arc<ConnPool>,
     parquet_path: Arc<str>,
@@ -448,9 +500,9 @@ fn spawn_fetch(
     set.spawn_blocking(move || {
         let _keepalive = tempfile_keepalive;
         let mut conn = pool.acquire();
-        let result = fetch_dispatch(&mut conn, &parquet_path, &target);
+        let result = fetch_dispatch(&mut conn, &parquet_path, target);
         pool.release(conn);
-        result.map(|rows| (target, rows))
+        result
     });
 }
 
@@ -564,18 +616,15 @@ impl Tsdb {
         let interval_ns = data.sampling_interval_ms * 1_000_000;
         let pool = Arc::new(ConnPool::new(DEFAULT_POOL_SIZE)?);
 
-        // Drop Skip targets up front; reverse so `pop()` yields the
-        // remaining targets in their original (schema) order. Order
-        // doesn't affect correctness — fetches are independent across
-        // columns and histogram `prev` lives inside one column — but
-        // keeping schema order makes any debug output predictable.
-        let mut targets: Vec<ColumnTarget> = targets
-            .into_iter()
-            .filter(|t| !matches!(t, ColumnTarget::Skip))
-            .collect();
+        // Reverse so `pop()` yields targets in their original (schema)
+        // order. Order doesn't affect correctness — fetches are
+        // independent across columns and histogram `prev` lives inside
+        // one column — but keeping schema order makes any debug output
+        // predictable.
+        let mut targets = targets;
         targets.reverse();
 
-        let mut set: JoinSet<Result<(ColumnTarget, RawRows), FetchError>> = JoinSet::new();
+        let mut set: JoinSet<Result<FetchResult, FetchError>> = JoinSet::new();
 
         // Prime: spawn up to POOL_SIZE tasks immediately.
         for _ in 0..DEFAULT_POOL_SIZE.min(targets.len()) {
@@ -594,8 +643,8 @@ impl Tsdb {
         // completion order, not submission order — fine, populate_target
         // is independent across columns.
         while let Some(join_result) = set.join_next().await {
-            let (target, rows) = join_result??;
-            populate_target(data, target, rows, interval_ns);
+            let result = join_result??;
+            apply_fetch_result(data, result, interval_ns);
 
             if let Some(next) = targets.pop() {
                 spawn_fetch(
