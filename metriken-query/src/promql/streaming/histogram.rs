@@ -363,6 +363,37 @@ pub fn mean(
     )
 }
 
+/// Sum of all observations per `(group, tick)` — `count × mean` off
+/// the merged `Ref`. The histogram crate doesn't carry a native `sum`
+/// field, so this is bucket-midpoint-approximated (exact for values
+/// inside the linear region of the histogram config).
+pub fn sum(
+    collection: &HistogramCollection,
+    label_filter: &Labels,
+    group_by: GroupBy<'_>,
+    start_ns: u64,
+    end_ns: u64,
+    stride_ns: Option<u64>,
+    metric_name: &str,
+) -> Vec<MatrixSample> {
+    reduce(
+        collection,
+        label_filter,
+        group_by,
+        start_ns,
+        end_ns,
+        stride_ns,
+        metric_name,
+        |r| {
+            let c = r.total_count();
+            if c == 0 {
+                return None;
+            }
+            r.mean().map(|m| c as f64 * m)
+        },
+    )
+}
+
 /// Total observation count per `(group, tick)` — `total_count()` off
 /// the merged `Ref`, no quantile walk.
 pub fn count(

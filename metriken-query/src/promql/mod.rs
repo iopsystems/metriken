@@ -187,9 +187,14 @@ fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
     }
     let inner = after_open[..close].trim();
 
-    let inner_func = ["histogram_irate", "histogram_mean", "histogram_count"]
-        .iter()
-        .find(|f| inner.starts_with(*f))?;
+    let inner_func = [
+        "histogram_irate",
+        "histogram_mean",
+        "histogram_count",
+        "histogram_sum",
+    ]
+    .iter()
+    .find(|f| inner.starts_with(*f))?;
     let after_name = inner.strip_prefix(*inner_func)?;
     if !matches!(after_name.chars().next(), Some('(' | ' ' | '\t')) {
         return None;
@@ -656,6 +661,15 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 stride_ns,
                 &metric_name,
             ),
+            "histogram_sum" => streaming::histogram::sum(
+                collection,
+                &labels,
+                group,
+                start_ns,
+                end_ns,
+                stride_ns,
+                &metric_name,
+            ),
             _ => streaming::histogram::count(
                 collection,
                 &labels,
@@ -698,7 +712,7 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         let rewritten = unwrap_sum_around_histogram(query_str);
         let query_str: &str = rewritten.as_deref().unwrap_or(query_str);
 
-        for func in ["histogram_mean", "histogram_count"] {
+        for func in ["histogram_mean", "histogram_count", "histogram_sum"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
                 return self.handle_histogram_scalar(func, inner, group_by, start, end);
             }
