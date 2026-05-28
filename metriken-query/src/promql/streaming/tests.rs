@@ -362,7 +362,7 @@ fn cachecannon_smoke_test() {
         return;
     };
 
-    let engine = match crate::parquet::Parquet::open(&path) {
+    let engine = match crate::parquet::ParquetReader::open(&path) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("skipping cachecannon smoke test: failed to open {path:?}: {e}");

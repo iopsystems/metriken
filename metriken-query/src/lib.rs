@@ -6,7 +6,7 @@ pub(crate) mod promql;
 pub(crate) mod types;
 pub(crate) mod histogram_stream;
 
-pub use parquet::Parquet;
+pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{QueryError, QueryResult};
 
 use histogram_stream::HistogramStream;

@@ -19,7 +19,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use metriken_query::Parquet;
+use metriken_query::ParquetReader;
 
 /// Tracking allocator: delegates to `System` for the actual work and
 /// keeps three running totals on the side.
@@ -189,7 +189,7 @@ fn main() {
 
     println!("loading {path:?}");
     let load = snap();
-    let engine = Parquet::open(&path).expect("open parquet");
+    let engine = ParquetReader::open(&path).expect("open parquet");
     let after_load = snap();
     println!(
         "resident: {} (allocated during open: {})\n",

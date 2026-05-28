@@ -1836,8 +1836,8 @@ fn test_histogram_stream_merge_empty_returns_none() {
 }
 
 #[test]
-fn test_parquet_open_many_empty_paths_errors() {
-    use std::path::Path;
-    let result = crate::parquet::Parquet::open_many(&[] as &[&Path]);
-    assert!(result.is_err(), "open_many(&[]) should return an error");
+fn test_parquet_builder_empty_errors() {
+    use crate::parquet::ParquetReader;
+    let result = ParquetReader::builder().build();
+    assert!(result.is_err());
 }

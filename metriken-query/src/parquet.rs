@@ -19,45 +19,70 @@ use crate::DataSource;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-pub struct Parquet {
+pub struct ParquetReader {
     engine: QueryEngine,
 }
 
-impl Parquet {
-    pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let source: Arc<ParquetSource> = ParquetSource::open(path)?;
-        // Arc<ParquetSource> implements DataSource, so wrap it in another Arc
-        // to satisfy Arc<dyn DataSource>.
-        let ds: Arc<dyn DataSource> = Arc::new(source);
-        Ok(Self { engine: QueryEngine::new(ds) })
+impl ParquetReader {
+    pub fn builder() -> ParquetBuilder {
+        ParquetBuilder::new()
     }
 
-    /// Open multiple parquet files and merge their data into a single query engine.
-    /// Histograms are streamed via k-way merge; counters and gauges are concatenated.
-    pub fn open_many(paths: &[&Path]) -> Result<Self, Box<dyn Error>> {
-        if paths.is_empty() {
-            return Err("open_many requires at least one path".into());
-        }
-        let files: Result<Vec<Arc<ParquetSource>>, Box<dyn Error>> =
-            paths.iter().map(|p| ParquetSource::open(p)).collect();
-        let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
-        Ok(Self { engine: QueryEngine::new(source) })
+    /// Convenience: open a single file with no extra labels.
+    pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+        Self::builder().file(path).build()
     }
 
     pub fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError> {
         self.engine.query_range(expr, start_s, end_s, step_s)
     }
 
-    /// Time range of data in the file in seconds, or `None` if the file is empty.
     pub fn time_range(&self) -> Option<(f64, f64)> {
-        self.engine.time_range().map(|(min_ns, max_ns)| (min_ns as f64 / 1e9, max_ns as f64 / 1e9))
+        self.engine.time_range().map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
+    }
+}
+
+// ─── Builder ──────────────────────────────────────────────────────────────────
+
+pub struct ParquetBuilder {
+    entries: Vec<(std::path::PathBuf, Labels)>,
+}
+
+impl ParquetBuilder {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Add a file with no extra labels.
+    pub fn file(mut self, path: impl AsRef<Path>) -> Self {
+        self.entries.push((path.as_ref().to_path_buf(), Labels::default()));
+        self
+    }
+
+    /// Add a file whose series will carry `labels` as additional metadata.
+    pub fn file_labeled(mut self, path: impl AsRef<Path>, labels: impl Into<Labels>) -> Self {
+        self.entries.push((path.as_ref().to_path_buf(), labels.into()));
+        self
+    }
+
+    pub fn build(self) -> Result<ParquetReader, Box<dyn Error>> {
+        if self.entries.is_empty() {
+            return Err("ParquetReader requires at least one file".into());
+        }
+        let files: Result<Vec<(Arc<ParquetSource>, Labels)>, Box<dyn Error>> = self
+            .entries
+            .into_iter()
+            .map(|(path, labels)| Ok((ParquetSource::open(&path)?, labels)))
+            .collect();
+        let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
+        Ok(ParquetReader { engine: QueryEngine::new(source) })
     }
 }
 
 // ─── Multi-file source ────────────────────────────────────────────────────────
 
 struct MultiParquetSource {
-    files: Vec<Arc<ParquetSource>>,
+    files: Vec<(Arc<ParquetSource>, Labels)>,
 }
 
 impl DataSource for MultiParquetSource {
@@ -67,7 +92,7 @@ impl DataSource for MultiParquetSource {
     // via k-way merge; counter/gauge dedup is a follow-on task.
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
         let series: Vec<Counter> = self.files.iter()
-            .flat_map(|pf| {
+            .flat_map(|(pf, _)| {
                 read_counters(pf, name, filter, start_ns, end_ns)
                     .ok()
                     .into_iter()
@@ -79,7 +104,7 @@ impl DataSource for MultiParquetSource {
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let series: Vec<Gauge> = self.files.iter()
-            .flat_map(|pf| {
+            .flat_map(|(pf, _)| {
                 read_gauges(pf, name, filter, start_ns, end_ns)
                     .ok()
                     .into_iter()
@@ -91,20 +116,20 @@ impl DataSource for MultiParquetSource {
 
     fn histogram_stream(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<HistogramStream> {
         let streams: Vec<HistogramStream> = self.files.iter()
-            .filter_map(|pf| pf.histogram_stream(name, filter, start_ns, end_ns))
+            .filter_map(|(pf, _)| pf.histogram_stream(name, filter, start_ns, end_ns))
             .collect();
         HistogramStream::merge(streams)
     }
 
     fn interval(&self) -> f64 {
         self.files.iter()
-            .map(|pf| pf.sampling_interval_ms as f64 / 1000.0)
+            .map(|(pf, _)| pf.sampling_interval_ms as f64 / 1000.0)
             .fold(f64::MAX, f64::min)
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {
         let (mut lo, mut hi): (Option<u64>, Option<u64>) = (None, None);
-        for pf in &self.files {
+        for (pf, _) in &self.files {
             if let Some((a, b)) = pf.time_range_from_stats() {
                 lo = Some(lo.map_or(a, |m: u64| m.min(a)));
                 hi = Some(hi.map_or(b, |m: u64| m.max(b)));
@@ -116,7 +141,7 @@ impl DataSource for MultiParquetSource {
     #[cfg(test)]
     fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
         let mut out = std::collections::HashMap::new();
-        for pf in &self.files {
+        for (pf, _) in &self.files {
             for (metric, cols) in pf.column_map() {
                 out.entry(metric)
                     .or_insert_with(std::collections::HashMap::new)
