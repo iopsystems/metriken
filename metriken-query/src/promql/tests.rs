@@ -1972,3 +1972,16 @@ fn test_injected_label_filter_excludes_incompatible_file() {
         assert_eq!(s.inner.get("run").map(String::as_str), Some("a"));
     }
 }
+
+#[test]
+fn test_parquet_reader_open_bytes_compiles() {
+    // Compile-time check that open_bytes accepts Vec<u8>, bytes::Bytes, and builder forms.
+    // Both calls fail at runtime (invalid parquet), but the important thing is they compile.
+    fn _check() {
+        let _ = crate::ParquetReader::open_bytes(vec![0u8; 4]);
+        let _ = crate::ParquetReader::builder().bytes(vec![0u8; 4]).build();
+        let _ = crate::ParquetReader::builder()
+            .bytes_labeled(bytes::Bytes::from_static(b""), crate::labels::Labels::default())
+            .build();
+    }
+}

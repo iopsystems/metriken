@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
+use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::RowGroupMetaData;
@@ -32,6 +33,11 @@ impl ParquetReader {
     /// Convenience: open a single file with no extra labels.
     pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
         Self::builder().file(path).build()
+    }
+
+    /// Convenience: open a parquet file from raw bytes (e.g. from a browser file upload).
+    pub fn open_bytes(bytes: impl Into<Bytes>) -> Result<Self, Box<dyn Error>> {
+        Self::builder().bytes(bytes).build()
     }
 
     pub fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError> {
@@ -172,8 +178,13 @@ impl MetricsSource for ParquetReader {
 
 // ─── Builder ──────────────────────────────────────────────────────────────────
 
+enum BuilderEntry {
+    Path(std::path::PathBuf, Labels),
+    Bytes(Bytes, Labels),
+}
+
 pub struct ParquetBuilder {
-    entries: Vec<(std::path::PathBuf, Labels)>,
+    entries: Vec<BuilderEntry>,
 }
 
 impl Default for ParquetBuilder {
@@ -189,7 +200,7 @@ impl ParquetBuilder {
 
     /// Add a file with no extra labels.
     pub fn file(mut self, path: impl AsRef<Path>) -> Self {
-        self.entries.push((path.as_ref().to_path_buf(), Labels::default()));
+        self.entries.push(BuilderEntry::Path(path.as_ref().to_path_buf(), Labels::default()));
         self
     }
 
@@ -200,7 +211,21 @@ impl ParquetBuilder {
     /// Injected label keys must not conflict with column labels already present
     /// in the parquet file's schema; if they do, the native value is overwritten.
     pub fn file_labeled(mut self, path: impl AsRef<Path>, labels: impl Into<Labels>) -> Self {
-        self.entries.push((path.as_ref().to_path_buf(), labels.into()));
+        self.entries.push(BuilderEntry::Path(path.as_ref().to_path_buf(), labels.into()));
+        self
+    }
+
+    /// Add an in-memory parquet source with no extra labels.
+    /// Accepts any type that converts to `bytes::Bytes` (e.g. `Vec<u8>`, `&[u8]`, `Bytes`).
+    /// `Bytes::clone()` is a refcount bump — cloning this source is cheap.
+    pub fn bytes(mut self, bytes: impl Into<Bytes>) -> Self {
+        self.entries.push(BuilderEntry::Bytes(bytes.into(), Labels::default()));
+        self
+    }
+
+    /// Add an in-memory parquet source whose series will carry `labels` as additional metadata.
+    pub fn bytes_labeled(mut self, bytes: impl Into<Bytes>, labels: impl Into<Labels>) -> Self {
+        self.entries.push(BuilderEntry::Bytes(bytes.into(), labels.into()));
         self
     }
 
@@ -211,7 +236,10 @@ impl ParquetBuilder {
         let files: Result<Vec<(Arc<ParquetSource>, Labels)>, Box<dyn Error>> = self
             .entries
             .into_iter()
-            .map(|(path, labels)| Ok((ParquetSource::open(&path)?, labels)))
+            .map(|entry| match entry {
+                BuilderEntry::Path(path, labels) => Ok((ParquetSource::open(&path)?, labels)),
+                BuilderEntry::Bytes(bytes, labels) => Ok((ParquetSource::open_bytes(bytes)?, labels)),
+            })
             .collect();
         let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
         Ok(ParquetReader { engine: QueryEngine::new(source), _cleanup: None })
@@ -464,31 +492,64 @@ impl DataSource for MultiParquetSource {
 
 // ─── Private file reader ──────────────────────────────────────────────────────
 
+enum ParquetBacking {
+    File(File),
+    Bytes(Bytes),
+}
+
 struct ParquetSource {
-    file: File,
+    backing: ParquetBacking,
     meta: ArrowReaderMetadata,
     sampling_interval_ms: u64,
+}
+
+fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
+    let mut file_metadata: HashMap<String, String> = HashMap::new();
+    if let Some(kv) = meta.metadata().file_metadata().key_value_metadata() {
+        for entry in kv {
+            file_metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+        }
+    }
+    file_metadata
+        .get("sampling_interval_ms")
+        .map(|v| v.parse::<u64>().expect("bad interval"))
+        .unwrap_or(1000)
 }
 
 impl ParquetSource {
     fn open(path: &Path) -> Result<Arc<Self>, Box<dyn Error>> {
         let file = File::open(path)?;
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
-        let pq_metadata = meta.metadata();
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self { backing: ParquetBacking::File(file), meta, sampling_interval_ms }))
+    }
 
-        let mut file_metadata: HashMap<String, String> = HashMap::new();
-        if let Some(kv) = pq_metadata.file_metadata().key_value_metadata() {
-            for entry in kv {
-                file_metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+    fn open_bytes(bytes: Bytes) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self { backing: ParquetBacking::Bytes(bytes), meta, sampling_interval_ms }))
+    }
+
+    fn build_batch_reader(
+        &self,
+        rg_idx: usize,
+        projection: ProjectionMask,
+    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, Box<dyn Error>> {
+        let reader = match &self.backing {
+            ParquetBacking::File(f) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(f.try_clone()?, self.meta.clone())
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(projection)
+                    .build()?
             }
-        }
-
-        let sampling_interval_ms = file_metadata
-            .get("sampling_interval_ms")
-            .map(|v| v.parse::<u64>().expect("bad interval"))
-            .unwrap_or(1000);
-
-        Ok(Arc::new(Self { file, meta, sampling_interval_ms }))
+            ParquetBacking::Bytes(b) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(b.clone(), self.meta.clone())
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(projection)
+                    .build()?
+            }
+        };
+        Ok(reader)
     }
 
     fn read_file_metadata(&self) -> std::collections::HashMap<String, String> {
@@ -669,10 +730,7 @@ fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
 
 fn read_timestamps(pf: &ParquetSource, rg_idx: usize, ts_col_idx: usize, interval_ns: u64) -> Result<Vec<Option<u64>>, Box<dyn Error>> {
     let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
-    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(pf.file.try_clone()?, pf.meta.clone())
-        .with_row_groups(vec![rg_idx])
-        .with_projection(ProjectionMask::roots(&parquet_schema, [ts_col_idx]))
-        .build()?;
+    let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [ts_col_idx]))?;
     let mut out = Vec::new();
     for batch in reader.flatten() {
         let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>().ok_or("timestamp column is not UInt64")?;
@@ -705,10 +763,7 @@ fn read_counters(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64,
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
         for (i, col) in cols.iter().enumerate() {
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(pf.file.try_clone()?, pf.meta.clone())
-                .with_row_groups(vec![rg_idx])
-                .with_projection(ProjectionMask::roots(&parquet_schema, [col.col_idx]))
-                .build()?;
+            let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col.col_idx]))?;
             let mut row = 0usize;
             for batch in reader.flatten() {
                 let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>().expect("counter column is not UInt64");
@@ -751,10 +806,7 @@ fn read_gauges(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, e
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
         for (i, col) in cols.iter().enumerate() {
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(pf.file.try_clone()?, pf.meta.clone())
-                .with_row_groups(vec![rg_idx])
-                .with_projection(ProjectionMask::roots(&parquet_schema, [col.col_idx]))
-                .build()?;
+            let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col.col_idx]))?;
             let mut row = 0usize;
             for batch in reader.flatten() {
                 let arr = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("gauge column is not Int64");
@@ -808,15 +860,11 @@ impl ParquetHistogramCursor {
 
             for (si, col) in self.col_descs.iter().enumerate() {
                 let ColKind::Histogram { .. } = col.kind else { continue; };
-                // Iterator::next cannot propagate errors; fd exhaustion is treated as
-                // unrecoverable. Counter/gauge readers use ? instead.
-                let Ok(reader) = ParquetRecordBatchReaderBuilder::new_with_metadata(
-                    self.pf.file.try_clone().expect("clone file handle"),
-                    self.pf.meta.clone(),
-                )
-                .with_row_groups(vec![rg_idx])
-                .with_projection(ProjectionMask::roots(&parquet_schema, [col.col_idx]))
-                .build() else { continue; };
+                // Iterator::next cannot propagate errors; skip on failure.
+                let Ok(reader) = self.pf.build_batch_reader(
+                    rg_idx,
+                    ProjectionMask::roots(&parquet_schema, [col.col_idx]),
+                ) else { continue; };
 
                 let mut row = 0usize;
                 for batch in reader.flatten() {
