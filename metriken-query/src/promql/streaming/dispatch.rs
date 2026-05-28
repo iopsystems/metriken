@@ -471,10 +471,11 @@ where
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
-    let histograms = ctx
+    let stream = ctx
         .source
-        .histograms(metric_name, &filter, ctx.start_ns, ctx.end_ns)
+        .histogram_stream(metric_name, &filter, ctx.start_ns, ctx.end_ns)
         .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+    let histograms = crate::promql::stream_to_histograms(stream);
     let result = histograms.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
     Ok(Built::Materialized {
         result,

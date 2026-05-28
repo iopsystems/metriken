@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::types::{
-    Counter, Counters, Gauge, Gauges, Histogram, Histograms,
+    Counter, Counters, Gauge, Gauges, Histogram,
 };
 use crate::DataSource;
 
@@ -94,34 +95,46 @@ impl DataSource for Memory {
         if series.is_empty() { None } else { Some(Gauges { series }) }
     }
 
-    fn histograms(
+    fn histogram_stream(
         &self,
         name: &str,
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
-    ) -> Option<Histograms> {
+    ) -> Option<HistogramStream> {
         let stored = self.histograms.get(name)?;
-        let series: Vec<Histogram> = stored
-            .iter()
-            .filter(|h| filter.inner.is_empty() || h.labels.matches(filter))
-            .map(|h| {
-                let r = slice_range(&h.timestamps, start_ns, end_ns);
-                Histogram {
-                    labels: h.labels.clone(),
-                    config: h.config,
-                    timestamps: h.timestamps[r.clone()].to_vec(),
-                    snapshots: h.snapshots[r].iter().map(|s| {
-                        crate::types::HistogramSnapshot {
-                            index: s.index.clone(),
-                            count: s.count.clone(),
-                        }
-                    }).collect(),
-                }
-            })
-            .filter(|h| !h.timestamps.is_empty())
-            .collect();
-        if series.is_empty() { None } else { Some(Histograms { series }) }
+        let mut series_labels: Vec<crate::labels::Labels> = Vec::new();
+        let mut config: Option<::histogram::Config> = None;
+        let mut rows: Vec<HistogramRow> = Vec::new();
+
+        for hist in stored.iter().filter(|h| filter.inner.is_empty() || h.labels.matches(filter)) {
+            config = config.or(Some(hist.config));
+            let series_idx = series_labels.len();
+            series_labels.push(hist.labels.clone());
+
+            let r = slice_range(&hist.timestamps, start_ns, end_ns);
+            for (ts, snap) in hist.timestamps[r.clone()].iter().zip(hist.snapshots[r].iter()) {
+                rows.push(HistogramRow {
+                    series_idx,
+                    timestamp: *ts,
+                    snapshot: crate::types::HistogramSnapshot {
+                        index: snap.index.clone(),
+                        count: snap.count.clone(),
+                    },
+                });
+            }
+        }
+
+        let config = config?;
+        if series_labels.is_empty() {
+            return None;
+        }
+        rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+
+        Some(HistogramStream {
+            meta: HistogramStreamMeta { config, series: series_labels },
+            rows: Box::new(rows.into_iter()),
+        })
     }
 
     fn interval(&self) -> f64 {

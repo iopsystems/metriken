@@ -9,13 +9,20 @@ pub(crate) mod histogram_stream;
 pub use parquet::Parquet;
 pub use promql::{QueryError, QueryResult};
 
+use histogram_stream::HistogramStream;
 use labels::Labels;
-use types::{Counters, Gauges, Histograms};
+use types::{Counters, Gauges};
 
 pub(crate) trait DataSource: Send + Sync {
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters>;
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
-    fn histograms(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Histograms>;
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream>;
     /// Sampling interval in seconds.
     fn interval(&self) -> f64;
     /// Full time extent of the stored data in nanoseconds, or `None` if empty.

@@ -11,6 +11,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Counters, Gauge, Gauges, Histogram, HistogramSnapshot, Histograms};
@@ -99,8 +100,30 @@ impl DataSource for ParquetSource {
         read_gauges(self, name, filter, start_ns, end_ns).ok().filter(|g| !g.series.is_empty())
     }
 
-    fn histograms(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Histograms> {
-        read_histograms(self, name, filter, start_ns, end_ns).ok().filter(|h| !h.series.is_empty())
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let h = read_histograms(self, name, filter, start_ns, end_ns).ok()?;
+        if h.series.is_empty() {
+            return None;
+        }
+        let config = h.series.first()?.config;
+        let series_labels: Vec<Labels> = h.series.iter().map(|s| s.labels.clone()).collect();
+        let mut rows: Vec<HistogramRow> = Vec::new();
+        for (si, hist) in h.series.iter().enumerate() {
+            for (ts, snap) in hist.timestamps.iter().zip(hist.snapshots.iter()) {
+                rows.push(HistogramRow { series_idx: si, timestamp: *ts, snapshot: snap.clone() });
+            }
+        }
+        rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+        Some(HistogramStream {
+            meta: HistogramStreamMeta { config, series: series_labels },
+            rows: Box::new(rows.into_iter()),
+        })
     }
 
     fn interval(&self) -> f64 {
