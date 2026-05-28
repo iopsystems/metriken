@@ -36,6 +36,10 @@ impl HistogramStream {
 
         // Build unified series list; record per-stream remapping tables.
         let config = streams[0].meta.config;
+        debug_assert!(
+            streams.iter().all(|s| s.meta.config == config),
+            "HistogramStream::merge called with mismatched histogram configs"
+        );
         let mut global_series: Vec<Labels> = Vec::new();
         // remap[stream_idx][local_series_idx] = global_series_idx
         let mut remap: Vec<Vec<usize>> = Vec::with_capacity(streams.len());
@@ -115,6 +119,7 @@ impl HistogramStream {
             std::iter::from_fn(move || {
                 let entry = heap.pop()?;
                 // Advance that iterator and push its next row.
+                // iter_idx is always valid: set at heap-priming time, iters is never resized.
                 if let Some(next_row) = iters[entry.iter_idx].next() {
                     heap.push(Entry {
                         timestamp: next_row.timestamp,
