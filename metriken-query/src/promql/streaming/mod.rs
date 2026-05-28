@@ -1,39 +1,11 @@
 //! Streaming time-series query pipeline.
-//!
-//! A naïve evaluator materialises every intermediate stage as
-//! `Vec<(f64, f64)>`. For the WASM viewer that means a typical
-//! `sum by (label) (irate(metric[5s]))` over many series produces a
-//! transient `O(stages × points × series)` heap footprint just to be
-//! reduced down to `O(stages × points)` at the boundary.
-//!
-//! This module replaces the in-flight matrices with iterator pipelines:
-//!
-//! * [`Point`] — the single sample carried through the pipeline.
-//! * [`LabeledSeries`] — labelset + boxed iterator yielding `Point`.
-//! * Operators (e.g. [`CounterIrate`], [`MergeReduce`]) wrap upstream
-//!   iterators and pull lazily, holding only their own windowed state.
-//!
-//! Wired-up shapes:
-//!
-//! * Counter producers: [`CounterIrate`], [`CounterRate`].
-//! * Gauge producers: [`GaugeStepGrid`] (bare selector),
-//!   [`GaugeAvgOverTime`], [`GaugeIdelta`], [`GaugeDeriv`].
-//! * Aggregations: [`MergeReduce`] reducer driven by [`AggOp`]
-//!   (sum/avg/min/max/count) with [`GroupBy`] (by/without).
-//! * Binary ops: [`ScalarBroadcast`] (matrix×scalar) and
-//!   [`matrix_matrix_op`] (matrix×matrix with on/ignoring).
-//! * Histogram quantiles: [`histogram::quantiles`].
-//!
-//! The dispatcher ([`dispatch::try_streaming`]) walks the parsed AST
-//! and assembles the pipeline for each recognised shape. Eager
-//! handlers in `promql::mod` cover the residual cases (heatmaps,
-//! one-side-eager binary ops, group_left/right, scalar/vector
-//! wrappers, counter-rate `deriv`).
 
 use std::collections::HashMap;
 
+use crate::labels::Labels;
 use crate::promql::MatrixSample;
-use crate::tsdb::{CounterCollection, Labels};
+#[cfg(test)]
+use crate::types::Counters;
 
 mod aggregate;
 mod binary;
@@ -48,31 +20,20 @@ mod rate;
 mod tests;
 
 pub(crate) use aggregate::derive_group_labels;
-pub use aggregate::{aggregate, sum_by, AggOp, GroupBy, MergeReduce};
-pub use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec, ScalarBroadcast};
-pub use deriv::StreamingDeriv;
-pub use gauge::{
-    gauges_avg_over_time, gauges_deriv, gauges_idelta, gauges_step_grid, GaugeAvgOverTime,
-    GaugeDeriv, GaugeIdelta, GaugeStepGrid,
-};
-pub use irate::CounterIrate;
-pub use rate::{CounterPairwiseRate, CounterRate};
+pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
+pub(crate) use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
+pub(crate) use deriv::StreamingDeriv;
+pub(crate) use gauge::{GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
+pub(crate) use irate::CounterIrate;
+pub(crate) use rate::{CounterPairwiseRate, CounterRate};
+
+#[cfg(test)]
+pub(crate) use aggregate::sum_by;
 
 /// A single sample emitted through a streaming pipeline.
-///
-/// Timestamps are kept in raw nanoseconds — the same shape the TSDB
-/// stores. Conversion to seconds happens once, at the JSON boundary,
-/// to avoid the precision-loss round-trip the eager aggregator does
-/// (ns → f64 sec → u64 ns key).
 pub type Point = (u64, f64);
 
 /// A labeled, lazily-produced time series.
-///
-/// `iter` is type-erased so heterogeneous operator chains can sit in
-/// the same `Vec`. Once the API stabilises, the boxed form can be
-/// replaced with a generic `S: Iterator<Item = Point>` for monomorphised
-/// inlining; for the prototype, keeping things `dyn` keeps the surface
-/// area small while we validate the shape.
 pub struct LabeledSeries<'a> {
     pub labels: Labels,
     pub iter: Box<dyn Iterator<Item = Point> + 'a>,
@@ -90,67 +51,41 @@ impl<'a> LabeledSeries<'a> {
     }
 }
 
-/// Output of a streaming evaluation stage. Conceptually equivalent to
-/// `QueryResult::Matrix` but unmaterialised.
+/// Output of a streaming evaluation stage.
 pub type SeriesSet<'a> = Vec<LabeledSeries<'a>>;
 
-/// Build an iterator stream of `irate` over every counter series in
-/// `collection` whose labels match `filter`.
-///
-/// The iterators borrow the underlying counter sample slice — the
-/// caller must keep `collection` alive for the lifetime of the
-/// returned `SeriesSet`. This is the producer side of the pipeline:
-/// no values are computed until the consumer pulls.
-pub fn irate_counters<'a>(
-    collection: &'a CounterCollection,
-    filter: &Labels,
-    start_ns: u64,
-    end_ns: u64,
-    step_ns: u64,
-    range_ns: u64,
-) -> SeriesSet<'a> {
-    let mut out = Vec::new();
-    for (labels, series) in collection.iter() {
-        if !filter.inner.is_empty() && !labels.matches(filter) {
-            continue;
-        }
-        let iter = CounterIrate::new(series.samples(), start_ns, end_ns, step_ns, range_ns);
-        out.push(LabeledSeries::new(labels.clone(), iter));
-    }
-    out
-}
+// ─── Counters methods ────────────────────────────────────────────────────────
 
-/// `rate(metric[range])` over every counter series in `collection`
-/// whose labels match `filter`. See [`irate_counters`].
-pub fn rate_counters<'a>(
-    collection: &'a CounterCollection,
-    filter: &Labels,
-    start_ns: u64,
-    end_ns: u64,
-    step_ns: u64,
-    range_ns: u64,
-) -> SeriesSet<'a> {
-    let mut out = Vec::new();
-    for (labels, series) in collection.iter() {
-        if !filter.inner.is_empty() && !labels.matches(filter) {
-            continue;
-        }
-        let iter = CounterRate::new(series.samples(), start_ns, end_ns, step_ns, range_ns);
-        out.push(LabeledSeries::new(labels.clone(), iter));
+#[cfg(test)]
+impl Counters {
+    pub(crate) fn irate<'a>(
+        &'a self,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+        range_ns: u64,
+    ) -> SeriesSet<'a> {
+        self.series
+            .iter()
+            .filter(|c| filter.inner.is_empty() || c.labels.matches(filter))
+            .map(|c| {
+                let iter = CounterIrate::new(
+                    &c.timestamps,
+                    &c.values,
+                    start_ns,
+                    end_ns,
+                    step_ns,
+                    range_ns,
+                );
+                LabeledSeries::new(c.labels.clone(), iter)
+            })
+            .collect()
     }
-    out
 }
 
 /// Boundary collector: drain a streaming result into the same
-/// `MatrixSample` shape the eager engine returns, so the prototype can
-/// be plumbed through the existing JSON serializer unchanged.
-///
-/// `metric_name` is added as the `__name__` label when present;
-/// callers pass `None` for aggregated results (matching the eager
-/// path, which strips `__name__` after `sum`/`avg`/etc.).
-///
-/// Empty series (operators that never emitted) are dropped to match
-/// the eager path's behaviour.
+/// `MatrixSample` shape the eager engine returns.
 pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) -> Vec<MatrixSample> {
     streaming
         .into_iter()

@@ -1,52 +1,33 @@
 //! Resolve a PromQL query to the set of physical parquet columns it
-//! touches — without reading any values. Walks the parsed AST the
-//! same way `streaming::dispatch` does, but looks each selector up
-//! in the unified column map instead of fetching series data.
-//!
-//! Metric names are unique across types in the exposition format,
-//! so the resolver doesn't need to know which type table a selector
-//! targets — the name alone identifies the column.
+//! touches — without reading any values.
 
-use std::collections::HashSet;
-use std::ops::Deref;
+use std::collections::{HashMap, HashSet};
 
 use promql_parser::label::Matcher;
 use promql_parser::parser::{self, Expr};
 
+use crate::labels::Labels;
 use crate::promql::{
     extract_filter_labels, parse_histogram_call, parse_optional_stride, QueryEngine, QueryError,
 };
-use crate::tsdb::Tsdb;
 
-impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
+impl QueryEngine {
     /// Resolve a PromQL query to the set of physical parquet column
-    /// names in the underlying TSDB that it touches during evaluation.
+    /// names in the underlying data source that it touches.
     ///
     /// Returns an empty set if the query parses cleanly but matches
-    /// no series.  Returns `QueryError::ParseError` on syntax error,
-    /// so callers can distinguish "query is broken" from "query
-    /// touches nothing in this TSDB."
-    ///
-    /// Column identifiers are returned as-stored by the TSDB — for
-    /// parquet-backed TSDBs that's the parquet column name (e.g.
-    /// `"0::42"`, `"agent-4241::105"`, `"0::26x0:buckets"`). The
-    /// caller is expected to map these back to the parquet schema and
-    /// always-keep `timestamp` + `duration` separately.
+    /// no series. Returns `QueryError::ParseError` on syntax error.
     pub fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
         let stripped = strip_rezolus_wrapper(query)?;
         let expr = parser::parse(stripped)
             .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+        let col_map = self.source.column_map();
         let mut out = HashSet::new();
-        walk(&self.tsdb, &expr, &mut out);
+        walk(&col_map, &expr, &mut out);
         Ok(out)
     }
 }
 
-/// Reduce a rezolus-specific wrapper to its inner metric selector so
-/// the standard PromQL parser can handle it. The wrappers use array
-/// literals, multi-arg shapes, or names the parser doesn't recognise,
-/// but their *column set* is just the inner selector's. Non-rezolus
-/// queries pass through unchanged.
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     if let Some(inner) = query
         .strip_prefix("histogram_quantiles(")
@@ -88,32 +69,32 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     Ok(query)
 }
 
-fn walk(tsdb: &Tsdb, expr: &Expr, out: &mut HashSet<String>) {
+fn walk(col_map: &HashMap<String, HashMap<Labels, String>>, expr: &Expr, out: &mut HashSet<String>) {
     match expr {
-        Expr::Paren(p) => walk(tsdb, &p.expr, out),
-        Expr::Unary(u) => walk(tsdb, &u.expr, out),
-        Expr::Aggregate(agg) => walk(tsdb, &agg.expr, out),
+        Expr::Paren(p) => walk(col_map, &p.expr, out),
+        Expr::Unary(u) => walk(col_map, &u.expr, out),
+        Expr::Aggregate(agg) => walk(col_map, &agg.expr, out),
         Expr::Binary(b) => {
-            walk(tsdb, &b.lhs, out);
-            walk(tsdb, &b.rhs, out);
+            walk(col_map, &b.lhs, out);
+            walk(col_map, &b.rhs, out);
         }
         Expr::Call(call) => {
             for arg in &call.args.args {
-                walk(tsdb, arg, out);
+                walk(col_map, arg, out);
             }
         }
-        Expr::VectorSelector(sel) => collect_selector(tsdb, sel, out),
-        Expr::MatrixSelector(sel) => collect_selector(tsdb, &sel.vs, out),
-        Expr::Subquery(s) => walk(tsdb, &s.expr, out),
+        Expr::VectorSelector(sel) => collect_selector(col_map, sel, out),
+        Expr::MatrixSelector(sel) => collect_selector(col_map, &sel.vs, out),
+        Expr::Subquery(s) => walk(col_map, &s.expr, out),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
     }
 }
 
-/// Resolve one `VectorSelector` against the unified column map.
-/// Mirrors `streaming::dispatch::build_vector_selector`'s
-/// label-filter logic, but iterates the column-name map instead of
-/// the typed series collection.
-fn collect_selector(tsdb: &Tsdb, sel: &parser::VectorSelector, out: &mut HashSet<String>) {
+fn collect_selector(
+    col_map: &HashMap<String, HashMap<Labels, String>>,
+    sel: &parser::VectorSelector,
+    out: &mut HashSet<String>,
+) {
     let label_filter = extract_filter_labels(&sel.matchers.matchers);
     let name_matchers: Vec<&Matcher> = sel
         .matchers
@@ -123,7 +104,7 @@ fn collect_selector(tsdb: &Tsdb, sel: &parser::VectorSelector, out: &mut HashSet
         .collect();
 
     if let Some(n) = sel.name.as_deref() {
-        let Some(labels_map) = tsdb.columns_ref().get(n) else {
+        let Some(labels_map) = col_map.get(n) else {
             return;
         };
         if !name_matchers.iter().all(|m| m.is_match(n)) {
@@ -137,9 +118,7 @@ fn collect_selector(tsdb: &Tsdb, sel: &parser::VectorSelector, out: &mut HashSet
         return;
     }
 
-    // Regex / negated `__name__`: full scan, since the name is no
-    // longer a single bucket key.
-    for (metric_name, labels_map) in tsdb.columns_ref() {
+    for (metric_name, labels_map) in col_map {
         if !name_matchers.iter().all(|m| m.is_match(metric_name)) {
             continue;
         }

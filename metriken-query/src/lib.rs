@@ -1,32 +1,25 @@
-//! PromQL query engine and time-series database for metriken parquet files.
-//!
-//! This crate provides:
-//! - A time-series database (TSDB) that loads metrics from parquet files
-//! - A PromQL query engine for querying the loaded metrics
-//! - Optional HTTP API routes for serving PromQL queries (with `http` feature)
-//!
-//! # Example
-//!
-//! ```ignore
-//! use metriken_query::{Tsdb, QueryEngine};
-//! use std::sync::Arc;
-//! use std::path::Path;
-//!
-//! // Load a parquet file
-//! let tsdb = Arc::new(Tsdb::load(Path::new("metrics.parquet")).unwrap());
-//!
-//! // Create a query engine
-//! let engine = QueryEngine::new(tsdb);
-//!
-//! // Execute a range query
-//! let result = engine.query_range("rate(http_requests[5m])", start, end, step);
-//! ```
+pub(crate) mod labels;
+#[cfg(test)]
+pub(crate) mod memory;
+pub mod parquet;
+pub(crate) mod promql;
+pub(crate) mod types;
 
-mod parquet_query_engine;
-pub mod promql;
-pub mod tsdb;
+pub use parquet::Parquet;
+pub use promql::{QueryError, QueryResult};
 
-pub use bytes::Bytes;
-pub use parquet_query_engine::ParquetQueryEngine;
-pub use promql::{QueryEngine, QueryError, QueryResult};
-pub use tsdb::Tsdb;
+use labels::Labels;
+use types::{Counters, Gauges, Histograms};
+
+pub(crate) trait DataSource: Send + Sync {
+    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters>;
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
+    fn histograms(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Histograms>;
+    /// Sampling interval in seconds.
+    fn interval(&self) -> f64;
+    /// Full time extent of the stored data in nanoseconds, or `None` if empty.
+    fn time_range(&self) -> Option<(u64, u64)>;
+    /// Parquet column name for every `(metric_name, labels)` pair.
+    #[cfg(test)]
+    fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;
+}

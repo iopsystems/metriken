@@ -1,7 +1,7 @@
 //! Tests for the streaming pipeline.
 //!
-//! * Per-operator unit tests build a small TSDB by hand, exercise
-//!   the streaming function directly (e.g. `irate_counters` +
+//! * Per-operator unit tests build a small Memory by hand,
+//!   exercise the streaming function directly (e.g. `Counters::irate` +
 //!   `sum_by` + `collect_to_matrix`), and compare against the
 //!   `QueryEngine::query_range` output for the equivalent PromQL —
 //!   a coherence check that the dispatcher and the streaming
@@ -11,55 +11,32 @@
 //!   asserts no errors, catching regressions where a streaming
 //!   operator silently drops series or fails on a real workload.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
-use metriken_exposition::{Counter, Gauge, Snapshot, SnapshotV2};
-
-use crate::promql::streaming::{
-    collect_to_matrix, irate_counters, sum_by, CounterIrate, LabeledSeries,
-};
+use crate::labels::Labels;
+use crate::promql::streaming::{collect_to_matrix, sum_by, CounterIrate, LabeledSeries};
 use crate::promql::{MatrixSample, QueryEngine, QueryResult};
-use crate::tsdb::{Labels, Tsdb};
+use crate::memory::Memory;
+use crate::types::{Counter, Gauge};
+use crate::DataSource;
 
 /// Three counter series (foo/bar/baz) at t=1000..1002 with values
 /// (100,200,300) / (200,300,400) / (300,400,500). irate over a [5s]
 /// range yields 100/s at every emitted tick for every series.
-fn cgroup_tsdb() -> Tsdb {
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-    let cgroups = [
+fn cgroup_source() -> Arc<Memory> {
+    let mut source = Memory::new(1000);
+    for (name, base_val) in [
         ("/system.slice/foo.service", 100u64),
         ("/system.slice/bar.service", 200u64),
         ("/system.slice/baz.service", 300u64),
-    ];
-
-    for step in 0u64..3 {
-        let time = base_time + Duration::from_secs(step);
-        let mut counters = Vec::new();
-        for (name, base_val) in &cgroups {
-            let mut metadata = HashMap::new();
-            metadata.insert("name".to_string(), name.to_string());
-            metadata.insert("metric".to_string(), "cgroup_cpu_usage".to_string());
-            counters.push(Counter {
-                name: "cgroup_cpu_usage".to_string(),
-                value: base_val + step * 100,
-                metadata,
-            });
-        }
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters,
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
+    ] {
+        let mut labels = Labels::default();
+        labels.inner.insert("name".to_string(), name.to_string());
+        let timestamps: Vec<u64> = (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect();
+        let values: Vec<u64> = (0u64..3).map(|s| base_val + s * 100).collect();
+        source.add_counter("cgroup_cpu_usage", Counter { labels, timestamps, values });
     }
-
-    tsdb
+    Arc::new(source)
 }
 
 /// Sort matrix samples by their `name` label so unordered HashMap
@@ -84,22 +61,22 @@ fn into_sorted(result: QueryResult) -> Vec<MatrixSample> {
 
 #[test]
 fn streaming_irate_matches_eager_irate() {
-    let tsdb = Arc::new(cgroup_tsdb());
+    let source = cgroup_source();
 
-    // Eager.
-    let engine = QueryEngine::new(tsdb.clone());
+    // Eager path: QueryEngine dispatches through try_streaming → Counters::irate.
+    let engine = QueryEngine::new(source.clone());
     let eager = engine
         .query_range("irate(cgroup_cpu_usage[5s])", 1000.0, 1003.0, 1.0)
         .unwrap();
     let eager = into_sorted(eager);
 
-    // Streaming.
-    let collection = tsdb
-        .counters_ref("cgroup_cpu_usage")
+    // Direct streaming path: fetch counters then call irate() directly.
+    let filter = Labels::default();
+    let counters = source
+        .counters("cgroup_cpu_usage", &filter, 0, u64::MAX)
         .expect("collection present");
-    let stream = irate_counters(
-        collection,
-        &Labels::default(),
+    let stream = counters.irate(
+        &filter,
         1_000_000_000_000, // start_ns
         1_003_000_000_000, // end_ns
         1_000_000_000,     // step_ns
@@ -131,9 +108,9 @@ fn streaming_irate_matches_eager_irate() {
 
 #[test]
 fn streaming_sum_by_matches_eager_sum_by() {
-    let tsdb = Arc::new(cgroup_tsdb());
+    let source = cgroup_source();
 
-    let engine = QueryEngine::new(tsdb.clone());
+    let engine = QueryEngine::new(source.clone());
     let eager = engine
         .query_range(
             "sum by (name) (irate(cgroup_cpu_usage[5s]))",
@@ -144,12 +121,12 @@ fn streaming_sum_by_matches_eager_sum_by() {
         .unwrap();
     let eager = into_sorted(eager);
 
-    let collection = tsdb
-        .counters_ref("cgroup_cpu_usage")
+    let filter = Labels::default();
+    let counters = source
+        .counters("cgroup_cpu_usage", &filter, 0, u64::MAX)
         .expect("collection present");
-    let irate_stream = irate_counters(
-        collection,
-        &Labels::default(),
+    let irate_stream = counters.irate(
+        &filter,
         1_000_000_000_000,
         1_003_000_000_000,
         1_000_000_000,
@@ -206,16 +183,18 @@ fn sum_by_groups_disjoint_label_into_one_series() {
 #[test]
 fn counter_irate_handles_reset() {
     // Counter goes 100, 200, 300, 50 (reset), 150 at t=1..5 sec.
-    let samples: Vec<(u64, u64)> = vec![
-        (1_000_000_000, 100),
-        (2_000_000_000, 200),
-        (3_000_000_000, 300),
-        (4_000_000_000, 50),
-        (5_000_000_000, 150),
+    let timestamps: Vec<u64> = vec![
+        1_000_000_000,
+        2_000_000_000,
+        3_000_000_000,
+        4_000_000_000,
+        5_000_000_000,
     ];
+    let values: Vec<u64> = vec![100, 200, 300, 50, 150];
     // Range [5s], step 1s, evaluate at t=5s only.
     let mut iter = CounterIrate::new(
-        &samples,
+        &timestamps,
+        &values,
         5_000_000_000,
         5_000_000_000,
         1_000_000_000,
@@ -236,44 +215,37 @@ fn counter_irate_handles_reset() {
 /// shows no data.
 #[test]
 fn single_right_broadcasts_against_label_stripping_aggregate() {
-    let mut tsdb = Tsdb::default();
-    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    let mut source = Memory::new(1000);
 
-    // Two cpu_usage counter series at different cpus, each ramping
-    // 100/s. sum(irate(...)) over both = 200/s.
-    for step in 0u64..3 {
-        let mut counters = Vec::new();
-        for cpu in 0..2u64 {
-            let mut md = HashMap::new();
-            md.insert("metric".to_string(), "cpu_usage".to_string());
-            md.insert("cpu".to_string(), cpu.to_string());
-            counters.push(Counter {
-                name: "cpu_usage".to_string(),
-                value: cpu * 1000 + step * 100,
-                metadata: md,
-            });
-        }
-        let mut node_md = HashMap::new();
-        node_md.insert("metric".to_string(), "cpu_cores".to_string());
-        node_md.insert("node".to_string(), "agent-0".to_string());
-        node_md.insert("source".to_string(), "rezolus".to_string());
-        let gauges = vec![Gauge {
-            name: "cpu_cores".to_string(),
-            value: 4,
-            metadata: node_md,
-        }];
-
-        tsdb.ingest(Snapshot::V2(SnapshotV2 {
-            systemtime: base + Duration::from_secs(step),
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters,
-            gauges,
-            histograms: Vec::new(),
-        }));
+    // Two cpu_usage counter series at different cpus, each ramping 100/s.
+    // sum(irate(...)) over both = 200/s.
+    for cpu in 0..2u64 {
+        let mut labels = Labels::default();
+        labels.inner.insert("cpu".to_string(), cpu.to_string());
+        source.add_counter(
+            "cpu_usage",
+            Counter {
+                labels,
+                timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
+                values: vec![cpu * 1000, cpu * 1000 + 100, cpu * 1000 + 200],
+            },
+        );
     }
 
-    let engine = QueryEngine::new(Arc::new(tsdb));
+    // cpu_cores gauge: single series with node/source labels, value=4.
+    let mut labels = Labels::default();
+    labels.inner.insert("node".to_string(), "agent-0".to_string());
+    labels.inner.insert("source".to_string(), "rezolus".to_string());
+    source.add_gauge(
+        "cpu_cores",
+        Gauge {
+            labels,
+            timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
+            values: vec![4, 4, 4],
+        },
+    );
+
+    let engine = QueryEngine::new(Arc::new(source));
     let q = "sum(irate(cpu_usage[5s])) / cpu_cores";
     let r = engine.query(q, None).expect("query must succeed");
     let samples = match r {
@@ -379,14 +351,7 @@ fn count_points(result: &QueryResult) -> usize {
 /// Smoke test: run every query the cachecannon dashboard generates
 /// (plus representative shapes from the broader rezolus dashboards
 /// that hit the same parquet) against a real fixture, and assert
-/// each one returns `Ok` with at least one point. Catches
-/// regressions where a streaming operator silently drops series or
-/// errors out on a real-world workload, while remaining cheap to
-/// maintain (no per-query golden output that drifts when JSON
-/// serialisation evolves).
-///
-/// Per-query wall-clock is printed with `--nocapture` so the test
-/// also doubles as a quick perf sanity-check on local dev.
+/// each one returns `Ok` with at least one point.
 #[test]
 fn cachecannon_smoke_test() {
     let Some(path) = cachecannon_parquet_path() else {
@@ -397,16 +362,18 @@ fn cachecannon_smoke_test() {
         return;
     };
 
-    let tsdb = match crate::Tsdb::load(&path) {
-        Ok(t) => Arc::new(t),
+    let engine = match crate::parquet::Parquet::open(&path) {
+        Ok(e) => e,
         Err(e) => {
-            eprintln!("skipping cachecannon smoke test: failed to load {path:?}: {e}");
+            eprintln!("skipping cachecannon smoke test: failed to open {path:?}: {e}");
             return;
         }
     };
 
-    let engine = QueryEngine::new(tsdb.clone());
-    let (start, end) = engine.get_time_range();
+    let Some((start, end)) = engine.time_range() else {
+        eprintln!("skipping cachecannon smoke test: parquet file appears empty");
+        return;
+    };
     let step = 1.0;
 
     let mut total = std::time::Duration::ZERO;
@@ -423,11 +390,6 @@ fn cachecannon_smoke_test() {
         let dt = t0.elapsed();
         total += dt;
 
-        // Some queries legitimately produce zero points on this
-        // fixture (e.g. `cache_hits / cache_misses` where misses is
-        // identically zero — every point divides by zero and gets
-        // filtered).  We only require no error; the printed point
-        // count is for human inspection.
         let points = match &result {
             Ok(r) => count_points(r),
             Err(e) => panic!("query failed: {q}: {e}"),
