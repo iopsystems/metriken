@@ -87,38 +87,93 @@ struct MultiParquetSource {
     files: Vec<(Arc<ParquetSource>, Labels)>,
 }
 
+/// Given a file's injected `extra` labels and the query `filter`:
+/// - Returns `None` if `extra` contains a key from `filter` whose value
+///   doesn't satisfy the filter constraint (skip this file entirely).
+/// - Returns the filter with `extra`'s keys removed (since parquet columns
+///   don't carry injected labels; the filter for those keys is already satisfied).
+fn resolve_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
+    if extra.inner.is_empty() {
+        return Some(filter.clone());
+    }
+    // Build a sub-filter containing only keys present in extra.
+    let extra_constrained = Labels {
+        inner: filter.inner.iter()
+            .filter(|(k, _)| extra.inner.contains_key(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    // Check whether extra's values satisfy those constraints.
+    if !extra.matches(&extra_constrained) {
+        return None;
+    }
+    // Return filter with extra's keys stripped (parquet doesn't have them).
+    Some(Labels {
+        inner: filter.inner.iter()
+            .filter(|(k, _)| !extra.inner.contains_key(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    })
+}
+
 impl DataSource for MultiParquetSource {
-    // NOTE: Counter and gauge series are naively concatenated across files.
-    // For rolling files where the same metric/label appears in multiple files,
-    // this produces duplicate series. Histogram streams are correctly merged
-    // via k-way merge; counter/gauge dedup is a follow-on task.
+    // NOTE: Counter series are naively concatenated across files.
+    // Same (metric, label) pairs in multiple files produce duplicate series.
+    // Label injection via file_labeled() enables filtering on injected keys.
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
         let series: Vec<Counter> = self.files.iter()
-            .flat_map(|(pf, _)| {
-                read_counters(pf, name, filter, start_ns, end_ns)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|c| c.series)
+            .flat_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let counters = read_counters(pf, name, &pq_filter, start_ns, end_ns).ok()?;
+                Some(counters.series.into_iter().map({
+                    let extra = extra.clone();
+                    move |mut c| {
+                        for (k, v) in &extra.inner {
+                            c.labels.inner.insert(k.clone(), v.clone());
+                        }
+                        c
+                    }
+                }))
             })
+            .flatten()
             .collect();
         if series.is_empty() { None } else { Some(Counters { series }) }
     }
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let series: Vec<Gauge> = self.files.iter()
-            .flat_map(|(pf, _)| {
-                read_gauges(pf, name, filter, start_ns, end_ns)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|g| g.series)
+            .flat_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let gauges = read_gauges(pf, name, &pq_filter, start_ns, end_ns).ok()?;
+                Some(gauges.series.into_iter().map({
+                    let extra = extra.clone();
+                    move |mut g| {
+                        for (k, v) in &extra.inner {
+                            g.labels.inner.insert(k.clone(), v.clone());
+                        }
+                        g
+                    }
+                }))
             })
+            .flatten()
             .collect();
         if series.is_empty() { None } else { Some(Gauges { series }) }
     }
 
     fn histogram_stream(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<HistogramStream> {
         let streams: Vec<HistogramStream> = self.files.iter()
-            .filter_map(|(pf, _)| pf.histogram_stream(name, filter, start_ns, end_ns))
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let mut stream = pf.histogram_stream(name, &pq_filter, start_ns, end_ns)?;
+                if !extra.inner.is_empty() {
+                    for series_labels in &mut stream.meta.series {
+                        for (k, v) in &extra.inner {
+                            series_labels.inner.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Some(stream)
+            })
             .collect();
         HistogramStream::merge(streams)
     }
