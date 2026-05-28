@@ -475,8 +475,7 @@ where
         .source
         .histogram_stream(metric_name, &filter, ctx.start_ns, ctx.end_ns)
         .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
-    let histograms = crate::promql::stream_to_histograms(stream);
-    let result = histograms.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
+    let result = stream.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
     Ok(Built::Materialized {
         result,
         name: format!("No histogram data found for {metric_name}"),

@@ -318,37 +318,6 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
-/// Temporary: convert a `HistogramStream` back to the fully-materialised
-/// `Histograms` type so that the existing operator methods remain unchanged
-/// until Task 3 rewrites the operators to consume the stream directly.
-pub(crate) fn stream_to_histograms(
-    stream: crate::histogram_stream::HistogramStream,
-) -> crate::types::Histograms {
-    use crate::types::{Histogram, Histograms};
-    let n = stream.meta.series.len();
-    let config = stream.meta.config;
-    let mut ts_per_series: Vec<Vec<u64>> = vec![Vec::new(); n];
-    let mut snap_per_series: Vec<Vec<crate::types::HistogramSnapshot>> = vec![Vec::new(); n];
-    for row in stream.rows {
-        debug_assert!(row.series_idx < n, "series_idx {} out of bounds (n={})", row.series_idx, n);
-        ts_per_series[row.series_idx].push(row.timestamp);
-        snap_per_series[row.series_idx].push(row.snapshot);
-    }
-    let series = stream
-        .meta
-        .series
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !ts_per_series[*i].is_empty())
-        .map(|(i, labels)| Histogram {
-            labels,
-            config,
-            timestamps: ts_per_series[i].clone(),
-            snapshots: snap_per_series[i].clone(),
-        })
-        .collect();
-    Histograms { series }
-}
 
 impl QueryEngine {
     pub(crate) fn new(source: Arc<dyn DataSource>) -> Self {
@@ -486,8 +455,7 @@ impl QueryEngine {
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
             .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
-        let histograms = stream_to_histograms(stream);
-        let result = histograms.quantiles(&quantiles, start_ns, end_ns, stride_ns, &metric_name);
+        let result = stream.quantiles(&quantiles, start_ns, end_ns, stride_ns, &metric_name);
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
                 "No histogram data found for {}",
@@ -513,8 +481,7 @@ impl QueryEngine {
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
             .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
-        let histograms = stream_to_histograms(stream);
-        let result = histograms.heatmap(start_ns, end_ns, stride_ns);
+        let result = stream.heatmap(start_ns, end_ns, stride_ns);
         match result {
             Some(result) => Ok(QueryResult::HistogramHeatmap { result }),
             None => Err(QueryError::MetricNotFound(format!(
@@ -544,8 +511,7 @@ impl QueryEngine {
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
             .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
-        let histograms = stream_to_histograms(stream);
-        let result = histograms.irate(group_by.as_ref(), start_ns, end_ns, &metric_name);
+        let result = stream.irate(group_by.as_ref(), start_ns, end_ns, &metric_name);
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
                 "No histogram data found for {metric_name}"
@@ -571,16 +537,11 @@ impl QueryEngine {
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
             .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
-        let histograms = stream_to_histograms(stream);
         let group = group_by.as_ref();
         let result = match func {
-            "histogram_mean" => {
-                histograms.mean(group, start_ns, end_ns, stride_ns, &metric_name)
-            }
-            "histogram_sum" => {
-                histograms.sum(group, start_ns, end_ns, stride_ns, &metric_name)
-            }
-            _ => histograms.count(group, start_ns, end_ns, stride_ns, &metric_name),
+            "histogram_mean" => stream.mean(group, start_ns, end_ns, stride_ns, &metric_name),
+            "histogram_sum" => stream.sum(group, start_ns, end_ns, stride_ns, &metric_name),
+            _ => stream.count(group, start_ns, end_ns, stride_ns, &metric_name),
         };
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
