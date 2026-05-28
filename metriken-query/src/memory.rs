@@ -31,14 +31,17 @@ impl Memory {
         self.interval_ms = ms;
     }
 
+    #[cfg(test)]
     pub(crate) fn add_counter(&mut self, name: &str, counter: Counter) {
         self.counters.entry(name.to_string()).or_default().push(counter);
     }
 
+    #[cfg(test)]
     pub(crate) fn add_gauge(&mut self, name: &str, gauge: Gauge) {
         self.gauges.entry(name.to_string()).or_default().push(gauge);
     }
 
+    #[cfg(test)]
     pub(crate) fn add_histogram(&mut self, name: &str, histogram: Histogram) {
         self.histograms.entry(name.to_string()).or_default().push(histogram);
     }
@@ -189,7 +192,7 @@ impl DataSource for Memory {
 
         for hist in stored.iter().filter(|h| filter.inner.is_empty() || h.labels.matches(filter)) {
             debug_assert!(
-                config.map_or(true, |c| c == hist.config),
+                config.is_none_or(|c| c == hist.config),
                 "histogram series within one metric must share the same config"
             );
             config = config.or(Some(hist.config));

@@ -395,7 +395,6 @@ impl MemoryStore {
     /// performed at query time against pairs of consecutive snapshots.
     pub fn ingest_snapshot(&self, mut snapshot: metriken_exposition::Snapshot) {
         use crate::memory::extract_name_labels;
-        use crate::types::HistogramSnapshot;
 
         let raw_ts = snapshot
             .systemtime()
