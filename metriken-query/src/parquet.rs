@@ -205,19 +205,9 @@ impl ParquetSource {
         }
         min_ns.zip(max_ns)
     }
-}
-
-impl DataSource for Arc<ParquetSource> {
-    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
-        read_counters(self, name, filter, start_ns, end_ns).ok().filter(|c| !c.series.is_empty())
-    }
-
-    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
-        read_gauges(self, name, filter, start_ns, end_ns).ok().filter(|g| !g.series.is_empty())
-    }
 
     fn histogram_stream(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         filter: &Labels,
         start_ns: u64,
@@ -276,14 +266,6 @@ impl DataSource for Arc<ParquetSource> {
             meta: HistogramStreamMeta { config, series },
             rows: Box::new(cursor),
         })
-    }
-
-    fn interval(&self) -> f64 {
-        self.sampling_interval_ms as f64 / 1000.0
-    }
-
-    fn time_range(&self) -> Option<(u64, u64)> {
-        self.time_range_from_stats()
     }
 
     #[cfg(test)]
