@@ -329,6 +329,20 @@ impl QueryEngine {
         self.source.time_range()
     }
 
+    pub(crate) fn counter_names(&self) -> Vec<String> { self.source.counter_names() }
+    pub(crate) fn gauge_names(&self) -> Vec<String> { self.source.gauge_names() }
+    pub(crate) fn histogram_names(&self) -> Vec<String> { self.source.histogram_names() }
+    pub(crate) fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.counter_labels(name)
+    }
+    pub(crate) fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.gauge_labels(name)
+    }
+    pub(crate) fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.histogram_labels(name)
+    }
+    pub(crate) fn interval(&self) -> f64 { self.source.interval() }
+
     /// Execute an instant query at a single timestamp (test helper).
     #[cfg(test)]
     pub(crate) fn query(&self, query_str: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {

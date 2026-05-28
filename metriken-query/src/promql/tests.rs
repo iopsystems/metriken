@@ -1894,6 +1894,51 @@ fn test_histogram_stream_merge_single_passthrough() {
     assert_eq!(merged.meta.series.len(), n_series);
 }
 
+// ─── Schema introspection tests ───────────────────────────────────────────────
+
+#[test]
+fn test_counter_names_returns_metric_names() {
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
+    let names = engine.counter_names();
+    assert!(names.contains(&"cgroup_cpu_usage".to_string()));
+}
+
+#[test]
+fn test_counter_labels_returns_label_sets() {
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
+    let labels = engine.counter_labels("cgroup_cpu_usage");
+    assert_eq!(labels.len(), 3); // 3 cgroups
+    assert!(labels.iter().any(|l| l.get("name") == Some(&"/system.slice/foo.service".to_string())));
+}
+
+#[test]
+fn test_histogram_names_returns_metric_names() {
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
+    let names = engine.histogram_names();
+    assert!(names.contains(&"tcp_packet_latency".to_string()));
+}
+
+#[test]
+fn test_histogram_labels_returns_label_sets() {
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
+    let labels = engine.histogram_labels("tcp_packet_latency");
+    assert!(!labels.is_empty());
+    assert!(labels.iter().any(|l| l.contains_key("cpu")));
+}
+
+#[test]
+fn test_unknown_metric_returns_empty_labels() {
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
+    assert!(engine.counter_labels("does_not_exist").is_empty());
+    assert!(engine.gauge_labels("does_not_exist").is_empty());
+    assert!(engine.histogram_labels("does_not_exist").is_empty());
+}
+
 #[test]
 fn test_injected_label_filter_excludes_incompatible_file() {
     use crate::histogram_stream::HistogramStream;

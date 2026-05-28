@@ -27,6 +27,18 @@ pub(crate) trait DataSource: Send + Sync {
     fn interval(&self) -> f64;
     /// Full time extent of the stored data in nanoseconds, or `None` if empty.
     fn time_range(&self) -> Option<(u64, u64)>;
+    /// Names of all counter metrics (sorted, deduplicated).
+    fn counter_names(&self) -> Vec<String>;
+    /// Names of all gauge metrics (sorted, deduplicated).
+    fn gauge_names(&self) -> Vec<String>;
+    /// Names of all histogram metrics (sorted, deduplicated).
+    fn histogram_names(&self) -> Vec<String>;
+    /// All label combinations for the named counter metric. Empty if unknown.
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
+    /// All label combinations for the named gauge metric. Empty if unknown.
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
+    /// All label combinations for the named histogram metric. Empty if unknown.
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
     /// Parquet column name for every `(metric_name, labels)` pair.
     #[cfg(test)]
     fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;

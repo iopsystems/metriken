@@ -41,6 +41,36 @@ impl ParquetReader {
     pub fn time_range(&self) -> Option<(f64, f64)> {
         self.engine.time_range().map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
     }
+
+    /// Names of all counter metrics across all files (sorted, deduplicated).
+    pub fn counter_names(&self) -> Vec<String> { self.engine.counter_names() }
+
+    /// Names of all gauge metrics across all files (sorted, deduplicated).
+    pub fn gauge_names(&self) -> Vec<String> { self.engine.gauge_names() }
+
+    /// Names of all histogram metrics across all files (sorted, deduplicated).
+    pub fn histogram_names(&self) -> Vec<String> { self.engine.histogram_names() }
+
+    /// All label combinations for the named counter metric across all files.
+    /// Includes any per-file labels injected via `file_labeled`. Empty if unknown.
+    pub fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.counter_labels(name)
+    }
+
+    /// All label combinations for the named gauge metric across all files.
+    /// Includes any per-file labels injected via `file_labeled`. Empty if unknown.
+    pub fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.gauge_labels(name)
+    }
+
+    /// All label combinations for the named histogram metric across all files.
+    /// Includes any per-file labels injected via `file_labeled`. Empty if unknown.
+    pub fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.histogram_labels(name)
+    }
+
+    /// Sampling interval in seconds. For multi-file readers, returns the finest interval.
+    pub fn interval(&self) -> f64 { self.engine.interval() }
 }
 
 // ─── Builder ──────────────────────────────────────────────────────────────────
@@ -216,6 +246,102 @@ impl DataSource for MultiParquetSource {
             }
         }
         lo.zip(hi)
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Counter) {
+                    names.insert(col.name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Gauge) {
+                    names.insert(col.name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Histogram { .. }) {
+                    names.insert(col.name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Counter) && col.name == name {
+                    let mut labels = col.labels.inner.clone();
+                    for (k, v) in &extra.inner {
+                        labels.insert(k.clone(), v.clone());
+                    }
+                    sets.push(labels);
+                }
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Gauge) && col.name == name {
+                    let mut labels = col.labels.inner.clone();
+                    for (k, v) in &extra.inner {
+                        labels.insert(k.clone(), v.clone());
+                    }
+                    sets.push(labels);
+                }
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Histogram { .. }) && col.name == name {
+                    let mut labels = col.labels.inner.clone();
+                    for (k, v) in &extra.inner {
+                        labels.insert(k.clone(), v.clone());
+                    }
+                    sets.push(labels);
+                }
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
     }
 
     #[cfg(test)]

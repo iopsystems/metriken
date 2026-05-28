@@ -147,6 +147,42 @@ impl DataSource for Memory {
         self.interval_ms as f64 / 1000.0
     }
 
+    fn counter_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.counters.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.gauges.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.histograms.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.counters.get(name).map(|series| {
+            series.iter().map(|c| c.labels.inner.clone()).collect()
+        }).unwrap_or_default()
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.gauges.get(name).map(|series| {
+            series.iter().map(|g| g.labels.inner.clone()).collect()
+        }).unwrap_or_default()
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.histograms.get(name).map(|series| {
+            series.iter().map(|h| h.labels.inner.clone()).collect()
+        }).unwrap_or_default()
+    }
+
     fn time_range(&self) -> Option<(u64, u64)> {
         let mut min_ns: Option<u64> = None;
         let mut max_ns: Option<u64> = None;
