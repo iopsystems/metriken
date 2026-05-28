@@ -208,7 +208,6 @@ impl DataSource for Memory {
         min_ns.zip(max_ns)
     }
 
-    #[cfg(test)]
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
         let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
         for (name, series) in &self.counters {

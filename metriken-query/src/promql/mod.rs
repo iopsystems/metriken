@@ -9,7 +9,6 @@ use thiserror::Error;
 use crate::labels::Labels;
 use crate::DataSource;
 
-#[cfg(test)]
 mod columns;
 pub(crate) mod streaming;
 
@@ -346,8 +345,14 @@ impl QueryEngine {
         self.source.file_metadata()
     }
 
-    /// Execute an instant query at a single timestamp (test helper).
-    #[cfg(test)]
+    /// Convenience: the `version` key from file metadata.
+    /// Returns an empty string if absent.
+    pub(crate) fn version(&self) -> String {
+        self.source.file_metadata().remove("version").unwrap_or_default()
+    }
+
+    /// Execute an instant query at a single timestamp.
+    /// Uses the latest available timestamp when `time` is `None`.
     pub(crate) fn query(&self, query_str: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
         let target = time.unwrap_or_else(|| {
             self.source

@@ -15,7 +15,7 @@ use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta
 use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
-use crate::DataSource;
+use crate::{DataSource, MetricsSource};
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -91,6 +91,82 @@ impl ParquetReader {
     /// Returns an empty string if absent.
     pub fn source(&self) -> String {
         self.engine.file_metadata().remove("source").unwrap_or_default()
+    }
+
+    /// Convenience: the `version` key from file metadata.
+    /// Returns an empty string if absent.
+    pub fn version(&self) -> String {
+        self.engine.version()
+    }
+
+    /// Execute an instant PromQL query at a single timestamp.
+    /// Uses the latest available timestamp when `time` is `None`.
+    pub fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
+        self.engine.query(expr, time)
+    }
+
+    /// Resolve a PromQL query to the set of physical parquet column names it
+    /// touches, without reading any values.
+    pub fn columns(&self, query: &str) -> Result<std::collections::HashSet<String>, QueryError> {
+        self.engine.columns(query)
+    }
+}
+
+impl MetricsSource for ParquetReader {
+    fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError> {
+        self.query_range(expr, start_s, end_s, step_s)
+    }
+
+    fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
+        self.query(expr, time)
+    }
+
+    fn columns(&self, query: &str) -> Result<std::collections::HashSet<String>, QueryError> {
+        self.columns(query)
+    }
+
+    fn time_range(&self) -> Option<(f64, f64)> {
+        self.time_range()
+    }
+
+    fn interval(&self) -> f64 {
+        self.interval()
+    }
+
+    fn source(&self) -> String {
+        self.source()
+    }
+
+    fn version(&self) -> String {
+        self.version()
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.file_metadata()
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        self.counter_names()
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        self.gauge_names()
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        self.histogram_names()
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.counter_labels(name)
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.gauge_labels(name)
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.histogram_labels(name)
     }
 }
 
@@ -373,7 +449,6 @@ impl DataSource for MultiParquetSource {
         sets
     }
 
-    #[cfg(test)]
     fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
         let mut out = std::collections::HashMap::new();
         for (pf, _) in &self.files {
@@ -511,7 +586,6 @@ impl ParquetSource {
         })
     }
 
-    #[cfg(test)]
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
         let ts_col_idx = self.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
         let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
@@ -553,7 +627,6 @@ struct ColDesc {
     col_idx: usize,
     name: String,
     labels: Labels,
-    #[cfg(test)]
     column_name: String,
     kind: ColKind,
 }
@@ -584,7 +657,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             }
             _ => return None,
         };
-        Some(ColDesc { col_idx, name, labels, #[cfg(test)] column_name, kind })
+        Some(ColDesc { col_idx, name, labels, column_name, kind })
     }).collect()
 }
 
