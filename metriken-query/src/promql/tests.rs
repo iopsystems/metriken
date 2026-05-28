@@ -5,6 +5,7 @@ use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::memory::Memory;
 use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
+use crate::DataSource;
 
 fn make_labels(pairs: &[(&str, &str)]) -> Labels {
     let mut l = Labels::default();
@@ -1773,4 +1774,70 @@ fn test_columns_empty_tsdb_resolves_empty_set() {
 
     let cols = engine.columns("cpu_temp").unwrap();
     assert!(cols.is_empty());
+}
+
+// ─── HistogramStream::merge and Parquet::open_many guard tests ─────────────────
+
+#[test]
+fn test_histogram_stream_merge_two_streams() {
+    use crate::histogram_stream::HistogramStream;
+
+    // Source A covers t1000, t1001 (cumulative [0, 5])
+    let source_a = Arc::new(create_hist_source(&[0, 5]));
+    let stream_a = source_a
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .expect("stream_a should have data");
+
+    // Source B covers t1002 only (cumulative [12])
+    let mut mem_b = Memory::new(1000);
+    let config = ::histogram::Config::new(4, 16).unwrap();
+    for cpu in ["0", "1"] {
+        mem_b.add_histogram(
+            "req_latency",
+            Histogram {
+                labels: make_labels(&[("cpu", cpu)]),
+                config,
+                timestamps: vec![1002 * 1_000_000_000u64],
+                snapshots: vec![hist_snap_cumulative(12)],
+            },
+        );
+    }
+    let source_b = Arc::new(mem_b);
+    let stream_b = source_b
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .expect("stream_b should have data");
+
+    // Merge and inspect the result
+    let merged = HistogramStream::merge(vec![stream_a, stream_b])
+        .expect("merge should succeed");
+
+    // Should have 2 global series (cpu=0, cpu=1)
+    assert_eq!(merged.meta.series.len(), 2);
+
+    // Collect all rows; A: 2 rows/series × 2 series = 4; B: 1 row/series × 2 = 2 → 6 total
+    let rows: Vec<_> = merged.rows.collect();
+    assert_eq!(rows.len(), 6);
+
+    // All rows must be in (timestamp, series_idx) order
+    for w in rows.windows(2) {
+        assert!(
+            (w[0].timestamp, w[0].series_idx) <= (w[1].timestamp, w[1].series_idx),
+            "rows not in order: {:?} vs {:?}",
+            (w[0].timestamp, w[0].series_idx),
+            (w[1].timestamp, w[1].series_idx)
+        );
+    }
+}
+
+#[test]
+fn test_histogram_stream_merge_empty_returns_none() {
+    use crate::histogram_stream::HistogramStream;
+    assert!(HistogramStream::merge(vec![]).is_none());
+}
+
+#[test]
+fn test_parquet_open_many_empty_paths_errors() {
+    use std::path::Path;
+    let result = crate::parquet::Parquet::open_many(&[] as &[&Path]);
+    assert!(result.is_err(), "open_many(&[]) should return an error");
 }

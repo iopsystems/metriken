@@ -108,6 +108,10 @@ impl DataSource for Memory {
         let mut rows: Vec<HistogramRow> = Vec::new();
 
         for hist in stored.iter().filter(|h| filter.inner.is_empty() || h.labels.matches(filter)) {
+            debug_assert!(
+                config.map_or(true, |c| c == hist.config),
+                "histogram series within one metric must share the same config"
+            );
             config = config.or(Some(hist.config));
             let r = slice_range(&hist.timestamps, start_ns, end_ns);
             if r.is_empty() {
