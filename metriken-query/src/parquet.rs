@@ -37,6 +37,7 @@ impl ParquetReader {
         self.engine.query_range(expr, start_s, end_s, step_s)
     }
 
+    /// Time range of data across all files in seconds, or `None` if empty.
     pub fn time_range(&self) -> Option<(f64, f64)> {
         self.engine.time_range().map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
     }
@@ -49,7 +50,7 @@ pub struct ParquetBuilder {
 }
 
 impl ParquetBuilder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { entries: Vec::new() }
     }
 
@@ -60,6 +61,7 @@ impl ParquetBuilder {
     }
 
     /// Add a file whose series will carry `labels` as additional metadata.
+    /// The labels are injected into every series from this file at query time.
     pub fn file_labeled(mut self, path: impl AsRef<Path>, labels: impl Into<Labels>) -> Self {
         self.entries.push((path.as_ref().to_path_buf(), labels.into()));
         self

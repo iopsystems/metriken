@@ -1776,7 +1776,7 @@ fn test_columns_empty_tsdb_resolves_empty_set() {
     assert!(cols.is_empty());
 }
 
-// ─── HistogramStream::merge and Parquet::open_many guard tests ─────────────────
+// ─── HistogramStream::merge and ParquetBuilder guard tests ─────────────────────
 
 #[test]
 fn test_histogram_stream_merge_two_streams() {
