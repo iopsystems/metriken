@@ -26,6 +26,7 @@ pub struct HistogramSnapshot {
     pub count: Vec<u64>,
 }
 
+#[cfg(test)]
 pub struct Histogram {
     pub labels: Labels,
     pub config: ::histogram::Config,
@@ -41,6 +42,3 @@ pub struct Gauges {
     pub series: Vec<Gauge>,
 }
 
-pub struct Histograms {
-    pub series: Vec<Histogram>,
-}
