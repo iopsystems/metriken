@@ -1294,6 +1294,20 @@ fn test_columns_histogram_count_with_label_filter() {
     );
 }
 
+#[test]
+fn test_columns_histogram_sum_resolves_buckets_column() {
+    let tsdb = Arc::new(create_columns_histogram_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let cols = engine.columns("histogram_sum(tcp_packet_latency)").unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
 // Cumulative-since-start histograms (the ingest delta path requires
 // monotonic snapshots). Two label series (`cpu` 0/1), each with
 // cumulative observation counts [0, 5, 12] all landing in the exact
@@ -1387,6 +1401,108 @@ fn test_histogram_mean_is_bucket_weighted_midpoint() {
         assert!((v - 10.0).abs() < 1e-9, "mean should be 10.0, got {v}");
     }
     assert!(!result[0].values.is_empty());
+}
+
+#[test]
+fn test_histogram_sum_is_count_times_mean() {
+    // sum across all observations = count × bucket-midpoint. With
+    // value=10 landing in an exact bucket, mean is 10.0 and sum is
+    // 10.0 × count across both cpus.
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_sum(req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].metric.get("__name__").map(String::as_str),
+        Some("req_latency")
+    );
+    let sums: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    // counts are 10 then 14 (see histogram_count test), mean is 10.0.
+    assert_eq!(sums, vec![100.0, 140.0]);
+}
+
+#[test]
+fn test_histogram_sum_label_filter_selects_single_series() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range(
+            r#"histogram_sum(req_latency{cpu="0"})"#,
+            1000.0,
+            1003.0,
+            1.0,
+        )
+        .unwrap();
+
+    let QueryResult::Matrix { result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    let sums: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
+    // counts per cpu are 5 then 7; mean is 10.0.
+    assert_eq!(sums, vec![50.0, 70.0]);
+}
+
+#[test]
+fn test_histogram_sum_by_emits_per_group_series() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine
+        .query_range("histogram_sum by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let QueryResult::Matrix { mut result } = result else {
+        panic!("expected Matrix, got {result:?}");
+    };
+    result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
+    assert_eq!(result.len(), 2);
+    for series in &result {
+        let sums: Vec<f64> = series.values.iter().map(|(_, v)| *v).collect();
+        // per cpu: counts 5,7 × mean 10.0
+        assert_eq!(sums, vec![50.0, 70.0]);
+    }
+}
+
+#[test]
+fn test_histogram_sum_metric_not_found() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let result = engine.query_range("histogram_sum(does_not_exist)", 1000.0, 1003.0, 1.0);
+    match result {
+        Err(QueryError::MetricNotFound(_)) => {}
+        other => panic!("expected MetricNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_sum_wrapping_histogram_sum_matches_bare() {
+    let tsdb = Arc::new(create_hist_exec_tsdb());
+    let engine = QueryEngine::new(tsdb);
+
+    let bare = engine
+        .query_range("histogram_sum(req_latency)", 1000.0, 1003.0, 1.0)
+        .unwrap();
+    let wrapped = engine
+        .query_range("sum(histogram_sum(req_latency))", 1000.0, 1003.0, 1.0)
+        .unwrap();
+
+    let values_of = |r: QueryResult| -> Vec<f64> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(result.len(), 1);
+        result[0].values.iter().map(|(_, v)| *v).collect()
+    };
+    assert_eq!(values_of(bare), values_of(wrapped));
 }
 
 #[test]

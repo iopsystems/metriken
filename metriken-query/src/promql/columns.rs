@@ -74,7 +74,12 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
         let (selector, _stride) = parse_optional_stride(inner.trim())?;
         return Ok(selector);
     }
-    for func in ["histogram_mean", "histogram_count", "histogram_irate"] {
+    for func in [
+        "histogram_mean",
+        "histogram_count",
+        "histogram_sum",
+        "histogram_irate",
+    ] {
         if let Some((inner, _group_by)) = parse_histogram_call(func, query)? {
             let (selector, _stride) = parse_optional_stride(inner.trim())?;
             return Ok(selector);
