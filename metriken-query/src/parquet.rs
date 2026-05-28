@@ -366,6 +366,10 @@ fn read_gauges(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, e
 
 // ─── Histogram cursor ─────────────────────────────────────────────────────────
 
+/// Streams histogram rows from a parquet file one row group at a time.
+/// Assumes row groups appear in chronological timestamp order, which
+/// metriken-exposition guarantees. Rows within each row group are sorted
+/// by (timestamp, series_idx) before being buffered.
 struct ParquetHistogramCursor {
     pf: Arc<ParquetSource>,
     ts_col_idx: usize,
@@ -394,6 +398,8 @@ impl ParquetHistogramCursor {
 
             for (si, col) in self.col_descs.iter().enumerate() {
                 let ColKind::Histogram { .. } = col.kind else { continue; };
+                // Iterator::next cannot propagate errors; fd exhaustion is treated as
+                // unrecoverable. Counter/gauge readers use ? instead.
                 let Ok(reader) = ParquetRecordBatchReaderBuilder::new_with_metadata(
                     self.pf.file.try_clone().expect("clone file handle"),
                     self.pf.meta.clone(),
@@ -451,12 +457,6 @@ impl Iterator for ParquetHistogramCursor {
         }
     }
 }
-
-// SAFETY: Arc<ParquetSource> is Send; VecDeque<HistogramRow> is Send.
-// File is not automatically Send in all contexts, but our cursor only accesses
-// the file through try_clone() which creates a new file handle per row group
-// read. This is safe.
-unsafe impl Send for ParquetHistogramCursor {}
 
 // ─── Histogram snapshot helper ────────────────────────────────────────────────
 
