@@ -14,7 +14,7 @@ use parquet::file::statistics::Statistics;
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
-use crate::types::{Counter, Counters, Gauge, Gauges, Histogram, HistogramSnapshot, Histograms};
+use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
 use crate::DataSource;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -25,7 +25,11 @@ pub struct Parquet {
 
 impl Parquet {
     pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
-        Ok(Self { engine: QueryEngine::new(ParquetSource::open(path)?) })
+        let source: Arc<ParquetSource> = ParquetSource::open(path)?;
+        // Arc<ParquetSource> implements DataSource, so wrap it in another Arc
+        // to satisfy Arc<dyn DataSource>.
+        let ds: Arc<dyn DataSource> = Arc::new(source);
+        Ok(Self { engine: QueryEngine::new(ds) })
     }
 
     pub fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError> {
@@ -91,7 +95,7 @@ impl ParquetSource {
     }
 }
 
-impl DataSource for ParquetSource {
+impl DataSource for Arc<ParquetSource> {
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
         read_counters(self, name, filter, start_ns, end_ns).ok().filter(|c| !c.series.is_empty())
     }
@@ -107,22 +111,58 @@ impl DataSource for ParquetSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        let h = read_histograms(self, name, filter, start_ns, end_ns).ok()?;
-        if h.series.is_empty() {
+        let ts_col_idx = self.meta.schema().index_of("timestamp").ok()?;
+        let interval_ns = self.sampling_interval_ms * 1_000_000;
+        let num_rgs = self.meta.metadata().num_row_groups();
+
+        let col_descs: Vec<ColDesc> = parse_schema(self, ts_col_idx)
+            .into_iter()
+            .filter(|c| {
+                matches!(c.kind, ColKind::Histogram { .. })
+                    && c.name == name
+                    && (filter.inner.is_empty() || c.labels.matches(filter))
+            })
+            .collect();
+
+        if col_descs.is_empty() {
             return None;
         }
-        let config = h.series.first()?.config;
-        let series_labels: Vec<Labels> = h.series.iter().map(|s| s.labels.clone()).collect();
-        let mut rows: Vec<HistogramRow> = Vec::new();
-        for (si, hist) in h.series.iter().enumerate() {
-            for (ts, snap) in hist.timestamps.iter().zip(hist.snapshots.iter()) {
-                rows.push(HistogramRow { series_idx: si, timestamp: *ts, snapshot: snap.clone() });
+
+        let config = col_descs.iter().find_map(|c| match c.kind {
+            ColKind::Histogram { grouping_power: gp, max_value_power: mvp } => {
+                ::histogram::Config::new(gp, mvp).ok()
             }
-        }
-        rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+            _ => None,
+        })?;
+
+        let series: Vec<Labels> = col_descs.iter().map(|c| c.labels.clone()).collect();
+
+        let rg_queue: std::collections::VecDeque<usize> = (0..num_rgs)
+            .filter(|&rg_idx| !matches!(
+                rg_classify(
+                    self.meta.metadata().row_group(rg_idx),
+                    ts_col_idx,
+                    start_ns,
+                    end_ns,
+                ),
+                RgClass::Before | RgClass::After,
+            ))
+            .collect();
+
+        let cursor = ParquetHistogramCursor {
+            pf: Arc::clone(self),
+            ts_col_idx,
+            interval_ns,
+            start_ns,
+            end_ns,
+            col_descs,
+            rg_queue,
+            pending: std::collections::VecDeque::new(),
+        };
+
         Some(HistogramStream {
-            meta: HistogramStreamMeta { config, series: series_labels },
-            rows: Box::new(rows.into_iter()),
+            meta: HistogramStreamMeta { config, series },
+            rows: Box::new(cursor),
         })
     }
 
@@ -324,64 +364,99 @@ fn read_gauges(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, e
         .collect() })
 }
 
-// ─── Histogram reader ─────────────────────────────────────────────────────────
+// ─── Histogram cursor ─────────────────────────────────────────────────────────
 
-fn read_histograms(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Result<Histograms, Box<dyn Error>> {
-    let ts_col_idx = pf.meta.schema().index_of("timestamp").map_err(|_| "missing timestamp")?;
-    let interval_ns = pf.sampling_interval_ms * 1_000_000;
-    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
-    let num_rgs = pf.meta.metadata().num_row_groups();
+struct ParquetHistogramCursor {
+    pf: Arc<ParquetSource>,
+    ts_col_idx: usize,
+    interval_ns: u64,
+    start_ns: u64,
+    end_ns: u64,
+    /// Pre-filtered histogram columns for this metric, in series-index order.
+    col_descs: Vec<ColDesc>,
+    /// Overlapping row group indices remaining to process.
+    rg_queue: std::collections::VecDeque<usize>,
+    /// Buffered rows from the current row group (sorted, ready to yield).
+    pending: std::collections::VecDeque<HistogramRow>,
+}
 
-    let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx).into_iter()
-        .filter(|c| matches!(c.kind, ColKind::Histogram { .. }) && c.name == name && (filter.inner.is_empty() || c.labels.matches(filter)))
-        .collect();
-    if cols.is_empty() { return Ok(Histograms { series: vec![] }); }
+impl ParquetHistogramCursor {
+    /// Load the next overlapping row group into `self.pending`.
+    /// Returns false if no more row groups remain.
+    fn fill_next_rg(&mut self) -> bool {
+        while let Some(rg_idx) = self.rg_queue.pop_front() {
+            let Ok(timestamps) = read_timestamps(
+                &self.pf, rg_idx, self.ts_col_idx, self.interval_ns
+            ) else { continue; };
 
-    let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
-    let mut snap_acc: Vec<Vec<HistogramSnapshot>> = vec![Vec::new(); cols.len()];
-    let mut cfg_acc: Vec<Option<::histogram::Config>> = vec![None; cols.len()];
+            let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
+            let mut rg_rows: Vec<HistogramRow> = Vec::new();
 
-    for rg_idx in 0..num_rgs {
-        match rg_classify(pf.meta.metadata().row_group(rg_idx), ts_col_idx, start_ns, end_ns) {
-            RgClass::Before | RgClass::After => continue,
-            _ => {}
-        }
-        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
-        for (i, col) in cols.iter().enumerate() {
-            let (gp, mvp) = match col.kind {
-                ColKind::Histogram { grouping_power: gp, max_value_power: mvp } => (gp, mvp),
-                _ => continue,
-            };
-            if cfg_acc[i].is_none() { cfg_acc[i] = ::histogram::Config::new(gp, mvp).ok(); }
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(pf.file.try_clone()?, pf.meta.clone())
+            for (si, col) in self.col_descs.iter().enumerate() {
+                let ColKind::Histogram { .. } = col.kind else { continue; };
+                let Ok(reader) = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    self.pf.file.try_clone().expect("clone file handle"),
+                    self.pf.meta.clone(),
+                )
                 .with_row_groups(vec![rg_idx])
                 .with_projection(ProjectionMask::roots(&parquet_schema, [col.col_idx]))
-                .build()?;
-            let mut row = 0usize;
-            for batch in reader.flatten() {
-                let list = batch.column(0).as_any().downcast_ref::<ListArray>().expect("histogram column is not List");
-                for value in list.iter() {
-                    let Some(Some(ts)) = timestamps.get(row).copied() else { row += 1; continue; };
-                    if ts >= start_ns && ts <= end_ns {
+                .build() else { continue; };
+
+                let mut row = 0usize;
+                for batch in reader.flatten() {
+                    let list = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("histogram column is not List");
+                    for value in list.iter() {
+                        let ts = timestamps.get(row).copied().flatten();
+                        row += 1;
+                        let Some(ts) = ts else { continue; };
+                        if ts < self.start_ns || ts > self.end_ns { continue; }
                         let snap = value
-                            .and_then(|lv| lv.as_any().downcast_ref::<UInt64Array>().map(raw_to_sparse_cumulative))
+                            .and_then(|lv| lv.as_any().downcast_ref::<UInt64Array>()
+                                .map(raw_to_sparse_cumulative))
                             .unwrap_or_else(|| HistogramSnapshot { index: vec![], count: vec![] });
-                        snap_acc[i].push(snap);
-                        ts_acc[i].push(ts);
+                        rg_rows.push(HistogramRow {
+                            series_idx: si,
+                            timestamp: ts,
+                            snapshot: snap,
+                        });
                     }
-                    row += 1;
                 }
+            }
+
+            if !rg_rows.is_empty() {
+                rg_rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+                self.pending.extend(rg_rows);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Iterator for ParquetHistogramCursor {
+    type Item = HistogramRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Some(row);
+            }
+            if !self.fill_next_rg() {
+                return None;
             }
         }
     }
-
-    Ok(Histograms { series: cols.into_iter().zip(ts_acc).zip(snap_acc).zip(cfg_acc)
-        .filter(|(((_, ts), _), _)| !ts.is_empty())
-        .filter_map(|(((col, timestamps), snapshots), cfg)| {
-            Some(Histogram { labels: col.labels, config: cfg?, timestamps, snapshots })
-        })
-        .collect() })
 }
+
+// SAFETY: Arc<ParquetSource> is Send; VecDeque<HistogramRow> is Send.
+// File is not automatically Send in all contexts, but our cursor only accesses
+// the file through try_clone() which creates a new file handle per row group
+// read. This is safe.
+unsafe impl Send for ParquetHistogramCursor {}
 
 // ─── Histogram snapshot helper ────────────────────────────────────────────────
 
