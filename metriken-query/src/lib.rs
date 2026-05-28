@@ -3,6 +3,7 @@ pub(crate) mod labels;
 pub(crate) mod memory;
 pub mod parquet;
 pub(crate) mod promql;
+pub(crate) mod histogram_stream;
 pub(crate) mod types;
 
 pub use parquet::Parquet;
