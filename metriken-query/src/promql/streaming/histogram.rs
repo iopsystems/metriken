@@ -323,9 +323,6 @@ fn reduce(
                             }
                         }
                     }
-                    for g in 0..g_count {
-                        accum_per_group[g].clear();
-                    }
                 }
             }
         }
@@ -697,6 +694,8 @@ fn heatmap_impl(
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
+/// Flush `accum` into scratch buffers as a running cumulative. Clears `accum`.
+/// Returns `false` if the result is empty.
 fn flush_accum(
     accum: &mut BTreeMap<u32, u64>,
     scratch_idx: &mut Vec<u32>,
