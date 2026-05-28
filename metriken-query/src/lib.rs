@@ -7,7 +7,7 @@ pub(crate) mod types;
 pub(crate) mod histogram_stream;
 
 pub use parquet::{ParquetBuilder, ParquetReader};
-pub use promql::{QueryError, QueryResult};
+pub use promql::{HistogramHeatmapResult, QueryError, QueryResult, Sample};
 
 use histogram_stream::HistogramStream;
 use labels::Labels;
