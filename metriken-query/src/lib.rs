@@ -1,12 +1,13 @@
 pub(crate) mod labels;
-#[cfg(test)]
 pub(crate) mod memory;
 pub mod parquet;
 pub(crate) mod promql;
 pub(crate) mod types;
 pub(crate) mod histogram_stream;
+pub(crate) mod memory_store;
 
 pub use parquet::{ParquetBuilder, ParquetReader};
+pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use promql::{HistogramHeatmapResult, QueryError, QueryResult, Sample};
 
 use histogram_stream::HistogramStream;

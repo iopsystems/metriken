@@ -27,6 +27,10 @@ impl Memory {
         }
     }
 
+    pub(crate) fn set_interval_ms(&mut self, ms: u64) {
+        self.interval_ms = ms;
+    }
+
     pub(crate) fn add_counter(&mut self, name: &str, counter: Counter) {
         self.counters.entry(name.to_string()).or_default().push(counter);
     }

@@ -26,7 +26,6 @@ pub struct HistogramSnapshot {
     pub count: Vec<u64>,
 }
 
-#[cfg(test)]
 pub struct Histogram {
     pub labels: Labels,
     pub config: ::histogram::Config,
