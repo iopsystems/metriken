@@ -35,6 +35,9 @@ impl Parquet {
     /// Open multiple parquet files and merge their data into a single query engine.
     /// Histograms are streamed via k-way merge; counters and gauges are concatenated.
     pub fn open_many(paths: &[&Path]) -> Result<Self, Box<dyn Error>> {
+        if paths.is_empty() {
+            return Err("open_many requires at least one path".into());
+        }
         let files: Result<Vec<Arc<ParquetSource>>, Box<dyn Error>> =
             paths.iter().map(|p| ParquetSource::open(p)).collect();
         let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
@@ -58,6 +61,10 @@ struct MultiParquetSource {
 }
 
 impl DataSource for MultiParquetSource {
+    // NOTE: Counter and gauge series are naively concatenated across files.
+    // For rolling files where the same metric/label appears in multiple files,
+    // this produces duplicate series. Histogram streams are correctly merged
+    // via k-way merge; counter/gauge dedup is a follow-on task.
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
         let series: Vec<Counter> = self.files.iter()
             .flat_map(|pf| {
