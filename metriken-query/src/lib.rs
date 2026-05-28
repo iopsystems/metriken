@@ -8,7 +8,7 @@ pub(crate) mod memory_store;
 
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
-pub use promql::{HistogramHeatmapResult, QueryError, QueryResult, Sample};
+pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
 
 use histogram_stream::HistogramStream;
 use labels::Labels;

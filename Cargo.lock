@@ -859,6 +859,7 @@ dependencies = [
  "arrow",
  "bytes",
  "histogram",
+ "metriken-exposition",
  "parquet",
  "promql-parser",
  "serde",
