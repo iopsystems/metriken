@@ -364,9 +364,9 @@ pub fn mean(
 }
 
 /// Sum of all observations per `(group, tick)` — `count × mean` off
-/// the merged `Ref`, derived from bucket midpoints (the histogram crate
-/// doesn't store a separate Prometheus-native `sum` field). Both
-/// underlying reads are O(1) on the Ref.
+/// the merged `Ref`. The histogram crate doesn't carry a native `sum`
+/// field, so this is bucket-midpoint-approximated (exact for values
+/// inside the linear region of the histogram config).
 pub fn sum(
     collection: &HistogramCollection,
     label_filter: &Labels,

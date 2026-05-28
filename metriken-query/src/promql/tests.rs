@@ -1405,9 +1405,7 @@ fn test_histogram_mean_is_bucket_weighted_midpoint() {
 
 #[test]
 fn test_histogram_sum_is_count_times_mean() {
-    // sum across all observations = count × bucket-midpoint. With
-    // value=10 landing in an exact bucket, mean is 10.0 and sum is
-    // 10.0 × count across both cpus.
+    // value=10 is an exact bucket so mean=10.0; sum = 10.0 × count.
     let tsdb = Arc::new(create_hist_exec_tsdb());
     let engine = QueryEngine::new(tsdb);
 
@@ -1424,7 +1422,6 @@ fn test_histogram_sum_is_count_times_mean() {
         Some("req_latency")
     );
     let sums: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
-    // counts are 10 then 14 (see histogram_count test), mean is 10.0.
     assert_eq!(sums, vec![100.0, 140.0]);
 }
 
@@ -1446,7 +1443,6 @@ fn test_histogram_sum_label_filter_selects_single_series() {
         panic!("expected Matrix, got {result:?}");
     };
     let sums: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
-    // counts per cpu are 5 then 7; mean is 10.0.
     assert_eq!(sums, vec![50.0, 70.0]);
 }
 
@@ -1466,7 +1462,6 @@ fn test_histogram_sum_by_emits_per_group_series() {
     assert_eq!(result.len(), 2);
     for series in &result {
         let sums: Vec<f64> = series.values.iter().map(|(_, v)| *v).collect();
-        // per cpu: counts 5,7 × mean 10.0
         assert_eq!(sums, vec![50.0, 70.0]);
     }
 }
