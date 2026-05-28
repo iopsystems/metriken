@@ -1841,3 +1841,89 @@ fn test_parquet_builder_empty_errors() {
     let result = ParquetReader::builder().build();
     assert!(result.is_err());
 }
+
+// ─── Label injection tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_file_labeled_injects_labels_into_series() {
+    use crate::histogram_stream::HistogramStream;
+
+    // Two "files": source_a gets run="a" injected, source_b gets run="b"
+    let source_a = Arc::new(create_hist_source(&[0, 5]));
+    let mut stream_a = source_a
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_a.meta.series {
+        labels.inner.insert("run".to_string(), "a".to_string());
+    }
+
+    let source_b = Arc::new(create_hist_source(&[0, 3]));
+    let mut stream_b = source_b
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_b.meta.series {
+        labels.inner.insert("run".to_string(), "b".to_string());
+    }
+
+    let merged = HistogramStream::merge(vec![stream_a, stream_b]).unwrap();
+
+    // 2 cpus × 2 runs = 4 global series
+    assert_eq!(merged.meta.series.len(), 4);
+    // Every series must have a "run" label
+    for s in &merged.meta.series {
+        assert!(s.inner.contains_key("run"), "series missing injected 'run' label: {:?}", s);
+    }
+    // Both run values must be present
+    let run_values: std::collections::HashSet<String> = merged.meta.series.iter()
+        .filter_map(|s| s.inner.get("run").cloned())
+        .collect();
+    assert!(run_values.contains("a"), "run=a missing");
+    assert!(run_values.contains("b"), "run=b missing");
+}
+
+#[test]
+fn test_histogram_stream_merge_single_passthrough() {
+    use crate::histogram_stream::HistogramStream;
+
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let stream = source
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    let n_series = stream.meta.series.len();
+    let merged = HistogramStream::merge(vec![stream]).unwrap();
+    assert_eq!(merged.meta.series.len(), n_series);
+}
+
+#[test]
+fn test_injected_label_filter_excludes_incompatible_file() {
+    use crate::histogram_stream::HistogramStream;
+
+    let source_a = Arc::new(create_hist_source(&[0, 5]));
+    let mut stream_a = source_a
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_a.meta.series {
+        labels.inner.insert("run".to_string(), "a".to_string());
+    }
+
+    let source_b = Arc::new(create_hist_source(&[0, 3]));
+    let mut stream_b = source_b
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_b.meta.series {
+        labels.inner.insert("run".to_string(), "b".to_string());
+    }
+
+    let merged = HistogramStream::merge(vec![stream_a, stream_b]).unwrap();
+
+    // Filter the merged stream to only run="a" series
+    let run_a_filter = make_labels(&[("run", "a")]);
+    let series_matching_a: Vec<_> = merged.meta.series.iter()
+        .filter(|s| s.matches(&run_a_filter))
+        .collect();
+
+    assert_eq!(series_matching_a.len(), 2, "should get 2 series (cpu=0,1) with run=a");
+    for s in &series_matching_a {
+        assert_eq!(s.inner.get("run").map(String::as_str), Some("a"));
+    }
+}
