@@ -32,6 +32,15 @@ impl Parquet {
         Ok(Self { engine: QueryEngine::new(ds) })
     }
 
+    /// Open multiple parquet files and merge their data into a single query engine.
+    /// Histograms are streamed via k-way merge; counters and gauges are concatenated.
+    pub fn open_many(paths: &[&Path]) -> Result<Self, Box<dyn Error>> {
+        let files: Result<Vec<Arc<ParquetSource>>, Box<dyn Error>> =
+            paths.iter().map(|p| ParquetSource::open(p)).collect();
+        let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
+        Ok(Self { engine: QueryEngine::new(source) })
+    }
+
     pub fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError> {
         self.engine.query_range(expr, start_s, end_s, step_s)
     }
@@ -39,6 +48,75 @@ impl Parquet {
     /// Time range of data in the file in seconds, or `None` if the file is empty.
     pub fn time_range(&self) -> Option<(f64, f64)> {
         self.engine.time_range().map(|(min_ns, max_ns)| (min_ns as f64 / 1e9, max_ns as f64 / 1e9))
+    }
+}
+
+// ─── Multi-file source ────────────────────────────────────────────────────────
+
+struct MultiParquetSource {
+    files: Vec<Arc<ParquetSource>>,
+}
+
+impl DataSource for MultiParquetSource {
+    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
+        let series: Vec<Counter> = self.files.iter()
+            .flat_map(|pf| {
+                read_counters(pf, name, filter, start_ns, end_ns)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|c| c.series)
+            })
+            .collect();
+        if series.is_empty() { None } else { Some(Counters { series }) }
+    }
+
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        let series: Vec<Gauge> = self.files.iter()
+            .flat_map(|pf| {
+                read_gauges(pf, name, filter, start_ns, end_ns)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|g| g.series)
+            })
+            .collect();
+        if series.is_empty() { None } else { Some(Gauges { series }) }
+    }
+
+    fn histogram_stream(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<HistogramStream> {
+        let streams: Vec<HistogramStream> = self.files.iter()
+            .filter_map(|pf| pf.histogram_stream(name, filter, start_ns, end_ns))
+            .collect();
+        HistogramStream::merge(streams)
+    }
+
+    fn interval(&self) -> f64 {
+        self.files.iter()
+            .map(|pf| pf.sampling_interval_ms as f64 / 1000.0)
+            .fold(f64::MAX, f64::min)
+    }
+
+    fn time_range(&self) -> Option<(u64, u64)> {
+        let (mut lo, mut hi): (Option<u64>, Option<u64>) = (None, None);
+        for pf in &self.files {
+            if let Some((a, b)) = pf.time_range_from_stats() {
+                lo = Some(lo.map_or(a, |m: u64| m.min(a)));
+                hi = Some(hi.map_or(b, |m: u64| m.max(b)));
+            }
+        }
+        lo.zip(hi)
+    }
+
+    #[cfg(test)]
+    fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        let mut out = std::collections::HashMap::new();
+        for pf in &self.files {
+            for (metric, cols) in pf.column_map() {
+                out.entry(metric)
+                    .or_insert_with(std::collections::HashMap::new)
+                    .extend(cols);
+            }
+        }
+        out
     }
 }
 
