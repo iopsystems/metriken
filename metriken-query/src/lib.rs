@@ -39,6 +39,10 @@ pub(crate) trait DataSource: Send + Sync {
     fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
     /// All label combinations for the named histogram metric. Empty if unknown.
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
+    /// Key-value metadata from the file footer. Default returns empty.
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
     /// Parquet column name for every `(metric_name, labels)` pair.
     #[cfg(test)]
     fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;

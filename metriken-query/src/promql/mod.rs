@@ -342,6 +342,9 @@ impl QueryEngine {
         self.source.histogram_labels(name)
     }
     pub(crate) fn interval(&self) -> f64 { self.source.interval() }
+    pub(crate) fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.source.file_metadata()
+    }
 
     /// Execute an instant query at a single timestamp (test helper).
     #[cfg(test)]

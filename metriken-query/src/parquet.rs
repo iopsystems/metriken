@@ -21,6 +21,7 @@ use crate::DataSource;
 
 pub struct ParquetReader {
     engine: QueryEngine,
+    _cleanup: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl ParquetReader {
@@ -71,6 +72,26 @@ impl ParquetReader {
 
     /// Sampling interval in seconds. For multi-file readers, returns the finest interval.
     pub fn interval(&self) -> f64 { self.engine.interval() }
+
+    /// Tie a cleanup resource to this reader's lifetime. The guard is dropped
+    /// when the reader is dropped. Typical use: pass a `NamedTempFile` so the
+    /// backing file is deleted when the reader is evicted from cache.
+    pub fn with_cleanup(mut self, guard: impl std::any::Any + Send + Sync + 'static) -> Self {
+        self._cleanup = Some(Box::new(guard));
+        self
+    }
+
+    /// Key-value metadata from the parquet file footer.
+    /// For multi-file readers, merges across all files (last file wins on collision).
+    pub fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.engine.file_metadata()
+    }
+
+    /// Convenience: the `source` key from file metadata (e.g. "rezolus").
+    /// Returns an empty string if absent.
+    pub fn source(&self) -> String {
+        self.engine.file_metadata().remove("source").unwrap_or_default()
+    }
 }
 
 // ─── Builder ──────────────────────────────────────────────────────────────────
@@ -117,7 +138,7 @@ impl ParquetBuilder {
             .map(|(path, labels)| Ok((ParquetSource::open(&path)?, labels)))
             .collect();
         let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
-        Ok(ParquetReader { engine: QueryEngine::new(source) })
+        Ok(ParquetReader { engine: QueryEngine::new(source), _cleanup: None })
     }
 }
 
@@ -229,6 +250,14 @@ impl DataSource for MultiParquetSource {
             })
             .collect();
         HistogramStream::merge(streams)
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for (pf, _) in &self.files {
+            out.extend(pf.read_file_metadata());
+        }
+        out
     }
 
     fn interval(&self) -> f64 {
@@ -385,6 +414,16 @@ impl ParquetSource {
             .unwrap_or(1000);
 
         Ok(Arc::new(Self { file, meta, sampling_interval_ms }))
+    }
+
+    fn read_file_metadata(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        if let Some(kv) = self.meta.metadata().file_metadata().key_value_metadata() {
+            for entry in kv {
+                out.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+            }
+        }
+        out
     }
 
     fn time_range_from_stats(&self) -> Option<(u64, u64)> {
