@@ -49,6 +49,12 @@ pub struct ParquetBuilder {
     entries: Vec<(std::path::PathBuf, Labels)>,
 }
 
+impl Default for ParquetBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParquetBuilder {
     pub fn new() -> Self {
         Self { entries: Vec::new() }
@@ -62,6 +68,10 @@ impl ParquetBuilder {
 
     /// Add a file whose series will carry `labels` as additional metadata.
     /// The labels are injected into every series from this file at query time.
+    ///
+    /// # Precondition
+    /// Injected label keys must not conflict with column labels already present
+    /// in the parquet file's schema; if they do, the native value is overwritten.
     pub fn file_labeled(mut self, path: impl AsRef<Path>, labels: impl Into<Labels>) -> Self {
         self.entries.push((path.as_ref().to_path_buf(), labels.into()));
         self
@@ -122,40 +132,48 @@ impl DataSource for MultiParquetSource {
     // Label injection via file_labeled() enables filtering on injected keys.
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters> {
         let series: Vec<Counter> = self.files.iter()
-            .flat_map(|(pf, extra)| {
+            .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
                 let counters = read_counters(pf, name, &pq_filter, start_ns, end_ns).ok()?;
-                Some(counters.series.into_iter().map({
-                    let extra = extra.clone();
-                    move |mut c| {
-                        for (k, v) in &extra.inner {
-                            c.labels.inner.insert(k.clone(), v.clone());
-                        }
-                        c
-                    }
-                }))
+                Some((counters.series, extra.clone()))
             })
-            .flatten()
+            .flat_map(|(series, extra)| {
+                series.into_iter().map(move |mut c| {
+                    for (k, v) in &extra.inner {
+                        debug_assert!(
+                            !c.labels.inner.contains_key(k),
+                            "injected label key '{}' conflicts with native parquet label",
+                            k
+                        );
+                        c.labels.inner.insert(k.clone(), v.clone());
+                    }
+                    c
+                })
+            })
             .collect();
         if series.is_empty() { None } else { Some(Counters { series }) }
     }
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let series: Vec<Gauge> = self.files.iter()
-            .flat_map(|(pf, extra)| {
+            .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
                 let gauges = read_gauges(pf, name, &pq_filter, start_ns, end_ns).ok()?;
-                Some(gauges.series.into_iter().map({
-                    let extra = extra.clone();
-                    move |mut g| {
-                        for (k, v) in &extra.inner {
-                            g.labels.inner.insert(k.clone(), v.clone());
-                        }
-                        g
-                    }
-                }))
+                Some((gauges.series, extra.clone()))
             })
-            .flatten()
+            .flat_map(|(series, extra)| {
+                series.into_iter().map(move |mut g| {
+                    for (k, v) in &extra.inner {
+                        debug_assert!(
+                            !g.labels.inner.contains_key(k),
+                            "injected label key '{}' conflicts with native parquet label",
+                            k
+                        );
+                        g.labels.inner.insert(k.clone(), v.clone());
+                    }
+                    g
+                })
+            })
             .collect();
         if series.is_empty() { None } else { Some(Gauges { series }) }
     }
@@ -168,6 +186,11 @@ impl DataSource for MultiParquetSource {
                 if !extra.inner.is_empty() {
                     for series_labels in &mut stream.meta.series {
                         for (k, v) in &extra.inner {
+                            debug_assert!(
+                                !series_labels.inner.contains_key(k),
+                                "injected label key '{}' conflicts with native parquet label",
+                                k
+                            );
                             series_labels.inner.insert(k.clone(), v.clone());
                         }
                     }
