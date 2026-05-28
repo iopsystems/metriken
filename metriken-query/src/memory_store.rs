@@ -23,12 +23,23 @@ pub struct MemoryStore {
 pub(crate) struct MemoryStoreInner {
     pub(crate) memory: RwLock<Memory>,
     pub(crate) metadata: RwLock<HashMap<String, String>>,
+    pub(crate) filename: RwLock<Option<String>>,
 }
 
 impl MemoryStore {
     /// Create a builder for configuring and constructing a `MemoryStore`.
     pub fn builder() -> MemoryStoreBuilder {
         MemoryStoreBuilder::default()
+    }
+
+    /// Set or replace the display name.
+    pub fn set_filename(&self, name: impl Into<String>) {
+        *self.state.filename.write().unwrap() = Some(name.into());
+    }
+
+    /// Return the display name, if set.
+    pub fn filename(&self) -> Option<String> {
+        self.state.filename.read().unwrap().clone()
     }
 
     /// Set or replace the `source` metadata key.
@@ -109,26 +120,19 @@ impl MemoryStore {
         self.state.memory.read().unwrap().interval()
     }
 
+    /// Look up a single metadata value by key.
+    pub fn metadata_get(&self, key: &str) -> Option<String> {
+        self.state.metadata.read().unwrap().get(key).cloned()
+    }
+
     /// Convenience: the `source` key from metadata. Returns an empty string if absent.
     pub fn source(&self) -> String {
-        self.state
-            .metadata
-            .read()
-            .unwrap()
-            .get("source")
-            .cloned()
-            .unwrap_or_default()
+        self.metadata_get("source").unwrap_or_default()
     }
 
     /// Convenience: the `version` key from metadata. Returns an empty string if absent.
     pub fn version(&self) -> String {
-        self.state
-            .metadata
-            .read()
-            .unwrap()
-            .get("version")
-            .cloned()
-            .unwrap_or_default()
+        self.metadata_get("version").unwrap_or_default()
     }
 
     /// Key-value metadata for this store.
@@ -175,6 +179,7 @@ pub struct MemoryStoreBuilder {
     source: Option<String>,
     version: Option<String>,
     sampling_interval_ms: Option<u64>,
+    filename: Option<String>,
 }
 
 impl MemoryStoreBuilder {
@@ -196,6 +201,12 @@ impl MemoryStoreBuilder {
         self
     }
 
+    /// Set the display name.
+    pub fn filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
     /// Construct the [`MemoryStore`].
     pub fn build(self) -> MemoryStore {
         let interval_ms = self.sampling_interval_ms.unwrap_or(1000);
@@ -211,6 +222,7 @@ impl MemoryStoreBuilder {
             state: Arc::new(MemoryStoreInner {
                 memory: RwLock::new(memory),
                 metadata: RwLock::new(metadata),
+                filename: RwLock::new(self.filename),
             }),
         }
     }
@@ -287,6 +299,10 @@ impl DataSource for MemoryStoreInner {
         self.metadata.read().unwrap().clone()
     }
 
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.metadata.read().unwrap().get(key).cloned()
+    }
+
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
         self.memory.read().unwrap().column_map()
     }
@@ -329,6 +345,14 @@ impl MetricsSource for MemoryStore {
         MemoryStore::version(self)
     }
 
+    fn filename(&self) -> Option<String> {
+        MemoryStore::filename(self)
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        MemoryStore::metadata_get(self, key)
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         MemoryStore::file_metadata(self)
     }
@@ -369,7 +393,7 @@ impl MemoryStore {
     /// For histograms: a `HistogramSnapshot` is stored representing the
     /// cumulative (running) bucket counts. Quantile/rate computations are
     /// performed at query time against pairs of consecutive snapshots.
-    pub fn ingest_snapshot(&self, snapshot: &mut metriken_exposition::Snapshot) {
+    pub fn ingest_snapshot(&self, mut snapshot: metriken_exposition::Snapshot) {
         use crate::memory::extract_name_labels;
         use crate::types::HistogramSnapshot;
 
@@ -539,10 +563,10 @@ mod ingest_tests {
             .build();
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1001);
-        let mut s0 = make_counter_snap(t0, "cpu_cycles", 100, &[("cpu", "0")]);
-        let mut s1 = make_counter_snap(t1, "cpu_cycles", 200, &[("cpu", "0")]);
-        store.ingest_snapshot(&mut s0);
-        store.ingest_snapshot(&mut s1);
+        let s0 = make_counter_snap(t0, "cpu_cycles", 100, &[("cpu", "0")]);
+        let s1 = make_counter_snap(t1, "cpu_cycles", 200, &[("cpu", "0")]);
+        store.ingest_snapshot(s0);
+        store.ingest_snapshot(s1);
 
         assert!(store.counter_names().contains(&"cpu_cycles".to_string()));
         let labels = store.counter_labels("cpu_cycles");
@@ -561,10 +585,10 @@ mod ingest_tests {
             .sampling_interval_ms(1000)
             .build();
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-        let mut s0 = make_counter_snap(t0, "cpu_cycles", 100, &[("cpu", "0")]);
-        let mut s1 = make_counter_snap(t0, "cpu_cycles", 200, &[("cpu", "1")]);
-        store.ingest_snapshot(&mut s0);
-        store.ingest_snapshot(&mut s1);
+        let s0 = make_counter_snap(t0, "cpu_cycles", 100, &[("cpu", "0")]);
+        let s1 = make_counter_snap(t0, "cpu_cycles", 200, &[("cpu", "1")]);
+        store.ingest_snapshot(s0);
+        store.ingest_snapshot(s1);
 
         let labels = store.counter_labels("cpu_cycles");
         assert_eq!(labels.len(), 2);

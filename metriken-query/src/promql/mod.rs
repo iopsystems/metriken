@@ -345,10 +345,9 @@ impl QueryEngine {
         self.source.file_metadata()
     }
 
-    /// Convenience: the `version` key from file metadata.
-    /// Returns an empty string if absent.
-    pub(crate) fn version(&self) -> String {
-        self.source.file_metadata().remove("version").unwrap_or_default()
+    /// Look up a single metadata value by key without cloning the full map.
+    pub(crate) fn metadata_get(&self, key: &str) -> Option<String> {
+        self.source.metadata_get(key)
     }
 
     /// Execute an instant query at a single timestamp.

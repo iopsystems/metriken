@@ -22,7 +22,7 @@ use crate::{DataSource, MetricsSource};
 
 pub struct ParquetReader {
     engine: QueryEngine,
-    _cleanup: Option<Box<dyn std::any::Any + Send + Sync>>,
+    filename: Option<String>,
 }
 
 impl ParquetReader {
@@ -31,13 +31,39 @@ impl ParquetReader {
     }
 
     /// Convenience: open a single file with no extra labels.
+    /// The `filename()` defaults to the path's basename.
     pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
-        Self::builder().file(path).build()
+        let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        let source = ParquetSource::open(path)?;
+        let ds: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
+        Ok(Self { engine: QueryEngine::new(ds), filename })
     }
 
     /// Convenience: open a parquet file from raw bytes (e.g. from a browser file upload).
     pub fn open_bytes(bytes: impl Into<Bytes>) -> Result<Self, Box<dyn Error>> {
         Self::builder().bytes(bytes).build()
+    }
+
+    /// Open a parquet from an already-open file handle. Useful for the
+    /// "open-then-unlink" temp-file pattern: `NamedTempFile::into_file()`
+    /// hands you an owned `File` whose disk path has been removed, and the
+    /// data persists as long as the reader (and its `File`) is alive.
+    pub fn open_file(file: File) -> Result<Self, Box<dyn Error>> {
+        let source = ParquetSource::open_file(file)?;
+        let ds: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
+        Ok(Self { engine: QueryEngine::new(ds), filename: None })
+    }
+
+    /// Set the display name. Useful when constructing from bytes or
+    /// after the fact (e.g. a WASM viewer setting the original upload name).
+    pub fn with_filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
+    /// Return the display name, if set.
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
     }
 
     pub fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError> {
@@ -79,30 +105,27 @@ impl ParquetReader {
     /// Sampling interval in seconds. For multi-file readers, returns the finest interval.
     pub fn interval(&self) -> f64 { self.engine.interval() }
 
-    /// Tie a cleanup resource to this reader's lifetime. The guard is dropped
-    /// when the reader is dropped. Typical use: pass a `NamedTempFile` so the
-    /// backing file is deleted when the reader is evicted from cache.
-    pub fn with_cleanup(mut self, guard: impl std::any::Any + Send + Sync + 'static) -> Self {
-        self._cleanup = Some(Box::new(guard));
-        self
-    }
-
     /// Key-value metadata from the parquet file footer.
     /// For multi-file readers, merges across all files (last file wins on collision).
     pub fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         self.engine.file_metadata()
     }
 
+    /// Look up a single metadata value by key without cloning the full map.
+    pub fn metadata_get(&self, key: &str) -> Option<String> {
+        self.engine.metadata_get(key)
+    }
+
     /// Convenience: the `source` key from file metadata (e.g. "rezolus").
     /// Returns an empty string if absent.
     pub fn source(&self) -> String {
-        self.engine.file_metadata().remove("source").unwrap_or_default()
+        self.engine.metadata_get("source").unwrap_or_default()
     }
 
     /// Convenience: the `version` key from file metadata.
     /// Returns an empty string if absent.
     pub fn version(&self) -> String {
-        self.engine.version()
+        self.engine.metadata_get("version").unwrap_or_default()
     }
 
     /// Execute an instant PromQL query at a single timestamp.
@@ -147,6 +170,14 @@ impl MetricsSource for ParquetReader {
         self.version()
     }
 
+    fn filename(&self) -> Option<String> {
+        self.filename.clone()
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.metadata_get(key)
+    }
+
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         self.file_metadata()
     }
@@ -185,6 +216,7 @@ enum BuilderEntry {
 
 pub struct ParquetBuilder {
     entries: Vec<BuilderEntry>,
+    filename: Option<String>,
 }
 
 impl Default for ParquetBuilder {
@@ -195,7 +227,7 @@ impl Default for ParquetBuilder {
 
 impl ParquetBuilder {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self { entries: Vec::new(), filename: None }
     }
 
     /// Add a file with no extra labels.
@@ -229,10 +261,25 @@ impl ParquetBuilder {
         self
     }
 
+    /// Override the display name. Takes priority over basename auto-detection.
+    pub fn filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
     pub fn build(self) -> Result<ParquetReader, Box<dyn Error>> {
         if self.entries.is_empty() {
             return Err("ParquetReader requires at least one file".into());
         }
+        // Resolve filename: explicit > single-path basename > None
+        let filename = self.filename.or_else(|| {
+            if self.entries.len() == 1 {
+                if let BuilderEntry::Path(ref p, _) = self.entries[0] {
+                    return p.file_name().and_then(|n| n.to_str()).map(String::from);
+                }
+            }
+            None
+        });
         let files: Result<Vec<(Arc<ParquetSource>, Labels)>, Box<dyn Error>> = self
             .entries
             .into_iter()
@@ -242,7 +289,7 @@ impl ParquetBuilder {
             })
             .collect();
         let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
-        Ok(ParquetReader { engine: QueryEngine::new(source), _cleanup: None })
+        Ok(ParquetReader { engine: QueryEngine::new(source), filename })
     }
 }
 
@@ -362,6 +409,17 @@ impl DataSource for MultiParquetSource {
             out.extend(pf.read_file_metadata());
         }
         out
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        // Walk files; last value wins (matches file_metadata() merge semantics).
+        let mut last: Option<String> = None;
+        for (pf, _) in &self.files {
+            if let Some(v) = pf.read_file_metadata_value(key) {
+                last = Some(v);
+            }
+        }
+        last
     }
 
     fn interval(&self) -> f64 {
@@ -530,6 +588,12 @@ impl ParquetSource {
         Ok(Arc::new(Self { backing: ParquetBacking::Bytes(bytes), meta, sampling_interval_ms }))
     }
 
+    fn open_file(file: File) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self { backing: ParquetBacking::File(file), meta, sampling_interval_ms }))
+    }
+
     fn build_batch_reader(
         &self,
         rg_idx: usize,
@@ -560,6 +624,13 @@ impl ParquetSource {
             }
         }
         out
+    }
+
+    /// Walk key-value metadata entries looking for `key` without building a HashMap.
+    fn read_file_metadata_value(&self, key: &str) -> Option<String> {
+        self.meta.metadata().file_metadata().key_value_metadata()?.iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.clone().unwrap_or_default())
     }
 
     fn time_range_from_stats(&self) -> Option<(u64, u64)> {

@@ -44,6 +44,10 @@ pub(crate) trait DataSource: Send + Sync {
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
     }
+    /// Look up a single metadata value by key without cloning the full map.
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.file_metadata().get(key).cloned()
+    }
     /// Parquet column name for every `(metric_name, labels)` pair.
     fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;
 }
@@ -61,7 +65,7 @@ pub(crate) trait DataSource: Send + Sync {
 ///     println!("counters: {:?}", src.counter_names());
 /// }
 /// ```
-pub trait MetricsSource {
+pub trait MetricsSource: Send + Sync {
     /// Execute a PromQL range query.
     fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError>;
 
@@ -87,6 +91,15 @@ pub trait MetricsSource {
     /// Returns an empty string if absent.
     fn version(&self) -> String;
 
+    /// Optional display name. For `ParquetReader::open(path)` this defaults to
+    /// the path's basename. For bytes-backed or builder-constructed readers it's
+    /// `None` unless explicitly set.
+    fn filename(&self) -> Option<String>;
+
+    /// Look up a single metadata value by key. Avoids cloning the full
+    /// metadata map when callers only need one entry.
+    fn metadata_get(&self, key: &str) -> Option<String>;
+
     /// Key-value metadata from the file footer.
     fn file_metadata(&self) -> std::collections::HashMap<String, String>;
 
@@ -107,6 +120,23 @@ pub trait MetricsSource {
 
     /// All label combinations for the named histogram metric. Empty if unknown.
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
+
+    /// Distinct values of `key` across all series for `metric`. Walks counter,
+    /// gauge, and histogram series and returns the union. Returns empty if the
+    /// metric is unknown or no series carry the key.
+    fn label_values(&self, metric: &str, key: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for labels in self.counter_labels(metric) {
+            if let Some(v) = labels.get(key) { out.insert(v.clone()); }
+        }
+        for labels in self.gauge_labels(metric) {
+            if let Some(v) = labels.get(key) { out.insert(v.clone()); }
+        }
+        for labels in self.histogram_labels(metric) {
+            if let Some(v) = labels.get(key) { out.insert(v.clone()); }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +147,22 @@ mod trait_impls {
     fn _assert_parquet_reader_is_metrics_source<T: MetricsSource>(_: &T) {}
     fn _check(_reader: &ParquetReader) {
         _assert_parquet_reader_is_metrics_source(_reader);
+    }
+
+    /// Compile-time check: `Arc<dyn MetricsSource>` is Send + Sync via the supertrait.
+    #[test]
+    fn test_metrics_source_dyn_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>(_: T) {}
+        fn _check(s: std::sync::Arc<dyn MetricsSource>) {
+            assert_send_sync(s);
+        }
+    }
+
+    /// Compile-time check: `ParquetReader::open_file` accepts a `std::fs::File`.
+    #[test]
+    fn test_open_file_compiles() {
+        fn _check(f: std::fs::File) {
+            let _ = ParquetReader::open_file(f);
+        }
     }
 }
