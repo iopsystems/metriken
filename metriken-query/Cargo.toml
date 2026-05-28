@@ -15,6 +15,7 @@ repository = "https://github.com/iopsystems/metriken"
 arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
+metriken-exposition = { path = "../metriken-exposition", default-features = false, features = ["serde"], optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true
@@ -26,4 +27,5 @@ tempfile.workspace = true
 
 [features]
 default = ["lz4"]
+ingest = ["dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::types::{
-    Counter, Counters, Gauge, Gauges, Histogram,
+    Counter, Counters, Gauge, Gauges, Histogram, HistogramSnapshot,
 };
 use crate::DataSource;
 
@@ -42,6 +42,82 @@ impl Memory {
     pub(crate) fn add_histogram(&mut self, name: &str, histogram: Histogram) {
         self.histograms.entry(name.to_string()).or_default().push(histogram);
     }
+
+    /// Append a counter sample. If a series with matching (name, labels)
+    /// exists, the sample is appended to it; otherwise a new series is created.
+    pub(crate) fn upsert_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: u64) {
+        let series = self.counters.entry(name.to_string()).or_default();
+        if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
+            c.timestamps.push(ts);
+            c.values.push(value);
+        } else {
+            series.push(Counter { labels, timestamps: vec![ts], values: vec![value] });
+        }
+    }
+
+    /// Append a gauge sample. If a series with matching (name, labels)
+    /// exists, the sample is appended to it; otherwise a new series is created.
+    pub(crate) fn upsert_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: i64) {
+        let series = self.gauges.entry(name.to_string()).or_default();
+        if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
+            g.timestamps.push(ts);
+            g.values.push(value);
+        } else {
+            series.push(Gauge { labels, timestamps: vec![ts], values: vec![value] });
+        }
+    }
+
+    /// Append a histogram sample. If a series with matching (name, labels)
+    /// exists, the sample is appended to it; otherwise a new series is created.
+    pub(crate) fn upsert_histogram_sample(
+        &mut self,
+        name: &str,
+        labels: Labels,
+        config: ::histogram::Config,
+        ts: u64,
+        snapshot: HistogramSnapshot,
+    ) {
+        let series = self.histograms.entry(name.to_string()).or_default();
+        if let Some(h) = series.iter_mut().find(|h| h.labels == labels) {
+            h.timestamps.push(ts);
+            h.snapshots.push(snapshot);
+        } else {
+            series.push(Histogram {
+                labels,
+                config,
+                timestamps: vec![ts],
+                snapshots: vec![snapshot],
+            });
+        }
+    }
+
+    pub(crate) fn interval_ms(&self) -> u64 {
+        self.interval_ms
+    }
+}
+
+/// Extract metric name and label set from snapshot metadata.
+/// If `metadata` has a `"metric"` key, use it as the name; otherwise fall back
+/// to `default_name` (the snapshot's `.name` field). Drop reserved keys
+/// (`metric`, `metric_type`, `unit`) before constructing labels.
+pub(crate) fn extract_name_labels(
+    metadata: &std::collections::HashMap<String, String>,
+    default_name: &str,
+) -> (String, Labels) {
+    let name = metadata
+        .get("metric")
+        .cloned()
+        .unwrap_or_else(|| default_name.to_string());
+    let mut inner = std::collections::BTreeMap::new();
+    for (k, v) in metadata {
+        match k.as_str() {
+            "metric" | "metric_type" | "unit" => continue,
+            _ => {
+                inner.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    (name, Labels { inner })
 }
 
 fn slice_range(timestamps: &[u64], start_ns: u64, end_ns: u64) -> std::ops::Range<usize> {

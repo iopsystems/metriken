@@ -358,6 +358,73 @@ impl MetricsSource for MemoryStore {
     }
 }
 
+// ─── Ingest feature ──────────────────────────────────────────────────────────
+
+#[cfg(feature = "ingest")]
+impl MemoryStore {
+    /// Ingest a single snapshot into the store. Snapshot timestamp is snapped
+    /// to the nearest sampling-interval boundary so multiple samplers within
+    /// one collection cycle align.
+    ///
+    /// For histograms: a `HistogramSnapshot` is stored representing the
+    /// cumulative (running) bucket counts. Quantile/rate computations are
+    /// performed at query time against pairs of consecutive snapshots.
+    pub fn ingest_snapshot(&self, snapshot: &mut metriken_exposition::Snapshot) {
+        use crate::memory::extract_name_labels;
+        use crate::types::HistogramSnapshot;
+
+        let raw_ts = snapshot
+            .systemtime()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is earlier than 1970")
+            .as_nanos() as u64;
+
+        let mut memory = self.state.memory.write().unwrap();
+        let interval_ns = memory.interval_ms() * 1_000_000;
+        let ts = snap_timestamp(raw_ts, interval_ns);
+
+        for counter in snapshot.counters() {
+            let (name, labels) = extract_name_labels(&counter.metadata, &counter.name);
+            memory.upsert_counter_sample(&name, labels, ts, counter.value);
+        }
+
+        for gauge in snapshot.gauges() {
+            let (name, labels) = extract_name_labels(&gauge.metadata, &gauge.name);
+            memory.upsert_gauge_sample(&name, labels, ts, gauge.value);
+        }
+
+        for histogram in snapshot.histograms() {
+            let (name, labels) = extract_name_labels(&histogram.metadata, &histogram.name);
+            let config = histogram.value.config();
+            let snap = histogram_to_snapshot(&histogram.value);
+            memory.upsert_histogram_sample(&name, labels, config, ts, snap);
+        }
+    }
+}
+
+fn snap_timestamp(raw_ts: u64, interval_ns: u64) -> u64 {
+    if interval_ns == 0 {
+        return raw_ts;
+    }
+    ((raw_ts + interval_ns / 2) / interval_ns) * interval_ns
+}
+
+#[cfg(feature = "ingest")]
+fn histogram_to_snapshot(h: &::histogram::Histogram) -> crate::types::HistogramSnapshot {
+    let mut index = Vec::new();
+    let mut count = Vec::new();
+    let mut running: u64 = 0;
+    for (i, bucket) in h.iter().enumerate() {
+        let c = bucket.count();
+        if c > 0 {
+            running = running.saturating_add(c);
+            index.push(i as u32);
+            count.push(running);
+        }
+    }
+    crate::types::HistogramSnapshot { index, count }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -430,5 +497,76 @@ mod tests {
     fn test_memory_store_default_interval_is_one_second() {
         let store = MemoryStore::builder().build();
         assert_eq!(store.interval(), 1.0);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "ingest")]
+mod ingest_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    fn make_counter_snap(
+        ts: SystemTime,
+        counter_name: &str,
+        value: u64,
+        labels: &[(&str, &str)],
+    ) -> metriken_exposition::Snapshot {
+        let mut metadata: HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        metadata.insert("metric".to_string(), counter_name.to_string());
+        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+            systemtime: ts,
+            duration: Duration::from_secs(0),
+            metadata: HashMap::new(),
+            counters: vec![metriken_exposition::Counter {
+                name: counter_name.to_string(),
+                value,
+                metadata,
+            }],
+            gauges: vec![],
+            histograms: vec![],
+        })
+    }
+
+    #[test]
+    fn test_ingest_counter_basic() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1001);
+        let mut s0 = make_counter_snap(t0, "cpu_cycles", 100, &[("cpu", "0")]);
+        let mut s1 = make_counter_snap(t1, "cpu_cycles", 200, &[("cpu", "0")]);
+        store.ingest_snapshot(&mut s0);
+        store.ingest_snapshot(&mut s1);
+
+        assert!(store.counter_names().contains(&"cpu_cycles".to_string()));
+        let labels = store.counter_labels("cpu_cycles");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].get("cpu").map(String::as_str), Some("0"));
+
+        // Time range covers both samples in seconds
+        let (lo, hi) = store.time_range().unwrap();
+        assert!((lo - 1000.0).abs() < 0.01);
+        assert!((hi - 1001.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ingest_two_series_different_labels() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut s0 = make_counter_snap(t0, "cpu_cycles", 100, &[("cpu", "0")]);
+        let mut s1 = make_counter_snap(t0, "cpu_cycles", 200, &[("cpu", "1")]);
+        store.ingest_snapshot(&mut s0);
+        store.ingest_snapshot(&mut s1);
+
+        let labels = store.counter_labels("cpu_cycles");
+        assert_eq!(labels.len(), 2);
     }
 }
