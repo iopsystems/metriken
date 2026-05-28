@@ -109,10 +109,12 @@ impl DataSource for Memory {
 
         for hist in stored.iter().filter(|h| filter.inner.is_empty() || h.labels.matches(filter)) {
             config = config.or(Some(hist.config));
+            let r = slice_range(&hist.timestamps, start_ns, end_ns);
+            if r.is_empty() {
+                continue;
+            }
             let series_idx = series_labels.len();
             series_labels.push(hist.labels.clone());
-
-            let r = slice_range(&hist.timestamps, start_ns, end_ns);
             for (ts, snap) in hist.timestamps[r.clone()].iter().zip(hist.snapshots[r].iter()) {
                 rows.push(HistogramRow {
                     series_idx,

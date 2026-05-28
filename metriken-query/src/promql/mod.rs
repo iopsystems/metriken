@@ -330,6 +330,7 @@ pub(crate) fn stream_to_histograms(
     let mut ts_per_series: Vec<Vec<u64>> = vec![Vec::new(); n];
     let mut snap_per_series: Vec<Vec<crate::types::HistogramSnapshot>> = vec![Vec::new(); n];
     for row in stream.rows {
+        debug_assert!(row.series_idx < n, "series_idx {} out of bounds (n={})", row.series_idx, n);
         ts_per_series[row.series_idx].push(row.timestamp);
         snap_per_series[row.series_idx].push(row.snapshot);
     }

@@ -26,6 +26,7 @@ impl HistogramStream {
     /// K-way merge of multiple streams for the same metric across different
     /// parquet files. Normalises `series_idx` values to a unified series list.
     /// Returns `None` if `streams` is empty.
+    #[allow(dead_code)]
     pub fn merge(streams: Vec<HistogramStream>) -> Option<HistogramStream> {
         if streams.is_empty() {
             return None;
