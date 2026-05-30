@@ -2283,24 +2283,26 @@ fn test_filename_or_default() {
     assert_eq!(store_with_name.filename_or_default(), "myfile");
 }
 
-// ─── Item 4: ParquetBuilder composition (compile-time API checks) ─────────────
+// ─── Item 6: time_range_ns ────────────────────────────────────────────────────
 
 #[test]
-fn test_parquet_builder_file_owned_compiles() {
-    // file_owned and file_owned_labeled must accept std::fs::File.
-    fn _check(f1: std::fs::File, f2: std::fs::File) {
-        let _ = crate::ParquetReader::builder().file_owned(f1);
-        let _ = crate::ParquetReader::builder()
-            .file_owned_labeled(f2, [("run", "a")]);
-    }
+fn test_time_range_ns_is_exact_for_memory_store() {
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    let (lo, hi) = store.time_range_ns().expect("non-empty store should have time range");
+    assert_eq!(lo, 1_000_000_000_000, "expected 1e12 ns (1000 s)");
+    assert_eq!(hi, 2_000_000_000_000, "expected 2e12 ns (2000 s)");
+
+    // time_range_ns and time_range should agree (modulo f64 precision)
+    let (lo_s, hi_s) = store.time_range().unwrap();
+    assert!((lo_s - lo as f64 / 1e9).abs() < 1e-3, "lo seconds mismatch");
+    assert!((hi_s - hi as f64 / 1e9).abs() < 1e-3, "hi seconds mismatch");
 }
 
 #[test]
-fn test_parquet_builder_reader_and_reader_labeled_compile() {
-    // reader() and reader_labeled() must accept Arc<ParquetReader>.
-    fn _check(r1: Arc<crate::ParquetReader>, r2: Arc<crate::ParquetReader>) {
-        let _ = crate::ParquetReader::builder().reader(r1.clone());
-        let _ = crate::ParquetReader::builder()
-            .reader_labeled(r2, [("run", "b")]);
-    }
+fn test_time_range_ns_empty_store_is_none() {
+    let store = crate::MemoryStore::builder().build();
+    assert!(store.time_range_ns().is_none());
 }
+

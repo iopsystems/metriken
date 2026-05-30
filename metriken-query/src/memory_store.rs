@@ -121,6 +121,14 @@ impl MemoryStore {
             .map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
     }
 
+    /// Full time extent of the stored data in nanoseconds, or `None` if empty.
+    ///
+    /// Prefer this over [`time_range()`](Self::time_range) when you need exact
+    /// nanosecond timestamps without floating-point precision loss.
+    pub fn time_range_ns(&self) -> Option<(u64, u64)> {
+        self.state.memory.read().unwrap().time_range()
+    }
+
     /// Sampling interval in seconds.
     pub fn interval(&self) -> f64 {
         self.state.memory.read().unwrap().interval()
@@ -337,6 +345,10 @@ impl MetricsSource for MemoryStore {
 
     fn time_range(&self) -> Option<(f64, f64)> {
         MemoryStore::time_range(self)
+    }
+
+    fn time_range_ns(&self) -> Option<(u64, u64)> {
+        MemoryStore::time_range_ns(self)
     }
 
     fn interval(&self) -> f64 {

@@ -214,6 +214,11 @@ pub trait MetricsSource: Send + Sync {
         self.filename().unwrap_or_default()
     }
 
+    /// Time range of the data in nanoseconds, or `None` if empty.
+    ///
+    /// Use this instead of [`time_range()`](Self::time_range) when you need
+    /// exact nanosecond timestamps without floating-point precision loss.
+    fn time_range_ns(&self) -> Option<(u64, u64)>;
 }
 
 #[cfg(test)]

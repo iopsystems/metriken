@@ -75,6 +75,14 @@ impl ParquetReader {
         self.engine.time_range().map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
     }
 
+    /// Time range of data across all files in nanoseconds, or `None` if empty.
+    ///
+    /// Prefer this over [`time_range()`](Self::time_range) when you need exact
+    /// nanosecond timestamps without floating-point precision loss.
+    pub fn time_range_ns(&self) -> Option<(u64, u64)> {
+        self.engine.time_range()
+    }
+
     /// Names of all counter metrics across all files (sorted, deduplicated).
     pub fn counter_names(&self) -> Vec<String> { self.engine.counter_names() }
 
@@ -156,6 +164,10 @@ impl MetricsSource for ParquetReader {
 
     fn time_range(&self) -> Option<(f64, f64)> {
         self.time_range()
+    }
+
+    fn time_range_ns(&self) -> Option<(u64, u64)> {
+        self.time_range_ns()
     }
 
     fn interval(&self) -> f64 {
