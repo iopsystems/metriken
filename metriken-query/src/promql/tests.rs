@@ -2138,3 +2138,169 @@ fn test_memory_store_label_values_ingest() {
     let empty2 = store.label_values("unknown_metric", "cpu");
     assert!(empty2.is_empty());
 }
+
+// ─── Items 1, 2, 3, 7, 8, 9: MetricsSource convenience defaults ──────────────
+
+/// Build a mixed-type Memory (counters + gauges + histograms) for testing the
+/// new MetricsSource default methods without the `ingest` feature.
+fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
+    use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
+    let mut mem = Memory::new(1000);
+    let ts: Vec<u64> = vec![1_000_000_000_000, 2_000_000_000_000];
+
+    for cpu in ["0", "1"] {
+        let labels = make_labels(&[("cpu", cpu), ("kind", "counter")]);
+        mem.add_counter("cpu_cycles", Counter {
+            labels, timestamps: ts.clone(), values: vec![0, 100],
+        });
+    }
+    mem.add_gauge("cpu_temp", Gauge {
+        labels: make_labels(&[("cpu", "0")]),
+        timestamps: ts.clone(),
+        values: vec![50, 51],
+    });
+    mem.add_gauge("mem_used", Gauge {
+        labels: make_labels(&[("node", "n1")]),
+        timestamps: ts.clone(),
+        values: vec![1024, 2048],
+    });
+
+    let config = ::histogram::Config::new(4, 16).unwrap();
+    mem.add_histogram("req_latency", Histogram {
+        labels: make_labels(&[("cpu", "0")]),
+        config,
+        timestamps: ts.clone(),
+        snapshots: vec![
+            HistogramSnapshot { index: vec![], count: vec![] },
+            HistogramSnapshot { index: vec![10], count: vec![5] },
+        ],
+    });
+
+    Arc::new(crate::memory_store::MemoryStoreInner {
+        memory: std::sync::RwLock::new(mem),
+        metadata: std::sync::RwLock::new(std::collections::HashMap::new()),
+        filename: std::sync::RwLock::new(None),
+    })
+}
+
+#[test]
+fn test_all_names_is_sorted_union_of_all_types() {
+    use crate::MetricsSource as _;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    let names = store.all_names();
+    // Sorted: cpu_cycles, cpu_temp, mem_used, req_latency
+    assert_eq!(names, vec!["cpu_cycles", "cpu_temp", "mem_used", "req_latency"]);
+
+    // Each name appears exactly once even if the same metric appears in multiple types
+    let dedup: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(dedup.len(), names.len(), "all_names should be deduplicated");
+}
+
+#[test]
+fn test_total_series_count_sums_all_types() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    // cpu_cycles: 2 series, cpu_temp: 1, mem_used: 1, req_latency: 1
+    let count = store.total_series_count();
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn test_has_counter_gauge_histogram() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    assert!(store.has_counter("cpu_cycles"));
+    assert!(!store.has_counter("cpu_temp"));     // gauge, not counter
+    assert!(!store.has_counter("absent"));
+
+    assert!(store.has_gauge("cpu_temp"));
+    assert!(store.has_gauge("mem_used"));
+    assert!(!store.has_gauge("cpu_cycles"));     // counter, not gauge
+    assert!(!store.has_gauge("absent"));
+
+    assert!(store.has_histogram("req_latency"));
+    assert!(!store.has_histogram("cpu_cycles")); // counter, not histogram
+    assert!(!store.has_histogram("absent"));
+}
+
+#[test]
+fn test_all_label_keys_unions_across_all_metrics() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    let keys = store.all_label_keys();
+    // cpu (from cpu_cycles counter and cpu_temp gauge and req_latency histogram)
+    // kind (from cpu_cycles counter)
+    // node (from mem_used gauge)
+    assert!(keys.contains("cpu"),  "expected 'cpu' in label keys");
+    assert!(keys.contains("kind"), "expected 'kind' in label keys");
+    assert!(keys.contains("node"), "expected 'node' in label keys");
+    // Must be sorted (BTreeSet)
+    let sorted: Vec<_> = keys.iter().collect();
+    let mut expected = sorted.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "all_label_keys should be sorted");
+}
+
+#[test]
+fn test_label_values_by_key_groups_correctly() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    // cpu_cycles has two series: cpu=0 and cpu=1 (both counters)
+    let by_key = store.label_values_by_key("cpu_cycles");
+    let cpu_vals = by_key.get("cpu").expect("'cpu' key should be present");
+    assert!(cpu_vals.contains("0"), "cpu=0 should be present");
+    assert!(cpu_vals.contains("1"), "cpu=1 should be present");
+    assert_eq!(cpu_vals.len(), 2);
+
+    let kind_vals = by_key.get("kind").expect("'kind' key should be present");
+    assert_eq!(kind_vals, &["counter".to_string()].into_iter().collect());
+
+    // Unknown metric → empty map
+    let empty = store.label_values_by_key("nonexistent");
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn test_filename_or_default() {
+    use crate::MetricsSource;
+
+    // No filename set → empty string
+    let store_no_name = crate::MemoryStore::builder().build();
+    assert_eq!(store_no_name.filename_or_default(), "");
+
+    // Filename set → returns name
+    let store_with_name = crate::MemoryStore::builder().filename("myfile").build();
+    assert_eq!(store_with_name.filename_or_default(), "myfile");
+}
+
+// ─── Item 4: ParquetBuilder composition (compile-time API checks) ─────────────
+
+#[test]
+fn test_parquet_builder_file_owned_compiles() {
+    // file_owned and file_owned_labeled must accept std::fs::File.
+    fn _check(f1: std::fs::File, f2: std::fs::File) {
+        let _ = crate::ParquetReader::builder().file_owned(f1);
+        let _ = crate::ParquetReader::builder()
+            .file_owned_labeled(f2, [("run", "a")]);
+    }
+}
+
+#[test]
+fn test_parquet_builder_reader_and_reader_labeled_compile() {
+    // reader() and reader_labeled() must accept Arc<ParquetReader>.
+    fn _check(r1: Arc<crate::ParquetReader>, r2: Arc<crate::ParquetReader>) {
+        let _ = crate::ParquetReader::builder().reader(r1.clone());
+        let _ = crate::ParquetReader::builder()
+            .reader_labeled(r2, [("run", "b")]);
+    }
+}

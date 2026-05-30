@@ -32,6 +32,12 @@ impl MemoryStore {
         MemoryStoreBuilder::default()
     }
 
+    /// Test helper: wrap a pre-built `MemoryStoreInner`.
+    #[cfg(test)]
+    pub(crate) fn from_inner(inner: Arc<MemoryStoreInner>) -> Self {
+        Self { state: inner }
+    }
+
     /// Set or replace the display name.
     pub fn set_filename(&self, name: impl Into<String>) {
         *self.state.filename.write().unwrap() = Some(name.into());

@@ -137,6 +137,83 @@ pub trait MetricsSource: Send + Sync {
         }
         out
     }
+
+    /// Sorted union of all counter, gauge, and histogram metric names.
+    fn all_names(&self) -> Vec<String> {
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        out.extend(self.counter_names());
+        out.extend(self.gauge_names());
+        out.extend(self.histogram_names());
+        out.into_iter().collect()
+    }
+
+    /// Total number of distinct time series across all metric types.
+    ///
+    /// Sums the number of label-set combinations for every counter, gauge, and
+    /// histogram metric. Useful for capacity estimates and UI badges.
+    fn total_series_count(&self) -> usize {
+        let mut count = 0;
+        for name in self.counter_names() { count += self.counter_labels(&name).len(); }
+        for name in self.gauge_names() { count += self.gauge_labels(&name).len(); }
+        for name in self.histogram_names() { count += self.histogram_labels(&name).len(); }
+        count
+    }
+
+    /// Returns `true` if a counter metric with the given name exists.
+    fn has_counter(&self, name: &str) -> bool {
+        self.counter_names().iter().any(|n| n == name)
+    }
+
+    /// Returns `true` if a gauge metric with the given name exists.
+    fn has_gauge(&self, name: &str) -> bool {
+        self.gauge_names().iter().any(|n| n == name)
+    }
+
+    /// Returns `true` if a histogram metric with the given name exists.
+    fn has_histogram(&self, name: &str) -> bool {
+        self.histogram_names().iter().any(|n| n == name)
+    }
+
+    /// Union of all label keys across every series for every metric type.
+    /// Useful for answering "what dimensions does this data have?"
+    fn all_label_keys(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut collect = |labels_list: Vec<std::collections::BTreeMap<String, String>>| {
+            for labels in labels_list {
+                for k in labels.into_keys() {
+                    out.insert(k);
+                }
+            }
+        };
+        for name in self.counter_names() { collect(self.counter_labels(&name)); }
+        for name in self.gauge_names() { collect(self.gauge_labels(&name)); }
+        for name in self.histogram_names() { collect(self.histogram_labels(&name)); }
+        out
+    }
+
+    /// For a specific metric name, return every label key mapped to the set of
+    /// distinct values seen across all series of that metric (counter, gauge,
+    /// and histogram types are all included).
+    fn label_values_by_key(&self, metric: &str) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+        let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        let mut collect = |labels_list: Vec<std::collections::BTreeMap<String, String>>| {
+            for labels in labels_list {
+                for (k, v) in labels {
+                    out.entry(k).or_default().insert(v);
+                }
+            }
+        };
+        collect(self.counter_labels(metric));
+        collect(self.gauge_labels(metric));
+        collect(self.histogram_labels(metric));
+        out
+    }
+
+    /// Returns `self.filename()` or an empty string if no name is set.
+    fn filename_or_default(&self) -> String {
+        self.filename().unwrap_or_default()
+    }
+
 }
 
 #[cfg(test)]
