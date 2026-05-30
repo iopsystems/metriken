@@ -22,6 +22,8 @@ use crate::{DataSource, MetricsSource};
 
 pub struct ParquetReader {
     engine: QueryEngine,
+    /// Concrete handle retained for composition via `ParquetBuilder::reader()`.
+    inner: Arc<MultiParquetSource>,
     filename: Option<String>,
 }
 
@@ -35,8 +37,9 @@ impl ParquetReader {
     pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
         let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
         let source = ParquetSource::open(path)?;
-        let ds: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
-        Ok(Self { engine: QueryEngine::new(ds), filename })
+        let inner = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self { engine: QueryEngine::new(ds), inner, filename })
     }
 
     /// Convenience: open a parquet file from raw bytes (e.g. from a browser file upload).
@@ -50,8 +53,15 @@ impl ParquetReader {
     /// data persists as long as the reader (and its `File`) is alive.
     pub fn open_file(file: File) -> Result<Self, Box<dyn Error>> {
         let source = ParquetSource::open_file(file)?;
-        let ds: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
-        Ok(Self { engine: QueryEngine::new(ds), filename: None })
+        let inner = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self { engine: QueryEngine::new(ds), inner, filename: None })
+    }
+
+    /// Return the underlying `(source, labels)` pairs for use by
+    /// [`ParquetBuilder::reader`] and [`ParquetBuilder::reader_labeled`].
+    pub(crate) fn sources_for_composition(&self) -> Vec<(Arc<ParquetSource>, Labels)> {
+        self.inner.files.clone()
     }
 
     /// Set the display name. Useful when constructing from bytes or
@@ -224,6 +234,8 @@ impl MetricsSource for ParquetReader {
 enum BuilderEntry {
     Path(std::path::PathBuf, Labels),
     Bytes(Bytes, Labels),
+    OwnedFile(File, Labels),
+    Source(Arc<ParquetSource>, Labels),
 }
 
 pub struct ParquetBuilder {
@@ -279,6 +291,50 @@ impl ParquetBuilder {
         self
     }
 
+    /// Add an already-open file handle with no extra labels.
+    ///
+    /// Useful for the `NamedTempFile::into_file()` pattern where the path has
+    /// already been unlinked but the data should remain accessible.
+    pub fn file_owned(mut self, file: File) -> Self {
+        self.entries.push(BuilderEntry::OwnedFile(file, Labels::default()));
+        self
+    }
+
+    /// Add an already-open file handle whose series will carry `labels` as
+    /// additional metadata.
+    pub fn file_owned_labeled(mut self, file: File, labels: impl Into<Labels>) -> Self {
+        self.entries.push(BuilderEntry::OwnedFile(file, labels.into()));
+        self
+    }
+
+    /// Compose with all sources from an existing [`ParquetReader`].
+    ///
+    /// The per-file labels that were set when `reader` was built are preserved.
+    /// No I/O occurs — the already-loaded `Arc<ParquetSource>` handles are
+    /// reused directly.
+    pub fn reader(mut self, reader: Arc<ParquetReader>) -> Self {
+        for (source, labels) in reader.sources_for_composition() {
+            self.entries.push(BuilderEntry::Source(source, labels));
+        }
+        self
+    }
+
+    /// Compose with an existing [`ParquetReader`], merging `extra` labels into
+    /// every series the reader contributes.
+    ///
+    /// If the reader already has labels for a key that `extra` also contains,
+    /// `extra` wins (overrides).
+    pub fn reader_labeled(mut self, reader: Arc<ParquetReader>, extra: impl Into<Labels>) -> Self {
+        let extra = extra.into();
+        for (source, mut existing) in reader.sources_for_composition() {
+            for (k, v) in &extra.inner {
+                existing.inner.insert(k.clone(), v.clone());
+            }
+            self.entries.push(BuilderEntry::Source(source, existing));
+        }
+        self
+    }
+
     pub fn build(self) -> Result<ParquetReader, Box<dyn Error>> {
         if self.entries.is_empty() {
             return Err("ParquetReader requires at least one file".into());
@@ -298,10 +354,13 @@ impl ParquetBuilder {
             .map(|entry| match entry {
                 BuilderEntry::Path(path, labels) => Ok((ParquetSource::open(&path)?, labels)),
                 BuilderEntry::Bytes(bytes, labels) => Ok((ParquetSource::open_bytes(bytes)?, labels)),
+                BuilderEntry::OwnedFile(file, labels) => Ok((ParquetSource::open_file(file)?, labels)),
+                BuilderEntry::Source(source, labels) => Ok((source, labels)),
             })
             .collect();
-        let source: Arc<dyn DataSource> = Arc::new(MultiParquetSource { files: files? });
-        Ok(ParquetReader { engine: QueryEngine::new(source), filename })
+        let inner = Arc::new(MultiParquetSource { files: files? });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(ParquetReader { engine: QueryEngine::new(ds), inner, filename })
     }
 }
 
@@ -567,7 +626,7 @@ enum ParquetBacking {
     Bytes(Bytes),
 }
 
-struct ParquetSource {
+pub(crate) struct ParquetSource {
     backing: ParquetBacking,
     meta: ArrowReaderMetadata,
     sampling_interval_ms: u64,

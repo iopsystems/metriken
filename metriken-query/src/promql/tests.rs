@@ -2306,3 +2306,24 @@ fn test_time_range_ns_empty_store_is_none() {
     assert!(store.time_range_ns().is_none());
 }
 
+// ─── Item 4: ParquetBuilder composition (compile-time API checks) ─────────────
+
+#[test]
+fn test_parquet_builder_file_owned_compiles() {
+    // file_owned and file_owned_labeled must accept std::fs::File.
+    fn _check(f1: std::fs::File, f2: std::fs::File) {
+        let _ = crate::ParquetReader::builder().file_owned(f1);
+        let _ = crate::ParquetReader::builder()
+            .file_owned_labeled(f2, [("run", "a")]);
+    }
+}
+
+#[test]
+fn test_parquet_builder_reader_and_reader_labeled_compile() {
+    // reader() and reader_labeled() must accept Arc<ParquetReader>.
+    fn _check(r1: Arc<crate::ParquetReader>, r2: Arc<crate::ParquetReader>) {
+        let _ = crate::ParquetReader::builder().reader(r1.clone());
+        let _ = crate::ParquetReader::builder()
+            .reader_labeled(r2, [("run", "b")]);
+    }
+}
