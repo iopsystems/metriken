@@ -6,6 +6,9 @@ pub(crate) mod types;
 pub(crate) mod histogram_stream;
 pub(crate) mod memory_store;
 
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};

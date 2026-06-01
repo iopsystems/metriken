@@ -20,12 +20,20 @@ parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror = "2"
 
 [dev-dependencies]
 tempfile.workspace = true
+sysinfo = "0.32"
 
 [features]
 default = ["lz4"]
 ingest = ["dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]
+fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
+
+[[bench]]
+name = "memory"
+harness = false
+required-features = ["fixtures"]
