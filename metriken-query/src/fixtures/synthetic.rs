@@ -378,6 +378,12 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// Internal constructor for use by other modules in this crate.
+    #[doc(hidden)]
+    pub(crate) fn __from_named_temp(file: NamedTempFile, size_bytes: u64) -> Self {
+        Self { file, size_bytes }
+    }
+
     pub fn path(&self) -> &Path {
         self.file.path()
     }
