@@ -37,3 +37,8 @@ fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
 name = "memory"
 harness = false
 required-features = ["fixtures"]
+
+[[bench]]
+name = "query_latency"
+harness = false
+required-features = ["fixtures"]
