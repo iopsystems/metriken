@@ -33,6 +33,11 @@ ingest = ["dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]
 fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
 
+[[bin]]
+name = "gen-augmented"
+path = "src/bin/gen_augmented.rs"
+required-features = ["fixtures"]
+
 [[bench]]
 name = "memory"
 harness = false
