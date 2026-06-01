@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
-use crate::types::{
-    Counter, Counters, Gauge, Gauges, Histogram, HistogramSnapshot,
-};
+use crate::types::{Counter, Counters, Gauge, Gauges, Histogram};
+#[cfg(feature = "ingest")]
+use crate::types::HistogramSnapshot;
 use crate::DataSource;
 
 /// In-memory data source for tests. Callers build `Counter`/`Gauge`/`Histogram`
@@ -48,6 +48,7 @@ impl Memory {
 
     /// Append a counter sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
+    #[cfg(feature = "ingest")]
     pub(crate) fn upsert_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: u64) {
         let series = self.counters.entry(name.to_string()).or_default();
         if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
@@ -60,6 +61,7 @@ impl Memory {
 
     /// Append a gauge sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
+    #[cfg(feature = "ingest")]
     pub(crate) fn upsert_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: i64) {
         let series = self.gauges.entry(name.to_string()).or_default();
         if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
@@ -72,6 +74,7 @@ impl Memory {
 
     /// Append a histogram sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
+    #[cfg(feature = "ingest")]
     pub(crate) fn upsert_histogram_sample(
         &mut self,
         name: &str,
@@ -94,6 +97,7 @@ impl Memory {
         }
     }
 
+    #[cfg(feature = "ingest")]
     pub(crate) fn interval_ms(&self) -> u64 {
         self.interval_ms
     }
@@ -103,6 +107,7 @@ impl Memory {
 /// If `metadata` has a `"metric"` key, use it as the name; otherwise fall back
 /// to `default_name` (the snapshot's `.name` field). Drop reserved keys
 /// (`metric`, `metric_type`, `unit`) before constructing labels.
+#[cfg(feature = "ingest")]
 pub(crate) fn extract_name_labels(
     metadata: &std::collections::HashMap<String, String>,
     default_name: &str,

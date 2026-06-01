@@ -443,6 +443,7 @@ impl MemoryStore {
     }
 }
 
+#[cfg(feature = "ingest")]
 fn snap_timestamp(raw_ts: u64, interval_ns: u64) -> u64 {
     if interval_ns == 0 {
         return raw_ts;
