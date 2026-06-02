@@ -997,6 +997,24 @@ fn test_columns_histogram_quantiles_array_form() {
 }
 
 #[test]
+fn test_columns_histogram_percentiles_alias() {
+    // `histogram_percentiles(...)` is accepted as a synonym for
+    // `histogram_quantiles(...)` — same array-of-quantiles form.
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
+
+    let cols = engine
+        .columns("histogram_percentiles([0.5, 0.99], tcp_packet_latency)")
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
 fn test_columns_histogram_heatmap() {
     let source = Arc::new(create_columns_histogram_source());
     let engine = QueryEngine::new(source);

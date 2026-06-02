@@ -424,7 +424,15 @@ impl QueryEngine {
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
-        let inner = &query_str["histogram_quantiles(".len()..query_str.len() - 1];
+        // Accept both `histogram_quantiles(` and `histogram_percentiles(` as
+        // synonyms — quantile and percentile are interchangeable terms for
+        // the [0.0, 1.0] array form used here.
+        let prefix_len = if query_str.starts_with("histogram_percentiles(") {
+            "histogram_percentiles(".len()
+        } else {
+            "histogram_quantiles(".len()
+        };
+        let inner = &query_str[prefix_len..query_str.len() - 1];
 
         let array_start = inner.find('[').ok_or_else(|| {
             QueryError::ParseError(
@@ -579,7 +587,10 @@ impl QueryEngine {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        if query_str.starts_with("histogram_quantiles(") && query_str.ends_with(")") {
+        if (query_str.starts_with("histogram_quantiles(")
+            || query_str.starts_with("histogram_percentiles("))
+            && query_str.ends_with(")")
+        {
             return self.handle_histogram_quantiles(query_str, start, end);
         }
 

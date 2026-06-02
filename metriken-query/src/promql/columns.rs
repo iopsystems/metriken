@@ -31,6 +31,7 @@ impl QueryEngine {
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     if let Some(inner) = query
         .strip_prefix("histogram_quantiles(")
+        .or_else(|| query.strip_prefix("histogram_percentiles("))
         .and_then(|s| s.strip_suffix(')'))
     {
         let array_end = inner.find(']').ok_or_else(|| {
