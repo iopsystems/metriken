@@ -679,8 +679,88 @@ impl DataSource for MultiParquetSource {
 // ─── Private file reader ──────────────────────────────────────────────────────
 
 enum ParquetBacking {
-    File(File),
+    /// File-backed. We hold the `File` in an `Arc` so that concurrent queries
+    /// against the same source share the file descriptor without duplicating
+    /// it. Reads go through `PositionalFile`'s `ChunkReader` impl, which uses
+    /// `pread` (`FileExt::read_at`) — positional reads don't touch the shared
+    /// seek offset, so concurrent reads cannot interleave-corrupt each other.
+    File(PositionalFile),
     Bytes(Bytes),
+}
+
+/// Wrapper around `Arc<File>` that implements parquet's `ChunkReader` trait
+/// using positional reads (`pread`). Cloning is cheap (`Arc::clone`). Two
+/// readers from different threads can read concurrently without interfering
+/// because positional reads do not advance the file's current offset.
+#[derive(Clone)]
+pub(crate) struct PositionalFile {
+    inner: Arc<File>,
+    len: u64,
+}
+
+impl PositionalFile {
+    fn new(file: File) -> std::io::Result<Self> {
+        let len = file.metadata()?.len();
+        Ok(Self { inner: Arc::new(file), len })
+    }
+}
+
+impl parquet::file::reader::Length for PositionalFile {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// `Read` adapter that uses `read_at` so it does not depend on or modify
+/// the file's seek offset.
+pub(crate) struct PositionalReader {
+    file: Arc<File>,
+    pos: u64,
+    end: u64,
+}
+
+impl std::io::Read for PositionalReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end {
+            return Ok(0);
+        }
+        use std::os::unix::fs::FileExt;
+        let remaining = (self.end - self.pos) as usize;
+        let to_read = buf.len().min(remaining);
+        let n = self.file.read_at(&mut buf[..to_read], self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl parquet::file::reader::ChunkReader for PositionalFile {
+    type T = PositionalReader;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(PositionalReader {
+            file: Arc::clone(&self.inner),
+            pos: start,
+            end: self.len,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; length];
+        let mut read_total = 0usize;
+        // read_at can be a partial read; loop until full or EOF.
+        while read_total < length {
+            let n = self
+                .inner
+                .read_at(&mut buf[read_total..], start + read_total as u64)?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        buf.truncate(read_total);
+        Ok(Bytes::from(buf))
+    }
 }
 
 pub(crate) struct ParquetSource {
@@ -714,7 +794,7 @@ impl ParquetSource {
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
-            backing: ParquetBacking::File(file),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
             meta,
             sampling_interval_ms,
             pool: None,
@@ -738,7 +818,7 @@ impl ParquetSource {
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
-            backing: ParquetBacking::File(file),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
             meta,
             sampling_interval_ms,
             pool: None,
@@ -751,7 +831,7 @@ impl ParquetSource {
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
-            backing: ParquetBacking::File(file),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
             meta,
             sampling_interval_ms,
             pool: Some(pool),
@@ -775,7 +855,7 @@ impl ParquetSource {
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
-            backing: ParquetBacking::File(file),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
             meta,
             sampling_interval_ms,
             pool: Some(pool),
@@ -789,7 +869,10 @@ impl ParquetSource {
     ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, Box<dyn Error>> {
         let reader = match &self.backing {
             ParquetBacking::File(f) => {
-                ParquetRecordBatchReaderBuilder::new_with_metadata(f.try_clone()?, self.meta.clone())
+                // PositionalFile is Clone (Arc), and ChunkReader, so we don't
+                // need (and must not use) try_clone — its positional reads are
+                // concurrency-safe across queries against the same source.
+                ParquetRecordBatchReaderBuilder::new_with_metadata(f.clone(), self.meta.clone())
                     .with_row_groups(vec![rg_idx])
                     .with_projection(projection)
                     .build()?
