@@ -987,6 +987,22 @@ fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
     (ts + interval_ns / 2).checked_div(interval_ns).map_or(ts, |q| q * interval_ns)
 }
 
+/// Run a parquet decode block, catching any panic from the parquet crate so a
+/// malformed file (e.g. dictionary pages out of order — apache/arrow-rs has
+/// known panics like "Decoder for dict should have been set") doesn't crash
+/// the server.
+fn catch_decode_panic<T>(op: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).map_err(|payload| {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unknown panic payload>".to_string()
+        }
+    })
+}
+
 fn read_timestamps(
     pf: &ParquetSource,
     rg_idx: usize,
@@ -1003,15 +1019,28 @@ fn read_timestamps(
 
     let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
     let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [ts_col_idx]))?;
-    let mut out = Vec::new();
-    for batch in reader.flatten() {
-        let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
-            .ok_or("timestamp column is not UInt64")?;
-        out.reserve(arr.len());
-        for v in arr.iter() {
-            out.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
+    let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch in reader.flatten() {
+                let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("timestamp column is not UInt64".into())?;
+                out.reserve(arr.len());
+                for v in arr.iter() {
+                    out.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            return Err(format!(
+                "parquet decode panic reading timestamps (rg={rg_idx}, col={ts_col_idx}): {panic_msg}"
+            )
+            .into());
         }
-    }
+    };
     let result = Arc::new(out);
 
     if let Some(pool) = &pf.pool {
@@ -1036,15 +1065,28 @@ fn read_counter_values_per_rg(
 
     let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
     let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
-    let mut out = Vec::new();
-    for batch in reader.flatten() {
-        let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
-            .ok_or("counter column is not UInt64")?;
-        out.reserve(arr.len());
-        for v in arr.iter() {
-            out.push(v);  // preserve None so row indexing stays aligned with timestamps
+    let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch in reader.flatten() {
+                let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("counter column is not UInt64".into())?;
+                out.reserve(arr.len());
+                for v in arr.iter() {
+                    out.push(v); // preserve None so row indexing stays aligned with timestamps
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            return Err(format!(
+                "parquet decode panic reading counter (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into());
         }
-    }
+    };
     let result = Arc::new(out);
 
     if let Some(pool) = &pf.pool {
@@ -1069,15 +1111,28 @@ fn read_gauge_values_per_rg(
 
     let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
     let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
-    let mut out = Vec::new();
-    for batch in reader.flatten() {
-        let arr = batch.column(0).as_any().downcast_ref::<Int64Array>()
-            .ok_or("gauge column is not Int64")?;
-        out.reserve(arr.len());
-        for v in arr.iter() {
-            out.push(v);  // preserve None for row alignment
+    let decode_result: Result<Result<Vec<Option<i64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch in reader.flatten() {
+                let arr = batch.column(0).as_any().downcast_ref::<Int64Array>()
+                    .ok_or::<Box<dyn Error>>("gauge column is not Int64".into())?;
+                out.reserve(arr.len());
+                for v in arr.iter() {
+                    out.push(v); // preserve None for row alignment
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            return Err(format!(
+                "parquet decode panic reading gauge (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into());
         }
-    }
+    };
     let result = Arc::new(out);
 
     if let Some(pool) = &pf.pool {
@@ -1242,6 +1297,8 @@ impl ParquetHistogramCursor {
     }
 
     /// Decode all rows for one histogram column in one row group.
+    /// Returns an empty Vec on panic or read error (the streaming operator
+    /// will then see no data for that column in that row group).
     fn decode_histogram_column(&self, rg_idx: usize, col_idx: usize) -> Vec<HistogramSnapshot> {
         let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
         let Ok(reader) = self.pf.build_batch_reader(
@@ -1251,25 +1308,39 @@ impl ParquetHistogramCursor {
             return Vec::new();
         };
 
-        let mut out = Vec::new();
-        for batch in reader.flatten() {
-            let list = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("histogram column is not List");
-            for value in list.iter() {
-                let snap = value
-                    .and_then(|lv| {
-                        lv.as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .map(raw_to_sparse_cumulative)
-                    })
-                    .unwrap_or_else(|| HistogramSnapshot { index: vec![], count: vec![] });
-                out.push(snap);
+        let decode_result = catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch in reader.flatten() {
+                let list = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("histogram column is not List");
+                for value in list.iter() {
+                    let snap = value
+                        .and_then(|lv| {
+                            lv.as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .map(raw_to_sparse_cumulative)
+                        })
+                        .unwrap_or_else(|| HistogramSnapshot { index: vec![], count: vec![] });
+                    out.push(snap);
+                }
+            }
+            out
+        });
+
+        match decode_result {
+            Ok(out) => out,
+            Err(panic_msg) => {
+                eprintln!(
+                    "metriken-query: parquet decode panic reading histogram \
+                     (rg={rg_idx}, col={col_idx}): {panic_msg}; \
+                     returning empty data for this row group"
+                );
+                Vec::new()
             }
         }
-        out
     }
 }
 
