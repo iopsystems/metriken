@@ -1057,7 +1057,24 @@ fn read_timestamps(
     let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
         catch_decode_panic(|| {
             let mut out = Vec::new();
-            for batch in reader.flatten() {
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // BAIL on first error instead of silently retrying via .flatten().
+                        // Returning Err repeatedly without advancing internal state has been
+                        // observed to spin the reader in production. We log and stop reading
+                        // this row group, accepting whatever batches we got so far.
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx = ts_col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting timestamp read on parquet error",
+                        );
+                        break;
+                    }
+                };
                 let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
                     .ok_or::<Box<dyn Error>>("timestamp column is not UInt64".into())?;
                 out.reserve(arr.len());
@@ -1110,7 +1127,20 @@ fn read_counter_values_per_rg(
     let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
         catch_decode_panic(|| {
             let mut out = Vec::new();
-            for batch in reader.flatten() {
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting counter read on parquet error",
+                        );
+                        break;
+                    }
+                };
                 let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
                     .ok_or::<Box<dyn Error>>("counter column is not UInt64".into())?;
                 out.reserve(arr.len());
@@ -1163,7 +1193,20 @@ fn read_gauge_values_per_rg(
     let decode_result: Result<Result<Vec<Option<i64>>, Box<dyn Error>>, String> =
         catch_decode_panic(|| {
             let mut out = Vec::new();
-            for batch in reader.flatten() {
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting gauge read on parquet error",
+                        );
+                        break;
+                    }
+                };
                 let arr = batch.column(0).as_any().downcast_ref::<Int64Array>()
                     .ok_or::<Box<dyn Error>>("gauge column is not Int64".into())?;
                 out.reserve(arr.len());
@@ -1364,9 +1407,25 @@ impl ParquetHistogramCursor {
             return Vec::new();
         };
 
+        let rg_idx_captured = rg_idx;
+        let col_idx_captured = col_idx;
+        let source_id_captured = self.pf.id;
         let decode_result = catch_decode_panic(|| {
             let mut out = Vec::new();
-            for batch in reader.flatten() {
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx = rg_idx_captured,
+                            col_idx = col_idx_captured,
+                            source_id = source_id_captured,
+                            error = %e,
+                            "aborting histogram read on parquet error",
+                        );
+                        break;
+                    }
+                };
                 let list = batch
                     .column(0)
                     .as_any()
