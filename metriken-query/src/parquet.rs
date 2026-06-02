@@ -991,8 +991,19 @@ fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
 /// malformed file (e.g. dictionary pages out of order — apache/arrow-rs has
 /// known panics like "Decoder for dict should have been set") doesn't crash
 /// the server.
+///
+/// Also suppresses the global panic hook (e.g. sentry's panic_handler) for
+/// the duration of the call so deliberate catches don't pollute the error
+/// reporting pipeline. The first call to this function installs a chained
+/// panic hook that defers to the previously-installed hook for all panics
+/// EXCEPT those that occur inside `catch_decode_panic`.
 fn catch_decode_panic<T>(op: impl FnOnce() -> T) -> Result<T, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).map_err(|payload| {
+    ensure_panic_hook_installed();
+    SUPPRESS_DECODE_PANIC.with(|f| f.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op));
+    SUPPRESS_DECODE_PANIC.with(|f| f.set(false));
+
+    result.map_err(|payload| {
         if let Some(s) = payload.downcast_ref::<&str>() {
             (*s).to_string()
         } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1001,6 +1012,30 @@ fn catch_decode_panic<T>(op: impl FnOnce() -> T) -> Result<T, String> {
             "<unknown panic payload>".to_string()
         }
     })
+}
+
+std::thread_local! {
+    static SUPPRESS_DECODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static PANIC_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+/// Install a panic hook (once per process) that chains on top of whatever
+/// hook is currently active. When a panic fires while a thread has
+/// `SUPPRESS_DECODE_PANIC` set, we skip the upstream hook so the panic
+/// doesn't reach reporters like Sentry. All other panics still propagate
+/// normally.
+fn ensure_panic_hook_installed() {
+    PANIC_HOOK_INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SUPPRESS_DECODE_PANIC.with(|f| f.get()) {
+                // Suppressed: this panic is caught by catch_decode_panic.
+                return;
+            }
+            previous(info);
+        }));
+    });
 }
 
 fn read_timestamps(
