@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror = "2"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile.workspace = true

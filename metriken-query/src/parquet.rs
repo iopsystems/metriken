@@ -1035,6 +1035,13 @@ fn read_timestamps(
     let out = match decode_result {
         Ok(inner) => inner?,
         Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx = ts_col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading timestamps",
+            );
             return Err(format!(
                 "parquet decode panic reading timestamps (rg={rg_idx}, col={ts_col_idx}): {panic_msg}"
             )
@@ -1081,6 +1088,13 @@ fn read_counter_values_per_rg(
     let out = match decode_result {
         Ok(inner) => inner?,
         Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading counter",
+            );
             return Err(format!(
                 "parquet decode panic reading counter (rg={rg_idx}, col={col_idx}): {panic_msg}"
             )
@@ -1127,6 +1141,13 @@ fn read_gauge_values_per_rg(
     let out = match decode_result {
         Ok(inner) => inner?,
         Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading gauge",
+            );
             return Err(format!(
                 "parquet decode panic reading gauge (rg={rg_idx}, col={col_idx}): {panic_msg}"
             )
@@ -1333,10 +1354,12 @@ impl ParquetHistogramCursor {
         match decode_result {
             Ok(out) => out,
             Err(panic_msg) => {
-                eprintln!(
-                    "metriken-query: parquet decode panic reading histogram \
-                     (rg={rg_idx}, col={col_idx}): {panic_msg}; \
-                     returning empty data for this row group"
+                tracing::error!(
+                    rg_idx,
+                    col_idx,
+                    source_id = self.pf.id,
+                    panic = %panic_msg,
+                    "parquet decode panic reading histogram; returning empty data for this row group",
                 );
                 Vec::new()
             }
