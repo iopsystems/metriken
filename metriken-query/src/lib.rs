@@ -1,3 +1,4 @@
+pub(crate) mod buffer_pool;
 pub(crate) mod labels;
 pub(crate) mod memory;
 pub mod parquet;
@@ -9,6 +10,7 @@ pub(crate) mod memory_store;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 
+pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};

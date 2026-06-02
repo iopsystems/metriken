@@ -12,6 +12,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
+use crate::buffer_pool::{BufferPool, CacheKey, next_source_id};
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
@@ -53,6 +54,32 @@ impl ParquetReader {
     /// data persists as long as the reader (and its `File`) is alive.
     pub fn open_file(file: File) -> Result<Self, Box<dyn Error>> {
         let source = ParquetSource::open_file(file)?;
+        let inner = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self { engine: QueryEngine::new(ds), inner, filename: None })
+    }
+
+    /// Open a single file wired to `pool` for caching decoded row groups.
+    ///
+    /// Subsequent queries against this reader will populate the pool on first
+    /// access and serve cached decoded blocks on repeated access.  Multiple
+    /// readers sharing the same `Arc<BufferPool>` share the budget and LRU.
+    pub fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Self, Box<dyn Error>> {
+        let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        let source = ParquetSource::open_with_pool(path, pool)?;
+        let inner = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self { engine: QueryEngine::new(ds), inner, filename })
+    }
+
+    /// Open in-memory bytes wired to `pool`.
+    pub fn open_bytes_with_pool(bytes: impl Into<Bytes>, pool: Arc<BufferPool>) -> Result<Self, Box<dyn Error>> {
+        Self::builder().pool(pool).bytes(bytes).build()
+    }
+
+    /// Open an already-open file handle wired to `pool`.
+    pub fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Self, Box<dyn Error>> {
+        let source = ParquetSource::open_file_with_pool(file, pool)?;
         let inner = Arc::new(MultiParquetSource { files: vec![(source, Labels::default())] });
         let ds: Arc<dyn DataSource> = inner.clone();
         Ok(Self { engine: QueryEngine::new(ds), inner, filename: None })
@@ -241,6 +268,7 @@ enum BuilderEntry {
 pub struct ParquetBuilder {
     entries: Vec<BuilderEntry>,
     filename: Option<String>,
+    pool: Option<Arc<BufferPool>>,
 }
 
 impl Default for ParquetBuilder {
@@ -251,7 +279,17 @@ impl Default for ParquetBuilder {
 
 impl ParquetBuilder {
     pub fn new() -> Self {
-        Self { entries: Vec::new(), filename: None }
+        Self { entries: Vec::new(), filename: None, pool: None }
+    }
+
+    /// Attach a `BufferPool` that all files opened by this builder will share.
+    ///
+    /// The pool is cloned into each `ParquetSource` at build time.  Multiple
+    /// builders (and their resulting `ParquetReader`s) can share the same pool
+    /// by passing the same `Arc`.
+    pub fn pool(mut self, pool: Arc<BufferPool>) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Add a file with no extra labels.
@@ -348,13 +386,32 @@ impl ParquetBuilder {
             }
             None
         });
+        let pool = self.pool;
         let files: Result<Vec<(Arc<ParquetSource>, Labels)>, Box<dyn Error>> = self
             .entries
             .into_iter()
             .map(|entry| match entry {
-                BuilderEntry::Path(path, labels) => Ok((ParquetSource::open(&path)?, labels)),
-                BuilderEntry::Bytes(bytes, labels) => Ok((ParquetSource::open_bytes(bytes)?, labels)),
-                BuilderEntry::OwnedFile(file, labels) => Ok((ParquetSource::open_file(file)?, labels)),
+                BuilderEntry::Path(path, labels) => {
+                    let src = match &pool {
+                        Some(p) => ParquetSource::open_with_pool(&path, Arc::clone(p))?,
+                        None    => ParquetSource::open(&path)?,
+                    };
+                    Ok((src, labels))
+                }
+                BuilderEntry::Bytes(bytes, labels) => {
+                    let src = match &pool {
+                        Some(p) => ParquetSource::open_bytes_with_pool(bytes, Arc::clone(p))?,
+                        None    => ParquetSource::open_bytes(bytes)?,
+                    };
+                    Ok((src, labels))
+                }
+                BuilderEntry::OwnedFile(file, labels) => {
+                    let src = match &pool {
+                        Some(p) => ParquetSource::open_file_with_pool(file, Arc::clone(p))?,
+                        None    => ParquetSource::open_file(file)?,
+                    };
+                    Ok((src, labels))
+                }
                 BuilderEntry::Source(source, labels) => Ok((source, labels)),
             })
             .collect();
@@ -627,9 +684,14 @@ enum ParquetBacking {
 }
 
 pub(crate) struct ParquetSource {
+    /// Unique numeric identity assigned at construction; used as the `source_id`
+    /// component of every `CacheKey` produced by this source.
+    id: u64,
     backing: ParquetBacking,
     meta: ArrowReaderMetadata,
     sampling_interval_ms: u64,
+    /// Optional shared buffer pool for decoded row-group blocks.
+    pool: Option<Arc<BufferPool>>,
 }
 
 fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
@@ -650,19 +712,74 @@ impl ParquetSource {
         let file = File::open(path)?;
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
-        Ok(Arc::new(Self { backing: ParquetBacking::File(file), meta, sampling_interval_ms }))
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(file),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+        }))
     }
 
     fn open_bytes(bytes: Bytes) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
-        Ok(Arc::new(Self { backing: ParquetBacking::Bytes(bytes), meta, sampling_interval_ms }))
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::Bytes(bytes),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+        }))
     }
 
     fn open_file(file: File) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
-        Ok(Arc::new(Self { backing: ParquetBacking::File(file), meta, sampling_interval_ms }))
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(file),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+        }))
+    }
+
+    fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(file),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+        }))
+    }
+
+    fn open_bytes_with_pool(bytes: Bytes, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::Bytes(bytes),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+        }))
+    }
+
+    fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(file),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+        }))
     }
 
     fn build_batch_reader(
@@ -870,16 +987,104 @@ fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
     (ts + interval_ns / 2).checked_div(interval_ns).map_or(ts, |q| q * interval_ns)
 }
 
-fn read_timestamps(pf: &ParquetSource, rg_idx: usize, ts_col_idx: usize, interval_ns: u64) -> Result<Vec<Option<u64>>, Box<dyn Error>> {
+fn read_timestamps(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    ts_col_idx: usize,
+    interval_ns: u64,
+) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+    let key = CacheKey { source_id: pf.id, column_idx: ts_col_idx, row_group_idx: rg_idx };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_timestamps(key) {
+            return Ok(cached);
+        }
+    }
+
     let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
     let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [ts_col_idx]))?;
     let mut out = Vec::new();
     for batch in reader.flatten() {
-        let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>().ok_or("timestamp column is not UInt64")?;
+        let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+            .ok_or("timestamp column is not UInt64")?;
         out.reserve(arr.len());
-        for v in arr.iter() { out.push(v.map(|raw| snap_timestamp(raw, interval_ns))); }
+        for v in arr.iter() {
+            out.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
+        }
     }
-    Ok(out)
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_timestamps(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+fn read_counter_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+    let key = CacheKey { source_id: pf.id, column_idx: col_idx, row_group_idx: rg_idx };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_counter_values(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let mut out = Vec::new();
+    for batch in reader.flatten() {
+        let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+            .ok_or("counter column is not UInt64")?;
+        out.reserve(arr.len());
+        for v in arr.iter() {
+            out.push(v);  // preserve None so row indexing stays aligned with timestamps
+        }
+    }
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_counter_values(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+fn read_gauge_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<i64>>>, Box<dyn Error>> {
+    let key = CacheKey { source_id: pf.id, column_idx: col_idx, row_group_idx: rg_idx };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_gauge_values(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let mut out = Vec::new();
+    for batch in reader.flatten() {
+        let arr = batch.column(0).as_any().downcast_ref::<Int64Array>()
+            .ok_or("gauge column is not Int64")?;
+        out.reserve(arr.len());
+        for v in arr.iter() {
+            out.push(v);  // preserve None for row alignment
+        }
+    }
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_gauge_values(key, Arc::clone(&result));
+    }
+
+    Ok(result)
 }
 
 // ─── Counter reader ───────────────────────────────────────────────────────────
@@ -887,7 +1092,6 @@ fn read_timestamps(pf: &ParquetSource, rg_idx: usize, ts_col_idx: usize, interva
 fn read_counters(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Result<Counters, Box<dyn Error>> {
     let ts_col_idx = pf.meta.schema().index_of("timestamp").map_err(|_| "missing timestamp")?;
     let interval_ns = pf.sampling_interval_ms * 1_000_000;
-    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
     let num_rgs = pf.meta.metadata().num_row_groups();
 
     let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx).into_iter()
@@ -905,15 +1109,14 @@ fn read_counters(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64,
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
         for (i, col) in cols.iter().enumerate() {
-            let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col.col_idx]))?;
-            let mut row = 0usize;
-            for batch in reader.flatten() {
-                let arr = batch.column(0).as_any().downcast_ref::<UInt64Array>().expect("counter column is not UInt64");
-                for v in arr.iter() {
-                    if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                        if *ts >= start_ns && *ts <= end_ns { ts_acc[i].push(*ts); val_acc[i].push(v); }
+            let values = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
+            debug_assert_eq!(values.len(), timestamps.len(), "row count mismatch in row group");
+            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+                    if *ts >= start_ns && *ts <= end_ns {
+                        ts_acc[i].push(*ts);
+                        val_acc[i].push(*v);
                     }
-                    row += 1;
                 }
             }
         }
@@ -930,7 +1133,6 @@ fn read_counters(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64,
 fn read_gauges(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Result<Gauges, Box<dyn Error>> {
     let ts_col_idx = pf.meta.schema().index_of("timestamp").map_err(|_| "missing timestamp")?;
     let interval_ns = pf.sampling_interval_ms * 1_000_000;
-    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
     let num_rgs = pf.meta.metadata().num_row_groups();
 
     let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx).into_iter()
@@ -948,15 +1150,14 @@ fn read_gauges(pf: &ParquetSource, name: &str, filter: &Labels, start_ns: u64, e
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
         for (i, col) in cols.iter().enumerate() {
-            let reader = pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col.col_idx]))?;
-            let mut row = 0usize;
-            for batch in reader.flatten() {
-                let arr = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("gauge column is not Int64");
-                for v in arr.iter() {
-                    if let (Some(v), Some(Some(ts))) = (v, timestamps.get(row)) {
-                        if *ts >= start_ns && *ts <= end_ns { ts_acc[i].push(*ts); val_acc[i].push(v); }
+            let values = read_gauge_values_per_rg(pf, rg_idx, col.col_idx)?;
+            debug_assert_eq!(values.len(), timestamps.len(), "row count mismatch in row group");
+            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+                    if *ts >= start_ns && *ts <= end_ns {
+                        ts_acc[i].push(*ts);
+                        val_acc[i].push(*v);
                     }
-                    row += 1;
                 }
             }
         }
@@ -997,39 +1198,37 @@ impl ParquetHistogramCursor {
                 &self.pf, rg_idx, self.ts_col_idx, self.interval_ns
             ) else { continue; };
 
-            let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
             let mut rg_rows: Vec<HistogramRow> = Vec::new();
 
             for (si, col) in self.col_descs.iter().enumerate() {
                 let ColKind::Histogram { .. } = col.kind else { continue; };
-                // Iterator::next cannot propagate errors; skip on failure.
-                let Ok(reader) = self.pf.build_batch_reader(
-                    rg_idx,
-                    ProjectionMask::roots(&parquet_schema, [col.col_idx]),
-                ) else { continue; };
 
-                let mut row = 0usize;
-                for batch in reader.flatten() {
-                    let list = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .expect("histogram column is not List");
-                    for value in list.iter() {
-                        let ts = timestamps.get(row).copied().flatten();
-                        row += 1;
-                        let Some(ts) = ts else { continue; };
-                        if ts < self.start_ns || ts > self.end_ns { continue; }
-                        let snap = value
-                            .and_then(|lv| lv.as_any().downcast_ref::<UInt64Array>()
-                                .map(raw_to_sparse_cumulative))
-                            .unwrap_or_else(|| HistogramSnapshot { index: vec![], count: vec![] });
-                        rg_rows.push(HistogramRow {
-                            series_idx: si,
-                            timestamp: ts,
-                            snapshot: snap,
-                        });
+                let key = CacheKey {
+                    source_id: self.pf.id,
+                    column_idx: col.col_idx,
+                    row_group_idx: rg_idx,
+                };
+
+                let snapshots: Arc<Vec<HistogramSnapshot>> = if let Some(pool) = &self.pf.pool {
+                    if let Some(cached) = pool.get_histogram_snapshots(key) {
+                        cached
+                    } else {
+                        let decoded = Arc::new(self.decode_histogram_column(rg_idx, col.col_idx));
+                        pool.put_histogram_snapshots(key, Arc::clone(&decoded));
+                        decoded
                     }
+                } else {
+                    Arc::new(self.decode_histogram_column(rg_idx, col.col_idx))
+                };
+
+                for (ts_opt, snap) in timestamps.iter().zip(snapshots.iter()) {
+                    let Some(ts) = ts_opt else { continue; };
+                    if *ts < self.start_ns || *ts > self.end_ns { continue; }
+                    rg_rows.push(HistogramRow {
+                        series_idx: si,
+                        timestamp: *ts,
+                        snapshot: snap.clone(),
+                    });
                 }
             }
 
@@ -1040,6 +1239,37 @@ impl ParquetHistogramCursor {
             }
         }
         false
+    }
+
+    /// Decode all rows for one histogram column in one row group.
+    fn decode_histogram_column(&self, rg_idx: usize, col_idx: usize) -> Vec<HistogramSnapshot> {
+        let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
+        let Ok(reader) = self.pf.build_batch_reader(
+            rg_idx,
+            ProjectionMask::roots(&parquet_schema, [col_idx]),
+        ) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for batch in reader.flatten() {
+            let list = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("histogram column is not List");
+            for value in list.iter() {
+                let snap = value
+                    .and_then(|lv| {
+                        lv.as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .map(raw_to_sparse_cumulative)
+                    })
+                    .unwrap_or_else(|| HistogramSnapshot { index: vec![], count: vec![] });
+                out.push(snap);
+            }
+        }
+        out
     }
 }
 

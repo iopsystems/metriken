@@ -9,10 +9,11 @@
 //! If `METRIKEN_TEST_PARQUET` is unset, generates a synthetic ~1MB fixture.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use metriken_query::fixtures::{FixtureBuilder, ParquetAugmentor};
-use metriken_query::ParquetReader;
+use metriken_query::{BufferPool, ParquetReader};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 fn rss_bytes() -> u64 {
@@ -119,6 +120,54 @@ fn bench_one(base_path: &Path, repetitions: u32) {
     drop(augmented);
 }
 
+/// Same as `bench_one` but opens via a shared `BufferPool`.
+/// Runs each query twice: first (cold/miss) then second (warm/hit).
+fn bench_one_with_pool(base_path: &Path, repetitions: u32, pool: Arc<BufferPool>) {
+    println!("\n=== {repetitions}x replication (with pool) ===");
+
+    let augmented = ParquetAugmentor::from_path(base_path)
+        .repeat(repetitions)
+        .build()
+        .expect("augment");
+    let size = std::fs::metadata(augmented.path()).expect("stat").len();
+    println!("File: {}", fmt_size(size));
+
+    let t0 = Instant::now();
+    let reader = ParquetReader::open_with_pool(augmented.path(), Arc::clone(&pool)).expect("open");
+    let open_elapsed = t0.elapsed();
+    println!("  Open:                  {:>10.2?}", open_elapsed);
+
+    let (start, end) = reader.time_range().expect("time range");
+    let queries = pick_queries(&reader);
+
+    for (query, label) in &queries {
+        // Cold query (cache miss for this file)
+        let t0 = Instant::now();
+        let _ = reader.query_range(query, start, end, 1.0);
+        let cold = t0.elapsed();
+
+        // Warm query (cache hit)
+        let t0 = Instant::now();
+        let _ = reader.query_range(query, start, end, 1.0);
+        let warm = t0.elapsed();
+
+        let speedup = cold.as_secs_f64() / warm.as_secs_f64().max(1e-9);
+        println!(
+            "  {:<22} cold={:>10.2?}  warm={:>10.2?}  speedup={:.1}x  ({})",
+            label, cold, warm, speedup, query,
+        );
+    }
+
+    let stats = pool.stats();
+    println!(
+        "  Pool: hits={} misses={} bytes_used={} entries={}",
+        stats.hits, stats.misses, fmt_size(stats.bytes_used as u64), stats.entries,
+    );
+
+    drop(reader);
+    drop(augmented);
+}
+
 fn ensure_base_fixture() -> PathBuf {
     if let Ok(path) = std::env::var("METRIKEN_TEST_PARQUET") {
         return PathBuf::from(path);
@@ -159,6 +208,22 @@ fn main() {
     for reps in [1, 10, 25, 100] {
         bench_one(&base, reps);
     }
+
+    println!("\n\n=== BufferPool: cold vs warm query latency ===");
+    println!("(500 MB pool shared across all runs)");
+    // A fresh pool for the pool section so hits/misses are clean.
+    let pool = BufferPool::new(500 * 1024 * 1024);
+    for reps in [1, 10, 25, 100] {
+        bench_one_with_pool(&base, reps, Arc::clone(&pool));
+    }
+    let final_stats = pool.stats();
+    println!(
+        "\nFinal pool totals: hits={} misses={} bytes_used={} entries={}",
+        final_stats.hits,
+        final_stats.misses,
+        fmt_size(final_stats.bytes_used as u64),
+        final_stats.entries,
+    );
 
     println!("\nDone.");
 }
