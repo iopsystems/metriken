@@ -151,7 +151,7 @@ For a 315 MB capture:
 
 ```toml
 [dependencies]
-metriken-query = { version = "0.10", features = ["ingest"] }
+metriken-query = { version = "0.11", features = ["ingest"] }
 ```
 
 - `ingest` (off by default) — pulls in `metriken-exposition` and enables `MemoryStore::ingest_snapshot`. Without this feature, `MemoryStore` is still usable for query routing but cannot accept new snapshots.
@@ -163,7 +163,7 @@ Default features are minimal so consumers (including WASM viewers) can opt in.
 ## Cargo dependency
 
 ```toml
-metriken-query = "0.10"
+metriken-query = "0.11"
 ```
 
 To consume the workspace path during development:
