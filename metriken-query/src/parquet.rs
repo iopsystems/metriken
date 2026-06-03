@@ -42,7 +42,8 @@ impl ParquetReader {
 
     /// Convenience: open a single file with no extra labels.
     /// The `filename()` defaults to the path's basename.
-    pub fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
+        let path = path.as_ref();
         let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
         let source = ParquetSource::open(path)?;
         let inner = Arc::new(MultiParquetSource {
@@ -83,7 +84,11 @@ impl ParquetReader {
     /// Subsequent queries against this reader will populate the pool on first
     /// access and serve cached decoded blocks on repeated access.  Multiple
     /// readers sharing the same `Arc<BufferPool>` share the budget and LRU.
-    pub fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Self, Box<dyn Error>> {
+    pub fn open_with_pool(
+        path: impl AsRef<Path>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let path = path.as_ref();
         let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
         let source = ParquetSource::open_with_pool(path, pool)?;
         let inner = Arc::new(MultiParquetSource {
