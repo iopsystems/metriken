@@ -191,10 +191,9 @@ fn ensure_base_fixture() -> PathBuf {
 
 fn main() {
     // `cargo nextest` enumerates test/bench binaries by invoking them with
-    // `--list`; with `harness = false` we have no tests, so respond with an
-    // empty libtest-style listing to keep the runner happy.
+    // `--list`; with `harness = false` we have no tests, so emit an empty
+    // listing (nextest parses zero lines as zero tests).
     if std::env::args().any(|a| a == "--list") {
-        println!("0 benchmarks");
         return;
     }
     println!("=== ParquetReader Memory + Latency Benchmark ===");
