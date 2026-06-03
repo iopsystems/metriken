@@ -20,8 +20,10 @@ O(file size). See `README.md` for migration examples.
   injection.
 - Optional shared `BufferPool` — LRU-evicted cache of decoded blocks for
   dashboards that re-query the same windows.
-- `ingest` feature flag — gates `MemoryStore::ingest_snapshot` and the
-  `metriken-exposition` dependency.
+- `ingest` feature flag (default-on) — gates
+  `MemoryStore::ingest_snapshot` and the `metriken-exposition`
+  dependency. Disable with `default-features = false` for read-only
+  consumers like the rezolus WASM viewer.
 - `fixtures` feature flag — synthetic `FixtureBuilder` and real-file
   `ParquetAugmentor` for tests and benchmarks.
 - `histogram_sum` PromQL function; `histogram_percentiles` accepted as an

@@ -30,7 +30,7 @@ tempfile.workspace = true
 sysinfo = "0.32"
 
 [features]
-default = ["lz4"]
+default = ["lz4", "ingest"]
 ingest = ["dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]
 fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly

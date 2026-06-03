@@ -49,7 +49,7 @@ let result = reader.query_range(
 # Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
-### Live ingestion (with `ingest` feature)
+### Live ingestion
 
 ```rust,ignore
 use metriken_query::{MemoryStore, MetricsSource};
@@ -151,14 +151,12 @@ For a 315 MB capture:
 
 ```toml
 [dependencies]
-metriken-query = { version = "0.11", features = ["ingest"] }
+metriken-query = "0.11"
 ```
 
-- `ingest` (off by default) — pulls in `metriken-exposition` and enables `MemoryStore::ingest_snapshot`. Without this feature, `MemoryStore` is still usable for query routing but cannot accept new snapshots.
+- `ingest` (on by default) — pulls in `metriken-exposition` and enables `MemoryStore::ingest_snapshot`. Read-only consumers (e.g. the rezolus WASM viewer) can disable it with `default-features = false` to drop the dependency.
 - `lz4` (on by default) — enables LZ4 decompression support for parquet files.
 - `fixtures` (off by default, test/bench-only) — exposes the `fixtures` module with `FixtureBuilder` and `ParquetAugmentor` for generating test parquets.
-
-Default features are minimal so consumers (including WASM viewers) can opt in.
 
 ## Cargo dependency
 
