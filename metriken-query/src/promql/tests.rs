@@ -2124,7 +2124,6 @@ fn test_memory_store_metadata_get_matches_source() {
 #[test]
 fn test_label_values_via_query_engine() {
     use crate::types::{Counter, Gauge};
-    use crate::MetricsSource;
 
     // Build a MemoryStore and use its label_values default method.
     // We populate via the inner Memory (accessible inside the crate).

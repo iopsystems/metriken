@@ -190,6 +190,13 @@ fn ensure_base_fixture() -> PathBuf {
 }
 
 fn main() {
+    // `cargo nextest` enumerates test/bench binaries by invoking them with
+    // `--list`; with `harness = false` we have no tests, so respond with an
+    // empty libtest-style listing to keep the runner happy.
+    if std::env::args().any(|a| a == "--list") {
+        println!("0 benchmarks");
+        return;
+    }
     println!("=== ParquetReader Memory + Latency Benchmark ===");
     let base = ensure_base_fixture();
     let base_size = std::fs::metadata(&base).expect("stat base").len();

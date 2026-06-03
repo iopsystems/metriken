@@ -509,9 +509,9 @@ mod tests {
 
     #[test]
     fn test_memory_store_implements_metrics_source() {
-        fn assert_metrics_source<T: MetricsSource>(_: &T) {}
+        fn _assert_metrics_source<T: MetricsSource>(_: &T) {}
         fn _check(s: &MemoryStore) {
-            assert_metrics_source(s);
+            _assert_metrics_source(s);
         }
     }
 
@@ -548,7 +548,6 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "ingest")]
 mod ingest_tests {
-    use super::*;
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 

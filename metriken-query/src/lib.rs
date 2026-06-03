@@ -270,9 +270,9 @@ mod trait_impls {
     /// Compile-time check: `Arc<dyn MetricsSource>` is Send + Sync via the supertrait.
     #[test]
     fn test_metrics_source_dyn_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>(_: T) {}
+        fn _assert_send_sync<T: Send + Sync>(_: T) {}
         fn _check(s: std::sync::Arc<dyn MetricsSource>) {
-            assert_send_sync(s);
+            _assert_send_sync(s);
         }
     }
 
