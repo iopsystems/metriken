@@ -1,3 +1,9 @@
+//! `irate` as a pull-based iterator over a counter sample slice.
+//!
+//! At each step tick, locate the last two samples in `[t - range, t]`
+//! and emit `(t, delta / duration)`. The only state held is the
+//! cursor; the sample slice is borrowed from the upstream source.
+
 use super::Point;
 
 pub struct CounterIrate<'a> {

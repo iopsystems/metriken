@@ -1,3 +1,24 @@
+//! Streaming `histogram_quantile` / `histogram_quantiles` pipeline.
+//!
+//! Used by both `histogram_quantile(q, m)` (standard PromQL, single
+//! quantile) and `histogram_quantiles([qs], m)` (rezolus extension,
+//! multiple quantiles in one walk) — they're the same operation with
+//! N=1 vs N>1 and share this code path.
+//!
+//! The pipeline walks per-tick: pull the next snapshot from each
+//! matching [`HistogramStream`], sum the per-series deltas into a
+//! small reusable scratch buffer, compute the N quantiles for that
+//! tick, append to the N output Vecs, and repeat. Peak resident is
+//! one merged delta histogram (tens of KB at typical bucket density)
+//! plus the N partial output Vecs — independent of input series
+//! cardinality.
+//!
+//! Output ties to the existing [`MatrixSample`] JSON shape so the
+//! boundary serializer is unchanged. The `Iterator` trait isn't a
+//! fit (the per-tick summed `Ref` borrows from scratch that mutates
+//! between ticks — the classic lending-iterator problem), so the
+//! function is a straight loop rather than a generic chain.
+
 use std::collections::{BTreeMap, HashMap};
 
 use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult};

@@ -1,5 +1,11 @@
 //! Resolve a PromQL query to the set of physical parquet columns it
-//! touches — without reading any values.
+//! touches — without reading any values. Walks the parsed AST the
+//! same way `streaming::dispatch` does, but looks each selector up
+//! in the unified column map instead of fetching series data.
+//!
+//! Metric names are unique across types in the exposition format, so
+//! the resolver doesn't need to know which type table a selector
+//! targets — the name alone identifies the column.
 
 use std::collections::{HashMap, HashSet};
 

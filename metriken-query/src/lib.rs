@@ -1,3 +1,40 @@
+//! Arrow-native PromQL query engine for metriken parquet files.
+//!
+//! Two metric sources implement the [`MetricsSource`] trait:
+//!
+//! * [`ParquetReader`] — streams row groups on demand from a parquet
+//!   file (open with [`ParquetReader::open`]) or in-memory bytes
+//!   ([`ParquetReader::open_bytes`], used by the WASM viewer).
+//!   Resident memory is `O(active row group + parquet metadata)`,
+//!   not `O(file size)`.
+//! * [`MemoryStore`] — in-memory source for live agent polling.
+//!   Available with the `ingest` feature flag; ingests
+//!   `metriken_exposition::Snapshot` values.
+//!
+//! Queries go through the source's [`MetricsSource::query_range`]
+//! method, which parses a PromQL expression, dispatches recognised
+//! shapes to a streaming iterator pipeline, and returns
+//! Prometheus-compatible `MatrixSample` JSON.
+//!
+//! For multi-file (k-way merge) or per-file label injection, see
+//! [`ParquetBuilder`].
+//!
+//! An optional shared [`BufferPool`] caches decoded blocks across
+//! queries; attach it to any source with `.with_pool(...)`. The pool
+//! is process-wide and LRU-evicted by byte budget.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use metriken_query::{MetricsSource, ParquetReader};
+//!
+//! let reader = ParquetReader::open("metrics.parquet").unwrap();
+//! let (start, end) = reader.time_range().unwrap();
+//! let _matrix = reader
+//!     .query_range("rate(cpu_cycles[1m])", start, end, 1.0)
+//!     .unwrap();
+//! ```
+
 pub(crate) mod buffer_pool;
 pub(crate) mod histogram_stream;
 pub(crate) mod labels;

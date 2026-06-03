@@ -1,3 +1,16 @@
+//! Gauge-side streaming producers.
+//!
+//! All operate on a borrowed `&[(u64, i64)]` slice (the gauge sample
+//! storage) and emit `f64` values at step-aligned timestamps. State
+//! is the cursor plus, for the windowed forms, the indices into the
+//! source slice — no buffering of the input.
+//!
+//! * [`GaugeStepGrid`] — bare `metric{matchers}` selector at each tick,
+//!   subject to the staleness rule.
+//! * [`GaugeAvgOverTime`] — `avg_over_time(metric[range])`.
+//! * [`GaugeIdelta`] — `idelta(metric[range])`, last-two-samples delta.
+//! * [`GaugeDeriv`] — `deriv(metric[range])`, least-squares slope.
+
 use super::Point;
 
 pub struct GaugeStepGrid<'a> {

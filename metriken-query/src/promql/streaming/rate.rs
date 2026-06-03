@@ -1,3 +1,11 @@
+//! `rate` as a pull-based iterator over a counter sample slice.
+//!
+//! At each step tick, walk every consecutive sample pair in
+//! `[t - range, t]`, accumulate counter increases (handling resets),
+//! and divide by the time span between the first and last sample.
+//! Like [`super::CounterIrate`] the only state is the cursor; the
+//! sample slice is borrowed from the upstream source.
+
 use super::Point;
 
 pub struct CounterRate<'a> {
