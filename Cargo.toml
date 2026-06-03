@@ -7,7 +7,6 @@ members = [
     "metriken-derive",
     "metriken-exposition",
     "metriken-query",
-    "metriken-query-baseline-bench",
 ]
 
 [workspace.dependencies]

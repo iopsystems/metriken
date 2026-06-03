@@ -27,5 +27,3 @@ If `METRIKEN_TEST_PARQUET` is unset, both fall back to a synthetic ~1MB fixture.
 - **RSS delta on open**: Should be small (1-2 MB) regardless of file size. This is the streaming win — we hold parquet metadata, not the full data.
 - **RSS delta per query**: Scales with the *working set* (number of series touched), not the file size. A query touching one metric should stay small even on a 1 GB file.
 - **Latency**: Roughly linear in the data size (more row groups = more data to read), but with a smaller constant than full materialization.
-
-For a true before/after comparison against the old `Tsdb` approach, see the `metriken-query-baseline-bench` crate (added in a follow-on commit).
