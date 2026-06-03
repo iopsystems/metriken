@@ -29,7 +29,10 @@ fn match_pattern(value: &str, pattern: &str) -> bool {
 impl From<&[(&str, &str)]> for Labels {
     fn from(other: &[(&str, &str)]) -> Self {
         Labels {
-            inner: other.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            inner: other
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 }
@@ -43,7 +46,10 @@ impl From<()> for Labels {
 impl<const N: usize> From<[(&str, &str); N]> for Labels {
     fn from(other: [(&str, &str); N]) -> Self {
         Labels {
-            inner: other.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            inner: other
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 }
@@ -59,7 +65,10 @@ impl<const N: usize> From<[(String, String); N]> for Labels {
 impl<const N: usize> From<[(&str, String); N]> for Labels {
     fn from(other: [(&str, String); N]) -> Self {
         Labels {
-            inner: other.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            inner: other
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
         }
     }
 }

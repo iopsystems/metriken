@@ -4,8 +4,8 @@
 //! [`FixtureBuilder`] for synthetic deterministic fixtures, and
 //! [`ParquetAugmentor`] (added separately) to scale up real captures.
 
-mod synthetic;
 mod augment;
+mod synthetic;
 
-pub use synthetic::{Fixture, FixtureBuilder};
 pub use augment::ParquetAugmentor;
+pub use synthetic::{Fixture, FixtureBuilder};

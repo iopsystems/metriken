@@ -254,17 +254,17 @@ impl DataSource for MemoryStoreInner {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<Counters> {
-        self.memory.read().unwrap().counters(name, filter, start_ns, end_ns)
+        self.memory
+            .read()
+            .unwrap()
+            .counters(name, filter, start_ns, end_ns)
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-    ) -> Option<Gauges> {
-        self.memory.read().unwrap().gauges(name, filter, start_ns, end_ns)
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        self.memory
+            .read()
+            .unwrap()
+            .gauges(name, filter, start_ns, end_ns)
     }
 
     fn histogram_stream(
@@ -274,7 +274,10 @@ impl DataSource for MemoryStoreInner {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        self.memory.read().unwrap().histogram_stream(name, filter, start_ns, end_ns)
+        self.memory
+            .read()
+            .unwrap()
+            .histogram_stream(name, filter, start_ns, end_ns)
     }
 
     fn interval(&self) -> f64 {

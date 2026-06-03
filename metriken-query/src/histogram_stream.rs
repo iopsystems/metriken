@@ -115,8 +115,8 @@ impl HistogramStream {
             }
         }
 
-        let merged: Box<dyn Iterator<Item = HistogramRow> + Send> = Box::new(
-            std::iter::from_fn(move || {
+        let merged: Box<dyn Iterator<Item = HistogramRow> + Send> =
+            Box::new(std::iter::from_fn(move || {
                 let entry = heap.pop()?;
                 // Advance that iterator and push its next row.
                 // iter_idx is always valid: set at heap-priming time, iters is never resized.
@@ -129,11 +129,13 @@ impl HistogramStream {
                     });
                 }
                 Some(entry.row)
-            }),
-        );
+            }));
 
         Some(HistogramStream {
-            meta: HistogramStreamMeta { config, series: global_series },
+            meta: HistogramStreamMeta {
+                config,
+                series: global_series,
+            },
             rows: merged,
         })
     }

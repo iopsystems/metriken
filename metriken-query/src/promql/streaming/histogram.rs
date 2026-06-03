@@ -32,7 +32,15 @@ impl HistogramStream {
         stride_ns: Option<u64>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(self, group_by, start_ns, end_ns, stride_ns, metric_name, |r| r.mean())
+        reduce(
+            self,
+            group_by,
+            start_ns,
+            end_ns,
+            stride_ns,
+            metric_name,
+            |r| r.mean(),
+        )
     }
 
     pub fn count(
@@ -43,10 +51,18 @@ impl HistogramStream {
         stride_ns: Option<u64>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(self, group_by, start_ns, end_ns, stride_ns, metric_name, |r| {
-            let c = r.total_count();
-            (c > 0).then_some(c as f64)
-        })
+        reduce(
+            self,
+            group_by,
+            start_ns,
+            end_ns,
+            stride_ns,
+            metric_name,
+            |r| {
+                let c = r.total_count();
+                (c > 0).then_some(c as f64)
+            },
+        )
     }
 
     pub fn sum(
@@ -57,13 +73,21 @@ impl HistogramStream {
         stride_ns: Option<u64>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(self, group_by, start_ns, end_ns, stride_ns, metric_name, |r| {
-            let c = r.total_count();
-            if c == 0 {
-                return None;
-            }
-            r.mean().map(|m| c as f64 * m)
-        })
+        reduce(
+            self,
+            group_by,
+            start_ns,
+            end_ns,
+            stride_ns,
+            metric_name,
+            |r| {
+                let c = r.total_count();
+                if c == 0 {
+                    return None;
+                }
+                r.mean().map(|m| c as f64 * m)
+            },
+        )
     }
 
     pub fn irate(
@@ -110,7 +134,11 @@ fn decompose_to_individual(snap: &HistogramSnapshot) -> BTreeMap<u32, u64> {
 /// Compute `(curr - prev)` per-bucket individual counts and accumulate
 /// into `accum`. Counter resets (curr < prev for a bucket) are clamped
 /// to zero via `saturating_sub`, mirroring counter irate/rate semantics.
-fn accumulate_delta_into(prev: &HistogramSnapshot, curr: &HistogramSnapshot, accum: &mut BTreeMap<u32, u64>) {
+fn accumulate_delta_into(
+    prev: &HistogramSnapshot,
+    curr: &HistogramSnapshot,
+    accum: &mut BTreeMap<u32, u64>,
+) {
     let prev_map = decompose_to_individual(prev);
     let curr_map = decompose_to_individual(curr);
     for (&idx, &c) in &curr_map {
@@ -159,7 +187,12 @@ fn quantiles_impl(
     let mut stride_end_time: u64 = 0;
     let mut current_t: Option<u64> = None;
 
-    for HistogramRow { series_idx, timestamp: t, snapshot } in rows {
+    for HistogramRow {
+        series_idx,
+        timestamp: t,
+        snapshot,
+    } in rows
+    {
         if t > end_ns {
             continue;
         }
@@ -302,7 +335,12 @@ fn reduce(
     let mut stride_end_time: u64 = 0;
     let mut current_t: Option<u64> = None;
 
-    for HistogramRow { series_idx, timestamp: t, snapshot } in rows {
+    for HistogramRow {
+        series_idx,
+        timestamp: t,
+        snapshot,
+    } in rows
+    {
         if t > end_ns {
             continue;
         }
@@ -312,7 +350,8 @@ fn reduce(
             if let Some(prev_t) = current_t {
                 if prev_t != t && prev_t >= start_ns {
                     for g in 0..g_count {
-                        if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
+                        if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt)
+                        {
                             let r = CumulativeROHistogram32Ref::from_parts_unchecked(
                                 config,
                                 &scratch_idx,
@@ -358,8 +397,7 @@ fn reduce(
                                     &scratch_cnt,
                                 );
                                 if let Some(v) = reducer(&r) {
-                                    values_per_group[g]
-                                        .push((stride_end_time as f64 / 1e9, v));
+                                    values_per_group[g].push((stride_end_time as f64 / 1e9, v));
                                 }
                             }
                         }
@@ -436,7 +474,12 @@ fn irate_impl(
     let mut tick_has_data: Vec<bool> = vec![false; g_count];
     let mut current_t: Option<u64> = None;
 
-    for HistogramRow { series_idx, timestamp: t, snapshot } in rows {
+    for HistogramRow {
+        series_idx,
+        timestamp: t,
+        snapshot,
+    } in rows
+    {
         if t > end_ns {
             continue;
         }
@@ -481,8 +524,7 @@ fn irate_impl(
                 if let Some(prev_group_t) = prev_t_per_group[g] {
                     let dt_ns = t.saturating_sub(prev_group_t);
                     if dt_ns > 0 {
-                        let rate =
-                            (tick_count_per_group[g] as f64).max(0.0) / (dt_ns as f64 / 1e9);
+                        let rate = (tick_count_per_group[g] as f64).max(0.0) / (dt_ns as f64 / 1e9);
                         values_per_group[g].push((t as f64 / 1e9, rate));
                     }
                 }
@@ -559,7 +601,12 @@ fn heatmap_impl(
 
     let mut current_t: Option<u64> = None;
 
-    for HistogramRow { series_idx, timestamp: t, snapshot } in rows {
+    for HistogramRow {
+        series_idx,
+        timestamp: t,
+        snapshot,
+    } in rows
+    {
         if t > end_ns {
             continue;
         }

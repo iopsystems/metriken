@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use crate::labels::Labels;
+use crate::memory::Memory;
 use crate::promql::streaming::{collect_to_matrix, sum_by, CounterIrate, LabeledSeries};
 use crate::promql::{MatrixSample, QueryEngine, QueryResult};
-use crate::memory::Memory;
 use crate::types::{Counter, Gauge};
 use crate::DataSource;
 
@@ -34,7 +34,14 @@ fn cgroup_source() -> Arc<Memory> {
         labels.inner.insert("name".to_string(), name.to_string());
         let timestamps: Vec<u64> = (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect();
         let values: Vec<u64> = (0u64..3).map(|s| base_val + s * 100).collect();
-        source.add_counter("cgroup_cpu_usage", Counter { labels, timestamps, values });
+        source.add_counter(
+            "cgroup_cpu_usage",
+            Counter {
+                labels,
+                timestamps,
+                values,
+            },
+        );
     }
     Arc::new(source)
 }
@@ -234,8 +241,12 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
 
     // cpu_cores gauge: single series with node/source labels, value=4.
     let mut labels = Labels::default();
-    labels.inner.insert("node".to_string(), "agent-0".to_string());
-    labels.inner.insert("source".to_string(), "rezolus".to_string());
+    labels
+        .inner
+        .insert("node".to_string(), "agent-0".to_string());
+    labels
+        .inner
+        .insert("source".to_string(), "rezolus".to_string());
     source.add_gauge(
         "cpu_cores",
         Gauge {

@@ -243,4 +243,3 @@ impl<'a> Iterator for GaugeDeriv<'a> {
         None
     }
 }
-

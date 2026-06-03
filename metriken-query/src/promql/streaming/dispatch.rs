@@ -28,9 +28,9 @@ use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp,
-    CounterIrate, CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta,
-    GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    aggregate, collect_to_matrix, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp, CounterIrate,
+    CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
+    GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{MatrixSample, QueryError, QueryResult};
 use crate::DataSource;
@@ -416,8 +416,7 @@ where
                 .series
                 .into_iter()
                 .map(|c| {
-                    let rate_iter =
-                        CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns);
+                    let rate_iter = CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns);
                     let pts: Vec<_> =
                         StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
                             .collect();

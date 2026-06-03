@@ -1,18 +1,18 @@
 pub(crate) mod buffer_pool;
+pub(crate) mod histogram_stream;
 pub(crate) mod labels;
 pub(crate) mod memory;
+pub(crate) mod memory_store;
 pub mod parquet;
 pub(crate) mod promql;
 pub(crate) mod types;
-pub(crate) mod histogram_stream;
-pub(crate) mod memory_store;
 
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
-pub use parquet::{ParquetBuilder, ParquetReader};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
+pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
 
 use histogram_stream::HistogramStream;
@@ -20,7 +20,8 @@ use labels::Labels;
 use types::{Counters, Gauges};
 
 pub(crate) trait DataSource: Send + Sync {
-    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Counters>;
+    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64)
+        -> Option<Counters>;
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
     fn histogram_stream(
         &self,
@@ -54,7 +55,9 @@ pub(crate) trait DataSource: Send + Sync {
         self.file_metadata().get(key).cloned()
     }
     /// Parquet column name for every `(metric_name, labels)` pair.
-    fn column_map(&self) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;
 }
 
 /// Public trait expressing the full read-only capability of a metrics source.
@@ -72,7 +75,13 @@ pub(crate) trait DataSource: Send + Sync {
 /// ```
 pub trait MetricsSource: Send + Sync {
     /// Execute a PromQL range query.
-    fn query_range(&self, expr: &str, start_s: f64, end_s: f64, step_s: f64) -> Result<QueryResult, QueryError>;
+    fn query_range(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+    ) -> Result<QueryResult, QueryError>;
 
     /// Execute an instant PromQL query at a single timestamp (uses the latest
     /// available timestamp when `time` is `None`).
@@ -132,13 +141,19 @@ pub trait MetricsSource: Send + Sync {
     fn label_values(&self, metric: &str, key: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         for labels in self.counter_labels(metric) {
-            if let Some(v) = labels.get(key) { out.insert(v.clone()); }
+            if let Some(v) = labels.get(key) {
+                out.insert(v.clone());
+            }
         }
         for labels in self.gauge_labels(metric) {
-            if let Some(v) = labels.get(key) { out.insert(v.clone()); }
+            if let Some(v) = labels.get(key) {
+                out.insert(v.clone());
+            }
         }
         for labels in self.histogram_labels(metric) {
-            if let Some(v) = labels.get(key) { out.insert(v.clone()); }
+            if let Some(v) = labels.get(key) {
+                out.insert(v.clone());
+            }
         }
         out
     }
@@ -158,9 +173,15 @@ pub trait MetricsSource: Send + Sync {
     /// histogram metric. Useful for capacity estimates and UI badges.
     fn total_series_count(&self) -> usize {
         let mut count = 0;
-        for name in self.counter_names() { count += self.counter_labels(&name).len(); }
-        for name in self.gauge_names() { count += self.gauge_labels(&name).len(); }
-        for name in self.histogram_names() { count += self.histogram_labels(&name).len(); }
+        for name in self.counter_names() {
+            count += self.counter_labels(&name).len();
+        }
+        for name in self.gauge_names() {
+            count += self.gauge_labels(&name).len();
+        }
+        for name in self.histogram_names() {
+            count += self.histogram_labels(&name).len();
+        }
         count
     }
 
@@ -190,17 +211,27 @@ pub trait MetricsSource: Send + Sync {
                 }
             }
         };
-        for name in self.counter_names() { collect(self.counter_labels(&name)); }
-        for name in self.gauge_names() { collect(self.gauge_labels(&name)); }
-        for name in self.histogram_names() { collect(self.histogram_labels(&name)); }
+        for name in self.counter_names() {
+            collect(self.counter_labels(&name));
+        }
+        for name in self.gauge_names() {
+            collect(self.gauge_labels(&name));
+        }
+        for name in self.histogram_names() {
+            collect(self.histogram_labels(&name));
+        }
         out
     }
 
     /// For a specific metric name, return every label key mapped to the set of
     /// distinct values seen across all series of that metric (counter, gauge,
     /// and histogram types are all included).
-    fn label_values_by_key(&self, metric: &str) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
-        let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    fn label_values_by_key(
+        &self,
+        metric: &str,
+    ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+        let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
         let mut collect = |labels_list: Vec<std::collections::BTreeMap<String, String>>| {
             for labels in labels_list {
                 for (k, v) in labels {

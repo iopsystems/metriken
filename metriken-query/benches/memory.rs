@@ -29,10 +29,7 @@ fn pick_queries(reader: &ParquetReader) -> Vec<(String, String)> {
 
     // Counter rate (1m window)
     if let Some(c) = reader.counter_names().first().cloned() {
-        queries.push((
-            format!("rate({c}[1m])"),
-            "counter rate".to_string(),
-        ));
+        queries.push((format!("rate({c}[1m])"), "counter rate".to_string()));
     }
 
     // Gauge (raw)
@@ -161,7 +158,10 @@ fn bench_one_with_pool(base_path: &Path, repetitions: u32, pool: Arc<BufferPool>
     let stats = pool.stats();
     println!(
         "  Pool: hits={} misses={} bytes_used={} entries={}",
-        stats.hits, stats.misses, fmt_size(stats.bytes_used as u64), stats.entries,
+        stats.hits,
+        stats.misses,
+        fmt_size(stats.bytes_used as u64),
+        stats.entries,
     );
 
     drop(reader);

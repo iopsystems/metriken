@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::labels::Labels;
-use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::memory::Memory;
+use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
 use crate::DataSource;
 
@@ -32,7 +32,14 @@ fn create_cgroup_source() -> Memory {
         let labels = make_labels(&[("name", name), ("state", "user")]);
         let timestamps: Vec<u64> = (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect();
         let values: Vec<u64> = (0u64..3).map(|s| base_val + s * 100).collect();
-        source.add_counter("cgroup_cpu_usage", Counter { labels, timestamps, values });
+        source.add_counter(
+            "cgroup_cpu_usage",
+            Counter {
+                labels,
+                timestamps,
+                values,
+            },
+        );
     }
     source
 }
@@ -868,9 +875,18 @@ fn create_columns_histogram_source() -> Memory {
                 config,
                 timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
                 snapshots: vec![
-                    HistogramSnapshot { index: vec![], count: vec![] },
-                    HistogramSnapshot { index: vec![10], count: vec![1u64] },
-                    HistogramSnapshot { index: vec![10], count: vec![2u64] },
+                    HistogramSnapshot {
+                        index: vec![],
+                        count: vec![],
+                    },
+                    HistogramSnapshot {
+                        index: vec![10],
+                        count: vec![1u64],
+                    },
+                    HistogramSnapshot {
+                        index: vec![10],
+                        count: vec![2u64],
+                    },
                 ],
             },
         );
@@ -1105,9 +1121,15 @@ fn test_columns_histogram_sum_resolves_buckets_column() {
 /// at bucket index 10.
 fn hist_snap_cumulative(n: u64) -> HistogramSnapshot {
     if n == 0 {
-        HistogramSnapshot { index: vec![], count: vec![] }
+        HistogramSnapshot {
+            index: vec![],
+            count: vec![],
+        }
     } else {
-        HistogramSnapshot { index: vec![10], count: vec![n] }
+        HistogramSnapshot {
+            index: vec![10],
+            count: vec![n],
+        }
     }
 }
 
@@ -1127,9 +1149,19 @@ fn create_hist_source(cumulative_per_cpu: &[u64]) -> Memory {
     for cpu in ["0", "1"] {
         let labels = make_labels(&[("cpu", cpu)]);
         let timestamps: Vec<u64> = (0..n).map(|i| (1000 + i as u64) * 1_000_000_000).collect();
-        let snapshots: Vec<HistogramSnapshot> =
-            cumulative_per_cpu.iter().map(|&c| hist_snap_cumulative(c)).collect();
-        source.add_histogram("req_latency", Histogram { labels, config, timestamps, snapshots });
+        let snapshots: Vec<HistogramSnapshot> = cumulative_per_cpu
+            .iter()
+            .map(|&c| hist_snap_cumulative(c))
+            .collect();
+        source.add_histogram(
+            "req_latency",
+            Histogram {
+                labels,
+                config,
+                timestamps,
+                snapshots,
+            },
+        );
     }
     source
 }
@@ -1826,8 +1858,7 @@ fn test_histogram_stream_merge_two_streams() {
         .expect("stream_b should have data");
 
     // Merge and inspect the result
-    let merged = HistogramStream::merge(vec![stream_a, stream_b])
-        .expect("merge should succeed");
+    let merged = HistogramStream::merge(vec![stream_a, stream_b]).expect("merge should succeed");
 
     // Should have 2 global series (cpu=0, cpu=1)
     assert_eq!(merged.meta.series.len(), 2);
@@ -1889,10 +1920,17 @@ fn test_file_labeled_injects_labels_into_series() {
     assert_eq!(merged.meta.series.len(), 4);
     // Every series must have a "run" label
     for s in &merged.meta.series {
-        assert!(s.inner.contains_key("run"), "series missing injected 'run' label: {:?}", s);
+        assert!(
+            s.inner.contains_key("run"),
+            "series missing injected 'run' label: {:?}",
+            s
+        );
     }
     // Both run values must be present
-    let run_values: std::collections::HashSet<String> = merged.meta.series.iter()
+    let run_values: std::collections::HashSet<String> = merged
+        .meta
+        .series
+        .iter()
         .filter_map(|s| s.inner.get("run").cloned())
         .collect();
     assert!(run_values.contains("a"), "run=a missing");
@@ -1928,7 +1966,9 @@ fn test_counter_labels_returns_label_sets() {
     let engine = QueryEngine::new(source);
     let labels = engine.counter_labels("cgroup_cpu_usage");
     assert_eq!(labels.len(), 3); // 3 cgroups
-    assert!(labels.iter().any(|l| l.get("name") == Some(&"/system.slice/foo.service".to_string())));
+    assert!(labels
+        .iter()
+        .any(|l| l.get("name") == Some(&"/system.slice/foo.service".to_string())));
 }
 
 #[test]
@@ -1981,11 +2021,18 @@ fn test_injected_label_filter_excludes_incompatible_file() {
 
     // Filter the merged stream to only run="a" series
     let run_a_filter = make_labels(&[("run", "a")]);
-    let series_matching_a: Vec<_> = merged.meta.series.iter()
+    let series_matching_a: Vec<_> = merged
+        .meta
+        .series
+        .iter()
         .filter(|s| s.matches(&run_a_filter))
         .collect();
 
-    assert_eq!(series_matching_a.len(), 2, "should get 2 series (cpu=0,1) with run=a");
+    assert_eq!(
+        series_matching_a.len(),
+        2,
+        "should get 2 series (cpu=0,1) with run=a"
+    );
     for s in &series_matching_a {
         assert_eq!(s.inner.get("run").map(String::as_str), Some("a"));
     }
@@ -1999,7 +2046,10 @@ fn test_parquet_reader_open_bytes_compiles() {
         let _ = crate::ParquetReader::open_bytes(vec![0u8; 4]);
         let _ = crate::ParquetReader::builder().bytes(vec![0u8; 4]).build();
         let _ = crate::ParquetReader::builder()
-            .bytes_labeled(bytes::Bytes::from_static(b""), crate::labels::Labels::default())
+            .bytes_labeled(
+                bytes::Bytes::from_static(b""),
+                crate::labels::Labels::default(),
+            )
             .build();
     }
 }
@@ -2052,7 +2102,10 @@ fn test_memory_store_filename_via_trait() {
 #[test]
 fn test_memory_store_metadata_get_matches_source() {
     use crate::MetricsSource;
-    let store = crate::MemoryStore::builder().source("rezolus").version("3.0").build();
+    let store = crate::MemoryStore::builder()
+        .source("rezolus")
+        .version("3.0")
+        .build();
     assert_eq!(store.metadata_get("source"), Some("rezolus".to_string()));
     assert_eq!(store.metadata_get("version"), Some("3.0".to_string()));
     assert_eq!(store.metadata_get("nonexistent"), None);
@@ -2079,13 +2132,23 @@ fn test_label_values_via_query_engine() {
     let ts: Vec<u64> = vec![1_000_000_000_000, 2_000_000_000_000];
     for cpu in ["0", "1"] {
         let labels = make_labels(&[("cpu", cpu)]);
-        mem.add_counter("cpu_cycles", Counter { labels, timestamps: ts.clone(), values: vec![0, 100] });
+        mem.add_counter(
+            "cpu_cycles",
+            Counter {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![0, 100],
+            },
+        );
     }
-    mem.add_gauge("cpu_temp", Gauge {
-        labels: make_labels(&[("cpu", "0")]),
-        timestamps: ts.clone(),
-        values: vec![50, 51],
-    });
+    mem.add_gauge(
+        "cpu_temp",
+        Gauge {
+            labels: make_labels(&[("cpu", "0")]),
+            timestamps: ts.clone(),
+            values: vec![50, 51],
+        },
+    );
 
     // Wrap in a DataSource-backed QueryEngine and drive label_values
     // through a MemoryStoreInner, which has access to the DataSource methods.
@@ -2104,10 +2167,14 @@ fn test_label_values_via_query_engine() {
     // Collect expected label values manually (mirrors label_values logic).
     let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
     for lbl in inner.counter_labels("cpu_cycles") {
-        if let Some(v) = lbl.get("cpu") { expected.insert(v.clone()); }
+        if let Some(v) = lbl.get("cpu") {
+            expected.insert(v.clone());
+        }
     }
     for lbl in inner.gauge_labels("cpu_cycles") {
-        if let Some(v) = lbl.get("cpu") { expected.insert(v.clone()); }
+        if let Some(v) = lbl.get("cpu") {
+            expected.insert(v.clone());
+        }
     }
     assert!(expected.contains("0"));
     assert!(expected.contains("1"));
@@ -2121,7 +2188,12 @@ fn test_memory_store_label_values_ingest() {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    fn make_snap(ts: SystemTime, name: &str, value: u64, cpu: &str) -> metriken_exposition::Snapshot {
+    fn make_snap(
+        ts: SystemTime,
+        name: &str,
+        value: u64,
+        cpu: &str,
+    ) -> metriken_exposition::Snapshot {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("metric".to_string(), name.to_string());
         metadata.insert("cpu".to_string(), cpu.to_string());
@@ -2139,7 +2211,9 @@ fn test_memory_store_label_values_ingest() {
         })
     }
 
-    let store = crate::MemoryStore::builder().sampling_interval_ms(1000).build();
+    let store = crate::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
     let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1001);
     store.ingest_snapshot(make_snap(t0, "cpu_cycles", 100, "0"));
@@ -2168,31 +2242,51 @@ fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
 
     for cpu in ["0", "1"] {
         let labels = make_labels(&[("cpu", cpu), ("kind", "counter")]);
-        mem.add_counter("cpu_cycles", Counter {
-            labels, timestamps: ts.clone(), values: vec![0, 100],
-        });
+        mem.add_counter(
+            "cpu_cycles",
+            Counter {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![0, 100],
+            },
+        );
     }
-    mem.add_gauge("cpu_temp", Gauge {
-        labels: make_labels(&[("cpu", "0")]),
-        timestamps: ts.clone(),
-        values: vec![50, 51],
-    });
-    mem.add_gauge("mem_used", Gauge {
-        labels: make_labels(&[("node", "n1")]),
-        timestamps: ts.clone(),
-        values: vec![1024, 2048],
-    });
+    mem.add_gauge(
+        "cpu_temp",
+        Gauge {
+            labels: make_labels(&[("cpu", "0")]),
+            timestamps: ts.clone(),
+            values: vec![50, 51],
+        },
+    );
+    mem.add_gauge(
+        "mem_used",
+        Gauge {
+            labels: make_labels(&[("node", "n1")]),
+            timestamps: ts.clone(),
+            values: vec![1024, 2048],
+        },
+    );
 
     let config = ::histogram::Config::new(4, 16).unwrap();
-    mem.add_histogram("req_latency", Histogram {
-        labels: make_labels(&[("cpu", "0")]),
-        config,
-        timestamps: ts.clone(),
-        snapshots: vec![
-            HistogramSnapshot { index: vec![], count: vec![] },
-            HistogramSnapshot { index: vec![10], count: vec![5] },
-        ],
-    });
+    mem.add_histogram(
+        "req_latency",
+        Histogram {
+            labels: make_labels(&[("cpu", "0")]),
+            config,
+            timestamps: ts.clone(),
+            snapshots: vec![
+                HistogramSnapshot {
+                    index: vec![],
+                    count: vec![],
+                },
+                HistogramSnapshot {
+                    index: vec![10],
+                    count: vec![5],
+                },
+            ],
+        },
+    );
 
     Arc::new(crate::memory_store::MemoryStoreInner {
         memory: std::sync::RwLock::new(mem),
@@ -2209,7 +2303,10 @@ fn test_all_names_is_sorted_union_of_all_types() {
 
     let names = store.all_names();
     // Sorted: cpu_cycles, cpu_temp, mem_used, req_latency
-    assert_eq!(names, vec!["cpu_cycles", "cpu_temp", "mem_used", "req_latency"]);
+    assert_eq!(
+        names,
+        vec!["cpu_cycles", "cpu_temp", "mem_used", "req_latency"]
+    );
 
     // Each name appears exactly once even if the same metric appears in multiple types
     let dedup: std::collections::HashSet<_> = names.iter().collect();
@@ -2234,12 +2331,12 @@ fn test_has_counter_gauge_histogram() {
     let store = crate::MemoryStore::from_inner(inner);
 
     assert!(store.has_counter("cpu_cycles"));
-    assert!(!store.has_counter("cpu_temp"));     // gauge, not counter
+    assert!(!store.has_counter("cpu_temp")); // gauge, not counter
     assert!(!store.has_counter("absent"));
 
     assert!(store.has_gauge("cpu_temp"));
     assert!(store.has_gauge("mem_used"));
-    assert!(!store.has_gauge("cpu_cycles"));     // counter, not gauge
+    assert!(!store.has_gauge("cpu_cycles")); // counter, not gauge
     assert!(!store.has_gauge("absent"));
 
     assert!(store.has_histogram("req_latency"));
@@ -2257,7 +2354,7 @@ fn test_all_label_keys_unions_across_all_metrics() {
     // cpu (from cpu_cycles counter and cpu_temp gauge and req_latency histogram)
     // kind (from cpu_cycles counter)
     // node (from mem_used gauge)
-    assert!(keys.contains("cpu"),  "expected 'cpu' in label keys");
+    assert!(keys.contains("cpu"), "expected 'cpu' in label keys");
     assert!(keys.contains("kind"), "expected 'kind' in label keys");
     assert!(keys.contains("node"), "expected 'node' in label keys");
     // Must be sorted (BTreeSet)
@@ -2308,7 +2405,9 @@ fn test_time_range_ns_is_exact_for_memory_store() {
     let inner = make_mixed_memory();
     let store = crate::MemoryStore::from_inner(inner);
 
-    let (lo, hi) = store.time_range_ns().expect("non-empty store should have time range");
+    let (lo, hi) = store
+        .time_range_ns()
+        .expect("non-empty store should have time range");
     assert_eq!(lo, 1_000_000_000_000, "expected 1e12 ns (1000 s)");
     assert_eq!(hi, 2_000_000_000_000, "expected 2e12 ns (2000 s)");
 
@@ -2331,8 +2430,7 @@ fn test_parquet_builder_file_owned_compiles() {
     // file_owned and file_owned_labeled must accept std::fs::File.
     fn _check(f1: std::fs::File, f2: std::fs::File) {
         let _ = crate::ParquetReader::builder().file_owned(f1);
-        let _ = crate::ParquetReader::builder()
-            .file_owned_labeled(f2, [("run", "a")]);
+        let _ = crate::ParquetReader::builder().file_owned_labeled(f2, [("run", "a")]);
     }
 }
 
@@ -2341,7 +2439,6 @@ fn test_parquet_builder_reader_and_reader_labeled_compile() {
     // reader() and reader_labeled() must accept Arc<ParquetReader>.
     fn _check(r1: Arc<crate::ParquetReader>, r2: Arc<crate::ParquetReader>) {
         let _ = crate::ParquetReader::builder().reader(r1.clone());
-        let _ = crate::ParquetReader::builder()
-            .reader_labeled(r2, [("run", "b")]);
+        let _ = crate::ParquetReader::builder().reader_labeled(r2, [("run", "b")]);
     }
 }

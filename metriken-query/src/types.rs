@@ -40,4 +40,3 @@ pub struct Counters {
 pub struct Gauges {
     pub series: Vec<Gauge>,
 }
-

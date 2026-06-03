@@ -59,7 +59,12 @@ fn counter_with_label_filter_selects_one_series() {
     let reader = ParquetReader::open(fixture.path()).unwrap();
     let (start, end) = reader.time_range().unwrap();
     let result = reader
-        .query_range(r#"rate(requests{zone="us-east"}[1m])"#, start, end + 1.0, 1.0)
+        .query_range(
+            r#"rate(requests{zone="us-east"}[1m])"#,
+            start,
+            end + 1.0,
+            1.0,
+        )
         .unwrap();
 
     if let QueryResult::Matrix { result } = result {
@@ -312,7 +317,9 @@ fn filename_defaults_to_basename_for_path_open() {
         .build()
         .unwrap();
     let reader = ParquetReader::open(fixture.path()).unwrap();
-    let name = reader.filename().expect("filename should default from path");
+    let name = reader
+        .filename()
+        .expect("filename should default from path");
     assert!(
         name.ends_with(".parquet"),
         "expected .parquet basename, got {name}"

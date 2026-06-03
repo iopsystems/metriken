@@ -70,7 +70,11 @@ fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     Ok(query)
 }
 
-fn walk(col_map: &HashMap<String, HashMap<Labels, String>>, expr: &Expr, out: &mut HashSet<String>) {
+fn walk(
+    col_map: &HashMap<String, HashMap<Labels, String>>,
+    expr: &Expr,
+    out: &mut HashSet<String>,
+) {
     match expr {
         Expr::Paren(p) => walk(col_map, &p.expr, out),
         Expr::Unary(u) => walk(col_map, &u.expr, out),

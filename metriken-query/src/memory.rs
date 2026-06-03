@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
-use crate::types::{Counter, Counters, Gauge, Gauges, Histogram};
 #[cfg(feature = "ingest")]
 use crate::types::HistogramSnapshot;
+use crate::types::{Counter, Counters, Gauge, Gauges, Histogram};
 use crate::DataSource;
 
 /// In-memory data source for tests. Callers build `Counter`/`Gauge`/`Histogram`
@@ -33,7 +33,10 @@ impl Memory {
 
     #[cfg(test)]
     pub(crate) fn add_counter(&mut self, name: &str, counter: Counter) {
-        self.counters.entry(name.to_string()).or_default().push(counter);
+        self.counters
+            .entry(name.to_string())
+            .or_default()
+            .push(counter);
     }
 
     #[cfg(test)]
@@ -43,19 +46,32 @@ impl Memory {
 
     #[cfg(test)]
     pub(crate) fn add_histogram(&mut self, name: &str, histogram: Histogram) {
-        self.histograms.entry(name.to_string()).or_default().push(histogram);
+        self.histograms
+            .entry(name.to_string())
+            .or_default()
+            .push(histogram);
     }
 
     /// Append a counter sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
     #[cfg(feature = "ingest")]
-    pub(crate) fn upsert_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: u64) {
+    pub(crate) fn upsert_counter_sample(
+        &mut self,
+        name: &str,
+        labels: Labels,
+        ts: u64,
+        value: u64,
+    ) {
         let series = self.counters.entry(name.to_string()).or_default();
         if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
             c.timestamps.push(ts);
             c.values.push(value);
         } else {
-            series.push(Counter { labels, timestamps: vec![ts], values: vec![value] });
+            series.push(Counter {
+                labels,
+                timestamps: vec![ts],
+                values: vec![value],
+            });
         }
     }
 
@@ -68,7 +84,11 @@ impl Memory {
             g.timestamps.push(ts);
             g.values.push(value);
         } else {
-            series.push(Gauge { labels, timestamps: vec![ts], values: vec![value] });
+            series.push(Gauge {
+                labels,
+                timestamps: vec![ts],
+                values: vec![value],
+            });
         }
     }
 
@@ -156,16 +176,14 @@ impl DataSource for Memory {
             })
             .filter(|c| !c.timestamps.is_empty())
             .collect();
-        if series.is_empty() { None } else { Some(Counters { series }) }
+        if series.is_empty() {
+            None
+        } else {
+            Some(Counters { series })
+        }
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-    ) -> Option<Gauges> {
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let stored = self.gauges.get(name)?;
         let series: Vec<Gauge> = stored
             .iter()
@@ -180,7 +198,11 @@ impl DataSource for Memory {
             })
             .filter(|g| !g.timestamps.is_empty())
             .collect();
-        if series.is_empty() { None } else { Some(Gauges { series }) }
+        if series.is_empty() {
+            None
+        } else {
+            Some(Gauges { series })
+        }
     }
 
     fn histogram_stream(
@@ -195,7 +217,10 @@ impl DataSource for Memory {
         let mut config: Option<::histogram::Config> = None;
         let mut rows: Vec<HistogramRow> = Vec::new();
 
-        for hist in stored.iter().filter(|h| filter.inner.is_empty() || h.labels.matches(filter)) {
+        for hist in stored
+            .iter()
+            .filter(|h| filter.inner.is_empty() || h.labels.matches(filter))
+        {
             debug_assert!(
                 config.is_none_or(|c| c == hist.config),
                 "histogram series within one metric must share the same config"
@@ -207,7 +232,10 @@ impl DataSource for Memory {
             }
             let series_idx = series_labels.len();
             series_labels.push(hist.labels.clone());
-            for (ts, snap) in hist.timestamps[r.clone()].iter().zip(hist.snapshots[r].iter()) {
+            for (ts, snap) in hist.timestamps[r.clone()]
+                .iter()
+                .zip(hist.snapshots[r].iter())
+            {
                 rows.push(HistogramRow {
                     series_idx,
                     timestamp: *ts,
@@ -226,7 +254,10 @@ impl DataSource for Memory {
         rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
 
         Some(HistogramStream {
-            meta: HistogramStreamMeta { config, series: series_labels },
+            meta: HistogramStreamMeta {
+                config,
+                series: series_labels,
+            },
             rows: Box::new(rows.into_iter()),
         })
     }
@@ -254,21 +285,24 @@ impl DataSource for Memory {
     }
 
     fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        self.counters.get(name).map(|series| {
-            series.iter().map(|c| c.labels.inner.clone()).collect()
-        }).unwrap_or_default()
+        self.counters
+            .get(name)
+            .map(|series| series.iter().map(|c| c.labels.inner.clone()).collect())
+            .unwrap_or_default()
     }
 
     fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        self.gauges.get(name).map(|series| {
-            series.iter().map(|g| g.labels.inner.clone()).collect()
-        }).unwrap_or_default()
+        self.gauges
+            .get(name)
+            .map(|series| series.iter().map(|g| g.labels.inner.clone()).collect())
+            .unwrap_or_default()
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        self.histograms.get(name).map(|series| {
-            series.iter().map(|h| h.labels.inner.clone()).collect()
-        }).unwrap_or_default()
+        self.histograms
+            .get(name)
+            .map(|series| series.iter().map(|h| h.labels.inner.clone()).collect())
+            .unwrap_or_default()
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {
@@ -300,12 +334,16 @@ impl DataSource for Memory {
         let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
         for (name, series) in &self.counters {
             for s in series {
-                out.entry(name.clone()).or_default().insert(s.labels.clone(), name.clone());
+                out.entry(name.clone())
+                    .or_default()
+                    .insert(s.labels.clone(), name.clone());
             }
         }
         for (name, series) in &self.gauges {
             for s in series {
-                out.entry(name.clone()).or_default().insert(s.labels.clone(), name.clone());
+                out.entry(name.clone())
+                    .or_default()
+                    .insert(s.labels.clone(), name.clone());
             }
         }
         for (name, series) in &self.histograms {

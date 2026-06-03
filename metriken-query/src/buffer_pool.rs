@@ -129,9 +129,17 @@ impl BufferPool {
     pub(crate) fn get_timestamps(&self, key: CacheKey) -> Option<Arc<Vec<Option<u64>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
-            if let Block::Timestamps(v) = &entry.data { Some(Arc::clone(v)) } else { None }
+            if let Block::Timestamps(v) = &entry.data {
+                Some(Arc::clone(v))
+            } else {
+                None
+            }
         });
-        if result.is_some() { inner.hits += 1; } else { inner.misses += 1; }
+        if result.is_some() {
+            inner.hits += 1;
+        } else {
+            inner.misses += 1;
+        }
         result
     }
 
@@ -146,9 +154,17 @@ impl BufferPool {
     pub(crate) fn get_counter_values(&self, key: CacheKey) -> Option<Arc<Vec<Option<u64>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
-            if let Block::CounterValues(v) = &entry.data { Some(Arc::clone(v)) } else { None }
+            if let Block::CounterValues(v) = &entry.data {
+                Some(Arc::clone(v))
+            } else {
+                None
+            }
         });
-        if result.is_some() { inner.hits += 1; } else { inner.misses += 1; }
+        if result.is_some() {
+            inner.hits += 1;
+        } else {
+            inner.misses += 1;
+        }
         result
     }
 
@@ -162,9 +178,17 @@ impl BufferPool {
     pub(crate) fn get_gauge_values(&self, key: CacheKey) -> Option<Arc<Vec<Option<i64>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
-            if let Block::GaugeValues(v) = &entry.data { Some(Arc::clone(v)) } else { None }
+            if let Block::GaugeValues(v) = &entry.data {
+                Some(Arc::clone(v))
+            } else {
+                None
+            }
         });
-        if result.is_some() { inner.hits += 1; } else { inner.misses += 1; }
+        if result.is_some() {
+            inner.hits += 1;
+        } else {
+            inner.misses += 1;
+        }
         result
     }
 
@@ -175,17 +199,29 @@ impl BufferPool {
 
     // ─── Histogram snapshot column ───────────────────────────────────────────
 
-    pub(crate) fn get_histogram_snapshots(&self, key: CacheKey) -> Option<Arc<Vec<HistogramSnapshot>>> {
+    pub(crate) fn get_histogram_snapshots(
+        &self,
+        key: CacheKey,
+    ) -> Option<Arc<Vec<HistogramSnapshot>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
-            if let Block::HistogramSnapshots(v) = &entry.data { Some(Arc::clone(v)) } else { None }
+            if let Block::HistogramSnapshots(v) = &entry.data {
+                Some(Arc::clone(v))
+            } else {
+                None
+            }
         });
-        if result.is_some() { inner.hits += 1; } else { inner.misses += 1; }
+        if result.is_some() {
+            inner.hits += 1;
+        } else {
+            inner.misses += 1;
+        }
         result
     }
 
     pub(crate) fn put_histogram_snapshots(&self, key: CacheKey, data: Arc<Vec<HistogramSnapshot>>) {
-        let size: usize = data.iter()
+        let size: usize = data
+            .iter()
             .map(|s| {
                 s.index.len() * std::mem::size_of::<u32>()
                     + s.count.len() * std::mem::size_of::<u64>()
@@ -230,7 +266,11 @@ mod tests {
     #[test]
     fn test_pool_basic_get_put() {
         let pool = BufferPool::new(1024);
-        let key = CacheKey { source_id: 1, column_idx: 0, row_group_idx: 0 };
+        let key = CacheKey {
+            source_id: 1,
+            column_idx: 0,
+            row_group_idx: 0,
+        };
         let data = Arc::new(vec![Some(1u64), Some(2)]);
         pool.put_timestamps(key, Arc::clone(&data));
 
@@ -244,7 +284,11 @@ mod tests {
         // So only one entry fits. After inserting 10, budget must be respected.
         let pool = BufferPool::new(64);
         for i in 0..10u64 {
-            let key = CacheKey { source_id: 1, column_idx: 0, row_group_idx: i as usize };
+            let key = CacheKey {
+                source_id: 1,
+                column_idx: 0,
+                row_group_idx: i as usize,
+            };
             // 1-element entries: 16 bytes each
             pool.put_timestamps(key, Arc::new(vec![Some(i)]));
         }
@@ -254,13 +298,21 @@ mod tests {
             "bytes_used={} exceeds budget=64",
             stats.bytes_used
         );
-        assert!(stats.entries < 10, "expected evictions, got {} entries", stats.entries);
+        assert!(
+            stats.entries < 10,
+            "expected evictions, got {} entries",
+            stats.entries
+        );
     }
 
     #[test]
     fn test_pool_stats_hits_misses() {
         let pool = BufferPool::new(1024);
-        let key = CacheKey { source_id: 1, column_idx: 0, row_group_idx: 0 };
+        let key = CacheKey {
+            source_id: 1,
+            column_idx: 0,
+            row_group_idx: 0,
+        };
 
         assert_eq!(pool.stats().hits, 0);
         assert!(pool.get_timestamps(key).is_none());
@@ -275,7 +327,11 @@ mod tests {
     fn test_pool_clear() {
         // 100 * size_of::<Option<u64>>() = 100 * 16 = 1600 bytes; give the pool 2 KB
         let pool = BufferPool::new(2048);
-        let key = CacheKey { source_id: 1, column_idx: 0, row_group_idx: 0 };
+        let key = CacheKey {
+            source_id: 1,
+            column_idx: 0,
+            row_group_idx: 0,
+        };
         pool.put_timestamps(key, Arc::new(vec![Some(1u64); 100]));
         assert!(pool.stats().bytes_used > 0);
 
@@ -290,7 +346,11 @@ mod tests {
     fn test_pool_type_mismatch_is_miss() {
         // Inserting as timestamps then reading as counter values should be a miss.
         let pool = BufferPool::new(1024);
-        let key = CacheKey { source_id: 1, column_idx: 0, row_group_idx: 0 };
+        let key = CacheKey {
+            source_id: 1,
+            column_idx: 0,
+            row_group_idx: 0,
+        };
         pool.put_timestamps(key, Arc::new(vec![Some(42u64)]));
         assert!(pool.get_counter_values(key).is_none());
     }
@@ -299,7 +359,11 @@ mod tests {
     fn test_pool_oversized_entry_not_cached() {
         // An entry larger than the entire budget should not be inserted.
         let pool = BufferPool::new(8); // only 8 bytes
-        let key = CacheKey { source_id: 1, column_idx: 0, row_group_idx: 0 };
+        let key = CacheKey {
+            source_id: 1,
+            column_idx: 0,
+            row_group_idx: 0,
+        };
         // 1 Option<u64> = 16 bytes > 8 byte budget
         pool.put_timestamps(key, Arc::new(vec![Some(1u64)]));
         assert_eq!(pool.stats().entries, 0);
@@ -309,8 +373,16 @@ mod tests {
     #[test]
     fn test_pool_counter_and_gauge_values() {
         let pool = BufferPool::new(4096);
-        let ck = CacheKey { source_id: 2, column_idx: 1, row_group_idx: 0 };
-        let gk = CacheKey { source_id: 2, column_idx: 2, row_group_idx: 0 };
+        let ck = CacheKey {
+            source_id: 2,
+            column_idx: 1,
+            row_group_idx: 0,
+        };
+        let gk = CacheKey {
+            source_id: 2,
+            column_idx: 2,
+            row_group_idx: 0,
+        };
 
         pool.put_counter_values(ck, Arc::new(vec![Some(100u64), None, Some(200)]));
         pool.put_gauge_values(gk, Arc::new(vec![Some(-1i64), Some(0), None]));

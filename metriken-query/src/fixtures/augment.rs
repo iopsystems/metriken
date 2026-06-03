@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, UInt64Array};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
@@ -63,10 +65,8 @@ impl ParquetAugmentor {
             .map_err(|_| "source parquet has no `timestamp` column")?;
 
         // Extract file-level metadata to preserve in output
-        let kv_metadata: Option<Vec<KeyValue>> = pq_meta
-            .file_metadata()
-            .key_value_metadata()
-            .cloned();
+        let kv_metadata: Option<Vec<KeyValue>> =
+            pq_meta.file_metadata().key_value_metadata().cloned();
 
         // Infer interval from file metadata's sampling_interval_ms (or default 1000)
         let interval_ms: u64 = kv_metadata
@@ -87,10 +87,8 @@ impl ParquetAugmentor {
             for rg_idx in 0..pq_meta.num_row_groups() {
                 // The timestamp column might be Int64 or UInt64 depending on writer.
                 // We're writing UInt64; reading rezolus's UInt64 too. Handle both.
-                if let Some(Statistics::Int64(s)) = pq_meta
-                    .row_group(rg_idx)
-                    .column(ts_col_idx)
-                    .statistics()
+                if let Some(Statistics::Int64(s)) =
+                    pq_meta.row_group(rg_idx).column(ts_col_idx).statistics()
                 {
                     if let Some(v) = s.min_opt() {
                         let ts = *v as u64;
@@ -268,6 +266,10 @@ mod tests {
         let (start, end) = reader.time_range().unwrap();
 
         let result = reader.query_range("rate(rps[5s])", start, end + 1.0, 1.0);
-        assert!(result.is_ok(), "query against augmented file should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "query against augmented file should succeed: {:?}",
+            result.err()
+        );
     }
 }

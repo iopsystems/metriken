@@ -16,7 +16,7 @@ arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
 lru = "0.12"
-metriken-exposition = { path = "../metriken-exposition", default-features = false, features = ["serde"], optional = true }
+metriken-exposition = { version = "0.16.1", path = "../metriken-exposition", default-features = false, features = ["serde"], optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true

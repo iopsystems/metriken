@@ -317,7 +317,6 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
-
 impl QueryEngine {
     pub(crate) fn new(source: Arc<dyn DataSource>) -> Self {
         Self { source }
@@ -328,19 +327,36 @@ impl QueryEngine {
         self.source.time_range()
     }
 
-    pub(crate) fn counter_names(&self) -> Vec<String> { self.source.counter_names() }
-    pub(crate) fn gauge_names(&self) -> Vec<String> { self.source.gauge_names() }
-    pub(crate) fn histogram_names(&self) -> Vec<String> { self.source.histogram_names() }
-    pub(crate) fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+    pub(crate) fn counter_names(&self) -> Vec<String> {
+        self.source.counter_names()
+    }
+    pub(crate) fn gauge_names(&self) -> Vec<String> {
+        self.source.gauge_names()
+    }
+    pub(crate) fn histogram_names(&self) -> Vec<String> {
+        self.source.histogram_names()
+    }
+    pub(crate) fn counter_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
         self.source.counter_labels(name)
     }
-    pub(crate) fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+    pub(crate) fn gauge_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
         self.source.gauge_labels(name)
     }
-    pub(crate) fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+    pub(crate) fn histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
         self.source.histogram_labels(name)
     }
-    pub(crate) fn interval(&self) -> f64 { self.source.interval() }
+    pub(crate) fn interval(&self) -> f64 {
+        self.source.interval()
+    }
     pub(crate) fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         self.source.file_metadata()
     }
@@ -352,7 +368,11 @@ impl QueryEngine {
 
     /// Execute an instant query at a single timestamp.
     /// Uses the latest available timestamp when `time` is `None`.
-    pub(crate) fn query(&self, query_str: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
+    pub(crate) fn query(
+        &self,
+        query_str: &str,
+        time: Option<f64>,
+    ) -> Result<QueryResult, QueryError> {
         let target = time.unwrap_or_else(|| {
             self.source
                 .time_range()
@@ -366,7 +386,12 @@ impl QueryEngine {
         };
         let vector: Vec<Sample> = samples
             .into_iter()
-            .filter_map(|s| s.values.last().copied().map(|value| Sample { metric: s.metric, value }))
+            .filter_map(|s| {
+                s.values.last().copied().map(|value| Sample {
+                    metric: s.metric,
+                    value,
+                })
+            })
             .collect();
         Ok(QueryResult::Vector { result: vector })
     }
@@ -388,9 +413,17 @@ impl QueryEngine {
                 } else if let Some(pos) = part.find("!~") {
                     (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
                 } else if let Some(pos) = part.find("=~") {
-                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), false)
+                    (
+                        &part[..pos],
+                        part[pos + 2..].trim().trim_matches('"'),
+                        false,
+                    )
                 } else if let Some(pos) = part.find('=') {
-                    (&part[..pos], part[pos + 1..].trim().trim_matches('"'), false)
+                    (
+                        &part[..pos],
+                        part[pos + 1..].trim().trim_matches('"'),
+                        false,
+                    )
                 } else {
                     continue;
                 };
@@ -448,7 +481,9 @@ impl QueryEngine {
             .split(',')
             .map(|s| s.trim().parse::<f64>())
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| QueryError::ParseError(format!("Failed to parse quantile value: {}", e)))?;
+            .map_err(|e| {
+                QueryError::ParseError(format!("Failed to parse quantile value: {}", e))
+            })?;
 
         if quantiles.is_empty() {
             return Err(QueryError::ParseError(
