@@ -1,6 +1,6 @@
 [package]
 name = "metriken-query"
-version = "0.10.8"
+version = "0.11.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -15,17 +15,37 @@ repository = "https://github.com/iopsystems/metriken"
 arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
-metriken-exposition = { version = "0.16.1", path = "../metriken-exposition", default-features = false, optional = true }
+lru = "0.12"
+metriken-exposition = { version = "0.16.1", path = "../metriken-exposition", default-features = false, features = ["serde"], optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror = "2"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+sysinfo = "0.32"
 
 [features]
-default = ["ingest", "lz4"]
-ingest = ["metriken-exposition"]
+default = ["lz4", "ingest"]
+ingest = ["dep:metriken-exposition"]
 lz4 = ["parquet/lz4"]
+fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
+
+[[bin]]
+name = "gen-augmented"
+path = "src/bin/gen_augmented.rs"
+required-features = ["fixtures"]
+
+[[bench]]
+name = "memory"
+harness = false
+required-features = ["fixtures"]
+
+[[bench]]
+name = "query_latency"
+harness = false
+required-features = ["fixtures"]

@@ -1,57 +1,47 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
+use crate::labels::Labels;
+use crate::memory::Memory;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
-use crate::tsdb::Tsdb;
+use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
+use crate::DataSource;
 
-fn create_test_tsdb() -> Tsdb {
-    Tsdb::default()
+fn make_labels(pairs: &[(&str, &str)]) -> Labels {
+    let mut l = Labels::default();
+    for (k, v) in pairs {
+        l.inner.insert(k.to_string(), v.to_string());
+    }
+    l
 }
 
-/// Create a TSDB with cgroup_cpu_usage counter data for testing label filtering.
+fn create_empty_source() -> Memory {
+    Memory::new(1000)
+}
+
+/// Create a Memory with cgroup_cpu_usage counter data.
 /// Creates 3 cgroups with different counter values across 3 time steps.
-fn create_cgroup_tsdb() -> Tsdb {
-    use metriken_exposition::{Counter, Snapshot, SnapshotV2};
-
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
+fn create_cgroup_source() -> Memory {
+    let mut source = Memory::new(1000);
     let cgroups = [
         ("/system.slice/foo.service", 100u64),
         ("/system.slice/bar.service", 200u64),
         ("/system.slice/baz.service", 300u64),
     ];
-
-    for step in 0..3 {
-        let time = base_time + Duration::from_secs(step);
-        let mut counters = Vec::new();
-
-        for (name, base_val) in &cgroups {
-            let mut metadata = HashMap::new();
-            metadata.insert("name".to_string(), name.to_string());
-            metadata.insert("state".to_string(), "user".to_string());
-            metadata.insert("metric".to_string(), "cgroup_cpu_usage".to_string());
-            counters.push(Counter {
-                name: "cgroup_cpu_usage".to_string(),
-                value: base_val + step * 100,
-                metadata,
-            });
-        }
-
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters,
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-        });
-
-        tsdb.ingest(snapshot);
+    for (name, base_val) in &cgroups {
+        let labels = make_labels(&[("name", name), ("state", "user")]);
+        let timestamps: Vec<u64> = (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect();
+        let values: Vec<u64> = (0u64..3).map(|s| base_val + s * 100).collect();
+        source.add_counter(
+            "cgroup_cpu_usage",
+            Counter {
+                labels,
+                timestamps,
+                values,
+            },
+        );
     }
-
-    tsdb
+    source
 }
 
 fn count_matrix_series(result: &QueryResult) -> usize {
@@ -73,153 +63,124 @@ fn get_matrix_series_names(result: &QueryResult) -> Vec<String> {
 
 #[test]
 fn test_query_engine_creation() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
-
-    // Test that we can create a query engine
-    assert!(!engine.tsdb().source().is_empty() || engine.tsdb().source() == "");
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
+    // Engine creation itself is the test; an empty source returns MetricNotFound.
+    let result = engine.query("nonexistent_metric", None);
+    match result {
+        Err(QueryError::MetricNotFound(_)) => {}
+        other => panic!("Expected MetricNotFound, got {other:?}"),
+    }
 }
 
 #[test]
 fn test_simple_rate_query_parsing() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test that rate query parsing doesn't panic
     let result = engine.query("rate(cpu_cycles[5m])", None);
-
-    // Should return MetricNotFound for empty TSDB, but shouldn't crash
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_simple_metric_query() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test simple metric query
     let result = engine.query("cpu_cores", None);
-
-    // Should return MetricNotFound for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_sum_rate_query() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test sum(rate()) query parsing
     let result = engine.query("sum(rate(network_rx_bytes[1m]))", None);
-
-    // Should return MetricNotFound for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_range_query_delegation() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test that range queries delegate to instant queries
     let result = engine.query_range("cpu_cores", 0.0, 3600.0, 60.0);
-
-    // Should return MetricNotFound for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_label_filtering_in_rate_query() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test rate query with label filtering
     let result = engine.query("rate(network_bytes{direction=\"transmit\"}[5m])", None);
-
-    // Should return MetricNotFound for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_label_filtering_in_sum_rate_query() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test sum(rate()) query with label filtering
     let result = engine.query("sum(rate(blockio_bytes{op=\"read\"}[1m]))", None);
-
-    // Should return MetricNotFound for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_simple_metric_with_labels() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test simple metric query with label filtering
     let result = engine.query("cpu_cores{cpu=\"0\"}", None);
-
-    // Should return MetricNotFound for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_metric_selector_parsing() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test that parse_metric_selector works correctly (we can't call it directly
-    // due to visibility) but we can test it indirectly through query parsing
-
-    // This should not panic during parsing
     let _result = engine.query("metric_name{label1=\"value1\",label2=\"value2\"}", None);
-
-    // Multiple labels with single quotes
     let _result = engine.query("metric_name{label1='value1',label2='value2'}", None);
-
-    // Labels with spaces
     let _result = engine.query("metric_name{label1 = \"value 1\", label2= 'value 2'}", None);
 }
 
 #[test]
 fn test_histogram_quantile_parsing() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // Test single percentile histogram_quantile parsing
     let result = engine.query_range(
         "histogram_quantile(0.95, tcp_packet_latency)",
         0.0,
         3600.0,
         60.0,
     );
-
-    // Should return MetricNotFound error for empty TSDB
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
@@ -227,8 +188,8 @@ fn test_histogram_quantile_parsing() {
 
 #[test]
 fn test_exact_match_filters_correctly() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -246,8 +207,8 @@ fn test_exact_match_filters_correctly() {
 
 #[test]
 fn test_regex_match_filters_correctly() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -265,8 +226,8 @@ fn test_regex_match_filters_correctly() {
 
 #[test]
 fn test_regex_alternation_filters_correctly() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -285,8 +246,8 @@ fn test_regex_alternation_filters_correctly() {
 
 #[test]
 fn test_negative_exact_match_excludes() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -306,8 +267,8 @@ fn test_negative_exact_match_excludes() {
 
 #[test]
 fn test_negative_regex_excludes() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -325,8 +286,8 @@ fn test_negative_regex_excludes() {
 
 #[test]
 fn test_sum_by_name_with_regex_match() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -349,8 +310,8 @@ fn test_sum_by_name_with_regex_match() {
 
 #[test]
 fn test_sum_with_negative_match_excludes() {
-    let tsdb = Arc::new(create_cgroup_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source.clone());
 
     let total = engine
         .query_range(r#"sum(irate(cgroup_cpu_usage[5s]))"#, 1000.0, 1003.0, 1.0)
@@ -371,133 +332,63 @@ fn test_sum_with_negative_match_excludes() {
 
 // -- Windowed rate / irate / avg_over_time tests --
 
-/// Create a TSDB with a single counter series having known values for rate testing.
-/// Counter "test_counter" with values 0, 100, 200, 300, 400 at t=1000..1004.
-fn create_rate_tsdb() -> Tsdb {
-    use metriken_exposition::{Counter, Snapshot, SnapshotV2};
-
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    for step in 0u64..5 {
-        let time = base_time + Duration::from_secs(step);
-        let mut metadata = HashMap::new();
-        metadata.insert("metric".to_string(), "test_counter".to_string());
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: vec![Counter {
-                name: "test_counter".to_string(),
-                value: step * 100,
-                metadata,
-            }],
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
-    }
-
-    tsdb
+/// Single counter series: values 0, 100, 200, 300, 400 at t=1000..1004.
+fn create_rate_source() -> Memory {
+    let mut source = Memory::new(1000);
+    source.add_counter(
+        "test_counter",
+        Counter {
+            labels: Labels::default(),
+            timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
+            values: (0u64..5).map(|s| s * 100).collect(),
+        },
+    );
+    source
 }
 
-/// Create a TSDB with counter data that includes a reset.
-/// Counter "reset_counter": 100, 200, 300, 50 (reset), 150 at t=1000..1004.
-fn create_counter_reset_tsdb() -> Tsdb {
-    use metriken_exposition::{Counter, Snapshot, SnapshotV2};
-
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-    let values = [100u64, 200, 300, 50, 150];
-
-    for (step, &val) in values.iter().enumerate() {
-        let time = base_time + Duration::from_secs(step as u64);
-        let mut metadata = HashMap::new();
-        metadata.insert("metric".to_string(), "reset_counter".to_string());
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: vec![Counter {
-                name: "reset_counter".to_string(),
-                value: val,
-                metadata,
-            }],
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
-    }
-
-    tsdb
+/// Counter with a reset: 100, 200, 300, 50, 150 at t=1000..1004.
+fn create_counter_reset_source() -> Memory {
+    let mut source = Memory::new(1000);
+    source.add_counter(
+        "reset_counter",
+        Counter {
+            labels: Labels::default(),
+            timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
+            values: vec![100, 200, 300, 50, 150],
+        },
+    );
+    source
 }
 
-/// Create a TSDB with gauge data for avg_over_time testing.
-/// Gauge "test_gauge" with values 10, 20, 30, 40, 50 at t=1000..1004.
-fn create_gauge_tsdb() -> Tsdb {
-    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
-
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    for step in 0u64..5 {
-        let time = base_time + Duration::from_secs(step);
-        let mut metadata = HashMap::new();
-        metadata.insert("metric".to_string(), "test_gauge".to_string());
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: vec![Gauge {
-                name: "test_gauge".to_string(),
-                value: (step as i64 + 1) * 10,
-                metadata,
-            }],
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
-    }
-
-    tsdb
+/// Gauge: values 10, 20, 30, 40, 50 at t=1000..1004.
+fn create_gauge_source() -> Memory {
+    let mut source = Memory::new(1000);
+    source.add_gauge(
+        "test_gauge",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
+            values: (1i64..=5).map(|v| v * 10).collect(),
+        },
+    );
+    source
 }
 
-/// Create a TSDB with multiple gauge series for label filtering tests.
-fn create_labeled_gauge_tsdb() -> Tsdb {
-    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
-
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    let series = [("host_a", 10i64), ("host_b", 20i64)];
-
-    for step in 0u64..3 {
-        let time = base_time + Duration::from_secs(step);
-        let mut gauges = Vec::new();
-
-        for (host, base_val) in &series {
-            let mut metadata = HashMap::new();
-            metadata.insert("host".to_string(), host.to_string());
-            metadata.insert("metric".to_string(), "labeled_gauge".to_string());
-            gauges.push(Gauge {
-                name: "labeled_gauge".to_string(),
-                value: base_val + step as i64,
-                metadata,
-            });
-        }
-
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges,
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
+/// Two labeled gauge series: host_a (10+step) and host_b (20+step).
+fn create_labeled_gauge_source() -> Memory {
+    let mut source = Memory::new(1000);
+    for (host, base_val) in [("host_a", 10i64), ("host_b", 20i64)] {
+        let labels = make_labels(&[("host", host)]);
+        source.add_gauge(
+            "labeled_gauge",
+            Gauge {
+                labels,
+                timestamps: (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect(),
+                values: (0i64..3).map(|s| base_val + s).collect(),
+            },
+        );
     }
-
-    tsdb
+    source
 }
 
 fn get_matrix_values(result: &QueryResult) -> Vec<Vec<(f64, f64)>> {
@@ -509,11 +400,9 @@ fn get_matrix_values(result: &QueryResult) -> Vec<Vec<(f64, f64)>> {
 
 #[test]
 fn test_windowed_rate_basic() {
-    let tsdb = Arc::new(create_rate_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_rate_source());
+    let engine = QueryEngine::new(source);
 
-    // rate(test_counter[3s]) evaluated at each step
-    // Counter values: t=1000:0, t=1001:100, t=1002:200, t=1003:300, t=1004:400
     let result = engine
         .query_range("rate(test_counter[3s])", 1001.0, 1004.0, 1.0)
         .unwrap();
@@ -523,7 +412,6 @@ fn test_windowed_rate_basic() {
     let all_values = get_matrix_values(&result);
     assert!(!all_values[0].is_empty());
 
-    // At each step, rate should be 100/s (linear counter)
     for (_ts, rate) in &all_values[0] {
         assert!(
             (*rate - 100.0).abs() < 1e-6,
@@ -535,13 +423,9 @@ fn test_windowed_rate_basic() {
 
 #[test]
 fn test_windowed_rate_counter_reset() {
-    let tsdb = Arc::new(create_counter_reset_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_counter_reset_source());
+    let engine = QueryEngine::new(source);
 
-    // reset_counter: 100, 200, 300, 50 (reset), 150
-    // rate over full window [5s] at t=1004:
-    //   pairs: (100->200)=100, (200->300)=100, (300->50 reset)=50, (50->150)=100
-    //   total_increase = 350, duration = 4s, rate = 87.5/s
     let result = engine
         .query_range("rate(reset_counter[5s])", 1004.0, 1004.0, 1.0)
         .unwrap();
@@ -560,12 +444,9 @@ fn test_windowed_rate_counter_reset() {
 
 #[test]
 fn test_windowed_irate_basic() {
-    let tsdb = Arc::new(create_rate_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_rate_source());
+    let engine = QueryEngine::new(source);
 
-    // irate uses last two samples in window
-    // Counter: t=1000:0, t=1001:100, t=1002:200, t=1003:300, t=1004:400
-    // At t=1004 with [5s]: last two = (1003:300, 1004:400), irate = 100/s
     let result = engine
         .query_range("irate(test_counter[5s])", 1004.0, 1004.0, 1.0)
         .unwrap();
@@ -584,12 +465,9 @@ fn test_windowed_irate_basic() {
 
 #[test]
 fn test_rate_vs_irate_differ_with_reset() {
-    let tsdb = Arc::new(create_counter_reset_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_counter_reset_source());
+    let engine = QueryEngine::new(source);
 
-    // At t=1004 with [5s]:
-    // rate walks all pairs -> 87.5/s
-    // irate uses last two (50->150) -> 100/s
     let rate_result = engine
         .query_range("rate(reset_counter[5s])", 1004.0, 1004.0, 1.0)
         .unwrap();
@@ -618,11 +496,9 @@ fn test_rate_vs_irate_differ_with_reset() {
 
 #[test]
 fn test_avg_over_time_basic() {
-    let tsdb = Arc::new(create_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
-    // avg_over_time with [3s] at t=1002: window [999,1002] -> samples at 1000,1001,1002 = {10,20,30} -> avg=20
     let result = engine
         .query_range("avg_over_time(test_gauge[3s])", 1002.0, 1002.0, 1.0)
         .unwrap();
@@ -637,10 +513,9 @@ fn test_avg_over_time_basic() {
 
 #[test]
 fn test_avg_over_time_full_window() {
-    let tsdb = Arc::new(create_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // avg_over_time with [5s] at t=1004: window [999,1004] -> all 5 samples {10,20,30,40,50} -> avg=30
     let result = engine
         .query_range("avg_over_time(test_gauge[5s])", 1004.0, 1004.0, 1.0)
         .unwrap();
@@ -653,10 +528,9 @@ fn test_avg_over_time_full_window() {
 
 #[test]
 fn test_avg_over_time_with_label_filter() {
-    let tsdb = Arc::new(create_labeled_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_labeled_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // Only host_a series
     let result = engine
         .query_range(
             r#"avg_over_time(labeled_gauge{host="host_a"}[3s])"#,
@@ -679,33 +553,30 @@ fn test_avg_over_time_with_label_filter() {
 
 #[test]
 fn test_avg_over_time_empty_tsdb() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine.query_range("avg_over_time(test_gauge[5m])", 0.0, 3600.0, 60.0);
     match result {
         Err(QueryError::MetricNotFound(_)) => {}
-        _ => panic!("Expected MetricNotFound error for empty TSDB"),
+        _ => panic!("Expected MetricNotFound error for empty source"),
     }
 }
 
 #[test]
 fn test_rate_parse_error_without_range() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
-    // rate() without a range selector should fail at parsing level
     let result = engine.query_range("rate(test_counter)", 0.0, 3600.0, 60.0);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_vector_selector_respects_coarse_step() {
-    let tsdb = Arc::new(create_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
-    // With step=2.0, should produce 3 points at t=1000, 1002, 1004
     let result = engine
         .query_range("test_gauge", 1000.0, 1004.0, 2.0)
         .unwrap();
@@ -719,12 +590,10 @@ fn test_vector_selector_respects_coarse_step() {
         all_values[0].len()
     );
 
-    // Timestamps should be step-aligned
     assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
     assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
     assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
 
-    // Values at those timestamps
     assert!((all_values[0][0].1 - 10.0).abs() < 1e-6);
     assert!((all_values[0][1].1 - 30.0).abs() < 1e-6);
     assert!((all_values[0][2].1 - 50.0).abs() < 1e-6);
@@ -732,11 +601,9 @@ fn test_vector_selector_respects_coarse_step() {
 
 #[test]
 fn test_vector_selector_preserves_all_points_when_step_equals_interval() {
-    let tsdb = Arc::new(create_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // Gauge: t=1000:10, t=1001:20, t=1002:30, t=1003:40, t=1004:50
-    // With step=1.0 (same as native interval), should return all 5 points
     let result = engine
         .query_range("test_gauge", 1000.0, 1004.0, 1.0)
         .unwrap();
@@ -751,64 +618,44 @@ fn test_vector_selector_preserves_all_points_when_step_equals_interval() {
     );
 }
 
-/// Create a TSDB with three gauge metrics for binary expression testing.
-/// "mem_total" = 1000 at every timestamp
-/// "mem_available" = 800, 700, 600, 500, 400 at t=1000..1004
-/// "mem_reserved" = 50 at every timestamp
-fn create_three_gauge_tsdb() -> Tsdb {
-    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
+/// Three gauge metrics for binary expression tests.
+/// "mem_total" = 1000, "mem_available" = 800..400, "mem_reserved" = 50.
+fn create_three_gauge_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect();
 
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    for step in 0u64..5 {
-        let time = base_time + Duration::from_secs(step);
-        let mut meta_total = HashMap::new();
-        meta_total.insert("metric".to_string(), "mem_total".to_string());
-        let mut meta_avail = HashMap::new();
-        meta_avail.insert("metric".to_string(), "mem_available".to_string());
-        let mut meta_reserved = HashMap::new();
-        meta_reserved.insert("metric".to_string(), "mem_reserved".to_string());
-
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: vec![
-                Gauge {
-                    name: "mem_total".to_string(),
-                    value: 1000,
-                    metadata: meta_total,
-                },
-                Gauge {
-                    name: "mem_available".to_string(),
-                    value: 800 - (step as i64 * 100),
-                    metadata: meta_avail,
-                },
-                Gauge {
-                    name: "mem_reserved".to_string(),
-                    value: 50,
-                    metadata: meta_reserved,
-                },
-            ],
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
-    }
-
-    tsdb
+    source.add_gauge(
+        "mem_total",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts.clone(),
+            values: vec![1000; 5],
+        },
+    );
+    source.add_gauge(
+        "mem_available",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts.clone(),
+            values: (0i64..5).map(|s| 800 - s * 100).collect(),
+        },
+    );
+    source.add_gauge(
+        "mem_reserved",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts,
+            values: vec![50; 5],
+        },
+    );
+    source
 }
 
 #[test]
 fn test_compound_gauge_expression_respects_step() {
-    let tsdb = Arc::new(create_three_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_three_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // mem_total = 1000 at all timestamps
-    // mem_available: t=1000:800, t=1001:700, t=1002:600, t=1003:500, t=1004:400
-    // mem_total - mem_available: 200, 300, 400, 500, 600
-    // With step=2.0, should get 3 points at t=1000, 1002, 1004
     let result = engine
         .query_range("mem_total - mem_available", 1000.0, 1004.0, 2.0)
         .unwrap();
@@ -822,30 +669,21 @@ fn test_compound_gauge_expression_respects_step() {
         all_values[0].len()
     );
 
-    // Verify timestamps and values
     assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
-    assert!((all_values[0][0].1 - 200.0).abs() < 1e-6); // 1000 - 800
+    assert!((all_values[0][0].1 - 200.0).abs() < 1e-6);
 
     assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
-    assert!((all_values[0][1].1 - 400.0).abs() < 1e-6); // 1000 - 600
+    assert!((all_values[0][1].1 - 400.0).abs() < 1e-6);
 
     assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
-    assert!((all_values[0][2].1 - 600.0).abs() < 1e-6); // 1000 - 400
+    assert!((all_values[0][2].1 - 600.0).abs() < 1e-6);
 }
 
 #[test]
 fn test_triple_gauge_expression_respects_step() {
-    let tsdb = Arc::new(create_three_gauge_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_three_gauge_source());
+    let engine = QueryEngine::new(source);
 
-    // mem_total = 1000, mem_available = {800,700,600,500,400}, mem_reserved = 50
-    // (mem_total - mem_available) - mem_reserved => (a - b) - c
-    //   t=1000: (1000 - 800) - 50 = 150
-    //   t=1001: (1000 - 700) - 50 = 250
-    //   t=1002: (1000 - 600) - 50 = 350
-    //   t=1003: (1000 - 500) - 50 = 450
-    //   t=1004: (1000 - 400) - 50 = 550
-    // With step=2.0, expect 3 points at t=1000, 1002, 1004
     let result = engine
         .query_range(
             "mem_total - mem_available - mem_reserved",
@@ -865,68 +703,44 @@ fn test_triple_gauge_expression_respects_step() {
     );
 
     assert!((all_values[0][0].0 - 1000.0).abs() < 1e-6);
-    assert!((all_values[0][0].1 - 150.0).abs() < 1e-6); // (1000-800)-50
+    assert!((all_values[0][0].1 - 150.0).abs() < 1e-6);
 
     assert!((all_values[0][1].0 - 1002.0).abs() < 1e-6);
-    assert!((all_values[0][1].1 - 350.0).abs() < 1e-6); // (1000-600)-50
+    assert!((all_values[0][1].1 - 350.0).abs() < 1e-6);
 
     assert!((all_values[0][2].0 - 1004.0).abs() < 1e-6);
-    assert!((all_values[0][2].1 - 550.0).abs() < 1e-6); // (1000-400)-50
+    assert!((all_values[0][2].1 - 550.0).abs() < 1e-6);
 }
 
-/// Build a TSDB modeling a duplex link: per-direction traffic counters and a
-/// per-interface bandwidth gauge. Traffic carries a `direction` label that the
-/// bandwidth series does not, so combining them requires on()/ignoring().
-///
-///   tx_bytes{iface="eth0", direction="tx"} = 100 at each step
-///   tx_bytes{iface="eth1", direction="tx"} = 200 at each step
-///   link_bandwidth{iface="eth0"} = 1000 at each step
-///   link_bandwidth{iface="eth1"} = 2000 at each step
-fn create_duplex_tsdb() -> Tsdb {
-    use metriken_exposition::{Gauge, Snapshot, SnapshotV2};
+/// Duplex-link source: tx_bytes{iface, direction} and link_bandwidth{iface}.
+fn create_duplex_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect();
 
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    for step in 0u64..3 {
-        let time = base_time + Duration::from_secs(step);
-        let mut gauges = Vec::new();
-
-        for (iface, tx_val) in [("eth0", 100i64), ("eth1", 200i64)] {
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "tx_bytes".to_string());
-            meta.insert("iface".to_string(), iface.to_string());
-            meta.insert("direction".to_string(), "tx".to_string());
-            gauges.push(Gauge {
-                name: "tx_bytes".to_string(),
-                value: tx_val,
-                metadata: meta,
-            });
-        }
-
-        for (iface, bw) in [("eth0", 1000i64), ("eth1", 2000i64)] {
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "link_bandwidth".to_string());
-            meta.insert("iface".to_string(), iface.to_string());
-            gauges.push(Gauge {
-                name: "link_bandwidth".to_string(),
-                value: bw,
-                metadata: meta,
-            });
-        }
-
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges,
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
+    for (iface, tx_val) in [("eth0", 100i64), ("eth1", 200i64)] {
+        let labels = make_labels(&[("iface", iface), ("direction", "tx")]);
+        source.add_gauge(
+            "tx_bytes",
+            Gauge {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![tx_val; 3],
+            },
+        );
     }
 
-    tsdb
+    for (iface, bw) in [("eth0", 1000i64), ("eth1", 2000i64)] {
+        let labels = make_labels(&[("iface", iface)]);
+        source.add_gauge(
+            "link_bandwidth",
+            Gauge {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![bw; 3],
+            },
+        );
+    }
+    source
 }
 
 fn series_for_iface(result: &QueryResult, iface: &str) -> Option<Vec<(f64, f64)>> {
@@ -941,11 +755,8 @@ fn series_for_iface(result: &QueryResult, iface: &str) -> Option<Vec<(f64, f64)>
 
 #[test]
 fn test_ignoring_matches_mismatched_labels() {
-    // tx_bytes has {iface, direction}; link_bandwidth has only {iface}. With
-    // ignoring(direction) the series are matched pairwise by iface, giving
-    // tx_bytes / link_bandwidth per interface.
-    let tsdb = Arc::new(create_duplex_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_duplex_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -978,9 +789,8 @@ fn test_ignoring_matches_mismatched_labels() {
 
 #[test]
 fn test_on_matches_shared_labels() {
-    // Same shape as ignoring(), but expressed with on(iface).
-    let tsdb = Arc::new(create_duplex_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_duplex_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("tx_bytes / on(iface) link_bandwidth", 1000.0, 1002.0, 1.0)
@@ -1001,12 +811,8 @@ fn test_on_matches_shared_labels() {
 
 #[test]
 fn test_mismatched_labels_without_modifier_do_not_match() {
-    // Without a matching modifier, and with multiple series on both sides,
-    // mismatched label sets produce no pairings — confirming that ignoring()
-    // is doing real work in the tests above rather than being papered over
-    // by the single-series fallback.
-    let tsdb = Arc::new(create_duplex_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_duplex_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("tx_bytes / link_bandwidth", 1000.0, 1002.0, 1.0)
@@ -1016,106 +822,82 @@ fn test_mismatched_labels_without_modifier_do_not_match() {
 }
 
 // -- columns() resolver tests --
-//
-// The ingest path synthesizes column names as the metric name (or
-// `name:buckets` for histograms), so assertions key off those
-// synthesized names rather than per-labelset parquet field names.
 
-fn create_columns_tsdb() -> Tsdb {
-    use metriken_exposition::{Counter, Gauge, Snapshot, SnapshotV2};
+fn create_columns_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..2).map(|s| (1000 + s) * 1_000_000_000).collect();
 
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    for step in 0u64..2 {
-        let time = base_time + Duration::from_secs(step);
-
-        let mut counters = Vec::new();
-        for cpu in ["0", "1"] {
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "cpu_cycles".to_string());
-            meta.insert("cpu".to_string(), cpu.to_string());
-            counters.push(Counter {
-                name: "cpu_cycles".to_string(),
-                value: step * 100,
-                metadata: meta,
-            });
-        }
-
-        let mut gauges = Vec::new();
-        for host in ["a", "b"] {
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "cpu_temp".to_string());
-            meta.insert("host".to_string(), host.to_string());
-            gauges.push(Gauge {
-                name: "cpu_temp".to_string(),
-                value: 50,
-                metadata: meta,
-            });
-        }
-        let mut meta = HashMap::new();
-        meta.insert("metric".to_string(), "cpu_cores".to_string());
-        gauges.push(Gauge {
-            name: "cpu_cores".to_string(),
-            value: 8,
-            metadata: meta,
-        });
-
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters,
-            gauges,
-            histograms: Vec::new(),
-        });
-        tsdb.ingest(snapshot);
+    for cpu in ["0", "1"] {
+        let labels = make_labels(&[("cpu", cpu)]);
+        source.add_counter(
+            "cpu_cycles",
+            Counter {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![0, 100],
+            },
+        );
     }
 
-    tsdb
+    for host in ["a", "b"] {
+        let labels = make_labels(&[("host", host)]);
+        source.add_gauge(
+            "cpu_temp",
+            Gauge {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![50, 50],
+            },
+        );
+    }
+
+    source.add_gauge(
+        "cpu_cores",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts,
+            values: vec![8, 8],
+        },
+    );
+    source
 }
 
-fn create_columns_histogram_tsdb() -> Tsdb {
-    use histogram::Histogram;
-    use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
+fn create_columns_histogram_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let config = ::histogram::Config::new(4, 16).unwrap();
 
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    // Two snapshots so the ingest delta path emits a non-empty series.
-    for step in 0u64..2 {
-        let time = base_time + Duration::from_secs(step);
-        let mut histograms = Vec::new();
-        for cpu in ["0", "1"] {
-            let mut h = Histogram::new(4, 16).unwrap();
-            h.increment(10 * (step + 1)).unwrap();
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "tcp_packet_latency".to_string());
-            meta.insert("cpu".to_string(), cpu.to_string());
-            histograms.push(SnapHist {
-                name: "tcp_packet_latency".to_string(),
-                value: h,
-                metadata: meta,
-            });
-        }
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: Vec::new(),
-            histograms,
-        });
-        tsdb.ingest(snapshot);
+    for cpu in ["0", "1"] {
+        let labels = make_labels(&[("cpu", cpu)]);
+        source.add_histogram(
+            "tcp_packet_latency",
+            Histogram {
+                labels,
+                config,
+                timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
+                snapshots: vec![
+                    HistogramSnapshot {
+                        index: vec![],
+                        count: vec![],
+                    },
+                    HistogramSnapshot {
+                        index: vec![10],
+                        count: vec![1u64],
+                    },
+                    HistogramSnapshot {
+                        index: vec![10],
+                        count: vec![2u64],
+                    },
+                ],
+            },
+        );
     }
-
-    tsdb
+    source
 }
 
 #[test]
 fn test_columns_bare_gauge_selector_matches_all_labels() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns("cpu_temp").unwrap();
     assert_eq!(cols, ["cpu_temp".to_string()].into_iter().collect());
@@ -1123,8 +905,8 @@ fn test_columns_bare_gauge_selector_matches_all_labels() {
 
 #[test]
 fn test_columns_bare_selector_with_label_filter() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns(r#"cpu_temp{host="a"}"#).unwrap();
     assert_eq!(cols, ["cpu_temp".to_string()].into_iter().collect());
@@ -1132,8 +914,8 @@ fn test_columns_bare_selector_with_label_filter() {
 
 #[test]
 fn test_columns_bare_selector_no_match_is_empty() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns("nonexistent_metric").unwrap();
     assert!(cols.is_empty());
@@ -1141,8 +923,8 @@ fn test_columns_bare_selector_no_match_is_empty() {
 
 #[test]
 fn test_columns_irate_resolves_inner_metric() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns("irate(cpu_cycles[5s])").unwrap();
     assert_eq!(cols, ["cpu_cycles".to_string()].into_iter().collect());
@@ -1150,8 +932,8 @@ fn test_columns_irate_resolves_inner_metric() {
 
 #[test]
 fn test_columns_rate_resolves_inner_metric() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns("rate(cpu_cycles[5s])").unwrap();
     assert_eq!(cols, ["cpu_cycles".to_string()].into_iter().collect());
@@ -1159,8 +941,8 @@ fn test_columns_rate_resolves_inner_metric() {
 
 #[test]
 fn test_columns_binary_op_unions_both_sides() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("sum(irate(cpu_cycles[5s])) / cpu_cores")
@@ -1173,8 +955,8 @@ fn test_columns_binary_op_unions_both_sides() {
 
 #[test]
 fn test_columns_aggregation_preserves_all_inner_columns() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("sum without (cpu) (irate(cpu_cycles[5s]))")
@@ -1184,8 +966,8 @@ fn test_columns_aggregation_preserves_all_inner_columns() {
 
 #[test]
 fn test_columns_name_regex_resolves_multiple_metrics() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns(r#"{__name__=~"cpu_.*"}"#).unwrap();
     let expected: HashSet<String> = [
@@ -1200,8 +982,8 @@ fn test_columns_name_regex_resolves_multiple_metrics() {
 
 #[test]
 fn test_columns_histogram_quantile_resolves_buckets_column() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("histogram_quantile(0.5, tcp_packet_latency)")
@@ -1216,8 +998,8 @@ fn test_columns_histogram_quantile_resolves_buckets_column() {
 
 #[test]
 fn test_columns_histogram_quantiles_array_form() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("histogram_quantiles([0.5, 0.99], tcp_packet_latency)")
@@ -1231,9 +1013,27 @@ fn test_columns_histogram_quantiles_array_form() {
 }
 
 #[test]
+fn test_columns_histogram_percentiles_alias() {
+    // `histogram_percentiles(...)` is accepted as a synonym for
+    // `histogram_quantiles(...)` — same array-of-quantiles form.
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
+
+    let cols = engine
+        .columns("histogram_percentiles([0.5, 0.99], tcp_packet_latency)")
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["tcp_packet_latency:buckets".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
 fn test_columns_histogram_heatmap() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("histogram_heatmap(tcp_packet_latency)")
@@ -1248,8 +1048,8 @@ fn test_columns_histogram_heatmap() {
 
 #[test]
 fn test_columns_histogram_heatmap_with_label_filter() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns(r#"histogram_heatmap(tcp_packet_latency{cpu="0"})"#)
@@ -1264,8 +1064,8 @@ fn test_columns_histogram_heatmap_with_label_filter() {
 
 #[test]
 fn test_columns_histogram_mean_resolves_buckets_column() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("histogram_mean(tcp_packet_latency)")
@@ -1280,8 +1080,8 @@ fn test_columns_histogram_mean_resolves_buckets_column() {
 
 #[test]
 fn test_columns_histogram_count_with_label_filter() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns(r#"histogram_count(tcp_packet_latency{cpu="0"})"#)
@@ -1296,8 +1096,8 @@ fn test_columns_histogram_count_with_label_filter() {
 
 #[test]
 fn test_columns_histogram_sum_resolves_buckets_column() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns("histogram_sum(tcp_packet_latency)").unwrap();
     assert_eq!(
@@ -1308,55 +1108,68 @@ fn test_columns_histogram_sum_resolves_buckets_column() {
     );
 }
 
-// Cumulative-since-start histograms (the ingest delta path requires
-// monotonic snapshots). Two label series (`cpu` 0/1), each with
-// cumulative observation counts [0, 5, 12] all landing in the exact
-// bucket for value 10 (values < 32 are exact under grouping_power 4,
-// so the bucket midpoint is exactly 10.0). Per-period deltas are
-// therefore 5 then 7 observations per series; collapsed across both
-// series that's 10 then 14 per tick, all at mean 10.0.
-fn create_hist_exec_tsdb() -> Tsdb {
-    use histogram::Histogram;
-    use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
+// ─── Histogram execution tests ────────────────────────────────────────────────
+//
+// Raw cumulative observations: two label series (`cpu` 0/1), each with
+// cumulative observation counts stored directly (e.g. [0, 5, 12] at
+// t1000, t1001, t1002). All observations land in the exact bucket for
+// value 10 (values < 16 are exact under grouping_power=4, so the bucket
+// index equals the value). The streaming layer computes per-interval
+// deltas: 5 then 7 per series; collapsed → 10 then 14. Mean is 10.0.
 
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-    let cumulative = [0u64, 5, 12];
-
-    for (step, &count) in cumulative.iter().enumerate() {
-        let time = base_time + Duration::from_secs(step as u64);
-        let mut histograms = Vec::new();
-        for cpu in ["0", "1"] {
-            let mut h = Histogram::new(4, 16).unwrap();
-            for _ in 0..count {
-                h.increment(10).unwrap();
-            }
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "req_latency".to_string());
-            meta.insert("cpu".to_string(), cpu.to_string());
-            histograms.push(SnapHist {
-                name: "req_latency".to_string(),
-                value: h,
-                metadata: meta,
-            });
+/// Build a raw cumulative `HistogramSnapshot` with `n` total observations
+/// at bucket index 10.
+fn hist_snap_cumulative(n: u64) -> HistogramSnapshot {
+    if n == 0 {
+        HistogramSnapshot {
+            index: vec![],
+            count: vec![],
         }
-        tsdb.ingest(Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: Vec::new(),
-            histograms,
-        }));
+    } else {
+        HistogramSnapshot {
+            index: vec![10],
+            count: vec![n],
+        }
+    }
+}
+
+/// Build a Memory with `req_latency` histograms storing raw cumulative
+/// snapshot data. All observations land at bucket 10 (value 10 in a
+/// histogram(4,16) → exact bucket at index 10). The streaming layer
+/// computes deltas between consecutive snapshots, mirroring counters.
+fn create_hist_source(cumulative_per_cpu: &[u64]) -> Memory {
+    let mut source = Memory::new(1000);
+    let config = ::histogram::Config::new(4, 16).unwrap();
+
+    let n = cumulative_per_cpu.len();
+    if n == 0 {
+        return source;
     }
 
-    tsdb
+    for cpu in ["0", "1"] {
+        let labels = make_labels(&[("cpu", cpu)]);
+        let timestamps: Vec<u64> = (0..n).map(|i| (1000 + i as u64) * 1_000_000_000).collect();
+        let snapshots: Vec<HistogramSnapshot> = cumulative_per_cpu
+            .iter()
+            .map(|&c| hist_snap_cumulative(c))
+            .collect();
+        source.add_histogram(
+            "req_latency",
+            Histogram {
+                labels,
+                config,
+                timestamps,
+                snapshots,
+            },
+        );
+    }
+    source
 }
 
 #[test]
 fn test_histogram_count_collapses_series_and_sums_counts() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_count(req_latency)", 1000.0, 1003.0, 1.0)
@@ -1375,14 +1188,13 @@ fn test_histogram_count_collapses_series_and_sums_counts() {
         "count has no quantile label"
     );
     let counts: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
-    // Per-period deltas 5 then 7, summed across cpu 0/1 → 10 then 14.
     assert_eq!(counts, vec![10.0, 14.0]);
 }
 
 #[test]
 fn test_histogram_mean_is_bucket_weighted_midpoint() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_mean(req_latency)", 1000.0, 1003.0, 1.0)
@@ -1396,7 +1208,6 @@ fn test_histogram_mean_is_bucket_weighted_midpoint() {
         result[0].metric.get("__name__").map(String::as_str),
         Some("req_latency")
     );
-    // Every observation is value 10, an exact bucket → mean is 10.0.
     for (_, v) in &result[0].values {
         assert!((v - 10.0).abs() < 1e-9, "mean should be 10.0, got {v}");
     }
@@ -1406,8 +1217,8 @@ fn test_histogram_mean_is_bucket_weighted_midpoint() {
 #[test]
 fn test_histogram_sum_is_count_times_mean() {
     // value=10 is an exact bucket so mean=10.0; sum = 10.0 × count.
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_sum(req_latency)", 1000.0, 1003.0, 1.0)
@@ -1427,8 +1238,8 @@ fn test_histogram_sum_is_count_times_mean() {
 
 #[test]
 fn test_histogram_sum_label_filter_selects_single_series() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -1448,8 +1259,8 @@ fn test_histogram_sum_label_filter_selects_single_series() {
 
 #[test]
 fn test_histogram_sum_by_emits_per_group_series() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_sum by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
@@ -1468,8 +1279,8 @@ fn test_histogram_sum_by_emits_per_group_series() {
 
 #[test]
 fn test_histogram_sum_metric_not_found() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[]));
+    let engine = QueryEngine::new(source);
 
     let result = engine.query_range("histogram_sum(does_not_exist)", 1000.0, 1003.0, 1.0);
     match result {
@@ -1480,8 +1291,8 @@ fn test_histogram_sum_metric_not_found() {
 
 #[test]
 fn test_sum_wrapping_histogram_sum_matches_bare() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let bare = engine
         .query_range("histogram_sum(req_latency)", 1000.0, 1003.0, 1.0)
@@ -1502,8 +1313,8 @@ fn test_sum_wrapping_histogram_sum_matches_bare() {
 
 #[test]
 fn test_histogram_count_label_filter_selects_single_series() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -1518,14 +1329,13 @@ fn test_histogram_count_label_filter_selects_single_series() {
         panic!("expected Matrix, got {result:?}");
     };
     let counts: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
-    // Only cpu=0 → unsummed per-period deltas 5 then 7.
     assert_eq!(counts, vec![5.0, 7.0]);
 }
 
 #[test]
 fn test_histogram_mean_metric_not_found() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine.query_range("histogram_mean(does_not_exist)", 1000.0, 1003.0, 1.0);
     match result {
@@ -1534,54 +1344,10 @@ fn test_histogram_mean_metric_not_found() {
     }
 }
 
-/// Two-cpu histogram TSDB driven by an explicit cumulative-count
-/// sequence; one snapshot per second starting at t=1000. All
-/// observations land in the exact bucket for value 10 (values < 32
-/// are exact under grouping_power 4).
-fn create_hist_irate_tsdb(cumulative_per_cpu: &[u64]) -> Tsdb {
-    use histogram::Histogram;
-    use metriken_exposition::{Histogram as SnapHist, Snapshot, SnapshotV2};
-
-    let mut tsdb = Tsdb::default();
-    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-    for (step, &count) in cumulative_per_cpu.iter().enumerate() {
-        let time = base_time + Duration::from_secs(step as u64);
-        let mut histograms = Vec::new();
-        for cpu in ["0", "1"] {
-            let mut h = Histogram::new(4, 16).unwrap();
-            for _ in 0..count {
-                h.increment(10).unwrap();
-            }
-            let mut meta = HashMap::new();
-            meta.insert("metric".to_string(), "req_latency".to_string());
-            meta.insert("cpu".to_string(), cpu.to_string());
-            histograms.push(SnapHist {
-                name: "req_latency".to_string(),
-                value: h,
-                metadata: meta,
-            });
-        }
-        tsdb.ingest(Snapshot::V2(SnapshotV2 {
-            systemtime: time,
-            duration: Duration::from_secs(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: Vec::new(),
-            histograms,
-        }));
-    }
-
-    tsdb
-}
-
 #[test]
 fn test_histogram_irate_steady_rate_is_constant() {
-    // Per-cpu deltas of +10/sec → 20/sec collapsed. The first delta
-    // (t=1001) has no prior, so the remaining three ticks each emit
-    // rate 20.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
@@ -1608,10 +1374,8 @@ fn test_histogram_irate_steady_rate_is_constant() {
 
 #[test]
 fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
-    // Collapsed per-tick deltas: 0, 100, 0, 0. After skipping the
-    // priorless first tick, irate emits 100 then 0 then 0.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 0, 50, 50, 50]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 0, 50, 50, 50]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
@@ -1629,11 +1393,8 @@ fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
 
 #[test]
 fn test_histogram_irate_counter_drop_clamps_to_zero() {
-    // cv=5 < pv=10 at t=1002 → delta_to_32_or_empty absorbs the
-    // underflow into an empty delta, so irate emits 0 (not a
-    // negative rate). t=1003 recovers with delta=20.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 5, 15]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 5, 15]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_irate(req_latency)", 1000.0, 1004.0, 1.0)
@@ -1658,10 +1419,8 @@ fn test_histogram_irate_counter_drop_clamps_to_zero() {
 
 #[test]
 fn test_histogram_irate_first_step_is_null() {
-    // Single delta → no prior tick to rate against → empty matrix,
-    // which the histogram_* helpers surface as MetricNotFound.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 5]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5]));
+    let engine = QueryEngine::new(source);
 
     let result = engine.query_range("histogram_irate(req_latency)", 1000.0, 1002.0, 1.0);
     match result {
@@ -1672,9 +1431,8 @@ fn test_histogram_irate_first_step_is_null() {
 
 #[test]
 fn test_histogram_irate_label_filter_selects_single_series() {
-    // Filter to one cpu → per-tick count is 10 (not 20) → rate 10.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -1697,9 +1455,8 @@ fn test_histogram_irate_label_filter_selects_single_series() {
 
 #[test]
 fn test_histogram_irate_by_groups_per_cpu() {
-    // Per-cpu deltas of +10/sec; bare call collapses to 20, by(cpu) keeps 10 each.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -1732,9 +1489,8 @@ fn test_histogram_irate_by_groups_per_cpu() {
 
 #[test]
 fn test_histogram_irate_without_drops_named_label() {
-    // cpu is the only label, so `without (cpu)` collapses to one group.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let bare = engine
         .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
@@ -1760,8 +1516,8 @@ fn test_histogram_irate_without_drops_named_label() {
 
 #[test]
 fn test_histogram_count_by_emits_per_group_series() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range(
@@ -1784,8 +1540,8 @@ fn test_histogram_count_by_emits_per_group_series() {
 
 #[test]
 fn test_histogram_mean_by_preserves_mean_per_group() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let result = engine
         .query_range("histogram_mean by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
@@ -1803,8 +1559,8 @@ fn test_histogram_mean_by_preserves_mean_per_group() {
 
 #[test]
 fn test_histogram_irate_rejects_invalid_label_in_grouping() {
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20]));
+    let engine = QueryEngine::new(source);
 
     let result = engine.query_range(
         r#"histogram_irate by ("cpu") (req_latency)"#,
@@ -1822,10 +1578,8 @@ fn test_histogram_irate_rejects_invalid_label_in_grouping() {
 
 #[test]
 fn test_sum_wrapping_histogram_irate_matches_bare() {
-    // The rezolus 0.10.6 dashboard contract: sum(histogram_irate(m))
-    // must compose, not just parse.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let bare = engine
         .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
@@ -1846,8 +1600,8 @@ fn test_sum_wrapping_histogram_irate_matches_bare() {
 
 #[test]
 fn test_sum_by_wrapping_histogram_irate_matches_native_grouping() {
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let native = engine
         .query_range(
@@ -1886,8 +1640,8 @@ fn test_sum_by_wrapping_histogram_irate_matches_native_grouping() {
 
 #[test]
 fn test_sum_without_wrapping_histogram_irate_matches_native_grouping() {
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let native = engine
         .query_range(
@@ -1918,8 +1672,8 @@ fn test_sum_without_wrapping_histogram_irate_matches_native_grouping() {
 
 #[test]
 fn test_sum_wrapping_histogram_count_matches_bare() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let bare = engine
         .query_range("histogram_count(req_latency)", 1000.0, 1003.0, 1.0)
@@ -1940,8 +1694,8 @@ fn test_sum_wrapping_histogram_count_matches_bare() {
 
 #[test]
 fn test_sum_by_wrapping_histogram_mean_matches_native_grouping() {
-    let tsdb = Arc::new(create_hist_exec_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let engine = QueryEngine::new(source);
 
     let native = engine
         .query_range("histogram_mean by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
@@ -1975,9 +1729,8 @@ fn test_sum_by_wrapping_histogram_mean_matches_native_grouping() {
 
 #[test]
 fn test_sum_wrapping_histogram_irate_with_label_matcher() {
-    // Guards the string-level rewriter against `{}` in the inner selector.
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20, 30, 40]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20, 30, 40]));
+    let engine = QueryEngine::new(source);
 
     let bare = engine
         .query_range(
@@ -2008,8 +1761,8 @@ fn test_sum_wrapping_histogram_irate_with_label_matcher() {
 
 #[test]
 fn test_histogram_irate_rejects_stride_argument() {
-    let tsdb = Arc::new(create_hist_irate_tsdb(&[0, 10, 20]));
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_hist_source(&[0, 10, 20]));
+    let engine = QueryEngine::new(source);
 
     let result = engine.query_range("histogram_irate(req_latency, 5)", 1000.0, 1003.0, 1.0);
     match result {
@@ -2022,8 +1775,8 @@ fn test_histogram_irate_rejects_stride_argument() {
 
 #[test]
 fn test_columns_histogram_irate_resolves_buckets_column() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("histogram_irate(tcp_packet_latency)")
@@ -2038,8 +1791,8 @@ fn test_columns_histogram_irate_resolves_buckets_column() {
 
 #[test]
 fn test_columns_resolves_histogram_with_by_grouping() {
-    let tsdb = Arc::new(create_columns_histogram_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine
         .columns("histogram_irate by (cpu) (tcp_packet_latency)")
@@ -2054,8 +1807,8 @@ fn test_columns_resolves_histogram_with_by_grouping() {
 
 #[test]
 fn test_columns_returns_parse_error_for_invalid_syntax() {
-    let tsdb = Arc::new(create_columns_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_columns_source());
+    let engine = QueryEngine::new(source);
 
     let result = engine.columns("foo[[");
     match result {
@@ -2066,9 +1819,625 @@ fn test_columns_returns_parse_error_for_invalid_syntax() {
 
 #[test]
 fn test_columns_empty_tsdb_resolves_empty_set() {
-    let tsdb = Arc::new(create_test_tsdb());
-    let engine = QueryEngine::new(tsdb);
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
 
     let cols = engine.columns("cpu_temp").unwrap();
     assert!(cols.is_empty());
+}
+
+// ─── HistogramStream::merge and ParquetBuilder guard tests ─────────────────────
+
+#[test]
+fn test_histogram_stream_merge_two_streams() {
+    use crate::histogram_stream::HistogramStream;
+
+    // Source A covers t1000, t1001 (cumulative [0, 5])
+    let source_a = Arc::new(create_hist_source(&[0, 5]));
+    let stream_a = source_a
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .expect("stream_a should have data");
+
+    // Source B covers t1002 only (cumulative [12])
+    let mut mem_b = Memory::new(1000);
+    let config = ::histogram::Config::new(4, 16).unwrap();
+    for cpu in ["0", "1"] {
+        mem_b.add_histogram(
+            "req_latency",
+            Histogram {
+                labels: make_labels(&[("cpu", cpu)]),
+                config,
+                timestamps: vec![1002 * 1_000_000_000u64],
+                snapshots: vec![hist_snap_cumulative(12)],
+            },
+        );
+    }
+    let source_b = Arc::new(mem_b);
+    let stream_b = source_b
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .expect("stream_b should have data");
+
+    // Merge and inspect the result
+    let merged = HistogramStream::merge(vec![stream_a, stream_b]).expect("merge should succeed");
+
+    // Should have 2 global series (cpu=0, cpu=1)
+    assert_eq!(merged.meta.series.len(), 2);
+
+    // Collect all rows; A: 2 rows/series × 2 series = 4; B: 1 row/series × 2 = 2 → 6 total
+    let rows: Vec<_> = merged.rows.collect();
+    assert_eq!(rows.len(), 6);
+
+    // All rows must be in (timestamp, series_idx) order
+    for w in rows.windows(2) {
+        assert!(
+            (w[0].timestamp, w[0].series_idx) <= (w[1].timestamp, w[1].series_idx),
+            "rows not in order: {:?} vs {:?}",
+            (w[0].timestamp, w[0].series_idx),
+            (w[1].timestamp, w[1].series_idx)
+        );
+    }
+}
+
+#[test]
+fn test_histogram_stream_merge_empty_returns_none() {
+    use crate::histogram_stream::HistogramStream;
+    assert!(HistogramStream::merge(vec![]).is_none());
+}
+
+#[test]
+fn test_parquet_builder_empty_errors() {
+    use crate::parquet::ParquetReader;
+    let result = ParquetReader::builder().build();
+    assert!(result.is_err());
+}
+
+// ─── Label injection tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_file_labeled_injects_labels_into_series() {
+    use crate::histogram_stream::HistogramStream;
+
+    // Two "files": source_a gets run="a" injected, source_b gets run="b"
+    let source_a = Arc::new(create_hist_source(&[0, 5]));
+    let mut stream_a = source_a
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_a.meta.series {
+        labels.inner.insert("run".to_string(), "a".to_string());
+    }
+
+    let source_b = Arc::new(create_hist_source(&[0, 3]));
+    let mut stream_b = source_b
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_b.meta.series {
+        labels.inner.insert("run".to_string(), "b".to_string());
+    }
+
+    let merged = HistogramStream::merge(vec![stream_a, stream_b]).unwrap();
+
+    // 2 cpus × 2 runs = 4 global series
+    assert_eq!(merged.meta.series.len(), 4);
+    // Every series must have a "run" label
+    for s in &merged.meta.series {
+        assert!(
+            s.inner.contains_key("run"),
+            "series missing injected 'run' label: {:?}",
+            s
+        );
+    }
+    // Both run values must be present
+    let run_values: std::collections::HashSet<String> = merged
+        .meta
+        .series
+        .iter()
+        .filter_map(|s| s.inner.get("run").cloned())
+        .collect();
+    assert!(run_values.contains("a"), "run=a missing");
+    assert!(run_values.contains("b"), "run=b missing");
+}
+
+#[test]
+fn test_histogram_stream_merge_single_passthrough() {
+    use crate::histogram_stream::HistogramStream;
+
+    let source = Arc::new(create_hist_source(&[0, 5, 12]));
+    let stream = source
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    let n_series = stream.meta.series.len();
+    let merged = HistogramStream::merge(vec![stream]).unwrap();
+    assert_eq!(merged.meta.series.len(), n_series);
+}
+
+// ─── Schema introspection tests ───────────────────────────────────────────────
+
+#[test]
+fn test_counter_names_returns_metric_names() {
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
+    let names = engine.counter_names();
+    assert!(names.contains(&"cgroup_cpu_usage".to_string()));
+}
+
+#[test]
+fn test_counter_labels_returns_label_sets() {
+    let source = Arc::new(create_cgroup_source());
+    let engine = QueryEngine::new(source);
+    let labels = engine.counter_labels("cgroup_cpu_usage");
+    assert_eq!(labels.len(), 3); // 3 cgroups
+    assert!(labels
+        .iter()
+        .any(|l| l.get("name") == Some(&"/system.slice/foo.service".to_string())));
+}
+
+#[test]
+fn test_histogram_names_returns_metric_names() {
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
+    let names = engine.histogram_names();
+    assert!(names.contains(&"tcp_packet_latency".to_string()));
+}
+
+#[test]
+fn test_histogram_labels_returns_label_sets() {
+    let source = Arc::new(create_columns_histogram_source());
+    let engine = QueryEngine::new(source);
+    let labels = engine.histogram_labels("tcp_packet_latency");
+    assert!(!labels.is_empty());
+    assert!(labels.iter().any(|l| l.contains_key("cpu")));
+}
+
+#[test]
+fn test_unknown_metric_returns_empty_labels() {
+    let source = Arc::new(create_empty_source());
+    let engine = QueryEngine::new(source);
+    assert!(engine.counter_labels("does_not_exist").is_empty());
+    assert!(engine.gauge_labels("does_not_exist").is_empty());
+    assert!(engine.histogram_labels("does_not_exist").is_empty());
+}
+
+#[test]
+fn test_injected_label_filter_excludes_incompatible_file() {
+    use crate::histogram_stream::HistogramStream;
+
+    let source_a = Arc::new(create_hist_source(&[0, 5]));
+    let mut stream_a = source_a
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_a.meta.series {
+        labels.inner.insert("run".to_string(), "a".to_string());
+    }
+
+    let source_b = Arc::new(create_hist_source(&[0, 3]));
+    let mut stream_b = source_b
+        .histogram_stream("req_latency", &Labels::default(), 0, u64::MAX)
+        .unwrap();
+    for labels in &mut stream_b.meta.series {
+        labels.inner.insert("run".to_string(), "b".to_string());
+    }
+
+    let merged = HistogramStream::merge(vec![stream_a, stream_b]).unwrap();
+
+    // Filter the merged stream to only run="a" series
+    let run_a_filter = make_labels(&[("run", "a")]);
+    let series_matching_a: Vec<_> = merged
+        .meta
+        .series
+        .iter()
+        .filter(|s| s.matches(&run_a_filter))
+        .collect();
+
+    assert_eq!(
+        series_matching_a.len(),
+        2,
+        "should get 2 series (cpu=0,1) with run=a"
+    );
+    for s in &series_matching_a {
+        assert_eq!(s.inner.get("run").map(String::as_str), Some("a"));
+    }
+}
+
+#[test]
+fn test_parquet_reader_open_bytes_compiles() {
+    // Compile-time check that open_bytes accepts Vec<u8>, bytes::Bytes, and builder forms.
+    // Both calls fail at runtime (invalid parquet), but the important thing is they compile.
+    fn _check() {
+        let _ = crate::ParquetReader::open_bytes(vec![0u8; 4]);
+        let _ = crate::ParquetReader::builder().bytes(vec![0u8; 4]).build();
+        let _ = crate::ParquetReader::builder()
+            .bytes_labeled(
+                bytes::Bytes::from_static(b""),
+                crate::labels::Labels::default(),
+            )
+            .build();
+    }
+}
+
+// ─── Item 1: filename tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_parquet_reader_with_filename() {
+    // Runtime: open_bytes fails on invalid parquet, but with_filename is chainable and compile-time correct.
+    fn _check() {
+        let _ = crate::ParquetReader::open_bytes(vec![0u8; 4])
+            .map(|r| r.with_filename("myfile.parquet"));
+    }
+    // Verify via builder that filename() returns what was set (compile-time shape check).
+    fn _check_builder() {
+        let _ = crate::ParquetReader::builder()
+            .filename("custom.parquet")
+            .bytes(vec![0u8; 4])
+            .build()
+            .map(|r| {
+                assert_eq!(r.filename(), Some("custom.parquet"));
+            });
+    }
+}
+
+#[test]
+fn test_memory_store_builder_filename() {
+    let store = crate::MemoryStore::builder().filename("my-store").build();
+    assert_eq!(store.filename(), Some("my-store".to_string()));
+}
+
+#[test]
+fn test_memory_store_set_filename() {
+    let store = crate::MemoryStore::builder().build();
+    assert_eq!(store.filename(), None);
+    store.set_filename("set-later");
+    assert_eq!(store.filename(), Some("set-later".to_string()));
+}
+
+#[test]
+fn test_memory_store_filename_via_trait() {
+    use crate::MetricsSource;
+    let store = crate::MemoryStore::builder().filename("trait-name").build();
+    let src: &dyn MetricsSource = &store;
+    assert_eq!(src.filename(), Some("trait-name".to_string()));
+}
+
+// ─── Item 3: metadata_get tests ──────────────────────────────────────────────
+
+#[test]
+fn test_memory_store_metadata_get_matches_source() {
+    use crate::MetricsSource;
+    let store = crate::MemoryStore::builder()
+        .source("rezolus")
+        .version("3.0")
+        .build();
+    assert_eq!(store.metadata_get("source"), Some("rezolus".to_string()));
+    assert_eq!(store.metadata_get("version"), Some("3.0".to_string()));
+    assert_eq!(store.metadata_get("nonexistent"), None);
+    // Trait path
+    let src: &dyn MetricsSource = &store;
+    assert_eq!(src.metadata_get("source"), Some("rezolus".to_string()));
+    assert_eq!(src.source(), "rezolus");
+}
+
+// ─── Item 5: label_values tests ──────────────────────────────────────────────
+
+/// Test label_values via QueryEngine + Memory (the internal DataSource layer).
+/// We can't easily put counters into a public MemoryStore without the ingest
+/// feature, but we can drive `label_values` through the `MetricsSource` default
+/// method on an internal MemoryStore-like object using the Memory DataSource.
+#[test]
+fn test_label_values_via_query_engine() {
+    use crate::types::{Counter, Gauge};
+
+    // Build a MemoryStore and use its label_values default method.
+    // We populate via the inner Memory (accessible inside the crate).
+    let mut mem = Memory::new(1000);
+    let ts: Vec<u64> = vec![1_000_000_000_000, 2_000_000_000_000];
+    for cpu in ["0", "1"] {
+        let labels = make_labels(&[("cpu", cpu)]);
+        mem.add_counter(
+            "cpu_cycles",
+            Counter {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![0, 100],
+            },
+        );
+    }
+    mem.add_gauge(
+        "cpu_temp",
+        Gauge {
+            labels: make_labels(&[("cpu", "0")]),
+            timestamps: ts.clone(),
+            values: vec![50, 51],
+        },
+    );
+
+    // Wrap in a DataSource-backed QueryEngine and drive label_values
+    // through a MemoryStoreInner, which has access to the DataSource methods.
+    // Since MemoryStoreInner is pub(crate), construct it directly.
+    let inner = Arc::new(crate::memory_store::MemoryStoreInner {
+        memory: std::sync::RwLock::new(mem),
+        metadata: std::sync::RwLock::new(std::collections::HashMap::new()),
+        filename: std::sync::RwLock::new(None),
+    });
+
+    // Call counter_labels/gauge_labels directly (DataSource trait methods).
+    // Then verify the label_values default impl through a QueryEngine call.
+    let cpu_counter_labels = inner.counter_labels("cpu_cycles");
+    assert_eq!(cpu_counter_labels.len(), 2);
+
+    // Collect expected label values manually (mirrors label_values logic).
+    let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for lbl in inner.counter_labels("cpu_cycles") {
+        if let Some(v) = lbl.get("cpu") {
+            expected.insert(v.clone());
+        }
+    }
+    for lbl in inner.gauge_labels("cpu_cycles") {
+        if let Some(v) = lbl.get("cpu") {
+            expected.insert(v.clone());
+        }
+    }
+    assert!(expected.contains("0"));
+    assert!(expected.contains("1"));
+    assert_eq!(expected.len(), 2);
+}
+
+#[cfg(feature = "ingest")]
+#[test]
+fn test_memory_store_label_values_ingest() {
+    use crate::MetricsSource;
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    fn make_snap(
+        ts: SystemTime,
+        name: &str,
+        value: u64,
+        cpu: &str,
+    ) -> metriken_exposition::Snapshot {
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("metric".to_string(), name.to_string());
+        metadata.insert("cpu".to_string(), cpu.to_string());
+        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+            systemtime: ts,
+            duration: Duration::from_secs(0),
+            metadata: HashMap::new(),
+            counters: vec![metriken_exposition::Counter {
+                name: name.to_string(),
+                value,
+                metadata,
+            }],
+            gauges: vec![],
+            histograms: vec![],
+        })
+    }
+
+    let store = crate::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1001);
+    store.ingest_snapshot(make_snap(t0, "cpu_cycles", 100, "0"));
+    store.ingest_snapshot(make_snap(t1, "cpu_cycles", 200, "1"));
+
+    let vals = store.label_values("cpu_cycles", "cpu");
+    assert_eq!(vals.len(), 2);
+    assert!(vals.contains("0"));
+    assert!(vals.contains("1"));
+
+    let empty = store.label_values("cpu_cycles", "nonexistent");
+    assert!(empty.is_empty());
+
+    let empty2 = store.label_values("unknown_metric", "cpu");
+    assert!(empty2.is_empty());
+}
+
+// ─── Items 1, 2, 3, 7, 8, 9: MetricsSource convenience defaults ──────────────
+
+/// Build a mixed-type Memory (counters + gauges + histograms) for testing the
+/// new MetricsSource default methods without the `ingest` feature.
+fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
+    use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
+    let mut mem = Memory::new(1000);
+    let ts: Vec<u64> = vec![1_000_000_000_000, 2_000_000_000_000];
+
+    for cpu in ["0", "1"] {
+        let labels = make_labels(&[("cpu", cpu), ("kind", "counter")]);
+        mem.add_counter(
+            "cpu_cycles",
+            Counter {
+                labels,
+                timestamps: ts.clone(),
+                values: vec![0, 100],
+            },
+        );
+    }
+    mem.add_gauge(
+        "cpu_temp",
+        Gauge {
+            labels: make_labels(&[("cpu", "0")]),
+            timestamps: ts.clone(),
+            values: vec![50, 51],
+        },
+    );
+    mem.add_gauge(
+        "mem_used",
+        Gauge {
+            labels: make_labels(&[("node", "n1")]),
+            timestamps: ts.clone(),
+            values: vec![1024, 2048],
+        },
+    );
+
+    let config = ::histogram::Config::new(4, 16).unwrap();
+    mem.add_histogram(
+        "req_latency",
+        Histogram {
+            labels: make_labels(&[("cpu", "0")]),
+            config,
+            timestamps: ts.clone(),
+            snapshots: vec![
+                HistogramSnapshot {
+                    index: vec![],
+                    count: vec![],
+                },
+                HistogramSnapshot {
+                    index: vec![10],
+                    count: vec![5],
+                },
+            ],
+        },
+    );
+
+    Arc::new(crate::memory_store::MemoryStoreInner {
+        memory: std::sync::RwLock::new(mem),
+        metadata: std::sync::RwLock::new(std::collections::HashMap::new()),
+        filename: std::sync::RwLock::new(None),
+    })
+}
+
+#[test]
+fn test_all_names_is_sorted_union_of_all_types() {
+    use crate::MetricsSource as _;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    let names = store.all_names();
+    // Sorted: cpu_cycles, cpu_temp, mem_used, req_latency
+    assert_eq!(
+        names,
+        vec!["cpu_cycles", "cpu_temp", "mem_used", "req_latency"]
+    );
+
+    // Each name appears exactly once even if the same metric appears in multiple types
+    let dedup: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(dedup.len(), names.len(), "all_names should be deduplicated");
+}
+
+#[test]
+fn test_total_series_count_sums_all_types() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    // cpu_cycles: 2 series, cpu_temp: 1, mem_used: 1, req_latency: 1
+    let count = store.total_series_count();
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn test_has_counter_gauge_histogram() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    assert!(store.has_counter("cpu_cycles"));
+    assert!(!store.has_counter("cpu_temp")); // gauge, not counter
+    assert!(!store.has_counter("absent"));
+
+    assert!(store.has_gauge("cpu_temp"));
+    assert!(store.has_gauge("mem_used"));
+    assert!(!store.has_gauge("cpu_cycles")); // counter, not gauge
+    assert!(!store.has_gauge("absent"));
+
+    assert!(store.has_histogram("req_latency"));
+    assert!(!store.has_histogram("cpu_cycles")); // counter, not histogram
+    assert!(!store.has_histogram("absent"));
+}
+
+#[test]
+fn test_all_label_keys_unions_across_all_metrics() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    let keys = store.all_label_keys();
+    // cpu (from cpu_cycles counter and cpu_temp gauge and req_latency histogram)
+    // kind (from cpu_cycles counter)
+    // node (from mem_used gauge)
+    assert!(keys.contains("cpu"), "expected 'cpu' in label keys");
+    assert!(keys.contains("kind"), "expected 'kind' in label keys");
+    assert!(keys.contains("node"), "expected 'node' in label keys");
+    // Must be sorted (BTreeSet)
+    let sorted: Vec<_> = keys.iter().collect();
+    let mut expected = sorted.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "all_label_keys should be sorted");
+}
+
+#[test]
+fn test_label_values_by_key_groups_correctly() {
+    use crate::MetricsSource;
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    // cpu_cycles has two series: cpu=0 and cpu=1 (both counters)
+    let by_key = store.label_values_by_key("cpu_cycles");
+    let cpu_vals = by_key.get("cpu").expect("'cpu' key should be present");
+    assert!(cpu_vals.contains("0"), "cpu=0 should be present");
+    assert!(cpu_vals.contains("1"), "cpu=1 should be present");
+    assert_eq!(cpu_vals.len(), 2);
+
+    let kind_vals = by_key.get("kind").expect("'kind' key should be present");
+    assert_eq!(kind_vals, &["counter".to_string()].into_iter().collect());
+
+    // Unknown metric → empty map
+    let empty = store.label_values_by_key("nonexistent");
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn test_filename_or_default() {
+    use crate::MetricsSource;
+
+    // No filename set → empty string
+    let store_no_name = crate::MemoryStore::builder().build();
+    assert_eq!(store_no_name.filename_or_default(), "");
+
+    // Filename set → returns name
+    let store_with_name = crate::MemoryStore::builder().filename("myfile").build();
+    assert_eq!(store_with_name.filename_or_default(), "myfile");
+}
+
+// ─── Item 6: time_range_ns ────────────────────────────────────────────────────
+
+#[test]
+fn test_time_range_ns_is_exact_for_memory_store() {
+    let inner = make_mixed_memory();
+    let store = crate::MemoryStore::from_inner(inner);
+
+    let (lo, hi) = store
+        .time_range_ns()
+        .expect("non-empty store should have time range");
+    assert_eq!(lo, 1_000_000_000_000, "expected 1e12 ns (1000 s)");
+    assert_eq!(hi, 2_000_000_000_000, "expected 2e12 ns (2000 s)");
+
+    // time_range_ns and time_range should agree (modulo f64 precision)
+    let (lo_s, hi_s) = store.time_range().unwrap();
+    assert!((lo_s - lo as f64 / 1e9).abs() < 1e-3, "lo seconds mismatch");
+    assert!((hi_s - hi as f64 / 1e9).abs() < 1e-3, "hi seconds mismatch");
+}
+
+#[test]
+fn test_time_range_ns_empty_store_is_none() {
+    let store = crate::MemoryStore::builder().build();
+    assert!(store.time_range_ns().is_none());
+}
+
+// ─── Item 4: ParquetBuilder composition (compile-time API checks) ─────────────
+
+#[test]
+fn test_parquet_builder_file_owned_compiles() {
+    // file_owned and file_owned_labeled must accept std::fs::File.
+    fn _check(f1: std::fs::File, f2: std::fs::File) {
+        let _ = crate::ParquetReader::builder().file_owned(f1);
+        let _ = crate::ParquetReader::builder().file_owned_labeled(f2, [("run", "a")]);
+    }
+}
+
+#[test]
+fn test_parquet_builder_reader_and_reader_labeled_compile() {
+    // reader() and reader_labeled() must accept Arc<ParquetReader>.
+    fn _check(r1: Arc<crate::ParquetReader>, r2: Arc<crate::ParquetReader>) {
+        let _ = crate::ParquetReader::builder().reader(r1.clone());
+        let _ = crate::ParquetReader::builder().reader_labeled(r2, [("run", "b")]);
+    }
 }

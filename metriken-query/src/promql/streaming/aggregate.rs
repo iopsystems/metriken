@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use crate::tsdb::Labels;
+use crate::labels::Labels;
 
 use super::{LabeledSeries, Point, SeriesSet};
 
@@ -47,9 +47,9 @@ pub enum GroupBy<'a> {
     Exclude(&'a [String]),
 }
 
-/// Backwards-compatible thin wrapper. Older callers pass a list of
-/// labels meaning "group by these"; the equivalent on the general
-/// API is `aggregate(input, AggOp::Sum, GroupBy::Include(labels))`.
+/// Thin wrapper used by tests; the general API is
+/// `aggregate(input, AggOp::Sum, GroupBy::Include(labels))`.
+#[cfg(test)]
 pub fn sum_by<'a>(input: SeriesSet<'a>, by_labels: &[String]) -> SeriesSet<'a> {
     aggregate(input, AggOp::Sum, GroupBy::Include(by_labels))
 }

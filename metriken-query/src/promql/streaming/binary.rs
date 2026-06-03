@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use promql_parser::parser::token::TokenType;
 
-use crate::tsdb::Labels;
+use crate::labels::Labels;
 
 use super::{LabeledSeries, Point, SeriesSet};
 

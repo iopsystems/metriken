@@ -1,12 +1,10 @@
-use super::*;
+use std::collections::BTreeMap;
 
 #[derive(Default, Eq, PartialEq, Hash, Clone, Debug)]
 pub struct Labels {
     pub inner: BTreeMap<String, String>,
 }
 
-/// Check if a value matches a pattern.
-/// Supports: alternation with `|`, optional parens `(a|b)`, escaped dots `\.`.
 fn match_pattern(value: &str, pattern: &str) -> bool {
     if pattern.contains('|') {
         let inner = if pattern.starts_with('(') && pattern.ends_with(')') {
@@ -25,41 +23,6 @@ fn match_pattern(value: &str, pattern: &str) -> bool {
         value == pattern.replace("\\.", ".")
     } else {
         value == pattern
-    }
-}
-
-impl Labels {
-    pub fn matches(&self, other: &Labels) -> bool {
-        for (label, value) in other.inner.iter() {
-            // Check if it's a negative match pattern
-            if let Some(pattern) = value.strip_prefix('!') {
-                // Negative match (from != or !~ operator)
-                if let Some(v) = self.inner.get(label) {
-                    if match_pattern(v, pattern) {
-                        return false;
-                    }
-                }
-                // If label doesn't exist, it passes the negative filter
-            } else if let Some(pattern) = value.strip_prefix('~') {
-                // Regex positive match (from =~ operator, marked with ~ prefix)
-                let Some(v) = self.inner.get(label) else {
-                    return false;
-                };
-                if !match_pattern(v, pattern) {
-                    return false;
-                }
-            } else if let Some(v) = self.inner.get(label) {
-                // Exact positive match (from = operator)
-                if !match_pattern(v, value) {
-                    return false;
-                }
-            } else {
-                // Label doesn't exist but was required (positive match)
-                return false;
-            }
-        }
-
-        true
     }
 }
 
@@ -115,5 +78,33 @@ impl From<&mut dyn Iterator<Item = (&str, &str)>> for Labels {
         Self {
             inner: other.map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
+    }
+}
+
+impl Labels {
+    pub fn matches(&self, other: &Labels) -> bool {
+        for (label, value) in other.inner.iter() {
+            if let Some(pattern) = value.strip_prefix('!') {
+                if let Some(v) = self.inner.get(label) {
+                    if match_pattern(v, pattern) {
+                        return false;
+                    }
+                }
+            } else if let Some(pattern) = value.strip_prefix('~') {
+                let Some(v) = self.inner.get(label) else {
+                    return false;
+                };
+                if !match_pattern(v, pattern) {
+                    return false;
+                }
+            } else if let Some(v) = self.inner.get(label) {
+                if !match_pattern(v, value) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
     }
 }

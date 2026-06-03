@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use promql_parser::label::Matcher;
@@ -7,10 +6,11 @@ use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tsdb::{Labels, Tsdb};
+use crate::labels::Labels;
+use crate::DataSource;
 
 mod columns;
-pub mod streaming;
+pub(crate) mod streaming;
 
 #[cfg(test)]
 mod tests;
@@ -77,13 +77,9 @@ pub enum QueryResult {
     HistogramHeatmap { result: HistogramHeatmapResult },
 }
 
-/// The PromQL query engine
-///
-/// Generic over the TSDB handle type. The default (`Arc<Tsdb>`) covers the
-/// common owned case (MCP, tests, file-backed viewer). Pass `&Tsdb` (or any
-/// other `Deref<Target = Tsdb>`) for zero-copy borrowed access.
-pub struct QueryEngine<T: Deref<Target = Tsdb> = Arc<Tsdb>> {
-    tsdb: T,
+/// The PromQL query engine, backed by any `DataSource`.
+pub(crate) struct QueryEngine {
+    source: Arc<dyn DataSource>,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -145,18 +141,9 @@ impl HistogramGroupBy {
 
 /// Rewrite `sum [by/without (...)] (<histogram_func>(...))` to the
 /// native `<histogram_func> [by/without (...)] (...)` form.
-///
-/// `histogram_irate`/`histogram_mean` aren't standard PromQL names, so
-/// promql-parser rejects them — even wrapped in a known aggregator —
-/// before the engine sees the query. The wrapping `sum` is a
-/// pass-through against the histogram pipeline's internal grouping
-/// (already collapses across label sets), so unwrapping here lets the
-/// existing top-level dispatcher take over. `avg`/`min`/`max` would
-/// need per-group post-reduction and are intentionally left alone.
 fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
     let query = query.trim();
     let after_sum = query.strip_prefix("sum")?;
-    // Reject identifier prefixes like `summary_foo`.
     if !matches!(after_sum.chars().next(), Some('(' | ' ' | '\t')) {
         return None;
     }
@@ -174,9 +161,6 @@ fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
 
     let after_open = after_modifier.strip_prefix('(')?;
     let close = find_close_paren(after_open)?;
-    // Anything after the closing paren means the `sum` is part of a
-    // larger expression (binary op, another wrapper) we can't safely
-    // rewrite from string level.
     if after_open[close + 1..]
         .trim_start()
         .chars()
@@ -200,8 +184,6 @@ fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
         return None;
     }
 
-    // Two grouping modifiers would be ambiguous; bail and let the
-    // dispatcher emit its own error.
     let inner_after_name = after_name.trim_start();
     if inner_after_name.starts_with("by") || inner_after_name.starts_with("without") {
         let next = inner_after_name
@@ -219,8 +201,6 @@ fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
     }
 }
 
-/// Consume a `by (..)` / `without (..)` clause, returning the rest of
-/// the input and the clause re-stringified so callers can splice it.
 fn take_grouping_clause<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, String)> {
     let inside = s.strip_prefix('(')?;
     let close = find_close_paren(inside)?;
@@ -229,8 +209,7 @@ fn take_grouping_clause<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, Strin
     Some((after, format!("{keyword} ({labels})")))
 }
 
-/// Parse `<func> [by (labels) | without (labels)] (body)`. `Ok(None)`
-/// if the prefix doesn't match.
+/// Parse `<func> [by (labels) | without (labels)] (body)`.
 pub(crate) fn parse_histogram_call<'a>(
     func: &str,
     query: &'a str,
@@ -238,7 +217,6 @@ pub(crate) fn parse_histogram_call<'a>(
     let Some(after_name) = query.strip_prefix(func) else {
         return Ok(None);
     };
-    // Guard against prefix collisions with longer function names.
     if !matches!(after_name.chars().next(), Some('(' | ' ' | '\t')) {
         return Ok(None);
     }
@@ -314,26 +292,6 @@ fn find_close_paren(s: &str) -> Option<usize> {
     None
 }
 
-/// Collapse a matrix result into a vector by taking the latest
-/// point of each series. Used by `query()` to convert a degenerate
-/// range query (`start = end = time`) into instant-query shape.
-/// Non-matrix results pass through unchanged.
-fn matrix_to_vector(result: QueryResult) -> QueryResult {
-    let QueryResult::Matrix { result: samples } = result else {
-        return result;
-    };
-    let vector: Vec<Sample> = samples
-        .into_iter()
-        .filter_map(|s| {
-            s.values.last().copied().map(|value| Sample {
-                metric: s.metric,
-                value,
-            })
-        })
-        .collect();
-    QueryResult::Vector { result: vector }
-}
-
 /// Extract label filter from parsed PromQL matchers, skipping `__name__`.
 pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     let mut filter_labels = Labels::default();
@@ -359,52 +317,85 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
-impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
-    pub fn new(tsdb: T) -> Self {
-        Self { tsdb }
+impl QueryEngine {
+    pub(crate) fn new(source: Arc<dyn DataSource>) -> Self {
+        Self { source }
     }
 
-    /// Get a reference to the underlying TSDB
-    pub fn tsdb(&self) -> &Tsdb {
-        &self.tsdb
+    /// Time range of the underlying source in nanoseconds, or `None` if empty.
+    pub(crate) fn time_range(&self) -> Option<(u64, u64)> {
+        self.source.time_range()
     }
 
-    /// Get the time range (min, max) of all data in seconds
-    pub fn get_time_range(&self) -> (f64, f64) {
-        self.tsdb
-            .time_range()
-            .map(|(min_ns, max_ns)| (min_ns as f64 / 1e9, max_ns as f64 / 1e9))
-            .unwrap_or_else(|| {
-                // No data found, return a reasonable default
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64();
-                (now - 3600.0, now) // 1 hour ago to now
-            })
+    pub(crate) fn counter_names(&self) -> Vec<String> {
+        self.source.counter_names()
+    }
+    pub(crate) fn gauge_names(&self) -> Vec<String> {
+        self.source.gauge_names()
+    }
+    pub(crate) fn histogram_names(&self) -> Vec<String> {
+        self.source.histogram_names()
+    }
+    pub(crate) fn counter_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.counter_labels(name)
+    }
+    pub(crate) fn gauge_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.gauge_labels(name)
+    }
+    pub(crate) fn histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.histogram_labels(name)
+    }
+    pub(crate) fn interval(&self) -> f64 {
+        self.source.interval()
+    }
+    pub(crate) fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.source.file_metadata()
     }
 
-    /// Execute an instant query — evaluate `query_str` at a single
-    /// timestamp. Mirrors Prometheus' `/api/v1/query` semantics.
-    ///
-    /// Internally a degenerate range query (`start = end = time`,
-    /// `step = sampling_interval`) collapsed into a vector by taking
-    /// the latest point of each result series. Inherits the full
-    /// supported PromQL surface from `query_range`.
-    ///
-    /// `time` defaults to the latest timestamp in the TSDB.
-    pub fn query(&self, query_str: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        let target = time.unwrap_or_else(|| self.get_time_range().1);
-        let step = self.tsdb.interval().max(1.0);
+    /// Look up a single metadata value by key without cloning the full map.
+    pub(crate) fn metadata_get(&self, key: &str) -> Option<String> {
+        self.source.metadata_get(key)
+    }
+
+    /// Execute an instant query at a single timestamp.
+    /// Uses the latest available timestamp when `time` is `None`.
+    pub(crate) fn query(
+        &self,
+        query_str: &str,
+        time: Option<f64>,
+    ) -> Result<QueryResult, QueryError> {
+        let target = time.unwrap_or_else(|| {
+            self.source
+                .time_range()
+                .map(|(_, max_ns)| max_ns as f64 / 1e9)
+                .unwrap_or(0.0)
+        });
+        let step = self.source.interval().max(1.0);
         let result = self.query_range(query_str, target, target, step)?;
-        Ok(matrix_to_vector(result))
+        let QueryResult::Matrix { result: samples } = result else {
+            return Ok(result);
+        };
+        let vector: Vec<Sample> = samples
+            .into_iter()
+            .filter_map(|s| {
+                s.values.last().copied().map(|value| Sample {
+                    metric: s.metric,
+                    value,
+                })
+            })
+            .collect();
+        Ok(QueryResult::Vector { result: vector })
     }
 
-    /// Parse a metric selector like
-    /// `metric_name{label1="value1",label2="value2"}`. Used by the
-    /// `histogram_quantiles` / `histogram_heatmap` pre-parsers in
-    /// `query_range`, which take their argument as a query string
-    /// rather than going through the standard PromQL AST.
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
         if let Some(brace_pos) = selector.find('{') {
             let metric_name = selector[..brace_pos].trim().to_string();
@@ -417,7 +408,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                     continue;
                 }
 
-                // Parse operator: check for !=, !~, =~, then = (order matters)
                 let (key, value, negate) = if let Some(pos) = part.find("!=") {
                     (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
                 } else if let Some(pos) = part.find("!~") {
@@ -451,9 +441,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Evaluate a parsed PromQL expression. Thin wrapper around the
-    /// streaming dispatcher; any shape the dispatcher doesn't
-    /// recognise becomes `QueryError::Unsupported`.
     fn evaluate_expr(
         &self,
         expr: &Expr,
@@ -461,33 +448,25 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        streaming::dispatch::try_streaming(&self.tsdb, expr, start, end, step)
+        streaming::dispatch::try_streaming(&*self.source, expr, start, end, step)
     }
 
-    /// Handle histogram_quantiles(quantiles_array, histogram_metric)
-    /// queries.  Example: `histogram_quantiles([0.5, 0.9, 0.99, 0.999],
-    /// tcp_packet_latency)`.
-    ///
-    /// This is a rezolus extension on top of standard PromQL — the
-    /// scalar `histogram_quantile(q, m)` only supports a single
-    /// quantile per call, so a dashboard wanting p50/p90/p99/p999
-    /// from one metric would otherwise issue four separate queries
-    /// and walk the histogram series four times.  The plural form
-    /// fuses them into a single walk.
-    ///
-    /// Output series are labeled `{__name__: name, quantile: "0.99"}`
-    /// to match the standard PromQL `histogram_quantile` convention,
-    /// so a dashboard can consume either entry point uniformly.
     fn handle_histogram_quantiles(
         &self,
         query_str: &str,
         start: f64,
         end: f64,
     ) -> Result<QueryResult, QueryError> {
-        // Extract the inner part: [0.5, 0.9, 0.99, 0.999], tcp_packet_latency
-        let inner = &query_str["histogram_quantiles(".len()..query_str.len() - 1];
+        // Accept both `histogram_quantiles(` and `histogram_percentiles(` as
+        // synonyms — quantile and percentile are interchangeable terms for
+        // the [0.0, 1.0] array form used here.
+        let prefix_len = if query_str.starts_with("histogram_percentiles(") {
+            "histogram_percentiles(".len()
+        } else {
+            "histogram_quantiles(".len()
+        };
+        let inner = &query_str[prefix_len..query_str.len() - 1];
 
-        // Find the array portion [...]
         let array_start = inner.find('[').ok_or_else(|| {
             QueryError::ParseError(
                 "histogram_quantiles first argument must be an array of quantiles".to_string(),
@@ -497,7 +476,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             QueryError::ParseError("Missing closing bracket in quantiles array".to_string())
         })?;
 
-        // Parse the quantiles array
         let array_str = &inner[array_start + 1..array_end];
         let quantiles: Vec<f64> = array_str
             .split(',')
@@ -522,7 +500,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             }
         }
 
-        // Extract the metric selector (everything after the array and comma)
         let after_array = &inner[array_end + 1..].trim();
         let remaining = after_array
             .strip_prefix(',')
@@ -533,26 +510,16 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
                 )
             })?;
 
-        // Split off an optional trailing stride parameter (e.g. ", 15")
         let (metric_selector, stride_ns) = parse_optional_stride(remaining)?;
-
-        // Parse the metric selector to extract name and labels
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
-            return Err(QueryError::MetricNotFound(metric_name.to_string()));
-        };
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
-        let result = streaming::histogram::quantiles(
-            collection,
-            &labels,
-            &quantiles,
-            start_ns,
-            end_ns,
-            stride_ns,
-            &metric_name,
-        );
+        let stream = self
+            .source
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
+            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+        let result = stream.quantiles(&quantiles, start_ns, end_ns, stride_ns, &metric_name);
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
                 "No histogram data found for {}",
@@ -562,13 +529,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         Ok(QueryResult::Matrix { result })
     }
 
-    /// Handle histogram_heatmap(histogram_metric) queries
-    /// Returns bucket data suitable for rendering as a latency heatmap
-    /// `histogram_heatmap(metric{matchers}[, stride])` — output is
-    /// inherently 2-D so a `Vec` of `(time_idx, bucket_idx, count)`
-    /// triples gets materialised either way; the streaming-side win
-    /// is avoiding the `tsdb.histograms()` clone and the
-    /// `collection.sum()` merged-series allocation.
     fn handle_histogram_heatmap(
         &self,
         query_str: &str,
@@ -579,14 +539,13 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
-            return Err(QueryError::MetricNotFound(metric_name.to_string()));
-        };
-
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
-        let result =
-            streaming::histogram::heatmap(collection, &labels, start_ns, end_ns, stride_ns);
+        let stream = self
+            .source
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
+            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+        let result = stream.heatmap(start_ns, end_ns, stride_ns);
         match result {
             Some(result) => Ok(QueryResult::HistogramHeatmap { result }),
             None => Err(QueryError::MetricNotFound(format!(
@@ -595,7 +554,6 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
     }
 
-    /// Rejects a trailing stride — see [`streaming::histogram::irate`].
     fn handle_histogram_irate(
         &self,
         inner: &str,
@@ -611,20 +569,13 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         }
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
-            return Err(QueryError::MetricNotFound(metric_name.to_string()));
-        };
-
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
-        let result = streaming::histogram::irate(
-            collection,
-            &labels,
-            group_by.as_ref(),
-            start_ns,
-            end_ns,
-            &metric_name,
-        );
+        let stream = self
+            .source
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
+            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+        let result = stream.irate(group_by.as_ref(), start_ns, end_ns, &metric_name);
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
                 "No histogram data found for {metric_name}"
@@ -644,41 +595,17 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let Some(collection) = self.tsdb.histograms_ref(&metric_name) else {
-            return Err(QueryError::MetricNotFound(metric_name.to_string()));
-        };
-
         let start_ns = (start * 1e9) as u64;
         let end_ns = (end * 1e9) as u64;
+        let stream = self
+            .source
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
+            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
         let group = group_by.as_ref();
         let result = match func {
-            "histogram_mean" => streaming::histogram::mean(
-                collection,
-                &labels,
-                group,
-                start_ns,
-                end_ns,
-                stride_ns,
-                &metric_name,
-            ),
-            "histogram_sum" => streaming::histogram::sum(
-                collection,
-                &labels,
-                group,
-                start_ns,
-                end_ns,
-                stride_ns,
-                &metric_name,
-            ),
-            _ => streaming::histogram::count(
-                collection,
-                &labels,
-                group,
-                start_ns,
-                end_ns,
-                stride_ns,
-                &metric_name,
-            ),
+            "histogram_mean" => stream.mean(group, start_ns, end_ns, stride_ns, &metric_name),
+            "histogram_sum" => stream.sum(group, start_ns, end_ns, stride_ns, &metric_name),
+            _ => stream.count(group, start_ns, end_ns, stride_ns, &metric_name),
         };
         if result.is_empty() {
             return Err(QueryError::MetricNotFound(format!(
@@ -695,20 +622,17 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        // Handle histogram_quantiles specially since it uses array literal syntax
-        // that may not be parsed correctly by the standard PromQL parser
-        if query_str.starts_with("histogram_quantiles(") && query_str.ends_with(")") {
+        if (query_str.starts_with("histogram_quantiles(")
+            || query_str.starts_with("histogram_percentiles("))
+            && query_str.ends_with(")")
+        {
             return self.handle_histogram_quantiles(query_str, start, end);
         }
 
-        // Handle histogram_heatmap specially
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self.handle_histogram_heatmap(query_str, start, end);
         }
 
-        // Unwrap `sum [by/without (...)] (<histogram_func>(...))` —
-        // promql-parser doesn't know our `histogram_irate`/`mean`
-        // names, so wrapped forms would otherwise fail at parse time.
         let rewritten = unwrap_sum_around_histogram(query_str);
         let query_str: &str = rewritten.as_deref().unwrap_or(query_str);
 
@@ -721,15 +645,9 @@ impl<T: Deref<Target = Tsdb>> QueryEngine<T> {
             return self.handle_histogram_irate(inner, group_by, start, end);
         }
 
-        // Parse the query into an AST and evaluate. The streaming
-        // dispatcher fires inside `evaluate_expr`, so it covers
-        // every recursion level — not just the top — letting eager
-        // wrappers like `scalar(sum(irate(...)))` benefit from
-        // streaming on their inner sub-trees too.
         match parser::parse(query_str) {
             Ok(expr) => self.evaluate_expr(&expr, start, end, step),
             Err(err) => {
-                // Provide more helpful error messages for common mistakes
                 let error_msg = format!("{:?}", err);
                 if error_msg.contains("invalid promql query") && query_str.contains(" by ") {
                     Err(QueryError::ParseError(

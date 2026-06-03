@@ -1,0 +1,1885 @@
+// Several nested `Result<Result<…>, _>` types arise naturally from
+// `catch_unwind` wrapping fallible decode functions; flattening them through
+// type aliases is more confusing than the inline form.
+#![allow(clippy::type_complexity)]
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+
+use arrow::array::{Int64Array, ListArray, UInt64Array};
+use arrow::datatypes::DataType;
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use parquet::arrow::ProjectionMask;
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::statistics::Statistics;
+
+use crate::buffer_pool::{next_source_id, BufferPool, CacheKey};
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::labels::Labels;
+use crate::promql::{QueryEngine, QueryError, QueryResult};
+use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
+use crate::{DataSource, MetricsSource};
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+
+pub struct ParquetReader {
+    engine: QueryEngine,
+    /// Concrete handle retained for composition via `ParquetBuilder::reader()`.
+    inner: Arc<MultiParquetSource>,
+    filename: Option<String>,
+}
+
+impl ParquetReader {
+    pub fn builder() -> ParquetBuilder {
+        ParquetBuilder::new()
+    }
+
+    /// Convenience: open a single file with no extra labels.
+    /// The `filename()` defaults to the path's basename.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
+        let path = path.as_ref();
+        let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        let source = ParquetSource::open(path)?;
+        let inner = Arc::new(MultiParquetSource {
+            files: vec![(source, Labels::default())],
+        });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self {
+            engine: QueryEngine::new(ds),
+            inner,
+            filename,
+        })
+    }
+
+    /// Convenience: open a parquet file from raw bytes (e.g. from a browser file upload).
+    pub fn open_bytes(bytes: impl Into<Bytes>) -> Result<Self, Box<dyn Error>> {
+        Self::builder().bytes(bytes).build()
+    }
+
+    /// Open a parquet from an already-open file handle. Useful for the
+    /// "open-then-unlink" temp-file pattern: `NamedTempFile::into_file()`
+    /// hands you an owned `File` whose disk path has been removed, and the
+    /// data persists as long as the reader (and its `File`) is alive.
+    pub fn open_file(file: File) -> Result<Self, Box<dyn Error>> {
+        let source = ParquetSource::open_file(file)?;
+        let inner = Arc::new(MultiParquetSource {
+            files: vec![(source, Labels::default())],
+        });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self {
+            engine: QueryEngine::new(ds),
+            inner,
+            filename: None,
+        })
+    }
+
+    /// Open a single file wired to `pool` for caching decoded row groups.
+    ///
+    /// Subsequent queries against this reader will populate the pool on first
+    /// access and serve cached decoded blocks on repeated access.  Multiple
+    /// readers sharing the same `Arc<BufferPool>` share the budget and LRU.
+    pub fn open_with_pool(
+        path: impl AsRef<Path>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let path = path.as_ref();
+        let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        let source = ParquetSource::open_with_pool(path, pool)?;
+        let inner = Arc::new(MultiParquetSource {
+            files: vec![(source, Labels::default())],
+        });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self {
+            engine: QueryEngine::new(ds),
+            inner,
+            filename,
+        })
+    }
+
+    /// Open in-memory bytes wired to `pool`.
+    pub fn open_bytes_with_pool(
+        bytes: impl Into<Bytes>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::builder().pool(pool).bytes(bytes).build()
+    }
+
+    /// Open an already-open file handle wired to `pool`.
+    pub fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Self, Box<dyn Error>> {
+        let source = ParquetSource::open_file_with_pool(file, pool)?;
+        let inner = Arc::new(MultiParquetSource {
+            files: vec![(source, Labels::default())],
+        });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(Self {
+            engine: QueryEngine::new(ds),
+            inner,
+            filename: None,
+        })
+    }
+
+    /// Return the underlying `(source, labels)` pairs for use by
+    /// [`ParquetBuilder::reader`] and [`ParquetBuilder::reader_labeled`].
+    pub(crate) fn sources_for_composition(&self) -> Vec<(Arc<ParquetSource>, Labels)> {
+        self.inner.files.clone()
+    }
+
+    /// Set the display name. Useful when constructing from bytes or
+    /// after the fact (e.g. a WASM viewer setting the original upload name).
+    pub fn with_filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
+    /// Return the display name, if set.
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
+    }
+
+    pub fn query_range(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+    ) -> Result<QueryResult, QueryError> {
+        self.engine.query_range(expr, start_s, end_s, step_s)
+    }
+
+    /// Time range of data across all files in seconds, or `None` if empty.
+    pub fn time_range(&self) -> Option<(f64, f64)> {
+        self.engine
+            .time_range()
+            .map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
+    }
+
+    /// Time range of data across all files in nanoseconds, or `None` if empty.
+    ///
+    /// Prefer this over [`time_range()`](Self::time_range) when you need exact
+    /// nanosecond timestamps without floating-point precision loss.
+    pub fn time_range_ns(&self) -> Option<(u64, u64)> {
+        self.engine.time_range()
+    }
+
+    /// Names of all counter metrics across all files (sorted, deduplicated).
+    pub fn counter_names(&self) -> Vec<String> {
+        self.engine.counter_names()
+    }
+
+    /// Names of all gauge metrics across all files (sorted, deduplicated).
+    pub fn gauge_names(&self) -> Vec<String> {
+        self.engine.gauge_names()
+    }
+
+    /// Names of all histogram metrics across all files (sorted, deduplicated).
+    pub fn histogram_names(&self) -> Vec<String> {
+        self.engine.histogram_names()
+    }
+
+    /// All label combinations for the named counter metric across all files.
+    /// Includes any per-file labels injected via `file_labeled`. Empty if unknown.
+    pub fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.counter_labels(name)
+    }
+
+    /// All label combinations for the named gauge metric across all files.
+    /// Includes any per-file labels injected via `file_labeled`. Empty if unknown.
+    pub fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.gauge_labels(name)
+    }
+
+    /// All label combinations for the named histogram metric across all files.
+    /// Includes any per-file labels injected via `file_labeled`. Empty if unknown.
+    pub fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.histogram_labels(name)
+    }
+
+    /// Sampling interval in seconds. For multi-file readers, returns the finest interval.
+    pub fn interval(&self) -> f64 {
+        self.engine.interval()
+    }
+
+    /// Key-value metadata from the parquet file footer.
+    /// For multi-file readers, merges across all files (last file wins on collision).
+    pub fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.engine.file_metadata()
+    }
+
+    /// Look up a single metadata value by key without cloning the full map.
+    pub fn metadata_get(&self, key: &str) -> Option<String> {
+        self.engine.metadata_get(key)
+    }
+
+    /// Convenience: the `source` key from file metadata (e.g. "rezolus").
+    /// Returns an empty string if absent.
+    pub fn source(&self) -> String {
+        self.engine.metadata_get("source").unwrap_or_default()
+    }
+
+    /// Convenience: the `version` key from file metadata.
+    /// Returns an empty string if absent.
+    pub fn version(&self) -> String {
+        self.engine.metadata_get("version").unwrap_or_default()
+    }
+
+    /// Execute an instant PromQL query at a single timestamp.
+    /// Uses the latest available timestamp when `time` is `None`.
+    pub fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
+        self.engine.query(expr, time)
+    }
+
+    /// Resolve a PromQL query to the set of physical parquet column names it
+    /// touches, without reading any values.
+    pub fn columns(&self, query: &str) -> Result<std::collections::HashSet<String>, QueryError> {
+        self.engine.columns(query)
+    }
+}
+
+impl MetricsSource for ParquetReader {
+    fn query_range(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+    ) -> Result<QueryResult, QueryError> {
+        self.query_range(expr, start_s, end_s, step_s)
+    }
+
+    fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
+        self.query(expr, time)
+    }
+
+    fn columns(&self, query: &str) -> Result<std::collections::HashSet<String>, QueryError> {
+        self.columns(query)
+    }
+
+    fn time_range(&self) -> Option<(f64, f64)> {
+        self.time_range()
+    }
+
+    fn time_range_ns(&self) -> Option<(u64, u64)> {
+        self.time_range_ns()
+    }
+
+    fn interval(&self) -> f64 {
+        self.interval()
+    }
+
+    fn source(&self) -> String {
+        self.source()
+    }
+
+    fn version(&self) -> String {
+        self.version()
+    }
+
+    fn filename(&self) -> Option<String> {
+        self.filename.clone()
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.metadata_get(key)
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.file_metadata()
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        self.counter_names()
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        self.gauge_names()
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        self.histogram_names()
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.counter_labels(name)
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.gauge_labels(name)
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.histogram_labels(name)
+    }
+}
+
+// ─── Builder ──────────────────────────────────────────────────────────────────
+
+enum BuilderEntry {
+    Path(std::path::PathBuf, Labels),
+    Bytes(Bytes, Labels),
+    OwnedFile(File, Labels),
+    Source(Arc<ParquetSource>, Labels),
+}
+
+pub struct ParquetBuilder {
+    entries: Vec<BuilderEntry>,
+    filename: Option<String>,
+    pool: Option<Arc<BufferPool>>,
+}
+
+impl Default for ParquetBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParquetBuilder {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            filename: None,
+            pool: None,
+        }
+    }
+
+    /// Attach a `BufferPool` that all files opened by this builder will share.
+    ///
+    /// The pool is cloned into each `ParquetSource` at build time.  Multiple
+    /// builders (and their resulting `ParquetReader`s) can share the same pool
+    /// by passing the same `Arc`.
+    pub fn pool(mut self, pool: Arc<BufferPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Add a file with no extra labels.
+    pub fn file(mut self, path: impl AsRef<Path>) -> Self {
+        self.entries.push(BuilderEntry::Path(
+            path.as_ref().to_path_buf(),
+            Labels::default(),
+        ));
+        self
+    }
+
+    /// Add a file whose series will carry `labels` as additional metadata.
+    /// The labels are injected into every series from this file at query time.
+    ///
+    /// # Precondition
+    /// Injected label keys must not conflict with column labels already present
+    /// in the parquet file's schema; if they do, the native value is overwritten.
+    pub fn file_labeled(mut self, path: impl AsRef<Path>, labels: impl Into<Labels>) -> Self {
+        self.entries.push(BuilderEntry::Path(
+            path.as_ref().to_path_buf(),
+            labels.into(),
+        ));
+        self
+    }
+
+    /// Add an in-memory parquet source with no extra labels.
+    /// Accepts any type that converts to `bytes::Bytes` (e.g. `Vec<u8>`, `&[u8]`, `Bytes`).
+    /// `Bytes::clone()` is a refcount bump — cloning this source is cheap.
+    pub fn bytes(mut self, bytes: impl Into<Bytes>) -> Self {
+        self.entries
+            .push(BuilderEntry::Bytes(bytes.into(), Labels::default()));
+        self
+    }
+
+    /// Add an in-memory parquet source whose series will carry `labels` as additional metadata.
+    pub fn bytes_labeled(mut self, bytes: impl Into<Bytes>, labels: impl Into<Labels>) -> Self {
+        self.entries
+            .push(BuilderEntry::Bytes(bytes.into(), labels.into()));
+        self
+    }
+
+    /// Override the display name. Takes priority over basename auto-detection.
+    pub fn filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
+    /// Add an already-open file handle with no extra labels.
+    ///
+    /// Useful for the `NamedTempFile::into_file()` pattern where the path has
+    /// already been unlinked but the data should remain accessible.
+    pub fn file_owned(mut self, file: File) -> Self {
+        self.entries
+            .push(BuilderEntry::OwnedFile(file, Labels::default()));
+        self
+    }
+
+    /// Add an already-open file handle whose series will carry `labels` as
+    /// additional metadata.
+    pub fn file_owned_labeled(mut self, file: File, labels: impl Into<Labels>) -> Self {
+        self.entries
+            .push(BuilderEntry::OwnedFile(file, labels.into()));
+        self
+    }
+
+    /// Compose with all sources from an existing [`ParquetReader`].
+    ///
+    /// The per-file labels that were set when `reader` was built are preserved.
+    /// No I/O occurs — the already-loaded `Arc<ParquetSource>` handles are
+    /// reused directly.
+    pub fn reader(mut self, reader: Arc<ParquetReader>) -> Self {
+        for (source, labels) in reader.sources_for_composition() {
+            self.entries.push(BuilderEntry::Source(source, labels));
+        }
+        self
+    }
+
+    /// Compose with an existing [`ParquetReader`], merging `extra` labels into
+    /// every series the reader contributes.
+    ///
+    /// If the reader already has labels for a key that `extra` also contains,
+    /// `extra` wins (overrides).
+    pub fn reader_labeled(mut self, reader: Arc<ParquetReader>, extra: impl Into<Labels>) -> Self {
+        let extra = extra.into();
+        for (source, mut existing) in reader.sources_for_composition() {
+            for (k, v) in &extra.inner {
+                existing.inner.insert(k.clone(), v.clone());
+            }
+            self.entries.push(BuilderEntry::Source(source, existing));
+        }
+        self
+    }
+
+    pub fn build(self) -> Result<ParquetReader, Box<dyn Error>> {
+        if self.entries.is_empty() {
+            return Err("ParquetReader requires at least one file".into());
+        }
+        // Resolve filename: explicit > single-path basename > None
+        let filename = self.filename.or_else(|| {
+            if self.entries.len() == 1 {
+                if let BuilderEntry::Path(ref p, _) = self.entries[0] {
+                    return p.file_name().and_then(|n| n.to_str()).map(String::from);
+                }
+            }
+            None
+        });
+        let pool = self.pool;
+        let files: Result<Vec<(Arc<ParquetSource>, Labels)>, Box<dyn Error>> = self
+            .entries
+            .into_iter()
+            .map(|entry| match entry {
+                BuilderEntry::Path(path, labels) => {
+                    let src = match &pool {
+                        Some(p) => ParquetSource::open_with_pool(&path, Arc::clone(p))?,
+                        None => ParquetSource::open(&path)?,
+                    };
+                    Ok((src, labels))
+                }
+                BuilderEntry::Bytes(bytes, labels) => {
+                    let src = match &pool {
+                        Some(p) => ParquetSource::open_bytes_with_pool(bytes, Arc::clone(p))?,
+                        None => ParquetSource::open_bytes(bytes)?,
+                    };
+                    Ok((src, labels))
+                }
+                BuilderEntry::OwnedFile(file, labels) => {
+                    let src = match &pool {
+                        Some(p) => ParquetSource::open_file_with_pool(file, Arc::clone(p))?,
+                        None => ParquetSource::open_file(file)?,
+                    };
+                    Ok((src, labels))
+                }
+                BuilderEntry::Source(source, labels) => Ok((source, labels)),
+            })
+            .collect();
+        let inner = Arc::new(MultiParquetSource { files: files? });
+        let ds: Arc<dyn DataSource> = inner.clone();
+        Ok(ParquetReader {
+            engine: QueryEngine::new(ds),
+            inner,
+            filename,
+        })
+    }
+}
+
+// ─── Multi-file source ────────────────────────────────────────────────────────
+
+struct MultiParquetSource {
+    files: Vec<(Arc<ParquetSource>, Labels)>,
+}
+
+/// Given a file's injected `extra` labels and the query `filter`:
+/// - Returns `None` if `extra` contains a key from `filter` whose value
+///   doesn't satisfy the filter constraint (skip this file entirely).
+/// - Returns the filter with `extra`'s keys removed (since parquet columns
+///   don't carry injected labels; the filter for those keys is already satisfied).
+fn resolve_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
+    if extra.inner.is_empty() {
+        return Some(filter.clone());
+    }
+    // Build a sub-filter containing only keys present in extra.
+    let extra_constrained = Labels {
+        inner: filter
+            .inner
+            .iter()
+            .filter(|(k, _)| extra.inner.contains_key(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    // Check whether extra's values satisfy those constraints.
+    if !extra.matches(&extra_constrained) {
+        return None;
+    }
+    // Return filter with extra's keys stripped (parquet doesn't have them).
+    Some(Labels {
+        inner: filter
+            .inner
+            .iter()
+            .filter(|(k, _)| !extra.inner.contains_key(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    })
+}
+
+impl DataSource for MultiParquetSource {
+    // NOTE: Counter series are naively concatenated across files.
+    // Same (metric, label) pairs in multiple files produce duplicate series.
+    // Label injection via file_labeled() enables filtering on injected keys.
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Counters> {
+        let series: Vec<Counter> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let counters = read_counters(pf, name, &pq_filter, start_ns, end_ns).ok()?;
+                Some((counters.series, extra.clone()))
+            })
+            .flat_map(|(series, extra)| {
+                series.into_iter().map(move |mut c| {
+                    for (k, v) in &extra.inner {
+                        debug_assert!(
+                            !c.labels.inner.contains_key(k),
+                            "injected label key '{}' conflicts with native parquet label",
+                            k
+                        );
+                        c.labels.inner.insert(k.clone(), v.clone());
+                    }
+                    c
+                })
+            })
+            .collect();
+        if series.is_empty() {
+            None
+        } else {
+            Some(Counters { series })
+        }
+    }
+
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        let series: Vec<Gauge> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let gauges = read_gauges(pf, name, &pq_filter, start_ns, end_ns).ok()?;
+                Some((gauges.series, extra.clone()))
+            })
+            .flat_map(|(series, extra)| {
+                series.into_iter().map(move |mut g| {
+                    for (k, v) in &extra.inner {
+                        debug_assert!(
+                            !g.labels.inner.contains_key(k),
+                            "injected label key '{}' conflicts with native parquet label",
+                            k
+                        );
+                        g.labels.inner.insert(k.clone(), v.clone());
+                    }
+                    g
+                })
+            })
+            .collect();
+        if series.is_empty() {
+            None
+        } else {
+            Some(Gauges { series })
+        }
+    }
+
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let streams: Vec<HistogramStream> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let mut stream = pf.histogram_stream(name, &pq_filter, start_ns, end_ns)?;
+                if !extra.inner.is_empty() {
+                    for series_labels in &mut stream.meta.series {
+                        for (k, v) in &extra.inner {
+                            debug_assert!(
+                                !series_labels.inner.contains_key(k),
+                                "injected label key '{}' conflicts with native parquet label",
+                                k
+                            );
+                            series_labels.inner.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Some(stream)
+            })
+            .collect();
+        HistogramStream::merge(streams)
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for (pf, _) in &self.files {
+            out.extend(pf.read_file_metadata());
+        }
+        out
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        // Walk files; last value wins (matches file_metadata() merge semantics).
+        let mut last: Option<String> = None;
+        for (pf, _) in &self.files {
+            if let Some(v) = pf.read_file_metadata_value(key) {
+                last = Some(v);
+            }
+        }
+        last
+    }
+
+    fn interval(&self) -> f64 {
+        self.files
+            .iter()
+            .map(|(pf, _)| pf.sampling_interval_ms as f64 / 1000.0)
+            .fold(f64::MAX, f64::min)
+    }
+
+    fn time_range(&self) -> Option<(u64, u64)> {
+        let (mut lo, mut hi): (Option<u64>, Option<u64>) = (None, None);
+        for (pf, _) in &self.files {
+            if let Some((a, b)) = pf.time_range_from_stats() {
+                lo = Some(lo.map_or(a, |m: u64| m.min(a)));
+                hi = Some(hi.map_or(b, |m: u64| m.max(b)));
+            }
+        }
+        lo.zip(hi)
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Counter) {
+                    names.insert(col.name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Gauge) {
+                    names.insert(col.name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Histogram { .. }) {
+                    names.insert(col.name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Counter) && col.name == name {
+                    let mut labels = col.labels.inner.clone();
+                    for (k, v) in &extra.inner {
+                        labels.insert(k.clone(), v.clone());
+                    }
+                    sets.push(labels);
+                }
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Gauge) && col.name == name {
+                    let mut labels = col.labels.inner.clone();
+                    for (k, v) in &extra.inner {
+                        labels.insert(k.clone(), v.clone());
+                    }
+                    sets.push(labels);
+                }
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Histogram { .. }) && col.name == name {
+                    let mut labels = col.labels.inner.clone();
+                    for (k, v) in &extra.inner {
+                        labels.insert(k.clone(), v.clone());
+                    }
+                    sets.push(labels);
+                }
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        let mut out = std::collections::HashMap::new();
+        for (pf, _) in &self.files {
+            for (metric, cols) in pf.column_map() {
+                out.entry(metric)
+                    .or_insert_with(std::collections::HashMap::new)
+                    .extend(cols);
+            }
+        }
+        out
+    }
+}
+
+// ─── Private file reader ──────────────────────────────────────────────────────
+
+enum ParquetBacking {
+    /// File-backed. We hold the `File` in an `Arc` so that concurrent queries
+    /// against the same source share the file descriptor without duplicating
+    /// it. Reads go through `PositionalFile`'s `ChunkReader` impl, which uses
+    /// positional reads — they do not touch the shared seek offset, so
+    /// concurrent reads cannot interleave-corrupt each other.
+    File(PositionalFile),
+    Bytes(Bytes),
+}
+
+/// Positional read into `file` at byte `offset`. Does not touch the shared
+/// seek offset on Unix (via `pread`) or Windows (via `seek_read`). On other
+/// targets falls back to a non-atomic `seek + read` — those platforms must
+/// avoid concurrent reads on the same file handle.
+fn pread(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f: &File = file;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read(buf)
+    }
+}
+
+/// Wrapper around `Arc<File>` that implements parquet's `ChunkReader` trait
+/// using positional reads. Cloning is cheap (`Arc::clone`). On Unix and
+/// Windows, two readers from different threads can read concurrently without
+/// interfering because positional reads do not advance the file's current
+/// offset.
+#[derive(Clone)]
+pub(crate) struct PositionalFile {
+    inner: Arc<File>,
+    len: u64,
+}
+
+impl PositionalFile {
+    fn new(file: File) -> std::io::Result<Self> {
+        let len = file.metadata()?.len();
+        Ok(Self {
+            inner: Arc::new(file),
+            len,
+        })
+    }
+}
+
+impl parquet::file::reader::Length for PositionalFile {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// `Read` adapter built on `pread` so it does not depend on or modify the
+/// file's seek offset.
+pub(crate) struct PositionalReader {
+    file: Arc<File>,
+    pos: u64,
+    end: u64,
+}
+
+impl std::io::Read for PositionalReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end {
+            return Ok(0);
+        }
+        let remaining = (self.end - self.pos) as usize;
+        let to_read = buf.len().min(remaining);
+        let n = pread(&self.file, &mut buf[..to_read], self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl parquet::file::reader::ChunkReader for PositionalFile {
+    type T = PositionalReader;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(PositionalReader {
+            file: Arc::clone(&self.inner),
+            pos: start,
+            end: self.len,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        let mut buf = vec![0u8; length];
+        let mut read_total = 0usize;
+        // pread can be a partial read; loop until full or EOF.
+        while read_total < length {
+            let n = pread(
+                &self.inner,
+                &mut buf[read_total..],
+                start + read_total as u64,
+            )?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        buf.truncate(read_total);
+        Ok(Bytes::from(buf))
+    }
+}
+
+pub(crate) struct ParquetSource {
+    /// Unique numeric identity assigned at construction; used as the `source_id`
+    /// component of every `CacheKey` produced by this source.
+    id: u64,
+    backing: ParquetBacking,
+    meta: ArrowReaderMetadata,
+    sampling_interval_ms: u64,
+    /// Optional shared buffer pool for decoded row-group blocks.
+    pool: Option<Arc<BufferPool>>,
+}
+
+fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
+    let mut file_metadata: HashMap<String, String> = HashMap::new();
+    if let Some(kv) = meta.metadata().file_metadata().key_value_metadata() {
+        for entry in kv {
+            file_metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+        }
+    }
+    file_metadata
+        .get("sampling_interval_ms")
+        .map(|v| v.parse::<u64>().expect("bad interval"))
+        .unwrap_or(1000)
+}
+
+impl ParquetSource {
+    fn open(path: &Path) -> Result<Arc<Self>, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+        }))
+    }
+
+    fn open_bytes(bytes: Bytes) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::Bytes(bytes),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+        }))
+    }
+
+    fn open_file(file: File) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+        }))
+    }
+
+    fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+        }))
+    }
+
+    fn open_bytes_with_pool(
+        bytes: Bytes,
+        pool: Arc<BufferPool>,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::Bytes(bytes),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+        }))
+    }
+
+    fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+        }))
+    }
+
+    fn build_batch_reader(
+        &self,
+        rg_idx: usize,
+        projection: ProjectionMask,
+    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, Box<dyn Error>> {
+        let reader = match &self.backing {
+            ParquetBacking::File(f) => {
+                // PositionalFile is Clone (Arc), and ChunkReader, so we don't
+                // need (and must not use) try_clone — its positional reads are
+                // concurrency-safe across queries against the same source.
+                ParquetRecordBatchReaderBuilder::new_with_metadata(f.clone(), self.meta.clone())
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(projection)
+                    .build()?
+            }
+            ParquetBacking::Bytes(b) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(b.clone(), self.meta.clone())
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(projection)
+                    .build()?
+            }
+        };
+        Ok(reader)
+    }
+
+    fn read_file_metadata(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        if let Some(kv) = self.meta.metadata().file_metadata().key_value_metadata() {
+            for entry in kv {
+                out.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// Walk key-value metadata entries looking for `key` without building a HashMap.
+    fn read_file_metadata_value(&self, key: &str) -> Option<String> {
+        self.meta
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()?
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.clone().unwrap_or_default())
+    }
+
+    fn time_range_from_stats(&self) -> Option<(u64, u64)> {
+        let ts_col_idx = self.meta.schema().index_of("timestamp").ok()?;
+        let pq_metadata = self.meta.metadata();
+        let mut min_ns: Option<u64> = None;
+        let mut max_ns: Option<u64> = None;
+        for rg_idx in 0..pq_metadata.num_row_groups() {
+            let Some(stats) = pq_metadata
+                .row_group(rg_idx)
+                .column(ts_col_idx)
+                .statistics()
+            else {
+                continue;
+            };
+            if let Statistics::Int64(s) = stats {
+                if let Some(v) = s.min_opt() {
+                    let ts = *v as u64;
+                    min_ns = Some(min_ns.map_or(ts, |m: u64| m.min(ts)));
+                }
+                if let Some(v) = s.max_opt() {
+                    let ts = *v as u64;
+                    max_ns = Some(max_ns.map_or(ts, |m: u64| m.max(ts)));
+                }
+            }
+        }
+        min_ns.zip(max_ns)
+    }
+
+    fn histogram_stream(
+        self: &Arc<Self>,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let ts_col_idx = self.meta.schema().index_of("timestamp").ok()?;
+        let interval_ns = self.sampling_interval_ms * 1_000_000;
+        let num_rgs = self.meta.metadata().num_row_groups();
+
+        let col_descs: Vec<ColDesc> = parse_schema(self, ts_col_idx)
+            .into_iter()
+            .filter(|c| {
+                matches!(c.kind, ColKind::Histogram { .. })
+                    && c.name == name
+                    && (filter.inner.is_empty() || c.labels.matches(filter))
+            })
+            .collect();
+
+        if col_descs.is_empty() {
+            return None;
+        }
+
+        let config = col_descs.iter().find_map(|c| match c.kind {
+            ColKind::Histogram {
+                grouping_power: gp,
+                max_value_power: mvp,
+            } => ::histogram::Config::new(gp, mvp).ok(),
+            _ => None,
+        })?;
+
+        let series: Vec<Labels> = col_descs.iter().map(|c| c.labels.clone()).collect();
+
+        let rg_queue: std::collections::VecDeque<usize> = (0..num_rgs)
+            .filter(|&rg_idx| {
+                !matches!(
+                    rg_classify(
+                        self.meta.metadata().row_group(rg_idx),
+                        ts_col_idx,
+                        start_ns,
+                        end_ns,
+                    ),
+                    RgClass::Before | RgClass::After,
+                )
+            })
+            .collect();
+
+        let cursor = ParquetHistogramCursor {
+            pf: Arc::clone(self),
+            ts_col_idx,
+            interval_ns,
+            start_ns,
+            end_ns,
+            col_descs,
+            rg_queue,
+            pending: std::collections::VecDeque::new(),
+        };
+
+        Some(HistogramStream {
+            meta: HistogramStreamMeta { config, series },
+            rows: Box::new(cursor),
+        })
+    }
+
+    fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+        let ts_col_idx = self
+            .meta
+            .schema()
+            .index_of("timestamp")
+            .unwrap_or(usize::MAX);
+        let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
+        for c in parse_schema(self, ts_col_idx) {
+            out.entry(c.name)
+                .or_default()
+                .insert(c.labels, c.column_name);
+        }
+        out
+    }
+}
+
+// ─── Row group classification ─────────────────────────────────────────────────
+
+enum RgClass {
+    Before,
+    Overlaps,
+    After,
+    Unknown,
+}
+
+fn rg_classify(rg: &RowGroupMetaData, ts_col_idx: usize, start_ns: u64, end_ns: u64) -> RgClass {
+    let Some(stats) = rg.column(ts_col_idx).statistics() else {
+        return RgClass::Unknown;
+    };
+    let Statistics::Int64(s) = stats else {
+        return RgClass::Unknown;
+    };
+    let (Some(rg_min), Some(rg_max)) = (s.min_opt(), s.max_opt()) else {
+        return RgClass::Unknown;
+    };
+    let (rg_min, rg_max) = (*rg_min as u64, *rg_max as u64);
+    if rg_max < start_ns {
+        RgClass::Before
+    } else if rg_min > end_ns {
+        RgClass::After
+    } else {
+        RgClass::Overlaps
+    }
+}
+
+// ─── Schema parsing ───────────────────────────────────────────────────────────
+
+enum ColKind {
+    Counter,
+    Gauge,
+    Histogram {
+        grouping_power: u8,
+        max_value_power: u8,
+    },
+}
+
+struct ColDesc {
+    col_idx: usize,
+    name: String,
+    labels: Labels,
+    column_name: String,
+    kind: ColKind,
+}
+
+fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
+    pf.meta
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(col_idx, field)| {
+            if col_idx == ts_col_idx {
+                return None;
+            }
+            let mut meta = field.metadata().clone();
+            let column_name = field.name().to_string();
+            let name = meta.get("metric").cloned().unwrap_or_else(|| {
+                column_name
+                    .strip_suffix(":buckets")
+                    .unwrap_or(&column_name)
+                    .to_string()
+            });
+            let grouping_power: Option<u8> =
+                meta.remove("grouping_power").and_then(|v| v.parse().ok());
+            let max_value_power: Option<u8> =
+                meta.remove("max_value_power").and_then(|v| v.parse().ok());
+            let mut labels = Labels::default();
+            for (k, v) in meta.iter() {
+                match k.as_str() {
+                    "metric" | "metric_type" | "unit" => continue,
+                    _ => {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            let kind = match field.data_type() {
+                DataType::UInt64 => ColKind::Counter,
+                DataType::Int64 => ColKind::Gauge,
+                DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
+                    let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
+                        return None;
+                    };
+                    ColKind::Histogram {
+                        grouping_power: gp,
+                        max_value_power: mvp,
+                    }
+                }
+                _ => return None,
+            };
+            Some(ColDesc {
+                col_idx,
+                name,
+                labels,
+                column_name,
+                kind,
+            })
+        })
+        .collect()
+}
+
+// ─── Timestamp reader ─────────────────────────────────────────────────────────
+
+fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
+    (ts + interval_ns / 2)
+        .checked_div(interval_ns)
+        .map_or(ts, |q| q * interval_ns)
+}
+
+/// Run a parquet decode block, catching any panic from the parquet crate so a
+/// malformed file (e.g. dictionary pages out of order — apache/arrow-rs has
+/// known panics like "Decoder for dict should have been set") doesn't crash
+/// the server.
+///
+/// Also suppresses the global panic hook (e.g. sentry's panic_handler) for
+/// the duration of the call so deliberate catches don't pollute the error
+/// reporting pipeline. The first call to this function installs a chained
+/// panic hook that defers to the previously-installed hook for all panics
+/// EXCEPT those that occur inside `catch_decode_panic`.
+fn catch_decode_panic<T>(op: impl FnOnce() -> T) -> Result<T, String> {
+    ensure_panic_hook_installed();
+    SUPPRESS_DECODE_PANIC.with(|f| f.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op));
+    SUPPRESS_DECODE_PANIC.with(|f| f.set(false));
+
+    result.map_err(|payload| {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unknown panic payload>".to_string()
+        }
+    })
+}
+
+std::thread_local! {
+    static SUPPRESS_DECODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static PANIC_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+/// Install a panic hook (once per process) that chains on top of whatever
+/// hook is currently active. When a panic fires while a thread has
+/// `SUPPRESS_DECODE_PANIC` set, we skip the upstream hook so the panic
+/// doesn't reach reporters like Sentry. All other panics still propagate
+/// normally.
+fn ensure_panic_hook_installed() {
+    PANIC_HOOK_INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SUPPRESS_DECODE_PANIC.with(|f| f.get()) {
+                // Suppressed: this panic is caught by catch_decode_panic.
+                return;
+            }
+            previous(info);
+        }));
+    });
+}
+
+fn read_timestamps(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    ts_col_idx: usize,
+    interval_ns: u64,
+) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: ts_col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_timestamps(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [ts_col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // BAIL on first error instead of silently retrying via .flatten().
+                        // Returning Err repeatedly without advancing internal state has been
+                        // observed to spin the reader in production. We log and stop reading
+                        // this row group, accepting whatever batches we got so far.
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx = ts_col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting timestamp read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("timestamp column is not UInt64".into())?;
+                out.reserve(arr.len());
+                for v in arr.iter() {
+                    out.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx = ts_col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading timestamps",
+            );
+            return Err(format!(
+                "parquet decode panic reading timestamps (rg={rg_idx}, col={ts_col_idx}): {panic_msg}"
+            )
+            .into());
+        }
+    };
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_timestamps(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+fn read_counter_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_counter_values(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting counter read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("counter column is not UInt64".into())?;
+                out.reserve(arr.len());
+                for v in arr.iter() {
+                    out.push(v); // preserve None so row indexing stays aligned with timestamps
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading counter",
+            );
+            return Err(format!(
+                "parquet decode panic reading counter (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into());
+        }
+    };
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_counter_values(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+fn read_gauge_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<i64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_gauge_values(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<i64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting gauge read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or::<Box<dyn Error>>("gauge column is not Int64".into())?;
+                out.reserve(arr.len());
+                for v in arr.iter() {
+                    out.push(v); // preserve None for row alignment
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading gauge",
+            );
+            return Err(format!(
+                "parquet decode panic reading gauge (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into());
+        }
+    };
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_gauge_values(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+// ─── Counter reader ───────────────────────────────────────────────────────────
+
+fn read_counters(
+    pf: &ParquetSource,
+    name: &str,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Counters, Box<dyn Error>> {
+    let ts_col_idx = pf
+        .meta
+        .schema()
+        .index_of("timestamp")
+        .map_err(|_| "missing timestamp")?;
+    let interval_ns = pf.sampling_interval_ms * 1_000_000;
+    let num_rgs = pf.meta.metadata().num_row_groups();
+
+    let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx)
+        .into_iter()
+        .filter(|c| {
+            matches!(c.kind, ColKind::Counter)
+                && c.name == name
+                && (filter.inner.is_empty() || c.labels.matches(filter))
+        })
+        .collect();
+    if cols.is_empty() {
+        return Ok(Counters { series: vec![] });
+    }
+
+    let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+
+    for rg_idx in 0..num_rgs {
+        match rg_classify(
+            pf.meta.metadata().row_group(rg_idx),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+        ) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
+        for (i, col) in cols.iter().enumerate() {
+            let values = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
+            debug_assert_eq!(
+                values.len(),
+                timestamps.len(),
+                "row count mismatch in row group"
+            );
+            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+                    if *ts >= start_ns && *ts <= end_ns {
+                        ts_acc[i].push(*ts);
+                        val_acc[i].push(*v);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Counters {
+        series: cols
+            .into_iter()
+            .zip(ts_acc)
+            .zip(val_acc)
+            .filter(|((_, ts), _)| !ts.is_empty())
+            .map(|((col, timestamps), values)| Counter {
+                labels: col.labels,
+                timestamps,
+                values,
+            })
+            .collect(),
+    })
+}
+
+// ─── Gauge reader ─────────────────────────────────────────────────────────────
+
+fn read_gauges(
+    pf: &ParquetSource,
+    name: &str,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Gauges, Box<dyn Error>> {
+    let ts_col_idx = pf
+        .meta
+        .schema()
+        .index_of("timestamp")
+        .map_err(|_| "missing timestamp")?;
+    let interval_ns = pf.sampling_interval_ms * 1_000_000;
+    let num_rgs = pf.meta.metadata().num_row_groups();
+
+    let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx)
+        .into_iter()
+        .filter(|c| {
+            matches!(c.kind, ColKind::Gauge)
+                && c.name == name
+                && (filter.inner.is_empty() || c.labels.matches(filter))
+        })
+        .collect();
+    if cols.is_empty() {
+        return Ok(Gauges { series: vec![] });
+    }
+
+    let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut val_acc: Vec<Vec<i64>> = vec![Vec::new(); cols.len()];
+
+    for rg_idx in 0..num_rgs {
+        match rg_classify(
+            pf.meta.metadata().row_group(rg_idx),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+        ) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
+        for (i, col) in cols.iter().enumerate() {
+            let values = read_gauge_values_per_rg(pf, rg_idx, col.col_idx)?;
+            debug_assert_eq!(
+                values.len(),
+                timestamps.len(),
+                "row count mismatch in row group"
+            );
+            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+                    if *ts >= start_ns && *ts <= end_ns {
+                        ts_acc[i].push(*ts);
+                        val_acc[i].push(*v);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Gauges {
+        series: cols
+            .into_iter()
+            .zip(ts_acc)
+            .zip(val_acc)
+            .filter(|((_, ts), _)| !ts.is_empty())
+            .map(|((col, timestamps), values)| Gauge {
+                labels: col.labels,
+                timestamps,
+                values,
+            })
+            .collect(),
+    })
+}
+
+// ─── Histogram cursor ─────────────────────────────────────────────────────────
+
+/// Streams histogram rows from a parquet file one row group at a time.
+/// Assumes row groups appear in chronological timestamp order, which
+/// metriken-exposition guarantees. Rows within each row group are sorted
+/// by (timestamp, series_idx) before being buffered.
+struct ParquetHistogramCursor {
+    pf: Arc<ParquetSource>,
+    ts_col_idx: usize,
+    interval_ns: u64,
+    start_ns: u64,
+    end_ns: u64,
+    /// Pre-filtered histogram columns for this metric, in series-index order.
+    col_descs: Vec<ColDesc>,
+    /// Overlapping row group indices remaining to process.
+    rg_queue: std::collections::VecDeque<usize>,
+    /// Buffered rows from the current row group (sorted, ready to yield).
+    pending: std::collections::VecDeque<HistogramRow>,
+}
+
+impl ParquetHistogramCursor {
+    /// Load the next overlapping row group into `self.pending`.
+    /// Returns false if no more row groups remain.
+    fn fill_next_rg(&mut self) -> bool {
+        while let Some(rg_idx) = self.rg_queue.pop_front() {
+            let Ok(timestamps) =
+                read_timestamps(&self.pf, rg_idx, self.ts_col_idx, self.interval_ns)
+            else {
+                continue;
+            };
+
+            let mut rg_rows: Vec<HistogramRow> = Vec::new();
+
+            for (si, col) in self.col_descs.iter().enumerate() {
+                let ColKind::Histogram { .. } = col.kind else {
+                    continue;
+                };
+
+                let key = CacheKey {
+                    source_id: self.pf.id,
+                    column_idx: col.col_idx,
+                    row_group_idx: rg_idx,
+                };
+
+                let snapshots: Arc<Vec<HistogramSnapshot>> = if let Some(pool) = &self.pf.pool {
+                    if let Some(cached) = pool.get_histogram_snapshots(key) {
+                        cached
+                    } else {
+                        let decoded = Arc::new(self.decode_histogram_column(rg_idx, col.col_idx));
+                        pool.put_histogram_snapshots(key, Arc::clone(&decoded));
+                        decoded
+                    }
+                } else {
+                    Arc::new(self.decode_histogram_column(rg_idx, col.col_idx))
+                };
+
+                for (ts_opt, snap) in timestamps.iter().zip(snapshots.iter()) {
+                    let Some(ts) = ts_opt else {
+                        continue;
+                    };
+                    if *ts < self.start_ns || *ts > self.end_ns {
+                        continue;
+                    }
+                    rg_rows.push(HistogramRow {
+                        series_idx: si,
+                        timestamp: *ts,
+                        snapshot: snap.clone(),
+                    });
+                }
+            }
+
+            if !rg_rows.is_empty() {
+                rg_rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+                self.pending.extend(rg_rows);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Decode all rows for one histogram column in one row group.
+    /// Returns an empty Vec on panic or read error (the streaming operator
+    /// will then see no data for that column in that row group).
+    fn decode_histogram_column(&self, rg_idx: usize, col_idx: usize) -> Vec<HistogramSnapshot> {
+        let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
+        let Ok(reader) = self
+            .pf
+            .build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))
+        else {
+            return Vec::new();
+        };
+
+        let rg_idx_captured = rg_idx;
+        let col_idx_captured = col_idx;
+        let source_id_captured = self.pf.id;
+        let decode_result = catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx = rg_idx_captured,
+                            col_idx = col_idx_captured,
+                            source_id = source_id_captured,
+                            error = %e,
+                            "aborting histogram read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let list = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("histogram column is not List");
+                for value in list.iter() {
+                    let snap = value
+                        .and_then(|lv| {
+                            lv.as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .map(raw_to_sparse_cumulative)
+                        })
+                        .unwrap_or_else(|| HistogramSnapshot {
+                            index: vec![],
+                            count: vec![],
+                        });
+                    out.push(snap);
+                }
+            }
+            out
+        });
+
+        match decode_result {
+            Ok(out) => out,
+            Err(panic_msg) => {
+                tracing::error!(
+                    rg_idx,
+                    col_idx,
+                    source_id = self.pf.id,
+                    panic = %panic_msg,
+                    "parquet decode panic reading histogram; returning empty data for this row group",
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+impl Iterator for ParquetHistogramCursor {
+    type Item = HistogramRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Some(row);
+            }
+            if !self.fill_next_rg() {
+                return None;
+            }
+        }
+    }
+}
+
+// ─── Histogram snapshot helper ────────────────────────────────────────────────
+
+/// Convert a raw bucket array (individual counts per bucket) into a
+/// sparse cumulative prefix-sum snapshot. Only non-zero buckets are stored.
+fn raw_to_sparse_cumulative(arr: &UInt64Array) -> HistogramSnapshot {
+    let mut index = Vec::new();
+    let mut count = Vec::new();
+    let mut running = 0u64;
+    for (i, v) in arr.iter().enumerate() {
+        let v = v.unwrap_or(0);
+        if v > 0 {
+            running = running.saturating_add(v);
+            index.push(i as u32);
+            count.push(running);
+        }
+    }
+    HistogramSnapshot { index, count }
+}

@@ -18,9 +18,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
-use metriken_query::{QueryEngine, Tsdb};
+use metriken_query::ParquetReader;
 
 /// Tracking allocator: delegates to `System` for the actual work and
 /// keeps three running totals on the side.
@@ -190,16 +189,18 @@ fn main() {
 
     println!("loading {path:?}");
     let load = snap();
-    let tsdb = Arc::new(Tsdb::load(&path).expect("load parquet"));
+    let engine = ParquetReader::open(&path).expect("open parquet");
     let after_load = snap();
     println!(
-        "tsdb resident: {} (allocated during load: {})\n",
+        "resident: {} (allocated during open: {})\n",
         fmt_bytes(after_load.current.saturating_sub(load.current)),
         fmt_bytes(after_load.total - load.total),
     );
 
-    let engine = QueryEngine::new(tsdb.clone());
-    let (start, end) = engine.get_time_range();
+    let Some((start, end)) = engine.time_range() else {
+        eprintln!("parquet file has no data");
+        std::process::exit(2);
+    };
     let step = 1.0;
 
     println!("{:<70} {:>14} {:>14}", "query", "peak", "alloc");

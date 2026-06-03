@@ -23,39 +23,34 @@
 //! * `NumberLiteral` — produces a `Built::Scalar`; usable on either
 //!   side of a binary op.
 //! * Parenthesised expressions are unwrapped.
-//!
-//! `histogram_quantiles([qs], metric)` and `histogram_heatmap(metric)`
-//! aren't standard PromQL (array literals / multi-output topology)
-//! and are pre-parsed as raw query strings inside `query_range`
-//! before the AST parser runs.
 
 use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, gauges_avg_over_time, gauges_deriv, gauges_idelta,
-    gauges_step_grid, irate_counters, matrix_matrix_op, matrix_scalar_op, rate_counters, AggOp,
-    BinOp, CounterPairwiseRate, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    aggregate, collect_to_matrix, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp, CounterIrate,
+    CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
+    GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
-use crate::promql::{streaming, MatrixSample, QueryError, QueryResult};
-use crate::tsdb::{Labels, Tsdb};
+use crate::promql::{MatrixSample, QueryError, QueryResult};
+use crate::DataSource;
 
 /// Evaluate `expr` via the streaming pipeline. Returns
 /// `QueryError::Unsupported` for any AST shape the dispatcher doesn't
 /// recognise; this is now the only PromQL evaluator in the engine.
 pub fn try_streaming(
-    tsdb: &Tsdb,
+    source: &dyn DataSource,
     expr: &Expr,
     start: f64,
     end: f64,
     step: f64,
 ) -> Result<QueryResult, QueryError> {
     let ctx = Ctx {
-        tsdb,
+        source,
         start_ns: (start * 1e9) as u64,
         end_ns: (end * 1e9) as u64,
         step_ns: (step * 1e9) as u64,
-        interval_ns: (tsdb.interval() * 1e9) as u64,
+        interval_ns: (source.interval() * 1e9) as u64,
     };
 
     let result = match build(&ctx, expr)? {
@@ -86,7 +81,7 @@ pub fn try_streaming(
 }
 
 struct Ctx<'a> {
-    tsdb: &'a Tsdb,
+    source: &'a dyn DataSource,
     start_ns: u64,
     end_ns: u64,
     step_ns: u64,
@@ -161,9 +156,6 @@ where
         Some(parser::LabelModifier::Exclude(ls)) => GroupBy::Exclude(ls.labels.as_slice()),
     };
 
-    // Aggregating a non-series (e.g. a bare scalar) is well-defined
-    // in PromQL but never useful in real dashboards; reject rather
-    // than maintaining the eager passthrough.
     let Built::Series {
         series: inner_series,
         metric_name_for_error,
@@ -241,10 +233,6 @@ where
         (Built::Scalar(a), Built::Scalar(b)) => {
             Ok(Built::Scalar(op.apply(a, b).unwrap_or(f64::NAN)))
         }
-        // Materialized × anything: histogram_quantile output is a
-        // single ready-made series; mixing it into a binary op is
-        // legal in PromQL but never used in rezolus dashboards.
-        // Reject explicitly rather than hand-rolling the wrapper.
         _ => Err(QueryError::Unsupported(
             "binary op against a histogram_quantile result not supported".to_string(),
         )),
@@ -258,15 +246,10 @@ fn build_call<'a, 'expr>(
 where
     'expr: 'a,
 {
-    // `histogram_quantile(q, metric)` has a different arg shape
-    // (number literal + vector selector) from the windowed-call
-    // family below, so handle it up front.
     if call.func.name == "histogram_quantile" {
         return build_histogram_quantile(ctx, call);
     }
 
-    // Every other recognised function takes a single matrix-selector
-    // argument: `func(metric[range])`.
     let Some(first) = call.args.args.first() else {
         return Err(QueryError::Unsupported(format!(
             "function {} requires arguments",
@@ -286,20 +269,30 @@ where
         .ok_or_else(|| QueryError::ParseError("Matrix selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.vs.matchers.matchers);
     let range_ns = sel.range.as_nanos() as u64;
+    let data_start = ctx.start_ns.saturating_sub(range_ns);
 
     match call.func.name {
         "irate" => {
-            let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-            };
-            let series = irate_counters(
-                collection,
-                &filter,
-                ctx.start_ns,
-                ctx.end_ns,
-                ctx.step_ns,
-                range_ns,
-            );
+            let counters = ctx
+                .source
+                .counters(metric_name, &filter, data_start, ctx.end_ns)
+                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let series: SeriesSet<'a> = counters
+                .series
+                .into_iter()
+                .map(|c| {
+                    let pts: Vec<_> = CounterIrate::new(
+                        &c.timestamps,
+                        &c.values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                    )
+                    .collect();
+                    LabeledSeries::new(c.labels, pts.into_iter())
+                })
+                .collect();
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -307,17 +300,26 @@ where
             })
         }
         "rate" => {
-            let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-            };
-            let series = rate_counters(
-                collection,
-                &filter,
-                ctx.start_ns,
-                ctx.end_ns,
-                ctx.step_ns,
-                range_ns,
-            );
+            let counters = ctx
+                .source
+                .counters(metric_name, &filter, data_start, ctx.end_ns)
+                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let series: SeriesSet<'a> = counters
+                .series
+                .into_iter()
+                .map(|c| {
+                    let pts: Vec<_> = CounterRate::new(
+                        &c.timestamps,
+                        &c.values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                    )
+                    .collect();
+                    LabeledSeries::new(c.labels, pts.into_iter())
+                })
+                .collect();
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -325,17 +327,26 @@ where
             })
         }
         "avg_over_time" => {
-            let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-            };
-            let series = gauges_avg_over_time(
-                collection,
-                &filter,
-                ctx.start_ns,
-                ctx.end_ns,
-                ctx.step_ns,
-                range_ns,
-            );
+            let gauges = ctx
+                .source
+                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let series: SeriesSet<'a> = gauges
+                .series
+                .into_iter()
+                .map(|g| {
+                    let pts: Vec<_> = GaugeAvgOverTime::new(
+                        &g.timestamps,
+                        &g.values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                    )
+                    .collect();
+                    LabeledSeries::new(g.labels, pts.into_iter())
+                })
+                .collect();
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -343,17 +354,26 @@ where
             })
         }
         "idelta" => {
-            let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-            };
-            let series = gauges_idelta(
-                collection,
-                &filter,
-                ctx.start_ns,
-                ctx.end_ns,
-                ctx.step_ns,
-                range_ns,
-            );
+            let gauges = ctx
+                .source
+                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let series: SeriesSet<'a> = gauges
+                .series
+                .into_iter()
+                .map(|g| {
+                    let pts: Vec<_> = GaugeIdelta::new(
+                        &g.timestamps,
+                        &g.values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                    )
+                    .collect();
+                    LabeledSeries::new(g.labels, pts.into_iter())
+                })
+                .collect();
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -361,37 +381,50 @@ where
             })
         }
         "deriv" => {
-            // Gauge: random-access slope over the source slice.
-            // Counter (2nd-derivative case): chain a pair-wise rate
-            // producer into the generic streaming deriv consumer.
-            //
-            // Both paths relabel `__name__` to literally "deriv"
-            // rather than preserving the source metric name —
-            // matching the historical PromQL behaviour.
-            if let Some(collection) = ctx.tsdb.gauges_ref(metric_name) {
-                let series =
-                    gauges_deriv(collection, &filter, ctx.start_ns, ctx.end_ns, ctx.step_ns);
+            // Try gauge path first; fall back to counter 2nd-derivative.
+            let deriv_data_start = ctx.start_ns.saturating_sub(ctx.step_ns.saturating_mul(2));
+            if let Some(gauges) =
+                ctx.source
+                    .gauges(metric_name, &filter, deriv_data_start, ctx.end_ns)
+            {
+                let series: SeriesSet<'a> = gauges
+                    .series
+                    .into_iter()
+                    .map(|g| {
+                        let pts: Vec<_> = GaugeDeriv::new(
+                            &g.timestamps,
+                            &g.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                            ctx.step_ns,
+                        )
+                        .collect();
+                        LabeledSeries::new(g.labels, pts.into_iter())
+                    })
+                    .collect();
                 return Ok(Built::Series {
                     series,
                     metric_name: Some("deriv"),
                     metric_name_for_error: Some(metric_name.to_string()),
                 });
             }
-            let Some(collection) = ctx.tsdb.counters_ref(metric_name) else {
-                return Err(QueryError::MetricNotFound(metric_name.to_string()));
-            };
-            let mut out: SeriesSet<'_> = Vec::new();
-            for (labels, series) in collection.iter() {
-                if !filter.inner.is_empty() && !labels.matches(&filter) {
-                    continue;
-                }
-                let rate_iter = CounterPairwiseRate::new(series.samples(), ctx.end_ns);
-                let deriv_iter =
-                    StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns);
-                out.push(LabeledSeries::new(labels.clone(), deriv_iter));
-            }
+            let counters = ctx
+                .source
+                .counters(metric_name, &filter, deriv_data_start, ctx.end_ns)
+                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let series: SeriesSet<'a> = counters
+                .series
+                .into_iter()
+                .map(|c| {
+                    let rate_iter = CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns);
+                    let pts: Vec<_> =
+                        StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
+                            .collect();
+                    LabeledSeries::new(c.labels, pts.into_iter())
+                })
+                .collect();
             Ok(Built::Series {
-                series: out,
+                series,
                 metric_name: Some("deriv"),
                 metric_name_for_error: Some(metric_name.to_string()),
             })
@@ -403,8 +436,7 @@ where
 }
 
 /// `histogram_quantile(q, metric{matchers})` — single-quantile case
-/// of the histogram quantile pipeline. Output is one `MatrixSample`
-/// labeled `{__name__: metric, quantile: q}`.
+/// of the histogram quantile pipeline.
 fn build_histogram_quantile<'a, 'expr>(
     ctx: &'a Ctx<'a>,
     call: &'expr parser::Call,
@@ -437,18 +469,12 @@ where
         .name
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
-    let Some(collection) = ctx.tsdb.histograms_ref(metric_name) else {
-        return Err(QueryError::MetricNotFound(metric_name.to_string()));
-    };
-    let result = streaming::histogram::quantiles(
-        collection,
-        &Labels::default(),
-        &[quantile],
-        ctx.start_ns,
-        ctx.end_ns,
-        None,
-        metric_name,
-    );
+    let filter = extract_filter_labels(&sel.matchers.matchers);
+    let stream = ctx
+        .source
+        .histogram_stream(metric_name, &filter, ctx.start_ns, ctx.end_ns)
+        .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+    let result = stream.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
     Ok(Built::Materialized {
         result,
         name: format!("No histogram data found for {metric_name}"),
@@ -468,25 +494,30 @@ where
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
 
-    // Bare counter selectors aren't meaningful in PromQL (rate/irate
-    // are required) and aren't streamed; report MetricNotFound so the
-    // error shape matches an outright-missing metric.
-    let Some(collection) = ctx.tsdb.gauges_ref(metric_name) else {
-        return Err(QueryError::MetricNotFound(metric_name.to_string()));
-    };
-
-    // Mirror the historical staleness rule: at least the step size,
-    // but not less than the file's sampling interval.
     let staleness_ns = ctx.step_ns.max(ctx.interval_ns);
+    let data_start = ctx.start_ns.saturating_sub(staleness_ns);
 
-    let series = gauges_step_grid(
-        collection,
-        &filter,
-        ctx.start_ns,
-        ctx.end_ns,
-        ctx.step_ns,
-        staleness_ns,
-    );
+    let gauges = ctx
+        .source
+        .gauges(metric_name, &filter, data_start, ctx.end_ns)
+        .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+
+    let series: SeriesSet<'a> = gauges
+        .series
+        .into_iter()
+        .map(|g| {
+            let pts: Vec<_> = GaugeStepGrid::new(
+                &g.timestamps,
+                &g.values,
+                ctx.start_ns,
+                ctx.end_ns,
+                ctx.step_ns,
+                staleness_ns,
+            )
+            .collect();
+            LabeledSeries::new(g.labels, pts.into_iter())
+        })
+        .collect();
     Ok(Built::Series {
         series,
         metric_name: Some(metric_name),
