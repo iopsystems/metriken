@@ -879,6 +879,7 @@ dependencies = [
 name = "metriken-derive"
 version = "0.5.1"
 dependencies = [
+ "heck",
  "proc-macro-crate",
  "proc-macro2",
  "quote",

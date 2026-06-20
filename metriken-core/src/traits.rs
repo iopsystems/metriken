@@ -81,3 +81,69 @@ pub trait HistogramGroupMetric: Send + Sync + 'static {
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
 }
+
+/// A type that maps to a fixed set of labeled metric slots.
+///
+/// Implement this on enums (or tuples of enums) to drive
+/// `DimensionedCounter`, `DimensionedGauge`, and `DimensionedHistogram`.
+/// Use `#[derive(MetricDimension)]` from `metriken-derive` rather than
+/// implementing this by hand.
+pub trait MetricDimension: Send + Sync + 'static {
+    /// Total number of distinct values (slots in the dense backing array).
+    const COUNT: usize;
+
+    /// Maps this value to an index in `[0, COUNT)`.
+    ///
+    /// # Invariants
+    ///
+    /// The returned index must be in the range `[0, COUNT)`. Implementations
+    /// that return out-of-bounds indices will cause a panic at the call site.
+    fn index(&self) -> usize;
+
+    /// Returns the Prometheus labels for this specific value.
+    fn labels(&self) -> HashMap<String, String>;
+
+    /// Returns labels for every index in order, used to pre-populate
+    /// group metadata so zero-value entries are still exported.
+    ///
+    /// # Invariants
+    ///
+    /// The returned vector must be in index-ascending order: `all_labels()[i]`
+    /// must contain the labels for the value that would return `i` from `index()`.
+    fn all_labels() -> Vec<HashMap<String, String>>;
+}
+
+/// Composite dimension for tuples of two dimensions.
+///
+/// Merges labels from both `A` and `B` dimensions. If both produce labels
+/// with the same key, `B`'s value takes precedence (last-writer-wins).
+/// Users are responsible for ensuring their dimensions use disjoint label key sets.
+impl<A, B> MetricDimension for (A, B)
+where
+    A: MetricDimension,
+    B: MetricDimension,
+{
+    const COUNT: usize = A::COUNT * B::COUNT;
+
+    fn index(&self) -> usize {
+        self.0.index() * B::COUNT + self.1.index()
+    }
+
+    fn labels(&self) -> HashMap<String, String> {
+        let mut map = self.0.labels();
+        map.extend(self.1.labels());
+        map
+    }
+
+    fn all_labels() -> Vec<HashMap<String, String>> {
+        let mut result = Vec::with_capacity(Self::COUNT);
+        for a_labels in A::all_labels() {
+            for b_labels in B::all_labels() {
+                let mut map = a_labels.clone();
+                map.extend(b_labels);
+                result.push(map);
+            }
+        }
+        result
+    }
+}

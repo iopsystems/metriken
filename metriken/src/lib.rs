@@ -70,6 +70,7 @@
 //! [`linkme`]: https://docs.rs/linkme
 
 mod counter;
+pub mod dimensioned;
 mod gauge;
 pub mod group;
 pub mod histogram;
@@ -82,11 +83,12 @@ extern crate self as metriken;
 pub use metriken_core::{
     default_formatter, dynmetrics, metrics, CounterGroupMetric, DynMetricsIter, Format,
     GaugeGroupMetric, HistogramGroupMetric, HistogramMetric, Metadata, MetadataIter, Metric,
-    MetricEntry, Metrics, MetricsIter, Value,
+    MetricDimension, MetricEntry, Metrics, MetricsIter, Value,
 };
-pub use metriken_derive::metric;
+pub use metriken_derive::{metric, MetricDimension};
 
 pub use crate::counter::Counter;
+pub use crate::dimensioned::{DimensionedCounter, DimensionedGauge, DimensionedHistogram};
 #[doc(inline)]
 pub use crate::dynmetrics::{DynBoxedMetric, DynPinnedMetric, MetricBuilder};
 pub use crate::gauge::Gauge;

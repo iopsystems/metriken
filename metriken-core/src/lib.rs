@@ -38,7 +38,7 @@ pub use crate::metadata::{Metadata, MetadataIter};
 pub use crate::metrics::{metrics, DynMetricsIter, Metrics, MetricsIter};
 pub use crate::provide::{request_ref, request_value, Request};
 pub use crate::traits::{
-    CounterGroupMetric, GaugeGroupMetric, HistogramGroupMetric, HistogramMetric,
+    CounterGroupMetric, GaugeGroupMetric, HistogramGroupMetric, HistogramMetric, MetricDimension,
 };
 
 /// Global interface to a metric.

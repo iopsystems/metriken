@@ -5,6 +5,7 @@
 use proc_macro::TokenStream;
 
 mod args;
+mod dimension;
 mod metric;
 
 /// Declare a global metric that can be accessed via the `metrics` method.
@@ -29,4 +30,26 @@ pub fn metric(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
+}
+
+/// Derive `MetricDimension` for a unit enum.
+///
+/// The Prometheus label key is the snake_case of the enum name.
+/// Override it with `#[metric_dimension(name = "custom_key")]` on the enum.
+/// Label values are the snake_case of each variant name.
+///
+/// # Example
+/// ```ignore
+/// #[derive(MetricDimension)]
+/// enum CacheResult { Hit, Miss }
+/// // Generates labels: cache_result="hit", cache_result="miss"
+///
+/// #[derive(MetricDimension)]
+/// #[metric_dimension(name = "result")]
+/// enum Status { Ok, Err }
+/// // Generates labels: result="ok", result="err"
+/// ```
+#[proc_macro_derive(MetricDimension, attributes(metric_dimension))]
+pub fn derive_metric_dimension(item: TokenStream) -> TokenStream {
+    dimension::derive_metric_dimension(item)
 }

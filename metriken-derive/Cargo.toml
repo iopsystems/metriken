@@ -16,6 +16,7 @@ repository = "https://github.com/pelikan-io/rustcommon"
 proc-macro = true
 
 [dependencies]
+heck = "0.5"
 proc-macro2 = "1.0.39"
 proc-macro-crate = "3.0.0"
 quote = "1.0.9"
