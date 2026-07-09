@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.12.0
+
+- Add `MetricsSource::query_range_display` and a `display` module: a
+  range query evaluated at native resolution and then decimated to a
+  bounded point budget for *display*, without losing spikes. Each point
+  is a per-bucket boxplot `EnvPoint { t, min, lo, median, hi, max }` —
+  a robust median line, a hard min/max envelope so a 1-in-N spike
+  survives the downsample, and a configurable inner band (`lo`/`hi` at
+  the `DisplayOptions.band` quantiles, default IQR; the min/max outer
+  band is invariant). Returns a `DisplayResult` (a richer, non-PromQL
+  shape); only `Matrix` results are decimated, heatmap/scalar/vector
+  pass through. The default trait method post-processes `query_range`,
+  so every backend gets it with no per-impl code. Analysis consumers
+  that recompute on the data should keep using `query_range`.
+
 ### metriken-query 0.10.6
 
 - Add `histogram_irate(m)` — per-step rate of a histogram's
