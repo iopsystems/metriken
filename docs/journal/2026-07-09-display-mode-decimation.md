@@ -94,14 +94,34 @@ All in `metriken-query`, branch `feat/display-reducer`:
 workspace fails on a deprecated `histogram::Histogram::percentiles` call in
 `metriken-exposition` (`src/prometheus.rs:168`) — unrelated to this work.
 
-## GO/NO-GO
+## GO/NO-GO — measured GO
 
-This is engine plumbing with no runtime sampler cost. The GO gate is
-**milestone 2's payload measurement**: on a real long recording (e.g. 24h @
-1s), display mode at a ~2–4k budget must cut per-series payload by >10x vs
-native-resolution `query_range` while keeping spikes visible. If the win
-isn't there, the whole envelope response is not worth the consumer
-complexity. Not yet measured — see below.
+Gate: on a real long recording, display mode must cut per-series payload
+substantially vs native `query_range` while keeping spikes visible.
+
+**Measured (2026-07-09)** on a real 24h @ 1s rezolus recording (88,951
+rows/series, native ≈ 3.0 MB/series JSON), single-series queries
+(`memory_free`, `sum(irate(cpu_cycles[1m]))`, `sum(rate(network_bytes[1m]))`):
+
+| budget | points vs native | bytes | reduction | spike (`max`) |
+|--------|------------------|-------|-----------|---------------|
+| 2000   | 44.5× fewer      | ~250 KB | **~12×** | preserved |
+| 1000   | 89× fewer        | ~125 KB | **~24×** | preserved |
+| 500    | 178× fewer       | ~63 KB  | **~48×** | preserved |
+| 250    | 356× fewer       | ~31 KB  | **~96×** | preserved |
+
+GO. Spikes survive at every budget. **Chosen consumer budget: 500** (a
+chart can't render more points than its pixel width anyway; 500 gives ~48×
+on 24h and still a real win on medium recordings).
+
+Caveat measured on a 130-min recording (7,800 rows, native only ~265 KB):
+the win there is modest (budget 2000 → ~1.06× bytes; 500 → ~4.2×) because
+each boxplot point is 6 floats vs a native point's 2, so **byte win ≈
+N / (3.7 · budget)** — the point-count reduction is far larger than the
+byte reduction. The design correctly does little when native is already
+small and a lot when it is large. Optional future optimization: array-encode
+`EnvPoint` as `[t,min,lo,median,hi,max]` to shave ~20–25% of per-point JSON
+key overhead.
 
 ## Milestone 2 — rezolus integration (not started)
 
