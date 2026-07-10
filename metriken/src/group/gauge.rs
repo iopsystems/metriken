@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 
 use super::metadata::GroupMetadata;
+use super::windows::GroupWindows;
 use crate::{GaugeGroupMetric, Metric, Value};
+use metriken_core::Window;
 
 enum Backing {
     Owned(Vec<AtomicI64>),
@@ -45,6 +47,7 @@ impl Backing {
 pub struct GaugeGroup {
     values: OnceLock<Backing>,
     metadata: GroupMetadata,
+    windows: GroupWindows,
     entries: usize,
 }
 
@@ -54,6 +57,7 @@ impl GaugeGroup {
         Self {
             values: OnceLock::new(),
             metadata: GroupMetadata::new(),
+            windows: GroupWindows::new(),
             entries,
         }
     }
@@ -221,6 +225,23 @@ impl GaugeGroup {
     pub fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.metadata.snapshot()
     }
+
+    /// Record the acquisition window for the entry at `idx`.
+    pub fn set_window(&self, idx: usize, begin_ns: u64, end_ns: u64) {
+        if idx < self.entries {
+            self.windows.insert(idx, Window::new(begin_ns, end_ns));
+        }
+    }
+
+    /// Load the acquisition window recorded for the entry at `idx`.
+    pub fn load_window(&self, idx: usize) -> Option<Window> {
+        self.windows.load(idx)
+    }
+
+    /// Snapshot all per-entry acquisition windows.
+    pub fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        self.windows.snapshot()
+    }
 }
 
 impl GaugeGroupMetric for GaugeGroup {
@@ -242,6 +263,14 @@ impl GaugeGroupMetric for GaugeGroup {
 
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.metadata.snapshot()
+    }
+
+    fn load_window(&self, idx: usize) -> Option<Window> {
+        self.windows.load(idx)
+    }
+
+    fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        self.windows.snapshot()
     }
 }
 
@@ -300,6 +329,21 @@ mod tests {
 
         let snap = GROUP.load().unwrap();
         assert_eq!(snap, vec![10, -20, 30]);
+    }
+
+    #[test]
+    fn windows() {
+        use metriken_core::Window;
+        static GROUP: GaugeGroup = GaugeGroup::new(4);
+
+        assert!(GROUP.load_window(0).is_none());
+        GROUP.set_window(0, 1_000, 3_000);
+        assert_eq!(GROUP.load_window(0), Some(Window::new(1_000, 3_000)));
+
+        GROUP.set_window(9, 1, 2); // out of bounds ignored
+        assert!(GROUP.load_window(9).is_none());
+
+        assert_eq!(GROUP.window_snapshot(), vec![(0, Window::new(1_000, 3_000))]);
     }
 
     #[test]
