@@ -570,6 +570,7 @@ mod ingest_tests {
                 name: counter_name.to_string(),
                 value,
                 metadata,
+                window: None,
             }],
             gauges: vec![],
             histograms: vec![],

@@ -2204,6 +2204,7 @@ fn test_memory_store_label_values_ingest() {
                 name: name.to_string(),
                 value,
                 metadata,
+                window: None,
             }],
             gauges: vec![],
             histograms: vec![],
