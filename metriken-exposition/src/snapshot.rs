@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use metriken::Window;
+
 #[cfg(feature = "msgpack")]
 use rmp_serde::encode::Error as SerializeMsgpackError;
 #[cfg(feature = "json")]
@@ -12,6 +14,11 @@ pub struct Counter {
     pub name: String,
     pub value: u64,
     pub metadata: HashMap<String, String>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub window: Option<Window>,
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +27,11 @@ pub struct Gauge {
     pub name: String,
     pub value: i64,
     pub metadata: HashMap<String, String>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub window: Option<Window>,
 }
 
 #[derive(Clone, Debug)]
@@ -28,6 +40,11 @@ pub struct Histogram {
     pub name: String,
     pub value: histogram::Histogram,
     pub metadata: HashMap<String, String>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub window: Option<Window>,
 }
 
 /// Contains a snapshot of metric readings.
@@ -166,6 +183,54 @@ impl From<Snapshot> for HashedSnapshot {
             counters,
             gauges,
             histograms,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "json"))]
+mod window_tests {
+    use super::*;
+    use metriken::Window;
+
+    fn gauge(window: Option<Window>) -> Gauge {
+        Gauge {
+            name: "g".into(),
+            value: 42,
+            metadata: HashMap::new(),
+            window,
+        }
+    }
+
+    #[test]
+    fn window_absent_is_omitted_and_roundtrips() {
+        let json = serde_json::to_string(&gauge(None)).unwrap();
+        assert!(!json.contains("window"), "absent window must be skipped: {json}");
+        let back: Gauge = serde_json::from_str(&json).unwrap();
+        assert!(back.window.is_none());
+    }
+
+    #[test]
+    fn window_present_roundtrips() {
+        let g = gauge(Some(Window::new(100, 250)));
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Gauge = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.window, Some(Window::new(100, 250)));
+    }
+
+    #[test]
+    fn v2_bytes_without_window_still_deserialize() {
+        let old = r#"{"name":"g","value":42,"metadata":{}}"#;
+        let g: Gauge = serde_json::from_str(old).unwrap();
+        assert!(g.window.is_none());
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn window_msgpack_roundtrip() {
+        for w in [None, Some(Window::new(1, 2))] {
+            let bytes = rmp_serde::to_vec(&gauge(w)).unwrap();
+            let back: Gauge = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.window, w);
         }
     }
 }

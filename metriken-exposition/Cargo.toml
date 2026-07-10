@@ -26,7 +26,7 @@ tempfile.workspace = true
 
 [features]
 default = ["parquet-conversion"]
-serde = ["dep:serde", "chrono/serde", "histogram/serde"]
+serde = ["dep:serde", "chrono/serde", "histogram/serde", "metriken/serde"]
 json = ["dep:serde", "dep:serde_json"]
 msgpack = ["dep:serde", "dep:rmp-serde"]
 parquet = ["dep:arrow", "dep:parquet"]

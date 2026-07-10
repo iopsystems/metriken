@@ -82,7 +82,7 @@ extern crate self as metriken;
 pub use metriken_core::{
     default_formatter, dynmetrics, metrics, CounterGroupMetric, DynMetricsIter, Format,
     GaugeGroupMetric, HistogramGroupMetric, HistogramMetric, Metadata, MetadataIter, Metric,
-    MetricEntry, Metrics, MetricsIter, Value,
+    MetricEntry, Metrics, MetricsIter, Value, Window,
 };
 pub use metriken_derive::metric;
 

@@ -92,6 +92,7 @@ impl Snapshotter {
                         name: column_name.clone(),
                         value,
                         metadata: build_metadata(metric),
+                        window: None,
                     });
                 }
                 Some(Value::Gauge(value)) => {
@@ -99,6 +100,7 @@ impl Snapshotter {
                         name: column_name.clone(),
                         value,
                         metadata: build_metadata(metric),
+                        window: None,
                     });
                 }
                 Some(Value::Histogram(h)) => {
@@ -117,6 +119,7 @@ impl Snapshotter {
                             name: column_name.clone(),
                             value: histogram,
                             metadata,
+                            window: None,
                         });
                     }
                 }
@@ -130,6 +133,7 @@ impl Snapshotter {
                                 name: format!("{column_name}x{idx}"),
                                 value,
                                 metadata,
+                                window: None,
                             });
                         }
                     }
@@ -144,6 +148,7 @@ impl Snapshotter {
                                 name: format!("{column_name}x{idx}"),
                                 value,
                                 metadata,
+                                window: None,
                             });
                         }
                     }
@@ -166,6 +171,7 @@ impl Snapshotter {
                                 name: format!("{column_name}x{idx}"),
                                 value: histogram,
                                 metadata,
+                                window: None,
                             });
                         }
                     }
