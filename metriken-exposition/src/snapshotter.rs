@@ -86,24 +86,24 @@ impl Snapshotter {
                 metadata
             };
 
-            match metric.value() {
-                Some(Value::Counter(value)) => {
+            match metric.value_with_window() {
+                (Some(Value::Counter(value)), window) => {
                     counters.push(Counter {
                         name: column_name.clone(),
                         value,
                         metadata: build_metadata(metric),
-                        window: None,
+                        window,
                     });
                 }
-                Some(Value::Gauge(value)) => {
+                (Some(Value::Gauge(value)), window) => {
                     gauges.push(Gauge {
                         name: column_name.clone(),
                         value,
                         metadata: build_metadata(metric),
-                        window: None,
+                        window,
                     });
                 }
-                Some(Value::Histogram(h)) => {
+                (Some(Value::Histogram(h)), window) => {
                     if let Some(histogram) = h.load() {
                         let mut metadata = build_metadata(metric);
                         metadata.insert(
@@ -119,41 +119,44 @@ impl Snapshotter {
                             name: column_name.clone(),
                             value: histogram,
                             metadata,
-                            window: None,
+                            window,
                         });
                     }
                 }
-                Some(Value::CounterGroup(g)) => {
+                (Some(Value::CounterGroup(g)), _) => {
                     let base_metadata = build_metadata(metric);
                     for (idx, entry_meta) in g.metadata_snapshot() {
-                        if let Some(value) = g.counter_value(idx) {
+                        let (value, window) = g.load_with_window(idx);
+                        if let Some(value) = value {
                             let mut metadata = base_metadata.clone();
                             metadata.extend(entry_meta);
                             counters.push(Counter {
                                 name: format!("{column_name}x{idx}"),
                                 value,
                                 metadata,
-                                window: None,
+                                window,
                             });
                         }
                     }
                 }
-                Some(Value::GaugeGroup(g)) => {
+                (Some(Value::GaugeGroup(g)), _) => {
                     let base_metadata = build_metadata(metric);
                     for (idx, entry_meta) in g.metadata_snapshot() {
-                        if let Some(value) = g.gauge_value(idx) {
+                        let (value, window) = g.load_with_window(idx);
+                        if let Some(value) = value {
                             let mut metadata = base_metadata.clone();
                             metadata.extend(entry_meta);
                             gauges.push(Gauge {
                                 name: format!("{column_name}x{idx}"),
                                 value,
                                 metadata,
-                                window: None,
+                                window,
                             });
                         }
                     }
                 }
-                Some(Value::HistogramGroup(g)) => {
+                (Some(Value::HistogramGroup(g)), _) => {
+                    // Out of scope: histogram-group windowing. Windowless, unchanged from today.
                     let base_metadata = build_metadata(metric);
                     for (idx, entry_meta) in g.metadata_snapshot() {
                         if let Some(histogram) = g.load_histogram(idx) {
