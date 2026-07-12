@@ -242,6 +242,52 @@ impl GaugeGroup {
     pub fn window_snapshot(&self) -> Vec<(usize, Window)> {
         self.windows.snapshot()
     }
+
+    /// Set the gauge at `idx` to `value` and record its acquisition window as a
+    /// torn-safe pair.
+    ///
+    /// The value store and the window insert happen under the group's window
+    /// write guard, so a concurrent
+    /// [`load_with_window`](GaugeGroup::load_with_window) never observes a
+    /// value from one call paired with a window from another.
+    ///
+    /// # Torn-safety caveat (base type coexists with lock-free mutators)
+    /// This base group also exposes the lock-free `set`/`add`/`sub`, which
+    /// bypass the window lock. A concurrent lock-free write to the same entry
+    /// can pair a fresh value with a stale window. The **enforced** torn-safe
+    /// path is the [`WindowedGaugeGroup`](crate::WindowedGaugeGroup) wrapper,
+    /// which exposes no lock-free mutator; use it (not the base group) for
+    /// windowed metrics.
+    ///
+    /// Returns `false` if `idx` is out of bounds.
+    pub fn set_with_window(&self, idx: usize, value: i64, window: Window) -> bool {
+        if idx >= self.entries {
+            return false;
+        }
+        let slice = self.get_or_init();
+        self.windows.with_write(|map| {
+            slice[idx].store(value, Ordering::Relaxed);
+            map.insert(idx, window);
+        });
+        true
+    }
+
+    /// Load the gauge at `idx` and its acquisition window as a torn-safe pair.
+    /// The value is `None` if `idx` is out of bounds or the slot has never been
+    /// written (still the `i64::MIN` sentinel).
+    pub fn load_with_window(&self, idx: usize) -> (Option<i64>, Option<Window>) {
+        if idx >= self.entries {
+            return (None, None);
+        }
+        self.windows.with_read(|map| {
+            let value = self.values.get().and_then(|b| {
+                let v = b.as_slice()[idx].load(Ordering::Relaxed);
+                (v != i64::MIN).then_some(v)
+            });
+            let window = map.and_then(|m| m.get(&idx).copied());
+            (value, window)
+        })
+    }
 }
 
 impl GaugeGroupMetric for GaugeGroup {
@@ -271,6 +317,10 @@ impl GaugeGroupMetric for GaugeGroup {
 
     fn window_snapshot(&self) -> Vec<(usize, Window)> {
         self.windows.snapshot()
+    }
+
+    fn load_with_window(&self, idx: usize) -> (Option<i64>, Option<Window>) {
+        GaugeGroup::load_with_window(self, idx)
     }
 }
 
@@ -362,5 +412,29 @@ mod tests {
         GROUP.set(2, 42);
         assert_eq!(GROUP.value(2), Some(42));
         assert_eq!(EXTERNAL[2].load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn set_with_window_round_trip() {
+        use metriken_core::Window;
+        static GROUP: GaugeGroup = GaugeGroup::new(4);
+
+        GROUP.set_with_window(1, -12, Window::new(10, 20));
+        assert_eq!(GROUP.load_with_window(1), (Some(-12), Some(Window::new(10, 20))));
+        assert_eq!(GROUP.value(1), Some(-12));
+        assert_eq!(GROUP.load_with_window(9), (None, None));
+
+        use crate::GaugeGroupMetric;
+        let m: &dyn GaugeGroupMetric = &GROUP;
+        assert_eq!(m.load_with_window(1), (Some(-12), Some(Window::new(10, 20))));
+    }
+
+    #[test]
+    fn load_with_window_unset_does_not_allocate() {
+        static GROUP: GaugeGroup = GaugeGroup::new(2);
+        GROUP.set(0, 7);
+        assert_eq!(GROUP.load_with_window(0), (Some(7), None));
+        assert!(GROUP.load_window(0).is_none());
+        assert!(GROUP.window_snapshot().is_empty(), "no window write must not allocate");
     }
 }

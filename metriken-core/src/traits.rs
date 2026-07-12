@@ -88,6 +88,14 @@ pub trait GaugeGroupMetric: Send + Sync + 'static {
     fn window_snapshot(&self) -> Vec<(usize, Window)> {
         Vec::new()
     }
+
+    /// Load the gauge at `idx` and its acquisition window as a pair.
+    ///
+    /// Default: separate `gauge_value` and `load_window` reads — **not**
+    /// atomic. Windowed groups override this to read the pair under one lock.
+    fn load_with_window(&self, idx: usize) -> (Option<i64>, Option<Window>) {
+        (self.gauge_value(idx), self.load_window(idx))
+    }
 }
 
 /// Trait for a group of histogram metrics with per-entry metadata.
