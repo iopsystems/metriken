@@ -255,7 +255,10 @@ mod tests {
         let (hist, window) = h.load_with_window();
         assert!(hist.is_some());
         assert_eq!(window, Some(Window::new(10, 20)));
-        assert_eq!(<RwLockHistogram as Metric>::load_window(&h), Some(Window::new(10, 20)));
+        assert_eq!(
+            <RwLockHistogram as Metric>::load_window(&h),
+            Some(Window::new(10, 20))
+        );
     }
 
     #[test]

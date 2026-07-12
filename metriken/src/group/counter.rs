@@ -389,7 +389,10 @@ mod tests {
         GROUP.set_window(9, 1, 2); // out of bounds ignored
         assert!(GROUP.load_window(9).is_none());
 
-        assert_eq!(GROUP.window_snapshot(), vec![(0, Window::new(1_000, 3_000))]);
+        assert_eq!(
+            GROUP.window_snapshot(),
+            vec![(0, Window::new(1_000, 3_000))]
+        );
     }
 
     #[test]
@@ -416,7 +419,10 @@ mod tests {
         static GROUP: CounterGroup = CounterGroup::new(4);
 
         GROUP.set_with_window(1, 55, Window::new(10, 20));
-        assert_eq!(GROUP.load_with_window(1), (Some(55), Some(Window::new(10, 20))));
+        assert_eq!(
+            GROUP.load_with_window(1),
+            (Some(55), Some(Window::new(10, 20)))
+        );
         assert_eq!(GROUP.value(1), Some(55));
         assert_eq!(GROUP.load_with_window(9), (None, None));
 
@@ -431,7 +437,10 @@ mod tests {
         GROUP.set(0, 7); // value set, but no window recorded
         assert_eq!(GROUP.load_with_window(0), (Some(7), None));
         assert!(GROUP.load_window(0).is_none());
-        assert!(GROUP.window_snapshot().is_empty(), "no window write must not allocate");
+        assert!(
+            GROUP.window_snapshot().is_empty(),
+            "no window write must not allocate"
+        );
     }
 
     #[test]

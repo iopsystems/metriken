@@ -39,10 +39,7 @@ impl GroupWindows {
     /// Run `f` while holding the read guard if the store has been initialized;
     /// otherwise pass `None` without allocating. Read the paired group value
     /// inside `f` to make the pair atomic.
-    pub(crate) fn with_read<R>(
-        &self,
-        f: impl FnOnce(Option<&HashMap<usize, Window>>) -> R,
-    ) -> R {
+    pub(crate) fn with_read<R>(&self, f: impl FnOnce(Option<&HashMap<usize, Window>>) -> R) -> R {
         match self.inner.get() {
             Some(m) => {
                 let guard = m.read();
@@ -76,7 +73,10 @@ mod tests {
         // with_read must see None (no map) without initializing the OnceLock.
         let seen = w.with_read(|map| map.map(|m| m.len()));
         assert_eq!(seen, None);
-        assert!(w.snapshot().is_empty(), "with_read must not allocate the map");
+        assert!(
+            w.snapshot().is_empty(),
+            "with_read must not allocate the map"
+        );
     }
 
     #[test]

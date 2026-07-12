@@ -26,7 +26,10 @@ fn scalar_counter_window_is_exposed() {
 
 #[test]
 fn counter_group_window_is_exposed() {
-    GROUP.set_metadata(0, std::collections::HashMap::from([("slot".into(), "0".into())]));
+    GROUP.set_metadata(
+        0,
+        std::collections::HashMap::from([("slot".into(), "0".into())]),
+    );
     GROUP.set_with_window(0, 5, Window::new(11, 22));
     let snapshot = SnapshotterBuilder::new().build().snapshot();
     let mut snapshot = snapshot;

@@ -204,7 +204,10 @@ mod window_tests {
     #[test]
     fn window_absent_is_omitted_and_roundtrips() {
         let json = serde_json::to_string(&gauge(None)).unwrap();
-        assert!(!json.contains("window"), "absent window must be skipped: {json}");
+        assert!(
+            !json.contains("window"),
+            "absent window must be skipped: {json}"
+        );
         let back: Gauge = serde_json::from_str(&json).unwrap();
         assert!(back.window.is_none());
     }

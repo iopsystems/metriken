@@ -1,5 +1,7 @@
 use crate::window_cell::WindowCell;
-use crate::{Counter, CounterGroup, Gauge, GaugeGroup, Lazy, LazyCounter, LazyGauge, Metric, Value};
+use crate::{
+    Counter, CounterGroup, Gauge, GaugeGroup, Lazy, LazyCounter, LazyGauge, Metric, Value,
+};
 use metriken_core::Window;
 use std::collections::HashMap;
 
@@ -310,7 +312,6 @@ mod tests {
 
     #[test]
     fn counter_group_round_trip() {
-        use crate::CounterGroupMetric;
         use metriken_core::Window;
 
         let g = WindowedCounterGroup::new(4);
@@ -322,7 +323,10 @@ mod tests {
         assert_eq!(g.load_with_window(9), (None, None));
 
         if let Some(Value::CounterGroup(inner)) = <WindowedCounterGroup as Metric>::value(&g) {
-            assert_eq!(inner.load_with_window(1), (Some(55), Some(Window::new(10, 20))));
+            assert_eq!(
+                inner.load_with_window(1),
+                (Some(55), Some(Window::new(10, 20)))
+            );
         } else {
             panic!("expected Value::CounterGroup");
         }
@@ -375,8 +379,14 @@ mod tests {
         let c = WindowedLazyCounter::new(Counter::new);
         c.set_with_window(42, Window::new(10, 20));
         assert_eq!(c.load_with_window(), (Some(42), Some(Window::new(10, 20))));
-        assert!(matches!(<WindowedLazyCounter as Metric>::value(&c), Some(Value::Counter(42))));
-        assert_eq!(<WindowedLazyCounter as Metric>::load_window(&c), Some(Window::new(10, 20)));
+        assert!(matches!(
+            <WindowedLazyCounter as Metric>::value(&c),
+            Some(Value::Counter(42))
+        ));
+        assert_eq!(
+            <WindowedLazyCounter as Metric>::load_window(&c),
+            Some(Window::new(10, 20))
+        );
     }
 
     #[test]
@@ -455,8 +465,14 @@ mod tests {
     fn gauge_round_trip() {
         let g = WindowedLazyGauge::new(Gauge::new);
         g.set_with_window(-7, Window::new(100, 250));
-        assert_eq!(g.load_with_window(), (Some(-7), Some(Window::new(100, 250))));
-        assert_eq!(<WindowedLazyGauge as Metric>::load_window(&g), Some(Window::new(100, 250)));
+        assert_eq!(
+            g.load_with_window(),
+            (Some(-7), Some(Window::new(100, 250)))
+        );
+        assert_eq!(
+            <WindowedLazyGauge as Metric>::load_window(&g),
+            Some(Window::new(100, 250))
+        );
     }
 
     #[test]
@@ -477,19 +493,24 @@ mod tests {
 
     #[test]
     fn gauge_group_round_trip() {
-        use crate::GaugeGroupMetric;
         use metriken_core::Window;
 
         let g = WindowedGaugeGroup::new(4);
         assert!(g.set_with_window(1, -12, Window::new(10, 20)));
-        assert_eq!(g.load_with_window(1), (Some(-12), Some(Window::new(10, 20))));
+        assert_eq!(
+            g.load_with_window(1),
+            (Some(-12), Some(Window::new(10, 20)))
+        );
         assert_eq!(g.value(1), Some(-12));
         assert_eq!(g.entries(), 4);
         assert!(!g.set_with_window(9, 1, Window::new(1, 2)));
         assert_eq!(g.load_with_window(9), (None, None));
 
         if let Some(Value::GaugeGroup(inner)) = <WindowedGaugeGroup as Metric>::value(&g) {
-            assert_eq!(inner.load_with_window(1), (Some(-12), Some(Window::new(10, 20))));
+            assert_eq!(
+                inner.load_with_window(1),
+                (Some(-12), Some(Window::new(10, 20)))
+            );
         } else {
             panic!("expected Value::GaugeGroup");
         }

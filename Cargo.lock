@@ -873,6 +873,8 @@ dependencies = [
  "linkme",
  "parking_lot",
  "phf",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
