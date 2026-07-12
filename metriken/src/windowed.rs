@@ -1,5 +1,5 @@
 use crate::window_cell::WindowCell;
-use crate::{Counter, Lazy, LazyCounter, Metric, Value};
+use crate::{Counter, Gauge, Lazy, LazyCounter, LazyGauge, Metric, Value};
 use metriken_core::Window;
 
 /// A [`LazyCounter`] paired with a torn-safe acquisition [`Window`].
@@ -73,6 +73,67 @@ impl Metric for WindowedLazyCounter {
         // One WindowCell read-lock acquisition reads both the value (via the
         // inner Lazy's non-forcing Metric::value) and the window, so
         // exposition never pairs a value with a stale window.
+        self.window.with_read(|w| (self.inner.value(), w))
+    }
+}
+
+/// A [`LazyGauge`] paired with a torn-safe acquisition [`Window`].
+///
+/// Signed mirror of [`WindowedLazyCounter`]; the base [`Gauge`] primitive is
+/// left lean and unchanged.
+pub struct WindowedLazyGauge {
+    inner: LazyGauge,
+    window: WindowCell,
+}
+
+impl WindowedLazyGauge {
+    /// Create a windowed lazy gauge whose inner gauge is produced by `f` on
+    /// first write (mirrors [`LazyGauge::new`]).
+    pub const fn new(f: fn() -> Gauge) -> Self {
+        Self {
+            inner: LazyGauge::new(f),
+            window: WindowCell::new(),
+        }
+    }
+
+    /// Set the value and its acquisition window as a torn-safe pair.
+    ///
+    /// Torn-safety is **enforced** by this type: it exposes no lock-free
+    /// mutator and does not `Deref` to the inner gauge, so a windowless write
+    /// is unrepresentable and cannot bypass the window lock.
+    pub fn set_with_window(&self, value: i64, window: Window) {
+        self.window.with_write(|w| {
+            self.inner.set(value);
+            *w = Some(window);
+        });
+    }
+
+    /// Load the value and its acquisition window as a torn-safe pair. The
+    /// value is `None` while the inner lazy gauge has never been written.
+    pub fn load_with_window(&self) -> (Option<i64>, Option<Window>) {
+        self.window
+            .with_read(|w| (Lazy::get(&self.inner).map(|g| g.value()), w))
+    }
+}
+
+impl Metric for WindowedLazyGauge {
+    fn is_enabled(&self) -> bool {
+        self.inner.is_enabled()
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.as_any()
+    }
+
+    fn value(&self) -> Option<Value<'_>> {
+        self.inner.value()
+    }
+
+    fn load_window(&self) -> Option<Window> {
+        self.window.load()
+    }
+
+    fn value_with_window(&self) -> (Option<Value<'_>>, Option<Window>) {
         self.window.with_read(|w| (self.inner.value(), w))
     }
 }
@@ -164,5 +225,29 @@ mod tests {
         };
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn gauge_round_trip() {
+        let g = WindowedLazyGauge::new(Gauge::new);
+        g.set_with_window(-7, Window::new(100, 250));
+        assert_eq!(g.load_with_window(), (Some(-7), Some(Window::new(100, 250))));
+        assert_eq!(<WindowedLazyGauge as Metric>::load_window(&g), Some(Window::new(100, 250)));
+    }
+
+    #[test]
+    fn gauge_unset_window_is_none() {
+        let g = WindowedLazyGauge::new(Gauge::new);
+        assert_eq!(g.load_with_window(), (None, None));
+        assert!(<WindowedLazyGauge as Metric>::load_window(&g).is_none());
+    }
+
+    #[test]
+    fn gauge_value_with_window_pairs_atomically() {
+        let g = WindowedLazyGauge::new(Gauge::new);
+        g.set_with_window(-7, Window::new(100, 250));
+        let (value, window) = <WindowedLazyGauge as Metric>::value_with_window(&g);
+        assert!(matches!(value, Some(Value::Gauge(-7))));
+        assert_eq!(window, Some(Window::new(100, 250)));
     }
 }
