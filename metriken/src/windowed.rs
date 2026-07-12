@@ -1,6 +1,7 @@
 use crate::window_cell::WindowCell;
-use crate::{Counter, Gauge, Lazy, LazyCounter, LazyGauge, Metric, Value};
+use crate::{Counter, CounterGroup, Gauge, Lazy, LazyCounter, LazyGauge, Metric, Value};
 use metriken_core::Window;
+use std::collections::HashMap;
 
 /// A [`LazyCounter`] paired with a torn-safe acquisition [`Window`].
 ///
@@ -138,6 +139,91 @@ impl Metric for WindowedLazyGauge {
     }
 }
 
+/// A [`CounterGroup`] restricted to torn-safe windowed access.
+///
+/// Holds an inner base [`CounterGroup`] and exposes **only** the windowed
+/// writer/reader ([`set_with_window`]/[`load_with_window`]), the lock-free
+/// read accessors, and metadata — **not** the base group's lock-free mutators
+/// (`set`/`add`/`increment`). Because no lock-free mutator is reachable, a
+/// windowless write is unrepresentable and torn-safety is enforced by the
+/// type. The window store and the atomic `(value, window)` pairing live on the
+/// inner base group (Phase-1 `GroupWindows` lock); this wrapper only narrows
+/// the API.
+///
+/// [`set_with_window`]: WindowedCounterGroup::set_with_window
+/// [`load_with_window`]: WindowedCounterGroup::load_with_window
+pub struct WindowedCounterGroup {
+    inner: CounterGroup,
+}
+
+impl WindowedCounterGroup {
+    /// Create a windowed counter group with the given number of entries.
+    pub const fn new(entries: usize) -> Self {
+        Self {
+            inner: CounterGroup::new(entries),
+        }
+    }
+
+    /// Return the number of entries in this group.
+    pub fn entries(&self) -> usize {
+        self.inner.entries()
+    }
+
+    /// Set the counter at `idx` to `value` and record its acquisition window
+    /// as a torn-safe pair. Returns `false` if `idx` is out of bounds.
+    pub fn set_with_window(&self, idx: usize, value: u64, window: Window) -> bool {
+        self.inner.set_with_window(idx, value, window)
+    }
+
+    /// Load the counter at `idx` and its acquisition window as a torn-safe
+    /// pair. Returns `(None, None)` if `idx` is out of bounds.
+    pub fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
+        self.inner.load_with_window(idx)
+    }
+
+    /// Load the current value of the counter at `idx`.
+    pub fn value(&self, idx: usize) -> Option<u64> {
+        self.inner.value(idx)
+    }
+
+    /// Set metadata for the entry at `idx`.
+    pub fn set_metadata(&self, idx: usize, metadata: HashMap<String, String>) {
+        self.inner.set_metadata(idx, metadata)
+    }
+
+    /// Set a single metadata key-value pair for the entry at `idx`.
+    pub fn insert_metadata(&self, idx: usize, key: String, value: String) {
+        self.inner.insert_metadata(idx, key, value)
+    }
+
+    /// Load metadata for the entry at `idx`.
+    pub fn load_metadata(&self, idx: usize) -> Option<HashMap<String, String>> {
+        self.inner.load_metadata(idx)
+    }
+
+    /// Snapshot all metadata.
+    pub fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
+        self.inner.metadata_snapshot()
+    }
+
+    /// Remove metadata for the entry at `idx`.
+    pub fn clear_metadata(&self, idx: usize) {
+        self.inner.clear_metadata(idx)
+    }
+}
+
+impl Metric for WindowedCounterGroup {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn value(&self) -> Option<Value<'_>> {
+        // Expose the inner base group, whose `CounterGroupMetric` impl provides
+        // the atomic `load_with_window(idx)` the exposition snapshotter calls.
+        Some(Value::CounterGroup(&self.inner))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +231,68 @@ mod tests {
     use metriken_core::Window;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn counter_group_round_trip() {
+        use crate::CounterGroupMetric;
+        use metriken_core::Window;
+
+        let g = WindowedCounterGroup::new(4);
+        assert!(g.set_with_window(1, 55, Window::new(10, 20)));
+        assert_eq!(g.load_with_window(1), (Some(55), Some(Window::new(10, 20))));
+        assert_eq!(g.value(1), Some(55));
+        assert_eq!(g.entries(), 4);
+        assert!(!g.set_with_window(9, 1, Window::new(1, 2)));
+        assert_eq!(g.load_with_window(9), (None, None));
+
+        if let Some(Value::CounterGroup(inner)) = <WindowedCounterGroup as Metric>::value(&g) {
+            assert_eq!(inner.load_with_window(1), (Some(55), Some(Window::new(10, 20))));
+        } else {
+            panic!("expected Value::CounterGroup");
+        }
+    }
+
+    #[test]
+    fn counter_group_metadata_round_trips() {
+        let g = WindowedCounterGroup::new(2);
+        g.insert_metadata(0, "cpu".into(), "0".into());
+        assert_eq!(g.load_metadata(0).unwrap().get("cpu").unwrap(), "0");
+        assert_eq!(g.metadata_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn counter_group_torn_read_stress() {
+        use metriken_core::Window;
+        use std::sync::Arc;
+        use std::thread;
+
+        const ITERS: u64 = 200_000;
+        let g = Arc::new(WindowedCounterGroup::new(1));
+        g.set_with_window(0, 0, Window::new(0, 1));
+
+        let writer = {
+            let g = g.clone();
+            thread::spawn(move || {
+                for v in 1..ITERS {
+                    g.set_with_window(0, v, Window::new(v, v + 1));
+                }
+            })
+        };
+        let reader = {
+            let g = g.clone();
+            thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let (v, w) = g.load_with_window(0);
+                    if let (Some(v), Some(w)) = (v, w) {
+                        assert_eq!(w.begin_ns, v, "torn read: value {v} paired with {w:?}");
+                        assert_eq!(w.end_ns, v + 1, "torn read: value {v} paired with {w:?}");
+                    }
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
 
     #[test]
     fn round_trip() {
