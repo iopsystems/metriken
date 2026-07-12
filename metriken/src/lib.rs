@@ -75,6 +75,7 @@ pub mod group;
 pub mod histogram;
 mod lazy;
 mod sharded;
+mod window_cell;
 
 extern crate self as metriken;
 
