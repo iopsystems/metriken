@@ -175,6 +175,14 @@ impl<M: Metric> Metric for ProviderMetric<M> {
         self.metric.value()
     }
 
+    fn load_window(&self) -> Option<crate::Window> {
+        self.metric.load_window()
+    }
+
+    fn value_with_window(&self) -> (Option<crate::Value<'_>>, Option<crate::Window>) {
+        self.metric.value_with_window()
+    }
+
     fn provide<'a>(&'a self, request: &mut crate::Request<'a>) {
         self.provider.provide(request);
         self.metric.provide(request);
