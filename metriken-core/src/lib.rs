@@ -69,6 +69,31 @@ pub trait Metric: Send + Sync + 'static {
     /// [`as_any`](crate::Metric::as_any) to specifically handle your metric.
     fn value(&self) -> Option<Value<'_>>;
 
+    /// Get this metric's acquisition window, if one has been recorded.
+    ///
+    /// The acquisition window is the interval over which the metric's value
+    /// was read. Default: `None` — most metrics do not record a window. The
+    /// windowed scalar wrappers (`WindowedLazyCounter`, `WindowedLazyGauge`)
+    /// and the base `RwLockHistogram` override this to return the window
+    /// recorded by `set_with_window`.
+    fn load_window(&self) -> Option<Window> {
+        None
+    }
+
+    /// Get this metric's value and its acquisition window as a torn-safe pair.
+    ///
+    /// Consumers that need a self-consistent `(value, window)` pair (such as
+    /// exposition) must call this instead of pairing separate `value()` and
+    /// `load_window()` reads, which can tear under a concurrent
+    /// `set_with_window`. Default: `(self.value(), None)`. The windowed scalar
+    /// wrappers (`WindowedLazyCounter`, `WindowedLazyGauge`) and the base
+    /// `RwLockHistogram` override this to read both the value and the window
+    /// under a single acquisition of their window lock, so the pair is never
+    /// torn.
+    fn value_with_window(&self) -> (Option<Value<'_>>, Option<Window>) {
+        (self.value(), None)
+    }
+
     /// Provides type based access to context.
     ///
     /// This can be used in conjunction with [`Request::provide_value`] and
