@@ -47,6 +47,15 @@ pub trait CounterGroupMetric: Send + Sync + 'static {
     fn window_snapshot(&self) -> Vec<(usize, Window)> {
         Vec::new()
     }
+
+    /// Load the counter at `idx` and its acquisition window as a pair.
+    ///
+    /// Default: separate `counter_value` and `load_window` reads — **not**
+    /// atomic. Windowed groups override this to read the pair under one lock so
+    /// exposition never sees a torn `(value, window)` pair.
+    fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
+        (self.counter_value(idx), self.load_window(idx))
+    }
 }
 
 /// Trait for a group of gauge metrics with per-entry metadata.
