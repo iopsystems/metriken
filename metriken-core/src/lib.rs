@@ -143,6 +143,7 @@ pub struct MetricEntry {
     metric: *const dyn Metric,
     name: Cow<'static, str>,
     description: Option<Cow<'static, str>>,
+    module: Cow<'static, str>,
 }
 
 impl MetricEntry {
@@ -154,6 +155,12 @@ impl MetricEntry {
     /// Get the name of this metric.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Get the module path where this metric was defined (`module_path!()` at
+    /// the `#[metric]` definition site).
+    pub fn module(&self) -> &str {
+        &self.module
     }
 
     /// Get the description of this metric.
@@ -257,6 +264,7 @@ pub mod export {
         metric: &'static dyn Metric,
         name: &'static str,
         description: Option<&'static str>,
+        module: &'static str,
     ) -> crate::MetricEntry {
         use std::borrow::Cow;
 
@@ -267,6 +275,7 @@ pub mod export {
                 Some(desc) => Some(Cow::Borrowed(desc)),
                 None => None,
             },
+            module: Cow::Borrowed(module),
         }
     }
 
@@ -282,6 +291,7 @@ macro_rules! declare_metric_v1 {
         metric: $metric:expr,
         name: $name:expr,
         description: $description:expr,
+        module: $module:expr,
         metadata: { $( $key:expr => $value:expr ),* $(,)? },
         formatter: $formatter:expr $(,)?
     } => {
@@ -310,6 +320,7 @@ macro_rules! declare_metric_v1 {
                 $crate::export::MetricWrapper::<_, MetricProvider>::from_ref(&$metric),
                 $name,
                 $description,
+                $module,
             );
         };
     }

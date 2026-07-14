@@ -127,6 +127,7 @@ impl MetricBuilder {
             metric: &NullMetric,
             name: self.name,
             description: self.desc,
+            module: Cow::Borrowed(""),
         };
 
         (metric, entry)
