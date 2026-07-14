@@ -36,6 +36,7 @@
 //! ```
 
 pub(crate) mod buffer_pool;
+pub mod display;
 pub(crate) mod histogram_stream;
 pub(crate) mod labels;
 pub(crate) mod memory;
@@ -48,6 +49,7 @@ pub(crate) mod types;
 pub mod fixtures;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
+pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
@@ -119,6 +121,61 @@ pub trait MetricsSource: Send + Sync {
         end_s: f64,
         step_s: f64,
     ) -> Result<QueryResult, QueryError>;
+
+    /// Execute a PromQL range query in *display* mode: evaluate at native
+    /// resolution (`step_s`), then decimate each result series per `opts`
+    /// (see [`DisplayOptions`]) into per-bucket boxplots — a robust median
+    /// line, a configurable inner band, and a hard min/max envelope so
+    /// short-lived spikes survive the downsample.
+    ///
+    /// Only `Matrix` results are decimated (into `Series`); heatmap, scalar,
+    /// and vector results pass through unchanged. `opts.budget == 0` disables
+    /// decimation (full resolution). Analysis consumers that recompute on the
+    /// data should call [`query_range`](Self::query_range) instead — the
+    /// envelope is lossy for anything but display.
+    ///
+    /// The default implementation post-processes [`query_range`](Self::query_range),
+    /// so it works for every backend without per-impl code. (A future
+    /// engine-level optimization could decimate before materializing the full
+    /// matrix, saving memory on long recordings.)
+    fn query_range_display(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &DisplayOptions,
+    ) -> Result<DisplayResult, QueryError> {
+        match self.query_range(expr, start_s, end_s, step_s)? {
+            QueryResult::Matrix { result } => {
+                let series = result
+                    .into_iter()
+                    .map(|s| {
+                        let raw_points = s.values.len() as u64;
+                        let points = opts.reducer.reduce(&s.values, opts.budget, opts.band);
+                        DisplaySeries {
+                            decimated: (points.len() as u64) < raw_points,
+                            metric: s.metric,
+                            points,
+                            native_interval: step_s,
+                            raw_points,
+                            reducer: opts.reducer,
+                            band: opts.band,
+                        }
+                    })
+                    .collect();
+                Ok(DisplayResult::Series {
+                    result: series,
+                    budget: opts.budget as u32,
+                })
+            }
+            QueryResult::HistogramHeatmap { result } => {
+                Ok(DisplayResult::HistogramHeatmap { result })
+            }
+            QueryResult::Scalar { result } => Ok(DisplayResult::Scalar { result }),
+            QueryResult::Vector { result } => Ok(DisplayResult::Vector { result }),
+        }
+    }
 
     /// Execute an instant PromQL query at a single timestamp (uses the latest
     /// available timestamp when `time` is `None`).

@@ -613,4 +613,112 @@ mod ingest_tests {
         let labels = store.counter_labels("cpu_cycles");
         assert_eq!(labels.len(), 2);
     }
+
+    fn make_gauge_snap(ts: SystemTime, name: &str, value: i64) -> metriken_exposition::Snapshot {
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("metric".to_string(), name.to_string());
+        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+            systemtime: ts,
+            duration: Duration::from_secs(0),
+            metadata: HashMap::new(),
+            counters: vec![],
+            gauges: vec![metriken_exposition::Gauge {
+                name: name.to_string(),
+                value,
+                metadata,
+            }],
+            histograms: vec![],
+        })
+    }
+
+    // Ingest a gauge with `n` 1s samples that are flat at `base` except for a
+    // single spike to `spike` in the middle.
+    fn store_with_spiky_gauge(n: u64, base: i64, spike: i64) -> (crate::MemoryStore, u64, u64) {
+        use crate::MetricsSource;
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let start = 1000;
+        for i in 0..n {
+            let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(start + i);
+            let v = if i == n / 2 { spike } else { base };
+            store.ingest_snapshot(make_gauge_snap(ts, "load", v));
+        }
+        let _ = store.interval();
+        (store, start, start + n - 1)
+    }
+
+    #[test]
+    fn query_range_display_decimates_matrix_and_preserves_spike() {
+        use crate::{DisplayOptions, DisplayResult, MetricsSource, Reducer};
+        let (store, lo, hi) = store_with_spiky_gauge(200, 10, 1000);
+
+        let opts = DisplayOptions {
+            budget: 10,
+            ..Default::default()
+        };
+        let result = store
+            .query_range_display("load", lo as f64, hi as f64, 1.0, &opts)
+            .unwrap();
+
+        match result {
+            DisplayResult::Series { result, budget } => {
+                assert_eq!(budget, 10);
+                assert_eq!(result.len(), 1, "one series");
+                let s = &result[0];
+                assert!(
+                    s.points.len() <= 10,
+                    "bounded by budget: {}",
+                    s.points.len()
+                );
+                assert_eq!(s.raw_points, 200, "raw sample count recorded");
+                assert!(s.decimated, "200 samples -> 10 budget is a downsample");
+                assert_eq!(s.native_interval, 1.0);
+                assert_eq!(s.reducer, Reducer::Boxplot);
+                assert_eq!(s.band, [0.25, 0.75], "default inner band is IQR");
+                let max_max = s.points.iter().map(|p| p.max).fold(f64::MIN, f64::max);
+                assert_eq!(max_max, 1000.0, "spike survives in max");
+                // The spike (1 in 200) never moves a bucket median off baseline.
+                for p in &s.points {
+                    assert_eq!(p.median, 10.0, "median robust to the spike");
+                    assert!(p.min <= p.lo && p.lo <= p.median);
+                    assert!(p.median <= p.hi && p.hi <= p.max);
+                }
+            }
+            other => panic!("expected Series, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_range_display_is_identity_when_under_budget() {
+        use crate::{DisplayOptions, DisplayResult, MetricsSource};
+        let (store, lo, hi) = store_with_spiky_gauge(50, 10, 1000);
+
+        let opts = DisplayOptions {
+            budget: 5000,
+            ..Default::default()
+        };
+        let result = store
+            .query_range_display("load", lo as f64, hi as f64, 1.0, &opts)
+            .unwrap();
+
+        match result {
+            DisplayResult::Series { result, .. } => {
+                let s = &result[0];
+                assert!(
+                    !s.decimated,
+                    "50 samples under a 5000 budget is not decimated"
+                );
+                assert_eq!(s.points.len() as u64, s.raw_points);
+                for p in &s.points {
+                    // Identity: the boxplot of a single sample collapses.
+                    assert_eq!((p.min, p.lo, p.median, p.hi, p.max), {
+                        let v = p.median;
+                        (v, v, v, v, v)
+                    });
+                }
+            }
+            other => panic!("expected Series, got {other:?}"),
+        }
+    }
 }
