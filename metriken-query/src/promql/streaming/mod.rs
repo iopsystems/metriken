@@ -135,10 +135,23 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
     streaming
         .into_iter()
         .filter_map(|ls| {
-            let values: Vec<(f64, f64)> = ls.iter.map(|p| (p.t as f64 / 1e9, p.v)).collect();
-            if values.is_empty() {
+            #[allow(clippy::type_complexity)]
+            let points: Vec<((f64, f64), Option<(f64, f64)>)> = ls
+                .iter
+                .map(|p| ((p.t as f64 / 1e9, p.v), p.bounds))
+                .collect();
+            if points.is_empty() {
                 return None;
             }
+            let values: Vec<(f64, f64)> = points.iter().map(|(v, _)| *v).collect();
+            // Rate output is uniform (all points have bounds, or none do). Emit
+            // intervals only when every point carries one; else None (leaf-only:
+            // any operator upstream produced bounds-less points).
+            let intervals: Option<Vec<(f64, f64)>> = if points.iter().all(|(_, b)| b.is_some()) {
+                Some(points.iter().map(|(_, b)| b.unwrap()).collect())
+            } else {
+                None
+            };
             let mut metric: HashMap<String, String> = HashMap::new();
             if let Some(name) = metric_name {
                 metric.insert("__name__".to_string(), name.to_string());
@@ -146,7 +159,11 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
             for (k, v) in ls.labels.inner.iter() {
                 metric.insert(k.clone(), v.clone());
             }
-            Some(MatrixSample { metric, values })
+            Some(MatrixSample {
+                metric,
+                values,
+                intervals,
+            })
         })
         .collect()
 }

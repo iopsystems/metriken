@@ -536,3 +536,74 @@ fn counter_carries_reconstructed_windows() {
         ])
     );
 }
+
+#[test]
+fn rate_query_carries_intervals_leaf_only() {
+    use arrow::array::{Int64Array, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::collections::HashMap;
+
+    let ts = Field::new("timestamp", DataType::UInt64, false);
+    let counter = Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+        ("metric".to_string(), "cpu_cycles".to_string()),
+        ("metric_type".to_string(), "counter".to_string()),
+    ]));
+    let wbegin = Field::new("cpu_cycles:window_begin", DataType::Int64, true);
+    let wwidth = Field::new("cpu_cycles:window_width", DataType::UInt64, true);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![ts, counter, wbegin, wwidth],
+        HashMap::from([
+            ("source".to_string(), "rezolus".to_string()),
+            ("sampling_interval_ms".to_string(), "1000".to_string()),
+        ]),
+    ));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000u64])),
+            Arc::new(UInt64Array::from(vec![Some(100u64), Some(400u64)])),
+            Arc::new(Int64Array::from(vec![
+                Some(-50_000_000i64),
+                Some(-40_000_000i64),
+            ])),
+            Arc::new(UInt64Array::from(vec![
+                Some(30_000_000u64),
+                Some(20_000_000u64),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    let reader = ParquetReader::open_bytes(bytes).unwrap();
+    let (s, e) = reader.time_range().unwrap();
+
+    // Bare rate → intervals present.
+    let r = reader.query_range("rate(cpu_cycles[1m])", s, e + 1.0, 1.0).unwrap();
+    match r {
+        QueryResult::Matrix { result } => {
+            assert!(!result.is_empty());
+            assert!(result[0].intervals.is_some(), "bare rate should carry intervals");
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+
+    // Scalar op → intervals dropped (leaf-only).
+    let r2 = reader.query_range("rate(cpu_cycles[1m]) * 60", s, e + 1.0, 1.0).unwrap();
+    match r2 {
+        QueryResult::Matrix { result } => {
+            assert!(!result.is_empty());
+            assert!(result[0].intervals.is_none(), "operator must drop intervals (leaf-only)");
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+}

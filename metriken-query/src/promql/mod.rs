@@ -35,6 +35,8 @@ pub enum QueryError {
 pub struct Sample {
     pub metric: HashMap<String, String>,
     pub value: (f64, f64), // (timestamp_seconds, value)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<(f64, f64)>,
 }
 
 /// A matrix sample with multiple values over time
@@ -42,6 +44,8 @@ pub struct Sample {
 pub struct MatrixSample {
     pub metric: HashMap<String, String>,
     pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervals: Option<Vec<(f64, f64)>>,
 }
 
 /// Histogram heatmap data for visualization
@@ -388,8 +392,9 @@ impl QueryEngine {
             .into_iter()
             .filter_map(|s| {
                 s.values.last().copied().map(|value| Sample {
-                    metric: s.metric,
+                    metric: s.metric.clone(),
                     value,
+                    interval: s.intervals.as_ref().and_then(|iv| iv.last().copied()),
                 })
             })
             .collect();

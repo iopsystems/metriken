@@ -313,7 +313,11 @@ fn quantiles_impl(
         let mut metric: HashMap<String, String> = HashMap::new();
         metric.insert("__name__".to_string(), metric_name.to_string());
         metric.insert("quantile".to_string(), q.to_string());
-        samples.push(MatrixSample { metric, values });
+        samples.push(MatrixSample {
+            metric,
+            values,
+            intervals: None,
+        });
     }
     samples
 }
@@ -831,7 +835,11 @@ fn build_grouped_output(
         for (k, v) in key.inner {
             metric.insert(k, v);
         }
-        samples.push(MatrixSample { metric, values });
+        samples.push(MatrixSample {
+            metric,
+            values,
+            intervals: None,
+        });
     }
     samples
 }
