@@ -4,12 +4,24 @@ pub struct Counter {
     pub labels: Labels,
     pub timestamps: Vec<u64>,
     pub values: Vec<u64>,
+    /// Per-sample reconstructed acquisition windows `[begin_ns, end_ns]`, aligned
+    /// with `timestamps`/`values`. `None` when the source carried no `:window_*`
+    /// sidecar columns for this metric. Populated by the parquet reader; consumed
+    /// by a later phase (rate/increase error bars), hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub windows: Option<Vec<(u64, u64)>>,
 }
 
 pub struct Gauge {
     pub labels: Labels,
     pub timestamps: Vec<u64>,
     pub values: Vec<i64>,
+    /// Per-sample reconstructed acquisition windows `[begin_ns, end_ns]`, aligned
+    /// with `timestamps`/`values`. `None` when the source carried no `:window_*`
+    /// sidecar columns for this metric. Populated by the parquet reader; consumed
+    /// by a later phase (rate/increase error bars), hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub windows: Option<Vec<(u64, u64)>>,
 }
 
 /// Raw cumulative sparse prefix-sum snapshot for one histogram sample.

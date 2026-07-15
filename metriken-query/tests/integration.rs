@@ -472,3 +472,67 @@ fn buffer_pool_evicts_when_full() {
         "bytes_used should respect budget: {stats:?}"
     );
 }
+
+// ─── Reconstructed acquisition windows ───────────────────────────────────────
+
+// The `<m>:window_begin` (Int64 signed offset from row `timestamp`) and
+// `<m>:window_width` (UInt64 ns) sidecars must be associated with their base
+// metric and reconstructed into per-sample `[begin_ns, end_ns]` pairs carried
+// on the `Counter`/`Gauge` series.
+#[test]
+fn counter_carries_reconstructed_windows() {
+    use arrow::array::{Int64Array, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::collections::HashMap;
+
+    let ts = Field::new("timestamp", DataType::UInt64, false);
+    let counter = Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+        ("metric".to_string(), "cpu_cycles".to_string()),
+        ("metric_type".to_string(), "counter".to_string()),
+    ]));
+    let wbegin = Field::new("cpu_cycles:window_begin", DataType::Int64, true);
+    let wwidth = Field::new("cpu_cycles:window_width", DataType::UInt64, true);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![ts, counter, wbegin, wwidth],
+        HashMap::from([
+            ("source".to_string(), "rezolus".to_string()),
+            ("sampling_interval_ms".to_string(), "1000".to_string()),
+        ]),
+    ));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000u64])),
+            Arc::new(UInt64Array::from(vec![Some(100u64), Some(400u64)])),
+            Arc::new(Int64Array::from(vec![
+                Some(-50_000_000i64),
+                Some(-40_000_000i64),
+            ])),
+            Arc::new(UInt64Array::from(vec![
+                Some(30_000_000u64),
+                Some(20_000_000u64),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    let reader = ParquetReader::open_bytes(bytes).unwrap();
+    let w = reader.counter_windows_for_test("cpu_cycles");
+    assert_eq!(
+        w,
+        Some(vec![
+            (950_000_000u64, 980_000_000u64),
+            (1_960_000_000u64, 1_980_000_000u64)
+        ])
+    );
+}

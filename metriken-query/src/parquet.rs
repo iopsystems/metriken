@@ -167,6 +167,22 @@ impl ParquetReader {
         self.engine.time_range()
     }
 
+    /// Test-only accessor: read the counter series named `name` over the full
+    /// time range and return the first series' reconstructed acquisition windows.
+    /// Routes through the same `read_counters` path production queries use.
+    #[cfg(feature = "fixtures")]
+    pub fn counter_windows_for_test(&self, name: &str) -> Option<Vec<(u64, u64)>> {
+        let (start, end) = self.time_range_ns()?;
+        let filter = Labels::default();
+        for (pf, _extra) in &self.inner.files {
+            let counters = read_counters(pf, name, &filter, start, end).ok()?;
+            if let Some(c) = counters.series.into_iter().next() {
+                return c.windows;
+            }
+        }
+        None
+    }
+
     /// Names of all counter metrics across all files (sorted, deduplicated).
     pub fn counter_names(&self) -> Vec<String> {
         self.engine.counter_names()
@@ -1245,12 +1261,27 @@ struct ColDesc {
     labels: Labels,
     column_name: String,
     kind: ColKind,
+    /// Column index of this metric's `<m>:window_begin` sidecar (Int64 offset), if present.
+    begin_col: Option<usize>,
+    /// Column index of this metric's `<m>:window_width` sidecar (UInt64 ns), if present.
+    width_col: Option<usize>,
 }
 
 fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
-    pf.meta
-        .schema()
-        .fields()
+    let fields = pf.meta.schema().fields();
+    // Pass 1: window sidecar column indices, keyed by base column name.
+    let mut win_begin: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut win_width: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (col_idx, field) in fields.iter().enumerate() {
+        let n = field.name();
+        if let Some(base) = n.strip_suffix(":window_begin") {
+            win_begin.insert(base.to_string(), col_idx);
+        } else if let Some(base) = n.strip_suffix(":window_width") {
+            win_width.insert(base.to_string(), col_idx);
+        }
+    }
+    // Pass 2: metric ColDescs, attaching window indices by column name.
+    fields
         .iter()
         .enumerate()
         .filter_map(|(col_idx, field)| {
@@ -1300,12 +1331,16 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 }
                 _ => return None,
             };
+            let begin_col = win_begin.get(&column_name).copied();
+            let width_col = win_width.get(&column_name).copied();
             Some(ColDesc {
                 col_idx,
                 name,
                 labels,
                 column_name,
                 kind,
+                begin_col,
+                width_col,
             })
         })
         .collect()
@@ -1687,6 +1722,16 @@ fn read_counters(
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
+        .iter()
+        .map(|c| {
+            if c.begin_col.is_some() && c.width_col.is_some() {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for rg_idx in 0..num_rgs {
         match rg_classify(
@@ -1706,11 +1751,32 @@ fn read_counters(
                 timestamps.len(),
                 "row count mismatch in row group"
             );
-            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+            let begins = col
+                .begin_col
+                .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            let widths = col
+                .width_col
+                .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
                     if *ts >= start_ns && *ts <= end_ns {
                         ts_acc[i].push(*ts);
                         val_acc[i].push(*v);
+                        if let Some(w) = win_acc[i].as_mut() {
+                            let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                            let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                            match (bo, wd) {
+                                (Some(bo), Some(wd)) => {
+                                    let begin_ns = (*ts as i64 + bo) as u64;
+                                    w.push((begin_ns, begin_ns + wd));
+                                }
+                                // window columns present but null for this row:
+                                // degenerate window at the timestamp.
+                                _ => w.push((*ts, *ts)),
+                            }
+                        }
                     }
                 }
             }
@@ -1722,11 +1788,13 @@ fn read_counters(
             .into_iter()
             .zip(ts_acc)
             .zip(val_acc)
-            .filter(|((_, ts), _)| !ts.is_empty())
-            .map(|((col, timestamps), values)| Counter {
+            .zip(win_acc)
+            .filter(|(((_, ts), _), _)| !ts.is_empty())
+            .map(|(((col, timestamps), values), windows)| Counter {
                 labels: col.labels,
                 timestamps,
                 values,
+                windows,
             })
             .collect(),
     })
@@ -1763,6 +1831,16 @@ fn read_gauges(
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<i64>> = vec![Vec::new(); cols.len()];
+    let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
+        .iter()
+        .map(|c| {
+            if c.begin_col.is_some() && c.width_col.is_some() {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for rg_idx in 0..num_rgs {
         match rg_classify(
@@ -1782,11 +1860,32 @@ fn read_gauges(
                 timestamps.len(),
                 "row count mismatch in row group"
             );
-            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+            let begins = col
+                .begin_col
+                .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            let widths = col
+                .width_col
+                .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
                     if *ts >= start_ns && *ts <= end_ns {
                         ts_acc[i].push(*ts);
                         val_acc[i].push(*v);
+                        if let Some(w) = win_acc[i].as_mut() {
+                            let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                            let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                            match (bo, wd) {
+                                (Some(bo), Some(wd)) => {
+                                    let begin_ns = (*ts as i64 + bo) as u64;
+                                    w.push((begin_ns, begin_ns + wd));
+                                }
+                                // window columns present but null for this row:
+                                // degenerate window at the timestamp.
+                                _ => w.push((*ts, *ts)),
+                            }
+                        }
                     }
                 }
             }
@@ -1798,11 +1897,13 @@ fn read_gauges(
             .into_iter()
             .zip(ts_acc)
             .zip(val_acc)
-            .filter(|((_, ts), _)| !ts.is_empty())
-            .map(|((col, timestamps), values)| Gauge {
+            .zip(win_acc)
+            .filter(|(((_, ts), _), _)| !ts.is_empty())
+            .map(|(((col, timestamps), values), windows)| Gauge {
                 labels: col.labels,
                 timestamps,
                 values,
+                windows,
             })
             .collect(),
     })

@@ -40,6 +40,7 @@ fn cgroup_source() -> Arc<Memory> {
                 labels,
                 timestamps,
                 values,
+                windows: None,
             },
         );
     }
@@ -235,6 +236,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
                 labels,
                 timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
                 values: vec![cpu * 1000, cpu * 1000 + 100, cpu * 1000 + 200],
+                windows: None,
             },
         );
     }
@@ -253,6 +255,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
             labels,
             timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
             values: vec![4, 4, 4],
+            windows: None,
         },
     );
 

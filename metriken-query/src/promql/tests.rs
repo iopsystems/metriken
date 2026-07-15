@@ -38,6 +38,7 @@ fn create_cgroup_source() -> Memory {
                 labels,
                 timestamps,
                 values,
+                windows: None,
             },
         );
     }
@@ -341,6 +342,7 @@ fn create_rate_source() -> Memory {
             labels: Labels::default(),
             timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
             values: (0u64..5).map(|s| s * 100).collect(),
+            windows: None,
         },
     );
     source
@@ -355,6 +357,7 @@ fn create_counter_reset_source() -> Memory {
             labels: Labels::default(),
             timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
             values: vec![100, 200, 300, 50, 150],
+            windows: None,
         },
     );
     source
@@ -369,6 +372,7 @@ fn create_gauge_source() -> Memory {
             labels: Labels::default(),
             timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
             values: (1i64..=5).map(|v| v * 10).collect(),
+            windows: None,
         },
     );
     source
@@ -385,6 +389,7 @@ fn create_labeled_gauge_source() -> Memory {
                 labels,
                 timestamps: (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect(),
                 values: (0i64..3).map(|s| base_val + s).collect(),
+                windows: None,
             },
         );
     }
@@ -630,6 +635,7 @@ fn create_three_gauge_source() -> Memory {
             labels: Labels::default(),
             timestamps: ts.clone(),
             values: vec![1000; 5],
+            windows: None,
         },
     );
     source.add_gauge(
@@ -638,6 +644,7 @@ fn create_three_gauge_source() -> Memory {
             labels: Labels::default(),
             timestamps: ts.clone(),
             values: (0i64..5).map(|s| 800 - s * 100).collect(),
+            windows: None,
         },
     );
     source.add_gauge(
@@ -646,6 +653,7 @@ fn create_three_gauge_source() -> Memory {
             labels: Labels::default(),
             timestamps: ts,
             values: vec![50; 5],
+            windows: None,
         },
     );
     source
@@ -725,6 +733,7 @@ fn create_duplex_source() -> Memory {
                 labels,
                 timestamps: ts.clone(),
                 values: vec![tx_val; 3],
+                windows: None,
             },
         );
     }
@@ -737,6 +746,7 @@ fn create_duplex_source() -> Memory {
                 labels,
                 timestamps: ts.clone(),
                 values: vec![bw; 3],
+                windows: None,
             },
         );
     }
@@ -835,6 +845,7 @@ fn create_columns_source() -> Memory {
                 labels,
                 timestamps: ts.clone(),
                 values: vec![0, 100],
+                windows: None,
             },
         );
     }
@@ -847,6 +858,7 @@ fn create_columns_source() -> Memory {
                 labels,
                 timestamps: ts.clone(),
                 values: vec![50, 50],
+                windows: None,
             },
         );
     }
@@ -857,6 +869,7 @@ fn create_columns_source() -> Memory {
             labels: Labels::default(),
             timestamps: ts,
             values: vec![8, 8],
+            windows: None,
         },
     );
     source
@@ -2137,6 +2150,7 @@ fn test_label_values_via_query_engine() {
                 labels,
                 timestamps: ts.clone(),
                 values: vec![0, 100],
+                windows: None,
             },
         );
     }
@@ -2146,6 +2160,7 @@ fn test_label_values_via_query_engine() {
             labels: make_labels(&[("cpu", "0")]),
             timestamps: ts.clone(),
             values: vec![50, 51],
+            windows: None,
         },
     );
 
@@ -2248,6 +2263,7 @@ fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
                 labels,
                 timestamps: ts.clone(),
                 values: vec![0, 100],
+                windows: None,
             },
         );
     }
@@ -2257,6 +2273,7 @@ fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
             labels: make_labels(&[("cpu", "0")]),
             timestamps: ts.clone(),
             values: vec![50, 51],
+            windows: None,
         },
     );
     mem.add_gauge(
@@ -2265,6 +2282,7 @@ fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
             labels: make_labels(&[("node", "n1")]),
             timestamps: ts.clone(),
             values: vec![1024, 2048],
+            windows: None,
         },
     );
 
