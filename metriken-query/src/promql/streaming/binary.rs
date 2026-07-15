@@ -94,14 +94,14 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
-        for (t, v) in self.upstream.by_ref() {
+        for p in self.upstream.by_ref() {
             let result = if self.scalar_first {
-                self.op.apply(self.scalar, v)
+                self.op.apply(self.scalar, p.v)
             } else {
-                self.op.apply(v, self.scalar)
+                self.op.apply(p.v, self.scalar)
             };
             if let Some(r) = result {
-                return Some((t, r));
+                return Some(Point::at(p.t, r));
             }
             // Skip on division by zero, mirroring the eager path's
             // `continue` in the same situation.
@@ -191,8 +191,8 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let lt = self.left.peek().map(|&(t, _)| t)?;
-            let rt = self.right.peek().map(|&(t, _)| t)?;
+            let lt = self.left.peek().map(|p| p.t)?;
+            let rt = self.right.peek().map(|p| p.t)?;
             match lt.cmp(&rt) {
                 std::cmp::Ordering::Less => {
                     self.left.next();
@@ -201,10 +201,10 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
                     self.right.next();
                 }
                 std::cmp::Ordering::Equal => {
-                    let (t, lv) = self.left.next().expect("peek matched");
-                    let (_, rv) = self.right.next().expect("peek matched");
-                    if let Some(v) = self.op.apply(lv, rv) {
-                        return Some((t, v));
+                    let left = self.left.next().expect("peek matched");
+                    let right = self.right.next().expect("peek matched");
+                    if let Some(v) = self.op.apply(left.v, right.v) {
+                        return Some(Point::at(left.t, v));
                     }
                 }
             }
@@ -227,10 +227,10 @@ impl<'a> Iterator for RightLookupBinary<'a> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
-        for (t, lv) in self.upstream.by_ref() {
-            if let Some(&rv) = self.rhs.get(&t) {
-                if let Some(v) = self.op.apply(lv, rv) {
-                    return Some((t, v));
+        for p in self.upstream.by_ref() {
+            if let Some(&rv) = self.rhs.get(&p.t) {
+                if let Some(v) = self.op.apply(p.v, rv) {
+                    return Some(Point::at(p.t, v));
                 }
             }
         }
@@ -285,7 +285,8 @@ pub fn matrix_matrix_op<'a>(
     // engine's per-left fallback for `aggregated / scalar_metric`.
     if !unmatched_left.is_empty() && matches!(spec, MatchSpec::Default) && right_by_key.len() == 1 {
         let (_, right_singleton) = right_by_key.into_iter().next().unwrap();
-        let rhs: Rc<HashMap<u64, f64>> = Rc::new(right_singleton.iter.collect());
+        let rhs: Rc<HashMap<u64, f64>> =
+            Rc::new(right_singleton.iter.map(|p| (p.t, p.v)).collect());
         for left in unmatched_left {
             let iter = RightLookupBinary {
                 upstream: left.iter,

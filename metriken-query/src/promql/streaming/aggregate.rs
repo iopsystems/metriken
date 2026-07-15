@@ -118,7 +118,8 @@ impl<'a> Iterator for MergeReduce<'a> {
     fn next(&mut self) -> Option<Point> {
         let mut min_ts: Option<u64> = None;
         for c in self.children.iter_mut() {
-            if let Some(&(t, _)) = c.peek() {
+            if let Some(&p) = c.peek() {
+                let t = p.t;
                 min_ts = Some(min_ts.map_or(t, |m| m.min(t)));
             }
         }
@@ -130,9 +131,9 @@ impl<'a> Iterator for MergeReduce<'a> {
         let mut max = f64::NEG_INFINITY;
 
         for c in self.children.iter_mut() {
-            let take = matches!(c.peek(), Some(&(ts, _)) if ts == t);
+            let take = matches!(c.peek(), Some(&p) if p.t == t);
             if take {
-                let (_, v) = c.next().expect("peek returned Some, next must too");
+                let v = c.next().expect("peek returned Some, next must too").v;
                 sum += v;
                 count += 1;
                 if v < min {
@@ -155,6 +156,6 @@ impl<'a> Iterator for MergeReduce<'a> {
             AggOp::Max => max,
             AggOp::Count => count as f64,
         };
-        Some((t, v))
+        Some(Point::at(t, v))
     }
 }

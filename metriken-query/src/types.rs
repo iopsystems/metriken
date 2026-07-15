@@ -6,9 +6,8 @@ pub struct Counter {
     pub values: Vec<u64>,
     /// Per-sample reconstructed acquisition windows `[begin_ns, end_ns]`, aligned
     /// with `timestamps`/`values`. `None` when the source carried no `:window_*`
-    /// sidecar columns for this metric. Populated by the parquet reader; consumed
-    /// by a later phase (rate/increase error bars), hence `allow(dead_code)`.
-    #[allow(dead_code)]
+    /// sidecar columns for this metric. Populated by the parquet reader; read by
+    /// rate()/irate() to attach per-point uncertainty bounds.
     pub windows: Option<Vec<(u64, u64)>>,
 }
 

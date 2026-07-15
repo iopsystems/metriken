@@ -61,7 +61,21 @@ pub(crate) use rate::{CounterPairwiseRate, CounterRate};
 pub(crate) use aggregate::sum_by;
 
 /// A single sample emitted through a streaming pipeline.
-pub type Point = (u64, f64);
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Point {
+    pub t: u64,
+    pub v: f64,
+    /// Uncertainty interval (lo, hi) from acquisition windows; set only by
+    /// rate()/irate() (leaf-only). None means exact / not applicable.
+    pub bounds: Option<(f64, f64)>,
+}
+impl Point {
+    /// A point with no uncertainty bound (the default for every producer/operator
+    /// except rate/irate).
+    pub fn at(t: u64, v: f64) -> Self {
+        Self { t, v, bounds: None }
+    }
+}
 
 /// A labeled, lazily-produced time series.
 pub struct LabeledSeries<'a> {
@@ -107,6 +121,7 @@ impl Counters {
                     end_ns,
                     step_ns,
                     range_ns,
+                    c.windows.as_deref(),
                 );
                 LabeledSeries::new(c.labels.clone(), iter)
             })
@@ -120,7 +135,7 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
     streaming
         .into_iter()
         .filter_map(|ls| {
-            let values: Vec<(f64, f64)> = ls.iter.map(|(t, v)| (t as f64 / 1e9, v)).collect();
+            let values: Vec<(f64, f64)> = ls.iter.map(|p| (p.t as f64 / 1e9, p.v)).collect();
             if values.is_empty() {
                 return None;
             }

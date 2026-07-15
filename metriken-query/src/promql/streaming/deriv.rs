@@ -54,8 +54,8 @@ impl<I: Iterator<Item = Point>> Iterator for StreamingDeriv<I> {
             let window_end = t.saturating_add(self.step_ns);
 
             // Pull upstream until next peeked ts is past window_end.
-            while let Some(&(next_ts, _)) = self.upstream.peek() {
-                if next_ts > window_end {
+            while let Some(&next) = self.upstream.peek() {
+                if next.t > window_end {
                     break;
                 }
                 self.buffer
@@ -63,8 +63,8 @@ impl<I: Iterator<Item = Point>> Iterator for StreamingDeriv<I> {
             }
 
             // Evict points before window_start.
-            while let Some(&(ts, _)) = self.buffer.front() {
-                if ts < window_start {
+            while let Some(&front) = self.buffer.front() {
+                if front.t < window_start {
                     self.buffer.pop_front();
                 } else {
                     break;
@@ -87,8 +87,9 @@ impl<I: Iterator<Item = Point>> Iterator for StreamingDeriv<I> {
             let mut sum_y = 0.0_f64;
             let mut sum_xy = 0.0_f64;
             let mut sum_x2 = 0.0_f64;
-            for &(ts, y) in self.buffer.iter() {
-                let x = ts as f64 / 1e9;
+            for &p in self.buffer.iter() {
+                let x = p.t as f64 / 1e9;
+                let y = p.v;
                 sum_x += x;
                 sum_y += y;
                 sum_xy += x * y;
@@ -96,9 +97,9 @@ impl<I: Iterator<Item = Point>> Iterator for StreamingDeriv<I> {
             }
             let denom = n * sum_x2 - sum_x * sum_x;
             if denom.abs() < 1e-10 {
-                return Some((t, 0.0));
+                return Some(Point::at(t, 0.0));
             }
-            return Some((t, (n * sum_xy - sum_x * sum_y) / denom));
+            return Some(Point::at(t, (n * sum_xy - sum_x * sum_y) / denom));
         }
         None
     }

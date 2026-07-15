@@ -64,7 +64,7 @@ impl<'a> Iterator for GaugeStepGrid<'a> {
             if t.saturating_sub(ts) > self.staleness_ns {
                 continue;
             }
-            return Some((t, val as f64));
+            return Some(Point::at(t, val as f64));
         }
         None
     }
@@ -124,7 +124,7 @@ impl<'a> Iterator for GaugeAvgOverTime<'a> {
             for &v in &self.values[lo..hi] {
                 sum += v as f64;
             }
-            return Some((t, sum / count as f64));
+            return Some(Point::at(t, sum / count as f64));
         }
         None
     }
@@ -180,7 +180,7 @@ impl<'a> Iterator for GaugeIdelta<'a> {
             }
             let cur = self.values[hi - 1] as f64;
             let prev = self.values[hi - 2] as f64;
-            return Some((t, cur - prev));
+            return Some(Point::at(t, cur - prev));
         }
         None
     }
@@ -248,10 +248,10 @@ impl<'a> Iterator for GaugeDeriv<'a> {
             }
             let denom = n * sum_x2 - sum_x * sum_x;
             if denom.abs() < 1e-10 {
-                return Some((t, 0.0));
+                return Some(Point::at(t, 0.0));
             }
             let slope = (n * sum_xy - sum_x * sum_y) / denom;
-            return Some((t, slope));
+            return Some(Point::at(t, slope));
         }
         None
     }

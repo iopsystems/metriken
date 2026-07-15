@@ -288,6 +288,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        c.windows.as_deref(),
                     )
                     .collect();
                     LabeledSeries::new(c.labels, pts.into_iter())
@@ -315,6 +316,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        c.windows.as_deref(),
                     )
                     .collect();
                     LabeledSeries::new(c.labels, pts.into_iter())
