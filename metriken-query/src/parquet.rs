@@ -1259,6 +1259,14 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             }
             let mut meta = field.metadata().clone();
             let column_name = field.name().to_string();
+            // Per-metric acquisition-window sidecar columns (`<m>:window_begin`
+            // Int64, `<m>:window_width` UInt64) describe the base metric's
+            // observation window — they are not metrics. Without this skip they
+            // would classify by Arrow type as a phantom gauge / counter. (A later
+            // phase reads them for rate/increase error bars.)
+            if column_name.ends_with(":window_begin") || column_name.ends_with(":window_width") {
+                return None;
+            }
             let name = meta.get("metric").cloned().unwrap_or_else(|| {
                 column_name
                     .strip_suffix(":buckets")

@@ -278,6 +278,75 @@ fn open_file_matches_open_path() {
     assert_eq!(reader_a.counter_names(), reader_b.counter_names());
 }
 
+// ─── Window sidecar columns are not metrics ──────────────────────────────────
+
+// A `.rez` per-sampler table carries per-metric acquisition-window sidecar
+// columns `<m>:window_begin` (Int64) and `<m>:window_width` (UInt64) that have
+// no `metric` metadata. `parse_schema` classifies purely by Arrow type, so
+// without special handling the Int64 begin column becomes a phantom gauge and
+// the UInt64 width column a phantom counter. They must be recognized as sidecars
+// of `<m>` and excluded from the metric listings.
+#[test]
+fn window_sidecar_columns_are_not_metrics() {
+    use arrow::array::{Int64Array, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let ts = Field::new("timestamp", DataType::UInt64, false);
+    let counter = Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+        ("metric".to_string(), "cpu_cycles".to_string()),
+        ("metric_type".to_string(), "counter".to_string()),
+    ]));
+    // Sidecars carry no metadata at all — exactly as the rezolus writer emits them.
+    let wbegin = Field::new("cpu_cycles:window_begin", DataType::Int64, true);
+    let wwidth = Field::new("cpu_cycles:window_width", DataType::UInt64, true);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![ts, counter, wbegin, wwidth],
+        HashMap::from([
+            ("source".to_string(), "rezolus".to_string()),
+            ("sampling_interval_ms".to_string(), "1000".to_string()),
+        ]),
+    ));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1_000u64, 2_000u64])),
+            Arc::new(UInt64Array::from(vec![Some(10u64), Some(20u64)])),
+            Arc::new(Int64Array::from(vec![Some(-100i64), Some(-50i64)])),
+            Arc::new(UInt64Array::from(vec![Some(80u64), Some(90u64)])),
+        ],
+    )
+    .unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    let reader = ParquetReader::open_bytes(bytes).unwrap();
+    assert_eq!(
+        reader.counter_names(),
+        vec!["cpu_cycles".to_string()],
+        "the width sidecar must not appear as a phantom counter"
+    );
+    assert!(
+        reader.gauge_names().is_empty(),
+        "the begin sidecar must not appear as a phantom gauge: {:?}",
+        reader.gauge_names()
+    );
+    assert!(
+        !reader.all_names().iter().any(|n| n.contains(":window")),
+        "no sidecar should surface in any metric listing: {:?}",
+        reader.all_names()
+    );
+}
+
 // ─── Time range edges ────────────────────────────────────────────────────────
 
 #[test]
