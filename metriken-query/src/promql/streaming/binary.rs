@@ -94,14 +94,33 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
-        for p in self.upstream.by_ref() {
-            let result = if self.scalar_first {
-                self.op.apply(self.scalar, p.v)
+        let (op, scalar, scalar_first) = (self.op, self.scalar, self.scalar_first);
+        let apply = |x: f64| -> Option<f64> {
+            if scalar_first {
+                op.apply(scalar, x)
             } else {
-                self.op.apply(p.v, self.scalar)
-            };
-            if let Some(r) = result {
-                return Some(Point::at(p.t, r));
+                op.apply(x, scalar)
+            }
+        };
+        for p in self.upstream.by_ref() {
+            if let Some(r) = apply(p.v) {
+                // Propagate the uncertainty band through the scalar op: add/sub/
+                // mul/div by a constant are monotonic in the value, so the band
+                // endpoints map to endpoints; min/max normalizes any reordering
+                // (negative scalar, or `scalar / value`). So `rate(x[1m]) * 8`
+                // carries a scaled band. (Series OP series stays bounds-less —
+                // that is deferred Tier-1 propagation.)
+                let bounds = p.bounds.and_then(|(lo, hi)| match (apply(lo), apply(hi)) {
+                    (Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
+                        Some((a.min(b), a.max(b)))
+                    }
+                    _ => None,
+                });
+                return Some(Point {
+                    t: p.t,
+                    v: r,
+                    bounds,
+                });
             }
             // Skip on division by zero, mirroring the eager path's
             // `continue` in the same situation.

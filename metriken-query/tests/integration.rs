@@ -588,21 +588,50 @@ fn rate_query_carries_intervals_leaf_only() {
     let (s, e) = reader.time_range().unwrap();
 
     // Bare rate → intervals present.
-    let r = reader.query_range("rate(cpu_cycles[1m])", s, e + 1.0, 1.0).unwrap();
-    match r {
+    let r = reader
+        .query_range("rate(cpu_cycles[1m])", s, e + 1.0, 1.0)
+        .unwrap();
+    match &r {
         QueryResult::Matrix { result } => {
             assert!(!result.is_empty());
-            assert!(result[0].intervals.is_some(), "bare rate should carry intervals");
+            assert!(
+                result[0].intervals.is_some(),
+                "bare rate should carry intervals"
+            );
         }
         other => panic!("expected Matrix, got {other:?}"),
     }
 
-    // Scalar op → intervals dropped (leaf-only).
-    let r2 = reader.query_range("rate(cpu_cycles[1m]) * 60", s, e + 1.0, 1.0).unwrap();
+    // Scalar op → interval PROPAGATES (scaled by the constant): the band from
+    // the bare rate, multiplied by 60. Series-OP-series is still bounds-less
+    // (deferred Tier-1), but scalar ops carry the band so `rate(x)*k` works.
+    let bare = match &r {
+        QueryResult::Matrix { result } => result[0].intervals.clone().unwrap(),
+        _ => unreachable!(),
+    };
+    let r2 = reader
+        .query_range("rate(cpu_cycles[1m]) * 60", s, e + 1.0, 1.0)
+        .unwrap();
     match r2 {
         QueryResult::Matrix { result } => {
             assert!(!result.is_empty());
-            assert!(result[0].intervals.is_none(), "operator must drop intervals (leaf-only)");
+            let scaled = result[0]
+                .intervals
+                .clone()
+                .expect("scalar op should propagate the interval");
+            // Each scaled bound == the bare bound * 60.
+            for ((blo, bhi), (slo, shi)) in bare.iter().zip(scaled.iter()) {
+                assert!(
+                    (slo - blo * 60.0).abs() < 1e-3,
+                    "lo {slo} vs {}",
+                    blo * 60.0
+                );
+                assert!(
+                    (shi - bhi * 60.0).abs() < 1e-3,
+                    "hi {shi} vs {}",
+                    bhi * 60.0
+                );
+            }
         }
         other => panic!("expected Matrix, got {other:?}"),
     }
