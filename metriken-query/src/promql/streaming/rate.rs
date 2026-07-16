@@ -78,22 +78,25 @@ impl<'a> Iterator for CounterRate<'a> {
                 continue;
             }
 
-            let bounds = self.windows.and_then(|w| {
-                let (b_first, e_first) = *w.get(lo)?;
-                let (b_last, e_last) = *w.get(hi - 1)?;
-                let elapsed_max = e_last.saturating_sub(b_first) as f64 / 1e9;
-                let elapsed_min = b_last.saturating_sub(e_first) as f64 / 1e9;
-                if elapsed_min > 0.0 && elapsed_max > 0.0 {
-                    Some((total_increase / elapsed_max, total_increase / elapsed_min))
-                } else {
-                    None
-                }
-            });
-            return Some(Point {
-                t,
-                v: total_increase / dur_s,
-                bounds,
-            });
+            let v = total_increase / dur_s;
+            let bounds = self
+                .windows
+                .and_then(|w| {
+                    let (b_first, e_first) = *w.get(lo)?;
+                    let (b_last, e_last) = *w.get(hi - 1)?;
+                    let elapsed_max = e_last.saturating_sub(b_first) as f64 / 1e9;
+                    let elapsed_min = b_last.saturating_sub(e_first) as f64 / 1e9;
+                    if elapsed_min > 0.0 && elapsed_max > 0.0 {
+                        Some((total_increase / elapsed_max, total_increase / elapsed_min))
+                    } else {
+                        None
+                    }
+                })
+                // The nominal divides by the row-timestamp gap while the bounds
+                // derive from the window edges (a different time reference), so
+                // widen the band to always contain the displayed value.
+                .map(|(lo, hi)| (lo.min(v), hi.max(v)));
+            return Some(Point { t, v, bounds });
         }
         None
     }
@@ -184,10 +187,50 @@ mod tests {
     fn rate_without_windows_has_no_bounds() {
         let ts = [1_000_000_000u64, 2_000_000_000];
         let vals = [100u64, 400];
-        let pts: Vec<Point> =
-            CounterRate::new(&ts, &vals, 2_000_000_000, 2_000_000_000, 1_000_000_000, 2_000_000_000, None)
-                .collect();
+        let pts: Vec<Point> = CounterRate::new(
+            &ts,
+            &vals,
+            2_000_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            2_000_000_000,
+            None,
+        )
+        .collect();
         assert_eq!(pts.len(), 1);
         assert!(pts[0].bounds.is_none());
+    }
+
+    #[test]
+    fn rate_bounds_widen_to_contain_nominal() {
+        // Row timestamps imply a 4s gap, but the windows imply ~1s — the nominal
+        // (row-ts based) falls well outside the raw window bounds, so the band
+        // must widen to contain it.
+        let ts = [1_000_000_000u64, 5_000_000_000];
+        let vals = [0u64, 200];
+        let windows = [
+            (1_000_000_000u64, 1_010_000_000u64),
+            (2_000_000_000u64, 2_010_000_000u64),
+        ];
+        let pts: Vec<Point> = CounterRate::new(
+            &ts,
+            &vals,
+            5_000_000_000,
+            5_000_000_000,
+            1_000_000_000,
+            10_000_000_000,
+            Some(&windows),
+        )
+        .collect();
+        assert_eq!(pts.len(), 1);
+        let p = pts[0];
+        assert!((p.v - 50.0).abs() < 1e-6, "nominal {} (200/4s)", p.v); // 200/4s
+        let (lo, hi) = p.bounds.expect("bounds present");
+        assert!(
+            lo <= p.v && p.v <= hi,
+            "nominal {} must be in [{lo}, {hi}]",
+            p.v
+        );
+        assert!((lo - 50.0).abs() < 1e-6, "lo widened to nominal, got {lo}");
     }
 }

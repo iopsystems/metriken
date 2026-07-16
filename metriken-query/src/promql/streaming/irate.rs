@@ -72,22 +72,23 @@ impl<'a> Iterator for CounterIrate<'a> {
                 continue;
             }
 
-            let bounds = self.windows.and_then(|w| {
-                let (b_prev, e_prev) = *w.get(hi - 2)?;
-                let (b_cur, e_cur) = *w.get(hi - 1)?;
-                let elapsed_max = e_cur.saturating_sub(b_prev) as f64 / 1e9;
-                let elapsed_min = b_cur.saturating_sub(e_prev) as f64 / 1e9;
-                if elapsed_min > 0.0 && elapsed_max > 0.0 {
-                    Some((delta / elapsed_max, delta / elapsed_min))
-                } else {
-                    None
-                }
-            });
-            return Some(Point {
-                t,
-                v: delta / dur_s,
-                bounds,
-            });
+            let v = delta / dur_s;
+            let bounds = self
+                .windows
+                .and_then(|w| {
+                    let (b_prev, e_prev) = *w.get(hi - 2)?;
+                    let (b_cur, e_cur) = *w.get(hi - 1)?;
+                    let elapsed_max = e_cur.saturating_sub(b_prev) as f64 / 1e9;
+                    let elapsed_min = b_cur.saturating_sub(e_prev) as f64 / 1e9;
+                    if elapsed_min > 0.0 && elapsed_max > 0.0 {
+                        Some((delta / elapsed_max, delta / elapsed_min))
+                    } else {
+                        None
+                    }
+                })
+                // Widen the band to always contain the nominal (see rate.rs).
+                .map(|(lo, hi)| (lo.min(v), hi.max(v)));
+            return Some(Point { t, v, bounds });
         }
         None
     }
