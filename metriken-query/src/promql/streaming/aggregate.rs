@@ -129,11 +129,16 @@ impl<'a> Iterator for MergeReduce<'a> {
         let mut count = 0u32;
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
+        // Interval arithmetic for sum/avg: a windowless child contributes its
+        // point value as a degenerate band [v, v].
+        let mut any_bounded = false;
+        let (mut lo_sum, mut hi_sum) = (0.0f64, 0.0f64);
 
         for c in self.children.iter_mut() {
             let take = matches!(c.peek(), Some(&p) if p.t == t);
             if take {
-                let v = c.next().expect("peek returned Some, next must too").v;
+                let p = c.next().expect("peek returned Some, next must too");
+                let v = p.v;
                 sum += v;
                 count += 1;
                 if v < min {
@@ -142,6 +147,12 @@ impl<'a> Iterator for MergeReduce<'a> {
                 if v > max {
                     max = v;
                 }
+                let (lo, hi) = p.bounds.unwrap_or((v, v));
+                if p.bounds.is_some() {
+                    any_bounded = true;
+                }
+                lo_sum += lo;
+                hi_sum += hi;
             }
         }
 
@@ -156,6 +167,83 @@ impl<'a> Iterator for MergeReduce<'a> {
             AggOp::Max => max,
             AggOp::Count => count as f64,
         };
-        Some(Point::at(t, v))
+        // sum/avg propagate the band by interval arithmetic ([Σlo, Σhi], /n),
+        // and the nominal stays inside it (each child band contains its own
+        // nominal). min/max are declined: which series is the extremum is
+        // uncertain, so the nominal can fall outside the true interval. count is
+        // exact.
+        let bounds = if any_bounded {
+            match self.op {
+                AggOp::Sum => Some((lo_sum, hi_sum)),
+                AggOp::Avg => Some((lo_sum / count as f64, hi_sum / count as f64)),
+                AggOp::Min | AggOp::Max | AggOp::Count => None,
+            }
+        } else {
+            None
+        };
+        Some(Point { t, v, bounds })
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    fn one(t: u64, v: f64, b: Option<(f64, f64)>) -> Box<dyn Iterator<Item = Point>> {
+        Box::new(std::iter::once(Point { t, v, bounds: b }))
+    }
+
+    #[test]
+    fn sum_propagates_interval_arithmetic() {
+        // sum([9,11] + [18,22]) = [27, 33]; nominal 30 stays inside.
+        let mut mr = MergeReduce::new(
+            vec![
+                one(1, 10.0, Some((9.0, 11.0))),
+                one(1, 20.0, Some((18.0, 22.0))),
+            ],
+            AggOp::Sum,
+        );
+        let p = mr.next().unwrap();
+        assert_eq!(p.v, 30.0);
+        assert_eq!(p.bounds, Some((27.0, 33.0)));
+        assert!(mr.next().is_none());
+    }
+
+    #[test]
+    fn avg_propagates_scaled_interval() {
+        let mut mr = MergeReduce::new(
+            vec![
+                one(1, 10.0, Some((9.0, 11.0))),
+                one(1, 20.0, Some((18.0, 22.0))),
+            ],
+            AggOp::Avg,
+        );
+        let p = mr.next().unwrap();
+        assert_eq!(p.v, 15.0);
+        assert_eq!(p.bounds, Some((13.5, 16.5))); // [27/2, 33/2]
+    }
+
+    #[test]
+    fn min_declines_bounds() {
+        // Nominal min = 5 (series A), but B could dip to 1: the honest true-min
+        // interval [1,3] excludes the nominal, so min declines a band.
+        let mut mr = MergeReduce::new(
+            vec![
+                one(1, 5.0, Some((4.0, 100.0))),
+                one(1, 10.0, Some((1.0, 3.0))),
+            ],
+            AggOp::Min,
+        );
+        let p = mr.next().unwrap();
+        assert_eq!(p.v, 5.0);
+        assert!(p.bounds.is_none());
+    }
+
+    #[test]
+    fn sum_windowless_children_no_band() {
+        let mut mr = MergeReduce::new(vec![one(1, 10.0, None), one(1, 20.0, None)], AggOp::Sum);
+        let p = mr.next().unwrap();
+        assert_eq!(p.v, 30.0);
+        assert!(p.bounds.is_none());
     }
 }
