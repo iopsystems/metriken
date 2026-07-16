@@ -636,3 +636,60 @@ fn rate_query_carries_intervals_leaf_only() {
         other => panic!("expected Matrix, got {other:?}"),
     }
 }
+
+// ─── Histogram value uncertainty (bucket resolution) ─────────────────────────
+
+#[test]
+fn histogram_quantile_carries_bucket_value_band() {
+    let fixture = FixtureBuilder::new()
+        .samples(20)
+        .row_group_size(20)
+        .point_histogram("latency", &[], 4, 16, 5, 100)
+        .build()
+        .unwrap();
+    let reader = ParquetReader::open(fixture.path()).unwrap();
+    let (start, end) = reader.time_range().unwrap();
+
+    let r = reader
+        .query_range("histogram_quantile(0.99, latency)", start, end + 1.0, 1.0)
+        .unwrap();
+    match r {
+        QueryResult::Matrix { result } => {
+            assert!(!result.is_empty());
+            let s = &result[0];
+            let ivls = s
+                .intervals
+                .as_ref()
+                .expect("quantile carries a bucket band");
+            assert_eq!(ivls.len(), s.values.len());
+            for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
+                // band is the containing bucket [start, end]; nominal = end (top
+                // edge). Linear-region buckets are exact (zero width, lo == hi);
+                // log-region buckets carry real quantization width.
+                assert!(*lo <= *v && *v <= *hi, "value {v} within [{lo}, {hi}]");
+                assert!((*v - *hi).abs() < 1e-6, "nominal sits at bucket.end");
+            }
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+
+    // The ns→s unit conversion (Materialized / Scalar) keeps a scaled band.
+    let r2 = reader
+        .query_range(
+            "histogram_quantile(0.99, latency) / 1000000000",
+            start,
+            end + 1.0,
+            1.0,
+        )
+        .unwrap();
+    match r2 {
+        QueryResult::Matrix { result } => {
+            let s = &result[0];
+            let ivls = s.intervals.as_ref().expect("scalar op keeps the band");
+            for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
+                assert!(*lo <= *v && *v <= *hi);
+            }
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+}

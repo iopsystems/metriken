@@ -198,7 +198,11 @@ fn quantiles_impl(
     }
     let quantile_floats: Vec<f64> = quantile_keys.iter().map(|(_, q, _)| *q).collect();
 
-    let mut outputs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); quantiles_in.len()];
+    // Per point: (ts_sec, value, Some([bucket.start, bucket.end])) — the value
+    // quantization band from the bucket the quantile lands in.
+    #[allow(clippy::type_complexity)]
+    let mut outputs: Vec<Vec<(f64, f64, Option<(f64, f64)>)>> =
+        vec![Vec::new(); quantiles_in.len()];
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
@@ -306,17 +310,24 @@ fn quantiles_impl(
 
     let mut samples = Vec::with_capacity(outputs.len());
     for (i, q) in quantiles_in.iter().enumerate() {
-        let values = std::mem::take(&mut outputs[i]);
-        if values.is_empty() {
+        let rows = std::mem::take(&mut outputs[i]);
+        if rows.is_empty() {
             continue;
         }
+        let values: Vec<(f64, f64)> = rows.iter().map(|(t, v, _)| (*t, *v)).collect();
+        // Every quantile point carries its bucket band, so emit intervals.
+        let intervals: Option<Vec<(f64, f64)>> = if rows.iter().all(|(_, _, b)| b.is_some()) {
+            Some(rows.iter().map(|(_, _, b)| b.unwrap()).collect())
+        } else {
+            None
+        };
         let mut metric: HashMap<String, String> = HashMap::new();
         metric.insert("__name__".to_string(), metric_name.to_string());
         metric.insert("quantile".to_string(), q.to_string());
         samples.push(MatrixSample {
             metric,
             values,
-            intervals: None,
+            intervals,
         });
     }
     samples
@@ -796,7 +807,7 @@ fn apply_quantiles(
     quantile_floats: &[f64],
     keys: &[(usize, f64, Quantile)],
     t_ns: u64,
-    out: &mut [Vec<(f64, f64)>],
+    out: &mut [Vec<(f64, f64, Option<(f64, f64)>)>],
 ) {
     let r = CumulativeROHistogram32Ref::from_parts_unchecked(config, idx, cnt);
     let q_result: Result<Option<QuantilesResult>, _> = r.quantiles(quantile_floats);
@@ -804,7 +815,10 @@ fn apply_quantiles(
         let t_sec = t_ns as f64 / 1e9;
         for (out_idx, _q_f, q_key) in keys {
             if let Some(bucket) = qr.get(q_key) {
-                out[*out_idx].push((t_sec, bucket.end() as f64));
+                // Nominal is bucket.end(); the value quantization band is the
+                // bucket's full [start, end] range (nominal sits at the top edge).
+                let band = (bucket.start() as f64, bucket.end() as f64);
+                out[*out_idx].push((t_sec, band.1, Some(band)));
             }
         }
     }
