@@ -79,6 +79,50 @@ impl BinOp {
     }
 }
 
+/// Interval arithmetic for a binary op over two uncertainty bands. The four
+/// corner combinations cover every sign case for `*` (and add/sub/div, which are
+/// monotone in each operand, land on corners too); `/` returns `None` when the
+/// denominator band spans zero (the quotient is unbounded). The nominal
+/// `op(v_l, v_r)` always lies inside the returned band, since each operand's
+/// value lies inside its own band.
+fn interval_binop(op: BinOp, l: (f64, f64), r: (f64, f64)) -> Option<(f64, f64)> {
+    let (a, b) = l;
+    let (c, d) = r;
+    let corners = match op {
+        BinOp::Add => [a + c, a + d, b + c, b + d],
+        BinOp::Sub => [a - c, a - d, b - c, b - d],
+        BinOp::Mul => [a * c, a * d, b * c, b * d],
+        BinOp::Div => {
+            if c <= 0.0 && d >= 0.0 {
+                return None; // denominator band contains 0 → unbounded
+            }
+            [a / c, a / d, b / c, b / d]
+        }
+    };
+    if corners.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    let lo = corners.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = corners.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Some((lo, hi))
+}
+
+/// Combine two operands' optional bands for `op`. If either side carries a real
+/// band, propagate (the bandless side is exact, `[v, v]`); if neither does, the
+/// result has no band.
+fn combine_bounds(
+    op: BinOp,
+    lv: f64,
+    lb: Option<(f64, f64)>,
+    rv: f64,
+    rb: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    if lb.is_none() && rb.is_none() {
+        return None;
+    }
+    interval_binop(op, lb.unwrap_or((lv, lv)), rb.unwrap_or((rv, rv)))
+}
+
 /// Wrap an upstream `(t, v)` iterator, applying `op` against a
 /// constant scalar on every emitted point.  `scalar_first = true`
 /// for `scalar OP matrix`, `false` for `matrix OP scalar` — the
@@ -223,7 +267,13 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
                     let left = self.left.next().expect("peek matched");
                     let right = self.right.next().expect("peek matched");
                     if let Some(v) = self.op.apply(left.v, right.v) {
-                        return Some(Point::at(left.t, v));
+                        let bounds =
+                            combine_bounds(self.op, left.v, left.bounds, right.v, right.bounds);
+                        return Some(Point {
+                            t: left.t,
+                            v,
+                            bounds,
+                        });
                     }
                 }
             }
@@ -239,7 +289,7 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
 pub struct RightLookupBinary<'a> {
     upstream: Box<dyn Iterator<Item = Point> + 'a>,
     op: BinOp,
-    rhs: Rc<HashMap<u64, f64>>,
+    rhs: Rc<HashMap<u64, (f64, Option<(f64, f64)>)>>,
 }
 
 impl<'a> Iterator for RightLookupBinary<'a> {
@@ -247,9 +297,10 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 
     fn next(&mut self) -> Option<Point> {
         for p in self.upstream.by_ref() {
-            if let Some(&rv) = self.rhs.get(&p.t) {
+            if let Some(&(rv, rb)) = self.rhs.get(&p.t) {
                 if let Some(v) = self.op.apply(p.v, rv) {
-                    return Some(Point::at(p.t, v));
+                    let bounds = combine_bounds(self.op, p.v, p.bounds, rv, rb);
+                    return Some(Point { t: p.t, v, bounds });
                 }
             }
         }
@@ -304,8 +355,12 @@ pub fn matrix_matrix_op<'a>(
     // engine's per-left fallback for `aggregated / scalar_metric`.
     if !unmatched_left.is_empty() && matches!(spec, MatchSpec::Default) && right_by_key.len() == 1 {
         let (_, right_singleton) = right_by_key.into_iter().next().unwrap();
-        let rhs: Rc<HashMap<u64, f64>> =
-            Rc::new(right_singleton.iter.map(|p| (p.t, p.v)).collect());
+        let rhs: Rc<HashMap<u64, (f64, Option<(f64, f64)>)>> = Rc::new(
+            right_singleton
+                .iter
+                .map(|p| (p.t, (p.v, p.bounds)))
+                .collect(),
+        );
         for left in unmatched_left {
             let iter = RightLookupBinary {
                 upstream: left.iter,
@@ -317,4 +372,56 @@ pub fn matrix_matrix_op<'a>(
     }
 
     out
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    #[test]
+    fn interval_binop_div_positive_bounds() {
+        // [80,120] / [8,12] = [80/12, 120/8]; nominal 100/10=10 stays inside.
+        let (lo, hi) = interval_binop(BinOp::Div, (80.0, 120.0), (8.0, 12.0)).unwrap();
+        assert!((lo - 80.0 / 12.0).abs() < 1e-9, "lo {lo}");
+        assert!((hi - 120.0 / 8.0).abs() < 1e-9, "hi {hi}");
+        assert!(lo <= 10.0 && 10.0 <= hi);
+    }
+
+    #[test]
+    fn interval_binop_div_denominator_spanning_zero_is_none() {
+        assert!(interval_binop(BinOp::Div, (1.0, 2.0), (-1.0, 1.0)).is_none());
+    }
+
+    #[test]
+    fn combine_bounds_none_when_both_exact() {
+        assert!(combine_bounds(BinOp::Div, 100.0, None, 10.0, None).is_none());
+        // one-sided: exact numerator, banded denominator still propagates
+        assert!(combine_bounds(BinOp::Div, 100.0, None, 10.0, Some((8.0, 12.0))).is_some());
+    }
+
+    #[test]
+    fn zip_merge_propagates_division_band() {
+        let l: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
+            t: 1,
+            v: 100.0,
+            bounds: Some((80.0, 120.0)),
+        }));
+        let r: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
+            t: 1,
+            v: 10.0,
+            bounds: Some((8.0, 12.0)),
+        }));
+        let mut z = ZipMergeBinary {
+            left: l.peekable(),
+            right: r.peekable(),
+            op: BinOp::Div,
+        };
+        let p = z.next().unwrap();
+        assert!((p.v - 10.0).abs() < 1e-9);
+        let (lo, hi) = p
+            .bounds
+            .expect("division of two banded series carries a band");
+        assert!(lo <= p.v && p.v <= hi);
+        assert!((lo - 80.0 / 12.0).abs() < 1e-9 && (hi - 120.0 / 8.0).abs() < 1e-9);
+    }
 }
