@@ -349,6 +349,13 @@ pub trait MetricsSource: Send + Sync {
     /// Use this instead of [`time_range()`](Self::time_range) when you need
     /// exact nanosecond timestamps without floating-point precision loss.
     fn time_range_ns(&self) -> Option<(u64, u64)>;
+
+    /// Raw per-sample collection timestamps (ns since epoch), ascending, in
+    /// row order — the un-snapped `timestamp` column. Default empty for
+    /// sources that don't track it (e.g. live `MemoryStore`).
+    fn sample_timestamps(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

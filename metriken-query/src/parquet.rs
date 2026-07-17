@@ -239,6 +239,13 @@ impl ParquetReader {
     pub fn columns(&self, query: &str) -> Result<std::collections::HashSet<String>, QueryError> {
         self.engine.columns(query)
     }
+
+    /// Raw per-sample collection timestamps (ns since epoch), ascending, in
+    /// row order — the un-snapped `timestamp` column, concatenated across
+    /// all files. Unlike query results, this is never gridded or rounded.
+    pub fn sample_timestamps(&self) -> Vec<u64> {
+        self.inner.sample_timestamps()
+    }
 }
 
 impl MetricsSource for ParquetReader {
@@ -314,6 +321,10 @@ impl MetricsSource for ParquetReader {
 
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         self.histogram_labels(name)
+    }
+
+    fn sample_timestamps(&self) -> Vec<u64> {
+        self.sample_timestamps()
     }
 }
 
@@ -782,6 +793,35 @@ impl DataSource for MultiParquetSource {
                 out.entry(metric)
                     .or_insert_with(std::collections::HashMap::new)
                     .extend(cols);
+            }
+        }
+        out
+    }
+}
+
+impl MultiParquetSource {
+    /// Raw `timestamp` column values across every file, in file-list then
+    /// row-group order — un-snapped, unlike the query path (`read_timestamps`)
+    /// which rounds to the nominal sampling grid.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (pf, _labels) in &self.files {
+            let Ok(ts_col_idx) = pf.meta.schema().index_of("timestamp") else {
+                continue;
+            };
+            let num_rgs = pf.meta.metadata().num_row_groups();
+            for rg_idx in 0..num_rgs {
+                match read_raw_u64_rg(pf, rg_idx, ts_col_idx) {
+                    Ok(values) => out.extend(values),
+                    Err(e) => {
+                        tracing::warn!(
+                            source_id = pf.id,
+                            rg_idx,
+                            error = %e,
+                            "skipping row group in sample_timestamps",
+                        );
+                    }
+                }
             }
         }
         out
@@ -1401,6 +1441,65 @@ fn read_timestamps(
     Ok(result)
 }
 
+/// Read raw UInt64 values from `col_idx` in a single row group, in row
+/// order, dropping nulls. Unlike `read_timestamps`, this does NOT snap to
+/// the sampling grid and does NOT go through the buffer pool (which caches
+/// only the snapped form) — callers that need the true on-disk values
+/// (e.g. jitter visualization) need the untouched column.
+fn read_raw_u64_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<u64>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Same bail-on-first-error rationale as read_timestamps: stop this
+                        // row group rather than risk spinning the reader on repeated errors.
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting raw column read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("column is not UInt64".into())?;
+                out.extend(arr.iter().flatten());
+            }
+            Ok(out)
+        });
+    match decode_result {
+        Ok(inner) => inner,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading raw column",
+            );
+            Err(format!(
+                "parquet decode panic reading raw column (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into())
+        }
+    }
+}
+
 fn read_counter_values_per_rg(
     pf: &ParquetSource,
     rg_idx: usize,
@@ -1882,4 +1981,69 @@ fn raw_to_sparse_cumulative(arr: &UInt64Array) -> HistogramSnapshot {
         }
     }
     HistogramSnapshot { index, count }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::metadata::KeyValue;
+    use parquet::file::properties::WriterProperties;
+
+    /// Minimal parquet writer for timestamp-jitter tests: a `timestamp`
+    /// UInt64 column set to exactly `raw` (no grid alignment) plus one dummy
+    /// gauge column, mirroring the schema shape `FixtureBuilder` produces but
+    /// without its "timestamp = tick * interval" grid assumption.
+    fn build_parquet_with_timestamps(raw: &[u64], sampling_interval_ms: u64) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("dummy_gauge", DataType::Int64, true).with_metadata(HashMap::from([
+                ("metric".to_string(), "dummy_gauge".to_string()),
+                ("metric_type".to_string(), "gauge".to_string()),
+            ])),
+        ]));
+
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some(sampling_interval_ms.to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+
+        let ts_array = Arc::new(UInt64Array::from(raw.to_vec())) as ArrayRef;
+        let gauge_array = Arc::new(Int64Array::from(vec![0i64; raw.len()])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ts_array, gauge_array]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    #[test]
+    fn sample_timestamps_returns_raw_unsnapped_values() {
+        // 1s nominal interval, but samples are jittered off the grid.
+        let raw: Vec<u64> = vec![
+            1_000_000_000, // t0
+            2_003_000_000, // +1.003s (late)
+            2_998_000_000, // +0.995s (early)
+            4_001_000_000, // +1.003s
+        ];
+        let bytes = build_parquet_with_timestamps(&raw, 1000);
+        let reader = ParquetReader::open_bytes(bytes).unwrap();
+        assert_eq!(reader.sample_timestamps(), raw);
+    }
+
+    #[test]
+    fn memory_store_sample_timestamps_is_empty_by_default() {
+        let store = crate::MemoryStore::builder().build();
+        assert!(store.sample_timestamps().is_empty());
+    }
 }
