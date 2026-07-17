@@ -294,7 +294,7 @@ mod tests {
             None
         }
 
-        fn value(&self) -> Option<crate::Value> {
+        fn value(&self) -> Option<crate::Value<'_>> {
             None
         }
 

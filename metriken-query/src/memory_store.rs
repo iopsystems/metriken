@@ -636,7 +636,6 @@ mod ingest_tests {
     // Ingest a gauge with `n` 1s samples that are flat at `base` except for a
     // single spike to `spike` in the middle.
     fn store_with_spiky_gauge(n: u64, base: i64, spike: i64) -> (crate::MemoryStore, u64, u64) {
-        use crate::MetricsSource;
         let store = crate::MemoryStore::builder()
             .sampling_interval_ms(1000)
             .build();
