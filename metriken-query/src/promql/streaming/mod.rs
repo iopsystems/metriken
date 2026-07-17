@@ -60,6 +60,12 @@ pub(crate) use rate::{CounterPairwiseRate, CounterRate};
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;
 
+/// An uncertainty interval `(lo, hi)` — either an acquisition-window bound
+/// (rate/irate) or a histogram bucket-resolution band. Aliased so the nested
+/// `Option<Band>` / `Vec<Vec<Option<Band>>>` shapes that thread it through the
+/// pipeline stay readable (and clear clippy's `type_complexity`).
+pub(crate) type Band = (f64, f64);
+
 /// A single sample emitted through a streaming pipeline.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Point {
@@ -67,7 +73,7 @@ pub struct Point {
     pub v: f64,
     /// Uncertainty interval (lo, hi) from acquisition windows; set only by
     /// rate()/irate() (leaf-only). None means exact / not applicable.
-    pub bounds: Option<(f64, f64)>,
+    pub bounds: Option<Band>,
 }
 impl Point {
     /// A point with no uncertainty bound (the default for every producer/operator

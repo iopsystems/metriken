@@ -25,9 +25,16 @@ use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult}
 
 use crate::histogram_stream::{HistogramRow, HistogramStream};
 use crate::labels::Labels;
-use crate::promql::streaming::{derive_group_labels, GroupBy};
+use crate::promql::streaming::{derive_group_labels, Band, GroupBy};
 use crate::promql::{HistogramHeatmapResult, MatrixSample};
 use crate::types::HistogramSnapshot;
+
+/// One `apply_quantiles` output row: `(t_sec, value, optional bucket band)`.
+type QuantileRow = (f64, f64, Option<Band>);
+
+/// Per-group value-uncertainty bands, parallel to a group's values. Aliased to
+/// keep `Option<GroupBands>` readable (clears clippy's `type_complexity`).
+type GroupBands = Vec<Vec<Option<Band>>>;
 
 // ─── impl HistogramStream ────────────────────────────────────────────────────
 
@@ -233,9 +240,7 @@ fn quantiles_impl(
 
     // Per point: (ts_sec, value, Some([bucket.start, bucket.end])) — the value
     // quantization band from the bucket the quantile lands in.
-    #[allow(clippy::type_complexity)]
-    let mut outputs: Vec<Vec<(f64, f64, Option<(f64, f64)>)>> =
-        vec![Vec::new(); quantiles_in.len()];
+    let mut outputs: Vec<Vec<QuantileRow>> = vec![Vec::new(); quantiles_in.len()];
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
@@ -853,7 +858,7 @@ fn apply_quantiles(
     quantile_floats: &[f64],
     keys: &[(usize, f64, Quantile)],
     t_ns: u64,
-    out: &mut [Vec<(f64, f64, Option<(f64, f64)>)>],
+    out: &mut [Vec<QuantileRow>],
 ) {
     let r = CumulativeROHistogram32Ref::from_parts_unchecked(config, idx, cnt);
     let q_result: Result<Option<QuantilesResult>, _> = r.quantiles(quantile_floats);
@@ -888,7 +893,7 @@ fn build_grouped_output(
     // present and every point in a group has a band, the group emits
     // `intervals`; a group with any None point (or no bands at all) emits
     // `intervals: None`.
-    bands_per_group: Option<Vec<Vec<Option<(f64, f64)>>>>,
+    bands_per_group: Option<GroupBands>,
 ) -> Vec<MatrixSample> {
     let mut samples = Vec::new();
     let mut bands_iter = bands_per_group.map(|b| b.into_iter());

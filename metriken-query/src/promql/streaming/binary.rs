@@ -35,7 +35,12 @@ use promql_parser::parser::token::TokenType;
 
 use crate::labels::Labels;
 
-use super::{LabeledSeries, Point, SeriesSet};
+use super::{Band, LabeledSeries, Point, SeriesSet};
+
+/// Timestamp → `(value, optional band)` lookup for the right singleton in a
+/// single-right broadcast. Aliased to keep the `Rc<HashMap<…>>` readable
+/// (clears clippy's `type_complexity`).
+type RightLookup = HashMap<u64, (f64, Option<Band>)>;
 
 /// Subset of PromQL binary operators the streaming pipeline
 /// recognises. Maps directly onto the eager `apply_binary_op`
@@ -289,7 +294,7 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
 pub struct RightLookupBinary<'a> {
     upstream: Box<dyn Iterator<Item = Point> + 'a>,
     op: BinOp,
-    rhs: Rc<HashMap<u64, (f64, Option<(f64, f64)>)>>,
+    rhs: Rc<RightLookup>,
 }
 
 impl<'a> Iterator for RightLookupBinary<'a> {
@@ -355,7 +360,7 @@ pub fn matrix_matrix_op<'a>(
     // engine's per-left fallback for `aggregated / scalar_metric`.
     if !unmatched_left.is_empty() && matches!(spec, MatchSpec::Default) && right_by_key.len() == 1 {
         let (_, right_singleton) = right_by_key.into_iter().next().unwrap();
-        let rhs: Rc<HashMap<u64, (f64, Option<(f64, f64)>)>> = Rc::new(
+        let rhs: Rc<RightLookup> = Rc::new(
             right_singleton
                 .iter
                 .map(|p| (p.t, (p.v, p.bounds)))
