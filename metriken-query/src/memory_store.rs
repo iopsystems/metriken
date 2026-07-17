@@ -627,6 +627,7 @@ mod ingest_tests {
                 name: name.to_string(),
                 value,
                 metadata,
+                window: None,
             }],
             histograms: vec![],
         })
