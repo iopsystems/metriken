@@ -693,3 +693,85 @@ fn histogram_quantile_carries_bucket_value_band() {
         other => panic!("expected Matrix, got {other:?}"),
     }
 }
+
+#[test]
+fn histogram_sum_and_mean_carry_bucket_value_band() {
+    let fixture = FixtureBuilder::new()
+        .samples(20)
+        .row_group_size(20)
+        .point_histogram("latency", &[], 4, 16, 5, 100)
+        // Bucket 100 is in the log region (grouping_power=4 → linear region is
+        // buckets 0..=31), so its [start, end] span is > 1: a real band.
+        .point_histogram("latencylog", &[], 4, 16, 100, 100)
+        .build()
+        .unwrap();
+    let reader = ParquetReader::open(fixture.path()).unwrap();
+    let (start, end) = reader.time_range().unwrap();
+
+    // histogram_sum: nominal = Σ count·midpoint; band = [Σ count·start, Σ count·end].
+    let r = reader
+        .query_range("histogram_sum(latency)", start, end + 1.0, 1.0)
+        .unwrap();
+    match r {
+        QueryResult::Matrix { result } => {
+            assert!(!result.is_empty());
+            let s = &result[0];
+            let ivls = s.intervals.as_ref().expect("sum carries a bucket band");
+            assert_eq!(ivls.len(), s.values.len());
+            for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
+                assert!(*lo <= *v && *v <= *hi, "sum {v} within [{lo}, {hi}]");
+                // Bucket 5 sits in the linear (exact) region, so the band is
+                // degenerate (lo == hi) — honest for exact buckets.
+                assert!(*lo <= *hi);
+            }
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+
+    // The log-region histogram carries a genuinely wide band (lo < hi).
+    let r = reader
+        .query_range("histogram_sum(latencylog)", start, end + 1.0, 1.0)
+        .unwrap();
+    match r {
+        QueryResult::Matrix { result } => {
+            let s = &result[0];
+            let ivls = s.intervals.as_ref().expect("log-region sum carries a band");
+            for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
+                assert!(*lo <= *v && *v <= *hi, "sum {v} within [{lo}, {hi}]");
+                assert!(*lo < *hi, "log-region bucket band has positive width");
+            }
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+
+    // histogram_mean: the sum band divided by N; nominal (midpoint mean) inside.
+    let r = reader
+        .query_range("histogram_mean(latency)", start, end + 1.0, 1.0)
+        .unwrap();
+    match r {
+        QueryResult::Matrix { result } => {
+            let s = &result[0];
+            let ivls = s.intervals.as_ref().expect("mean carries a bucket band");
+            assert_eq!(ivls.len(), s.values.len());
+            for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
+                assert!(*lo <= *v && *v <= *hi, "mean {v} within [{lo}, {hi}]");
+            }
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+
+    // histogram_count is exact — no band.
+    let r = reader
+        .query_range("histogram_count(latency)", start, end + 1.0, 1.0)
+        .unwrap();
+    match r {
+        QueryResult::Matrix { result } => {
+            let s = &result[0];
+            assert!(
+                s.intervals.is_none(),
+                "count is an exact tally, no uncertainty band"
+            );
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+}
