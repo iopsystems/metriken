@@ -603,6 +603,21 @@ fn window_base_is_raw_timestamp_not_snapped() {
             (1_960_300_000u64, 1_980_300_000u64)
         ])
     );
+
+    // 117↔118 contract: the window base must be exactly what sample_timestamps()
+    // (#118, raw un-snapped column) reports — both read the same raw clock. So
+    // window_begin[i] - begin_offset[i] == sample_timestamps()[i].
+    let raw = reader.sample_timestamps();
+    assert_eq!(raw, vec![1_000_500_000u64, 2_000_300_000u64]);
+    let begins = w.unwrap();
+    let offsets = [-50_000_000i64, -40_000_000i64];
+    for (i, (begin, _)) in begins.iter().enumerate() {
+        assert_eq!(
+            (*begin as i64 - offsets[i]) as u64,
+            raw[i],
+            "window base at row {i} equals the raw sample timestamp"
+        );
+    }
 }
 
 #[test]
