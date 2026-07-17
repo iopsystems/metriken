@@ -28,7 +28,8 @@ use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp, CounterIrate,
+    aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp,
+    CounterIrate,
     CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
     GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
@@ -275,11 +276,21 @@ fn scalar_op_matrix(
         for (i, (t, v)) in sample.values.iter().enumerate() {
             let Some(nv) = apply(*v) else { continue };
             vals.push((*t, nv));
+            // Propagate the band via the same interval arithmetic as the
+            // streaming scalar op (treat the scalar as exact `[scalar, scalar]`),
+            // so a spanning-zero denominator under `scalar / value` yields no
+            // band instead of a bogus narrow one. Histogram bands are currently
+            // non-negative so this path can't hit that case today, but it stays
+            // consistent with ScalarBroadcast.
+            let sb = (scalar, scalar);
             if let Some((lo, hi)) = sample.intervals.as_ref().and_then(|iv| iv.get(i)) {
-                if let (Some(a), Some(b)) = (apply(*lo), apply(*hi)) {
-                    if a.is_finite() && b.is_finite() {
-                        ivls.push((a.min(b), a.max(b)));
-                    }
+                let band = if scalar_first {
+                    interval_binop(op, sb, (*lo, *hi))
+                } else {
+                    interval_binop(op, (*lo, *hi), sb)
+                };
+                if let Some(bb) = band {
+                    ivls.push(bb);
                 }
             }
         }

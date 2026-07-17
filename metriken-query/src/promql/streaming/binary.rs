@@ -90,7 +90,7 @@ impl BinOp {
 /// denominator band spans zero (the quotient is unbounded). The nominal
 /// `op(v_l, v_r)` always lies inside the returned band, since each operand's
 /// value lies inside its own band.
-fn interval_binop(op: BinOp, l: (f64, f64), r: (f64, f64)) -> Option<(f64, f64)> {
+pub(crate) fn interval_binop(op: BinOp, l: (f64, f64), r: (f64, f64)) -> Option<(f64, f64)> {
     let (a, b) = l;
     let (c, d) = r;
     let corners = match op {
@@ -153,17 +153,21 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
         };
         for p in self.upstream.by_ref() {
             if let Some(r) = apply(p.v) {
-                // Propagate the uncertainty band through the scalar op: add/sub/
-                // mul/div by a constant are monotonic in the value, so the band
-                // endpoints map to endpoints; min/max normalizes any reordering
-                // (negative scalar, or `scalar / value`). So `rate(x[1m]) * 8`
-                // carries a scaled band. (Series OP series stays bounds-less —
-                // that is deferred Tier-1 propagation.)
-                let bounds = p.bounds.and_then(|(lo, hi)| match (apply(lo), apply(hi)) {
-                    (Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
-                        Some((a.min(b), a.max(b)))
+                // Propagate the uncertainty band through the scalar op via the
+                // same interval arithmetic as series-op-series: treat the scalar
+                // as an exact band `[scalar, scalar]`. This handles the tricky
+                // `scalar / value` case where the value's band spans zero — the
+                // reciprocal is non-monotonic and unbounded, so `interval_binop`
+                // returns None rather than a bogus narrow interval that would
+                // exclude the nominal. `rate(x[1m]) * 8` still carries a scaled
+                // band. (Naively mapping the band endpoints was wrong here.)
+                let sb = (self.scalar, self.scalar);
+                let bounds = p.bounds.and_then(|b| {
+                    if scalar_first {
+                        interval_binop(op, sb, b)
+                    } else {
+                        interval_binop(op, b, sb)
                     }
-                    _ => None,
                 });
                 return Some(Point {
                     t: p.t,
@@ -428,5 +432,52 @@ mod interval_tests {
             .expect("division of two banded series carries a band");
         assert!(lo <= p.v && p.v <= hi);
         assert!((lo - 80.0 / 12.0).abs() < 1e-9 && (hi - 120.0 / 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scalar_over_series_div_spanning_zero_drops_band() {
+        // `10 / value` where the value's band strictly spans zero: x ↦ 10/x is
+        // non-monotonic and unbounded near 0, so applying the op to the band
+        // endpoints yields a narrow finite interval that EXCLUDES the nominal.
+        // The correct answer is "no finite band" (None). Regression for the
+        // ScalarBroadcast reciprocal bug.
+        let up: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
+            t: 1,
+            v: 0.1,
+            bounds: Some((-4.0, 4.0)),
+        }));
+        let mut sb = ScalarBroadcast {
+            upstream: up,
+            op: BinOp::Div,
+            scalar: 10.0,
+            scalar_first: true,
+        };
+        let p = sb.next().unwrap();
+        assert!((p.v - 100.0).abs() < 1e-9, "nominal 10/0.1 = 100");
+        assert!(
+            p.bounds.is_none(),
+            "spanning-zero denominator ⇒ unbounded ⇒ no band, got {:?}",
+            p.bounds
+        );
+    }
+
+    #[test]
+    fn scalar_over_series_div_positive_band_contains_nominal() {
+        // Guard the fix doesn't over-drop: `10 / [8,12]`, nominal 10/10 = 1.0,
+        // band [10/12, 10/8] still propagates and contains the nominal.
+        let up: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
+            t: 1,
+            v: 10.0,
+            bounds: Some((8.0, 12.0)),
+        }));
+        let mut sb = ScalarBroadcast {
+            upstream: up,
+            op: BinOp::Div,
+            scalar: 10.0,
+            scalar_first: true,
+        };
+        let p = sb.next().unwrap();
+        let (lo, hi) = p.bounds.expect("positive denominator band propagates");
+        assert!(lo <= p.v && p.v <= hi, "nominal {} in [{lo}, {hi}]", p.v);
     }
 }
