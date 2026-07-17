@@ -233,7 +233,10 @@ impl CounterGroup {
     }
 
     /// Load the counter at `idx` and its acquisition window as a torn-safe
-    /// pair. Returns `(None, None)` if `idx` is out of bounds.
+    /// pair — provided writers use [`set_with_window`](CounterGroup::set_with_window),
+    /// not the lock-free `set`/`add`/`increment` (see that method's torn-safety
+    /// caveat; the enforced path is [`WindowedCounterGroup`](crate::WindowedCounterGroup)).
+    /// Returns `(None, None)` if `idx` is out of bounds.
     pub fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
         if idx >= self.entries {
             return (None, None);

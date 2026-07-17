@@ -86,6 +86,13 @@ impl<'a> Iterator for CounterRate<'a> {
                     let (b_last, e_last) = *w.get(hi - 1)?;
                     let elapsed_max = e_last.saturating_sub(b_first) as f64 / 1e9;
                     let elapsed_min = b_last.saturating_sub(e_first) as f64 / 1e9;
+                    // A well-formed window pair gives elapsed_min ≤ elapsed_max
+                    // (both > 0). Overlapping / out-of-order / end<begin windows
+                    // make b_last ≤ e_first, saturating elapsed_min to 0 → this
+                    // point gets no band. Conservative but all-or-nothing: since
+                    // collect_to_matrix only emits `intervals` when EVERY point
+                    // has a band, one such degenerate window drops the whole
+                    // series' band. Acceptable (better no band than a wrong one).
                     if elapsed_min > 0.0 && elapsed_max > 0.0 {
                         Some((total_increase / elapsed_max, total_increase / elapsed_min))
                     } else {

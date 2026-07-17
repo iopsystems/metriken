@@ -272,7 +272,10 @@ impl GaugeGroup {
         true
     }
 
-    /// Load the gauge at `idx` and its acquisition window as a torn-safe pair.
+    /// Load the gauge at `idx` and its acquisition window as a torn-safe pair —
+    /// provided writers use [`set_with_window`](GaugeGroup::set_with_window), not
+    /// the lock-free `set` (see that method's torn-safety caveat; the enforced
+    /// path is [`WindowedGaugeGroup`](crate::WindowedGaugeGroup)).
     /// The value is `None` if `idx` is out of bounds or the slot has never been
     /// written (still the `i64::MIN` sentinel).
     pub fn load_with_window(&self, idx: usize) -> (Option<i64>, Option<Window>) {

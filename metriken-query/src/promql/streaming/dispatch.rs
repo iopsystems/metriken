@@ -29,9 +29,8 @@ use promql_parser::parser::{self, Expr};
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
     aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp,
-    CounterIrate,
-    CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
-    GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    CounterIrate, CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta,
+    GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{MatrixSample, QueryError, QueryResult};
 use crate::DataSource;

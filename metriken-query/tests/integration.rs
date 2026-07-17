@@ -671,8 +671,9 @@ fn rate_query_carries_intervals_leaf_only() {
     }
 
     // Scalar op → interval PROPAGATES (scaled by the constant): the band from
-    // the bare rate, multiplied by 60. Series-OP-series is still bounds-less
-    // (deferred Tier-1), but scalar ops carry the band so `rate(x)*k` works.
+    // the bare rate, multiplied by 60. (Bands also propagate through sum/avg
+    // aggregation and series-op-series binary ops; see the binary/aggregate
+    // interval tests.)
     let bare = match &r {
         QueryResult::Matrix { result } => result[0].intervals.clone().unwrap(),
         _ => unreachable!(),

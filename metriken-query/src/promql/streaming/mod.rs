@@ -71,8 +71,9 @@ pub(crate) type Band = (f64, f64);
 pub struct Point {
     pub t: u64,
     pub v: f64,
-    /// Uncertainty interval (lo, hi) from acquisition windows; set only by
-    /// rate()/irate() (leaf-only). None means exact / not applicable.
+    /// Uncertainty interval (lo, hi) from acquisition windows; originated by
+    /// rate()/irate() and propagated through scalar ops, aggregation, and
+    /// series-op-series binary ops. None means exact / not applicable.
     pub bounds: Option<Band>,
 }
 impl Point {
@@ -150,9 +151,11 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
                 return None;
             }
             let values: Vec<(f64, f64)> = points.iter().map(|(v, _)| *v).collect();
-            // Rate output is uniform (all points have bounds, or none do). Emit
-            // intervals only when every point carries one; else None (leaf-only:
-            // any operator upstream produced bounds-less points).
+            // Emit intervals only when every point carries a band; else None.
+            // Bands originate at rate()/irate() (and histogram value bands) and
+            // propagate through scalar ops, sum/avg aggregation, and
+            // series-op-series binary ops — but an unsupported operator upstream
+            // (e.g. min/max) drops them, making the series non-uniform.
             let intervals: Option<Vec<(f64, f64)>> = if points.iter().all(|(_, b)| b.is_some()) {
                 Some(points.iter().map(|(_, b)| b.unwrap()).collect())
             } else {
