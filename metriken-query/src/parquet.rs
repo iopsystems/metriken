@@ -1744,6 +1744,14 @@ fn read_counters(
             _ => {}
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
+        // Window offsets were written by the recorder relative to the RAW
+        // (un-snapped) timestamp, and `time_range`/the stats bounds are raw too,
+        // so filter and reconstruct windows against the raw column; the emitted
+        // point keeps the snapped grid for cross-series alignment. (The ts column
+        // is non-nullable, so the raw Vec aligns 1:1 with the snapped one; guard
+        // on length and fall back to snapped if that ever fails to hold.)
+        let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
+        let raw_aligned = raw_ts.len() == timestamps.len();
         for (i, col) in cols.iter().enumerate() {
             let values = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
             debug_assert_eq!(
@@ -1761,7 +1769,8 @@ fn read_counters(
                 .transpose()?;
             for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
-                    if *ts >= start_ns && *ts <= end_ns {
+                    let base = if raw_aligned { raw_ts[row] } else { *ts };
+                    if base >= start_ns && base <= end_ns {
                         ts_acc[i].push(*ts);
                         val_acc[i].push(*v);
                         if let Some(w) = win_acc[i].as_mut() {
@@ -1769,12 +1778,15 @@ fn read_counters(
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
                             match (bo, wd) {
                                 (Some(bo), Some(wd)) => {
-                                    let begin_ns = (*ts as i64 + bo) as u64;
-                                    w.push((begin_ns, begin_ns + wd));
+                                    // saturating + clamp-to-0: a corrupt/huge
+                                    // negative offset can't wrap into a bogus
+                                    // giant u64 or overflow i64.
+                                    let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
+                                    w.push((begin_ns, begin_ns.saturating_add(wd)));
                                 }
                                 // window columns present but null for this row:
-                                // degenerate window at the timestamp.
-                                _ => w.push((*ts, *ts)),
+                                // degenerate window at the raw sample time.
+                                _ => w.push((base, base)),
                             }
                         }
                     }
@@ -1853,6 +1865,11 @@ fn read_gauges(
             _ => {}
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
+        // See read_counters: windows and the stats time range live in RAW
+        // timestamp space, so filter and anchor windows on the raw column while
+        // emitting the snapped grid point for alignment.
+        let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
+        let raw_aligned = raw_ts.len() == timestamps.len();
         for (i, col) in cols.iter().enumerate() {
             let values = read_gauge_values_per_rg(pf, rg_idx, col.col_idx)?;
             debug_assert_eq!(
@@ -1870,7 +1887,8 @@ fn read_gauges(
                 .transpose()?;
             for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
-                    if *ts >= start_ns && *ts <= end_ns {
+                    let base = if raw_aligned { raw_ts[row] } else { *ts };
+                    if base >= start_ns && base <= end_ns {
                         ts_acc[i].push(*ts);
                         val_acc[i].push(*v);
                         if let Some(w) = win_acc[i].as_mut() {
@@ -1878,12 +1896,15 @@ fn read_gauges(
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
                             match (bo, wd) {
                                 (Some(bo), Some(wd)) => {
-                                    let begin_ns = (*ts as i64 + bo) as u64;
-                                    w.push((begin_ns, begin_ns + wd));
+                                    // saturating + clamp-to-0: a corrupt/huge
+                                    // negative offset can't wrap into a bogus
+                                    // giant u64 or overflow i64.
+                                    let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
+                                    w.push((begin_ns, begin_ns.saturating_add(wd)));
                                 }
                                 // window columns present but null for this row:
-                                // degenerate window at the timestamp.
-                                _ => w.push((*ts, *ts)),
+                                // degenerate window at the raw sample time.
+                                _ => w.push((base, base)),
                             }
                         }
                     }

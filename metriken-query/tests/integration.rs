@@ -538,6 +538,74 @@ fn counter_carries_reconstructed_windows() {
 }
 
 #[test]
+fn window_base_is_raw_timestamp_not_snapped() {
+    // Window offsets are written by the recorder relative to the RAW (un-snapped)
+    // timestamp. When timestamps are OFF the sampling grid (jitter), the reader
+    // must anchor the window on the raw timestamp, not the snapped query grid —
+    // otherwise windows shift by the snap error. Regression for W1 (unify with
+    // sample_timestamps()).
+    use arrow::array::{Int64Array, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::collections::HashMap;
+
+    let ts = Field::new("timestamp", DataType::UInt64, false);
+    let counter = Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+        ("metric".to_string(), "cpu_cycles".to_string()),
+        ("metric_type".to_string(), "counter".to_string()),
+    ]));
+    let wbegin = Field::new("cpu_cycles:window_begin", DataType::Int64, true);
+    let wwidth = Field::new("cpu_cycles:window_width", DataType::UInt64, true);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![ts, counter, wbegin, wwidth],
+        HashMap::from([
+            ("source".to_string(), "rezolus".to_string()),
+            ("sampling_interval_ms".to_string(), "1000".to_string()),
+        ]),
+    ));
+
+    // Off-grid raw timestamps: +0.5ms and +0.3ms past the 1s grid. snap_timestamp
+    // rounds these to 1.0s / 2.0s, so a snapped base would corrupt the window.
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1_000_500_000u64, 2_000_300_000u64])),
+            Arc::new(UInt64Array::from(vec![Some(100u64), Some(400u64)])),
+            Arc::new(Int64Array::from(vec![
+                Some(-50_000_000i64),
+                Some(-40_000_000i64),
+            ])),
+            Arc::new(UInt64Array::from(vec![
+                Some(30_000_000u64),
+                Some(20_000_000u64),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    let reader = ParquetReader::open_bytes(bytes).unwrap();
+    let w = reader.counter_windows_for_test("cpu_cycles");
+    // Raw base: 1_000_500_000 - 50_000_000 = 950_500_000 (+30ms width), and
+    // 2_000_300_000 - 40_000_000 = 1_960_300_000 (+20ms width). A snapped base
+    // would (wrongly) give 950_000_000 / 1_960_000_000.
+    assert_eq!(
+        w,
+        Some(vec![
+            (950_500_000u64, 980_500_000u64),
+            (1_960_300_000u64, 1_980_300_000u64)
+        ])
+    );
+}
+
+#[test]
 fn rate_query_carries_intervals_leaf_only() {
     use arrow::array::{Int64Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
