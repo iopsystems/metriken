@@ -30,8 +30,12 @@ pub enum QueryError {
     MetricNotFound(String),
 }
 
-/// A single sample in the result
+/// A single sample in the result.
+///
+/// `#[non_exhaustive]`: build with [`Sample::new`] + [`with_interval`](Sample::with_interval)
+/// so future per-sample fields don't break downstream construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Sample {
     pub metric: HashMap<String, String>,
     pub value: (f64, f64), // (timestamp_seconds, value)
@@ -39,13 +43,52 @@ pub struct Sample {
     pub interval: Option<(f64, f64)>,
 }
 
-/// A matrix sample with multiple values over time
+impl Sample {
+    /// A sample with no uncertainty interval. Add one with [`with_interval`](Self::with_interval).
+    pub fn new(metric: HashMap<String, String>, value: (f64, f64)) -> Self {
+        Self {
+            metric,
+            value,
+            interval: None,
+        }
+    }
+
+    /// Attach (or clear) the measurement-uncertainty interval `(lo, hi)`.
+    pub fn with_interval(mut self, interval: Option<(f64, f64)>) -> Self {
+        self.interval = interval;
+        self
+    }
+}
+
+/// A matrix sample with multiple values over time.
+///
+/// `#[non_exhaustive]`: build with [`MatrixSample::new`] +
+/// [`with_intervals`](MatrixSample::with_intervals).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MatrixSample {
     pub metric: HashMap<String, String>,
     pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervals: Option<Vec<(f64, f64)>>,
+}
+
+impl MatrixSample {
+    /// A matrix sample with no uncertainty band. Add one with
+    /// [`with_intervals`](Self::with_intervals).
+    pub fn new(metric: HashMap<String, String>, values: Vec<(f64, f64)>) -> Self {
+        Self {
+            metric,
+            values,
+            intervals: None,
+        }
+    }
+
+    /// Attach (or clear) the per-value uncertainty band, parallel to `values`.
+    pub fn with_intervals(mut self, intervals: Option<Vec<(f64, f64)>>) -> Self {
+        self.intervals = intervals;
+        self
+    }
 }
 
 /// Histogram heatmap data for visualization

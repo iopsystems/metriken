@@ -2215,12 +2215,11 @@ fn test_memory_store_label_values_ingest() {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
-            counters: vec![metriken_exposition::Counter {
-                name: name.to_string(),
+            counters: vec![metriken_exposition::Counter::new(
+                name.to_string(),
                 value,
                 metadata,
-                window: None,
-            }],
+            )],
             gauges: vec![],
             histograms: vec![],
         })

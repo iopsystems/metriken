@@ -8,8 +8,14 @@ use rmp_serde::encode::Error as SerializeMsgpackError;
 #[cfg(feature = "json")]
 use serde_json::Error as JsonError;
 
+// These carry all-public fields but are `#[non_exhaustive]` so future
+// per-observation fields (beyond `window`) can be added without breaking
+// downstream construction. Build them with `new(..)` + `with_window(..)`
+// rather than a struct literal.
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Counter {
     pub name: String,
     pub value: u64,
@@ -21,8 +27,27 @@ pub struct Counter {
     pub window: Option<Window>,
 }
 
+impl Counter {
+    /// A counter with no acquisition window. Add one with [`with_window`](Self::with_window).
+    pub fn new(name: String, value: u64, metadata: HashMap<String, String>) -> Self {
+        Self {
+            name,
+            value,
+            metadata,
+            window: None,
+        }
+    }
+
+    /// Attach (or clear) the acquisition window.
+    pub fn with_window(mut self, window: Option<Window>) -> Self {
+        self.window = window;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Gauge {
     pub name: String,
     pub value: i64,
@@ -34,8 +59,27 @@ pub struct Gauge {
     pub window: Option<Window>,
 }
 
+impl Gauge {
+    /// A gauge with no acquisition window. Add one with [`with_window`](Self::with_window).
+    pub fn new(name: String, value: i64, metadata: HashMap<String, String>) -> Self {
+        Self {
+            name,
+            value,
+            metadata,
+            window: None,
+        }
+    }
+
+    /// Attach (or clear) the acquisition window.
+    pub fn with_window(mut self, window: Option<Window>) -> Self {
+        self.window = window;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Histogram {
     pub name: String,
     pub value: histogram::Histogram,
@@ -45,6 +89,28 @@ pub struct Histogram {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub window: Option<Window>,
+}
+
+impl Histogram {
+    /// A histogram with no acquisition window. Add one with [`with_window`](Self::with_window).
+    pub fn new(
+        name: String,
+        value: histogram::Histogram,
+        metadata: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            name,
+            value,
+            metadata,
+            window: None,
+        }
+    }
+
+    /// Attach (or clear) the acquisition window.
+    pub fn with_window(mut self, window: Option<Window>) -> Self {
+        self.window = window;
+        self
+    }
 }
 
 /// Contains a snapshot of metric readings.
