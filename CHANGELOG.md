@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.14.1
+
+- Fleet fallback acquisition window: a windowless file with a `duration` column
+  now gets a coarse per-snapshot window `[timestamp, timestamp + duration]`, so
+  `rate()`/`irate()` carry uncertainty bands on older/plain-parquet recordings.
+  Per-observation `:window_*` sidecars still take precedence.
+
 ### Measurement uncertainty: acquisition windows + rate() error bars (#117)
 
 A cross-crate, breaking release. Metrics can now carry a per-observation

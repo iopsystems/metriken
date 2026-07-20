@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1]
+
+### Added
+
+- Fleet fallback acquisition window. When a metric has no per-observation
+  `:window_*` sidecar but the file carries a `duration` column, synthesize a
+  coarse per-snapshot window `[timestamp, timestamp + duration]` (the same
+  `[begin, begin+elapsed]` shape the agent records). This gives `rate()`/`irate()`
+  measurement-uncertainty bands on windowless recordings (older files, plain
+  `.parquet`) that previously had none. Per-observation sidecars still take
+  precedence where present (`.rez` / live), so tight windows are unchanged.
+
 ## [0.14.0]
 
 ### Added
