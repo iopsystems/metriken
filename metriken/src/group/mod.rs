@@ -2,6 +2,7 @@ mod counter;
 mod gauge;
 mod histogram;
 pub(crate) mod metadata;
+pub(crate) mod windows;
 
 pub use counter::CounterGroup;
 pub use gauge::GaugeGroup;

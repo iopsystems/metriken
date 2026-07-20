@@ -31,6 +31,7 @@ mod metrics;
 mod null;
 mod provide;
 mod traits;
+mod window;
 mod wrapper;
 
 pub use crate::formatter::{default_formatter, Format};
@@ -40,6 +41,7 @@ pub use crate::provide::{request_ref, request_value, Request};
 pub use crate::traits::{
     CounterGroupMetric, GaugeGroupMetric, HistogramGroupMetric, HistogramMetric,
 };
+pub use crate::window::Window;
 
 /// Global interface to a metric.
 ///
@@ -66,6 +68,31 @@ pub trait Metric: Send + Sync + 'static {
     /// [`Value`] then return [`Value::Other`] and metric consumers can use
     /// [`as_any`](crate::Metric::as_any) to specifically handle your metric.
     fn value(&self) -> Option<Value<'_>>;
+
+    /// Get this metric's acquisition window, if one has been recorded.
+    ///
+    /// The acquisition window is the interval over which the metric's value
+    /// was read. Default: `None` — most metrics do not record a window. The
+    /// windowed scalar wrappers (`WindowedLazyCounter`, `WindowedLazyGauge`)
+    /// and the base `RwLockHistogram` override this to return the window
+    /// recorded by `set_with_window`.
+    fn load_window(&self) -> Option<Window> {
+        None
+    }
+
+    /// Get this metric's value and its acquisition window as a torn-safe pair.
+    ///
+    /// Consumers that need a self-consistent `(value, window)` pair (such as
+    /// exposition) must call this instead of pairing separate `value()` and
+    /// `load_window()` reads, which can tear under a concurrent
+    /// `set_with_window`. Default: `(self.value(), None)`. The windowed scalar
+    /// wrappers (`WindowedLazyCounter`, `WindowedLazyGauge`) and the base
+    /// `RwLockHistogram` override this to read both the value and the window
+    /// under a single acquisition of their window lock, so the pair is never
+    /// torn.
+    fn value_with_window(&self) -> (Option<Value<'_>>, Option<Window>) {
+        (self.value(), None)
+    }
 
     /// Provides type based access to context.
     ///
@@ -116,6 +143,7 @@ pub struct MetricEntry {
     metric: *const dyn Metric,
     name: Cow<'static, str>,
     description: Option<Cow<'static, str>>,
+    module: Cow<'static, str>,
 }
 
 impl MetricEntry {
@@ -127,6 +155,12 @@ impl MetricEntry {
     /// Get the name of this metric.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Get the module path where this metric was defined (`module_path!()` at
+    /// the `#[metric]` definition site).
+    pub fn module(&self) -> &str {
+        &self.module
     }
 
     /// Get the description of this metric.
@@ -230,6 +264,7 @@ pub mod export {
         metric: &'static dyn Metric,
         name: &'static str,
         description: Option<&'static str>,
+        module: &'static str,
     ) -> crate::MetricEntry {
         use std::borrow::Cow;
 
@@ -240,6 +275,7 @@ pub mod export {
                 Some(desc) => Some(Cow::Borrowed(desc)),
                 None => None,
             },
+            module: Cow::Borrowed(module),
         }
     }
 
@@ -255,6 +291,7 @@ macro_rules! declare_metric_v1 {
         metric: $metric:expr,
         name: $name:expr,
         description: $description:expr,
+        module: $module:expr,
         metadata: { $( $key:expr => $value:expr ),* $(,)? },
         formatter: $formatter:expr $(,)?
     } => {
@@ -283,6 +320,7 @@ macro_rules! declare_metric_v1 {
                 $crate::export::MetricWrapper::<_, MetricProvider>::from_ref(&$metric),
                 $name,
                 $description,
+                $module,
             );
         };
     }

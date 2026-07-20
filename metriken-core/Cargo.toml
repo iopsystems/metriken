@@ -17,8 +17,15 @@ repository = "https://github.com/pelikan-io/rustcommon"
 # turn that into a compile-time error by using the links directive.
 links = "metriken-core"
 
+[features]
+serde = ["dep:serde"]
+
 [dependencies]
 histogram.workspace = true
 linkme = "0.3"
 parking_lot.workspace = true
 phf = { version = "0.13", features = ["macros"] }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

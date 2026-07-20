@@ -167,6 +167,22 @@ impl ParquetReader {
         self.engine.time_range()
     }
 
+    /// Test-only accessor: read the counter series named `name` over the full
+    /// time range and return the first series' reconstructed acquisition windows.
+    /// Routes through the same `read_counters` path production queries use.
+    #[cfg(feature = "fixtures")]
+    pub fn counter_windows_for_test(&self, name: &str) -> Option<Vec<(u64, u64)>> {
+        let (start, end) = self.time_range_ns()?;
+        let filter = Labels::default();
+        for (pf, _extra) in &self.inner.files {
+            let counters = read_counters(pf, name, &filter, start, end).ok()?;
+            if let Some(c) = counters.series.into_iter().next() {
+                return c.windows;
+            }
+        }
+        None
+    }
+
     /// Names of all counter metrics across all files (sorted, deduplicated).
     pub fn counter_names(&self) -> Vec<String> {
         self.engine.counter_names()
@@ -1245,12 +1261,27 @@ struct ColDesc {
     labels: Labels,
     column_name: String,
     kind: ColKind,
+    /// Column index of this metric's `<m>:window_begin` sidecar (Int64 offset), if present.
+    begin_col: Option<usize>,
+    /// Column index of this metric's `<m>:window_width` sidecar (UInt64 ns), if present.
+    width_col: Option<usize>,
 }
 
 fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
-    pf.meta
-        .schema()
-        .fields()
+    let fields = pf.meta.schema().fields();
+    // Pass 1: window sidecar column indices, keyed by base column name.
+    let mut win_begin: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut win_width: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (col_idx, field) in fields.iter().enumerate() {
+        let n = field.name();
+        if let Some(base) = n.strip_suffix(":window_begin") {
+            win_begin.insert(base.to_string(), col_idx);
+        } else if let Some(base) = n.strip_suffix(":window_width") {
+            win_width.insert(base.to_string(), col_idx);
+        }
+    }
+    // Pass 2: metric ColDescs, attaching window indices by column name.
+    fields
         .iter()
         .enumerate()
         .filter_map(|(col_idx, field)| {
@@ -1259,6 +1290,19 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             }
             let mut meta = field.metadata().clone();
             let column_name = field.name().to_string();
+            // Per-metric acquisition-window sidecar columns (`<m>:window_begin`
+            // Int64, `<m>:window_width` UInt64) describe the base metric's
+            // observation window — they are not metrics. Without this skip they
+            // would classify by Arrow type as a phantom gauge / counter. The
+            // window path reads them for rate/histogram error bars.
+            //
+            // NOTE: `:window_begin` / `:window_width` are therefore RESERVED
+            // suffixes — a real metric literally named `foo:window_begin` would
+            // be silently treated as a sidecar and dropped. Acceptable given the
+            // recorder never emits such names, but the reservation is intentional.
+            if column_name.ends_with(":window_begin") || column_name.ends_with(":window_width") {
+                return None;
+            }
             let name = meta.get("metric").cloned().unwrap_or_else(|| {
                 column_name
                     .strip_suffix(":buckets")
@@ -1292,12 +1336,16 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 }
                 _ => return None,
             };
+            let begin_col = win_begin.get(&column_name).copied();
+            let width_col = win_width.get(&column_name).copied();
             Some(ColDesc {
                 col_idx,
                 name,
                 labels,
                 column_name,
                 kind,
+                begin_col,
+                width_col,
             })
         })
         .collect()
@@ -1679,6 +1727,16 @@ fn read_counters(
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
+        .iter()
+        .map(|c| {
+            if c.begin_col.is_some() && c.width_col.is_some() {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for rg_idx in 0..num_rgs {
         match rg_classify(
@@ -1691,6 +1749,14 @@ fn read_counters(
             _ => {}
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
+        // Window offsets were written by the recorder relative to the RAW
+        // (un-snapped) timestamp, and `time_range`/the stats bounds are raw too,
+        // so filter and reconstruct windows against the raw column; the emitted
+        // point keeps the snapped grid for cross-series alignment. (The ts column
+        // is non-nullable, so the raw Vec aligns 1:1 with the snapped one; guard
+        // on length and fall back to snapped if that ever fails to hold.)
+        let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
+        let raw_aligned = raw_ts.len() == timestamps.len();
         for (i, col) in cols.iter().enumerate() {
             let values = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
             debug_assert_eq!(
@@ -1698,11 +1764,36 @@ fn read_counters(
                 timestamps.len(),
                 "row count mismatch in row group"
             );
-            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+            let begins = col
+                .begin_col
+                .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            let widths = col
+                .width_col
+                .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
-                    if *ts >= start_ns && *ts <= end_ns {
+                    let base = if raw_aligned { raw_ts[row] } else { *ts };
+                    if base >= start_ns && base <= end_ns {
                         ts_acc[i].push(*ts);
                         val_acc[i].push(*v);
+                        if let Some(w) = win_acc[i].as_mut() {
+                            let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                            let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                            match (bo, wd) {
+                                (Some(bo), Some(wd)) => {
+                                    // saturating + clamp-to-0: a corrupt/huge
+                                    // negative offset can't wrap into a bogus
+                                    // giant u64 or overflow i64.
+                                    let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
+                                    w.push((begin_ns, begin_ns.saturating_add(wd)));
+                                }
+                                // window columns present but null for this row:
+                                // degenerate window at the raw sample time.
+                                _ => w.push((base, base)),
+                            }
+                        }
                     }
                 }
             }
@@ -1714,11 +1805,13 @@ fn read_counters(
             .into_iter()
             .zip(ts_acc)
             .zip(val_acc)
-            .filter(|((_, ts), _)| !ts.is_empty())
-            .map(|((col, timestamps), values)| Counter {
+            .zip(win_acc)
+            .filter(|(((_, ts), _), _)| !ts.is_empty())
+            .map(|(((col, timestamps), values), windows)| Counter {
                 labels: col.labels,
                 timestamps,
                 values,
+                windows,
             })
             .collect(),
     })
@@ -1755,6 +1848,16 @@ fn read_gauges(
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<i64>> = vec![Vec::new(); cols.len()];
+    let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
+        .iter()
+        .map(|c| {
+            if c.begin_col.is_some() && c.width_col.is_some() {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for rg_idx in 0..num_rgs {
         match rg_classify(
@@ -1767,6 +1870,11 @@ fn read_gauges(
             _ => {}
         }
         let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
+        // See read_counters: windows and the stats time range live in RAW
+        // timestamp space, so filter and anchor windows on the raw column while
+        // emitting the snapped grid point for alignment.
+        let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
+        let raw_aligned = raw_ts.len() == timestamps.len();
         for (i, col) in cols.iter().enumerate() {
             let values = read_gauge_values_per_rg(pf, rg_idx, col.col_idx)?;
             debug_assert_eq!(
@@ -1774,11 +1882,36 @@ fn read_gauges(
                 timestamps.len(),
                 "row count mismatch in row group"
             );
-            for (ts_opt, val_opt) in timestamps.iter().zip(values.iter()) {
+            let begins = col
+                .begin_col
+                .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            let widths = col
+                .width_col
+                .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+                .transpose()?;
+            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
-                    if *ts >= start_ns && *ts <= end_ns {
+                    let base = if raw_aligned { raw_ts[row] } else { *ts };
+                    if base >= start_ns && base <= end_ns {
                         ts_acc[i].push(*ts);
                         val_acc[i].push(*v);
+                        if let Some(w) = win_acc[i].as_mut() {
+                            let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                            let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                            match (bo, wd) {
+                                (Some(bo), Some(wd)) => {
+                                    // saturating + clamp-to-0: a corrupt/huge
+                                    // negative offset can't wrap into a bogus
+                                    // giant u64 or overflow i64.
+                                    let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
+                                    w.push((begin_ns, begin_ns.saturating_add(wd)));
+                                }
+                                // window columns present but null for this row:
+                                // degenerate window at the raw sample time.
+                                _ => w.push((base, base)),
+                            }
+                        }
                     }
                 }
             }
@@ -1790,11 +1923,13 @@ fn read_gauges(
             .into_iter()
             .zip(ts_acc)
             .zip(val_acc)
-            .filter(|((_, ts), _)| !ts.is_empty())
-            .map(|((col, timestamps), values)| Gauge {
+            .zip(win_acc)
+            .filter(|(((_, ts), _), _)| !ts.is_empty())
+            .map(|(((col, timestamps), values), windows)| Gauge {
                 labels: col.labels,
                 timestamps,
                 values,
+                windows,
             })
             .collect(),
     })

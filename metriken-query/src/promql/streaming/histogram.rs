@@ -25,9 +25,16 @@ use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult}
 
 use crate::histogram_stream::{HistogramRow, HistogramStream};
 use crate::labels::Labels;
-use crate::promql::streaming::{derive_group_labels, GroupBy};
+use crate::promql::streaming::{derive_group_labels, Band, GroupBy};
 use crate::promql::{HistogramHeatmapResult, MatrixSample};
 use crate::types::HistogramSnapshot;
+
+/// One `apply_quantiles` output row: `(t_sec, value, optional bucket band)`.
+type QuantileRow = (f64, f64, Option<Band>);
+
+/// Per-group value-uncertainty bands, parallel to a group's values. Aliased to
+/// keep `Option<GroupBands>` readable (clears clippy's `type_complexity`).
+type GroupBands = Vec<Vec<Option<Band>>>;
 
 // ─── impl HistogramStream ────────────────────────────────────────────────────
 
@@ -60,7 +67,19 @@ impl HistogramStream {
             end_ns,
             stride_ns,
             metric_name,
-            |r| r.mean(),
+            |r| {
+                let c = r.total_count();
+                r.mean().map(|m| {
+                    // mean = sum / N; propagate the sum band divided by N.
+                    let band = if c > 0 {
+                        let (lo, hi) = bucket_weighted_sum(r);
+                        Some((lo / c as f64, hi / c as f64))
+                    } else {
+                        None
+                    };
+                    (m, band)
+                })
+            },
         )
     }
 
@@ -80,8 +99,10 @@ impl HistogramStream {
             stride_ns,
             metric_name,
             |r| {
+                // count is exact — an integer tally, no bucket-resolution
+                // uncertainty. No band.
                 let c = r.total_count();
-                (c > 0).then_some(c as f64)
+                (c > 0).then_some((c as f64, None))
             },
         )
     }
@@ -106,7 +127,10 @@ impl HistogramStream {
                 if c == 0 {
                     return None;
                 }
-                r.mean().map(|m| c as f64 * m)
+                // Nominal sum = total_count · mean (midpoints); the band is the
+                // bucket-resolution range [Σ count·start, Σ count·end].
+                r.mean()
+                    .map(|m| (c as f64 * m, Some(bucket_weighted_sum(r))))
             },
         )
     }
@@ -135,6 +159,22 @@ impl HistogramStream {
 
 fn total_count(snap: &HistogramSnapshot) -> u64 {
     snap.count.last().copied().unwrap_or(0)
+}
+
+/// Bucket-resolution bounds on the sum of all observations in a histogram.
+/// Each observation is known only to lie within its bucket `[start, end]`, so
+/// the true sum lies within `[Σ count·start, Σ count·end]`. The nominal sum
+/// (`total_count · mean`, where `mean` uses bucket midpoints) sits inside this
+/// band by construction. Returns `(lo, hi)`.
+fn bucket_weighted_sum(r: &CumulativeROHistogram32Ref<'_>) -> (f64, f64) {
+    let mut lo = 0.0f64;
+    let mut hi = 0.0f64;
+    for bucket in r.iter() {
+        let c = bucket.count() as f64;
+        lo += c * bucket.start() as f64;
+        hi += c * bucket.end() as f64;
+    }
+    (lo, hi)
 }
 
 /// Decompose a sparse cumulative snapshot into a per-bucket individual count map.
@@ -198,7 +238,9 @@ fn quantiles_impl(
     }
     let quantile_floats: Vec<f64> = quantile_keys.iter().map(|(_, q, _)| *q).collect();
 
-    let mut outputs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); quantiles_in.len()];
+    // Per point: (ts_sec, value, Some([bucket.start, bucket.end])) — the value
+    // quantization band from the bucket the quantile lands in.
+    let mut outputs: Vec<Vec<QuantileRow>> = vec![Vec::new(); quantiles_in.len()];
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
@@ -306,14 +348,25 @@ fn quantiles_impl(
 
     let mut samples = Vec::with_capacity(outputs.len());
     for (i, q) in quantiles_in.iter().enumerate() {
-        let values = std::mem::take(&mut outputs[i]);
-        if values.is_empty() {
+        let rows = std::mem::take(&mut outputs[i]);
+        if rows.is_empty() {
             continue;
         }
+        let values: Vec<(f64, f64)> = rows.iter().map(|(t, v, _)| (*t, *v)).collect();
+        // Every quantile point carries its bucket band, so emit intervals.
+        let intervals: Option<Vec<(f64, f64)>> = if rows.iter().all(|(_, _, b)| b.is_some()) {
+            Some(rows.iter().map(|(_, _, b)| b.unwrap()).collect())
+        } else {
+            None
+        };
         let mut metric: HashMap<String, String> = HashMap::new();
         metric.insert("__name__".to_string(), metric_name.to_string());
         metric.insert("quantile".to_string(), q.to_string());
-        samples.push(MatrixSample { metric, values });
+        samples.push(MatrixSample {
+            metric,
+            values,
+            intervals,
+        });
     }
     samples
 }
@@ -326,7 +379,9 @@ fn reduce(
     end_ns: u64,
     stride_ns: Option<u64>,
     metric_name: &str,
-    reducer: impl Fn(&CumulativeROHistogram32Ref<'_>) -> Option<f64>,
+    // Returns (nominal value, optional value-uncertainty band from bucket
+    // resolution). sum/mean carry a band; count is exact (None).
+    reducer: impl Fn(&CumulativeROHistogram32Ref<'_>) -> Option<(f64, Option<(f64, f64)>)>,
 ) -> Vec<MatrixSample> {
     let HistogramStream { meta, rows } = stream;
     let config = meta.config;
@@ -347,6 +402,8 @@ fn reduce(
     let g_count = group_keys.len();
 
     let mut values_per_group: Vec<Vec<(f64, f64)>> = (0..g_count).map(|_| Vec::new()).collect();
+    let mut bands_per_group: Vec<Vec<Option<(f64, f64)>>> =
+        (0..g_count).map(|_| Vec::new()).collect();
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut accum_per_group: Vec<BTreeMap<u32, u64>> =
         (0..g_count).map(|_| BTreeMap::new()).collect();
@@ -378,8 +435,9 @@ fn reduce(
                                 &scratch_idx,
                                 &scratch_cnt,
                             );
-                            if let Some(v) = reducer(&r) {
+                            if let Some((v, band)) = reducer(&r) {
                                 values_per_group[g].push((prev_t as f64 / 1e9, v));
+                                bands_per_group[g].push(band);
                             }
                         }
                     }
@@ -417,8 +475,9 @@ fn reduce(
                                     &scratch_idx,
                                     &scratch_cnt,
                                 );
-                                if let Some(v) = reducer(&r) {
+                                if let Some((v, band)) = reducer(&r) {
                                     values_per_group[g].push((stride_end_time as f64 / 1e9, v));
+                                    bands_per_group[g].push(band);
                                 }
                             }
                         }
@@ -440,8 +499,9 @@ fn reduce(
                         &scratch_idx,
                         &scratch_cnt,
                     );
-                    if let Some(v) = reducer(&r) {
+                    if let Some((v, band)) = reducer(&r) {
                         values_per_group[g].push((stride_end_time as f64 / 1e9, v));
+                        bands_per_group[g].push(band);
                     }
                 }
             }
@@ -453,15 +513,21 @@ fn reduce(
                         &scratch_idx,
                         &scratch_cnt,
                     );
-                    if let Some(v) = reducer(&r) {
+                    if let Some((v, band)) = reducer(&r) {
                         values_per_group[g].push((t as f64 / 1e9, v));
+                        bands_per_group[g].push(band);
                     }
                 }
             }
         }
     }
 
-    build_grouped_output(metric_name, group_keys, values_per_group)
+    build_grouped_output(
+        metric_name,
+        group_keys,
+        values_per_group,
+        Some(bands_per_group),
+    )
 }
 
 fn irate_impl(
@@ -553,7 +619,7 @@ fn irate_impl(
         }
     }
 
-    build_grouped_output(metric_name, group_keys, values_per_group)
+    build_grouped_output(metric_name, group_keys, values_per_group, None)
 }
 
 fn heatmap_impl(
@@ -792,7 +858,7 @@ fn apply_quantiles(
     quantile_floats: &[f64],
     keys: &[(usize, f64, Quantile)],
     t_ns: u64,
-    out: &mut [Vec<(f64, f64)>],
+    out: &mut [Vec<QuantileRow>],
 ) {
     let r = CumulativeROHistogram32Ref::from_parts_unchecked(config, idx, cnt);
     let q_result: Result<Option<QuantilesResult>, _> = r.quantiles(quantile_floats);
@@ -800,7 +866,10 @@ fn apply_quantiles(
         let t_sec = t_ns as f64 / 1e9;
         for (out_idx, _q_f, q_key) in keys {
             if let Some(bucket) = qr.get(q_key) {
-                out[*out_idx].push((t_sec, bucket.end() as f64));
+                // Nominal is bucket.end(); the value quantization band is the
+                // bucket's full [start, end] range (nominal sits at the top edge).
+                let band = (bucket.start() as f64, bucket.end() as f64);
+                out[*out_idx].push((t_sec, band.1, Some(band)));
             }
         }
     }
@@ -820,18 +889,36 @@ fn build_grouped_output(
     metric_name: &str,
     group_keys: Vec<Labels>,
     values_per_group: Vec<Vec<(f64, f64)>>,
+    // Per-group value-uncertainty bands, parallel to values_per_group. When
+    // present and every point in a group has a band, the group emits
+    // `intervals`; a group with any None point (or no bands at all) emits
+    // `intervals: None`.
+    bands_per_group: Option<GroupBands>,
 ) -> Vec<MatrixSample> {
     let mut samples = Vec::new();
+    let mut bands_iter = bands_per_group.map(|b| b.into_iter());
     for (key, values) in group_keys.into_iter().zip(values_per_group) {
+        let group_bands = bands_iter.as_mut().and_then(|it| it.next());
         if values.is_empty() {
             continue;
         }
+        let intervals: Option<Vec<(f64, f64)>> = group_bands.and_then(|bands| {
+            if !bands.is_empty() && bands.iter().all(|b| b.is_some()) {
+                Some(bands.into_iter().map(|b| b.unwrap()).collect())
+            } else {
+                None
+            }
+        });
         let mut metric: HashMap<String, String> = HashMap::new();
         metric.insert("__name__".to_string(), metric_name.to_string());
         for (k, v) in key.inner {
             metric.insert(k, v);
         }
-        samples.push(MatrixSample { metric, values });
+        samples.push(MatrixSample {
+            metric,
+            values,
+            intervals,
+        });
     }
     samples
 }

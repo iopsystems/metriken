@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::labels::Labels;
 use crate::memory::Memory;
-use crate::promql::streaming::{collect_to_matrix, sum_by, CounterIrate, LabeledSeries};
+use crate::promql::streaming::{collect_to_matrix, sum_by, CounterIrate, LabeledSeries, Point};
 use crate::promql::{MatrixSample, QueryEngine, QueryResult};
 use crate::types::{Counter, Gauge};
 use crate::DataSource;
@@ -40,6 +40,7 @@ fn cgroup_source() -> Arc<Memory> {
                 labels,
                 timestamps,
                 values,
+                windows: None,
             },
         );
     }
@@ -164,8 +165,8 @@ fn sum_by_groups_disjoint_label_into_one_series() {
     let mut b_labels = Labels::default();
     b_labels.inner.insert("name".to_string(), "b".to_string());
 
-    let a_pts: Vec<(u64, f64)> = vec![(1, 1.0), (2, 2.0), (3, 3.0)];
-    let b_pts: Vec<(u64, f64)> = vec![(1, 10.0), (2, 20.0), (3, 30.0)];
+    let a_pts: Vec<Point> = vec![Point::at(1, 1.0), Point::at(2, 2.0), Point::at(3, 3.0)];
+    let b_pts: Vec<Point> = vec![Point::at(1, 10.0), Point::at(2, 20.0), Point::at(3, 30.0)];
 
     let stream = vec![
         LabeledSeries::new(a_labels.clone(), a_pts.clone().into_iter()),
@@ -181,9 +182,9 @@ fn sum_by_groups_disjoint_label_into_one_series() {
     let folded = sum_by(stream, &[]);
     assert_eq!(folded.len(), 1, "empty by-list collapses into one group");
     let mut iter = folded.into_iter().next().unwrap().iter;
-    assert_eq!(iter.next(), Some((1, 11.0)));
-    assert_eq!(iter.next(), Some((2, 22.0)));
-    assert_eq!(iter.next(), Some((3, 33.0)));
+    assert_eq!(iter.next(), Some(Point::at(1, 11.0)));
+    assert_eq!(iter.next(), Some(Point::at(2, 22.0)));
+    assert_eq!(iter.next(), Some(Point::at(3, 33.0)));
     assert_eq!(iter.next(), None);
 }
 
@@ -206,11 +207,12 @@ fn counter_irate_handles_reset() {
         5_000_000_000,
         1_000_000_000,
         5_000_000_000,
+        None,
     );
     let p = iter.next().expect("one point at t=5s");
-    assert_eq!(p.0, 5_000_000_000);
+    assert_eq!(p.t, 5_000_000_000);
     // Last two: (4s, 50) and (5s, 150). 150 >= 50 → delta=100/1s = 100.
-    assert!((p.1 - 100.0).abs() < 1e-9);
+    assert!((p.v - 100.0).abs() < 1e-9);
     assert!(iter.next().is_none());
 }
 
@@ -235,6 +237,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
                 labels,
                 timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
                 values: vec![cpu * 1000, cpu * 1000 + 100, cpu * 1000 + 200],
+                windows: None,
             },
         );
     }
@@ -253,6 +256,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
             labels,
             timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
             values: vec![4, 4, 4],
+            windows: None,
         },
     );
 

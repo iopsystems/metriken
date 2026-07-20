@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use super::metadata::GroupMetadata;
+use super::windows::GroupWindows;
 use crate::{CounterGroupMetric, Metric, Value};
+use metriken_core::Window;
 
 enum Backing {
     Owned(Vec<AtomicU64>),
@@ -48,6 +50,7 @@ impl Backing {
 pub struct CounterGroup {
     values: OnceLock<Backing>,
     metadata: GroupMetadata,
+    windows: GroupWindows,
     entries: usize,
 }
 
@@ -57,6 +60,7 @@ impl CounterGroup {
         Self {
             values: OnceLock::new(),
             metadata: GroupMetadata::new(),
+            windows: GroupWindows::new(),
             entries,
         }
     }
@@ -181,6 +185,71 @@ impl CounterGroup {
     pub fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.metadata.snapshot()
     }
+
+    /// Record the acquisition window for the entry at `idx`.
+    pub fn set_window(&self, idx: usize, begin_ns: u64, end_ns: u64) {
+        if idx < self.entries {
+            self.windows.insert(idx, Window::new(begin_ns, end_ns));
+        }
+    }
+
+    /// Load the acquisition window recorded for the entry at `idx`.
+    pub fn load_window(&self, idx: usize) -> Option<Window> {
+        self.windows.load(idx)
+    }
+
+    /// Snapshot all per-entry acquisition windows.
+    pub fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        self.windows.snapshot()
+    }
+
+    /// Set the counter at `idx` to `value` and record its acquisition window as
+    /// a torn-safe pair.
+    ///
+    /// The value store and the window insert happen under the group's window
+    /// write guard, so a concurrent
+    /// [`load_with_window`](CounterGroup::load_with_window) never observes a
+    /// value from one call paired with a window from another.
+    ///
+    /// # Torn-safety caveat (base type coexists with lock-free mutators)
+    /// This base group also exposes the lock-free `set`/`add`/`increment`,
+    /// which bypass the window lock. A concurrent lock-free write to the same
+    /// entry can pair a fresh value with a stale window. The **enforced**
+    /// torn-safe path is the [`WindowedCounterGroup`](crate::WindowedCounterGroup)
+    /// wrapper, which exposes no lock-free mutator; use it (not the base group)
+    /// for windowed metrics.
+    ///
+    /// Returns `false` if `idx` is out of bounds.
+    pub fn set_with_window(&self, idx: usize, value: u64, window: Window) -> bool {
+        if idx >= self.entries {
+            return false;
+        }
+        let slice = self.get_or_init();
+        self.windows.with_write(|map| {
+            slice[idx].store(value, Ordering::Relaxed);
+            map.insert(idx, window);
+        });
+        true
+    }
+
+    /// Load the counter at `idx` and its acquisition window as a torn-safe
+    /// pair — provided writers use [`set_with_window`](CounterGroup::set_with_window),
+    /// not the lock-free `set`/`add`/`increment` (see that method's torn-safety
+    /// caveat; the enforced path is [`WindowedCounterGroup`](crate::WindowedCounterGroup)).
+    /// Returns `(None, None)` if `idx` is out of bounds.
+    pub fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
+        if idx >= self.entries {
+            return (None, None);
+        }
+        self.windows.with_read(|map| {
+            let value = self
+                .values
+                .get()
+                .map(|b| b.as_slice()[idx].load(Ordering::Relaxed));
+            let window = map.and_then(|m| m.get(&idx).copied());
+            (value, window)
+        })
+    }
 }
 
 impl CounterGroupMetric for CounterGroup {
@@ -202,6 +271,18 @@ impl CounterGroupMetric for CounterGroup {
 
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.metadata.snapshot()
+    }
+
+    fn load_window(&self, idx: usize) -> Option<Window> {
+        self.windows.load(idx)
+    }
+
+    fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        self.windows.snapshot()
+    }
+
+    fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
+        CounterGroup::load_with_window(self, idx)
     }
 }
 
@@ -300,6 +381,24 @@ mod tests {
     }
 
     #[test]
+    fn windows() {
+        use metriken_core::Window;
+        static GROUP: CounterGroup = CounterGroup::new(4);
+
+        assert!(GROUP.load_window(0).is_none());
+        GROUP.set_window(0, 1_000, 3_000);
+        assert_eq!(GROUP.load_window(0), Some(Window::new(1_000, 3_000)));
+
+        GROUP.set_window(9, 1, 2); // out of bounds ignored
+        assert!(GROUP.load_window(9).is_none());
+
+        assert_eq!(
+            GROUP.window_snapshot(),
+            vec![(0, Window::new(1_000, 3_000))]
+        );
+    }
+
+    #[test]
     fn attach_external_after_init_is_noop() {
         static GROUP: CounterGroup = CounterGroup::new(2);
         static EXTERNAL: [AtomicU64; 2] = [AtomicU64::new(99), AtomicU64::new(99)];
@@ -315,5 +414,69 @@ mod tests {
 
         // Still using internal backing
         assert_eq!(GROUP.value(0), Some(1));
+    }
+
+    #[test]
+    fn set_with_window_round_trip() {
+        use metriken_core::Window;
+        static GROUP: CounterGroup = CounterGroup::new(4);
+
+        GROUP.set_with_window(1, 55, Window::new(10, 20));
+        assert_eq!(
+            GROUP.load_with_window(1),
+            (Some(55), Some(Window::new(10, 20)))
+        );
+        assert_eq!(GROUP.value(1), Some(55));
+        assert_eq!(GROUP.load_with_window(9), (None, None));
+
+        use crate::CounterGroupMetric;
+        let m: &dyn CounterGroupMetric = &GROUP;
+        assert_eq!(m.load_with_window(1), (Some(55), Some(Window::new(10, 20))));
+    }
+
+    #[test]
+    fn load_with_window_unset_does_not_allocate() {
+        static GROUP: CounterGroup = CounterGroup::new(2);
+        GROUP.set(0, 7); // value set, but no window recorded
+        assert_eq!(GROUP.load_with_window(0), (Some(7), None));
+        assert!(GROUP.load_window(0).is_none());
+        assert!(
+            GROUP.window_snapshot().is_empty(),
+            "no window write must not allocate"
+        );
+    }
+
+    #[test]
+    fn set_with_window_torn_read_stress() {
+        use metriken_core::Window;
+        use std::sync::Arc;
+        use std::thread;
+
+        const ITERS: u64 = 200_000;
+        let g = Arc::new(CounterGroup::new(1));
+        g.set_with_window(0, 0, Window::new(0, 1));
+
+        let writer = {
+            let g = g.clone();
+            thread::spawn(move || {
+                for v in 1..ITERS {
+                    g.set_with_window(0, v, Window::new(v, v + 1));
+                }
+            })
+        };
+        let reader = {
+            let g = g.clone();
+            thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let (v, w) = g.load_with_window(0);
+                    if let (Some(v), Some(w)) = (v, w) {
+                        assert_eq!(w.begin_ns, v, "torn read: value {v} paired with {w:?}");
+                        assert_eq!(w.end_ns, v + 1, "torn read: value {v} paired with {w:?}");
+                    }
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 }

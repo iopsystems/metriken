@@ -28,9 +28,9 @@ use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp, CounterIrate,
-    CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
-    GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp,
+    CounterIrate, CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta,
+    GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{MatrixSample, QueryError, QueryResult};
 use crate::DataSource;
@@ -233,10 +233,74 @@ where
         (Built::Scalar(a), Built::Scalar(b)) => {
             Ok(Built::Scalar(op.apply(a, b).unwrap_or(f64::NAN)))
         }
+        // A materialized histogram result (e.g. histogram_quantile) against a
+        // scalar — the ns→s unit conversion the latency panels use. Scale the
+        // values AND the bucket bands so the band survives. (Previously outright
+        // unsupported, forcing an eager fallback with no bands.)
+        (Built::Materialized { result, name }, Built::Scalar(s)) => Ok(Built::Materialized {
+            result: scalar_op_matrix(result, op, s, false),
+            name,
+        }),
+        (Built::Scalar(s), Built::Materialized { result, name }) => Ok(Built::Materialized {
+            result: scalar_op_matrix(result, op, s, true),
+            name,
+        }),
         _ => Err(QueryError::Unsupported(
             "binary op against a histogram_quantile result not supported".to_string(),
         )),
     }
+}
+
+/// Apply a scalar op to each materialized `MatrixSample`'s values and, when
+/// present, its uncertainty bands (interval arithmetic against a constant:
+/// apply to both endpoints, `min`/`max` to normalize sign; drop on div-by-zero).
+/// Keeps values and bands aligned point-for-point.
+fn scalar_op_matrix(
+    mut result: Vec<crate::promql::MatrixSample>,
+    op: BinOp,
+    scalar: f64,
+    scalar_first: bool,
+) -> Vec<crate::promql::MatrixSample> {
+    let apply = |x: f64| -> Option<f64> {
+        if scalar_first {
+            op.apply(scalar, x)
+        } else {
+            op.apply(x, scalar)
+        }
+    };
+    for sample in &mut result {
+        let had_intervals = sample.intervals.is_some();
+        let mut vals = Vec::with_capacity(sample.values.len());
+        let mut ivls = Vec::with_capacity(sample.values.len());
+        for (i, (t, v)) in sample.values.iter().enumerate() {
+            let Some(nv) = apply(*v) else { continue };
+            vals.push((*t, nv));
+            // Propagate the band via the same interval arithmetic as the
+            // streaming scalar op (treat the scalar as exact `[scalar, scalar]`),
+            // so a spanning-zero denominator under `scalar / value` yields no
+            // band instead of a bogus narrow one. Histogram bands are currently
+            // non-negative so this path can't hit that case today, but it stays
+            // consistent with ScalarBroadcast.
+            let sb = (scalar, scalar);
+            if let Some((lo, hi)) = sample.intervals.as_ref().and_then(|iv| iv.get(i)) {
+                let band = if scalar_first {
+                    interval_binop(op, sb, (*lo, *hi))
+                } else {
+                    interval_binop(op, (*lo, *hi), sb)
+                };
+                if let Some(bb) = band {
+                    ivls.push(bb);
+                }
+            }
+        }
+        sample.intervals = if had_intervals && ivls.len() == vals.len() {
+            Some(ivls)
+        } else {
+            None
+        };
+        sample.values = vals;
+    }
+    result
 }
 
 fn build_call<'a, 'expr>(
@@ -288,6 +352,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        c.windows.as_deref(),
                     )
                     .collect();
                     LabeledSeries::new(c.labels, pts.into_iter())
@@ -315,6 +380,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        c.windows.as_deref(),
                     )
                     .collect();
                     LabeledSeries::new(c.labels, pts.into_iter())

@@ -165,6 +165,7 @@ pub(crate) fn metric(
             metric: #static_name,
             name: #name,
             description: #description,
+            module: ::core::module_path!(),
             metadata: { #( #attrs, )* },
             formatter: #formatter,
         };

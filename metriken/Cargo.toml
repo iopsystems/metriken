@@ -8,6 +8,9 @@ description = "A fast and lightweight metrics library"
 homepage = "https://github.com/pelikan-io/rustcommon"
 repository = "https://github.com/pelikan-io/rustcommon"
 
+[features]
+serde = ["metriken-core/serde"]
+
 [dependencies]
 metriken-core   = { version = "0.2.1",  path = "../metriken-core" }
 metriken-derive = { version = "=0.5.1", path = "../metriken-derive" }

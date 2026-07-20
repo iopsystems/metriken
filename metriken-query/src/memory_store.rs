@@ -566,11 +566,11 @@ mod ingest_tests {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
-            counters: vec![metriken_exposition::Counter {
-                name: counter_name.to_string(),
+            counters: vec![metriken_exposition::Counter::new(
+                counter_name.to_string(),
                 value,
                 metadata,
-            }],
+            )],
             gauges: vec![],
             histograms: vec![],
         })
@@ -622,11 +622,11 @@ mod ingest_tests {
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
             counters: vec![],
-            gauges: vec![metriken_exposition::Gauge {
-                name: name.to_string(),
+            gauges: vec![metriken_exposition::Gauge::new(
+                name.to_string(),
                 value,
                 metadata,
-            }],
+            )],
             histograms: vec![],
         })
     }
@@ -634,7 +634,6 @@ mod ingest_tests {
     // Ingest a gauge with `n` 1s samples that are flat at `base` except for a
     // single spike to `spike` in the middle.
     fn store_with_spiky_gauge(n: u64, base: i64, spike: i64) -> (crate::MemoryStore, u64, u64) {
-        use crate::MetricsSource;
         let store = crate::MemoryStore::builder()
             .sampling_interval_ms(1000)
             .build();

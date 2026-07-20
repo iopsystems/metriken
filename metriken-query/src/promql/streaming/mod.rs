@@ -51,7 +51,7 @@ mod tests;
 
 pub(crate) use aggregate::derive_group_labels;
 pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
-pub(crate) use binary::{matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
+pub(crate) use binary::{interval_binop, matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
 pub(crate) use deriv::StreamingDeriv;
 pub(crate) use gauge::{GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
 pub(crate) use irate::CounterIrate;
@@ -60,8 +60,29 @@ pub(crate) use rate::{CounterPairwiseRate, CounterRate};
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;
 
+/// An uncertainty interval `(lo, hi)` — either an acquisition-window bound
+/// (rate/irate) or a histogram bucket-resolution band. Aliased so the nested
+/// `Option<Band>` / `Vec<Vec<Option<Band>>>` shapes that thread it through the
+/// pipeline stay readable (and clear clippy's `type_complexity`).
+pub(crate) type Band = (f64, f64);
+
 /// A single sample emitted through a streaming pipeline.
-pub type Point = (u64, f64);
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Point {
+    pub t: u64,
+    pub v: f64,
+    /// Uncertainty interval (lo, hi) from acquisition windows; originated by
+    /// rate()/irate() and propagated through scalar ops, aggregation, and
+    /// series-op-series binary ops. None means exact / not applicable.
+    pub bounds: Option<Band>,
+}
+impl Point {
+    /// A point with no uncertainty bound (the default for every producer/operator
+    /// except rate/irate).
+    pub fn at(t: u64, v: f64) -> Self {
+        Self { t, v, bounds: None }
+    }
+}
 
 /// A labeled, lazily-produced time series.
 pub struct LabeledSeries<'a> {
@@ -107,6 +128,7 @@ impl Counters {
                     end_ns,
                     step_ns,
                     range_ns,
+                    c.windows.as_deref(),
                 );
                 LabeledSeries::new(c.labels.clone(), iter)
             })
@@ -120,10 +142,25 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
     streaming
         .into_iter()
         .filter_map(|ls| {
-            let values: Vec<(f64, f64)> = ls.iter.map(|(t, v)| (t as f64 / 1e9, v)).collect();
-            if values.is_empty() {
+            #[allow(clippy::type_complexity)]
+            let points: Vec<((f64, f64), Option<(f64, f64)>)> = ls
+                .iter
+                .map(|p| ((p.t as f64 / 1e9, p.v), p.bounds))
+                .collect();
+            if points.is_empty() {
                 return None;
             }
+            let values: Vec<(f64, f64)> = points.iter().map(|(v, _)| *v).collect();
+            // Emit intervals only when every point carries a band; else None.
+            // Bands originate at rate()/irate() (and histogram value bands) and
+            // propagate through scalar ops, sum/avg aggregation, and
+            // series-op-series binary ops — but an unsupported operator upstream
+            // (e.g. min/max) drops them, making the series non-uniform.
+            let intervals: Option<Vec<(f64, f64)>> = if points.iter().all(|(_, b)| b.is_some()) {
+                Some(points.iter().map(|(_, b)| b.unwrap()).collect())
+            } else {
+                None
+            };
             let mut metric: HashMap<String, String> = HashMap::new();
             if let Some(name) = metric_name {
                 metric.insert("__name__".to_string(), name.to_string());
@@ -131,7 +168,11 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
             for (k, v) in ls.labels.inner.iter() {
                 metric.insert(k.clone(), v.clone());
             }
-            Some(MatrixSample { metric, values })
+            Some(MatrixSample {
+                metric,
+                values,
+                intervals,
+            })
         })
         .collect()
 }

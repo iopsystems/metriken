@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::Window;
+
 /// Trait for histogram metrics that can produce snapshots.
 ///
 /// Implemented by both `AtomicHistogram` (for recording individual events)
@@ -34,6 +36,26 @@ pub trait CounterGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// Load the acquisition window recorded for the entry at `idx`, if any.
+    /// Default: none — general groups do not record windows.
+    fn load_window(&self, _idx: usize) -> Option<Window> {
+        None
+    }
+
+    /// Snapshot all per-entry acquisition windows. Default: empty.
+    fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        Vec::new()
+    }
+
+    /// Load the counter at `idx` and its acquisition window as a pair.
+    ///
+    /// Default: separate `counter_value` and `load_window` reads — **not**
+    /// atomic. Windowed groups override this to read the pair under one lock so
+    /// exposition never sees a torn `(value, window)` pair.
+    fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
+        (self.counter_value(idx), self.load_window(idx))
+    }
 }
 
 /// Trait for a group of gauge metrics with per-entry metadata.
@@ -55,6 +77,25 @@ pub trait GaugeGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// Load the acquisition window recorded for the entry at `idx`, if any.
+    /// Default: none — general groups do not record windows.
+    fn load_window(&self, _idx: usize) -> Option<Window> {
+        None
+    }
+
+    /// Snapshot all per-entry acquisition windows. Default: empty.
+    fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        Vec::new()
+    }
+
+    /// Load the gauge at `idx` and its acquisition window as a pair.
+    ///
+    /// Default: separate `gauge_value` and `load_window` reads — **not**
+    /// atomic. Windowed groups override this to read the pair under one lock.
+    fn load_with_window(&self, idx: usize) -> (Option<i64>, Option<Window>) {
+        (self.gauge_value(idx), self.load_window(idx))
+    }
 }
 
 /// Trait for a group of histogram metrics with per-entry metadata.
@@ -80,4 +121,15 @@ pub trait HistogramGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// Load the acquisition window recorded for the entry at `idx`, if any.
+    /// Default: none — general groups do not record windows.
+    fn load_window(&self, _idx: usize) -> Option<Window> {
+        None
+    }
+
+    /// Snapshot all per-entry acquisition windows. Default: empty.
+    fn window_snapshot(&self) -> Vec<(usize, Window)> {
+        Vec::new()
+    }
 }

@@ -71,6 +71,7 @@ impl Memory {
                 labels,
                 timestamps: vec![ts],
                 values: vec![value],
+                windows: None,
             });
         }
     }
@@ -88,6 +89,7 @@ impl Memory {
                 labels,
                 timestamps: vec![ts],
                 values: vec![value],
+                windows: None,
             });
         }
     }
@@ -172,6 +174,7 @@ impl DataSource for Memory {
                     labels: c.labels.clone(),
                     timestamps: c.timestamps[r.clone()].to_vec(),
                     values: c.values[r].to_vec(),
+                    windows: None,
                 }
             })
             .filter(|c| !c.timestamps.is_empty())
@@ -194,6 +197,7 @@ impl DataSource for Memory {
                     labels: g.labels.clone(),
                     timestamps: g.timestamps[r.clone()].to_vec(),
                     values: g.values[r].to_vec(),
+                    windows: None,
                 }
             })
             .filter(|g| !g.timestamps.is_empty())

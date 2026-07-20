@@ -460,11 +460,13 @@ mod tests {
                 name: "counter".to_string(),
                 value: 100,
                 metadata: HashMap::new(),
+                window: None,
             }],
             vec![Counter {
                 name: "counter".to_string(),
                 value: 121,
                 metadata: HashMap::new(),
+                window: None,
             }],
         ];
 
@@ -473,11 +475,13 @@ mod tests {
                 name: "gauge".to_string(),
                 value: 16,
                 metadata: HashMap::new(),
+                window: None,
             }],
             vec![Gauge {
                 name: "gauge".to_string(),
                 value: 6,
                 metadata: HashMap::new(),
+                window: None,
             }],
         ];
 
@@ -489,11 +493,13 @@ mod tests {
                 name: "histogram".to_string(),
                 value: h1,
                 metadata: HashMap::new(),
+                window: None,
             }],
             vec![Histogram {
                 name: "histogram".to_string(),
                 value: h2,
                 metadata: HashMap::new(),
+                window: None,
             }],
         ];
 
