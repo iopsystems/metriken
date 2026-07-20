@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0]
+
+### Added
+
+- Measurement-uncertainty bands (#117). Reads per-metric `:window_begin` /
+  `:window_width` acquisition-window sidecar columns and turns them into honest
+  interval bounds: `rate()` / `irate()` derive `[Δv/(e_last−b_first),
+  Δv/(b_last−e_first)]` (widened to contain the nominal), propagated through
+  scalar ops, sum/avg aggregation, and series-op-series binary ops. Histogram
+  queries carry a value band from bucket resolution (`histogram_quantile`,
+  `histogram_sum`, `histogram_mean`; `histogram_count` is exact). `QueryResult`
+  gains optional `intervals`. Window offsets are anchored on the raw (un-snapped)
+  timestamp, consistent with `sample_timestamps()`.
+- `Sample::new` / `MatrixSample::new` + `with_interval` / `with_intervals`
+  constructors.
+
+### Changed
+
+- **BREAKING:** `Sample` and `MatrixSample` are now `#[non_exhaustive]`; build
+  them with the constructors instead of struct literals.
+- **BREAKING:** the streaming `Point` is a struct `{ t, v, bounds }` (was a
+  `(u64, f64)` tuple).
+
 ## [0.13.0] - 2026-07-16
 
 ### Added

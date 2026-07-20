@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.3.0
+### Added
+- `Window` acquisition-window type (`begin_ns`/`end_ns`, opt-in serde).
+- Default `Metric::load_window` / `value_with_window` accessors and
+  `window_snapshot` / `load_window` on the group traits (default empty).
+- `MetricEntry::module()` — the metric definition's `module_path!()`.
+
+### Changed
+- **BREAKING:** `MetricEntry` gained a `module` field; its constructor takes a
+  `module` argument (emitted by `#[metric]` via metriken-derive 0.6.0).
+
 ## 0.1.3
 ### Fixed
 - Fixed missing metric metadata on dynamic metrics.

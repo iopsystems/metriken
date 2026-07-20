@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Measurement uncertainty: acquisition windows + rate() error bars (#117)
+
+A cross-crate, breaking release. Metrics can now carry a per-observation
+**acquisition window** `[begin_ns, end_ns]`, which the query engine turns into
+honest measurement-uncertainty bands on `rate()`/`irate()` and histogram
+queries. Pre-1.0, so each breaking crate takes a minor bump.
+
+#### metriken-core 0.3.0
+- **Added:** `Window` acquisition-window type (opt-in serde); default
+  `Metric::load_window` / `value_with_window` accessors; `MetricEntry::module()`.
+- **BREAKING:** `MetricEntry` gained a `module` field, and its constructor takes
+  a `module` argument (the `#[metric]` definition's `module_path!()`).
+
+#### metriken 0.10.0
+- **Added:** torn-safe windowed wrappers — `WindowCell`, `WindowedLazyCounter` /
+  `WindowedLazyGauge`, `WindowedCounterGroup` / `WindowedGaugeGroup`, a per-index
+  window API on `CounterGroup`/`GaugeGroup`, and `set_with_window` /
+  `load_with_window`.
+- **BREAKING:** re-exports metriken-core 0.3.0 (the changed `MetricEntry`);
+  `#[metric]` now records the defining module path.
+
+#### metriken-derive 0.6.0
+- **BREAKING:** `#[metric]` emits the definition's `module_path!()` into the
+  `MetricEntry` (requires metriken 0.10.0 / metriken-core 0.3.0).
+
+#### metriken-exposition 0.17.0
+- **Added:** optional per-observation `window` on `Counter`/`Gauge`/`Histogram`
+  (serde `default` + `skip_serializing_if`, so it is wire-compatible with older
+  snapshots); `new()` + `with_window()` constructors.
+- **BREAKING:** `Counter`/`Gauge`/`Histogram` are now `#[non_exhaustive]` — build
+  them with `new()` / `with_window()`, not struct literals.
+
+#### metriken-query 0.14.0
+- **Added:** reads per-metric `:window_begin` / `:window_width` sidecar columns;
+  `rate()`/`irate()` derive interval bounds from acquisition windows (widened to
+  contain the nominal), propagated through scalar ops, sum/avg aggregation, and
+  series-op-series binary ops; histogram value bands from bucket resolution
+  (`histogram_quantile` / `histogram_sum` / `histogram_mean`); `QueryResult`
+  carries optional `intervals`; `new()` / `with_interval(s)` constructors.
+- **BREAKING:** `Sample` / `MatrixSample` are now `#[non_exhaustive]` (use the
+  constructors); `Point` is a struct (was a `(u64, f64)` tuple).
+
 ### metriken-query 0.12.0
 
 - Add `MetricsSource::query_range_display` and a `display` module: a
