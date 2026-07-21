@@ -1822,7 +1822,10 @@ fn read_counters(
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
-                            let dur = durations.as_ref().and_then(|d| d.get(row).copied()).flatten();
+                            let dur = durations
+                                .as_ref()
+                                .and_then(|d| d.get(row).copied())
+                                .flatten();
                             w.push(resolve_window(base, bo, wd, dur));
                         }
                     }
@@ -1935,7 +1938,10 @@ fn read_gauges(
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
-                            let dur = durations.as_ref().and_then(|d| d.get(row).copied()).flatten();
+                            let dur = durations
+                                .as_ref()
+                                .and_then(|d| d.get(row).copied())
+                                .flatten();
                             w.push(resolve_window(base, bo, wd, dur));
                         }
                     }
@@ -2168,7 +2174,10 @@ mod tests {
         // 2. No sidecar but duration present → fleet window [base, base + duration].
         assert_eq!(resolve_window(1_000, None, None, Some(30)), (1_000, 1_030));
         // Partial sidecar (begin without width) also falls back to fleet.
-        assert_eq!(resolve_window(1_000, Some(-50), None, Some(30)), (1_000, 1_030));
+        assert_eq!(
+            resolve_window(1_000, Some(-50), None, Some(30)),
+            (1_000, 1_030)
+        );
         // 3. Neither → degenerate point window.
         assert_eq!(resolve_window(1_000, None, None, None), (1_000, 1_000));
     }

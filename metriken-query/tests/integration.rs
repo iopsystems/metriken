@@ -506,7 +506,10 @@ fn windowless_file_uses_duration_fleet_fallback() {
         vec![
             Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000u64])),
             // Collection took 30ms / 20ms — the fleet window widths.
-            Arc::new(UInt64Array::from(vec![Some(30_000_000u64), Some(20_000_000u64)])),
+            Arc::new(UInt64Array::from(vec![
+                Some(30_000_000u64),
+                Some(20_000_000u64),
+            ])),
             Arc::new(UInt64Array::from(vec![Some(100u64), Some(400u64)])),
         ],
     )
