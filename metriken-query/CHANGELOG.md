@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0]
+
+### Changed
+
+- **Breaking:** `Reducer::reduce` / `reduce_boxplot` take an additional
+  `intervals: Option<&[(f64, f64)]>` argument (the per-sample measurement-
+  uncertainty band parallel to `points`). `EnvPoint` gains `unc_lo` / `unc_hi`
+  (`Option<f64>`), so struct-literal construction must supply them.
+
+### Added
+
+- Measurement-uncertainty bands survive display-mode decimation. When a
+  decimated bucket collapses N native samples, its aggregated band is the median
+  of the per-sample interval lows/highs (`unc_lo` / `unc_hi`) — robust, mirroring
+  the median line, and orthogonal to the min/max value spread. At native
+  resolution each sample keeps its exact interval, so zoomed-in and zoomed-out
+  bands are consistent. `query_range_display` threads `MatrixSample::intervals`
+  through automatically; series without uncertainty carry `None`.
+
 ## [0.14.1]
 
 ### Added

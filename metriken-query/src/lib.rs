@@ -152,7 +152,12 @@ pub trait MetricsSource: Send + Sync {
                     .into_iter()
                     .map(|s| {
                         let raw_points = s.values.len() as u64;
-                        let points = opts.reducer.reduce(&s.values, opts.budget, opts.band);
+                        let points = opts.reducer.reduce(
+                            &s.values,
+                            s.intervals.as_deref(),
+                            opts.budget,
+                            opts.band,
+                        );
                         DisplaySeries {
                             decimated: (points.len() as u64) < raw_points,
                             metric: s.metric,
