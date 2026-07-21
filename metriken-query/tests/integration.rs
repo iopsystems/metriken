@@ -475,6 +475,64 @@ fn buffer_pool_evicts_when_full() {
 
 // ─── Reconstructed acquisition windows ───────────────────────────────────────
 
+// A windowless file (no `:window_*` sidecars) that still has a `duration`
+// column gets a coarse FLEET fallback window `[timestamp, timestamp + duration]`
+// per snapshot — so older/plain-parquet recordings carry rate() uncertainty.
+#[test]
+fn windowless_file_uses_duration_fleet_fallback() {
+    use arrow::array::UInt64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::collections::HashMap;
+
+    // No :window_begin / :window_width columns — just timestamp + duration + a counter.
+    let ts = Field::new("timestamp", DataType::UInt64, false);
+    let duration = Field::new("duration", DataType::UInt64, true);
+    let counter = Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+        ("metric".to_string(), "cpu_cycles".to_string()),
+        ("metric_type".to_string(), "counter".to_string()),
+    ]));
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![ts, duration, counter],
+        HashMap::from([
+            ("source".to_string(), "rezolus".to_string()),
+            ("sampling_interval_ms".to_string(), "1000".to_string()),
+        ]),
+    ));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000u64])),
+            // Collection took 30ms / 20ms — the fleet window widths.
+            Arc::new(UInt64Array::from(vec![
+                Some(30_000_000u64),
+                Some(20_000_000u64),
+            ])),
+            Arc::new(UInt64Array::from(vec![Some(100u64), Some(400u64)])),
+        ],
+    )
+    .unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    let reader = ParquetReader::open_bytes(bytes).unwrap();
+    // Fleet window = [timestamp, timestamp + duration], no sidecars involved.
+    assert_eq!(
+        reader.counter_windows_for_test("cpu_cycles"),
+        Some(vec![
+            (1_000_000_000u64, 1_030_000_000u64),
+            (2_000_000_000u64, 2_020_000_000u64),
+        ])
+    );
+}
+
 // The `<m>:window_begin` (Int64 signed offset from row `timestamp`) and
 // `<m>:window_width` (UInt64 ns) sidecars must be associated with their base
 // metric and reconstructed into per-sample `[begin_ns, end_ns]` pairs carried

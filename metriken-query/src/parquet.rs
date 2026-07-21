@@ -1698,6 +1698,35 @@ fn read_gauge_values_per_rg(
 
 // ─── Counter reader ───────────────────────────────────────────────────────────
 
+/// Resolve one row's acquisition window, `base` being the raw row timestamp.
+///
+/// Precedence:
+/// 1. **Per-observation sidecar** `[base+begin, base+begin+width]` — the tight,
+///    per-metric window (`.rez` / live). `begin` may be negative; the start is
+///    saturated and clamped to 0 so a corrupt offset can't wrap or overflow.
+/// 2. **Fleet fallback** `[base, base+duration]` — when there is no sidecar but a
+///    snapshot `duration` is present, synthesize the coarse per-snapshot
+///    collection window (same `[begin, begin+elapsed]` shape the agent records).
+///    Lets windowless (older/plain-parquet) recordings still carry rate bands.
+/// 3. **Degenerate** `[base, base]` — neither sidecar nor duration available.
+fn resolve_window(
+    base: u64,
+    begin_off: Option<i64>,
+    width: Option<u64>,
+    duration: Option<u64>,
+) -> (u64, u64) {
+    match (begin_off, width) {
+        (Some(bo), Some(wd)) => {
+            let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
+            (begin_ns, begin_ns.saturating_add(wd))
+        }
+        _ => match duration {
+            Some(dur) => (base, base.saturating_add(dur)),
+            None => (base, base),
+        },
+    }
+}
+
 fn read_counters(
     pf: &ParquetSource,
     name: &str,
@@ -1710,6 +1739,12 @@ fn read_counters(
         .schema()
         .index_of("timestamp")
         .map_err(|_| "missing timestamp")?;
+    // PROTOTYPE (duration fallback): the snapshot-level collection window. When a
+    // metric has no per-observation :window_* sidecar, we synthesize a coarse
+    // fleet window [timestamp, timestamp + duration] from this column — the same
+    // [begin, begin+elapsed] formula the agent uses, just per-snapshot. Lets old
+    // (windowless) recordings carry rate() uncertainty.
+    let dur_col_idx = pf.meta.schema().index_of("duration").ok();
     let interval_ns = pf.sampling_interval_ms * 1_000_000;
     let num_rgs = pf.meta.metadata().num_row_groups();
 
@@ -1727,10 +1762,12 @@ fn read_counters(
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    // Reconstruct windows when a metric carries sidecars OR a duration column
+    // exists to synthesize the fleet fallback.
     let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
         .iter()
         .map(|c| {
-            if c.begin_col.is_some() && c.width_col.is_some() {
+            if (c.begin_col.is_some() && c.width_col.is_some()) || dur_col_idx.is_some() {
                 Some(Vec::new())
             } else {
                 None
@@ -1757,6 +1794,10 @@ fn read_counters(
         // on length and fall back to snapped if that ever fails to hold.)
         let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
         let raw_aligned = raw_ts.len() == timestamps.len();
+        // Per-snapshot collection duration for the fleet fallback window.
+        let durations = dur_col_idx
+            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+            .transpose()?;
         for (i, col) in cols.iter().enumerate() {
             let values = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
             debug_assert_eq!(
@@ -1781,18 +1822,11 @@ fn read_counters(
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
-                            match (bo, wd) {
-                                (Some(bo), Some(wd)) => {
-                                    // saturating + clamp-to-0: a corrupt/huge
-                                    // negative offset can't wrap into a bogus
-                                    // giant u64 or overflow i64.
-                                    let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
-                                    w.push((begin_ns, begin_ns.saturating_add(wd)));
-                                }
-                                // window columns present but null for this row:
-                                // degenerate window at the raw sample time.
-                                _ => w.push((base, base)),
-                            }
+                            let dur = durations
+                                .as_ref()
+                                .and_then(|d| d.get(row).copied())
+                                .flatten();
+                            w.push(resolve_window(base, bo, wd, dur));
                         }
                     }
                 }
@@ -1831,6 +1865,8 @@ fn read_gauges(
         .schema()
         .index_of("timestamp")
         .map_err(|_| "missing timestamp")?;
+    // Snapshot collection duration for the fleet fallback window (see read_counters).
+    let dur_col_idx = pf.meta.schema().index_of("duration").ok();
     let interval_ns = pf.sampling_interval_ms * 1_000_000;
     let num_rgs = pf.meta.metadata().num_row_groups();
 
@@ -1851,7 +1887,7 @@ fn read_gauges(
     let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
         .iter()
         .map(|c| {
-            if c.begin_col.is_some() && c.width_col.is_some() {
+            if (c.begin_col.is_some() && c.width_col.is_some()) || dur_col_idx.is_some() {
                 Some(Vec::new())
             } else {
                 None
@@ -1875,6 +1911,9 @@ fn read_gauges(
         // emitting the snapped grid point for alignment.
         let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
         let raw_aligned = raw_ts.len() == timestamps.len();
+        let durations = dur_col_idx
+            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+            .transpose()?;
         for (i, col) in cols.iter().enumerate() {
             let values = read_gauge_values_per_rg(pf, rg_idx, col.col_idx)?;
             debug_assert_eq!(
@@ -1899,18 +1938,11 @@ fn read_gauges(
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
-                            match (bo, wd) {
-                                (Some(bo), Some(wd)) => {
-                                    // saturating + clamp-to-0: a corrupt/huge
-                                    // negative offset can't wrap into a bogus
-                                    // giant u64 or overflow i64.
-                                    let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
-                                    w.push((begin_ns, begin_ns.saturating_add(wd)));
-                                }
-                                // window columns present but null for this row:
-                                // degenerate window at the raw sample time.
-                                _ => w.push((base, base)),
-                            }
+                            let dur = durations
+                                .as_ref()
+                                .and_then(|d| d.get(row).copied())
+                                .flatten();
+                            w.push(resolve_window(base, bo, wd, dur));
                         }
                     }
                 }
@@ -2128,6 +2160,27 @@ mod tests {
     use parquet::basic::Compression;
     use parquet::file::metadata::KeyValue;
     use parquet::file::properties::WriterProperties;
+
+    #[test]
+    fn resolve_window_precedence() {
+        // 1. Sidecar present → tight per-observation window (base + begin, + width).
+        assert_eq!(
+            resolve_window(1_000, Some(-50), Some(30), Some(999)),
+            (950, 980),
+            "sidecar wins over duration"
+        );
+        // Negative begin clamped to 0 (no wrap/overflow).
+        assert_eq!(resolve_window(10, Some(-100), Some(5), None), (0, 5));
+        // 2. No sidecar but duration present → fleet window [base, base + duration].
+        assert_eq!(resolve_window(1_000, None, None, Some(30)), (1_000, 1_030));
+        // Partial sidecar (begin without width) also falls back to fleet.
+        assert_eq!(
+            resolve_window(1_000, Some(-50), None, Some(30)),
+            (1_000, 1_030)
+        );
+        // 3. Neither → degenerate point window.
+        assert_eq!(resolve_window(1_000, None, None, None), (1_000, 1_000));
+    }
 
     /// Minimal parquet writer for timestamp-jitter tests: a `timestamp`
     /// UInt64 column set to exactly `raw` (no grid alignment) plus one dummy
