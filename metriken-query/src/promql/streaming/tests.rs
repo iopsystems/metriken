@@ -15,10 +15,9 @@ use std::sync::Arc;
 
 use crate::labels::Labels;
 use crate::memory::Memory;
-use crate::promql::streaming::{collect_to_matrix, sum_by, CounterIrate, LabeledSeries, Point};
+use crate::promql::streaming::{sum_by, LabeledSeries, Point};
 use crate::promql::{MatrixSample, QueryEngine, QueryResult};
 use crate::types::{Counter, Gauge};
-use crate::DataSource;
 
 /// Three counter series (foo/bar/baz) at t=1000..1002 with values
 /// (100,200,300) / (200,300,400) / (300,400,500). irate over a [5s]
@@ -67,93 +66,64 @@ fn into_sorted(result: QueryResult) -> Vec<MatrixSample> {
     }
 }
 
-#[test]
-fn streaming_irate_matches_eager_irate() {
-    let source = cgroup_source();
-
-    // Eager path: QueryEngine dispatches through try_streaming → Counters::irate.
-    let engine = QueryEngine::new(source.clone());
-    let eager = engine
-        .query_range("irate(cgroup_cpu_usage[5s])", 1000.0, 1003.0, 1.0)
-        .unwrap();
-    let eager = into_sorted(eager);
-
-    // Direct streaming path: fetch counters then call irate() directly.
-    let filter = Labels::default();
-    let counters = source
-        .counters("cgroup_cpu_usage", &filter, 0, u64::MAX)
-        .expect("collection present");
-    let stream = counters.irate(
-        &filter,
-        1_000_000_000_000, // start_ns
-        1_003_000_000_000, // end_ns
-        1_000_000_000,     // step_ns
-        5_000_000_000,     // range_ns
-    );
-    let streaming = sort_by_name(collect_to_matrix(stream, Some("cgroup_cpu_usage")));
-
-    assert_eq!(
-        eager.len(),
-        streaming.len(),
-        "series count must match (eager={}, streaming={})",
-        eager.len(),
-        streaming.len()
-    );
-    for (e, s) in eager.iter().zip(streaming.iter()) {
-        assert_eq!(e.metric.get("name"), s.metric.get("name"));
-        assert_eq!(
-            e.values.len(),
-            s.values.len(),
-            "point count for {:?}",
-            e.metric.get("name")
-        );
-        for ((et, ev), (st, sv)) in e.values.iter().zip(s.values.iter()) {
-            assert!((et - st).abs() < 1e-9, "ts mismatch: {et} vs {st}");
-            assert!((ev - sv).abs() < 1e-9, "value mismatch: {ev} vs {sv}");
+/// Assert two matrices are point-for-point equal.
+fn assert_matrices_eq(a: &[MatrixSample], b: &[MatrixSample]) {
+    assert_eq!(a.len(), b.len(), "series count");
+    assert!(!a.is_empty(), "fixture yields at least one series");
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.metric.get("name"), y.metric.get("name"));
+        assert_eq!(x.values.len(), y.values.len(), "point count");
+        for ((xt, xv), (yt, yv)) in x.values.iter().zip(y.values.iter()) {
+            assert!((xt - yt).abs() < 1e-9, "ts mismatch: {xt} vs {yt}");
+            assert!((xv - yv).abs() < 1e-9, "value mismatch: {xv} vs {yv}");
         }
     }
 }
 
 #[test]
-fn streaming_sum_by_matches_eager_sum_by() {
-    let source = cgroup_source();
-
-    let engine = QueryEngine::new(source.clone());
-    let eager = engine
-        .query_range(
-            "sum by (name) (irate(cgroup_cpu_usage[5s]))",
-            1000.0,
-            1003.0,
-            1.0,
-        )
-        .unwrap();
-    let eager = into_sorted(eager);
-
-    let filter = Labels::default();
-    let counters = source
-        .counters("cgroup_cpu_usage", &filter, 0, u64::MAX)
-        .expect("collection present");
-    let irate_stream = counters.irate(
-        &filter,
-        1_000_000_000_000,
-        1_003_000_000_000,
-        1_000_000_000,
-        5_000_000_000,
+fn query_rate_and_irate_are_identical() {
+    // `rate` and `irate` are the same operation in this engine (RateMode::Grid):
+    // the `[range]` window is inert and both compute the per-step grid rate.
+    let engine = QueryEngine::new(cgroup_source());
+    let rate = into_sorted(
+        engine
+            .query_range("rate(cgroup_cpu_usage[5s])", 1000.0, 1003.0, 1.0)
+            .unwrap(),
     );
-    let summed = sum_by(irate_stream, &["name".to_string()]);
-    // sum-by aggregated result: strip __name__ to match the eager
-    // path's `handle_aggregate` (which keeps only the by-labels).
-    let streaming = sort_by_name(collect_to_matrix(summed, None));
+    let irate = into_sorted(
+        engine
+            .query_range("irate(cgroup_cpu_usage[5s])", 1000.0, 1003.0, 1.0)
+            .unwrap(),
+    );
+    assert_matrices_eq(&rate, &irate);
+}
 
-    assert_eq!(eager.len(), streaming.len());
-    for (e, s) in eager.iter().zip(streaming.iter()) {
-        assert_eq!(e.metric.get("name"), s.metric.get("name"));
-        assert_eq!(e.values.len(), s.values.len());
-        for ((et, ev), (st, sv)) in e.values.iter().zip(s.values.iter()) {
-            assert!((et - st).abs() < 1e-9);
-            assert!((ev - sv).abs() < 1e-9);
-        }
-    }
+#[test]
+fn sum_by_rate_equals_sum_by_irate() {
+    // `sum by (name)` over the per-step rate; since rate ≡ irate, aggregating
+    // either yields the same series. Exercises sum_by over the grid producer.
+    let engine = QueryEngine::new(cgroup_source());
+    let via_rate = into_sorted(
+        engine
+            .query_range(
+                "sum by (name) (rate(cgroup_cpu_usage[5s]))",
+                1000.0,
+                1003.0,
+                1.0,
+            )
+            .unwrap(),
+    );
+    let via_irate = into_sorted(
+        engine
+            .query_range(
+                "sum by (name) (irate(cgroup_cpu_usage[5s]))",
+                1000.0,
+                1003.0,
+                1.0,
+            )
+            .unwrap(),
+    );
+    assert_matrices_eq(&via_rate, &via_irate);
 }
 
 #[test]
@@ -186,34 +156,6 @@ fn sum_by_groups_disjoint_label_into_one_series() {
     assert_eq!(iter.next(), Some(Point::at(2, 22.0)));
     assert_eq!(iter.next(), Some(Point::at(3, 33.0)));
     assert_eq!(iter.next(), None);
-}
-
-#[test]
-fn counter_irate_handles_reset() {
-    // Counter goes 100, 200, 300, 50 (reset), 150 at t=1..5 sec.
-    let timestamps: Vec<u64> = vec![
-        1_000_000_000,
-        2_000_000_000,
-        3_000_000_000,
-        4_000_000_000,
-        5_000_000_000,
-    ];
-    let values: Vec<u64> = vec![100, 200, 300, 50, 150];
-    // Range [5s], step 1s, evaluate at t=5s only.
-    let mut iter = CounterIrate::new(
-        &timestamps,
-        &values,
-        5_000_000_000,
-        5_000_000_000,
-        1_000_000_000,
-        5_000_000_000,
-        None,
-    );
-    let p = iter.next().expect("one point at t=5s");
-    assert_eq!(p.t, 5_000_000_000);
-    // Last two: (4s, 50) and (5s, 150). 150 >= 50 → delta=100/1s = 100.
-    assert!((p.v - 100.0).abs() < 1e-9);
-    assert!(iter.next().is_none());
 }
 
 /// Models the rezolus viewer's CPU-utilization pattern:

@@ -6,7 +6,7 @@ use crate::labels::Labels;
 use crate::memory::Memory;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counters, Gauges};
-use crate::{DataSource, MetricsSource};
+use crate::{DataSource, MetricsSource, QueryOptions};
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -97,6 +97,20 @@ impl MemoryStore {
         step: f64,
     ) -> Result<QueryResult, QueryError> {
         self.engine().query_range(expr, start, end, step)
+    }
+
+    /// Range query with explicit [`QueryOptions`] (e.g. a non-default
+    /// [`crate::RateMode`]).
+    pub fn query_range_opts(
+        &self,
+        expr: &str,
+        start: f64,
+        end: f64,
+        step: f64,
+        opts: &QueryOptions,
+    ) -> Result<QueryResult, QueryError> {
+        self.engine()
+            .query_range_opts(expr, start, end, step, opts.rate_mode)
     }
 
     /// Execute an instant PromQL query at a single timestamp.
@@ -328,14 +342,15 @@ impl DataSource for MemoryStoreInner {
 // ─── MetricsSource on MemoryStore ─────────────────────────────────────────────
 
 impl MetricsSource for MemoryStore {
-    fn query_range(
+    fn query_range_opts(
         &self,
         expr: &str,
         start_s: f64,
         end_s: f64,
         step_s: f64,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        MemoryStore::query_range(self, expr, start_s, end_s, step_s)
+        MemoryStore::query_range_opts(self, expr, start_s, end_s, step_s, opts)
     }
 
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {

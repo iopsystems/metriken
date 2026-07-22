@@ -15,7 +15,8 @@
 //!
 //! Wired-up shapes:
 //!
-//! * Counter producers: `CounterIrate`, `CounterRate`.
+//! * Counter producers: `CounterGridRate` (rate/irate — grid-aligned,
+//!   interval-attributable), `CounterPairwiseRate` (Raw mode / `deriv`).
 //! * Gauge producers: `GaugeStepGrid` (bare selector),
 //!   `GaugeAvgOverTime`, `GaugeIdelta`, `GaugeDeriv`.
 //! * Aggregations: `MergeReduce` reducer driven by [`AggOp`]
@@ -34,8 +35,6 @@ use std::collections::HashMap;
 
 use crate::labels::Labels;
 use crate::promql::MatrixSample;
-#[cfg(test)]
-use crate::types::Counters;
 
 mod aggregate;
 mod binary;
@@ -43,7 +42,6 @@ mod deriv;
 pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod histogram;
-mod irate;
 mod rate;
 
 #[cfg(test)]
@@ -54,8 +52,7 @@ pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
 pub(crate) use binary::{interval_binop, matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
 pub(crate) use deriv::StreamingDeriv;
 pub(crate) use gauge::{GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
-pub(crate) use irate::CounterIrate;
-pub(crate) use rate::{CounterPairwiseRate, CounterRate};
+pub(crate) use rate::{CounterGridRate, CounterPairwiseRate};
 
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;
@@ -104,37 +101,6 @@ impl<'a> LabeledSeries<'a> {
 
 /// Output of a streaming evaluation stage.
 pub type SeriesSet<'a> = Vec<LabeledSeries<'a>>;
-
-// ─── Counters methods ────────────────────────────────────────────────────────
-
-#[cfg(test)]
-impl Counters {
-    pub(crate) fn irate<'a>(
-        &'a self,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        step_ns: u64,
-        range_ns: u64,
-    ) -> SeriesSet<'a> {
-        self.series
-            .iter()
-            .filter(|c| filter.inner.is_empty() || c.labels.matches(filter))
-            .map(|c| {
-                let iter = CounterIrate::new(
-                    &c.timestamps,
-                    &c.values,
-                    start_ns,
-                    end_ns,
-                    step_ns,
-                    range_ns,
-                    c.windows.as_deref(),
-                );
-                LabeledSeries::new(c.labels.clone(), iter)
-            })
-            .collect()
-    }
-}
 
 /// Boundary collector: drain a streaming result into the same
 /// `MatrixSample` shape the eager engine returns.

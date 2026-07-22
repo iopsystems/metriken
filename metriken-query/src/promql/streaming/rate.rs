@@ -1,113 +1,12 @@
-//! `rate` as a pull-based iterator over a counter sample slice.
+//! Counter rate producers.
 //!
-//! At each step tick, walk every consecutive sample pair in
-//! `[t - range, t]`, accumulate counter increases (handling resets),
-//! and divide by the time span between the first and last sample.
-//! Like [`super::CounterIrate`] the only state is the cursor; the
-//! sample slice is borrowed from the upstream source.
+//! * [`CounterGridRate`] — `rate`/`irate` in this engine: a fixed-phase
+//!   evaluation grid whose value is the reset-adjusted cumulative counter
+//!   interpolated across each step interval (see the struct docs).
+//! * [`CounterPairwiseRate`] — one point per consecutive sample pair at the
+//!   real sample timestamp; used by `RateMode::Raw` and by `deriv`.
 
 use super::Point;
-
-pub struct CounterRate<'a> {
-    timestamps: &'a [u64],
-    values: &'a [u64],
-    cursor_ns: u64,
-    end_ns: u64,
-    step_ns: u64,
-    range_ns: u64,
-    windows: Option<&'a [(u64, u64)]>,
-    done: bool,
-}
-
-impl<'a> CounterRate<'a> {
-    pub fn new(
-        timestamps: &'a [u64],
-        values: &'a [u64],
-        start_ns: u64,
-        end_ns: u64,
-        step_ns: u64,
-        range_ns: u64,
-        windows: Option<&'a [(u64, u64)]>,
-    ) -> Self {
-        Self {
-            timestamps,
-            values,
-            cursor_ns: start_ns,
-            end_ns,
-            step_ns,
-            range_ns,
-            windows,
-            done: step_ns == 0,
-        }
-    }
-}
-
-impl<'a> Iterator for CounterRate<'a> {
-    type Item = Point;
-
-    fn next(&mut self) -> Option<Point> {
-        while !self.done && self.cursor_ns <= self.end_ns {
-            let t = self.cursor_ns;
-            match self.cursor_ns.checked_add(self.step_ns) {
-                Some(next) => self.cursor_ns = next,
-                None => self.done = true,
-            }
-
-            let window_start = t.saturating_sub(self.range_ns);
-            let lo = self.timestamps.partition_point(|&ts| ts < window_start);
-            let hi = self.timestamps.partition_point(|&ts| ts <= t);
-            if hi.saturating_sub(lo) < 2 {
-                continue;
-            }
-
-            let mut total_increase = 0.0;
-            for i in lo..hi - 1 {
-                let prev_v = self.values[i];
-                let cur_v = self.values[i + 1];
-                if cur_v >= prev_v {
-                    total_increase += (cur_v - prev_v) as f64;
-                } else {
-                    total_increase += cur_v as f64;
-                }
-            }
-
-            let first_ts = self.timestamps[lo];
-            let last_ts = self.timestamps[hi - 1];
-            let dur_s = (last_ts - first_ts) as f64 / 1e9;
-            if dur_s <= 0.0 {
-                continue;
-            }
-
-            let v = total_increase / dur_s;
-            let bounds = self
-                .windows
-                .and_then(|w| {
-                    let (b_first, e_first) = *w.get(lo)?;
-                    let (b_last, e_last) = *w.get(hi - 1)?;
-                    let elapsed_max = e_last.saturating_sub(b_first) as f64 / 1e9;
-                    let elapsed_min = b_last.saturating_sub(e_first) as f64 / 1e9;
-                    // A well-formed window pair gives elapsed_min ≤ elapsed_max
-                    // (both > 0). Overlapping / out-of-order / end<begin windows
-                    // make b_last ≤ e_first, saturating elapsed_min to 0 → this
-                    // point gets no band. Conservative but all-or-nothing: since
-                    // collect_to_matrix only emits `intervals` when EVERY point
-                    // has a band, one such degenerate window drops the whole
-                    // series' band. Acceptable (better no band than a wrong one).
-                    if elapsed_min > 0.0 && elapsed_max > 0.0 {
-                        Some((total_increase / elapsed_max, total_increase / elapsed_min))
-                    } else {
-                        None
-                    }
-                })
-                // The nominal divides by the row-timestamp gap while the bounds
-                // derive from the window edges (a different time reference), so
-                // widen the band to always contain the displayed value.
-                .map(|(lo, hi)| (lo.min(v), hi.max(v)));
-            return Some(Point { t, v, bounds });
-        }
-        None
-    }
-}
 
 /// Pair-wise rate producer over a counter sample slice.
 pub struct CounterPairwiseRate<'a> {
@@ -157,87 +56,250 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
     }
 }
 
+/// Grid-aligned rate producer (`RateMode::Grid`).
+///
+/// At each grid tick `t = start + k·step`, linearly interpolate the
+/// reset-adjusted cumulative counter to `t` and to `t − step`, then emit
+/// `(V(t) − V(t − step)) / step`. Unlike a whole-window average rate, the value
+/// is attributable to the grid interval `[t − step, t]` regardless of sample
+/// phase, so two recordings on a shared grid are directly comparable. The
+/// query's `[range]` window is intentionally ignored — the step is the
+/// interval. A grid point is emitted only when both interval edges fall
+/// within the observed sample range `[first_ts, last_ts]`; no extrapolation
+/// beyond observed data (leading/trailing partial intervals are dropped).
+pub struct CounterGridRate<'a> {
+    timestamps: &'a [u64],
+    /// Reset-adjusted monotone cumulative counter, aligned with `timestamps`.
+    cum: Vec<f64>,
+    cursor_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+    windows: Option<&'a [(u64, u64)]>,
+    done: bool,
+}
+
+impl<'a> CounterGridRate<'a> {
+    pub fn new(
+        timestamps: &'a [u64],
+        values: &'a [u64],
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+        windows: Option<&'a [(u64, u64)]>,
+    ) -> Self {
+        // Reset-adjusted cumulative: same convention as CounterRate's
+        // total_increase (a decrease is treated as a fresh counter start,
+        // contributing its own value as the increment).
+        let mut cum = Vec::with_capacity(values.len());
+        let mut acc = 0.0;
+        for (i, &v) in values.iter().enumerate() {
+            if i == 0 {
+                cum.push(0.0);
+            } else {
+                let prev = values[i - 1];
+                acc += if v >= prev {
+                    (v - prev) as f64
+                } else {
+                    v as f64
+                };
+                cum.push(acc);
+            }
+        }
+        Self {
+            timestamps,
+            cum,
+            cursor_ns: start_ns,
+            end_ns,
+            step_ns,
+            windows,
+            done: step_ns == 0 || timestamps.len() < 2,
+        }
+    }
+
+    /// Linearly interpolate the reset-adjusted cumulative value at `edge`.
+    /// Returns `None` when `edge` is outside the observed sample range (no
+    /// extrapolation).
+    fn interp(&self, edge: u64) -> Option<f64> {
+        let ts = self.timestamps;
+        let last = *ts.last()?;
+        if edge < ts[0] || edge > last {
+            return None;
+        }
+        // First index with ts >= edge.
+        let hi = ts.partition_point(|&t| t < edge);
+        if ts[hi] == edge {
+            return Some(self.cum[hi]);
+        }
+        // edge is strictly between hi-1 and hi (hi >= 1 since edge > ts[0]).
+        let lo = hi - 1;
+        let span = (ts[hi] - ts[lo]) as f64;
+        let frac = (edge - ts[lo]) as f64 / span;
+        Some(self.cum[lo] + frac * (self.cum[hi] - self.cum[lo]))
+    }
+
+    /// Interpolate the acquisition-window `(begin, end)` at `edge`, in the
+    /// same way as [`Self::interp`] does the value, so the uncertainty band
+    /// is attributable to the grid edge rather than the nearest raw sample.
+    /// `None` when there are no windows or `edge` is outside the sample range.
+    fn interp_window(&self, edge: u64) -> Option<(f64, f64)> {
+        let w = self.windows?;
+        let ts = self.timestamps;
+        let last = *ts.last()?;
+        if edge < ts[0] || edge > last {
+            return None;
+        }
+        let hi = ts.partition_point(|&t| t < edge);
+        let (b_hi, e_hi) = *w.get(hi)?;
+        if ts[hi] == edge {
+            return Some((b_hi as f64, e_hi as f64));
+        }
+        let lo = hi - 1;
+        let (b_lo, e_lo) = *w.get(lo)?;
+        let span = (ts[hi] - ts[lo]) as f64;
+        let frac = (edge - ts[lo]) as f64 / span;
+        let b = b_lo as f64 + frac * (b_hi as f64 - b_lo as f64);
+        let e = e_lo as f64 + frac * (e_hi as f64 - e_lo as f64);
+        Some((b, e))
+    }
+}
+
+impl<'a> Iterator for CounterGridRate<'a> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        while !self.done && self.cursor_ns <= self.end_ns {
+            let t = self.cursor_ns;
+            match self.cursor_ns.checked_add(self.step_ns) {
+                Some(next) => self.cursor_ns = next,
+                None => self.done = true,
+            }
+
+            let Some(left) = t.checked_sub(self.step_ns) else {
+                continue;
+            };
+            let (Some(v_hi), Some(v_lo)) = (self.interp(t), self.interp(left)) else {
+                continue;
+            };
+            let step_s = self.step_ns as f64 / 1e9;
+            if step_s <= 0.0 {
+                continue;
+            }
+            let increase = v_hi - v_lo;
+            let v = increase / step_s;
+            // Band from the interpolated window edges: the elapsed span between
+            // the left edge's begin and the right edge's end (widest → slowest)
+            // and between the right edge's begin and the left edge's end
+            // (narrowest → fastest). Widen to always contain the nominal, which
+            // divides by the exact step rather than the window-derived span.
+            let bounds = self
+                .interp_window(left)
+                .zip(self.interp_window(t))
+                .and_then(|((b_left, e_left), (b_hi, e_hi))| {
+                    let elapsed_max = (e_hi - b_left) / 1e9;
+                    let elapsed_min = (b_hi - e_left) / 1e9;
+                    if elapsed_min > 0.0 && elapsed_max > 0.0 {
+                        Some((increase / elapsed_max, increase / elapsed_min))
+                    } else {
+                        None
+                    }
+                })
+                .map(|(lo, hi)| (lo.min(v), hi.max(v)));
+            return Some(Point { t, v, bounds });
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ---- Grid producer (RateMode::Grid) ----
+
     #[test]
-    fn rate_computes_interval_bounds_from_windows() {
-        let ts = [1_000_000_000u64, 2_000_000_000];
-        let vals = [100u64, 400];
-        let windows = [
-            (950_000_000u64, 980_000_000u64),
-            (1_960_000_000u64, 1_980_000_000u64),
-        ];
-        let pts: Vec<Point> = CounterRate::new(
+    fn grid_rate_constant_counter_yields_constant_rate() {
+        // Counter climbing 100/s, samples aligned on the grid.
+        let ts = [0u64, 1_000_000_000, 2_000_000_000, 3_000_000_000];
+        let vals = [0u64, 100, 200, 300];
+        let pts: Vec<Point> = CounterGridRate::new(
             &ts,
             &vals,
-            2_000_000_000, // start = single eval point
-            2_000_000_000, // end
-            1_000_000_000, // step
-            2_000_000_000, // range covers both samples
-            Some(&windows),
+            0,             // start_ns (already snapped by the caller)
+            3_000_000_000, // end_ns
+            1_000_000_000, // step_ns
+            None,          // windows
         )
         .collect();
-        assert_eq!(pts.len(), 1);
-        let p = pts[0];
-        assert!((p.v - 300.0).abs() < 1e-6, "nominal {}", p.v); // 300/1s
-        let (lo, hi) = p.bounds.expect("bounds present");
-        // elapsed_max=(1.98e9-0.95e9)/1e9=1.03 -> 300/1.03=291.26
-        // elapsed_min=(1.96e9-0.98e9)/1e9=0.98 -> 300/0.98=306.12
-        assert!((lo - 291.2621).abs() < 0.02, "lo {lo}");
-        assert!((hi - 306.1224).abs() < 0.02, "hi {hi}");
+        // Grid point t needs both edges (t-step, t) inside the sample range
+        // [0, 3s]; t=0 has no left edge, so emit at t=1,2,3s.
+        let times: Vec<u64> = pts.iter().map(|p| p.t).collect();
+        assert_eq!(times, vec![1_000_000_000, 2_000_000_000, 3_000_000_000]);
+        for p in &pts {
+            assert!((p.v - 100.0).abs() < 1e-6, "t={} v={}", p.t, p.v);
+        }
+    }
+
+    #[test]
+    fn grid_rate_interpolates_between_offset_samples() {
+        // Samples offset 0.5s from the grid; the process is a constant 100/s.
+        // Only t=2s has both edges (1s, 2s) inside the sample range [0.5, 2.5],
+        // and interpolation must recover 100/s there — the case that
+        // distinguishes Grid from a naive per-window sum.
+        let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
+        let vals = [0u64, 100, 200];
+        let pts: Vec<Point> =
+            CounterGridRate::new(&ts, &vals, 0, 3_000_000_000, 1_000_000_000, None).collect();
+        assert_eq!(pts.len(), 1, "only the interior grid point is emitted");
+        assert_eq!(pts[0].t, 2_000_000_000);
+        // V(2s)=150 (interp 1.5→2.5), V(1s)=50 (interp 0.5→1.5) → 100/s.
+        assert!((pts[0].v - 100.0).abs() < 1e-6, "v={}", pts[0].v);
+    }
+
+    #[test]
+    fn grid_rate_handles_counter_reset() {
+        // Reset between idx 1 and 2 (100 → 50): reset-adjusted increments are
+        // 100, 50, 100 over 1s each.
+        let ts = [0u64, 1_000_000_000, 2_000_000_000, 3_000_000_000];
+        let vals = [0u64, 100, 50, 150];
+        let pts: Vec<Point> =
+            CounterGridRate::new(&ts, &vals, 0, 3_000_000_000, 1_000_000_000, None).collect();
+        let vs: Vec<f64> = pts.iter().map(|p| p.v).collect();
+        assert_eq!(vs.len(), 3);
+        assert!((vs[0] - 100.0).abs() < 1e-6, "{vs:?}");
+        assert!((vs[1] - 50.0).abs() < 1e-6, "{vs:?}");
+        assert!((vs[2] - 100.0).abs() < 1e-6, "{vs:?}");
+    }
+
+    #[test]
+    fn grid_rate_derives_bounds_from_interpolated_windows() {
+        let ts = [1_000_000_000u64, 2_000_000_000, 3_000_000_000];
+        let vals = [0u64, 100, 200];
+        // Per-sample acquisition windows (begin, end).
+        let windows = [
+            (1_000_000_000u64, 1_020_000_000u64),
+            (1_980_000_000u64, 2_000_000_000u64),
+            (2_980_000_000u64, 3_000_000_000u64),
+        ];
+        let pts: Vec<Point> =
+            CounterGridRate::new(&ts, &vals, 0, 3_000_000_000, 1_000_000_000, Some(&windows))
+                .collect();
+        // t=1s dropped (left edge 0 precedes first sample); emit t=2s, t=3s.
+        assert_eq!(
+            pts.iter().map(|p| p.t).collect::<Vec<_>>(),
+            vec![2_000_000_000, 3_000_000_000]
+        );
+        let p = pts[0]; // t=2s, interval [1s, 2s]
+        assert!((p.v - 100.0).abs() < 1e-6, "nominal {}", p.v);
+        let (lo, hi) = p.bounds.expect("grid bounds present");
+        // increase=100; elapsed_max=(2.00-1.00)=1.0s → 100;
+        // elapsed_min=(1.98-1.02)=0.96s → 104.17. Band widened to contain 100.
+        assert!((lo - 100.0).abs() < 0.05, "lo {lo}");
+        assert!((hi - 104.1667).abs() < 0.05, "hi {hi}");
         assert!(lo <= p.v && p.v <= hi);
     }
 
-    #[test]
-    fn rate_without_windows_has_no_bounds() {
-        let ts = [1_000_000_000u64, 2_000_000_000];
-        let vals = [100u64, 400];
-        let pts: Vec<Point> = CounterRate::new(
-            &ts,
-            &vals,
-            2_000_000_000,
-            2_000_000_000,
-            1_000_000_000,
-            2_000_000_000,
-            None,
-        )
-        .collect();
-        assert_eq!(pts.len(), 1);
-        assert!(pts[0].bounds.is_none());
-    }
-
-    #[test]
-    fn rate_bounds_widen_to_contain_nominal() {
-        // Row timestamps imply a 4s gap, but the windows imply ~1s — the nominal
-        // (row-ts based) falls well outside the raw window bounds, so the band
-        // must widen to contain it.
-        let ts = [1_000_000_000u64, 5_000_000_000];
-        let vals = [0u64, 200];
-        let windows = [
-            (1_000_000_000u64, 1_010_000_000u64),
-            (2_000_000_000u64, 2_010_000_000u64),
-        ];
-        let pts: Vec<Point> = CounterRate::new(
-            &ts,
-            &vals,
-            5_000_000_000,
-            5_000_000_000,
-            1_000_000_000,
-            10_000_000_000,
-            Some(&windows),
-        )
-        .collect();
-        assert_eq!(pts.len(), 1);
-        let p = pts[0];
-        assert!((p.v - 50.0).abs() < 1e-6, "nominal {} (200/4s)", p.v); // 200/4s
-        let (lo, hi) = p.bounds.expect("bounds present");
-        assert!(
-            lo <= p.v && p.v <= hi,
-            "nominal {} must be in [{lo}, {hi}]",
-            p.v
-        );
-        assert!((lo - 50.0).abs() < 1e-6, "lo widened to nominal, got {lo}");
-    }
+    // Note: the interpolated-window bounds convention (Grid) supersedes the old
+    // whole-window `CounterRate` bounds tests, which were retired with that
+    // producer. `grid_rate_derives_bounds_from_interpolated_windows` above is
+    // the replacement coverage.
 }

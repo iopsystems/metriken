@@ -24,7 +24,7 @@ use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta
 use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
-use crate::{DataSource, MetricsSource};
+use crate::{DataSource, MetricsSource, QueryOptions};
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -152,6 +152,21 @@ impl ParquetReader {
         self.engine.query_range(expr, start_s, end_s, step_s)
     }
 
+    /// Range query with explicit [`QueryOptions`] (e.g. a non-default
+    /// [`crate::RateMode`]). The no-arg [`query_range`](Self::query_range)
+    /// forwards here with defaults.
+    pub fn query_range_opts(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &QueryOptions,
+    ) -> Result<QueryResult, QueryError> {
+        self.engine
+            .query_range_opts(expr, start_s, end_s, step_s, opts.rate_mode)
+    }
+
     /// Time range of data across all files in seconds, or `None` if empty.
     pub fn time_range(&self) -> Option<(f64, f64)> {
         self.engine
@@ -265,14 +280,15 @@ impl ParquetReader {
 }
 
 impl MetricsSource for ParquetReader {
-    fn query_range(
+    fn query_range_opts(
         &self,
         expr: &str,
         start_s: f64,
         end_s: f64,
         step_s: f64,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        self.query_range(expr, start_s, end_s, step_s)
+        self.query_range_opts(expr, start_s, end_s, step_s, opts)
     }
 
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {

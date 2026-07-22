@@ -5,7 +5,24 @@ use crate::labels::Labels;
 use crate::memory::Memory;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
-use crate::DataSource;
+use crate::{DataSource, RateMode};
+
+/// Counter climbing 100/s whose samples land at `.374s` past each second —
+/// a phase deliberately offset from any round-second evaluation grid.
+fn create_phase_offset_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let phase = 374_000_000u64; // 0.374s
+    source.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            timestamps: (0u64..6).map(|s| s * 1_000_000_000 + phase).collect(),
+            values: (0u64..6).map(|s| s * 100).collect(),
+            windows: None,
+        },
+    );
+    source
+}
 
 fn make_labels(pairs: &[(&str, &str)]) -> Labels {
     let mut l = Labels::default();
@@ -427,7 +444,11 @@ fn test_windowed_rate_basic() {
 }
 
 #[test]
-fn test_windowed_rate_counter_reset() {
+fn test_grid_rate_counter_reset() {
+    // reset_counter [100,200,300,50,150]: reset-adjusted increments are
+    // 100,100,50,100 over 1s each. Grid evaluates the per-step interval
+    // [1003s, 1004s] → the 50→150 delta = 100/s (the old 5s-window value was
+    // 87.5; the [range] token is inert now).
     let source = Arc::new(create_counter_reset_source());
     let engine = QueryEngine::new(source);
 
@@ -439,10 +460,11 @@ fn test_windowed_rate_counter_reset() {
     assert_eq!(all_values.len(), 1);
     assert_eq!(all_values[0].len(), 1);
 
-    let rate = all_values[0][0].1;
+    let (ts, rate) = all_values[0][0];
+    assert!((ts - 1004.0).abs() < 1e-9, "grid timestamp {ts}");
     assert!(
-        (rate - 87.5).abs() < 1e-6,
-        "Expected rate 87.5, got {}",
+        (rate - 100.0).abs() < 1e-6,
+        "Expected per-step rate 100, got {}",
         rate
     );
 }
@@ -469,34 +491,75 @@ fn test_windowed_irate_basic() {
 }
 
 #[test]
-fn test_rate_vs_irate_differ_with_reset() {
+fn test_rate_and_irate_identical_with_reset() {
+    // rate ≡ irate in this engine (RateMode::Grid), including across a counter
+    // reset — both compute the same per-step grid rate; `[range]` is inert.
     let source = Arc::new(create_counter_reset_source());
     let engine = QueryEngine::new(source);
 
-    let rate_result = engine
-        .query_range("rate(reset_counter[5s])", 1004.0, 1004.0, 1.0)
-        .unwrap();
-    let irate_result = engine
-        .query_range("irate(reset_counter[5s])", 1004.0, 1004.0, 1.0)
-        .unwrap();
+    let rate = get_matrix_values(
+        &engine
+            .query_range("rate(reset_counter[5s])", 1001.0, 1004.0, 1.0)
+            .unwrap(),
+    );
+    let irate = get_matrix_values(
+        &engine
+            .query_range("irate(reset_counter[5s])", 1001.0, 1004.0, 1.0)
+            .unwrap(),
+    );
 
-    let rate_val = get_matrix_values(&rate_result)[0][0].1;
-    let irate_val = get_matrix_values(&irate_result)[0][0].1;
+    assert!(!rate.is_empty() && !rate[0].is_empty(), "expected points");
+    assert_eq!(rate, irate, "rate and irate must be identical");
+}
 
-    assert!(
-        (rate_val - 87.5).abs() < 1e-6,
-        "Expected rate 87.5, got {}",
-        rate_val
+#[test]
+fn test_default_mode_snaps_grid_to_round_timestamps() {
+    // Samples land at .374s; the viewer passes start = first-sample time. The
+    // default mode (Grid) must emit points on round-second grid boundaries, not
+    // at the sample phase — this is the phase-offset bug fix.
+    let engine = QueryEngine::new(Arc::new(create_phase_offset_source()));
+    let result = engine
+        .query_range("rate(c[1s])", 0.374, 5.374, 1.0)
+        .unwrap();
+    let vals = get_matrix_values(&result);
+    assert_eq!(vals.len(), 1);
+    assert!(!vals[0].is_empty(), "expected grid points");
+    for (ts, v) in &vals[0] {
+        assert!(
+            (ts - ts.round()).abs() < 1e-6,
+            "timestamp {ts} is not on a round-second grid"
+        );
+        assert!((v - 100.0).abs() < 1e-6, "constant-rate value {v}");
+    }
+    // Explicit Grid opts match the default exactly.
+    let explicit = get_matrix_values(
+        &engine
+            .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Grid)
+            .unwrap(),
     );
-    assert!(
-        (irate_val - 100.0).abs() < 1e-6,
-        "Expected irate 100.0, got {}",
-        irate_val
-    );
-    assert!(
-        (rate_val - irate_val).abs() > 1.0,
-        "rate and irate should differ with counter reset"
-    );
+    assert_eq!(vals, explicit, "default must equal RateMode::Grid");
+}
+
+#[test]
+fn test_raw_mode_emits_real_sample_timestamps() {
+    // Raw places points at the actual (phase-offset) sample timestamps, one per
+    // consecutive sample pair — the honest sample cadence, un-snapped.
+    let engine = QueryEngine::new(Arc::new(create_phase_offset_source()));
+    let result = engine
+        .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Raw)
+        .unwrap();
+    let vals = get_matrix_values(&result);
+    assert_eq!(vals.len(), 1);
+    let times: Vec<f64> = vals[0].iter().map(|(t, _)| *t).collect();
+    // Pairwise over samples at .374 → points at 1.374 … 5.374.
+    let expected = [1.374, 2.374, 3.374, 4.374, 5.374];
+    assert_eq!(times.len(), expected.len(), "got {times:?}");
+    for (got, exp) in times.iter().zip(expected.iter()) {
+        assert!((got - exp).abs() < 1e-6, "raw timestamp {got} vs {exp}");
+    }
+    for (_, v) in &vals[0] {
+        assert!((v - 100.0).abs() < 1e-6, "raw value {v}");
+    }
 }
 
 #[test]
