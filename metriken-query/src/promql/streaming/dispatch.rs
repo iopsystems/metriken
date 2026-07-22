@@ -29,11 +29,11 @@ use promql_parser::parser::{self, Expr};
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
     aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp,
-    CounterIrate, CounterPairwiseRate, CounterRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta,
-    GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
+    GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{MatrixSample, QueryError, QueryResult};
-use crate::DataSource;
+use crate::{DataSource, RateMode};
 
 /// Evaluate `expr` via the streaming pipeline. Returns
 /// `QueryError::Unsupported` for any AST shape the dispatcher doesn't
@@ -44,13 +44,25 @@ pub fn try_streaming(
     start: f64,
     end: f64,
     step: f64,
+    rate_mode: RateMode,
 ) -> Result<QueryResult, QueryError> {
+    let step_ns = (step * 1e9) as u64;
+    let raw_start_ns = (start * 1e9) as u64;
+    // Grid mode fixes the evaluation-grid phase to the step boundary so two
+    // recordings on the same step share a grid (A/B alignment) and gauge/rate
+    // labels land on round step multiples. Raw keeps the caller's start. Snap
+    // once here so every downstream producer inherits the fixed phase.
+    let start_ns = match rate_mode {
+        RateMode::Grid if step_ns > 0 => (raw_start_ns / step_ns) * step_ns,
+        _ => raw_start_ns,
+    };
     let ctx = Ctx {
         source,
-        start_ns: (start * 1e9) as u64,
+        start_ns,
         end_ns: (end * 1e9) as u64,
-        step_ns: (step * 1e9) as u64,
+        step_ns,
         interval_ns: (source.interval() * 1e9) as u64,
+        rate_mode,
     };
 
     let result = match build(&ctx, expr)? {
@@ -86,6 +98,7 @@ struct Ctx<'a> {
     end_ns: u64,
     step_ns: u64,
     interval_ns: u64,
+    rate_mode: RateMode,
 }
 
 /// One step of recursion.
@@ -336,7 +349,17 @@ where
     let data_start = ctx.start_ns.saturating_sub(range_ns);
 
     match call.func.name {
-        "irate" => {
+        // `rate` and `irate` are the same operation in this engine: the query's
+        // `[range]` window is inert, and the value is the per-step rate. The
+        // mode only chooses point placement (see `RateMode`).
+        "rate" | "irate" => {
+            // Grid needs at least one step of lookback to bracket the first
+            // interval's left edge, regardless of the (inert) query range.
+            let lookback = match ctx.rate_mode {
+                RateMode::Grid => range_ns.max(ctx.step_ns),
+                RateMode::Raw => range_ns,
+            };
+            let data_start = ctx.start_ns.saturating_sub(lookback);
             let counters = ctx
                 .source
                 .counters(metric_name, &filter, data_start, ctx.end_ns)
@@ -345,44 +368,20 @@ where
                 .series
                 .into_iter()
                 .map(|c| {
-                    let pts: Vec<_> = CounterIrate::new(
-                        &c.timestamps,
-                        &c.values,
-                        ctx.start_ns,
-                        ctx.end_ns,
-                        ctx.step_ns,
-                        range_ns,
-                        c.windows.as_deref(),
-                    )
-                    .collect();
-                    LabeledSeries::new(c.labels, pts.into_iter())
-                })
-                .collect();
-            Ok(Built::Series {
-                series,
-                metric_name: Some(metric_name),
-                metric_name_for_error: Some(metric_name.to_string()),
-            })
-        }
-        "rate" => {
-            let counters = ctx
-                .source
-                .counters(metric_name, &filter, data_start, ctx.end_ns)
-                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
-            let series: SeriesSet<'a> = counters
-                .series
-                .into_iter()
-                .map(|c| {
-                    let pts: Vec<_> = CounterRate::new(
-                        &c.timestamps,
-                        &c.values,
-                        ctx.start_ns,
-                        ctx.end_ns,
-                        ctx.step_ns,
-                        range_ns,
-                        c.windows.as_deref(),
-                    )
-                    .collect();
+                    let pts: Vec<_> = match ctx.rate_mode {
+                        RateMode::Grid => CounterGridRate::new(
+                            &c.timestamps,
+                            &c.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                            ctx.step_ns,
+                            c.windows.as_deref(),
+                        )
+                        .collect(),
+                        RateMode::Raw => {
+                            CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns).collect()
+                        }
+                    };
                     LabeledSeries::new(c.labels, pts.into_iter())
                 })
                 .collect();

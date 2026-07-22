@@ -58,6 +58,47 @@ use histogram_stream::HistogramStream;
 use labels::Labels;
 use types::{Counters, Gauges};
 
+/// How `rate()` / `irate()` are aligned to the evaluation grid.
+///
+/// In this engine `rate` and `irate` are **the same operation** — the query's
+/// `[range]` window is not used to compute the value; the step interval is.
+/// The mode only chooses how points are placed in time:
+///
+/// * [`Grid`](RateMode::Grid) (default): at each grid tick `t = floor(start/step)·step + k·step`,
+///   the value is the reset-adjusted cumulative counter interpolated across
+///   `[t − step, t]`, divided by the step. The grid phase is fixed to the step
+///   boundary, so two recordings on the same step share a grid and are directly
+///   comparable (A/B). The value is attributable to the grid interval.
+/// * [`Raw`](RateMode::Raw): points land at the actual sample timestamps, one
+///   per consecutive sample pair (pairwise delta / elapsed). Honest sample
+///   cadence, un-alignable across recordings by construction — for
+///   jitter/cadence and single-recording analysis.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum RateMode {
+    /// Fixed-phase grid with interval-attributable interpolated values. Default.
+    #[default]
+    Grid,
+    /// Actual sample timestamps, pairwise deltas. Not grid-aligned.
+    Raw,
+}
+
+/// Query-evaluation options threaded into the streaming engine. Additive and
+/// `#[non_exhaustive]`: new knobs can be added without breaking callers, and
+/// `QueryOptions::default()` reproduces today's default behavior.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct QueryOptions {
+    /// Rate/irate time-alignment mode. See [`RateMode`].
+    pub rate_mode: RateMode,
+}
+
+impl QueryOptions {
+    /// Construct options selecting a specific [`RateMode`].
+    pub fn with_rate_mode(rate_mode: RateMode) -> Self {
+        Self { rate_mode }
+    }
+}
+
 pub(crate) trait DataSource: Send + Sync {
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64)
         -> Option<Counters>;
@@ -113,13 +154,30 @@ pub(crate) trait DataSource: Send + Sync {
 /// }
 /// ```
 pub trait MetricsSource: Send + Sync {
-    /// Execute a PromQL range query.
+    /// Execute a PromQL range query with the default [`QueryOptions`]
+    /// (i.e. [`RateMode::Grid`]). Delegates to
+    /// [`query_range_opts`](Self::query_range_opts); implementors override that
+    /// one, not this.
     fn query_range(
         &self,
         expr: &str,
         start_s: f64,
         end_s: f64,
         step_s: f64,
+    ) -> Result<QueryResult, QueryError> {
+        self.query_range_opts(expr, start_s, end_s, step_s, &QueryOptions::default())
+    }
+
+    /// Execute a PromQL range query with explicit [`QueryOptions`] (e.g. a
+    /// non-default [`RateMode`]). This is the method concrete sources implement;
+    /// the non-`_opts` and display variants delegate to it.
+    fn query_range_opts(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError>;
 
     /// Execute a PromQL range query in *display* mode: evaluate at native
@@ -146,7 +204,23 @@ pub trait MetricsSource: Send + Sync {
         step_s: f64,
         opts: &DisplayOptions,
     ) -> Result<DisplayResult, QueryError> {
-        match self.query_range(expr, start_s, end_s, step_s)? {
+        self.query_range_display_opts(expr, start_s, end_s, step_s, opts, &QueryOptions::default())
+    }
+
+    /// Display-mode range query with explicit [`QueryOptions`]. Mirrors
+    /// [`query_range_display`](Self::query_range_display), post-processing
+    /// [`query_range_opts`](Self::query_range_opts) so the rate mode threads
+    /// through decimation. The default works for every backend.
+    fn query_range_display_opts(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &DisplayOptions,
+        qopts: &QueryOptions,
+    ) -> Result<DisplayResult, QueryError> {
+        match self.query_range_opts(expr, start_s, end_s, step_s, qopts)? {
             QueryResult::Matrix { result } => {
                 let series = result
                     .into_iter()
