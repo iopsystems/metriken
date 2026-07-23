@@ -407,6 +407,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
                     )
                     .collect();
                     LabeledSeries::new(g.labels, pts.into_iter())
@@ -434,6 +435,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
                     )
                     .collect();
                     LabeledSeries::new(g.labels, pts.into_iter())
@@ -462,6 +464,7 @@ where
                             ctx.start_ns,
                             ctx.end_ns,
                             ctx.step_ns,
+                            matches!(ctx.rate_mode, RateMode::Raw),
                         )
                         .collect();
                         LabeledSeries::new(g.labels, pts.into_iter())
@@ -578,6 +581,7 @@ where
                 ctx.end_ns,
                 ctx.step_ns,
                 staleness_ns,
+                matches!(ctx.rate_mode, RateMode::Raw),
             )
             .collect();
             LabeledSeries::new(g.labels, pts.into_iter())
