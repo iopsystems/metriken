@@ -379,7 +379,13 @@ where
                         )
                         .collect(),
                         RateMode::Raw => {
-                            CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns).collect()
+                            CounterPairwiseRate::new(
+                                &c.timestamps,
+                                &c.values,
+                                ctx.start_ns,
+                                ctx.end_ns,
+                            )
+                            .collect()
                         }
                     };
                     LabeledSeries::new(c.labels, pts.into_iter())
@@ -484,7 +490,11 @@ where
                 .series
                 .into_iter()
                 .map(|c| {
-                    let rate_iter = CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns);
+                    // deriv wraps the pairwise rate in StreamingDeriv, which does
+                    // its own windowing and needs the pre-start lookback, so no
+                    // start bound here (0).
+                    let rate_iter =
+                        CounterPairwiseRate::new(&c.timestamps, &c.values, 0, ctx.end_ns);
                     let pts: Vec<_> =
                         StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
                             .collect();
