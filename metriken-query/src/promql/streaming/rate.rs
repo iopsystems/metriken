@@ -8,20 +8,27 @@
 
 use super::Point;
 
-/// Pair-wise rate producer over a counter sample slice.
+/// Pair-wise rate producer over a counter sample slice. Emits one point per
+/// consecutive sample pair, stamped at the later sample, for pairs whose stamp
+/// falls in `[start_ns, end_ns]`. The source slice is fetched with lookback
+/// (for context), so the `start_ns` bound is what keeps a windowed/zoomed query
+/// from spilling points before the requested window — mirroring how the grid
+/// producer's cursor starts at `start_ns`.
 pub struct CounterPairwiseRate<'a> {
     timestamps: &'a [u64],
     values: &'a [u64],
     cursor: usize,
+    start_ns: u64,
     end_ns: u64,
 }
 
 impl<'a> CounterPairwiseRate<'a> {
-    pub fn new(timestamps: &'a [u64], values: &'a [u64], end_ns: u64) -> Self {
+    pub fn new(timestamps: &'a [u64], values: &'a [u64], start_ns: u64, end_ns: u64) -> Self {
         Self {
             timestamps,
             values,
             cursor: 0,
+            start_ns,
             end_ns,
         }
     }
@@ -40,6 +47,11 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
             let v_cur = self.values[i + 1];
             if ts_cur > self.end_ns {
                 return None;
+            }
+            // Skip pairs before the requested window; the slice carries lookback
+            // context whose stamps precede start_ns.
+            if ts_cur < self.start_ns {
+                continue;
             }
             let delta = if v_cur >= v_prev {
                 (v_cur - v_prev) as f64

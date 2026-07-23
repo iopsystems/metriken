@@ -100,9 +100,26 @@ impl QueryOptions {
 }
 
 pub(crate) trait DataSource: Send + Sync {
-    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64)
-        -> Option<Counters>;
-    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
+    /// `raw` requests the un-snapped acquisition timestamps (RateMode::Raw) —
+    /// the actual per-sample times — instead of the default nominal-grid-snapped
+    /// timestamps the query path normally emits. Sources with no snapping (live
+    /// MemoryStore) ignore it.
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        raw: bool,
+    ) -> Option<Counters>;
+    fn gauges(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        raw: bool,
+    ) -> Option<Gauges>;
     fn histogram_stream(
         &self,
         name: &str,

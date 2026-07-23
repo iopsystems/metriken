@@ -362,7 +362,13 @@ where
             let data_start = ctx.start_ns.saturating_sub(lookback);
             let counters = ctx
                 .source
-                .counters(metric_name, &filter, data_start, ctx.end_ns)
+                .counters(
+                    metric_name,
+                    &filter,
+                    data_start,
+                    ctx.end_ns,
+                    matches!(ctx.rate_mode, RateMode::Raw),
+                )
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = counters
                 .series
@@ -378,9 +384,13 @@ where
                             c.windows.as_deref(),
                         )
                         .collect(),
-                        RateMode::Raw => {
-                            CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns).collect()
-                        }
+                        RateMode::Raw => CounterPairwiseRate::new(
+                            &c.timestamps,
+                            &c.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                        )
+                        .collect(),
                     };
                     LabeledSeries::new(c.labels, pts.into_iter())
                 })
@@ -394,7 +404,13 @@ where
         "avg_over_time" => {
             let gauges = ctx
                 .source
-                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+                .gauges(
+                    metric_name,
+                    &filter,
+                    data_start,
+                    ctx.end_ns,
+                    matches!(ctx.rate_mode, RateMode::Raw),
+                )
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = gauges
                 .series
@@ -407,6 +423,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
                     )
                     .collect();
                     LabeledSeries::new(g.labels, pts.into_iter())
@@ -421,7 +438,13 @@ where
         "idelta" => {
             let gauges = ctx
                 .source
-                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+                .gauges(
+                    metric_name,
+                    &filter,
+                    data_start,
+                    ctx.end_ns,
+                    matches!(ctx.rate_mode, RateMode::Raw),
+                )
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = gauges
                 .series
@@ -434,6 +457,7 @@ where
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
                     )
                     .collect();
                     LabeledSeries::new(g.labels, pts.into_iter())
@@ -448,10 +472,13 @@ where
         "deriv" => {
             // Try gauge path first; fall back to counter 2nd-derivative.
             let deriv_data_start = ctx.start_ns.saturating_sub(ctx.step_ns.saturating_mul(2));
-            if let Some(gauges) =
-                ctx.source
-                    .gauges(metric_name, &filter, deriv_data_start, ctx.end_ns)
-            {
+            if let Some(gauges) = ctx.source.gauges(
+                metric_name,
+                &filter,
+                deriv_data_start,
+                ctx.end_ns,
+                matches!(ctx.rate_mode, RateMode::Raw),
+            ) {
                 let series: SeriesSet<'a> = gauges
                     .series
                     .into_iter()
@@ -462,6 +489,7 @@ where
                             ctx.start_ns,
                             ctx.end_ns,
                             ctx.step_ns,
+                            matches!(ctx.rate_mode, RateMode::Raw),
                         )
                         .collect();
                         LabeledSeries::new(g.labels, pts.into_iter())
@@ -475,13 +503,23 @@ where
             }
             let counters = ctx
                 .source
-                .counters(metric_name, &filter, deriv_data_start, ctx.end_ns)
+                .counters(
+                    metric_name,
+                    &filter,
+                    deriv_data_start,
+                    ctx.end_ns,
+                    matches!(ctx.rate_mode, RateMode::Raw),
+                )
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = counters
                 .series
                 .into_iter()
                 .map(|c| {
-                    let rate_iter = CounterPairwiseRate::new(&c.timestamps, &c.values, ctx.end_ns);
+                    // deriv wraps the pairwise rate in StreamingDeriv, which does
+                    // its own windowing and needs the pre-start lookback, so no
+                    // start bound here (0).
+                    let rate_iter =
+                        CounterPairwiseRate::new(&c.timestamps, &c.values, 0, ctx.end_ns);
                     let pts: Vec<_> =
                         StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
                             .collect();
@@ -564,7 +602,13 @@ where
 
     let gauges = ctx
         .source
-        .gauges(metric_name, &filter, data_start, ctx.end_ns)
+        .gauges(
+            metric_name,
+            &filter,
+            data_start,
+            ctx.end_ns,
+            matches!(ctx.rate_mode, RateMode::Raw),
+        )
         .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
 
     let series: SeriesSet<'a> = gauges
@@ -578,6 +622,7 @@ where
                 ctx.end_ns,
                 ctx.step_ns,
                 staleness_ns,
+                matches!(ctx.rate_mode, RateMode::Raw),
             )
             .collect();
             LabeledSeries::new(g.labels, pts.into_iter())

@@ -267,18 +267,27 @@ impl DataSource for MemoryStoreInner {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
+        raw: bool,
     ) -> Option<Counters> {
+        // Live in-memory samples aren't grid-snapped, so `raw` is a no-op here.
         self.memory
             .read()
             .unwrap()
-            .counters(name, filter, start_ns, end_ns)
+            .counters(name, filter, start_ns, end_ns, raw)
     }
 
-    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+    fn gauges(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        raw: bool,
+    ) -> Option<Gauges> {
         self.memory
             .read()
             .unwrap()
-            .gauges(name, filter, start_ns, end_ns)
+            .gauges(name, filter, start_ns, end_ns, raw)
     }
 
     fn histogram_stream(

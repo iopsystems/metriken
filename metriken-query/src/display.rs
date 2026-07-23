@@ -30,7 +30,9 @@ use crate::promql::{HistogramHeatmapResult, Sample};
 /// decimated data share one shape.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EnvPoint {
-    /// Representative timestamp (seconds) — the bucket's time midpoint.
+    /// Representative timestamp (seconds) — the bucket's epoch-aligned boundary
+    /// (a "nice" wall-clock instant), so decimated points snap to the same ticks
+    /// the time axis draws. (Native/undecimated points keep their exact time.)
     pub t: f64,
     /// Minimum value over the bucket (lower spike bound).
     pub min: f64,
@@ -197,17 +199,23 @@ fn reduce_boxplot(
             .collect();
     }
 
+    // Human-aligned decimation. Pick a "nice" bucket width ≥ the raw target
+    // (span/budget), align buckets to epoch multiples of it, and stamp each
+    // bucket at its boundary — so snap points land on the same round wall-clock
+    // times the axis draws its ticks at (a 20s bucket → :00/:20/:40), instead of
+    // the arbitrary sample-midpoint times a range/budget split produces.
     let t0 = points[0].0;
     let tn = points[points.len() - 1].0;
-    // Guard the degenerate all-same-timestamp case against divide-by-zero;
-    // every point then lands in bucket 0 (a single boxplot).
+    // Guard the degenerate all-same-timestamp case against divide-by-zero.
     let span = (tn - t0).max(f64::MIN_POSITIVE);
-    let budget_f = budget as f64;
-    let bucket_of = |t: f64| ((((t - t0) / span) * budget_f) as usize).min(budget - 1);
+    let bw = nice_bucket_secs(span / budget as f64);
+    // Absolute (epoch-aligned) bucket index — floor(t / bw).
+    let bucket_of = |t: f64| (t / bw).floor() as i64;
 
-    // Points are time-sorted and buckets are time-uniform, so each bucket is a
-    // contiguous slice. Walk the run of equal bucket indices, summarize it.
-    let mut out: Vec<EnvPoint> = Vec::with_capacity(budget);
+    // Points are time-sorted and buckets are contiguous in time, so each bucket
+    // is a contiguous slice. Walk the run of equal bucket indices, summarize it,
+    // and stamp the output at the bucket's aligned boundary.
+    let mut out: Vec<EnvPoint> = Vec::with_capacity(budget + 1);
     let mut i = 0;
     while i < points.len() {
         let bucket = bucket_of(points[i].0);
@@ -216,10 +224,32 @@ fn reduce_boxplot(
             j += 1;
         }
         let unc = intervals.map(|iv| &iv[i..j]);
-        out.push(boxplot_of(&points[i..j], unc, band));
+        let mut ep = boxplot_of(&points[i..j], unc, band);
+        ep.t = bucket as f64 * bw;
+        out.push(ep);
         i = j;
     }
     out
+}
+
+/// Smallest human-friendly bucket width (seconds) ≥ `raw`. Every rung divides
+/// evenly into a minute / hour / day, so epoch-aligned multiples land on round
+/// wall-clock boundaries — keeping decimated snap points on the same instants
+/// the time axis ticks at.
+fn nice_bucket_secs(raw: f64) -> f64 {
+    const NICE: &[f64] = &[
+        1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, // sub-minute
+        60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, // 1m,2m,5m,10m,15m,30m
+        3600.0, 7200.0, 10800.0, 21600.0, 43200.0, // 1h,2h,3h,6h,12h
+        86400.0, // 1d
+    ];
+    for &n in NICE {
+        if n >= raw {
+            return n;
+        }
+    }
+    // Beyond a day, round up to a whole number of days.
+    (raw / 86400.0).ceil() * 86400.0
 }
 
 /// Summarize a non-empty, time-sorted bucket slice into an [`EnvPoint`], with
@@ -345,6 +375,26 @@ mod tests {
     }
 
     #[test]
+    fn decimation_snaps_bucket_times_to_human_boundaries() {
+        // 200 samples at 1s spacing from a phase-offset start (1000.37s …).
+        // budget 20 → raw bucket ~10s → nice 10s. Every emitted timestamp must
+        // be a multiple of 10s (epoch-aligned, so it lands on the same
+        // wall-clock boundaries as the axis ticks) — not the sample-midpoint
+        // times (e.g. 1004.87) the old reducer produced.
+        let p: Vec<(f64, f64)> = (0..200).map(|i| (1000.37 + i as f64, i as f64)).collect();
+        let out = reduce_boxplot(&p, None, 20, IQR);
+        assert!(out.len() > 1 && out.len() <= 21, "len {}", out.len());
+        for e in &out {
+            let m = e.t / 10.0;
+            assert!(
+                (m - m.round()).abs() < 1e-9,
+                "t={} not on a 10s boundary",
+                e.t
+            );
+        }
+    }
+
+    #[test]
     fn known_quartiles() {
         // One bucket of exactly [10,20,30,40,50] (budget 1 forces one bucket).
         let p = pts(&[
@@ -362,7 +412,8 @@ mod tests {
         assert_eq!(e.median, 30.0);
         assert_eq!(e.hi, 40.0, "p75");
         assert_eq!(e.max, 50.0);
-        assert_eq!(e.t, 2.0, "time midpoint of [0,4]");
+        // Single 5s nice-bucket [0,5) containing [0,4]; stamped at its boundary.
+        assert_eq!(e.t, 0.0, "aligned bucket boundary");
     }
 
     #[test]

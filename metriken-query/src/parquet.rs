@@ -190,7 +190,7 @@ impl ParquetReader {
         let (start, end) = self.time_range_ns()?;
         let filter = Labels::default();
         for (pf, _extra) in &self.inner.files {
-            let counters = read_counters(pf, name, &filter, start, end).ok()?;
+            let counters = read_counters(pf, name, &filter, start, end, false).ok()?;
             if let Some(c) = counters.series.into_iter().next() {
                 return c.windows;
             }
@@ -592,13 +592,14 @@ impl DataSource for MultiParquetSource {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
+        raw: bool,
     ) -> Option<Counters> {
         let series: Vec<Counter> = self
             .files
             .iter()
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
-                let counters = read_counters(pf, name, &pq_filter, start_ns, end_ns).ok()?;
+                let counters = read_counters(pf, name, &pq_filter, start_ns, end_ns, raw).ok()?;
                 Some((counters.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
@@ -622,13 +623,20 @@ impl DataSource for MultiParquetSource {
         }
     }
 
-    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+    fn gauges(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        raw: bool,
+    ) -> Option<Gauges> {
         let series: Vec<Gauge> = self
             .files
             .iter()
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
-                let gauges = read_gauges(pf, name, &pq_filter, start_ns, end_ns).ok()?;
+                let gauges = read_gauges(pf, name, &pq_filter, start_ns, end_ns, raw).ok()?;
                 Some((gauges.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
@@ -1749,6 +1757,7 @@ fn read_counters(
     filter: &Labels,
     start_ns: u64,
     end_ns: u64,
+    raw: bool,
 ) -> Result<Counters, Box<dyn Error>> {
     let ts_col_idx = pf
         .meta
@@ -1833,7 +1842,10 @@ fn read_counters(
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
                     let base = if raw_aligned { raw_ts[row] } else { *ts };
                     if base >= start_ns && base <= end_ns {
-                        ts_acc[i].push(*ts);
+                        // Raw mode emits at the actual (un-snapped) acquisition
+                        // time; the default grid path emits the snapped nominal
+                        // timestamp for cross-series alignment.
+                        ts_acc[i].push(if raw { base } else { *ts });
                         val_acc[i].push(*v);
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
@@ -1875,6 +1887,7 @@ fn read_gauges(
     filter: &Labels,
     start_ns: u64,
     end_ns: u64,
+    raw: bool,
 ) -> Result<Gauges, Box<dyn Error>> {
     let ts_col_idx = pf
         .meta
@@ -1949,7 +1962,10 @@ fn read_gauges(
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
                     let base = if raw_aligned { raw_ts[row] } else { *ts };
                     if base >= start_ns && base <= end_ns {
-                        ts_acc[i].push(*ts);
+                        // Raw mode emits at the actual (un-snapped) acquisition
+                        // time; the default grid path emits the snapped nominal
+                        // timestamp for cross-series alignment.
+                        ts_acc[i].push(if raw { base } else { *ts });
                         val_acc[i].push(*v);
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
