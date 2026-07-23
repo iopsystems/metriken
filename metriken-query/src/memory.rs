@@ -163,6 +163,7 @@ impl DataSource for Memory {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
+        _raw: bool,
     ) -> Option<Counters> {
         let stored = self.counters.get(name)?;
         let series: Vec<Counter> = stored
@@ -186,7 +187,14 @@ impl DataSource for Memory {
         }
     }
 
-    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+    fn gauges(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        _raw: bool,
+    ) -> Option<Gauges> {
         let stored = self.gauges.get(name)?;
         let series: Vec<Gauge> = stored
             .iter()
