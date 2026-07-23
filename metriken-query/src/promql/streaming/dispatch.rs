@@ -384,15 +384,13 @@ where
                             c.windows.as_deref(),
                         )
                         .collect(),
-                        RateMode::Raw => {
-                            CounterPairwiseRate::new(
-                                &c.timestamps,
-                                &c.values,
-                                ctx.start_ns,
-                                ctx.end_ns,
-                            )
-                            .collect()
-                        }
+                        RateMode::Raw => CounterPairwiseRate::new(
+                            &c.timestamps,
+                            &c.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                        )
+                        .collect(),
                     };
                     LabeledSeries::new(c.labels, pts.into_iter())
                 })
@@ -474,16 +472,13 @@ where
         "deriv" => {
             // Try gauge path first; fall back to counter 2nd-derivative.
             let deriv_data_start = ctx.start_ns.saturating_sub(ctx.step_ns.saturating_mul(2));
-            if let Some(gauges) =
-                ctx.source
-                    .gauges(
-                        metric_name,
-                        &filter,
-                        deriv_data_start,
-                        ctx.end_ns,
-                        matches!(ctx.rate_mode, RateMode::Raw),
-                    )
-            {
+            if let Some(gauges) = ctx.source.gauges(
+                metric_name,
+                &filter,
+                deriv_data_start,
+                ctx.end_ns,
+                matches!(ctx.rate_mode, RateMode::Raw),
+            ) {
                 let series: SeriesSet<'a> = gauges
                     .series
                     .into_iter()

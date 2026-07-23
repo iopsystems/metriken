@@ -324,14 +324,23 @@ mod tests {
         let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
         let vals = [10i64, 20, 30];
         let pts: Vec<Point> = GaugeStepGrid::new(
-            &ts, &vals, 0, 3_000_000_000, 1_000_000_000, 5_000_000_000, true, // raw
+            &ts,
+            &vals,
+            0,
+            3_000_000_000,
+            1_000_000_000,
+            5_000_000_000,
+            true, // raw
         )
         .collect();
         assert_eq!(
             pts.iter().map(|p| p.t).collect::<Vec<_>>(),
             vec![500_000_000, 1_500_000_000, 2_500_000_000]
         );
-        assert_eq!(pts.iter().map(|p| p.v).collect::<Vec<_>>(), vec![10.0, 20.0, 30.0]);
+        assert_eq!(
+            pts.iter().map(|p| p.v).collect::<Vec<_>>(),
+            vec![10.0, 20.0, 30.0]
+        );
     }
 
     #[test]
@@ -340,7 +349,13 @@ mod tests {
         let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
         let vals = [10i64, 20, 30];
         let pts: Vec<Point> = GaugeStepGrid::new(
-            &ts, &vals, 0, 3_000_000_000, 1_000_000_000, 5_000_000_000, false,
+            &ts,
+            &vals,
+            0,
+            3_000_000_000,
+            1_000_000_000,
+            5_000_000_000,
+            false,
         )
         .collect();
         // Grid ticks 0,1,2,3s; t=0 has no sample ≤ it → skipped; 1,2,3 carry the
