@@ -57,8 +57,22 @@ impl SegmentedParquetReader {
             .map(|bytes| ParquetReader::open_bytes_with_pool(bytes, pool.clone()))
             .collect::<Result<Vec<_>, _>>()?;
         check_histogram_configs(&segments)?;
+
+        // Open-time, footer-only identity indexes (see `SeriesIdentity` /
+        // `HistogramRunIndex` docs): a single schema pass per segment per
+        // metric kind, reused by every query so splicing never re-derives
+        // series identity by linear scan.
+        let counter_identity = SeriesIdentity::build(&segments, ParquetReader::counter_columns);
+        let gauge_identity = SeriesIdentity::build(&segments, ParquetReader::gauge_columns);
+        let histogram_identity = SeriesIdentity::build(&segments, ParquetReader::histogram_columns);
+        let histogram_runs = HistogramRunIndex::build(&segments);
+
         let source = SegmentedSource {
             segments: segments.iter().map(ParquetReader::data_source).collect(),
+            counter_identity,
+            gauge_identity,
+            histogram_identity,
+            histogram_runs,
         };
         let engine = QueryEngine::new(Arc::new(source));
         Ok(Self { segments, engine })
@@ -149,42 +163,164 @@ impl SegmentedParquetReader {
     }
 }
 
-/// Reject segments whose histogram configs disagree for the same metric.
+/// Reject a segment whose OWN schema carries two histogram columns for the
+/// same metric name under different `grouping_power`/`max_value_power`
+/// configs.
 ///
-/// [`splice_histogram_streams`] chains per-segment streams under ONE config
-/// (the first segment's). If a long-running writer changed a sampler's
-/// `grouping_power`/`max_value_power` mid-recording, the later segments'
-/// buckets would be reinterpreted under the earlier config and every latency
-/// percentile derived from them would be silently wrong — no panic, no
-/// warning, just bad numbers.
+/// This is a WITHIN-segment check only. `ParquetSource::histogram_stream`
+/// resolves a metric purely by name (`c.name == name`) and decodes every
+/// matching column under the FIRST one's config — so if one segment's schema
+/// holds two differently-configured columns for the same name (label
+/// metadata can't rescue this: an unqualified query like
+/// `histogram_mean(latency)` has an empty label filter and matches both),
+/// their buckets can never be decoded separately. That's the one conflict
+/// shape this reader cannot split into distinct series, so it's rejected at
+/// open rather than silently misread.
 ///
-/// Config lives in parquet **field metadata**, so this reads footers only and
-/// costs no row-group decode. `HistogramStream::merge` has no equivalent
-/// check because it composes independent files at query time and has no
-/// `Result` to fail into; `open_bytes_with_pool` does.
+/// A DIFFERENT config for the same name in a LATER segment is not an error
+/// here — a `.rez` agent restart can retune a sampler's histogram mid
+/// recording, and each segment decodes fine under its own config. That case
+/// is handled by [`HistogramRunIndex`], which splits it into distinct
+/// `__run__`-labeled series instead of rejecting the whole archive.
+///
+/// Reads parquet field metadata only (via
+/// [`ParquetReader::histogram_config_variants`]) — no row-group decode.
 fn check_histogram_configs(segments: &[ParquetReader]) -> Result<(), Box<dyn Error>> {
-    let mut seen: BTreeMap<String, ((u8, u8), usize)> = BTreeMap::new();
     for (idx, segment) in segments.iter().enumerate() {
-        for (name, config) in segment.histogram_configs() {
-            match seen.get(&name) {
-                Some((first, first_idx)) if *first != config => {
-                    return Err(format!(
-                        "histogram config for metric '{name}' differs across segments: \
-                         segment {first_idx} has grouping_power={}, max_value_power={} \
-                         but segment {idx} has grouping_power={}, max_value_power={}; \
-                         segments of one table must share a histogram config",
-                        first.0, first.1, config.0, config.1,
-                    )
-                    .into());
-                }
-                Some(_) => {}
-                None => {
-                    seen.insert(name, (config, idx));
-                }
+        for (name, configs) in segment.histogram_config_variants() {
+            if configs.len() > 1 {
+                let detail = configs
+                    .iter()
+                    .map(|(gp, mvp)| format!("grouping_power={gp}, max_value_power={mvp}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                return Err(format!(
+                    "segment {idx} has multiple histogram columns for metric '{name}' under \
+                     different configs ({detail}); ParquetSource::histogram_stream decodes \
+                     every column for a metric name under ONE shared config, so these buckets \
+                     cannot be separated within a single segment"
+                )
+                .into());
             }
         }
     }
     Ok(())
+}
+
+/// `(name, labels) -> position` for one metric kind (counter, gauge, or raw
+/// per-column histogram identity), built ONCE at open from footer-only
+/// column lists (see [`ParquetReader::counter_columns`] and its gauge/
+/// histogram twins) — no row-group decode.
+///
+/// Splicing used to find a series' accumulator by scanning the
+/// already-spliced `Vec` (`acc.iter_mut().find(...)` / a `Vec::position`
+/// equivalent for histograms) for every incoming sample — O(segments ×
+/// series) per query, which becomes tens of millions of `Labels`
+/// comparisons on a wide archive (many series, many segments). This index
+/// turns that into an O(1) lookup: [`SegmentedSource::counters`] /
+/// `::gauges` size their accumulator once from [`Self::order`] and use
+/// [`Self::position`] to place each incoming sample directly;
+/// [`splice_histogram_streams`] does the same for histogram series.
+///
+/// Position order is "first appearance across segments, in segment order" —
+/// the same ordering contract splicing has always promised
+/// (`two_label_sets_splice_independently_across_three_segments` is the
+/// regression test). Built from RAW schema order
+/// (`counter_columns`/`gauge_columns`/`histogram_columns`), not the sorted
+/// order `counter_labels`/etc. return for display.
+#[derive(Default)]
+struct SeriesIdentity {
+    /// name -> distinct label sets, index == position.
+    order: HashMap<String, Vec<Labels>>,
+    /// name -> (labels -> position), mirrors `order`.
+    pos: HashMap<String, HashMap<Labels, usize>>,
+}
+
+impl SeriesIdentity {
+    /// Build from one schema pass per segment (`columns_for`), independent
+    /// of metric name — avoids re-scanning the schema once per name.
+    fn build(
+        segments: &[ParquetReader],
+        columns_for: impl Fn(&ParquetReader) -> Vec<(String, Labels)>,
+    ) -> Self {
+        let mut order: HashMap<String, Vec<Labels>> = HashMap::new();
+        let mut pos: HashMap<String, HashMap<Labels, usize>> = HashMap::new();
+        for seg in segments {
+            for (name, labels) in columns_for(seg) {
+                let list = order.entry(name.clone()).or_default();
+                let p = pos.entry(name).or_default();
+                if !p.contains_key(&labels) {
+                    p.insert(labels.clone(), list.len());
+                    list.push(labels);
+                }
+            }
+        }
+        Self { order, pos }
+    }
+
+    /// Ordered distinct label sets for `name` (empty if `name` is unknown).
+    fn order(&self, name: &str) -> &[Labels] {
+        self.order.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// O(1) position of `labels` within `name`'s series, if known.
+    fn position(&self, name: &str, labels: &Labels) -> Option<usize> {
+        self.pos.get(name)?.get(labels).copied()
+    }
+}
+
+/// Per-histogram-metric run assignment, built once at open from field
+/// metadata only (via [`ParquetReader::histogram_configs`], itself
+/// footer-only).
+///
+/// A `.rez` agent restart can remap a numeric column id to a histogram with
+/// different `grouping_power`/`max_value_power` mid-recording.
+/// [`splice_histogram_streams`] cannot decode two configs as one series, so
+/// each DISTINCT config observed for a name becomes its own "run", numbered
+/// by first appearance across segments (in segment order). A name with only
+/// one distinct config has a single run (`run_count() == 1`) and is spliced
+/// exactly as before — no `__run__` label, no behavior change.
+///
+/// Safe to key runs purely by config (ignoring per-column labels): this
+/// runs AFTER [`check_histogram_configs`], which has already rejected any
+/// WITHIN-segment conflict — so within one segment, a metric name has at
+/// most one histogram config.
+#[derive(Default)]
+struct HistogramRunIndex {
+    /// name -> distinct configs, in first-appearance order (index == run).
+    runs: HashMap<String, Vec<(u8, u8)>>,
+    /// name -> (segment index -> run index).
+    segment_run: HashMap<String, HashMap<usize, usize>>,
+}
+
+impl HistogramRunIndex {
+    fn build(segments: &[ParquetReader]) -> Self {
+        let mut runs: HashMap<String, Vec<(u8, u8)>> = HashMap::new();
+        let mut segment_run: HashMap<String, HashMap<usize, usize>> = HashMap::new();
+        for (idx, seg) in segments.iter().enumerate() {
+            for (name, config) in seg.histogram_configs() {
+                let list = runs.entry(name.clone()).or_default();
+                let run = list.iter().position(|c| *c == config).unwrap_or_else(|| {
+                    list.push(config);
+                    list.len() - 1
+                });
+                segment_run.entry(name).or_default().insert(idx, run);
+            }
+        }
+        Self { runs, segment_run }
+    }
+
+    /// Number of distinct runs for `name`. `1` (or `0` for an unknown name)
+    /// means no conflict: splice all segments as one series, unlabeled.
+    fn run_count(&self, name: &str) -> usize {
+        self.runs.get(name).map(Vec::len).unwrap_or(1)
+    }
+
+    /// Which run segment `idx` belongs to for `name`, if it carries that
+    /// metric at all.
+    fn segment_run(&self, name: &str, idx: usize) -> Option<usize> {
+        self.segment_run.get(name)?.get(&idx).copied()
+    }
 }
 
 /// Sorted, deduplicated union of metric names across segments.
@@ -224,76 +360,136 @@ fn union_labels<I: IntoIterator<Item = Vec<BTreeMap<String, String>>>>(
 struct SegmentedSource {
     /// Per-segment sample providers, in logical (time) order.
     segments: Vec<Arc<dyn DataSource>>,
+    /// Open-time identity indexes (see [`SeriesIdentity`]) used to splice
+    /// counters/gauges/histograms in O(1) per sample instead of scanning
+    /// the already-spliced accumulator.
+    counter_identity: SeriesIdentity,
+    gauge_identity: SeriesIdentity,
+    histogram_identity: SeriesIdentity,
+    /// Cross-segment histogram config-conflict resolution (see
+    /// [`HistogramRunIndex`]).
+    histogram_runs: HistogramRunIndex,
+}
+
+/// Merge `c`'s samples into the already-accumulated series `a` (same
+/// identity; concatenate in arrival order).
+///
+/// Windows policy: per-point acquisition windows concatenate only when every
+/// contributing chunk of a series carries them; a mixed series drops to
+/// `None` (no uncertainty band) rather than risk misaligned windows.
+///
+/// Shared by the O(1)-indexed production path
+/// ([`SegmentedSource::counters`]) and the linear-scan
+/// [`splice_counters`] kept for
+/// [`tests::splice_window_policy_drops_mixed_coverage`], which probes this
+/// exact policy directly.
+fn merge_counter(a: &mut Counter, c: Counter) {
+    a.timestamps.extend(c.timestamps);
+    a.values.extend(c.values);
+    a.windows = match (a.windows.take(), c.windows) {
+        (Some(mut aw), Some(cw)) => {
+            aw.extend(cw);
+            Some(aw)
+        }
+        _ => None,
+    };
+}
+
+/// Gauge twin of [`merge_counter`].
+fn merge_gauge(a: &mut Gauge, g: Gauge) {
+    a.timestamps.extend(g.timestamps);
+    a.values.extend(g.values);
+    a.windows = match (a.windows.take(), g.windows) {
+        (Some(mut aw), Some(gw)) => {
+            aw.extend(gw);
+            Some(aw)
+        }
+        _ => None,
+    };
 }
 
 /// Append `chunk`'s counter series onto `acc`, merging by label identity
 /// (concatenate in arrival order; first appearance fixes series order).
 ///
-/// Windows policy: per-point acquisition windows concatenate only when every
-/// contributing chunk of a series carries them; a mixed series drops to
-/// `None` (no uncertainty band) rather than risk misaligned windows.
+/// Test-only: this O(n) `Vec` scan is exactly what
+/// [`SegmentedSource::counters`] no longer does in production (it uses the
+/// open-time [`SeriesIdentity`] index instead, per Part 2 of the
+/// conflict-policy design) — this function survives solely so
+/// [`tests::splice_window_policy_drops_mixed_coverage`] can probe
+/// [`merge_counter`]'s windows policy directly, without going through a
+/// full `SegmentedParquetReader`.
+#[cfg(test)]
 fn splice_counters(acc: &mut Vec<Counter>, chunk: Counters) {
     for c in chunk.series {
         if let Some(a) = acc.iter_mut().find(|a| a.labels == c.labels) {
-            a.timestamps.extend(c.timestamps);
-            a.values.extend(c.values);
-            a.windows = match (a.windows.take(), c.windows) {
-                (Some(mut aw), Some(cw)) => {
-                    aw.extend(cw);
-                    Some(aw)
-                }
-                _ => None,
-            };
+            merge_counter(a, c);
         } else {
             acc.push(c);
         }
     }
 }
 
-/// Gauge twin of [`splice_counters`] (same identity-merge and windows policy).
+/// Gauge twin of [`splice_counters`], test-only for the same reason.
+#[cfg(test)]
 fn splice_gauges(acc: &mut Vec<Gauge>, chunk: Gauges) {
     for g in chunk.series {
         if let Some(a) = acc.iter_mut().find(|a| a.labels == g.labels) {
-            a.timestamps.extend(g.timestamps);
-            a.values.extend(g.values);
-            a.windows = match (a.windows.take(), g.windows) {
-                (Some(mut aw), Some(cw)) => {
-                    aw.extend(cw);
-                    Some(aw)
-                }
-                _ => None,
-            };
+            merge_gauge(a, g);
         } else {
             acc.push(g);
         }
     }
 }
 
-/// Chain per-segment histogram streams in segment order, remapping each
-/// stream's series indices onto a unified series list so the same labels are
-/// ONE series across segments. Unlike [`HistogramStream::merge`] (a k-way
-/// sort-merge for independent files), this concatenates — preserving
-/// single-file row-order semantics for segments of one table.
-fn splice_histogram_streams(streams: Vec<HistogramStream>) -> Option<HistogramStream> {
+/// Add a `__run__` label to every series in `stream`, disambiguating a
+/// histogram identity that [`HistogramRunIndex`] found split across
+/// incompatible configs.
+fn relabel_with_run(mut stream: HistogramStream, run: usize) -> HistogramStream {
+    for labels in &mut stream.meta.series {
+        labels.inner.insert("__run__".to_string(), run.to_string());
+    }
+    stream
+}
+
+/// Chain per-segment histogram streams (all belonging to the same run — see
+/// [`HistogramRunIndex`]) in segment order, remapping each stream's series
+/// indices onto a unified series list so the same labels are ONE series
+/// across segments. Unlike [`HistogramStream::merge`] (a k-way sort-merge
+/// for independent files), this concatenates — preserving single-file
+/// row-order semantics for segments of one table.
+///
+/// `identity` (built once at open, see [`SeriesIdentity`]) gives each
+/// label set's position in O(1); the loop below still only materializes
+/// entries for labels actually present in `streams` (a label-filtered query
+/// may touch only a subset of `identity`'s full order), so it never invents
+/// phantom empty series for labels the caller filtered out.
+fn splice_histogram_streams(
+    name: &str,
+    identity: &SeriesIdentity,
+    streams: Vec<HistogramStream>,
+) -> Option<HistogramStream> {
     if streams.len() <= 1 {
         return streams.into_iter().next();
     }
     let config = streams[0].meta.config;
-    // `check_histogram_configs` rejects mismatched segments at open, so this is
-    // belt-and-braces for a source composed some other way. Log in release too:
-    // the failure mode is silently wrong bucket boundaries, not a crash.
+    // `check_histogram_configs` + `HistogramRunIndex` keep same-run streams
+    // config-uniform, so this is belt-and-braces for a source composed some
+    // other way. Log in release too: the failure mode is silently wrong
+    // bucket boundaries, not a crash.
     if streams.iter().any(|s| s.meta.config != config) {
         tracing::error!(
-            "histogram configs differ across segments; decoding every segment \
-             under the first segment's config will produce wrong bucket \
-             boundaries (this should have been rejected at open)"
+            metric = name,
+            "histogram configs differ across segments within one run; decoding every \
+             segment under the first segment's config will produce wrong bucket \
+             boundaries (this should have been rejected at open or split into runs)"
         );
     }
     debug_assert!(
         streams.iter().all(|s| s.meta.config == config),
-        "segments of one table must share a histogram config"
+        "segments spliced together must share a histogram config"
     );
     let mut series: Vec<Labels> = Vec::new();
+    let mut local_of_global: HashMap<usize, usize> = HashMap::new();
     let mut parts: Vec<Box<dyn Iterator<Item = crate::histogram_stream::HistogramRow> + Send>> =
         Vec::with_capacity(streams.len());
     for stream in streams {
@@ -301,11 +497,24 @@ fn splice_histogram_streams(streams: Vec<HistogramStream>) -> Option<HistogramSt
             .meta
             .series
             .iter()
-            .map(|labels| {
-                series.iter().position(|s| s == labels).unwrap_or_else(|| {
+            .map(|labels| match identity.position(name, labels) {
+                Some(global) => *local_of_global.entry(global).or_insert_with(|| {
                     series.push(labels.clone());
                     series.len() - 1
-                })
+                }),
+                None => {
+                    // Shouldn't happen: `identity` was built from the union
+                    // of these same segments' histogram columns. Defensive
+                    // fallback so a mismatch degrades to an extra series,
+                    // not a panic.
+                    tracing::warn!(
+                        metric = name,
+                        ?labels,
+                        "histogram series missing from open-time identity index"
+                    );
+                    series.push(labels.clone());
+                    series.len() - 1
+                }
             })
             .collect();
         parts.push(Box::new(stream.rows.map(move |mut row| {
@@ -328,12 +537,37 @@ impl DataSource for SegmentedSource {
         end_ns: u64,
         raw: bool,
     ) -> Option<Counters> {
-        let mut series: Vec<Counter> = Vec::new();
+        // Slots sized/positioned from the open-time identity index: O(1)
+        // per incoming sample instead of the O(series) `Vec` scan splicing
+        // used to do (see `SeriesIdentity`). A label-filtered query simply
+        // leaves the non-matching slots `None`, dropped by `flatten()`
+        // below — same outcome as before, just not by linear search.
+        let order = self.counter_identity.order(name);
+        if order.is_empty() {
+            return None;
+        }
+        let mut slots: Vec<Option<Counter>> = (0..order.len()).map(|_| None).collect();
         for seg in &self.segments {
-            if let Some(chunk) = seg.counters(name, filter, start_ns, end_ns, raw) {
-                splice_counters(&mut series, chunk);
+            let Some(chunk) = seg.counters(name, filter, start_ns, end_ns, raw) else {
+                continue;
+            };
+            for c in chunk.series {
+                match self.counter_identity.position(name, &c.labels) {
+                    Some(pos) => match &mut slots[pos] {
+                        Some(a) => merge_counter(a, c),
+                        slot => *slot = Some(c),
+                    },
+                    None => {
+                        tracing::warn!(
+                            metric = name,
+                            labels = ?c.labels,
+                            "counter series missing from open-time identity index; dropping"
+                        );
+                    }
+                }
             }
         }
+        let series: Vec<Counter> = slots.into_iter().flatten().collect();
         if series.is_empty() {
             None
         } else {
@@ -349,12 +583,32 @@ impl DataSource for SegmentedSource {
         end_ns: u64,
         raw: bool,
     ) -> Option<Gauges> {
-        let mut series: Vec<Gauge> = Vec::new();
+        let order = self.gauge_identity.order(name);
+        if order.is_empty() {
+            return None;
+        }
+        let mut slots: Vec<Option<Gauge>> = (0..order.len()).map(|_| None).collect();
         for seg in &self.segments {
-            if let Some(chunk) = seg.gauges(name, filter, start_ns, end_ns, raw) {
-                splice_gauges(&mut series, chunk);
+            let Some(chunk) = seg.gauges(name, filter, start_ns, end_ns, raw) else {
+                continue;
+            };
+            for g in chunk.series {
+                match self.gauge_identity.position(name, &g.labels) {
+                    Some(pos) => match &mut slots[pos] {
+                        Some(a) => merge_gauge(a, g),
+                        slot => *slot = Some(g),
+                    },
+                    None => {
+                        tracing::warn!(
+                            metric = name,
+                            labels = ?g.labels,
+                            "gauge series missing from open-time identity index; dropping"
+                        );
+                    }
+                }
             }
         }
+        let series: Vec<Gauge> = slots.into_iter().flatten().collect();
         if series.is_empty() {
             None
         } else {
@@ -369,12 +623,41 @@ impl DataSource for SegmentedSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
+        if self.histogram_runs.run_count(name) <= 1 {
+            let streams: Vec<HistogramStream> = self
+                .segments
+                .iter()
+                .filter_map(|seg| seg.histogram_stream(name, filter, start_ns, end_ns))
+                .collect();
+            return splice_histogram_streams(name, &self.histogram_identity, streams);
+        }
+
+        // Cross-segment histogram config conflict: `name` carries more than
+        // one distinct (grouping_power, max_value_power) across segments
+        // (a `.rez` agent restart retuned the sampler mid-recording). Each
+        // config is its own run, disambiguated by a `__run__` label; an
+        // unqualified selector (no explicit `__run__`) resolves to the
+        // FIRST run rather than mixing configs — split, warn, never coerce.
+        let (want_run, inner_filter) = match filter.inner.get("__run__") {
+            Some(v) => {
+                let want: usize = v.parse().ok()?;
+                let mut f = filter.clone();
+                f.inner.remove("__run__");
+                (want, f)
+            }
+            None => (0usize, filter.clone()),
+        };
+
         let streams: Vec<HistogramStream> = self
             .segments
             .iter()
-            .filter_map(|seg| seg.histogram_stream(name, filter, start_ns, end_ns))
+            .enumerate()
+            .filter(|&(idx, _)| self.histogram_runs.segment_run(name, idx) == Some(want_run))
+            .filter_map(|(_, seg)| seg.histogram_stream(name, &inner_filter, start_ns, end_ns))
             .collect();
-        splice_histogram_streams(streams)
+
+        let spliced = splice_histogram_streams(name, &self.histogram_identity, streams)?;
+        Some(relabel_with_run(spliced, want_run))
     }
 
     fn interval(&self) -> f64 {
@@ -415,7 +698,24 @@ impl DataSource for SegmentedSource {
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        union_labels(self.segments.iter().map(|s| s.histogram_labels(name)))
+        if self.histogram_runs.run_count(name) <= 1 {
+            return union_labels(self.segments.iter().map(|s| s.histogram_labels(name)));
+        }
+        // Conflict: surface each run's label sets tagged with `__run__` so
+        // the split is addressable (`histogram_mean(latency{__run__="1"})`).
+        let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
+        for (idx, seg) in self.segments.iter().enumerate() {
+            let Some(run) = self.histogram_runs.segment_run(name, idx) else {
+                continue;
+            };
+            for mut labels in seg.histogram_labels(name) {
+                labels.insert("__run__".to_string(), run.to_string());
+                sets.push(labels);
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {
@@ -779,6 +1079,144 @@ mod tests {
             vec![
                 Arc::new(UInt64Array::from(ts)) as ArrayRef,
                 Arc::new(list) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// Histogram variant carrying the acquisition-window sidecars exactly the
+    /// way the `.rez` writer emits them (`src/recorder/rez.rs`): the value
+    /// column is `<name>:buckets` but the sidecars are named after the METRIC
+    /// (`<name>:window_begin` / `<name>:window_width`), not after the bucket
+    /// column. Used to pin that those sidecars stay unattached — see
+    /// [`counter_to_histogram_flip_splits_series`].
+    fn segment_histogram_windowed(
+        name: &str,
+        grouping_power: u8,
+        max_value_power: u8,
+        rows: &[(u64, Vec<u64>)],
+    ) -> Vec<u8> {
+        use arrow::array::{Int64Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+
+        let mut meta = HashMap::new();
+        meta.insert("metric".to_string(), name.to_string());
+        meta.insert("metric_type".to_string(), "histogram".to_string());
+        meta.insert("grouping_power".to_string(), grouping_power.to_string());
+        meta.insert("max_value_power".to_string(), max_value_power.to_string());
+
+        let item = Arc::new(Field::new("item", DataType::UInt64, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new(
+                format!("{name}:buckets"),
+                DataType::List(item.clone()),
+                true,
+            )
+            .with_metadata(meta),
+            Field::new(format!("{name}:window_begin"), DataType::Int64, true),
+            Field::new(format!("{name}:window_width"), DataType::UInt64, true),
+        ]));
+
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some("1000".to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+
+        let ts: Vec<u64> = rows.iter().map(|(t, _)| *t).collect();
+        let mut offsets: Vec<i32> = vec![0];
+        let mut flat: Vec<u64> = Vec::new();
+        for (_, buckets) in rows {
+            flat.extend(buckets);
+            offsets.push(flat.len() as i32);
+        }
+        let list = ListArray::new(
+            item,
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(UInt64Array::from(flat)),
+            None,
+        );
+        let begins: Vec<i64> = rows.iter().map(|_| -5_000_000i64).collect();
+        let widths: Vec<u64> = rows.iter().map(|_| 10_000_000u64).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(ts)) as ArrayRef,
+                Arc::new(list) as ArrayRef,
+                Arc::new(Int64Array::from(begins)) as ArrayRef,
+                Arc::new(UInt64Array::from(widths)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// One segment carrying TWO histogram columns for the SAME metric name
+    /// under DIFFERENT configs (label-differentiated). The `.rez` writer cannot
+    /// produce this (one column per metric id per table), but the reader must
+    /// not decode both under one config — see
+    /// [`open_rejects_unsplicable_histogram_within_one_segment`].
+    fn segment_two_histograms(name: &str, a: (u8, u8), b: (u8, u8), ts: u64) -> Vec<u8> {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+
+        let field = |col: &str, core: &str, (gp, mvp): (u8, u8), item: Arc<Field>| {
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), name.to_string());
+            meta.insert("metric_type".to_string(), "histogram".to_string());
+            meta.insert("grouping_power".to_string(), gp.to_string());
+            meta.insert("max_value_power".to_string(), mvp.to_string());
+            meta.insert("core".to_string(), core.to_string());
+            Field::new(col.to_string(), DataType::List(item), true).with_metadata(meta)
+        };
+
+        let item = Arc::new(Field::new("item", DataType::UInt64, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            field(&format!("{name}:buckets"), "0", a, item.clone()),
+            field(&format!("{name}__1:buckets"), "1", b, item.clone()),
+        ]));
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(vec![KeyValue {
+                key: "sampling_interval_ms".to_string(),
+                value: Some("1000".to_string()),
+            }]))
+            .build();
+
+        let list = |(gp, mvp): (u8, u8)| {
+            let n = ::histogram::Config::new(gp, mvp).unwrap().total_buckets();
+            let mut buckets = vec![0u64; n];
+            buckets[5] = 1;
+            ListArray::new(
+                item.clone(),
+                OffsetBuffer::new(vec![0i32, n as i32].into()),
+                Arc::new(UInt64Array::from(buckets)),
+                None,
+            )
+        };
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![ts])) as ArrayRef,
+                Arc::new(list(a)) as ArrayRef,
+                Arc::new(list(b)) as ArrayRef,
             ],
         )
         .unwrap();
@@ -1394,42 +1832,266 @@ mod tests {
         assert!(result[0].intervals.is_some());
     }
 
+    // ─── Cross-segment identity conflicts ────────────────────────────────────
+    //
+    // Column names in `.rez` tables are the snapshot's numeric-id names ("5",
+    // "5x3") and those ids are per-agent-process: an agent restart mid-recording
+    // remaps id → metric arbitrarily, so the SAME name can carry a DIFFERENT
+    // metric in a later segment. Identity here is (name, value shape, and for
+    // histograms the H2 powers); on conflict the runs stay DISTINCT series —
+    // never a hard error, never a silent coercion. (These fixtures use
+    // `id_5`-style names so PromQL doesn't parse the selector as a number; the
+    // policy is about the name, not its spelling.)
+
     #[test]
-    fn open_rejects_mismatched_histogram_configs() {
-        // A writer that changed a sampler's histogram config mid-recording
-        // would otherwise splice later segments' buckets under the earlier
-        // config — silently wrong latency numbers, no panic.
-        let row = |t: u64, gp: u8, mvp: u8| {
-            let n = ::histogram::Config::new(gp, mvp).unwrap().total_buckets();
+    fn type_flip_across_segments_splits_series() {
+        // "id_5" is a counter in segment A and a gauge in segment B.
+        let a = segment("id_5", &[], &[(1_000_000_000, 10), (2_000_000_000, 20)]);
+        let b = segment_gauge("id_5", &[(3_000_000_000, 35), (4_000_000_000, 50)]);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], pool).unwrap();
+
+        // Both runs survive the union, each under its own value shape.
+        assert_eq!(r.counter_names(), vec!["id_5".to_string()]);
+        assert_eq!(r.gauge_names(), vec!["id_5".to_string()]);
+
+        // The counter run reads as a counter: rate over segment A only.
+        let q = r.query_range("rate(id_5[2s])", 1.0, 5.0, 1.0).unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1);
+        let at2 = result[0]
+            .values
+            .iter()
+            .find(|(t, _)| (*t - 2.0).abs() < 1e-9)
+            .expect("a rate() point inside the counter run");
+        assert!((at2.1 - 10.0).abs() < 1e-9, "{at2:?}");
+        // …and it does NOT run past the flip: segment B's 35/50 are a different
+        // metric, so counting them as the same counter would show a jump here.
+        assert!(
+            result[0].values.iter().all(|(t, _)| *t <= 2.0),
+            "the gauge run must not be spliced onto the counter: {:?}",
+            result[0].values
+        );
+
+        // The gauge run reads as a gauge, with its own values.
+        let q = r.query_range("id_5", 3.0, 4.0, 1.0).unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].values, vec![(3.0, 35.0), (4.0, 50.0)]);
+    }
+
+    #[test]
+    fn counter_to_histogram_flip_splits_series() {
+        // Same name arrives as a counter (with acquisition-window sidecars) in
+        // segment A and as a histogram in segment B. Segment B is written the
+        // way the `.rez` writer writes histograms: value column `id_5:buckets`,
+        // sidecars named after the METRIC (`id_5:window_begin`) — the shape the
+        // design flags as the silent-success case for a naive schema union.
+        let n = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let hrow = |t: u64, count: u64| {
             let mut buckets = vec![0u64; n];
-            buckets[5] = t;
+            buckets[5] = count;
             (t, buckets)
         };
-        let a = segment_histogram("latency", 2, 8, &[row(1_000_000_000, 2, 8)]);
-        let b = segment_histogram("latency", 3, 8, &[row(2_000_000_000, 3, 8)]);
+        let a = segment_windowed(
+            "id_5",
+            &[
+                (1_000_000_000, 10, -5_000_000, 10_000_000),
+                (2_000_000_000, 20, -4_000_000, 8_000_000),
+            ],
+        );
+        // `histogram_irate` needs two deltas (three samples) before it emits
+        // anything — its first observed delta is always null, exactly like
+        // counter irate/rate needing a prior sample (see
+        // `test_histogram_irate_first_step_is_null` in promql/tests.rs).
+        // Two rows alone would make this probe vacuous regardless of the
+        // conflict policy, so segment B carries three.
+        let b = segment_histogram_windowed(
+            "id_5",
+            2,
+            8,
+            &[
+                hrow(3_000_000_000, 10),
+                hrow(4_000_000_000, 20),
+                hrow(5_000_000_000, 40),
+            ],
+        );
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], pool).unwrap();
+
+        // Both runs survive, each under its own value shape.
+        assert_eq!(r.counter_names(), vec!["id_5".to_string()]);
+        assert_eq!(r.histogram_names(), vec!["id_5".to_string()]);
+        // Segment B's `id_5:window_begin` is an Int64 column; if the reserved
+        // suffix were not honoured it would surface as a phantom gauge here and
+        // its offsets would read as metric values.
+        assert!(r.gauge_names().is_empty(), "{:?}", r.gauge_names());
+
+        // The counter run keeps ITS windows (the histogram segment contributes
+        // no counter samples, so coverage is uniform and the band survives).
+        let q = r.query_range("rate(id_5[2s])", 1.0, 5.0, 1.0).unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].intervals.is_some(),
+            "the counter run's own :window_* sidecars must still produce a band"
+        );
+        assert!(result[0].values.iter().all(|(t, _)| *t <= 2.0));
+
+        // The histogram run decodes as a histogram over segment B.
+        let q = r
+            .query_range("histogram_irate(id_5)", 3.0, 5.0, 1.0)
+            .unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1);
+        assert!(result[0].values.iter().any(|(_, v)| *v > 0.0));
+    }
+
+    #[test]
+    fn histogram_power_drift_splits_series() {
+        // Same histogram name, different H2 powers across segments. The powers
+        // are part of identity, so these are two runs — each decoded with its
+        // OWN powers, addressable as distinct series. Opening must NOT fail:
+        // one remapped id cannot cost the whole archive.
+        let buckets = |gp: u8, mvp: u8, idx: usize, count: u64| {
+            let n = ::histogram::Config::new(gp, mvp).unwrap().total_buckets();
+            let mut b = vec![0u64; n];
+            b[idx] = count;
+            b
+        };
+        // Bucket 20 resolves to a very different value under gp=2 vs gp=3, so a
+        // run decoded under the wrong config reads as a different latency.
+        let seg_a = || {
+            segment_histogram(
+                "latency",
+                2,
+                8,
+                &[
+                    (1_000_000_000, buckets(2, 8, 20, 10)),
+                    (2_000_000_000, buckets(2, 8, 20, 20)),
+                ],
+            )
+        };
+        let seg_b = || {
+            segment_histogram(
+                "latency",
+                3,
+                8,
+                &[
+                    (3_000_000_000, buckets(3, 8, 20, 10)),
+                    (4_000_000_000, buckets(3, 8, 20, 20)),
+                ],
+            )
+        };
 
         let pool = BufferPool::new(64 * 1024 * 1024);
-        let Err(err) = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], Arc::clone(&pool))
+        let r =
+            SegmentedParquetReader::open_bytes_with_pool(vec![seg_a(), seg_b()], Arc::clone(&pool))
+                .expect("a mid-recording powers change must not fail the open");
+        // Still footer-only: the conflict is decided from field metadata.
+        let stats = pool.stats();
+        assert_eq!(
+            stats.misses, 0,
+            "conflict policy must not decode row groups"
+        );
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.bytes_used, 0);
+
+        // Two distinct series, disambiguated by run.
+        let labels = r.histogram_labels("latency");
+        assert_eq!(labels.len(), 2, "{labels:?}");
+        assert_eq!(
+            labels
+                .iter()
+                .filter_map(|l| l.get("__run__").cloned())
+                .collect::<Vec<_>>(),
+            vec!["0".to_string(), "1".to_string()],
+        );
+
+        // Each run must decode with its own powers: compare against a
+        // single-segment reader, which has no conflict and no run label.
+        let mean = |r: &SegmentedParquetReader, expr: &str, at: f64| -> f64 {
+            let q = r.query_range(expr, 1.0, 5.0, 1.0).unwrap();
+            let QueryResult::Matrix { result } = q else {
+                panic!("expected matrix result for {expr}");
+            };
+            assert_eq!(result.len(), 1, "{expr}: {result:?}");
+            result[0]
+                .values
+                .iter()
+                .find(|(t, _)| (*t - at).abs() < 1e-9)
+                .unwrap_or_else(|| panic!("{expr}: no point at t={at}: {:?}", result[0].values))
+                .1
+        };
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let only_a =
+            SegmentedParquetReader::open_bytes_with_pool(vec![seg_a()], Arc::clone(&pool)).unwrap();
+        let only_b = SegmentedParquetReader::open_bytes_with_pool(vec![seg_b()], pool).unwrap();
+
+        let run0 = mean(&r, "histogram_mean(latency{__run__=\"0\"})", 2.0);
+        let run1 = mean(&r, "histogram_mean(latency{__run__=\"1\"})", 4.0);
+        assert_eq!(run0, mean(&only_a, "histogram_mean(latency)", 2.0));
+        assert_eq!(run1, mean(&only_b, "histogram_mean(latency)", 4.0));
+        assert!(
+            (run0 - run1).abs() > 1.0,
+            "bucket 20 must resolve differently under gp=2 ({run0}) and gp=3 ({run1}); \
+             equal values would make the per-run decode assertions vacuous"
+        );
+
+        // An unqualified query resolves to the FIRST run and never mixes the
+        // two: samples from the later run would be decoded under the wrong
+        // powers, which is exactly the coercion the policy forbids.
+        let q = r
+            .query_range("histogram_mean(latency)", 1.0, 5.0, 1.0)
+            .unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].values.iter().all(|(t, _)| *t <= 2.0),
+            "the drifted run must not be spliced into the first: {:?}",
+            result[0].values
+        );
+
+        // Matching configs are not a conflict: one series, no run label.
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let plain =
+            SegmentedParquetReader::open_bytes_with_pool(vec![seg_a(), seg_a()], pool).unwrap();
+        let labels = plain.histogram_labels("latency");
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!(labels[0].is_empty(), "{labels:?}");
+    }
+
+    #[test]
+    fn open_rejects_unsplicable_histogram_within_one_segment() {
+        // The one case that cannot be split into runs: TWO histogram columns
+        // for the same metric name under different configs inside ONE segment.
+        // `ParquetSource::histogram_stream` decodes every matching column under
+        // the first column's config, so these buckets cannot be separated —
+        // an error beats silently wrong latency numbers.
+        let a = segment_two_histograms("latency", (2, 8), (3, 8), 1_000_000_000);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let Err(err) = SegmentedParquetReader::open_bytes_with_pool(vec![a], Arc::clone(&pool))
         else {
-            panic!("mismatched histogram configs must be rejected at open");
+            panic!("a segment-internal histogram config conflict must be rejected");
         };
         let msg = err.to_string();
-        // The error must name the metric and both configs, or it is useless
-        // for diagnosing which sampler changed.
         assert!(msg.contains("latency"), "{msg}");
         assert!(msg.contains("grouping_power=2"), "{msg}");
         assert!(msg.contains("grouping_power=3"), "{msg}");
-
-        // The check is footer-only: rejecting must not have decoded anything.
+        // Footer-only, even when rejecting.
         let stats = pool.stats();
         assert_eq!(stats.misses, 0, "config check must not decode row groups");
         assert_eq!(stats.entries, 0);
-
-        // Matching configs still open fine.
-        let c = segment_histogram("latency", 2, 8, &[row(1_000_000_000, 2, 8)]);
-        let d = segment_histogram("latency", 2, 8, &[row(2_000_000_000, 2, 8)]);
-        let pool = BufferPool::new(64 * 1024 * 1024);
-        assert!(SegmentedParquetReader::open_bytes_with_pool(vec![c, d], pool).is_ok());
     }
 
     #[test]
