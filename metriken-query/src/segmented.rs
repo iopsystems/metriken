@@ -307,6 +307,27 @@ impl HistogramRunIndex {
                 segment_run.entry(name).or_default().insert(idx, run);
             }
         }
+        // Split, warn, never coerce: log the conflict ONCE per open (not
+        // once per query) for every name that resolved to more than one
+        // run, naming the metric and each run's config so an operator can
+        // tell a genuine agent restart from a misconfigured recorder.
+        for (name, configs) in &runs {
+            if configs.len() > 1 {
+                let detail = configs
+                    .iter()
+                    .enumerate()
+                    .map(|(run, (gp, mvp))| format!("run {run} = gp={gp}/mvp={mvp}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    metric = name,
+                    runs = configs.len(),
+                    "histogram '{name}' has {} distinct bucket configs across segments \
+                     (agent restart mid-recording?); splitting into __run__ series: {detail}",
+                    configs.len(),
+                );
+            }
+        }
         Self { runs, segment_run }
     }
 
@@ -378,11 +399,8 @@ struct SegmentedSource {
 /// contributing chunk of a series carries them; a mixed series drops to
 /// `None` (no uncertainty band) rather than risk misaligned windows.
 ///
-/// Shared by the O(1)-indexed production path
-/// ([`SegmentedSource::counters`]) and the linear-scan
-/// [`splice_counters`] kept for
-/// [`tests::splice_window_policy_drops_mixed_coverage`], which probes this
-/// exact policy directly.
+/// Used by the O(1)-indexed splice path in [`SegmentedSource::counters`];
+/// probed directly by [`tests::merge_counter_drops_windows_on_mixed_coverage`].
 fn merge_counter(a: &mut Counter, c: Counter) {
     a.timestamps.extend(c.timestamps);
     a.values.extend(c.values);
@@ -408,44 +426,22 @@ fn merge_gauge(a: &mut Gauge, g: Gauge) {
     };
 }
 
-/// Append `chunk`'s counter series onto `acc`, merging by label identity
-/// (concatenate in arrival order; first appearance fixes series order).
-///
-/// Test-only: this O(n) `Vec` scan is exactly what
-/// [`SegmentedSource::counters`] no longer does in production (it uses the
-/// open-time [`SeriesIdentity`] index instead, per Part 2 of the
-/// conflict-policy design) — this function survives solely so
-/// [`tests::splice_window_policy_drops_mixed_coverage`] can probe
-/// [`merge_counter`]'s windows policy directly, without going through a
-/// full `SegmentedParquetReader`.
-#[cfg(test)]
-fn splice_counters(acc: &mut Vec<Counter>, chunk: Counters) {
-    for c in chunk.series {
-        if let Some(a) = acc.iter_mut().find(|a| a.labels == c.labels) {
-            merge_counter(a, c);
-        } else {
-            acc.push(c);
-        }
-    }
-}
-
-/// Gauge twin of [`splice_counters`], test-only for the same reason.
-#[cfg(test)]
-fn splice_gauges(acc: &mut Vec<Gauge>, chunk: Gauges) {
-    for g in chunk.series {
-        if let Some(a) = acc.iter_mut().find(|a| a.labels == g.labels) {
-            merge_gauge(a, g);
-        } else {
-            acc.push(g);
-        }
-    }
-}
-
 /// Add a `__run__` label to every series in `stream`, disambiguating a
 /// histogram identity that [`HistogramRunIndex`] found split across
 /// incompatible configs.
+///
+/// `__run__` is therefore a RESERVED label name (mirroring how
+/// `:window_begin`/`:window_width` are reserved column-name suffixes, see
+/// parquet.rs) — a real user label with that name (e.g. from `record
+/// --label __run__=x`) would otherwise be silently overwritten here, which
+/// is exactly the silent-coercion class this feature exists to prevent.
 fn relabel_with_run(mut stream: HistogramStream, run: usize) -> HistogramStream {
     for labels in &mut stream.meta.series {
+        debug_assert!(
+            !labels.inner.contains_key("__run__"),
+            "'__run__' is a reserved label name; a real label with this name would be \
+             silently overwritten by the run-disambiguation policy"
+        );
         labels.inner.insert("__run__".to_string(), run.to_string());
     }
     stream
@@ -703,12 +699,20 @@ impl DataSource for SegmentedSource {
         }
         // Conflict: surface each run's label sets tagged with `__run__` so
         // the split is addressable (`histogram_mean(latency{__run__="1"})`).
+        // `__run__` is a RESERVED label name (see `relabel_with_run`) — a
+        // real user label with this name would otherwise be silently
+        // overwritten below.
         let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
         for (idx, seg) in self.segments.iter().enumerate() {
             let Some(run) = self.histogram_runs.segment_run(name, idx) else {
                 continue;
             };
             for mut labels in seg.histogram_labels(name) {
+                debug_assert!(
+                    !labels.contains_key("__run__"),
+                    "'__run__' is a reserved label name; a real label with this name would be \
+                     silently overwritten by the run-disambiguation policy"
+                );
                 labels.insert("__run__".to_string(), run.to_string());
                 sets.push(labels);
             }
@@ -1599,14 +1603,19 @@ mod tests {
         assert!((at3.1 - 15.0).abs() < 1e-9, "{at3:?}");
     }
 
-    /// Direct unit test of the windows policy in [`splice_counters`] /
-    /// [`splice_gauges`]. The end-to-end query path cannot discriminate here:
+    /// Direct unit test of the windows policy in [`merge_counter`] /
+    /// [`merge_gauge`] — the merge step the O(1)-indexed splice path in
+    /// [`SegmentedSource::counters`]/`::gauges` uses for a repeat identity.
+    /// The end-to-end query path cannot discriminate here:
     /// `collect_to_matrix` reports `intervals: None` unless every point has a
     /// band, so a splice that kept one segment's (now short and misattributed)
-    /// windows looks identical from outside. These assertions read the spliced
-    /// `windows` field itself.
+    /// windows looks identical from outside. These assertions read the merged
+    /// `windows` field itself. (Every case here operates on a single series
+    /// at position 0 — this test is about the windows-merge policy, not
+    /// identity matching across multiple series; that's covered by
+    /// `two_label_sets_splice_independently_across_three_segments`.)
     #[test]
-    fn splice_window_policy_drops_mixed_coverage() {
+    fn merge_counter_drops_windows_on_mixed_coverage() {
         let counter = |windows: Option<Vec<(u64, u64)>>| Counter {
             labels: Labels::default(),
             timestamps: vec![1, 2],
@@ -1616,41 +1625,25 @@ mod tests {
         let with = || Some(vec![(0u64, 1u64), (1, 2)]);
 
         // Some then None -> None.
-        let mut acc = vec![counter(with())];
-        splice_counters(
-            &mut acc,
-            Counters {
-                series: vec![counter(None)],
-            },
-        );
-        assert_eq!(acc.len(), 1);
+        let mut a = counter(with());
+        merge_counter(&mut a, counter(None));
         assert!(
-            acc[0].windows.is_none(),
+            a.windows.is_none(),
             "a later segment without windows must drop the band, not leave a \
              short window vector misaligned with {} timestamps",
-            acc[0].timestamps.len()
+            a.timestamps.len()
         );
 
         // None then Some -> None (windows must never attach to the wrong samples).
-        let mut acc = vec![counter(None)];
-        splice_counters(
-            &mut acc,
-            Counters {
-                series: vec![counter(with())],
-            },
-        );
-        assert!(acc[0].windows.is_none());
+        let mut a = counter(None);
+        merge_counter(&mut a, counter(with()));
+        assert!(a.windows.is_none());
 
         // Some then Some -> concatenated, one entry per timestamp.
-        let mut acc = vec![counter(with())];
-        splice_counters(
-            &mut acc,
-            Counters {
-                series: vec![counter(with())],
-            },
-        );
-        assert_eq!(acc[0].windows.as_ref().map(Vec::len), Some(4));
-        assert_eq!(acc[0].timestamps.len(), 4);
+        let mut a = counter(with());
+        merge_counter(&mut a, counter(with()));
+        assert_eq!(a.windows.as_ref().map(Vec::len), Some(4));
+        assert_eq!(a.timestamps.len(), 4);
 
         // Gauges follow the same policy.
         let gauge = |windows: Option<Vec<(u64, u64)>>| Gauge {
@@ -1659,32 +1652,17 @@ mod tests {
             values: vec![10, 20],
             windows,
         };
-        let mut acc = vec![gauge(with())];
-        splice_gauges(
-            &mut acc,
-            Gauges {
-                series: vec![gauge(None)],
-            },
-        );
-        assert!(acc[0].windows.is_none());
+        let mut a = gauge(with());
+        merge_gauge(&mut a, gauge(None));
+        assert!(a.windows.is_none());
 
-        let mut acc = vec![gauge(None)];
-        splice_gauges(
-            &mut acc,
-            Gauges {
-                series: vec![gauge(with())],
-            },
-        );
-        assert!(acc[0].windows.is_none());
+        let mut a = gauge(None);
+        merge_gauge(&mut a, gauge(with()));
+        assert!(a.windows.is_none());
 
-        let mut acc = vec![gauge(with())];
-        splice_gauges(
-            &mut acc,
-            Gauges {
-                series: vec![gauge(with())],
-            },
-        );
-        assert_eq!(acc[0].windows.as_ref().map(Vec::len), Some(4));
+        let mut a = gauge(with());
+        merge_gauge(&mut a, gauge(with()));
+        assert_eq!(a.windows.as_ref().map(Vec::len), Some(4));
     }
 
     #[test]
@@ -2069,6 +2047,41 @@ mod tests {
         let labels = plain.histogram_labels("latency");
         assert_eq!(labels.len(), 1, "{labels:?}");
         assert!(labels[0].is_empty(), "{labels:?}");
+    }
+
+    #[test]
+    fn histogram_run_index_flags_cross_segment_config_drift() {
+        // Direct unit test of the split-detection step `histogram_power_drift_splits_series`
+        // exercises end-to-end: two segments with different powers for the
+        // same name must resolve to two runs, each segment assigned to its
+        // own run in first-appearance order. This is also where
+        // `HistogramRunIndex::build` logs the "splitting into __run__
+        // series" warning (see its doc comment) — once per open, not once
+        // per query.
+        let n2 = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let n3 = ::histogram::Config::new(3, 8).unwrap().total_buckets();
+        let seg_a = ParquetReader::open_bytes_with_pool(
+            segment_histogram("latency", 2, 8, &[(1_000_000_000, vec![0u64; n2])]),
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let seg_b = ParquetReader::open_bytes_with_pool(
+            segment_histogram("latency", 3, 8, &[(2_000_000_000, vec![0u64; n3])]),
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+
+        let index = HistogramRunIndex::build(&[seg_a, seg_b]);
+        assert_eq!(
+            index.run_count("latency"),
+            2,
+            "two distinct configs must resolve to two runs"
+        );
+        assert_eq!(index.segment_run("latency", 0), Some(0));
+        assert_eq!(index.segment_run("latency", 1), Some(1));
+
+        // A name with a single config anywhere is not a conflict.
+        assert_eq!(index.run_count("no_such_metric"), 1);
     }
 
     #[test]
