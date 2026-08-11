@@ -39,6 +39,9 @@ impl SegmentedParquetReader {
         segments: Vec<Vec<u8>>,
         pool: Arc<BufferPool>,
     ) -> Result<Self, Box<dyn Error>> {
+        if segments.is_empty() {
+            return Err("SegmentedParquetReader requires at least one segment".into());
+        }
         let segments = segments
             .into_iter()
             .map(|bytes| ParquetReader::open_bytes_with_pool(bytes, pool.clone()))
@@ -270,14 +273,17 @@ mod tests {
     use parquet::file::properties::WriterProperties;
 
     /// Build one parquet segment: a `timestamp` UInt64 column plus one
-    /// counter column `name` (UInt64, field metadata `metric`/`metric_type=counter`)
-    /// with the given (ts, value) rows. Mirrors the schema conventions used
-    /// by `parquet.rs`'s test fixtures (see `build_parquet_with_timestamps`
-    /// and `fixtures::synthetic::FixtureBuilder`).
-    fn segment(name: &str, rows: &[(u64, u64)]) -> Vec<u8> {
+    /// counter column `name` (UInt64, field metadata `metric`/`metric_type=counter`,
+    /// plus any `labels`) with the given (ts, value) rows. Mirrors the schema
+    /// conventions used by `parquet.rs`'s test fixtures (see
+    /// `build_parquet_with_timestamps` and `fixtures::synthetic::FixtureBuilder`).
+    fn segment(name: &str, labels: &[(&str, &str)], rows: &[(u64, u64)]) -> Vec<u8> {
         let mut metadata = HashMap::new();
         metadata.insert("metric".to_string(), name.to_string());
         metadata.insert("metric_type".to_string(), "counter".to_string());
+        for (k, v) in labels {
+            metadata.insert(k.to_string(), v.to_string());
+        }
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::UInt64, false),
@@ -308,24 +314,55 @@ mod tests {
 
     #[test]
     fn union_names_single_series_across_segments() {
-        let a = segment("cpu_cycles", &[(1_000_000_000, 10), (2_000_000_000, 20)]);
-        let b = segment("cpu_cycles", &[(3_000_000_000, 35), (4_000_000_000, 50)]);
+        let a = segment(
+            "cpu_cycles",
+            &[],
+            &[(1_000_000_000, 10), (2_000_000_000, 20)],
+        );
+        let b = segment(
+            "cpu_cycles",
+            &[],
+            &[(3_000_000_000, 35), (4_000_000_000, 50)],
+        );
         let pool = BufferPool::new(64 * 1024 * 1024);
         let r = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], pool).unwrap();
         assert_eq!(r.counter_names(), vec!["cpu_cycles".to_string()]);
         // ONE series, not two (the MultiParquetSource failure mode).
         assert_eq!(r.counter_labels("cpu_cycles").len(), 1);
+
+        // Same metric name, but two DISTINCT label sets across segments:
+        // this must union to TWO series, not collapse to one just because
+        // the names match.
+        let c = segment("cpu_cycles", &[("core", "0")], &[(1_000_000_000, 1)]);
+        let d = segment("cpu_cycles", &[("core", "1")], &[(1_000_000_000, 2)]);
+        let pool2 = BufferPool::new(64 * 1024 * 1024);
+        let r2 = SegmentedParquetReader::open_bytes_with_pool(vec![c, d], pool2).unwrap();
+        assert_eq!(r2.counter_labels("cpu_cycles").len(), 2);
     }
 
     #[test]
-    fn open_is_footer_only_even_with_tiny_pool() {
-        // A pool far smaller than any row group: open MUST still succeed,
-        // proving no row-group decode happens at open. (Queries may then
-        // decode against the pool's LRU budget.)
-        let a = segment("cpu_cycles", &[(1_000_000_000, 10), (2_000_000_000, 20)]);
-        let b = segment("cpu_cycles", &[(3_000_000_000, 35)]);
-        let pool = BufferPool::new(1); // 1 byte
-        let r = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], pool);
-        assert!(r.is_ok(), "open must not decode row groups: {:?}", r.err());
+    fn open_performs_no_row_group_decode() {
+        // BufferPool is a pure cache — it never errors on size, so "open
+        // succeeds with a tiny pool" proves nothing. The load-bearing
+        // assertion: after open the pool must be completely untouched.
+        let a = segment(
+            "cpu_cycles",
+            &[],
+            &[(1_000_000_000, 10), (2_000_000_000, 20)],
+        );
+        let b = segment("cpu_cycles", &[], &[(3_000_000_000, 35)]);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let _r =
+            SegmentedParquetReader::open_bytes_with_pool(vec![a, b], Arc::clone(&pool)).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.misses, 0, "open must not decode row groups");
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.bytes_used, 0);
+    }
+
+    #[test]
+    fn open_rejects_empty_segments() {
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        assert!(SegmentedParquetReader::open_bytes_with_pool(vec![], pool).is_err());
     }
 }
