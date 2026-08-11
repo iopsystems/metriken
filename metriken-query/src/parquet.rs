@@ -130,6 +130,13 @@ impl ParquetReader {
         self.inner.files.clone()
     }
 
+    /// The reader's raw-sample [`DataSource`], for composition by
+    /// [`crate::SegmentedParquetReader`], which splices per-segment samples
+    /// below PromQL evaluation.
+    pub(crate) fn data_source(&self) -> Arc<dyn DataSource> {
+        self.inner.clone()
+    }
+
     /// Set the display name. Useful when constructing from bytes or
     /// after the fact (e.g. a WASM viewer setting the original upload name).
     pub fn with_filename(mut self, name: impl Into<String>) -> Self {
