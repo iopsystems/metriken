@@ -316,4 +316,16 @@ mod tests {
         // ONE series, not two (the MultiParquetSource failure mode).
         assert_eq!(r.counter_labels("cpu_cycles").len(), 1);
     }
+
+    #[test]
+    fn open_is_footer_only_even_with_tiny_pool() {
+        // A pool far smaller than any row group: open MUST still succeed,
+        // proving no row-group decode happens at open. (Queries may then
+        // decode against the pool's LRU budget.)
+        let a = segment("cpu_cycles", &[(1_000_000_000, 10), (2_000_000_000, 20)]);
+        let b = segment("cpu_cycles", &[(3_000_000_000, 35)]);
+        let pool = BufferPool::new(1); // 1 byte
+        let r = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], pool);
+        assert!(r.is_ok(), "open must not decode row groups: {:?}", r.err());
+    }
 }
