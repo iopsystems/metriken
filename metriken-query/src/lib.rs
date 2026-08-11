@@ -43,6 +43,7 @@ pub(crate) mod memory;
 pub(crate) mod memory_store;
 pub mod parquet;
 pub(crate) mod promql;
+pub mod segmented;
 pub(crate) mod types;
 
 #[cfg(any(test, feature = "fixtures"))]
@@ -53,6 +54,7 @@ pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reduce
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
+pub use segmented::SegmentedParquetReader;
 
 use histogram_stream::HistogramStream;
 use labels::Labels;
