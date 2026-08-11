@@ -56,6 +56,7 @@ impl SegmentedParquetReader {
             .into_iter()
             .map(|bytes| ParquetReader::open_bytes_with_pool(bytes, pool.clone()))
             .collect::<Result<Vec<_>, _>>()?;
+        check_histogram_configs(&segments)?;
         let source = SegmentedSource {
             segments: segments.iter().map(ParquetReader::data_source).collect(),
         };
@@ -68,48 +69,48 @@ impl SegmentedParquetReader {
         self.segments.len()
     }
 
+    // Introspection routes through `self.engine` — the same `QueryEngine` the
+    // queries use, over the same [`SegmentedSource`]. `ParquetReader` does the
+    // same (see `parquet.rs`). Re-deriving the union here from `self.segments`
+    // would be a second implementation of the same semantics that nothing
+    // keeps in step with the one queries actually see.
+
     /// Names of all counter metrics across every segment (sorted, deduplicated union).
     pub fn counter_names(&self) -> Vec<String> {
-        union_names(self.segments.iter().map(ParquetReader::counter_names))
+        self.engine.counter_names()
     }
 
     /// Names of all gauge metrics across every segment (sorted, deduplicated union).
     pub fn gauge_names(&self) -> Vec<String> {
-        union_names(self.segments.iter().map(ParquetReader::gauge_names))
+        self.engine.gauge_names()
     }
 
     /// Names of all histogram metrics across every segment (sorted, deduplicated union).
     pub fn histogram_names(&self) -> Vec<String> {
-        union_names(self.segments.iter().map(ParquetReader::histogram_names))
+        self.engine.histogram_names()
     }
 
     /// All label combinations for the named counter metric, unioned (and
     /// deduplicated) across every segment.
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        union_labels(self.segments.iter().map(|s| s.counter_labels(name)))
+        self.engine.counter_labels(name)
     }
 
     /// All label combinations for the named gauge metric, unioned (and
     /// deduplicated) across every segment.
     pub fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        union_labels(self.segments.iter().map(|s| s.gauge_labels(name)))
+        self.engine.gauge_labels(name)
     }
 
     /// All label combinations for the named histogram metric, unioned (and
     /// deduplicated) across every segment.
     pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        union_labels(self.segments.iter().map(|s| s.histogram_labels(name)))
+        self.engine.histogram_labels(name)
     }
 
     /// Full time extent across all segments in nanoseconds, or `None` if empty.
     pub fn time_range_ns(&self) -> Option<(u64, u64)> {
-        self.segments
-            .iter()
-            .filter_map(ParquetReader::time_range_ns)
-            .fold(None, |acc, (lo, hi)| match acc {
-                None => Some((lo, hi)),
-                Some((alo, ahi)) => Some((alo.min(lo), ahi.max(hi))),
-            })
+        self.engine.time_range()
     }
 
     /// Full time extent across all segments in seconds, or `None` if empty.
@@ -120,32 +121,19 @@ impl SegmentedParquetReader {
 
     /// Sampling interval in seconds; the finest across all segments.
     pub fn interval(&self) -> f64 {
-        self.segments
-            .iter()
-            .map(ParquetReader::interval)
-            .fold(f64::MAX, f64::min)
+        self.engine.interval()
     }
 
     /// Key-value metadata merged across all segment footers (last segment,
     /// in `segments` order, wins on key collision).
     pub fn file_metadata(&self) -> HashMap<String, String> {
-        let mut out = HashMap::new();
-        for s in &self.segments {
-            out.extend(s.file_metadata());
-        }
-        out
+        self.engine.file_metadata()
     }
 
     /// Look up a single metadata value by key without cloning the full map.
     /// Last segment wins on collision (matches [`file_metadata`](Self::file_metadata)).
     pub fn metadata_get(&self, key: &str) -> Option<String> {
-        let mut last = None;
-        for s in &self.segments {
-            if let Some(v) = s.metadata_get(key) {
-                last = Some(v);
-            }
-        }
-        last
+        self.engine.metadata_get(key)
     }
 
     /// Convenience: the `source` key from file metadata (e.g. "rezolus").
@@ -159,6 +147,44 @@ impl SegmentedParquetReader {
     pub fn version(&self) -> String {
         self.metadata_get("version").unwrap_or_default()
     }
+}
+
+/// Reject segments whose histogram configs disagree for the same metric.
+///
+/// [`splice_histogram_streams`] chains per-segment streams under ONE config
+/// (the first segment's). If a long-running writer changed a sampler's
+/// `grouping_power`/`max_value_power` mid-recording, the later segments'
+/// buckets would be reinterpreted under the earlier config and every latency
+/// percentile derived from them would be silently wrong — no panic, no
+/// warning, just bad numbers.
+///
+/// Config lives in parquet **field metadata**, so this reads footers only and
+/// costs no row-group decode. `HistogramStream::merge` has no equivalent
+/// check because it composes independent files at query time and has no
+/// `Result` to fail into; `open_bytes_with_pool` does.
+fn check_histogram_configs(segments: &[ParquetReader]) -> Result<(), Box<dyn Error>> {
+    let mut seen: BTreeMap<String, ((u8, u8), usize)> = BTreeMap::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        for (name, config) in segment.histogram_configs() {
+            match seen.get(&name) {
+                Some((first, first_idx)) if *first != config => {
+                    return Err(format!(
+                        "histogram config for metric '{name}' differs across segments: \
+                         segment {first_idx} has grouping_power={}, max_value_power={} \
+                         but segment {idx} has grouping_power={}, max_value_power={}; \
+                         segments of one table must share a histogram config",
+                        first.0, first.1, config.0, config.1,
+                    )
+                    .into());
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(name, (config, idx));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sorted, deduplicated union of metric names across segments.
@@ -253,6 +279,16 @@ fn splice_histogram_streams(streams: Vec<HistogramStream>) -> Option<HistogramSt
         return streams.into_iter().next();
     }
     let config = streams[0].meta.config;
+    // `check_histogram_configs` rejects mismatched segments at open, so this is
+    // belt-and-braces for a source composed some other way. Log in release too:
+    // the failure mode is silently wrong bucket boundaries, not a crash.
+    if streams.iter().any(|s| s.meta.config != config) {
+        tracing::error!(
+            "histogram configs differ across segments; decoding every segment \
+             under the first segment's config will produce wrong bucket \
+             boundaries (this should have been rejected at open)"
+        );
+    }
     debug_assert!(
         streams.iter().all(|s| s.meta.config == config),
         "segments of one table must share a histogram config"
@@ -549,6 +585,48 @@ mod tests {
         let ts_array = Arc::new(UInt64Array::from(ts)) as ArrayRef;
         let val_array = Arc::new(UInt64Array::from(vals)) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![ts_array, val_array]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// Multi-series variant of [`segment`]: one counter `name` carried by
+    /// several label-differentiated columns sharing one `timestamp` column.
+    /// `series` is `(label_value, values_aligned_to_ts)`, and its ORDER is the
+    /// schema order — which is the order `parse_schema` (and therefore
+    /// `read_counters`) yields the series in. Column names are unique but
+    /// arbitrary; identity comes from the `metric` + label field metadata.
+    fn segment_labeled(name: &str, key: &str, ts: &[u64], series: &[(&str, Vec<u64>)]) -> Vec<u8> {
+        let mut fields = vec![Field::new("timestamp", DataType::UInt64, false)];
+        for (i, (value, values)) in series.iter().enumerate() {
+            assert_eq!(values.len(), ts.len(), "series must align to timestamps");
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), name.to_string());
+            meta.insert("metric_type".to_string(), "counter".to_string());
+            meta.insert(key.to_string(), value.to_string());
+            fields.push(
+                Field::new(format!("{name}__{i}"), DataType::UInt64, true).with_metadata(meta),
+            );
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some("1000".to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(ts.to_vec())) as ArrayRef];
+        for (_, values) in series {
+            columns.push(Arc::new(UInt64Array::from(values.clone())) as ArrayRef);
+        }
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         buf
@@ -1081,6 +1159,277 @@ mod tests {
             .find(|(t, _)| (*t - 3.0).abs() < 1e-9)
             .expect("a rate() point at the segment boundary");
         assert!((at3.1 - 15.0).abs() < 1e-9, "{at3:?}");
+    }
+
+    /// Direct unit test of the windows policy in [`splice_counters`] /
+    /// [`splice_gauges`]. The end-to-end query path cannot discriminate here:
+    /// `collect_to_matrix` reports `intervals: None` unless every point has a
+    /// band, so a splice that kept one segment's (now short and misattributed)
+    /// windows looks identical from outside. These assertions read the spliced
+    /// `windows` field itself.
+    #[test]
+    fn splice_window_policy_drops_mixed_coverage() {
+        let counter = |windows: Option<Vec<(u64, u64)>>| Counter {
+            labels: Labels::default(),
+            timestamps: vec![1, 2],
+            values: vec![10, 20],
+            windows,
+        };
+        let with = || Some(vec![(0u64, 1u64), (1, 2)]);
+
+        // Some then None -> None.
+        let mut acc = vec![counter(with())];
+        splice_counters(
+            &mut acc,
+            Counters {
+                series: vec![counter(None)],
+            },
+        );
+        assert_eq!(acc.len(), 1);
+        assert!(
+            acc[0].windows.is_none(),
+            "a later segment without windows must drop the band, not leave a \
+             short window vector misaligned with {} timestamps",
+            acc[0].timestamps.len()
+        );
+
+        // None then Some -> None (windows must never attach to the wrong samples).
+        let mut acc = vec![counter(None)];
+        splice_counters(
+            &mut acc,
+            Counters {
+                series: vec![counter(with())],
+            },
+        );
+        assert!(acc[0].windows.is_none());
+
+        // Some then Some -> concatenated, one entry per timestamp.
+        let mut acc = vec![counter(with())];
+        splice_counters(
+            &mut acc,
+            Counters {
+                series: vec![counter(with())],
+            },
+        );
+        assert_eq!(acc[0].windows.as_ref().map(Vec::len), Some(4));
+        assert_eq!(acc[0].timestamps.len(), 4);
+
+        // Gauges follow the same policy.
+        let gauge = |windows: Option<Vec<(u64, u64)>>| Gauge {
+            labels: Labels::default(),
+            timestamps: vec![1, 2],
+            values: vec![10, 20],
+            windows,
+        };
+        let mut acc = vec![gauge(with())];
+        splice_gauges(
+            &mut acc,
+            Gauges {
+                series: vec![gauge(None)],
+            },
+        );
+        assert!(acc[0].windows.is_none());
+
+        let mut acc = vec![gauge(None)];
+        splice_gauges(
+            &mut acc,
+            Gauges {
+                series: vec![gauge(with())],
+            },
+        );
+        assert!(acc[0].windows.is_none());
+
+        let mut acc = vec![gauge(with())];
+        splice_gauges(
+            &mut acc,
+            Gauges {
+                series: vec![gauge(with())],
+            },
+        );
+        assert_eq!(acc[0].windows.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn two_label_sets_splice_independently_across_three_segments() {
+        // Every other splice test uses ONE series, so the identity-matching
+        // loop in `splice_counters` is barely exercised. Two label sets across
+        // three segments pin down both halves of the contract:
+        //   - each label set accumulates its OWN samples (no cross-talk), and
+        //   - "first appearance fixes series order" (segmented.rs docs).
+        //
+        // Segment 1 deliberately lists the columns in the OPPOSITE schema
+        // order, so a splice that matched positionally instead of by label
+        // would swap core=1's samples onto core=0. Segment 2 restores the
+        // original order.
+        let s0 = segment_labeled(
+            "cpu_cycles",
+            "core",
+            &[1_000_000_000, 2_000_000_000],
+            &[("0", vec![10, 20]), ("1", vec![100, 200])],
+        );
+        let s1 = segment_labeled(
+            "cpu_cycles",
+            "core",
+            &[3_000_000_000, 4_000_000_000],
+            &[("1", vec![300, 400]), ("0", vec![30, 40])],
+        );
+        let s2 = segment_labeled(
+            "cpu_cycles",
+            "core",
+            &[5_000_000_000],
+            &[("0", vec![50]), ("1", vec![500])],
+        );
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(vec![s0, s1, s2], pool).unwrap();
+
+        assert_eq!(r.counter_labels("cpu_cycles").len(), 2);
+
+        // irate in Raw mode reports pairwise deltas at the real sample times,
+        // so each point is directly attributable to two adjacent raw samples.
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let q = r
+            .query_range_opts("irate(cpu_cycles[1s])", 1.0, 5.0, 1.0, &opts)
+            .unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 2, "two label sets must stay two series");
+
+        // Order: core=0 appeared first in segment 0, so it stays first even
+        // though segment 1 lists core=1 first.
+        assert_eq!(result[0].metric.get("core").map(String::as_str), Some("0"));
+        assert_eq!(result[1].metric.get("core").map(String::as_str), Some("1"));
+
+        // core=0 climbs by 10 per second across every boundary; core=1 by 100.
+        // A cross-talk bug (samples landing on the wrong series) would show up
+        // here as a huge spike at a segment boundary.
+        let values = |i: usize| -> Vec<f64> { result[i].values.iter().map(|(_, v)| *v).collect() };
+        assert_eq!(values(0), vec![10.0, 10.0, 10.0, 10.0]);
+        assert_eq!(values(1), vec![100.0, 100.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn mixed_window_coverage_drops_the_band_for_that_series() {
+        // Windows policy (`splice_counters` / `splice_gauges`): per-point
+        // acquisition windows concatenate only when EVERY contributing segment
+        // carries them. A series covered by a windowed segment and a plain one
+        // drops to `None` rather than emit a band over misaligned windows.
+        let early_windowed = || {
+            segment_windowed(
+                "cpu_cycles",
+                &[
+                    (1_000_000_000, 10, -5_000_000, 10_000_000),
+                    (2_000_000_000, 20, -4_000_000, 8_000_000),
+                ],
+            )
+        };
+        let late_windowed = || {
+            segment_windowed(
+                "cpu_cycles",
+                &[
+                    (3_000_000_000, 35, -6_000_000, 12_000_000),
+                    (4_000_000_000, 50, -5_000_000, 9_000_000),
+                ],
+            )
+        };
+        let early_plain = || {
+            segment(
+                "cpu_cycles",
+                &[],
+                &[(1_000_000_000, 10), (2_000_000_000, 20)],
+            )
+        };
+        let late_plain = || {
+            segment(
+                "cpu_cycles",
+                &[],
+                &[(3_000_000_000, 35), (4_000_000_000, 50)],
+            )
+        };
+
+        // Both mixing directions. Segments always stay in TIME order (that is
+        // the type's contract); what varies is which one carries the windows,
+        // so this covers both the (Some, None) and (None, Some) arms of the
+        // `_ => None` match.
+        for segments in [
+            vec![early_windowed(), late_plain()],
+            vec![early_plain(), late_windowed()],
+        ] {
+            let pool = BufferPool::new(64 * 1024 * 1024);
+            let r = SegmentedParquetReader::open_bytes_with_pool(segments, pool).unwrap();
+            let q = r
+                .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+                .unwrap();
+            let QueryResult::Matrix { result } = q else {
+                panic!("expected matrix result");
+            };
+            assert_eq!(result.len(), 1);
+            assert!(
+                result[0].intervals.is_none(),
+                "a series with mixed window coverage must carry no band"
+            );
+        }
+
+        // NOTE: this end-to-end assertion pins the user-visible outcome, but it
+        // is NOT a tight probe of the policy branch: `collect_to_matrix` only
+        // emits `intervals` when EVERY point carries a band, so a splice that
+        // wrongly kept one segment's windows (leaving them short and
+        // misattributed) would also surface as `None` here. The branch itself
+        // is pinned directly by `splice_window_policy_drops_mixed_coverage`.
+
+        // Control: all-windowed segments DO produce a band, so the assertion
+        // above is about mixing, not about windows never surviving a splice.
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![early_windowed(), late_windowed()],
+            pool,
+        )
+        .unwrap();
+        let q = r
+            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .unwrap();
+        let QueryResult::Matrix { result } = q else {
+            panic!("expected matrix result");
+        };
+        assert!(result[0].intervals.is_some());
+    }
+
+    #[test]
+    fn open_rejects_mismatched_histogram_configs() {
+        // A writer that changed a sampler's histogram config mid-recording
+        // would otherwise splice later segments' buckets under the earlier
+        // config — silently wrong latency numbers, no panic.
+        let row = |t: u64, gp: u8, mvp: u8| {
+            let n = ::histogram::Config::new(gp, mvp).unwrap().total_buckets();
+            let mut buckets = vec![0u64; n];
+            buckets[5] = t;
+            (t, buckets)
+        };
+        let a = segment_histogram("latency", 2, 8, &[row(1_000_000_000, 2, 8)]);
+        let b = segment_histogram("latency", 3, 8, &[row(2_000_000_000, 3, 8)]);
+
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let Err(err) = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], Arc::clone(&pool))
+        else {
+            panic!("mismatched histogram configs must be rejected at open");
+        };
+        let msg = err.to_string();
+        // The error must name the metric and both configs, or it is useless
+        // for diagnosing which sampler changed.
+        assert!(msg.contains("latency"), "{msg}");
+        assert!(msg.contains("grouping_power=2"), "{msg}");
+        assert!(msg.contains("grouping_power=3"), "{msg}");
+
+        // The check is footer-only: rejecting must not have decoded anything.
+        let stats = pool.stats();
+        assert_eq!(stats.misses, 0, "config check must not decode row groups");
+        assert_eq!(stats.entries, 0);
+
+        // Matching configs still open fine.
+        let c = segment_histogram("latency", 2, 8, &[row(1_000_000_000, 2, 8)]);
+        let d = segment_histogram("latency", 2, 8, &[row(2_000_000_000, 2, 8)]);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        assert!(SegmentedParquetReader::open_bytes_with_pool(vec![c, d], pool).is_ok());
     }
 
     #[test]

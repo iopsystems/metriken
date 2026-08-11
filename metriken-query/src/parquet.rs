@@ -137,6 +137,32 @@ impl ParquetReader {
         self.inner.clone()
     }
 
+    /// Histogram `(grouping_power, max_value_power)` per metric name, read from
+    /// parquet **field metadata only** — no row group is touched.
+    ///
+    /// First column wins for a given name, mirroring how
+    /// `ParquetSource::histogram_stream` picks the config it decodes with.
+    /// Used by [`crate::SegmentedParquetReader`] to reject segments whose
+    /// histogram configs disagree, which would otherwise splice into silently
+    /// wrong bucket boundaries.
+    pub(crate) fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
+        let mut out = std::collections::BTreeMap::new();
+        for (pf, _) in &self.inner.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    out.entry(col.name)
+                        .or_insert((grouping_power, max_value_power));
+                }
+            }
+        }
+        out
+    }
+
     /// Set the display name. Useful when constructing from bytes or
     /// after the fact (e.g. a WASM viewer setting the original upload name).
     pub fn with_filename(mut self, name: impl Into<String>) -> Self {
