@@ -1455,6 +1455,19 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             if column_name.ends_with(":window_begin") || column_name.ends_with(":window_width") {
                 return None;
             }
+            // `:wall_offset` is a bare, table-level sidecar (one per table, not
+            // one per metric): the raw wall-clock reading at each row's tick,
+            // vs. the monotonic-anchored `timestamp` column. It carries no
+            // `metric` metadata and would otherwise classify by Arrow type as
+            // a phantom gauge. Unlike `:window_begin`/`:window_width`, it is
+            // not a per-metric suffix — it has no name prefix — so match it
+            // exactly rather than by `ends_with`.
+            //
+            // NOTE: `:wall_offset` is therefore also a RESERVED column name,
+            // alongside the `:window_begin` / `:window_width` suffixes above.
+            if column_name == ":wall_offset" {
+                return None;
+            }
             let name = meta.get("metric").cloned().unwrap_or_else(|| {
                 column_name
                     .strip_suffix(":buckets")
@@ -2393,5 +2406,86 @@ mod tests {
     fn memory_store_sample_timestamps_is_empty_by_default() {
         let store = crate::MemoryStore::builder().build();
         assert!(store.sample_timestamps().is_empty());
+    }
+
+    // A `.rez` per-sampler table carries one bare, table-level `:wall_offset`
+    // sidecar column (Int64) alongside the monotonic row `timestamp` — the raw
+    // wall-clock reading at that tick, for clock-drift bookkeeping. Unlike the
+    // per-metric `<m>:window_begin` / `<m>:window_width` suffixes, it has no
+    // metric prefix: it's one column per table, not one per metric. It must
+    // never surface as a metric and must not disturb its sibling column.
+    #[test]
+    fn wall_offset_sidecar_column_is_not_a_metric() {
+        let ts = Field::new("timestamp", DataType::UInt64, false);
+        let counter =
+            Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+                ("metric".to_string(), "cpu_cycles".to_string()),
+                ("metric_type".to_string(), "counter".to_string()),
+            ]));
+        // Bare sidecar column, no metric metadata — exactly as the rezolus
+        // writer emits it.
+        let wall_offset = Field::new(":wall_offset", DataType::Int64, true);
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![ts, counter, wall_offset],
+            HashMap::from([
+                ("source".to_string(), "rezolus".to_string()),
+                ("sampling_interval_ms".to_string(), "1000".to_string()),
+            ]),
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000u64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![Some(10u64), Some(20u64)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(5_000_000i64),
+                    Some(-3_000_000i64),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        let reader = ParquetReader::open_bytes(bytes).unwrap();
+
+        assert_eq!(
+            reader.counter_names(),
+            vec!["cpu_cycles".to_string()],
+            ":wall_offset must not appear as a phantom counter"
+        );
+        assert!(
+            reader.gauge_names().is_empty(),
+            ":wall_offset must not appear as a phantom gauge: {:?}",
+            reader.gauge_names()
+        );
+        assert!(
+            reader.histogram_names().is_empty(),
+            ":wall_offset must not appear as a phantom histogram: {:?}",
+            reader.histogram_names()
+        );
+
+        // The sibling metric column must still resolve normally — a skip that
+        // also broke it would be worse than the bug it fixes. Counters are
+        // only queryable via rate()/irate(), not a bare selector.
+        let (start, end) = reader.time_range().unwrap();
+        let result = reader
+            .query_range("rate(cpu_cycles[2s])", start, end + 1.0, 1.0)
+            .unwrap();
+        let QueryResult::Matrix { result } = result else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1, "expected exactly one series");
+        assert!(
+            result[0].values.iter().any(|(_, v)| *v > 0.0),
+            "expected a positive rate from the still-resolving cpu_cycles counter: {:?}",
+            result[0].values
+        );
     }
 }
