@@ -130,6 +130,134 @@ impl ParquetReader {
         self.inner.files.clone()
     }
 
+    /// The reader's raw-sample [`DataSource`], for composition by
+    /// [`crate::SegmentedParquetReader`], which splices per-segment samples
+    /// below PromQL evaluation.
+    pub(crate) fn data_source(&self) -> Arc<dyn DataSource> {
+        self.inner.clone()
+    }
+
+    /// Histogram `(grouping_power, max_value_power)` per metric name, read from
+    /// parquet **field metadata only** — no row group is touched.
+    ///
+    /// First column wins for a given name, mirroring how
+    /// `ParquetSource::histogram_stream` picks the config it decodes with.
+    /// Used by [`crate::SegmentedParquetReader`] to reject segments whose
+    /// histogram configs disagree, which would otherwise splice into silently
+    /// wrong bucket boundaries.
+    pub(crate) fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
+        let mut out = std::collections::BTreeMap::new();
+        for (pf, _) in &self.inner.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    out.entry(col.name)
+                        .or_insert((grouping_power, max_value_power));
+                }
+            }
+        }
+        out
+    }
+
+    /// All distinct histogram `(grouping_power, max_value_power)` configs
+    /// observed per metric name in this reader, footer-only (no row-group
+    /// decode). Unlike [`histogram_configs`](Self::histogram_configs)
+    /// (first column wins), this surfaces EVERY distinct config so a caller
+    /// can detect a same-file conflict: `ParquetSource::histogram_stream`
+    /// groups columns purely by name and decodes every matching column
+    /// under the first one's config, so two differently-configured columns
+    /// for the same name within one file can never be decoded separately.
+    /// Used by [`crate::SegmentedParquetReader`] to reject that case at
+    /// open (a cross-*segment* difference is fine — that's handled by
+    /// splitting into distinct runs, not rejected).
+    pub(crate) fn histogram_config_variants(
+        &self,
+    ) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
+        let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
+            std::collections::BTreeMap::new();
+        for (pf, _) in &self.inner.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    let cfg = (grouping_power, max_value_power);
+                    let list = out.entry(col.name).or_default();
+                    if !list.contains(&cfg) {
+                        list.push(cfg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `(name, labels)` for every counter column, in RAW SCHEMA order —
+    /// unlike [`counter_labels`](Self::counter_labels), this does not sort
+    /// or dedupe. Footer-only: one pass over the schema, no row-group
+    /// decode. Used by [`crate::SegmentedParquetReader`] to build an
+    /// open-time identity index that preserves "first appearance across
+    /// segments" splicing order without re-scanning the schema per metric
+    /// name.
+    pub(crate) fn counter_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.inner.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Counter) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Gauge twin of [`counter_columns`](Self::counter_columns).
+    pub(crate) fn gauge_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.inner.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Gauge) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Histogram twin of [`counter_columns`](Self::counter_columns).
+    pub(crate) fn histogram_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.inner.files {
+            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
+            for col in parse_schema(pf, ts) {
+                if matches!(col.kind, ColKind::Histogram { .. }) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
     /// Set the display name. Useful when constructing from bytes or
     /// after the fact (e.g. a WASM viewer setting the original upload name).
     pub fn with_filename(mut self, name: impl Into<String>) -> Self {
@@ -1327,6 +1455,19 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             if column_name.ends_with(":window_begin") || column_name.ends_with(":window_width") {
                 return None;
             }
+            // `:wall_offset` is a bare, table-level sidecar (one per table, not
+            // one per metric): the raw wall-clock reading at each row's tick,
+            // vs. the monotonic-anchored `timestamp` column. It carries no
+            // `metric` metadata and would otherwise classify by Arrow type as
+            // a phantom gauge. Unlike `:window_begin`/`:window_width`, it is
+            // not a per-metric suffix — it has no name prefix — so match it
+            // exactly rather than by `ends_with`.
+            //
+            // NOTE: `:wall_offset` is therefore also a RESERVED column name,
+            // alongside the `:window_begin` / `:window_width` suffixes above.
+            if column_name == ":wall_offset" {
+                return None;
+            }
             let name = meta.get("metric").cloned().unwrap_or_else(|| {
                 column_name
                     .strip_suffix(":buckets")
@@ -2265,5 +2406,86 @@ mod tests {
     fn memory_store_sample_timestamps_is_empty_by_default() {
         let store = crate::MemoryStore::builder().build();
         assert!(store.sample_timestamps().is_empty());
+    }
+
+    // A `.rez` per-sampler table carries one bare, table-level `:wall_offset`
+    // sidecar column (Int64) alongside the monotonic row `timestamp` — the raw
+    // wall-clock reading at that tick, for clock-drift bookkeeping. Unlike the
+    // per-metric `<m>:window_begin` / `<m>:window_width` suffixes, it has no
+    // metric prefix: it's one column per table, not one per metric. It must
+    // never surface as a metric and must not disturb its sibling column.
+    #[test]
+    fn wall_offset_sidecar_column_is_not_a_metric() {
+        let ts = Field::new("timestamp", DataType::UInt64, false);
+        let counter =
+            Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(HashMap::from([
+                ("metric".to_string(), "cpu_cycles".to_string()),
+                ("metric_type".to_string(), "counter".to_string()),
+            ]));
+        // Bare sidecar column, no metric metadata — exactly as the rezolus
+        // writer emits it.
+        let wall_offset = Field::new(":wall_offset", DataType::Int64, true);
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![ts, counter, wall_offset],
+            HashMap::from([
+                ("source".to_string(), "rezolus".to_string()),
+                ("sampling_interval_ms".to_string(), "1000".to_string()),
+            ]),
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1_000_000_000u64, 2_000_000_000u64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![Some(10u64), Some(20u64)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(5_000_000i64),
+                    Some(-3_000_000i64),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        let reader = ParquetReader::open_bytes(bytes).unwrap();
+
+        assert_eq!(
+            reader.counter_names(),
+            vec!["cpu_cycles".to_string()],
+            ":wall_offset must not appear as a phantom counter"
+        );
+        assert!(
+            reader.gauge_names().is_empty(),
+            ":wall_offset must not appear as a phantom gauge: {:?}",
+            reader.gauge_names()
+        );
+        assert!(
+            reader.histogram_names().is_empty(),
+            ":wall_offset must not appear as a phantom histogram: {:?}",
+            reader.histogram_names()
+        );
+
+        // The sibling metric column must still resolve normally — a skip that
+        // also broke it would be worse than the bug it fixes. Counters are
+        // only queryable via rate()/irate(), not a bare selector.
+        let (start, end) = reader.time_range().unwrap();
+        let result = reader
+            .query_range("rate(cpu_cycles[2s])", start, end + 1.0, 1.0)
+            .unwrap();
+        let QueryResult::Matrix { result } = result else {
+            panic!("expected matrix result");
+        };
+        assert_eq!(result.len(), 1, "expected exactly one series");
+        assert!(
+            result[0].values.iter().any(|(_, v)| *v > 0.0),
+            "expected a positive rate from the still-resolving cpu_cycles counter: {:?}",
+            result[0].values
+        );
     }
 }
