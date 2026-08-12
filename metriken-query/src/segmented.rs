@@ -743,9 +743,33 @@ impl DataSource for SegmentedSource {
 
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
         let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
-        for s in &self.segments {
+        for (idx, s) in self.segments.iter().enumerate() {
             for (metric, cols) in s.column_map() {
-                out.entry(metric).or_default().extend(cols);
+                // Mirror the run tagging that `histogram_stream` and
+                // `histogram_labels` apply. `QueryEngine::columns` requires
+                // every filter key to be PRESENT on the label set, so without
+                // `__run__` here a run-qualified selector resolves to no
+                // columns at all — and the only production consumer
+                // (rezolus' `RezReader`) routes every query through
+                // `columns()` first, so it would reject
+                // `histogram_mean(latency{__run__="1"})` outright and leave
+                // the conflict policy's documented escape hatch unreachable.
+                //
+                // Tagged for every histogram the run index knows, not just the
+                // drifted ones, so `__run__="0"` also addresses a metric that
+                // never drifted — matching `histogram_stream`, which accepts
+                // run 0 in the single-run case. These labels are routing keys,
+                // never user-visible series labels (that is `histogram_labels`,
+                // which still only tags an actual conflict).
+                let run = self.histogram_runs.segment_run(&metric, idx);
+                let entry = out.entry(metric).or_default();
+                match run {
+                    Some(run) => entry.extend(cols.into_iter().map(|(mut labels, col)| {
+                        labels.inner.insert("__run__".to_string(), run.to_string());
+                        (labels, col)
+                    })),
+                    None => entry.extend(cols),
+                }
             }
         }
         out
@@ -2047,6 +2071,56 @@ mod tests {
         let labels = plain.histogram_labels("latency");
         assert_eq!(labels.len(), 1, "{labels:?}");
         assert!(labels[0].is_empty(), "{labels:?}");
+    }
+
+    /// Bucket vector for `(gp, mvp)` with a single non-zero bucket.
+    fn run_test_buckets(gp: u8, mvp: u8, idx: usize, count: u64) -> Vec<u64> {
+        let n = ::histogram::Config::new(gp, mvp).unwrap().total_buckets();
+        let mut b = vec![0u64; n];
+        b[idx] = count;
+        b
+    }
+
+    // The conflict policy advertises `latency{__run__="1"}` as the way to reach
+    // a drifted run, but the only production consumer (rezolus' `RezReader`)
+    // routes EVERY query through `columns()` first. A run-qualified selector
+    // that resolves to no columns is therefore rejected before it can reach
+    // `query_range` — "query references no metric present in this .rez" — which
+    // makes runs >= 1 unreachable data through the front door even though the
+    // `query_range` unit tests (which bypass `columns()`) pass.
+    #[test]
+    fn run_qualified_queries_resolve_through_columns() {
+        let seg_a = segment_histogram(
+            "latency",
+            2,
+            8,
+            &[(1_000_000_000, run_test_buckets(2, 8, 20, 10))],
+        );
+        let seg_b = segment_histogram(
+            "latency",
+            3,
+            8,
+            &[(2_000_000_000, run_test_buckets(3, 8, 20, 10))],
+        );
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(vec![seg_a, seg_b], pool).unwrap();
+        assert_eq!(r.histogram_labels("latency").len(), 2, "drift expected");
+
+        let plain = r.columns("histogram_mean(latency)").unwrap();
+        assert!(plain.contains("latency:buckets"), "cols: {plain:?}");
+        for run in ["0", "1"] {
+            let cols = r
+                .columns(&format!("histogram_mean(latency{{__run__=\"{run}\"}})"))
+                .unwrap();
+            assert_eq!(
+                cols, plain,
+                "run {run} must resolve to the same physical column"
+            );
+        }
+
+        // A run that does not exist still resolves to nothing.
+        let cols = r.columns("histogram_mean(latency{__run__=\"7\"})").unwrap();
+        assert!(cols.is_empty(), "cols: {cols:?}");
     }
 
     #[test]
