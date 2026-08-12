@@ -620,10 +620,21 @@ impl DataSource for SegmentedSource {
         end_ns: u64,
     ) -> Option<HistogramStream> {
         if self.histogram_runs.run_count(name) <= 1 {
+            // No conflict, so the segments' own labels carry no `__run__` and
+            // `Labels::matches` would fail closed on one. A dashboard can
+            // legitimately pin `__run__="0"` to keep one query working across
+            // an A/B pair where only the other side drifted, and run 0 IS this
+            // single run — strip it. Any other run genuinely has no data here.
+            let mut effective = filter.clone();
+            match effective.inner.remove("__run__") {
+                None => {}
+                Some(v) if v == "0" => {}
+                Some(_) => return None,
+            }
             let streams: Vec<HistogramStream> = self
                 .segments
                 .iter()
-                .filter_map(|seg| seg.histogram_stream(name, filter, start_ns, end_ns))
+                .filter_map(|seg| seg.histogram_stream(name, &effective, start_ns, end_ns))
                 .collect();
             return splice_histogram_streams(name, &self.histogram_identity, streams);
         }
@@ -2121,6 +2132,59 @@ mod tests {
         // A run that does not exist still resolves to nothing.
         let cols = r.columns("histogram_mean(latency{__run__=\"7\"})").unwrap();
         assert!(cols.is_empty(), "cols: {cols:?}");
+    }
+
+    // A dashboard can pin `__run__="0"` so one query works across an A/B pair
+    // where only one side's histogram config drifted. On the side that did NOT
+    // drift the segments carry no `__run__` at all, so the filter used to fail
+    // closed: `columns()` returned nothing and the stream reported the metric
+    // missing. Run 0 IS the single run here, so it must resolve.
+    #[test]
+    fn run_zero_is_accepted_when_nothing_drifted() {
+        // Two rows per segment with a rising count: a histogram scalar is
+        // delta-based, so a single row per segment yields no points at all.
+        let seg = |t0: u64, c0: u64| {
+            segment_histogram(
+                "latency",
+                2,
+                8,
+                &[
+                    (t0, run_test_buckets(2, 8, 20, c0)),
+                    (t0 + 1_000_000_000, run_test_buckets(2, 8, 20, c0 + 10)),
+                ],
+            )
+        };
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![seg(1_000_000_000, 10), seg(3_000_000_000, 30)],
+            pool,
+        )
+        .unwrap();
+        assert_eq!(r.histogram_labels("latency").len(), 1, "no drift here");
+
+        let cols = r.columns("histogram_mean(latency{__run__=\"0\"})").unwrap();
+        assert!(cols.contains("latency:buckets"), "cols: {cols:?}");
+
+        let pinned = r
+            .query_range("histogram_mean(latency{__run__=\"0\"})", 1.0, 4.0, 1.0)
+            .expect("__run__=\"0\" must resolve on a single-run histogram");
+        let unpinned = r
+            .query_range("histogram_mean(latency)", 1.0, 4.0, 1.0)
+            .unwrap();
+        assert_eq!(
+            format!("{pinned:?}"),
+            format!("{unpinned:?}"),
+            "pinning run 0 must not change the result, nor add a __run__ label"
+        );
+
+        // Any other run genuinely has no data, at both entry points.
+        assert!(r
+            .columns("histogram_mean(latency{__run__=\"1\"})")
+            .unwrap()
+            .is_empty());
+        assert!(r
+            .query_range("histogram_mean(latency{__run__=\"1\"})", 1.0, 4.0, 1.0)
+            .is_err());
     }
 
     #[test]
