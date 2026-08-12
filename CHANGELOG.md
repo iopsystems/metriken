@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.17.0
+
+- **Added:** `SegmentedParquetReader` — presents an ordered list of parquet
+  byte blobs (segments of one logical table) as a single `MetricsSource`.
+  Splicing happens at the `DataSource` level, *below* PromQL evaluation, so a
+  `rate()` window spanning a segment boundary computes on complete data (unlike
+  `MultiParquetSource`, which duplicates same-identity series across files
+  rather than splicing one timeline). Open is footer-only — no row-group decode
+  — and an identity index built once at open keeps splice cost linear.
+  Cross-segment identity conflicts (an agent restart remapping a column id, or
+  histogram bucket-power drift) split into distinct `__run__`-labelled series
+  with a warning rather than erroring or silently coercing.
+- **Behavior change:** `:wall_offset` is now a reserved column name, skipped by
+  `parse_schema` alongside `:window_begin` / `:window_width`. A parquet file
+  carrying a column literally named `:wall_offset` no longer surfaces it as a
+  metric.
+
 ### metriken-query 0.14.1
 
 - Fleet fallback acquisition window: a windowless file with a `duration` column
