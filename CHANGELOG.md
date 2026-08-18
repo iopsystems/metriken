@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the V2 invariant that the metadata copy cannot disagree with the
   embedded config.
 
+### metriken-query 0.18.0
+
+- **Changed:** built against `metriken-exposition` 0.18.0. `Snapshot::V3`
+  payloads flow through the ingest path via the exposition accessors
+  (expansion), so live-agent ingest of a V3 producer works without engine
+  changes. No API changes in metriken-query itself.
+
 ### metriken-query 0.17.0
 
 - **Added:** `SegmentedParquetReader` — presents an ordered list of parquet
