@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.18.0
+
+- **Added:** `SnapshotV3` — the acquisition-group snapshot format. Metric
+  readings are organized into `GroupSnapshot`s (e.g. `cpu_usage/percpu`) that
+  share one acquisition `Window` per group instead of one per metric, with
+  membership driven by producer registration rather than value sentinels.
+  Group membership is described by a `GroupSchema` (`MetricDesc` entries for
+  counters/gauges/histograms) that is content-hashed (`schema_hash`, FNV-1a-128
+  as `(hi, lo)`) so receivers can cache parsed schemas across restarts instead
+  of re-parsing every tick. `Snapshot::V1`/`Snapshot::V2` still decode exactly
+  as before.
+- **BREAKING:** `Snapshot` gained a new `V3` variant, which breaks any
+  exhaustive `match` on `Snapshot` in downstream consumers. This is
+  deliberate — `Snapshot` stays intentionally *not* `#[non_exhaustive]` so
+  that a new wire version is a compile-time event for every consumer rather
+  than something a wildcard arm could silently swallow (see the `Snapshot`
+  rustdoc).
+- **Added:** `GroupSnapshot::validate()` — checks the cross-field invariants
+  a decoded `GroupSnapshot` cannot express on the wire (per-kind schema/value
+  arity, and `schema_hash` agreement with the transmitted `GroupSchema`).
+  Receivers that cache parsed schemas by `(name, schema_hash)` must call this
+  before inserting into the cache. The `Snapshot::counters()`/`gauges()`/
+  `histograms()` accessors now silently skip a group that fails these checks
+  instead of asserting on it — a malformed but structurally valid V3 payload
+  could previously trigger a `debug_assert_eq!` panic on decoded wire data in
+  debug builds.
+- **Added:** `Snapshot::from_msgpack()` — decodes with a nesting-depth cap
+  and rejects trailing bytes, unlike a bare `rmp_serde::from_slice`, which
+  silently ignores trailing bytes and has no depth limit.
+- **Fixed:** histograms decoded through `Snapshot::histograms()` (all of
+  V1/V2/V3) are now rebuilt through `histogram::Histogram::from_buckets`,
+  the validating constructor, and dropped if that fails. Raw
+  `Deserialize` on `histogram::Histogram` cannot enforce its invariants
+  (e.g. `grouping_power < max_value_power`), so a malformed decoded
+  histogram could previously panic downstream in `iter()`/`quantiles()`.
+  For V3, the expanded histogram's `grouping_power`/`max_value_power`
+  metadata is also overwritten from the canonicalized config, restoring
+  the V2 invariant that the metadata copy cannot disagree with the
+  embedded config.
+
 ### metriken-query 0.17.0
 
 - **Added:** `SegmentedParquetReader` — presents an ordered list of parquet
