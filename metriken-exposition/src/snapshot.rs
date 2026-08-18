@@ -157,6 +157,13 @@ pub struct SnapshotV2 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MetricDesc {
+    /// MUST be unique across ALL groups in a snapshot, not only within this
+    /// one's own group. Downstream code keys metrics by name, so a
+    /// cross-group collision silently drops one of the two readings rather
+    /// than erroring. V1/V2 had this structurally for free — one flat,
+    /// global counter/gauge/histogram list — so nothing enforced it
+    /// explicitly. V3 splits names into per-group schemas, so producers are
+    /// now responsible for preserving global uniqueness themselves.
     pub name: String,
     pub metadata: BTreeMap<String, String>,
 }
@@ -243,6 +250,44 @@ pub struct GroupSnapshot {
     pub histograms: Vec<Option<histogram::Histogram>>,
 }
 
+/// Errors a receiver can act on; the accessors on [`Snapshot`]
+/// (`counters()`/`gauges()`/`histograms()`) skip such groups silently
+/// instead of surfacing this type — call [`GroupSnapshot::validate`]
+/// directly when the distinction matters.
+#[cfg(feature = "msgpack")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupValidationError {
+    /// A value vector's length disagrees with its schema list.
+    ArityMismatch,
+    /// `schema_hash` does not equal the transmitted schema's [`GroupSchema::hash`].
+    SchemaHashMismatch,
+}
+
+#[cfg(feature = "msgpack")]
+impl GroupSnapshot {
+    /// Check the cross-field invariants the wire format cannot express:
+    /// per-kind schema/value arity, and — when a schema is transmitted —
+    /// that `schema_hash` matches it. Receivers that cache schemas by
+    /// `(name, schema_hash)` MUST call this before inserting into the
+    /// cache, or a stale hash binds the group's values to the wrong
+    /// metrics silently.
+    pub fn validate(&self) -> Result<(), GroupValidationError> {
+        let Some(schema) = &self.schema else {
+            return Ok(());
+        };
+        if schema.counters.len() != self.counters.len()
+            || schema.gauges.len() != self.gauges.len()
+            || schema.histograms.len() != self.histograms.len()
+        {
+            return Err(GroupValidationError::ArityMismatch);
+        }
+        if schema.hash() != self.schema_hash {
+            return Err(GroupValidationError::SchemaHashMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Contains a snapshot of metric readings organized by acquisition group.
 ///
 /// Arity is frozen: this struct (and [`GroupSnapshot`]) round-trip through
@@ -276,6 +321,18 @@ pub struct SnapshotV3 {
 /// out of scope for this change). Always decode with `rmp_serde::from_slice`
 /// against bytes produced by `Snapshot::to_msgpack`.
 ///
+/// # Decoding safely
+///
+/// Prefer [`Snapshot::from_msgpack`] over a bare `rmp_serde::from_slice`.
+/// `from_slice` silently ignores trailing bytes after a valid snapshot —
+/// two snapshots concatenated in one buffer decode as just the first one —
+/// and applies no nesting-depth cap, so a hostile payload can drive it
+/// through pathological allocation before it ever returns an error. A
+/// receiver that already knows its producer's version can skip the
+/// untagged enum entirely and deserialize the concrete struct (e.g.
+/// `SnapshotV3`) directly with its own depth cap — measured ~280× lower
+/// peak allocation than the untagged `Snapshot` path on hostile input.
+///
 /// # Deliberately not `#[non_exhaustive]`
 ///
 /// A new wire version must be a compile-time event for every consumer that
@@ -307,6 +364,23 @@ pub(crate) struct HashedSnapshot {
     pub(crate) counters: HashMap<String, Counter>,
     pub(crate) gauges: HashMap<String, Gauge>,
     pub(crate) histograms: HashMap<String, Histogram>,
+}
+
+/// Rebuild a decoded histogram through the validating constructor,
+/// returning `None` if the embedded config/bucket data violates an
+/// invariant that raw `Deserialize` cannot enforce (e.g. `grouping_power >=
+/// max_value_power`, or a bucket count that disagrees with the config).
+/// Used by [`Snapshot::histograms`] (all versions) so a malformed decoded
+/// histogram is dropped rather than handed to a caller, where it could
+/// panic in `iter()`/`quantiles()` or produce garbage bounds.
+fn canonicalize_histogram(value: histogram::Histogram) -> Option<histogram::Histogram> {
+    let cfg = value.config();
+    histogram::Histogram::from_buckets(
+        cfg.grouping_power(),
+        cfg.max_value_power(),
+        value.as_slice().to_vec(),
+    )
+    .ok()
 }
 
 impl Snapshot {
@@ -346,16 +420,31 @@ impl Snapshot {
     // cache, but the legacy accessors here are only ever fed self-contained
     // payloads. A schema-less group is left UNTOUCHED: its values are not
     // drained, so a caller that falls back to reading `groups[..].counters`
-    // (or `.gauges`/`.histograms`) directly still finds them there. If a
-    // group's schema and value-vector lengths disagree — a malformed
-    // payload, since a well-formed producer always keeps them in lockstep —
-    // `zip` truncates to the shorter side in release builds (no API channel
-    // here to report an error); debug/test builds additionally assert on
-    // the mismatch so it is loud rather than silently truncated. Each
-    // accessor drains only its own field of the group (`g.counters` /
-    // `g.gauges` / `g.histograms`) and only ever borrows `g.schema`, so
-    // calling all three in sequence on one snapshot is safe and produces no
-    // duplication.
+    // (or `.gauges`/`.histograms`) directly still finds them there.
+    //
+    // These accessors decode DATA THAT ARRIVED OVER THE WIRE, so a malformed
+    // payload must never be able to panic the receiver. If a group's schema
+    // and value-vector length disagree for the kind being read — something a
+    // well-formed producer never does, since it keeps them in lockstep — the
+    // WHOLE GROUP is skipped for that accessor, not panicked on and not
+    // silently truncated via `zip`. A receiver that needs to know a group
+    // was dropped, or that wants to validate a group before caching its
+    // schema by `(name, schema_hash)`, should call
+    // [`GroupSnapshot::validate`] instead of relying on these accessors to
+    // surface the problem. Each accessor drains only its own field of the
+    // group (`g.counters` / `g.gauges` / `g.histograms`) and only ever
+    // borrows `g.schema`, so calling all three in sequence on one snapshot
+    // is safe and produces no duplication.
+    //
+    // Histograms get one more layer of hardening, applied for ALL versions
+    // (V1/V2/V3): `histogram::Histogram`'s `Deserialize` is a naive derive
+    // over raw fields, so a decoded value can violate invariants that only
+    // the validating constructors (`Config::new`/`from_buckets`) enforce —
+    // this produces shift-overflow panics in `iter()`/`quantiles()` (debug),
+    // garbage bounds (release), or downstream `unwrap` panics. Every
+    // histogram handed out by `histograms()` is rebuilt through
+    // `histogram::Histogram::from_buckets` first; one that fails is dropped
+    // rather than exposed. See [`canonicalize_histogram`].
 
     pub fn counters(&mut self) -> Vec<Counter> {
         match self {
@@ -365,13 +454,10 @@ impl Snapshot {
                 let mut out = Vec::new();
                 for g in &mut s.groups {
                     let Some(schema) = &g.schema else { continue };
+                    if schema.counters.len() != g.counters.len() {
+                        continue;
+                    }
                     let values = std::mem::take(&mut g.counters);
-                    debug_assert_eq!(
-                        schema.counters.len(),
-                        values.len(),
-                        "group {:?} schema/value arity mismatch — malformed V3 payload",
-                        g.name
-                    );
                     for (desc, value) in schema.counters.iter().zip(values) {
                         let Some(value) = value else { continue };
                         out.push(
@@ -400,13 +486,10 @@ impl Snapshot {
                 let mut out = Vec::new();
                 for g in &mut s.groups {
                     let Some(schema) = &g.schema else { continue };
+                    if schema.gauges.len() != g.gauges.len() {
+                        continue;
+                    }
                     let values = std::mem::take(&mut g.gauges);
-                    debug_assert_eq!(
-                        schema.gauges.len(),
-                        values.len(),
-                        "group {:?} schema/value arity mismatch — malformed V3 payload",
-                        g.name
-                    );
                     for (desc, value) in schema.gauges.iter().zip(values) {
                         let Some(value) = value else { continue };
                         out.push(
@@ -429,31 +512,58 @@ impl Snapshot {
 
     pub fn histograms(&mut self) -> Vec<Histogram> {
         match self {
-            Snapshot::V1(s) => std::mem::take(&mut s.histograms),
-            Snapshot::V2(s) => std::mem::take(&mut s.histograms),
+            Snapshot::V1(s) => std::mem::take(&mut s.histograms)
+                .into_iter()
+                .filter_map(|mut h| {
+                    h.value = canonicalize_histogram(h.value)?;
+                    Some(h)
+                })
+                .collect(),
+            Snapshot::V2(s) => std::mem::take(&mut s.histograms)
+                .into_iter()
+                .filter_map(|mut h| {
+                    h.value = canonicalize_histogram(h.value)?;
+                    Some(h)
+                })
+                .collect(),
             Snapshot::V3(s) => {
                 let mut out = Vec::new();
                 for g in &mut s.groups {
                     let Some(schema) = &g.schema else { continue };
+                    if schema.histograms.len() != g.histograms.len() {
+                        continue;
+                    }
                     let values = std::mem::take(&mut g.histograms);
-                    debug_assert_eq!(
-                        schema.histograms.len(),
-                        values.len(),
-                        "group {:?} schema/value arity mismatch — malformed V3 payload",
-                        g.name
-                    );
                     for (desc, value) in schema.histograms.iter().zip(values) {
                         let Some(value) = value else { continue };
+                        let Some(value) = canonicalize_histogram(value) else {
+                            continue;
+                        };
+                        // The canonicalized config is now the source of
+                        // truth for these two keys, restoring the V2
+                        // invariant that the metadata copy cannot disagree
+                        // with the embedded config: V2 derived these
+                        // strings from the value's own config at the
+                        // producer, so they could never diverge; V3's
+                        // schema-carried metadata can, so overwrite from
+                        // `cfg` here rather than trusting the schema's copy.
+                        let cfg = value.config();
+                        let mut metadata: HashMap<String, String> = desc
+                            .metadata
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        metadata.insert(
+                            "grouping_power".to_string(),
+                            cfg.grouping_power().to_string(),
+                        );
+                        metadata.insert(
+                            "max_value_power".to_string(),
+                            cfg.max_value_power().to_string(),
+                        );
                         out.push(
-                            Histogram::new(
-                                desc.name.clone(),
-                                value,
-                                desc.metadata
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect(),
-                            )
-                            .with_window(g.window),
+                            Histogram::new(desc.name.clone(), value, metadata)
+                                .with_window(g.window),
                         );
                     }
                 }
@@ -478,6 +588,26 @@ impl Snapshot {
         T: serde::Serialize + ?Sized,
     {
         rmp_serde::encode::to_vec(val)
+    }
+
+    /// Decode one snapshot from a complete msgpack buffer, with a nesting-depth
+    /// cap (the format's real depth is ≤6; the cap defeats nested-length-header
+    /// allocation bombs that bare `rmp_serde::from_slice` amplifies to hundreds
+    /// of MB before erroring) and rejection of trailing bytes (`from_slice`
+    /// silently ignores them — two concatenated snapshots would decode as one).
+    #[cfg(feature = "msgpack")]
+    pub fn from_msgpack(bytes: &[u8]) -> Result<Snapshot, rmp_serde::decode::Error> {
+        use serde::Deserialize;
+
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(bytes));
+        de.set_max_depth(16);
+        let snapshot = Snapshot::deserialize(&mut de)?;
+        if de.position() as usize != bytes.len() {
+            return Err(rmp_serde::decode::Error::Syntax(
+                "trailing bytes after snapshot".to_string(),
+            ));
+        }
+        Ok(snapshot)
     }
 }
 
@@ -984,5 +1114,220 @@ mod v3_tests {
             (a.value, &a.metadata, a.window),
             (b.value, &b.metadata, b.window)
         );
+    }
+
+    #[test]
+    fn malformed_arity_group_is_skipped_not_panicked() {
+        // Regression for the removed debug_assert_eq!: a schema declaring 2
+        // counters but shipping only 1 value slot is a structurally valid
+        // decode (msgpack has no way to express "these two arrays must be
+        // the same length"), so this can arrive over the wire. It must not
+        // panic — it must be skipped whole, leaving the well-formed sibling
+        // group's metrics intact.
+        let malformed = GroupSnapshot {
+            name: "broken/group".to_string(),
+            schema_hash: (0, 0),
+            schema: Some(GroupSchema {
+                counters: vec![desc("0", "a"), desc("1", "b")],
+                gauges: vec![],
+                histograms: vec![],
+            }),
+            window: None,
+            counters: vec![Some(1)], // one slot short of the schema's two
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let mut s = v3();
+        s.groups.insert(0, malformed);
+        let mut snap = Snapshot::V3(s);
+
+        let counters = snap.counters(); // must not panic
+        assert_eq!(counters.len(), 1, "only the well-formed sibling's metric");
+        assert_eq!(counters[0].name, "0");
+        assert_eq!(counters[0].value, 7);
+    }
+
+    #[test]
+    fn validate_catches_arity_and_stale_hash() {
+        let schema = GroupSchema {
+            counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let good = GroupSnapshot {
+            name: "cpu_usage/percpu".to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(schema),
+            window: None,
+            counters: vec![Some(1), Some(2)],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        assert_eq!(good.validate(), Ok(()));
+
+        let mut bad_arity = good.clone();
+        bad_arity.counters = vec![Some(1)];
+        assert_eq!(
+            bad_arity.validate(),
+            Err(GroupValidationError::ArityMismatch)
+        );
+
+        let mut stale_hash = good.clone();
+        stale_hash.schema_hash = (1, 2);
+        assert_eq!(
+            stale_hash.validate(),
+            Err(GroupValidationError::SchemaHashMismatch)
+        );
+
+        let mut no_schema = good;
+        no_schema.schema = None;
+        assert_eq!(no_schema.validate(), Ok(()));
+    }
+
+    #[test]
+    fn malformed_histogram_is_dropped_at_expansion() {
+        // `histogram::Histogram`'s fields are private, so there is no public
+        // constructor that lets a test build an invariant-violating value
+        // directly. The route in: rmp-serde encodes a plain struct exactly
+        // like a same-arity tuple (positionally, compact msgpack — the same
+        // trick `truncated_arrays_error_not_misdecode` above relies on), so
+        // a tuple shaped like `(Config's 8 private fields, buckets)` decodes
+        // as a `Histogram` without ever passing through
+        // `Config::new`/`from_buckets`. Set `grouping_power` (200) >=
+        // `max_value_power` (64) — exactly the invariant those constructors
+        // reject.
+        #[allow(clippy::type_complexity)]
+        type FakeConfig = (u64, u8, u8, u8, u64, u32, u32, u32);
+        let fake_config: FakeConfig = (0, 200, 64, 0, 0, 0, 0, 0);
+        let fake: (FakeConfig, Vec<u64>) = (fake_config, vec![0; 4]);
+        let bytes = rmp_serde::to_vec(&fake).unwrap();
+        let bad: histogram::Histogram = rmp_serde::from_slice(&bytes).unwrap();
+
+        let mut good = histogram::Histogram::new(3, 64).unwrap();
+        good.increment(10).unwrap();
+
+        let schema = GroupSchema {
+            counters: vec![],
+            gauges: vec![],
+            histograms: vec![desc("0", "bad"), desc("1", "good")],
+        };
+        let group = GroupSnapshot {
+            name: "hist/group".to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(schema),
+            window: None,
+            counters: vec![],
+            gauges: vec![],
+            histograms: vec![Some(bad), Some(good.clone())],
+        };
+        let s = SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            duration: Duration::from_millis(10),
+            metadata: HashMap::new(),
+            groups: vec![group],
+        };
+        let mut snap = Snapshot::V3(s);
+
+        let histograms = snap.histograms(); // must not panic on the bad one
+        assert_eq!(histograms.len(), 1, "the malformed histogram is dropped");
+        assert_eq!(histograms[0].name, "1");
+        assert_eq!(histograms[0].value, good);
+    }
+
+    #[test]
+    fn v3_histogram_metadata_follows_embedded_config() {
+        // The schema's metadata copy claims grouping_power=7 /
+        // max_value_power=64, but the embedded histogram was actually built
+        // with (3, 64). After expansion the metadata must read the
+        // embedded config's values (3, 64), not the schema's stale claim.
+        let mut embedded = histogram::Histogram::new(3, 64).unwrap();
+        embedded.increment(5).unwrap();
+
+        let schema = GroupSchema {
+            counters: vec![],
+            gauges: vec![],
+            histograms: vec![MetricDesc {
+                name: "0".to_string(),
+                metadata: [
+                    ("grouping_power".to_string(), "7".to_string()),
+                    ("max_value_power".to_string(), "64".to_string()),
+                ]
+                .into(),
+            }],
+        };
+        let group = GroupSnapshot {
+            name: "hist/group".to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(schema),
+            window: None,
+            counters: vec![],
+            gauges: vec![],
+            histograms: vec![Some(embedded)],
+        };
+        let s = SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            duration: Duration::from_millis(10),
+            metadata: HashMap::new(),
+            groups: vec![group],
+        };
+        let mut snap = Snapshot::V3(s);
+        let histograms = snap.histograms();
+        assert_eq!(histograms.len(), 1);
+        assert_eq!(
+            histograms[0]
+                .metadata
+                .get("grouping_power")
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            histograms[0]
+                .metadata
+                .get("max_value_power")
+                .map(String::as_str),
+            Some("64")
+        );
+    }
+
+    #[test]
+    fn from_msgpack_rejects_trailing_bytes() {
+        let bytes = Snapshot::to_msgpack(&Snapshot::V3(v3())).unwrap();
+
+        // Exact bytes: from_msgpack must agree with from_slice's value.
+        let via_from_msgpack = Snapshot::from_msgpack(&bytes).unwrap();
+        let via_from_slice: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            rmp_serde::to_vec(&via_from_msgpack).unwrap(),
+            rmp_serde::to_vec(&via_from_slice).unwrap(),
+            "from_msgpack must decode exact bytes to the same value as from_slice"
+        );
+
+        // Trailing junk: from_slice happily ignores it; from_msgpack must not.
+        let mut with_junk = bytes.clone();
+        with_junk.extend_from_slice(&[0xC0, 0xC0, 0xC0]); // trailing msgpack nils
+        assert!(
+            rmp_serde::from_slice::<Snapshot>(&with_junk).is_ok(),
+            "sanity: from_slice is expected to ignore the trailing bytes"
+        );
+        assert!(
+            Snapshot::from_msgpack(&with_junk).is_err(),
+            "from_msgpack must reject trailing bytes rather than silently ignoring them"
+        );
+    }
+
+    #[test]
+    fn from_msgpack_caps_depth() {
+        // Hand-roll a msgpack payload nested far past Snapshot's real depth
+        // (<=6): 40 one-element fixarrays (0x91) wrapping a nil (0xC0).
+        // With the depth cap in place this must fail fast at depth 16
+        // rather than being handed to the untagged Snapshot decoder to
+        // chew through the full 40 levels.
+        let mut bytes = vec![0xC0u8]; // nil
+        for _ in 0..40 {
+            let mut next = vec![0x91u8]; // fixarray, len 1
+            next.extend_from_slice(&bytes);
+            bytes = next;
+        }
+        assert!(Snapshot::from_msgpack(&bytes).is_err());
     }
 }

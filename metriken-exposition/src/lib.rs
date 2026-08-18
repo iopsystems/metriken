@@ -18,6 +18,8 @@ pub use parquet::{
     ParquetCompression, ParquetHistogramType, ParquetOptions, ParquetSchema, ParquetWriter,
 };
 pub use prometheus::{prometheus_text, PrometheusOptions};
+#[cfg(feature = "msgpack")]
+pub use snapshot::GroupValidationError;
 pub use snapshot::{
     Counter, Gauge, GroupSchema, GroupSnapshot, Histogram, MetricDesc, Snapshot, SnapshotV1,
     SnapshotV2, SnapshotV3,

@@ -24,6 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that a new wire version is a compile-time event for every consumer rather
   than something a wildcard arm could silently swallow (see the `Snapshot`
   rustdoc).
+- **Added:** `GroupSnapshot::validate()` — checks the cross-field invariants
+  a decoded `GroupSnapshot` cannot express on the wire (per-kind schema/value
+  arity, and `schema_hash` agreement with the transmitted `GroupSchema`).
+  Receivers that cache parsed schemas by `(name, schema_hash)` must call this
+  before inserting into the cache. The `Snapshot::counters()`/`gauges()`/
+  `histograms()` accessors now silently skip a group that fails these checks
+  instead of asserting on it — a malformed but structurally valid V3 payload
+  could previously trigger a `debug_assert_eq!` panic on decoded wire data in
+  debug builds.
+- **Added:** `Snapshot::from_msgpack()` — decodes with a nesting-depth cap
+  and rejects trailing bytes, unlike a bare `rmp_serde::from_slice`, which
+  silently ignores trailing bytes and has no depth limit.
+- **Fixed:** histograms decoded through `Snapshot::histograms()` (all of
+  V1/V2/V3) are now rebuilt through `histogram::Histogram::from_buckets`,
+  the validating constructor, and dropped if that fails. Raw
+  `Deserialize` on `histogram::Histogram` cannot enforce its invariants
+  (e.g. `grouping_power < max_value_power`), so a malformed decoded
+  histogram could previously panic downstream in `iter()`/`quantiles()`.
+  For V3, the expanded histogram's `grouping_power`/`max_value_power`
+  metadata is also overwritten from the canonicalized config, restoring
+  the V2 invariant that the metadata copy cannot disagree with the
+  embedded config.
 
 ### metriken-query 0.17.0
 
