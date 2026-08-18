@@ -338,7 +338,15 @@ impl Snapshot {
     // `None` cannot be named at all, so it expands to nothing rather than
     // fabricating names — the V3-native path resolves that via its schema
     // cache, but the legacy accessors here are only ever fed self-contained
-    // payloads.
+    // payloads. If a group's schema and value-vector lengths disagree — a
+    // malformed payload, since a well-formed producer always keeps them in
+    // lockstep — `zip` truncates to the shorter side in release builds (no
+    // API channel here to report an error); debug/test builds additionally
+    // assert on the mismatch so it is loud rather than silently truncated.
+    // Each accessor drains only its own field of the group (`g.counters` /
+    // `g.gauges` / `g.histograms`) and only ever borrows `g.schema`, so
+    // calling all three in sequence on one snapshot is safe and produces no
+    // duplication.
 
     pub fn counters(&mut self) -> Vec<Counter> {
         match self {
@@ -352,6 +360,12 @@ impl Snapshot {
                     // borrow.
                     let values = std::mem::take(&mut g.counters);
                     let Some(schema) = &g.schema else { continue };
+                    debug_assert_eq!(
+                        schema.counters.len(),
+                        values.len(),
+                        "group {:?} schema/value arity mismatch — malformed V3 payload",
+                        g.name
+                    );
                     for (desc, value) in schema.counters.iter().zip(values) {
                         let Some(value) = value else { continue };
                         out.push(
@@ -381,6 +395,12 @@ impl Snapshot {
                 for g in &mut s.groups {
                     let values = std::mem::take(&mut g.gauges);
                     let Some(schema) = &g.schema else { continue };
+                    debug_assert_eq!(
+                        schema.gauges.len(),
+                        values.len(),
+                        "group {:?} schema/value arity mismatch — malformed V3 payload",
+                        g.name
+                    );
                     for (desc, value) in schema.gauges.iter().zip(values) {
                         let Some(value) = value else { continue };
                         out.push(
@@ -410,6 +430,12 @@ impl Snapshot {
                 for g in &mut s.groups {
                     let values = std::mem::take(&mut g.histograms);
                     let Some(schema) = &g.schema else { continue };
+                    debug_assert_eq!(
+                        schema.histograms.len(),
+                        values.len(),
+                        "group {:?} schema/value arity mismatch — malformed V3 payload",
+                        g.name
+                    );
                     for (desc, value) in schema.histograms.iter().zip(values) {
                         let Some(value) = value else { continue };
                         out.push(
