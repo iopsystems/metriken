@@ -224,6 +224,12 @@ pub struct GroupSnapshot {
     /// `(hi, lo)` because msgpack has no 128-bit integer. Content-addressed:
     /// receivers cache parsed schemas by `(name, schema_hash)`, so it
     /// survives agent restarts with no generation counter.
+    ///
+    /// MUST equal [`GroupSchema::hash`] of the schema these values align
+    /// with, whether or not `schema` is transmitted. Receivers cache parsed
+    /// schemas by `(name, schema_hash)`; a producer sending a stale hash
+    /// beside a changed schema makes receivers bind the group's values to
+    /// the wrong metrics — silently.
     pub schema_hash: (u64, u64),
     /// The membership. Producers may always include it (stateless payloads);
     /// receivers skip parsing on a hash match. Correctness must never depend
@@ -338,12 +344,15 @@ impl Snapshot {
     // `None` cannot be named at all, so it expands to nothing rather than
     // fabricating names — the V3-native path resolves that via its schema
     // cache, but the legacy accessors here are only ever fed self-contained
-    // payloads. If a group's schema and value-vector lengths disagree — a
-    // malformed payload, since a well-formed producer always keeps them in
-    // lockstep — `zip` truncates to the shorter side in release builds (no
-    // API channel here to report an error); debug/test builds additionally
-    // assert on the mismatch so it is loud rather than silently truncated.
-    // Each accessor drains only its own field of the group (`g.counters` /
+    // payloads. A schema-less group is left UNTOUCHED: its values are not
+    // drained, so a caller that falls back to reading `groups[..].counters`
+    // (or `.gauges`/`.histograms`) directly still finds them there. If a
+    // group's schema and value-vector lengths disagree — a malformed
+    // payload, since a well-formed producer always keeps them in lockstep —
+    // `zip` truncates to the shorter side in release builds (no API channel
+    // here to report an error); debug/test builds additionally assert on
+    // the mismatch so it is loud rather than silently truncated. Each
+    // accessor drains only its own field of the group (`g.counters` /
     // `g.gauges` / `g.histograms`) and only ever borrows `g.schema`, so
     // calling all three in sequence on one snapshot is safe and produces no
     // duplication.
@@ -355,11 +364,8 @@ impl Snapshot {
             Snapshot::V3(s) => {
                 let mut out = Vec::new();
                 for g in &mut s.groups {
-                    // Take the values before borrowing the schema, or the
-                    // mutable take conflicts with the immutable schema
-                    // borrow.
-                    let values = std::mem::take(&mut g.counters);
                     let Some(schema) = &g.schema else { continue };
+                    let values = std::mem::take(&mut g.counters);
                     debug_assert_eq!(
                         schema.counters.len(),
                         values.len(),
@@ -393,8 +399,8 @@ impl Snapshot {
             Snapshot::V3(s) => {
                 let mut out = Vec::new();
                 for g in &mut s.groups {
-                    let values = std::mem::take(&mut g.gauges);
                     let Some(schema) = &g.schema else { continue };
+                    let values = std::mem::take(&mut g.gauges);
                     debug_assert_eq!(
                         schema.gauges.len(),
                         values.len(),
@@ -428,8 +434,8 @@ impl Snapshot {
             Snapshot::V3(s) => {
                 let mut out = Vec::new();
                 for g in &mut s.groups {
-                    let values = std::mem::take(&mut g.histograms);
                     let Some(schema) = &g.schema else { continue };
+                    let values = std::mem::take(&mut g.histograms);
                     debug_assert_eq!(
                         schema.histograms.len(),
                         values.len(),
@@ -571,18 +577,20 @@ mod v3_tests {
     }
 
     fn v3() -> SnapshotV3 {
+        let schema = GroupSchema {
+            counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let schema_hash = schema.hash();
         SnapshotV3 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
             duration: Duration::from_millis(10),
             metadata: [("source".to_string(), "rezolus".to_string())].into(),
             groups: vec![GroupSnapshot {
                 name: "cpu_usage/percpu".to_string(),
-                schema_hash: (1, 2),
-                schema: Some(GroupSchema {
-                    counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
-                    gauges: vec![],
-                    histograms: vec![],
-                }),
+                schema_hash,
+                schema: Some(schema),
                 window: Some(Window::new(999_000, 999_400)),
                 counters: vec![Some(7), None],
                 gauges: vec![],
@@ -622,7 +630,7 @@ mod v3_tests {
         assert_eq!(s.groups.len(), 1);
         let g = &s.groups[0];
         assert_eq!(g.name, "cpu_usage/percpu");
-        assert_eq!(g.schema_hash, (1, 2));
+        assert_eq!(g.schema_hash, g.schema.as_ref().unwrap().hash());
         assert_eq!(g.counters, vec![Some(7), None]);
         assert_eq!(g.window, Some(Window::new(999_000, 999_400)));
         assert_eq!(
@@ -631,6 +639,41 @@ mod v3_tests {
                 .get("metric"),
             Some(&"cpu_instructions".to_string())
         );
+    }
+
+    #[test]
+    fn well_formed_group_carries_its_schemas_hash() {
+        // Executable link between the schema_hash producer obligation
+        // (doc'd on GroupSnapshot::schema_hash) and GroupSchema::hash(): a
+        // well-formed producer computes the hash from the schema it
+        // actually sends, and that pairing must survive the wire.
+        let schema = GroupSchema {
+            counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let group = GroupSnapshot {
+            name: "cpu_usage/percpu".to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(schema),
+            window: Some(Window::new(999_000, 999_400)),
+            counters: vec![Some(7), None],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let s = SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            duration: Duration::from_millis(10),
+            metadata: HashMap::new(),
+            groups: vec![group],
+        };
+        let bytes = Snapshot::to_msgpack(&Snapshot::V3(s)).unwrap();
+        let back: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let Snapshot::V3(back) = back else {
+            panic!("V3 bytes decoded as a different version")
+        };
+        let g = &back.groups[0];
+        assert_eq!(g.schema_hash, g.schema.as_ref().unwrap().hash());
     }
 
     #[test]
@@ -779,6 +822,37 @@ mod v3_tests {
     }
 
     #[test]
+    fn trailing_extra_field_errors_not_ignored() {
+        // The other direction from truncated_arrays_error_not_misdecode:
+        // pins that a too-LONG positional payload — shaped like V1 with one
+        // extra trailing element — also fails to decode rather than having
+        // the extra element silently ignored. This is the guarantee the
+        // `Snapshot` enum rustdoc's "arity is frozen" claim relies on, and
+        // what a future V4 author needs to be able to count on.
+        #[allow(clippy::type_complexity)]
+        let too_long: (
+            SystemTime,
+            HashMap<String, String>,
+            Vec<Counter>,
+            Vec<Counter>,
+            Vec<Counter>,
+            u32,
+        ) = (
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            HashMap::new(),
+            vec![Counter::new("0".to_string(), 7, HashMap::new())],
+            vec![],
+            vec![],
+            42,
+        );
+        let bytes = rmp_serde::to_vec(&too_long).unwrap();
+        assert!(
+            rmp_serde::from_slice::<Snapshot>(&bytes).is_err(),
+            "a too-long positional payload must error, not silently ignore the trailing extra"
+        );
+    }
+
+    #[test]
     fn schema_hash_is_stable_and_content_addressed() {
         let a = GroupSchema {
             counters: vec![desc("0", "cpu_cycles")],
@@ -874,11 +948,17 @@ mod v3_tests {
         // named metrics; the legacy path yields nothing rather than
         // fabricating names. (The V3-native recorder path resolves this via
         // its schema cache; the legacy path is only ever fed self-contained
-        // payloads.)
+        // payloads.) The group is left untouched: its raw values are not
+        // drained, so a caller falling back to reading `groups[..].counters`
+        // directly still finds them.
         let mut s = v3();
         s.groups[0].schema = None;
         let mut snap = Snapshot::V3(s);
         assert!(snap.counters().is_empty());
+        let Snapshot::V3(s) = snap else {
+            panic!("wrong version")
+        };
+        assert_eq!(s.groups[0].counters, vec![Some(7), None]);
     }
 
     #[test]
