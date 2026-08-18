@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.18.0
+
+- **Added:** `SnapshotV3` — the acquisition-group snapshot format. Metric
+  readings are organized into `GroupSnapshot`s (e.g. `cpu_usage/percpu`) that
+  share one acquisition `Window` per group instead of one per metric, with
+  membership driven by producer registration rather than value sentinels.
+  Group membership is described by a `GroupSchema` (`MetricDesc` entries for
+  counters/gauges/histograms) that is content-hashed (`schema_hash`, FNV-1a-128
+  as `(hi, lo)`) so receivers can cache parsed schemas across restarts instead
+  of re-parsing every tick. `Snapshot::V1`/`Snapshot::V2` still decode exactly
+  as before.
+- **BREAKING:** `Snapshot` gained a new `V3` variant, which breaks any
+  exhaustive `match` on `Snapshot` in downstream consumers. This is
+  deliberate — `Snapshot` stays intentionally *not* `#[non_exhaustive]` so
+  that a new wire version is a compile-time event for every consumer rather
+  than something a wildcard arm could silently swallow (see the `Snapshot`
+  rustdoc). Next release: 0.18.0.
+
 ### metriken-query 0.17.0
 
 - **Added:** `SegmentedParquetReader` — presents an ordered list of parquet

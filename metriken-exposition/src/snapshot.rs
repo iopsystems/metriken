@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use metriken::Window;
@@ -142,6 +142,13 @@ pub struct SnapshotV2 {
     pub histograms: Vec<Histogram>,
 }
 
+// SnapshotV3, GroupSnapshot and GroupSchema deliberately do NOT follow the
+// `#[non_exhaustive]` + `new(..)`/`with_window(..)` convention used above for
+// Counter/Gauge/Histogram. Their arity is frozen the moment they ship (see
+// the arity note on SnapshotV3 and on the Snapshot enum below); advertising
+// room to grow via `#[non_exhaustive]` would be false. A future field means
+// a V4, not an addition here.
+
 /// One metric's identity within a [`GroupSchema`]: its column key (the
 /// snapshot entry name, e.g. `"5"` / `"5x3"`) plus its annotations
 /// (`metric`, `sampler`, labels, and for histograms `grouping_power` /
@@ -151,7 +158,7 @@ pub struct SnapshotV2 {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MetricDesc {
     pub name: String,
-    pub metadata: std::collections::BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// The membership of one acquisition group: descriptors for every counter,
@@ -206,6 +213,12 @@ pub struct GroupSnapshot {
 }
 
 /// Contains a snapshot of metric readings organized by acquisition group.
+///
+/// Arity is frozen: this struct (and [`GroupSnapshot`]) round-trip through
+/// msgpack as positional arrays via the untagged [`Snapshot`] enum. Adding,
+/// removing, or reordering a field once this ships breaks decoding for every
+/// deployed consumer — extend by adding a `V4` variant, not by editing this
+/// struct.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SnapshotV3 {
@@ -218,6 +231,35 @@ pub struct SnapshotV3 {
     pub groups: Vec<GroupSnapshot>,
 }
 
+/// A versioned snapshot of metric readings.
+///
+/// # Version detection
+///
+/// This enum is `#[serde(untagged)]`: under the compact msgpack encoding
+/// (`Snapshot::to_msgpack`, i.e. `rmp_serde::to_vec`) each struct serializes
+/// positionally as an array, so serde picks the variant by trying each in
+/// order and taking the first whose field count/types match. That is a
+/// **compact-msgpack-only** contract. Map-keyed encodings — `to_vec_named`,
+/// JSON — are NOT a supported input for version detection: a V2 value
+/// encoded as a map can mis-decode as V1 there (pre-existing behavior,
+/// out of scope for this change). Always decode with `rmp_serde::from_slice`
+/// against bytes produced by `Snapshot::to_msgpack`.
+///
+/// # Deliberately not `#[non_exhaustive]`
+///
+/// A new wire version must be a compile-time event for every consumer that
+/// matches on `Snapshot`. A wildcard arm silently swallowing an unknown
+/// version is exactly the failure a version enum exists to prevent, so this
+/// type stays exhaustive even though it costs a downstream compile break
+/// each time a version is added (as this change itself does).
+///
+/// # Arity is frozen per version
+///
+/// Once a version ships, its field count and order can never change:
+/// positional decoding means trailing extra fields make an untagged decode
+/// attempt fail rather than ignore them. Adding a field to `SnapshotV3` (or
+/// `GroupSnapshot`) is a breaking change for every deployed consumer —
+/// extensions require a new `V4` variant, not an edit to an existing one.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(untagged))]
@@ -265,8 +307,14 @@ impl Snapshot {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.counters),
             Snapshot::V2(s) => std::mem::take(&mut s.counters),
-            // Task 3 replaces this stub with group expansion.
-            Snapshot::V3(_) => Vec::new(),
+            // A silent empty vec here would let a V3 snapshot flow through
+            // the parquet pipeline as a well-formed file with zero metric
+            // columns — successful-looking data loss. Panicking on this
+            // unreachable-until-then path is strictly safer. Task 3 (in
+            // this same PR) replaces this with real group expansion.
+            Snapshot::V3(_) => {
+                todo!("SnapshotV3 group expansion lands with the accessor-expansion task")
+            }
         }
     }
 
@@ -274,8 +322,11 @@ impl Snapshot {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.gauges),
             Snapshot::V2(s) => std::mem::take(&mut s.gauges),
-            // Task 3 replaces this stub with group expansion.
-            Snapshot::V3(_) => Vec::new(),
+            // See counters() above: an empty vec would silently drop every
+            // gauge reading rather than fail loudly. Task 3 replaces this.
+            Snapshot::V3(_) => {
+                todo!("SnapshotV3 group expansion lands with the accessor-expansion task")
+            }
         }
     }
 
@@ -283,8 +334,11 @@ impl Snapshot {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.histograms),
             Snapshot::V2(s) => std::mem::take(&mut s.histograms),
-            // Task 3 replaces this stub with group expansion.
-            Snapshot::V3(_) => Vec::new(),
+            // See counters() above: an empty vec would silently drop every
+            // histogram reading rather than fail loudly. Task 3 replaces this.
+            Snapshot::V3(_) => {
+                todo!("SnapshotV3 group expansion lands with the accessor-expansion task")
+            }
         }
     }
 
@@ -503,5 +557,109 @@ mod v3_tests {
         assert!(s.groups[0].schema.is_none());
         assert!(s.groups[0].window.is_none());
         assert_eq!(s.groups[0].counters, vec![Some(7), None]);
+    }
+
+    #[test]
+    fn empty_groups_decodes_as_v3() {
+        // An empty `groups` array is structurally identical, element for
+        // element, to V2's empty `counters` array: both are just "an empty
+        // seq" at that position. V3 wins the untagged-enum race only
+        // because the V2 attempt still needs a `gauges` and `histograms`
+        // element afterward, and a 4-element V3 payload doesn't have them
+        // (V2's `metadata` field defaults but `gauges`/`histograms` do not).
+        let s = SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            duration: Duration::from_millis(10),
+            metadata: HashMap::new(),
+            groups: vec![],
+        };
+        let bytes = Snapshot::to_msgpack(&Snapshot::V3(s)).unwrap();
+        let back: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let Snapshot::V3(s) = back else {
+            panic!("empty-groups V3 bytes decoded as a different version")
+        };
+        assert!(s.groups.is_empty());
+    }
+
+    #[test]
+    fn gauges_and_histograms_roundtrip() {
+        let mut h = histogram::Histogram::new(3, 64).unwrap();
+        h.increment(10).unwrap();
+
+        let mut s = v3();
+        s.groups[0].counters = vec![];
+        s.groups[0].gauges = vec![Some(i64::MIN), None, Some(-1)];
+        s.groups[0].histograms = vec![Some(h.clone()), None];
+
+        let bytes = Snapshot::to_msgpack(&Snapshot::V3(s.clone())).unwrap();
+        let back: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let Snapshot::V3(back) = back else {
+            panic!("V3 bytes decoded as a different version")
+        };
+        assert_eq!(back.groups[0].gauges, vec![Some(i64::MIN), None, Some(-1)]);
+        assert_eq!(back.groups[0].histograms, vec![Some(h), None]);
+        assert_eq!(back.groups[0], s.groups[0]);
+    }
+
+    #[test]
+    fn pre_v3_consumers_reject_v3_bytes() {
+        // A consumer built before V3 existed only knows about V1/V2. Once
+        // V3 ships, its bytes must never silently mis-decode as one of the
+        // older shapes on such a consumer — this is the direction that
+        // cannot be fixed after release, since it's every already-deployed
+        // binary we don't control.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        #[allow(dead_code)] // only decode success/failure is asserted, never the payload
+        enum LegacySnapshot {
+            V1(SnapshotV1),
+            V2(SnapshotV2),
+        }
+
+        let empty_groups = SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            duration: Duration::from_millis(10),
+            metadata: HashMap::new(),
+            groups: vec![],
+        };
+        let empty_bytes = Snapshot::to_msgpack(&Snapshot::V3(empty_groups)).unwrap();
+        assert!(
+            rmp_serde::from_slice::<LegacySnapshot>(&empty_bytes).is_err(),
+            "empty-groups V3 bytes must not decode as a pre-V3 snapshot"
+        );
+
+        let populated_bytes = Snapshot::to_msgpack(&Snapshot::V3(v3())).unwrap();
+        assert!(
+            rmp_serde::from_slice::<LegacySnapshot>(&populated_bytes).is_err(),
+            "populated V3 bytes must not decode as a pre-V3 snapshot"
+        );
+    }
+
+    #[test]
+    fn truncated_arrays_error_not_misdecode() {
+        // Hand-build a 4-element msgpack array shaped like "V1 minus
+        // histograms": (systemtime, metadata, counters, gauges). SnapshotV1
+        // has a `#[serde(default)]` on `metadata`, which creates a
+        // positional hazard in principle: a too-short array could let a
+        // default-annotated field silently fill in rather than erroring.
+        // This pins that it does not — decoding still fails outright rather
+        // than mis-decoding as any version.
+        #[allow(clippy::type_complexity)]
+        let truncated: (
+            SystemTime,
+            HashMap<String, String>,
+            Vec<Counter>,
+            Vec<Counter>,
+        ) = (
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            HashMap::new(),
+            vec![Counter::new("0".to_string(), 7, HashMap::new())],
+            vec![],
+        );
+        let bytes = rmp_serde::to_vec(&truncated).unwrap();
+        assert!(
+            rmp_serde::from_slice::<Snapshot>(&bytes).is_err(),
+            "a truncated positional payload must error, not silently decode as some version"
+        );
     }
 }
