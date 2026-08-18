@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberate — `Snapshot` stays intentionally *not* `#[non_exhaustive]` so
   that a new wire version is a compile-time event for every consumer rather
   than something a wildcard arm could silently swallow (see the `Snapshot`
-  rustdoc). Next release: 0.18.0.
+  rustdoc).
 
 ### metriken-query 0.17.0
 

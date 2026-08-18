@@ -171,6 +171,31 @@ pub struct GroupSchema {
     pub histograms: Vec<MetricDesc>,
 }
 
+impl GroupSchema {
+    /// FNV-1a-128 over the schema's canonical msgpack encoding, returned as
+    /// `(hi, lo)` because msgpack (and rmp-serde) has no 128-bit integer.
+    ///
+    /// Deterministic because `MetricDesc.metadata` is a `BTreeMap`. Only the
+    /// producer computes this; receivers treat it as an opaque cache key —
+    /// but the algorithm is still pinned by a known-answer test so hashes
+    /// stay comparable across producer versions. 128 bits because a
+    /// collision mis-associates an entire group's values with the wrong
+    /// schema.
+    #[cfg(feature = "msgpack")]
+    pub fn hash(&self) -> (u64, u64) {
+        const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+        const PRIME: u128 = 0x0000000001000000000000000000013b;
+        let bytes =
+            rmp_serde::encode::to_vec(self).expect("GroupSchema serialization is infallible");
+        let mut h = OFFSET;
+        for &b in &bytes {
+            h ^= b as u128;
+            h = h.wrapping_mul(PRIME);
+        }
+        ((h >> 64) as u64, h as u64)
+    }
+}
+
 /// One acquisition group's readings for one tick.
 ///
 /// The value vectors align positionally with the group's [`GroupSchema`];
@@ -588,6 +613,7 @@ mod v3_tests {
 
         let mut s = v3();
         s.groups[0].counters = vec![];
+        s.groups[0].schema = Some(GroupSchema::default());
         s.groups[0].gauges = vec![Some(i64::MIN), None, Some(-1)];
         s.groups[0].histograms = vec![Some(h.clone()), None];
 
@@ -661,5 +687,51 @@ mod v3_tests {
             rmp_serde::from_slice::<Snapshot>(&bytes).is_err(),
             "a truncated positional payload must error, not silently decode as some version"
         );
+    }
+
+    #[test]
+    fn schema_hash_is_stable_and_content_addressed() {
+        let a = GroupSchema {
+            counters: vec![desc("0", "cpu_cycles")],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let b = a.clone();
+        assert_eq!(a.hash(), b.hash(), "identical schemas hash identically");
+        assert_ne!(
+            a.hash(),
+            (0, 0),
+            "hash of a non-empty schema is non-trivial"
+        );
+
+        let mut c = a.clone();
+        c.counters[0]
+            .metadata
+            .insert("id".to_string(), "3".to_string());
+        assert_ne!(a.hash(), c.hash(), "metadata change changes the hash");
+
+        let mut d = a.clone();
+        d.counters.push(desc("1", "cpu_instructions"));
+        assert_ne!(a.hash(), d.hash(), "membership change changes the hash");
+
+        let mut e = a.clone();
+        e.gauges = std::mem::take(&mut e.counters);
+        assert_ne!(
+            a.hash(),
+            e.hash(),
+            "same members in a different kind changes the hash"
+        );
+    }
+
+    #[test]
+    fn schema_hash_known_answer() {
+        // Golden value: pins the algorithm (FNV-1a-128 over the msgpack
+        // encoding) so a refactor cannot silently change hashes and
+        // invalidate receiver caches across versions. Replace only with a
+        // deliberate design decision.
+        let h = GroupSchema::default().hash();
+        println!("empty-schema hash: ({:#x}, {:#x})", h.0, h.1);
+        let expected = (0x6370115622757277, 0xb806e79deae054ae);
+        assert_eq!(h, expected);
     }
 }
