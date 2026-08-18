@@ -328,17 +328,46 @@ impl Snapshot {
         }
     }
 
+    // V3 expansion semantics (shared by counters()/gauges()/histograms()):
+    // each group's value slots are zipped positionally against its
+    // `GroupSchema` to recover names/metadata; a `None` slot ("registered
+    // but no reading this tick") is skipped entirely, matching V2 semantics
+    // where an absent metric is simply not present in the flat list; the
+    // group's acquisition `window` (or `None` for a windowless group) is
+    // attached to every member it produces; and a group whose `schema` is
+    // `None` cannot be named at all, so it expands to nothing rather than
+    // fabricating names — the V3-native path resolves that via its schema
+    // cache, but the legacy accessors here are only ever fed self-contained
+    // payloads.
+
     pub fn counters(&mut self) -> Vec<Counter> {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.counters),
             Snapshot::V2(s) => std::mem::take(&mut s.counters),
-            // A silent empty vec here would let a V3 snapshot flow through
-            // the parquet pipeline as a well-formed file with zero metric
-            // columns — successful-looking data loss. Panicking on this
-            // unreachable-until-then path is strictly safer. Task 3 (in
-            // this same PR) replaces this with real group expansion.
-            Snapshot::V3(_) => {
-                todo!("SnapshotV3 group expansion lands with the accessor-expansion task")
+            Snapshot::V3(s) => {
+                let mut out = Vec::new();
+                for g in &mut s.groups {
+                    // Take the values before borrowing the schema, or the
+                    // mutable take conflicts with the immutable schema
+                    // borrow.
+                    let values = std::mem::take(&mut g.counters);
+                    let Some(schema) = &g.schema else { continue };
+                    for (desc, value) in schema.counters.iter().zip(values) {
+                        let Some(value) = value else { continue };
+                        out.push(
+                            Counter::new(
+                                desc.name.clone(),
+                                value,
+                                desc.metadata
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            )
+                            .with_window(g.window),
+                        );
+                    }
+                }
+                out
             }
         }
     }
@@ -347,10 +376,27 @@ impl Snapshot {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.gauges),
             Snapshot::V2(s) => std::mem::take(&mut s.gauges),
-            // See counters() above: an empty vec would silently drop every
-            // gauge reading rather than fail loudly. Task 3 replaces this.
-            Snapshot::V3(_) => {
-                todo!("SnapshotV3 group expansion lands with the accessor-expansion task")
+            Snapshot::V3(s) => {
+                let mut out = Vec::new();
+                for g in &mut s.groups {
+                    let values = std::mem::take(&mut g.gauges);
+                    let Some(schema) = &g.schema else { continue };
+                    for (desc, value) in schema.gauges.iter().zip(values) {
+                        let Some(value) = value else { continue };
+                        out.push(
+                            Gauge::new(
+                                desc.name.clone(),
+                                value,
+                                desc.metadata
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            )
+                            .with_window(g.window),
+                        );
+                    }
+                }
+                out
             }
         }
     }
@@ -359,10 +405,27 @@ impl Snapshot {
         match self {
             Snapshot::V1(s) => std::mem::take(&mut s.histograms),
             Snapshot::V2(s) => std::mem::take(&mut s.histograms),
-            // See counters() above: an empty vec would silently drop every
-            // histogram reading rather than fail loudly. Task 3 replaces this.
-            Snapshot::V3(_) => {
-                todo!("SnapshotV3 group expansion lands with the accessor-expansion task")
+            Snapshot::V3(s) => {
+                let mut out = Vec::new();
+                for g in &mut s.groups {
+                    let values = std::mem::take(&mut g.histograms);
+                    let Some(schema) = &g.schema else { continue };
+                    for (desc, value) in schema.histograms.iter().zip(values) {
+                        let Some(value) = value else { continue };
+                        out.push(
+                            Histogram::new(
+                                desc.name.clone(),
+                                value,
+                                desc.metadata
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            )
+                            .with_window(g.window),
+                        );
+                    }
+                }
+                out
             }
         }
     }
@@ -733,5 +796,87 @@ mod v3_tests {
         println!("empty-schema hash: ({:#x}, {:#x})", h.0, h.1);
         let expected = (0x6370115622757277, 0xb806e79deae054ae);
         assert_eq!(h, expected);
+    }
+
+    fn v3_rich() -> SnapshotV3 {
+        let mut s = v3();
+        s.groups.push(GroupSnapshot {
+            name: "memory/main".to_string(),
+            schema_hash: (3, 4),
+            schema: Some(GroupSchema {
+                counters: vec![],
+                gauges: vec![desc("9", "memory_free")],
+                histograms: vec![],
+            }),
+            window: None,
+            counters: vec![],
+            gauges: vec![Some(-5)],
+            histograms: vec![],
+        });
+        s
+    }
+
+    #[test]
+    fn v3_counters_expand_with_group_window_and_skip_none() {
+        let mut snap = Snapshot::V3(v3_rich());
+        let counters = snap.counters();
+        // v3() has counters [Some(7), None] — the None slot is skipped,
+        // matching V2 semantics where absent metrics are simply not present.
+        assert_eq!(counters.len(), 1);
+        assert_eq!(counters[0].name, "0");
+        assert_eq!(counters[0].value, 7);
+        assert_eq!(counters[0].window, Some(Window::new(999_000, 999_400)));
+        assert_eq!(
+            counters[0].metadata.get("metric").map(String::as_str),
+            Some("cpu_cycles")
+        );
+    }
+
+    #[test]
+    fn v3_gauges_expand_without_window_for_windowless_group() {
+        let mut snap = Snapshot::V3(v3_rich());
+        let gauges = snap.gauges();
+        assert_eq!(gauges.len(), 1);
+        assert_eq!(gauges[0].name, "9");
+        assert_eq!(gauges[0].value, -5);
+        assert_eq!(gauges[0].window, None);
+    }
+
+    #[test]
+    fn v3_group_missing_schema_expands_to_nothing() {
+        // A payload whose schema section was omitted cannot be expanded to
+        // named metrics; the legacy path yields nothing rather than
+        // fabricating names. (The V3-native recorder path resolves this via
+        // its schema cache; the legacy path is only ever fed self-contained
+        // payloads.)
+        let mut s = v3();
+        s.groups[0].schema = None;
+        let mut snap = Snapshot::V3(s);
+        assert!(snap.counters().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "parquet")]
+    fn v3_and_equivalent_v2_hash_identically_for_parquet() {
+        // The compatibility contract for MsgpackToParquet: a V3 snapshot and
+        // the V2 snapshot describing the same readings produce the same
+        // HashedSnapshot, so legacy parquet output is unchanged by V3 input.
+        let hv3: HashedSnapshot = Snapshot::V3(v3()).into();
+        let mut v2 = v2();
+        v2.counters = vec![Counter::new(
+            "0".to_string(),
+            7,
+            [("metric".to_string(), "cpu_cycles".to_string())].into(),
+        )
+        .with_window(Some(Window::new(999_000, 999_400)))];
+        let hv2: HashedSnapshot = Snapshot::V2(v2).into();
+        assert_eq!(hv3.ts, hv2.ts);
+        assert_eq!(hv3.duration, hv2.duration);
+        assert_eq!(hv3.counters.len(), hv2.counters.len());
+        let (a, b) = (&hv3.counters["0"], &hv2.counters["0"]);
+        assert_eq!(
+            (a.value, &a.metadata, a.window),
+            (b.value, &b.metadata, b.window)
+        );
     }
 }
