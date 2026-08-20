@@ -1414,15 +1414,43 @@ struct ColDesc {
     column_name: String,
     kind: ColKind,
     /// Column index of this metric's acquisition-window begin (Int64 offset
-    /// from the raw row timestamp), if present. Resolved with precedence:
-    /// the metric's own `<m>:window_begin` sidecar, else the table-level
-    /// bare `:window_begin` column shared by every metric in the table,
-    /// else `None`.
+    /// from the raw row timestamp), if present. Resolved atomically with
+    /// `width_col` by [`resolve_window_cols`]: the metric's own
+    /// `<m>:window_begin` sidecar (only if its `<m>:window_width` twin is
+    /// also present), else the table-level bare `:window_begin` column
+    /// (only if `:window_width` is also present), else `None`.
     begin_col: Option<usize>,
     /// Column index of this metric's acquisition-window width (UInt64 ns),
-    /// if present. Same precedence as `begin_col`: own `<m>:window_width`
-    /// sidecar, else the table-level bare `:window_width` column, else `None`.
+    /// if present. Resolved as an atomic pair with `begin_col` — see there.
     width_col: Option<usize>,
+}
+
+/// Resolve one metric's acquisition-window sidecar columns as an ATOMIC
+/// pair, never mixing one source's begin with another's width (that would
+/// fabricate a window describing no real acquisition, and the band math
+/// would be silently wrong rather than absent).
+///
+/// Precedence:
+/// 1. The metric's own `<m>:window_begin`/`<m>:window_width` sidecar,
+///    only if BOTH are present.
+/// 2. Else the table-level bare `:window_begin`/`:window_width` pair,
+///    only if BOTH are present.
+/// 3. Else neither (`(None, None)`) — including when either source has
+///    only one half of its pair (e.g. a bare `:window_begin` with no
+///    matching `:window_width`).
+fn resolve_window_cols(
+    own_begin: Option<usize>,
+    own_width: Option<usize>,
+    table_begin: Option<usize>,
+    table_width: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match (own_begin, own_width) {
+        (Some(b), Some(w)) => (Some(b), Some(w)),
+        _ => match (table_begin, table_width) {
+            (Some(b), Some(w)) => (Some(b), Some(w)),
+            _ => (None, None),
+        },
+    }
 }
 
 fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
@@ -1518,10 +1546,16 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 }
                 _ => return None,
             };
-            // Precedence: this metric's own sidecar, else the table-level
-            // bare pair, else no window column at all.
-            let begin_col = win_begin.get(&column_name).copied().or(table_begin_col);
-            let width_col = win_width.get(&column_name).copied().or(table_width_col);
+            // Precedence, resolved as an atomic pair (see resolve_window_cols):
+            // this metric's own sidecar pair, else the table-level bare pair,
+            // else no window columns at all. Never mixes one source's begin
+            // with another's width.
+            let (begin_col, width_col) = resolve_window_cols(
+                win_begin.get(&column_name).copied(),
+                win_width.get(&column_name).copied(),
+                table_begin_col,
+                table_width_col,
+            );
             Some(ColDesc {
                 col_idx,
                 name,
@@ -2736,6 +2770,74 @@ mod tests {
             "a column physically named ':window_begin' must never appear as a metric, \
              even with metric metadata claiming otherwise: {:?}",
             reader.counter_names()
+        );
+    }
+
+    /// A metric with only HALF of its own sidecar pair (`<m>:window_begin`
+    /// but no `<m>:window_width`) plus a table-level pair present must fall
+    /// back cleanly to the table-level pair — never mix its own begin with
+    /// the table's width. Pinned by comparing against a reference fixture
+    /// where "a" has no own sidecar columns at all (pure table-level), using
+    /// own-begin values distinct from the table's so a mix-up would produce
+    /// different query output.
+    #[test]
+    fn partial_own_sidecar_falls_back_to_table_level_pair_not_mixed() {
+        let a_vals = [10u64, 20, 35, 50];
+        // Deliberately distinct from WIN_BEGINS so a mixed (own-begin +
+        // table-width) resolution would produce a different band than the
+        // correct table-level-only resolution.
+        let own_begin_only = [-9_000_000i64, -9_000_000, -9_000_000, -9_000_000];
+
+        let mut table = vec![ts_field_array()];
+        table.push((
+            counter_field("a"),
+            Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+        ));
+        table.push((
+            Field::new("a:window_begin", DataType::Int64, true),
+            Arc::new(Int64Array::from(own_begin_only.to_vec())) as ArrayRef,
+        ));
+        table.extend(window_cols(":window_begin", ":window_width"));
+        let table_bytes = build_table(table);
+
+        let mut reference = vec![ts_field_array()];
+        reference.push((
+            counter_field("a"),
+            Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+        ));
+        reference.extend(window_cols(":window_begin", ":window_width"));
+        let reference_bytes = build_table(reference);
+
+        assert_eq!(
+            query_rate_with_bounds(table_bytes, "rate(a[2s])"),
+            query_rate_with_bounds(reference_bytes, "rate(a[2s])"),
+            "a metric with only half its own sidecar must fall back to the \
+             table-level pair, not mix its own begin with the table's width"
+        );
+    }
+
+    /// A table with only HALF of the bare table-level pair (`:window_begin`
+    /// but no `:window_width`) must produce no bands for any metric — and
+    /// must not panic while resolving or reading windows.
+    #[test]
+    fn bare_partial_table_pair_produces_no_bands_and_does_not_panic() {
+        let a_vals = [10u64, 20, 35, 50];
+        let table = vec![
+            ts_field_array(),
+            (
+                counter_field("a"),
+                Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+            ),
+            (
+                Field::new(":window_begin", DataType::Int64, true),
+                Arc::new(Int64Array::from(WIN_BEGINS.to_vec())) as ArrayRef,
+            ),
+            // No matching ":window_width" column.
+        ];
+        let out = query_rate_with_bounds(build_table(table), "rate(a[2s])");
+        assert!(
+            !out.contains("intervals: Some"),
+            "a partial (begin-only) table-level pair must not produce a band: {out}"
         );
     }
 }

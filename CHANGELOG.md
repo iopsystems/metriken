@@ -102,10 +102,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes. No API changes in metriken-query itself.
 - **Added:** table-level acquisition-window columns. A bare
   `:window_begin`/`:window_width` pair (no metric prefix) is read as one
-  acquisition window shared by every metric in the table. A metric's own
-  `<m>:window_begin`/`<m>:window_width` sidecar still takes precedence where
-  present; the table-level pair is the fallback; otherwise no window
-  (unchanged). Both bare names are reserved and never surface as metrics.
+  acquisition window shared by every metric in the table. Resolved as an
+  atomic pair — never a begin from one source mixed with a width from
+  another: a metric's own `<m>:window_begin`/`<m>:window_width` sidecar
+  takes precedence where BOTH are present; the table-level pair is the
+  fallback where BOTH are present; otherwise no window (unchanged). Both
+  bare names are reserved and never surface as metrics.
   `SegmentedParquetReader` splices table-level windows across segments the
   same way it splices per-metric sidecars.
 
