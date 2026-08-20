@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-core 0.3.0
+### metriken-core 0.3.1
 
 - **Added:** `with_metadata`/`for_each_metadata` default methods on
   `CounterGroupMetric`, `GaugeGroupMetric`, and `HistogramGroupMetric` —
@@ -22,9 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override both to route through their internal metadata store without
   cloning. Implementations may hold an internal read lock for the callback's
   duration — callers must not block, await, or re-enter the group inside it.
-  Consumed by rev, not published — no version bump.
+  Additive: existing implementors keep compiling on the defaults.
 
-### metriken 0.10.0
+### metriken 0.10.1
 
 - **Added:** `with_metadata` on `CounterGroup`, `GaugeGroup`, `HistogramGroup`,
   `WindowedCounterGroup`, and `WindowedGaugeGroup` — runs a closure against
@@ -39,12 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `metriken-core`'s `*GroupMetric` traits (see that entry) so allocation-free
   access works both from concrete callers and through `&dyn`.
   `WindowedCounterGroup`/`WindowedGaugeGroup` gain a matching inherent
-  `for_each_metadata` that forwards to the inner group. Consumed by rev, not
-  published — no version bump.
+  `for_each_metadata` that forwards to the inner group. Additive throughout —
+  `load_metadata` and every existing signature are unchanged. Requires
+  metriken-core 0.3.1 for the trait defaults it overrides.
 
-### metriken-exposition 0.18.0
+### metriken-exposition 0.19.0
 
-- **Changed:** `GroupSnapshot::schema` is now `Option<Arc<GroupSchema>>` (was
+- **BREAKING:** `GroupSnapshot::schema` is now `Option<Arc<GroupSchema>>` (was
   `Option<GroupSchema>`), with serde's `rc` feature enabled so `Arc<T>`
   serializes exactly as a bare `T` — wire bytes are unchanged (proved by the
   `arc_schema_wire_compat` test, which compares the encoding byte-for-byte
@@ -54,8 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of deep-cloning every `MetricDesc` on every tick — measured 54% of
   V3-builder allocations at 2k members before this change.
   `GroupSnapshot::validate()` and `GroupSchema::hash()` are unaffected (the
-  hash is computed over the schema's content, not its storage). Consumed by
-  rev, not published — no version bump.
+  hash is computed over the schema's content, not its storage). The wire
+  format is untouched, but the field's Rust type changes, so anything that
+  constructs or destructures `GroupSnapshot::schema` must adapt — hence a
+  breaking bump rather than a patch.
+
+### metriken-exposition 0.18.0
+
 - **Added:** `SnapshotV3` — the acquisition-group snapshot format. Metric
   readings are organized into `GroupSnapshot`s (e.g. `cpu_usage/percpu`) that
   share one acquisition `Window` per group instead of one per metric, with
