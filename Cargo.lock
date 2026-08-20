@@ -855,7 +855,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "metriken"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "histogram",
  "metriken-core",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "histogram",
  "linkme",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "arrow",
  "chrono",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "arrow",
  "bytes",
