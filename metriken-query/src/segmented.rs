@@ -353,14 +353,7 @@ impl HistogramRunIndex {
     }
 }
 
-/// Sorted, deduplicated union of metric names across segments.
-fn union_names<I: IntoIterator<Item = Vec<String>>>(lists: I) -> Vec<String> {
-    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for list in lists {
-        names.extend(list);
-    }
-    names.into_iter().collect()
-}
+use crate::util::union_names;
 
 /// Deduplicated union of label sets across segments. Mirrors the
 /// sort-then-dedup pattern `MultiParquetSource` uses for its own
