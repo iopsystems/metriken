@@ -77,4 +77,20 @@ impl GroupMetadata {
             None => Vec::new(),
         }
     }
+
+    /// Call `f` with each (index, metadata) pair, under one read guard,
+    /// without cloning. Order is unspecified.
+    ///
+    /// The read lock is held for the duration of the iteration — callers
+    /// must not block, await, or re-enter this group's methods inside `f`.
+    /// If the store has never been initialized, `f` is never called (no
+    /// allocation).
+    pub(crate) fn for_each(&self, f: &mut dyn FnMut(usize, &HashMap<String, String>)) {
+        if let Some(m) = self.inner.get() {
+            let guard = m.read();
+            for (idx, map) in guard.iter() {
+                f(*idx, map);
+            }
+        }
+    }
 }

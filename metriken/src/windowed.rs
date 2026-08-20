@@ -1,6 +1,7 @@
 use crate::window_cell::WindowCell;
 use crate::{
-    Counter, CounterGroup, Gauge, GaugeGroup, Lazy, LazyCounter, LazyGauge, Metric, Value,
+    Counter, CounterGroup, CounterGroupMetric, Gauge, GaugeGroup, GaugeGroupMetric, Lazy,
+    LazyCounter, LazyGauge, Metric, Value,
 };
 use metriken_core::Window;
 use std::collections::HashMap;
@@ -222,6 +223,12 @@ impl WindowedCounterGroup {
         self.inner.metadata_snapshot()
     }
 
+    /// Visit every populated entry's metadata without cloning. Order is
+    /// unspecified. Same locking caveat as [`with_metadata`](Self::with_metadata).
+    pub fn for_each_metadata(&self, f: &mut dyn FnMut(usize, &HashMap<String, String>)) {
+        CounterGroupMetric::for_each_metadata(&self.inner, f);
+    }
+
     /// Remove metadata for the entry at `idx`.
     pub fn clear_metadata(&self, idx: usize) {
         self.inner.clear_metadata(idx)
@@ -314,6 +321,12 @@ impl WindowedGaugeGroup {
         self.inner.metadata_snapshot()
     }
 
+    /// Visit every populated entry's metadata without cloning. Order is
+    /// unspecified. Same locking caveat as [`with_metadata`](Self::with_metadata).
+    pub fn for_each_metadata(&self, f: &mut dyn FnMut(usize, &HashMap<String, String>)) {
+        GaugeGroupMetric::for_each_metadata(&self.inner, f);
+    }
+
     /// Remove metadata for the entry at `idx`.
     pub fn clear_metadata(&self, idx: usize) {
         self.inner.clear_metadata(idx)
@@ -379,6 +392,23 @@ mod tests {
 
         let cpu = g.with_metadata(0, |m| m.and_then(|m| m.get("cpu").cloned()));
         assert_eq!(cpu.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn counter_group_for_each_metadata_matches_metadata_snapshot() {
+        let g = WindowedCounterGroup::new(4);
+        g.insert_metadata(0, "cpu".into(), "0".into());
+        g.insert_metadata(2, "cpu".into(), "2".into());
+
+        let mut seen: Vec<(usize, HashMap<String, String>)> = Vec::new();
+        g.for_each_metadata(&mut |idx, m| seen.push((idx, m.clone())));
+        seen.sort_by_key(|(idx, _)| *idx);
+
+        let mut expected = g.metadata_snapshot();
+        expected.sort_by_key(|(idx, _)| *idx);
+
+        assert_eq!(seen.len(), expected.len());
+        assert_eq!(seen, expected);
     }
 
     #[test]
@@ -576,5 +606,22 @@ mod tests {
 
         let cpu = g.with_metadata(0, |m| m.and_then(|m| m.get("cpu").cloned()));
         assert_eq!(cpu.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn gauge_group_for_each_metadata_matches_metadata_snapshot() {
+        let g = WindowedGaugeGroup::new(4);
+        g.insert_metadata(0, "cpu".into(), "0".into());
+        g.insert_metadata(2, "cpu".into(), "2".into());
+
+        let mut seen: Vec<(usize, HashMap<String, String>)> = Vec::new();
+        g.for_each_metadata(&mut |idx, m| seen.push((idx, m.clone())));
+        seen.sort_by_key(|(idx, _)| *idx);
+
+        let mut expected = g.metadata_snapshot();
+        expected.sort_by_key(|(idx, _)| *idx);
+
+        assert_eq!(seen.len(), expected.len());
+        assert_eq!(seen, expected);
     }
 }

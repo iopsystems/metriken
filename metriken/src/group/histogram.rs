@@ -174,6 +174,14 @@ impl HistogramGroupMetric for HistogramGroup {
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.metadata.snapshot()
     }
+
+    fn with_metadata(&self, idx: usize, f: &mut dyn FnMut(Option<&HashMap<String, String>>)) {
+        self.metadata.with(idx, f);
+    }
+
+    fn for_each_metadata(&self, f: &mut dyn FnMut(usize, &HashMap<String, String>)) {
+        self.metadata.for_each(f);
+    }
 }
 
 impl Metric for HistogramGroup {
@@ -245,6 +253,51 @@ mod tests {
         // A value returned out of the closure works (proves the `R` generic).
         let op = GROUP.with_metadata(0, |m| m.and_then(|m| m.get("op").cloned()));
         assert_eq!(op.as_deref(), Some("read"));
+    }
+
+    #[test]
+    fn trait_with_metadata_matches_load_metadata() {
+        // The object-safe trait method (reachable through `&dyn
+        // HistogramGroupMetric`, distinct from the inherent generic
+        // `with_metadata<R>` above since inherent methods shadow same-named
+        // trait methods on the concrete type).
+        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        GROUP.insert_metadata(0, "op".into(), "read".into());
+
+        let dyn_group: &dyn HistogramGroupMetric = &GROUP;
+
+        let expected = dyn_group.load_metadata(0);
+        let mut seen: Option<HashMap<String, String>> = None;
+        dyn_group.with_metadata(0, &mut |m| seen = m.cloned());
+        assert_eq!(seen, expected);
+
+        let mut called = false;
+        let mut seen_absent: Option<HashMap<String, String>> = None;
+        dyn_group.with_metadata(1, &mut |m| {
+            called = true;
+            seen_absent = m.cloned();
+        });
+        assert!(called);
+        assert!(seen_absent.is_none());
+    }
+
+    #[test]
+    fn trait_for_each_metadata_matches_metadata_snapshot() {
+        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        GROUP.insert_metadata(0, "op".into(), "read".into());
+        GROUP.insert_metadata(2, "op".into(), "write".into());
+
+        let dyn_group: &dyn HistogramGroupMetric = &GROUP;
+
+        let mut seen: Vec<(usize, HashMap<String, String>)> = Vec::new();
+        dyn_group.for_each_metadata(&mut |idx, m| seen.push((idx, m.clone())));
+        seen.sort_by_key(|(idx, _)| *idx);
+
+        let mut expected = dyn_group.metadata_snapshot();
+        expected.sort_by_key(|(idx, _)| *idx);
+
+        assert_eq!(seen.len(), expected.len());
+        assert_eq!(seen, expected);
     }
 
     #[test]

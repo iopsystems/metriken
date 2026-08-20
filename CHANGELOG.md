@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-core 0.3.0
+
+- **Added:** `with_metadata`/`for_each_metadata` default methods on
+  `CounterGroupMetric`, `GaugeGroupMetric`, and `HistogramGroupMetric` —
+  object-safe metadata visiting reachable through `&dyn` (unlike the
+  generic `with_metadata<R>` inherent methods below, a generic method can't
+  live on a trait used as a trait object; these use `&mut dyn FnMut(..)`
+  instead so they can). `with_metadata(idx, f)` visits one entry's metadata;
+  `for_each_metadata(f)` visits every populated entry's metadata in one
+  pass, in unspecified order. Both default to the allocating
+  `load_metadata`/`metadata_snapshot` so any existing implementor keeps
+  compiling; `metriken`'s `CounterGroup`/`GaugeGroup`/`HistogramGroup`
+  override both to route through their internal metadata store without
+  cloning. Implementations may hold an internal read lock for the callback's
+  duration — callers must not block, await, or re-enter the group inside it.
+  Consumed by rev, not published — no version bump.
+
 ### metriken 0.10.0
 
 - **Added:** `with_metadata` on `CounterGroup`, `GaugeGroup`, `HistogramGroup`,
@@ -17,7 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-tick identity checks) that only need to inspect metadata, not own a
   copy of it. Callers must not block, await, or re-enter the group's methods
   inside the closure. Additive — `load_metadata` is unchanged and still
-  available. Consumed by rev, not published — no version bump.
+  available. `CounterGroup`/`GaugeGroup`/`HistogramGroup` also override the
+  new object-safe `with_metadata`/`for_each_metadata` from
+  `metriken-core`'s `*GroupMetric` traits (see that entry) so allocation-free
+  access works both from concrete callers and through `&dyn`.
+  `WindowedCounterGroup`/`WindowedGaugeGroup` gain a matching inherent
+  `for_each_metadata` that forwards to the inner group. Consumed by rev, not
+  published — no version bump.
 
 ### metriken-exposition 0.18.0
 
