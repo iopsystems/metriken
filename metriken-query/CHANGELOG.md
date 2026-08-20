@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Table-level acquisition-window columns. A bare `:window_begin`/`:window_width`
+  pair (no metric prefix) is read as one acquisition window shared by every
+  metric in the table — the shape a `.rez` group table (one table == one
+  window) emits. Precedence, resolved as an atomic pair (never a begin from
+  one source mixed with a width from another): a metric's own
+  `<m>:window_begin`/`<m>:window_width` sidecar wins where BOTH are present;
+  otherwise the table-level pair applies where BOTH are present; otherwise no
+  window (unchanged). Both bare names remain reserved and never surface as
+  metrics, matching the existing per-metric `:window_begin`/`:window_width`
+  suffix reservation. `SegmentedParquetReader` splices table-level windows
+  across segments identically to per-metric sidecars.
+
 ## [0.15.0]
 
 ### Changed

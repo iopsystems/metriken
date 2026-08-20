@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-core 0.3.1
+
+- **Added:** `with_metadata`/`for_each_metadata` default methods on
+  `CounterGroupMetric`, `GaugeGroupMetric`, and `HistogramGroupMetric` —
+  object-safe metadata visiting reachable through `&dyn` (unlike the
+  generic `with_metadata<R>` inherent methods below, a generic method can't
+  live on a trait used as a trait object; these use `&mut dyn FnMut(..)`
+  instead so they can). `with_metadata(idx, f)` visits one entry's metadata;
+  `for_each_metadata(f)` visits every populated entry's metadata in one
+  pass, in unspecified order. Both default to the allocating
+  `load_metadata`/`metadata_snapshot` so any existing implementor keeps
+  compiling; `metriken`'s `CounterGroup`/`GaugeGroup`/`HistogramGroup`
+  override both to route through their internal metadata store without
+  cloning. Implementations may hold an internal read lock for the callback's
+  duration — callers must not block, await, or re-enter the group inside it.
+  Additive: existing implementors keep compiling on the defaults.
+
+### metriken 0.10.1
+
+- **Added:** `with_metadata` on `CounterGroup`, `GaugeGroup`, `HistogramGroup`,
+  `WindowedCounterGroup`, and `WindowedGaugeGroup` — runs a closure against
+  `Option<&HashMap<String, String>>` while holding the group's metadata read
+  lock for the closure's duration, instead of cloning the whole per-index map
+  the way `load_metadata` does. Intended for hot paths (e.g. per-member,
+  per-tick identity checks) that only need to inspect metadata, not own a
+  copy of it. Callers must not block, await, or re-enter the group's methods
+  inside the closure. Additive — `load_metadata` is unchanged and still
+  available. `CounterGroup`/`GaugeGroup`/`HistogramGroup` also override the
+  new object-safe `with_metadata`/`for_each_metadata` from
+  `metriken-core`'s `*GroupMetric` traits (see that entry) so allocation-free
+  access works both from concrete callers and through `&dyn`.
+  `WindowedCounterGroup`/`WindowedGaugeGroup` gain a matching inherent
+  `for_each_metadata` that forwards to the inner group. Additive throughout —
+  `load_metadata` and every existing signature are unchanged. Requires
+  metriken-core 0.3.1 for the trait defaults it overrides.
+
+### metriken-exposition 0.19.0
+
+- **BREAKING:** `GroupSnapshot::schema` is now `Option<Arc<GroupSchema>>` (was
+  `Option<GroupSchema>`), with serde's `rc` feature enabled so `Arc<T>`
+  serializes exactly as a bare `T` — wire bytes are unchanged (proved by the
+  `arc_schema_wire_compat` test, which compares the encoding byte-for-byte
+  against a mirror struct with a bare `GroupSchema` field). Lets a producer
+  that caches schemas by `(name, schema_hash)` hand out another reference to
+  the same allocation on a cache hit (an `Arc` clone, i.e. a refcount bump)
+  instead of deep-cloning every `MetricDesc` on every tick — measured 54% of
+  V3-builder allocations at 2k members before this change.
+  `GroupSnapshot::validate()` and `GroupSchema::hash()` are unaffected (the
+  hash is computed over the schema's content, not its storage). The wire
+  format is untouched, but the field's Rust type changes, so anything that
+  constructs or destructures `GroupSnapshot::schema` must adapt — hence a
+  breaking bump rather than a patch.
+
 ### metriken-exposition 0.18.0
 
 - **Added:** `SnapshotV3` — the acquisition-group snapshot format. Metric
@@ -53,6 +106,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payloads flow through the ingest path via the exposition accessors
   (expansion), so live-agent ingest of a V3 producer works without engine
   changes. No API changes in metriken-query itself.
+- **Added:** table-level acquisition-window columns. A bare
+  `:window_begin`/`:window_width` pair (no metric prefix) is read as one
+  acquisition window shared by every metric in the table. Resolved as an
+  atomic pair — never a begin from one source mixed with a width from
+  another: a metric's own `<m>:window_begin`/`<m>:window_width` sidecar
+  takes precedence where BOTH are present; the table-level pair is the
+  fallback where BOTH are present; otherwise no window (unchanged). Both
+  bare names are reserved and never surface as metrics.
+  `SegmentedParquetReader` splices table-level windows across segments the
+  same way it splices per-metric sidecars.
+- **Added:** `UnionMetricsSource` — presents several `ParquetReader`/
+  `SegmentedParquetReader` readers with DISJOINT metric-name sets as one
+  logical `MetricsSource`, for a caller that has split one logical table
+  into several physical ones (e.g. rezolus's `.rez` V3 container, which
+  tables a sampler's acquisition groups separately). A per-name accessor
+  call dispatches to whichever single child owns that name; catalog methods
+  (`counter_names()`/etc.) and `time_range()` are the union across
+  children; `interval()` is the FINEST (minimum) across children, since a
+  child that skipped ticks (window-advance dedup) has a coarser apparent
+  cadence than the sampler's true poll rate. No timestamp splicing or join:
+  each child keeps its own samples and acquisition windows exactly as
+  before, so a query combining two children's metrics (`a / b`) resolves
+  through the same grid-alignment the PromQL engine already does for any
+  two independently-sampled series, and a `rate()` band still comes from
+  whichever child's own table-level/per-metric window the metric belongs
+  to — no fan-out or reconstruction step to lose precision in. Identity
+  must be disjoint across children by construction (a caller decision, not
+  something derived from untrusted archive bytes); a name seen in more than
+  one child deterministically keeps its first owner rather than panicking.
+  Built via the new `UnionChild` (`From<&ParquetReader>`/
+  `From<&SegmentedParquetReader>`, borrowing — the original reader stays
+  usable standalone after contributing to a union). Consumed by rev, not
+  published — no version bump.
 
 ### metriken-query 0.17.0
 

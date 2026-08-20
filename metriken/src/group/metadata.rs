@@ -41,6 +41,25 @@ impl GroupMetadata {
         self.inner.get().and_then(|m| m.read().get(&idx).cloned())
     }
 
+    /// Run `f` with a borrowed view of the metadata for `idx`, without
+    /// cloning.
+    ///
+    /// The read lock is held for the duration of `f` — callers must not
+    /// block, await, or re-enter this group's methods inside the closure.
+    pub(crate) fn with<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(Option<&HashMap<String, String>>) -> R,
+    ) -> R {
+        match self.inner.get() {
+            Some(m) => {
+                let guard = m.read();
+                f(guard.get(&idx))
+            }
+            None => f(None),
+        }
+    }
+
     /// Remove metadata for a given index.
     pub(crate) fn remove(&self, idx: usize) {
         if let Some(m) = self.inner.get() {
@@ -56,6 +75,22 @@ impl GroupMetadata {
         match self.inner.get() {
             Some(m) => m.read().iter().map(|(k, v)| (*k, v.clone())).collect(),
             None => Vec::new(),
+        }
+    }
+
+    /// Call `f` with each (index, metadata) pair, under one read guard,
+    /// without cloning. Order is unspecified.
+    ///
+    /// The read lock is held for the duration of the iteration — callers
+    /// must not block, await, or re-enter this group's methods inside `f`.
+    /// If the store has never been initialized, `f` is never called (no
+    /// allocation).
+    pub(crate) fn for_each(&self, f: &mut dyn FnMut(usize, &HashMap<String, String>)) {
+        if let Some(m) = self.inner.get() {
+            let guard = m.read();
+            for (idx, map) in guard.iter() {
+                f(*idx, map);
+            }
         }
     }
 }

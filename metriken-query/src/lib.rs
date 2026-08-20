@@ -45,6 +45,8 @@ pub mod parquet;
 pub(crate) mod promql;
 pub mod segmented;
 pub(crate) mod types;
+pub mod union;
+pub(crate) mod util;
 
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
@@ -55,6 +57,7 @@ pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
 pub use segmented::SegmentedParquetReader;
+pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
 use histogram_stream::HistogramStream;
 use labels::Labels;

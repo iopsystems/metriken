@@ -216,6 +216,20 @@ impl GaugeGroup {
         self.metadata.load(idx)
     }
 
+    /// Run `f` with a borrowed view of the metadata for the entry at `idx`,
+    /// without cloning the underlying map.
+    ///
+    /// The group's metadata read lock is held for the duration of `f` —
+    /// callers must not block, await, or re-enter this group's methods
+    /// (e.g. `set_metadata`, `load_metadata`) inside the closure.
+    pub fn with_metadata<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(Option<&HashMap<String, String>>) -> R,
+    ) -> R {
+        self.metadata.with(idx, f)
+    }
+
     /// Remove metadata for the entry at `idx`.
     pub fn clear_metadata(&self, idx: usize) {
         self.metadata.remove(idx);
@@ -314,6 +328,14 @@ impl GaugeGroupMetric for GaugeGroup {
         self.metadata.snapshot()
     }
 
+    fn with_metadata(&self, idx: usize, f: &mut dyn FnMut(Option<&HashMap<String, String>>)) {
+        self.metadata.with(idx, f);
+    }
+
+    fn for_each_metadata(&self, f: &mut dyn FnMut(usize, &HashMap<String, String>)) {
+        self.metadata.for_each(f);
+    }
+
     fn load_window(&self, idx: usize) -> Option<Window> {
         self.windows.load(idx)
     }
@@ -370,6 +392,73 @@ mod tests {
         assert_eq!(meta.get("cpu").unwrap(), "0");
 
         assert!(GROUP.load_metadata(1).is_none());
+    }
+
+    #[test]
+    fn with_metadata_borrows_without_cloning() {
+        static GROUP: GaugeGroup = GaugeGroup::new(4);
+
+        GROUP.insert_metadata(0, "cpu".into(), "0".into());
+
+        // Content matches `load_metadata` for a populated index.
+        let owned = GROUP.load_metadata(0).unwrap();
+        GROUP.with_metadata(0, |m| {
+            assert_eq!(m.unwrap(), &owned);
+        });
+
+        // `None` for an unpopulated index.
+        GROUP.with_metadata(1, |m| {
+            assert!(m.is_none());
+        });
+
+        // A value returned out of the closure works (proves the `R` generic).
+        let cpu = GROUP.with_metadata(0, |m| m.and_then(|m| m.get("cpu").cloned()));
+        assert_eq!(cpu.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn trait_with_metadata_matches_load_metadata() {
+        // The object-safe trait method (reachable through `&dyn
+        // GaugeGroupMetric`, distinct from the inherent generic
+        // `with_metadata<R>` above since inherent methods shadow same-named
+        // trait methods on the concrete type).
+        static GROUP: GaugeGroup = GaugeGroup::new(4);
+        GROUP.insert_metadata(0, "cpu".into(), "0".into());
+
+        let dyn_group: &dyn GaugeGroupMetric = &GROUP;
+
+        let expected = dyn_group.load_metadata(0);
+        let mut seen: Option<HashMap<String, String>> = None;
+        dyn_group.with_metadata(0, &mut |m| seen = m.cloned());
+        assert_eq!(seen, expected);
+
+        let mut called = false;
+        let mut seen_absent: Option<HashMap<String, String>> = None;
+        dyn_group.with_metadata(1, &mut |m| {
+            called = true;
+            seen_absent = m.cloned();
+        });
+        assert!(called);
+        assert!(seen_absent.is_none());
+    }
+
+    #[test]
+    fn trait_for_each_metadata_matches_metadata_snapshot() {
+        static GROUP: GaugeGroup = GaugeGroup::new(4);
+        GROUP.insert_metadata(0, "cpu".into(), "0".into());
+        GROUP.insert_metadata(2, "cpu".into(), "2".into());
+
+        let dyn_group: &dyn GaugeGroupMetric = &GROUP;
+
+        let mut seen: Vec<(usize, HashMap<String, String>)> = Vec::new();
+        dyn_group.for_each_metadata(&mut |idx, m| seen.push((idx, m.clone())));
+        seen.sort_by_key(|(idx, _)| *idx);
+
+        let mut expected = dyn_group.metadata_snapshot();
+        expected.sort_by_key(|(idx, _)| *idx);
+
+        assert_eq!(seen.len(), expected.len());
+        assert_eq!(seen, expected);
     }
 
     #[test]
