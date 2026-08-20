@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken 0.10.0
+
+- **Added:** `with_metadata` on `CounterGroup`, `GaugeGroup`, `HistogramGroup`,
+  `WindowedCounterGroup`, and `WindowedGaugeGroup` — runs a closure against
+  `Option<&HashMap<String, String>>` while holding the group's metadata read
+  lock for the closure's duration, instead of cloning the whole per-index map
+  the way `load_metadata` does. Intended for hot paths (e.g. per-member,
+  per-tick identity checks) that only need to inspect metadata, not own a
+  copy of it. Callers must not block, await, or re-enter the group's methods
+  inside the closure. Additive — `load_metadata` is unchanged and still
+  available. Consumed by rev, not published — no version bump.
+
 ### metriken-exposition 0.18.0
 
 - **Added:** `SnapshotV3` — the acquisition-group snapshot format. Metric

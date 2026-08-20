@@ -125,6 +125,20 @@ impl HistogramGroup {
         self.metadata.load(idx)
     }
 
+    /// Run `f` with a borrowed view of the metadata for the entry at `idx`,
+    /// without cloning the underlying map.
+    ///
+    /// The group's metadata read lock is held for the duration of `f` —
+    /// callers must not block, await, or re-enter this group's methods
+    /// (e.g. `set_metadata`, `load_metadata`) inside the closure.
+    pub fn with_metadata<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(Option<&HashMap<String, String>>) -> R,
+    ) -> R {
+        self.metadata.with(idx, f)
+    }
+
     /// Remove metadata for the entry at `idx`.
     pub fn clear_metadata(&self, idx: usize) {
         self.metadata.remove(idx);
@@ -209,6 +223,28 @@ mod tests {
         assert_eq!(meta.get("op").unwrap(), "read");
 
         assert!(GROUP.load_metadata(1).is_none());
+    }
+
+    #[test]
+    fn with_metadata_borrows_without_cloning() {
+        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+
+        GROUP.insert_metadata(0, "op".into(), "read".into());
+
+        // Content matches `load_metadata` for a populated index.
+        let owned = GROUP.load_metadata(0).unwrap();
+        GROUP.with_metadata(0, |m| {
+            assert_eq!(m.unwrap(), &owned);
+        });
+
+        // `None` for an unpopulated index.
+        GROUP.with_metadata(1, |m| {
+            assert!(m.is_none());
+        });
+
+        // A value returned out of the closure works (proves the `R` generic).
+        let op = GROUP.with_metadata(0, |m| m.and_then(|m| m.get("op").cloned()));
+        assert_eq!(op.as_deref(), Some("read"));
     }
 
     #[test]

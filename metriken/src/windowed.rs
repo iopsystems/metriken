@@ -203,6 +203,20 @@ impl WindowedCounterGroup {
         self.inner.load_metadata(idx)
     }
 
+    /// Run `f` with a borrowed view of the metadata for the entry at `idx`,
+    /// without cloning the underlying map.
+    ///
+    /// The group's metadata read lock is held for the duration of `f` —
+    /// callers must not block, await, or re-enter this group's methods
+    /// (e.g. `set_metadata`, `load_metadata`) inside the closure.
+    pub fn with_metadata<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(Option<&HashMap<String, String>>) -> R,
+    ) -> R {
+        self.inner.with_metadata(idx, f)
+    }
+
     /// Snapshot all metadata.
     pub fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.inner.metadata_snapshot()
@@ -281,6 +295,20 @@ impl WindowedGaugeGroup {
         self.inner.load_metadata(idx)
     }
 
+    /// Run `f` with a borrowed view of the metadata for the entry at `idx`,
+    /// without cloning the underlying map.
+    ///
+    /// The group's metadata read lock is held for the duration of `f` —
+    /// callers must not block, await, or re-enter this group's methods
+    /// (e.g. `set_metadata`, `load_metadata`) inside the closure.
+    pub fn with_metadata<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(Option<&HashMap<String, String>>) -> R,
+    ) -> R {
+        self.inner.with_metadata(idx, f)
+    }
+
     /// Snapshot all metadata.
     pub fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.inner.metadata_snapshot()
@@ -338,6 +366,19 @@ mod tests {
         g.insert_metadata(0, "cpu".into(), "0".into());
         assert_eq!(g.load_metadata(0).unwrap().get("cpu").unwrap(), "0");
         assert_eq!(g.metadata_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn counter_group_with_metadata_borrows_without_cloning() {
+        let g = WindowedCounterGroup::new(2);
+        g.insert_metadata(0, "cpu".into(), "0".into());
+
+        let owned = g.load_metadata(0).unwrap();
+        g.with_metadata(0, |m| assert_eq!(m.unwrap(), &owned));
+        g.with_metadata(1, |m| assert!(m.is_none()));
+
+        let cpu = g.with_metadata(0, |m| m.and_then(|m| m.get("cpu").cloned()));
+        assert_eq!(cpu.as_deref(), Some("0"));
     }
 
     #[test]
@@ -522,5 +563,18 @@ mod tests {
         g.insert_metadata(0, "cpu".into(), "0".into());
         assert_eq!(g.load_metadata(0).unwrap().get("cpu").unwrap(), "0");
         assert_eq!(g.metadata_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn gauge_group_with_metadata_borrows_without_cloning() {
+        let g = WindowedGaugeGroup::new(2);
+        g.insert_metadata(0, "cpu".into(), "0".into());
+
+        let owned = g.load_metadata(0).unwrap();
+        g.with_metadata(0, |m| assert_eq!(m.unwrap(), &owned));
+        g.with_metadata(1, |m| assert!(m.is_none()));
+
+        let cpu = g.with_metadata(0, |m| m.and_then(|m| m.get("cpu").cloned()));
+        assert_eq!(cpu.as_deref(), Some("0"));
     }
 }

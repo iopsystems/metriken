@@ -176,6 +176,20 @@ impl CounterGroup {
         self.metadata.load(idx)
     }
 
+    /// Run `f` with a borrowed view of the metadata for the entry at `idx`,
+    /// without cloning the underlying map.
+    ///
+    /// The group's metadata read lock is held for the duration of `f` —
+    /// callers must not block, await, or re-enter this group's methods
+    /// (e.g. `set_metadata`, `load_metadata`) inside the closure.
+    pub fn with_metadata<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(Option<&HashMap<String, String>>) -> R,
+    ) -> R {
+        self.metadata.with(idx, f)
+    }
+
     /// Remove metadata for the entry at `idx`.
     pub fn clear_metadata(&self, idx: usize) {
         self.metadata.remove(idx);
@@ -331,6 +345,29 @@ mod tests {
 
         GROUP.clear_metadata(0);
         assert!(GROUP.load_metadata(0).is_none());
+    }
+
+    #[test]
+    fn with_metadata_borrows_without_cloning() {
+        static GROUP: CounterGroup = CounterGroup::new(4);
+
+        GROUP.insert_metadata(0, "cpu".into(), "0".into());
+        GROUP.insert_metadata(0, "node".into(), "numa0".into());
+
+        // Content matches `load_metadata` for a populated index.
+        let owned = GROUP.load_metadata(0).unwrap();
+        GROUP.with_metadata(0, |m| {
+            assert_eq!(m.unwrap(), &owned);
+        });
+
+        // `None` for an unpopulated index.
+        GROUP.with_metadata(1, |m| {
+            assert!(m.is_none());
+        });
+
+        // A value returned out of the closure works (proves the `R` generic).
+        let cpu = GROUP.with_metadata(0, |m| m.and_then(|m| m.get("cpu").cloned()));
+        assert_eq!(cpu.as_deref(), Some("0"));
     }
 
     #[test]
