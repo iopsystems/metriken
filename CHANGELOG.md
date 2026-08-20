@@ -110,6 +110,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare names are reserved and never surface as metrics.
   `SegmentedParquetReader` splices table-level windows across segments the
   same way it splices per-metric sidecars.
+- **Added:** `UnionMetricsSource` — presents several `ParquetReader`/
+  `SegmentedParquetReader` readers with DISJOINT metric-name sets as one
+  logical `MetricsSource`, for a caller that has split one logical table
+  into several physical ones (e.g. rezolus's `.rez` V3 container, which
+  tables a sampler's acquisition groups separately). A per-name accessor
+  call dispatches to whichever single child owns that name; catalog methods
+  (`counter_names()`/etc.) and `time_range()` are the union across
+  children; `interval()` is the FINEST (minimum) across children, since a
+  child that skipped ticks (window-advance dedup) has a coarser apparent
+  cadence than the sampler's true poll rate. No timestamp splicing or join:
+  each child keeps its own samples and acquisition windows exactly as
+  before, so a query combining two children's metrics (`a / b`) resolves
+  through the same grid-alignment the PromQL engine already does for any
+  two independently-sampled series, and a `rate()` band still comes from
+  whichever child's own table-level/per-metric window the metric belongs
+  to — no fan-out or reconstruction step to lose precision in. Identity
+  must be disjoint across children by construction (a caller decision, not
+  something derived from untrusted archive bytes); a name seen in more than
+  one child deterministically keeps its first owner rather than panicking.
+  Built via the new `UnionChild` (`From<&ParquetReader>`/
+  `From<&SegmentedParquetReader>`, borrowing — the original reader stays
+  usable standalone after contributing to a union). Consumed by rev, not
+  published — no version bump.
 
 ### metriken-query 0.17.0
 

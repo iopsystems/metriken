@@ -131,8 +131,10 @@ impl ParquetReader {
     }
 
     /// The reader's raw-sample [`DataSource`], for composition by
-    /// [`crate::SegmentedParquetReader`], which splices per-segment samples
-    /// below PromQL evaluation.
+    /// [`crate::SegmentedParquetReader`] (which splices per-segment samples
+    /// below PromQL evaluation) or [`crate::UnionMetricsSource`] (which
+    /// dispatches by metric name across readers with disjoint identity
+    /// sets).
     pub(crate) fn data_source(&self) -> Arc<dyn DataSource> {
         self.inner.clone()
     }

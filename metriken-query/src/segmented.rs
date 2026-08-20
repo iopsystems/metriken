@@ -83,6 +83,15 @@ impl SegmentedParquetReader {
         self.segments.len()
     }
 
+    /// The reader's spliced [`DataSource`] (the same [`SegmentedSource`]
+    /// queries evaluate against), for composition by
+    /// [`crate::UnionMetricsSource`] — mirrors
+    /// [`crate::ParquetReader::data_source`], the equivalent accessor for a
+    /// single-segment table.
+    pub(crate) fn data_source(&self) -> Arc<dyn DataSource> {
+        self.engine.data_source()
+    }
+
     // Introspection routes through `self.engine` — the same `QueryEngine` the
     // queries use, over the same [`SegmentedSource`]. `ParquetReader` does the
     // same (see `parquet.rs`). Re-deriving the union here from `self.segments`

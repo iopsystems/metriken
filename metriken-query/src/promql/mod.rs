@@ -369,6 +369,16 @@ impl QueryEngine {
         Self { source }
     }
 
+    /// The underlying `DataSource` this engine queries against — an `Arc`
+    /// clone (refcount bump), not a copy. Lets a reader that wraps a
+    /// `QueryEngine` (`ParquetReader`, `SegmentedParquetReader`) hand its raw
+    /// source to a composing reader (`SegmentedParquetReader` over several
+    /// `ParquetReader`s; `UnionMetricsSource` over several disjoint-identity
+    /// readers) without re-deriving it.
+    pub(crate) fn data_source(&self) -> Arc<dyn DataSource> {
+        Arc::clone(&self.source)
+    }
+
     /// Time range of the underlying source in nanoseconds, or `None` if empty.
     pub(crate) fn time_range(&self) -> Option<(u64, u64)> {
         self.source.time_range()
