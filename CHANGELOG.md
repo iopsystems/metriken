@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-exposition 0.18.0
 
+- **Changed:** `GroupSnapshot::schema` is now `Option<Arc<GroupSchema>>` (was
+  `Option<GroupSchema>`), with serde's `rc` feature enabled so `Arc<T>`
+  serializes exactly as a bare `T` — wire bytes are unchanged (proved by the
+  `arc_schema_wire_compat` test, which compares the encoding byte-for-byte
+  against a mirror struct with a bare `GroupSchema` field). Lets a producer
+  that caches schemas by `(name, schema_hash)` hand out another reference to
+  the same allocation on a cache hit (an `Arc` clone, i.e. a refcount bump)
+  instead of deep-cloning every `MetricDesc` on every tick — measured 54% of
+  V3-builder allocations at 2k members before this change.
+  `GroupSnapshot::validate()` and `GroupSchema::hash()` are unaffected (the
+  hash is computed over the schema's content, not its storage). Consumed by
+  rev, not published — no version bump.
 - **Added:** `SnapshotV3` — the acquisition-group snapshot format. Metric
   readings are organized into `GroupSnapshot`s (e.g. `cpu_usage/percpu`) that
   share one acquisition `Window` per group instead of one per metric, with

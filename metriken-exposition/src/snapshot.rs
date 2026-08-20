@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use metriken::Window;
@@ -241,7 +242,14 @@ pub struct GroupSnapshot {
     /// The membership. Producers may always include it (stateless payloads);
     /// receivers skip parsing on a hash match. Correctness must never depend
     /// on it being omitted.
-    pub schema: Option<GroupSchema>,
+    ///
+    /// `Arc`-wrapped so a cache-hit producer (schema unchanged since the last
+    /// tick) can hand out another reference to the same allocation instead of
+    /// deep-cloning every [`MetricDesc`] on every tick. `Arc<T>` is
+    /// serde-transparent — with the `rc` feature enabled it serializes
+    /// exactly as a bare `T` — so this is wire-compatible with the
+    /// pre-`Arc` field; see the `arc_schema_wire_compat` test.
+    pub schema: Option<Arc<GroupSchema>>,
     /// The acquisition window shared by every member, or `None` for a
     /// windowless (derived/ambient) group.
     pub window: Option<Window>,
@@ -720,7 +728,7 @@ mod v3_tests {
             groups: vec![GroupSnapshot {
                 name: "cpu_usage/percpu".to_string(),
                 schema_hash,
-                schema: Some(schema),
+                schema: Some(Arc::new(schema)),
                 window: Some(Window::new(999_000, 999_400)),
                 counters: vec![Some(7), None],
                 gauges: vec![],
@@ -785,7 +793,7 @@ mod v3_tests {
         let group = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
             schema_hash: schema.hash(),
-            schema: Some(schema),
+            schema: Some(Arc::new(schema)),
             window: Some(Window::new(999_000, 999_400)),
             counters: vec![Some(7), None],
             gauges: vec![],
@@ -804,6 +812,93 @@ mod v3_tests {
         };
         let g = &back.groups[0];
         assert_eq!(g.schema_hash, g.schema.as_ref().unwrap().hash());
+    }
+
+    #[test]
+    fn arc_schema_wire_compat() {
+        // Prove `Option<Arc<GroupSchema>>` serializes byte-identically to
+        // the `Option<GroupSchema>` field it replaced. `Arc<T>` is
+        // documented as serde-transparent with the `rc` feature, but this
+        // test does not take that on faith: a local mirror struct with the
+        // exact same field order/types as `GroupSnapshot`, except a bare
+        // (non-`Arc`) `schema: Option<GroupSchema>`, is filled with the
+        // same values and the two encodings are compared byte-for-byte.
+        #[derive(serde::Serialize)]
+        struct GroupSnapshotOwnedSchema {
+            name: String,
+            schema_hash: (u64, u64),
+            schema: Option<GroupSchema>,
+            window: Option<Window>,
+            counters: Vec<Option<u64>>,
+            gauges: Vec<Option<i64>>,
+            histograms: Vec<Option<histogram::Histogram>>,
+        }
+
+        let schema = GroupSchema {
+            counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
+            gauges: vec![],
+            histograms: vec![],
+        };
+        let schema_hash = schema.hash();
+        let counters = vec![Some(7), None];
+
+        let arc_form = GroupSnapshot {
+            name: "cpu_usage/percpu".to_string(),
+            schema_hash,
+            schema: Some(Arc::new(schema.clone())),
+            window: Some(Window::new(999_000, 999_400)),
+            counters: counters.clone(),
+            gauges: vec![],
+            histograms: vec![],
+        };
+
+        let owned_form = GroupSnapshotOwnedSchema {
+            name: "cpu_usage/percpu".to_string(),
+            schema_hash,
+            schema: Some(schema),
+            window: Some(Window::new(999_000, 999_400)),
+            counters,
+            gauges: vec![],
+            histograms: vec![],
+        };
+
+        let arc_bytes = rmp_serde::to_vec(&arc_form).unwrap();
+        let owned_bytes = rmp_serde::to_vec(&owned_form).unwrap();
+        assert_eq!(
+            arc_bytes, owned_bytes,
+            "Option<Arc<GroupSchema>> must serialize identically to the pre-Arc Option<GroupSchema>"
+        );
+
+        // And a `None` schema — the other arm of the `Option` — must also
+        // match byte-for-byte.
+        let arc_none = GroupSnapshot {
+            schema: None,
+            ..arc_form.clone()
+        };
+        let owned_none = GroupSnapshotOwnedSchema {
+            schema: None,
+            ..owned_form
+        };
+        assert_eq!(
+            rmp_serde::to_vec(&arc_none).unwrap(),
+            rmp_serde::to_vec(&owned_none).unwrap(),
+            "a None schema must also serialize identically"
+        );
+
+        // Sanity: the Arc-backed form still round-trips through the full
+        // untagged `Snapshot` enum with the schema content intact.
+        let s = SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            duration: Duration::from_millis(10),
+            metadata: HashMap::new(),
+            groups: vec![arc_form],
+        };
+        let bytes = Snapshot::to_msgpack(&Snapshot::V3(s)).unwrap();
+        let back: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let Snapshot::V3(back) = back else {
+            panic!("V3 bytes decoded as a different version")
+        };
+        assert_eq!(back.groups[0].schema.as_ref().unwrap().counters.len(), 2);
     }
 
     #[test]
@@ -875,7 +970,7 @@ mod v3_tests {
 
         let mut s = v3();
         s.groups[0].counters = vec![];
-        s.groups[0].schema = Some(GroupSchema::default());
+        s.groups[0].schema = Some(Arc::new(GroupSchema::default()));
         s.groups[0].gauges = vec![Some(i64::MIN), None, Some(-1)];
         s.groups[0].histograms = vec![Some(h.clone()), None];
 
@@ -1033,11 +1128,11 @@ mod v3_tests {
         s.groups.push(GroupSnapshot {
             name: "memory/main".to_string(),
             schema_hash: (3, 4),
-            schema: Some(GroupSchema {
+            schema: Some(Arc::new(GroupSchema {
                 counters: vec![],
                 gauges: vec![desc("9", "memory_free")],
                 histograms: vec![],
-            }),
+            })),
             window: None,
             counters: vec![],
             gauges: vec![Some(-5)],
@@ -1127,11 +1222,11 @@ mod v3_tests {
         let malformed = GroupSnapshot {
             name: "broken/group".to_string(),
             schema_hash: (0, 0),
-            schema: Some(GroupSchema {
+            schema: Some(Arc::new(GroupSchema {
                 counters: vec![desc("0", "a"), desc("1", "b")],
                 gauges: vec![],
                 histograms: vec![],
-            }),
+            })),
             window: None,
             counters: vec![Some(1)], // one slot short of the schema's two
             gauges: vec![],
@@ -1157,7 +1252,7 @@ mod v3_tests {
         let good = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
             schema_hash: schema.hash(),
-            schema: Some(schema),
+            schema: Some(Arc::new(schema)),
             window: None,
             counters: vec![Some(1), Some(2)],
             gauges: vec![],
@@ -1214,7 +1309,7 @@ mod v3_tests {
         let group = GroupSnapshot {
             name: "hist/group".to_string(),
             schema_hash: schema.hash(),
-            schema: Some(schema),
+            schema: Some(Arc::new(schema)),
             window: None,
             counters: vec![],
             gauges: vec![],
@@ -1258,7 +1353,7 @@ mod v3_tests {
         let group = GroupSnapshot {
             name: "hist/group".to_string(),
             schema_hash: schema.hash(),
-            schema: Some(schema),
+            schema: Some(Arc::new(schema)),
             window: None,
             counters: vec![],
             gauges: vec![],
