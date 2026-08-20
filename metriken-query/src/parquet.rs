@@ -1413,15 +1413,27 @@ struct ColDesc {
     labels: Labels,
     column_name: String,
     kind: ColKind,
-    /// Column index of this metric's `<m>:window_begin` sidecar (Int64 offset), if present.
+    /// Column index of this metric's acquisition-window begin (Int64 offset
+    /// from the raw row timestamp), if present. Resolved with precedence:
+    /// the metric's own `<m>:window_begin` sidecar, else the table-level
+    /// bare `:window_begin` column shared by every metric in the table,
+    /// else `None`.
     begin_col: Option<usize>,
-    /// Column index of this metric's `<m>:window_width` sidecar (UInt64 ns), if present.
+    /// Column index of this metric's acquisition-window width (UInt64 ns),
+    /// if present. Same precedence as `begin_col`: own `<m>:window_width`
+    /// sidecar, else the table-level bare `:window_width` column, else `None`.
     width_col: Option<usize>,
 }
 
 fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
     let fields = pf.meta.schema().fields();
     // Pass 1: window sidecar column indices, keyed by base column name.
+    // A column named exactly `:window_begin` / `:window_width` (no base
+    // name — `strip_suffix` yields "") is the table-level pair: one shared
+    // acquisition window for every metric in the table, used as the
+    // fallback when a metric has no `<m>:window_begin`/`<m>:window_width`
+    // sidecar of its own. Both bare names are reserved (see the metric-skip
+    // check below) and never surface as metrics themselves.
     let mut win_begin: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut win_width: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (col_idx, field) in fields.iter().enumerate() {
@@ -1432,6 +1444,8 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             win_width.insert(base.to_string(), col_idx);
         }
     }
+    let table_begin_col = win_begin.get("").copied();
+    let table_width_col = win_width.get("").copied();
     // Pass 2: metric ColDescs, attaching window indices by column name.
     fields
         .iter()
@@ -1442,16 +1456,19 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             }
             let mut meta = field.metadata().clone();
             let column_name = field.name().to_string();
-            // Per-metric acquisition-window sidecar columns (`<m>:window_begin`
-            // Int64, `<m>:window_width` UInt64) describe the base metric's
-            // observation window — they are not metrics. Without this skip they
-            // would classify by Arrow type as a phantom gauge / counter. The
-            // window path reads them for rate/histogram error bars.
+            // Acquisition-window sidecar columns (`<m>:window_begin` Int64,
+            // `<m>:window_width` UInt64 — per-metric; or the bare
+            // `:window_begin`/`:window_width` table-level pair) describe an
+            // observation window — they are not metrics. Without this skip
+            // they would classify by Arrow type as a phantom gauge / counter.
+            // The window path reads them for rate/histogram error bars.
             //
-            // NOTE: `:window_begin` / `:window_width` are therefore RESERVED
-            // suffixes — a real metric literally named `foo:window_begin` would
-            // be silently treated as a sidecar and dropped. Acceptable given the
-            // recorder never emits such names, but the reservation is intentional.
+            // NOTE: `:window_begin` / `:window_width`, both as a per-metric
+            // suffix and as the bare table-level column name, are therefore
+            // RESERVED — a real metric literally named `foo:window_begin` (or
+            // just `window_begin`, colon-prefixed) would be silently treated
+            // as a sidecar and dropped. Acceptable given the recorder never
+            // emits such names, but the reservation is intentional.
             if column_name.ends_with(":window_begin") || column_name.ends_with(":window_width") {
                 return None;
             }
@@ -1501,8 +1518,10 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 }
                 _ => return None,
             };
-            let begin_col = win_begin.get(&column_name).copied();
-            let width_col = win_width.get(&column_name).copied();
+            // Precedence: this metric's own sidecar, else the table-level
+            // bare pair, else no window column at all.
+            let begin_col = win_begin.get(&column_name).copied().or(table_begin_col);
+            let width_col = win_width.get(&column_name).copied().or(table_width_col);
             Some(ColDesc {
                 col_idx,
                 name,
@@ -2486,6 +2505,237 @@ mod tests {
             result[0].values.iter().any(|(_, v)| *v > 0.0),
             "expected a positive rate from the still-resolving cpu_cycles counter: {:?}",
             result[0].values
+        );
+    }
+
+    // ─── Table-level acquisition-window columns ───────────────────────────
+
+    fn counter_field(name: &str) -> Field {
+        Field::new(name, DataType::UInt64, true).with_metadata(HashMap::from([
+            ("metric".to_string(), name.to_string()),
+            ("metric_type".to_string(), "counter".to_string()),
+        ]))
+    }
+
+    /// Build a single-row-group parquet from explicit `(Field, ArrayRef)`
+    /// pairs, in column order, with a fixed 1s sampling interval.
+    fn build_table(field_specs: Vec<(Field, ArrayRef)>) -> Vec<u8> {
+        let fields: Vec<Field> = field_specs.iter().map(|(f, _)| f.clone()).collect();
+        let arrays: Vec<ArrayRef> = field_specs.into_iter().map(|(_, a)| a).collect();
+        let schema = Arc::new(Schema::new(fields));
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some("1000".to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    const WIN_TS: [u64; 4] = [1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000];
+    const WIN_BEGINS: [i64; 4] = [-5_000_000, -4_000_000, -6_000_000, -5_000_000];
+    const WIN_WIDTHS: [u64; 4] = [10_000_000, 8_000_000, 12_000_000, 9_000_000];
+
+    fn ts_field_array() -> (Field, ArrayRef) {
+        (
+            Field::new("timestamp", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(WIN_TS.to_vec())) as ArrayRef,
+        )
+    }
+
+    fn window_cols(begin_name: &str, width_name: &str) -> Vec<(Field, ArrayRef)> {
+        vec![
+            (
+                Field::new(begin_name, DataType::Int64, true),
+                Arc::new(Int64Array::from(WIN_BEGINS.to_vec())) as ArrayRef,
+            ),
+            (
+                Field::new(width_name, DataType::UInt64, true),
+                Arc::new(UInt64Array::from(WIN_WIDTHS.to_vec())) as ArrayRef,
+            ),
+        ]
+    }
+
+    fn query_rate_with_bounds(bytes: Vec<u8>, expr: &str) -> String {
+        let reader = ParquetReader::open_bytes(bytes).unwrap();
+        let (start, end) = reader.time_range().unwrap();
+        let result = reader.query_range(expr, start, end + 1.0, 1.0).unwrap();
+        format!("{result:?}")
+    }
+
+    /// A table with ONLY the bare table-level `:window_begin`/`:window_width`
+    /// pair (no per-metric sidecars) must give every metric in the table a
+    /// band, and that band must be byte-identical to an equivalent table
+    /// where each metric instead carries its own `<m>:window_begin`/
+    /// `<m>:window_width` sidecar with the same values.
+    #[test]
+    fn table_level_only_windows_match_per_metric_sidecar_equivalent() {
+        let a_vals = [10u64, 20, 35, 50];
+        let b_vals = [100u64, 200, 350, 500];
+
+        let mut per_metric = vec![ts_field_array()];
+        per_metric.push((
+            counter_field("a"),
+            Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+        ));
+        per_metric.extend(window_cols("a:window_begin", "a:window_width"));
+        per_metric.push((
+            counter_field("b"),
+            Arc::new(UInt64Array::from(b_vals.to_vec())) as ArrayRef,
+        ));
+        per_metric.extend(window_cols("b:window_begin", "b:window_width"));
+        let per_metric_bytes = build_table(per_metric);
+
+        let mut table_level = vec![ts_field_array()];
+        table_level.push((
+            counter_field("a"),
+            Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+        ));
+        table_level.push((
+            counter_field("b"),
+            Arc::new(UInt64Array::from(b_vals.to_vec())) as ArrayRef,
+        ));
+        table_level.extend(window_cols(":window_begin", ":window_width"));
+        let table_level_bytes = build_table(table_level);
+
+        for expr in ["rate(a[2s])", "rate(b[2s])"] {
+            let ref_out = query_rate_with_bounds(per_metric_bytes.clone(), expr);
+            let table_out = query_rate_with_bounds(table_level_bytes.clone(), expr);
+            assert_eq!(
+                ref_out, table_out,
+                "table-level window must reproduce per-metric-sidecar output for {expr}"
+            );
+            assert!(
+                table_out.contains("intervals: Some"),
+                "expected an uncertainty band from the table-level window: {table_out}"
+            );
+        }
+    }
+
+    /// Mixed table: a metric with its own sidecar keeps using it even though
+    /// a table-level pair is also present; a metric with no sidecar of its
+    /// own falls back to the table-level pair. Verified by comparing each
+    /// metric's query output against a reference fixture that isolates the
+    /// window source it's supposed to be using.
+    #[test]
+    fn mixed_table_precedence_own_sidecar_wins_over_table_level() {
+        let a_vals = [10u64, 20, 35, 50];
+        let b_vals = [100u64, 200, 350, 500];
+        // Distinct values so a mix-up is visible in the query output.
+        let a_begins = [-1_000_000i64, -1_000_000, -1_000_000, -1_000_000];
+        let a_widths = [2_000_000u64, 2_000_000, 2_000_000, 2_000_000];
+
+        let mut mixed = vec![ts_field_array()];
+        mixed.push((
+            counter_field("a"),
+            Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+        ));
+        mixed.push((
+            Field::new("a:window_begin", DataType::Int64, true),
+            Arc::new(Int64Array::from(a_begins.to_vec())) as ArrayRef,
+        ));
+        mixed.push((
+            Field::new("a:window_width", DataType::UInt64, true),
+            Arc::new(UInt64Array::from(a_widths.to_vec())) as ArrayRef,
+        ));
+        mixed.push((
+            counter_field("b"),
+            Arc::new(UInt64Array::from(b_vals.to_vec())) as ArrayRef,
+        ));
+        mixed.extend(window_cols(":window_begin", ":window_width")); // table-level (WIN_BEGINS/WIN_WIDTHS)
+        let mixed_bytes = build_table(mixed);
+
+        // Reference: "a" alone, using only its own sidecar (no table-level pair).
+        let mut ref_a = vec![ts_field_array()];
+        ref_a.push((
+            counter_field("a"),
+            Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+        ));
+        ref_a.push((
+            Field::new("a:window_begin", DataType::Int64, true),
+            Arc::new(Int64Array::from(a_begins.to_vec())) as ArrayRef,
+        ));
+        ref_a.push((
+            Field::new("a:window_width", DataType::UInt64, true),
+            Arc::new(UInt64Array::from(a_widths.to_vec())) as ArrayRef,
+        ));
+        let ref_a_bytes = build_table(ref_a);
+
+        // Reference: "b" alone, using only the table-level pair.
+        let mut ref_b = vec![ts_field_array()];
+        ref_b.push((
+            counter_field("b"),
+            Arc::new(UInt64Array::from(b_vals.to_vec())) as ArrayRef,
+        ));
+        ref_b.extend(window_cols(":window_begin", ":window_width"));
+        let ref_b_bytes = build_table(ref_b);
+
+        assert_eq!(
+            query_rate_with_bounds(mixed_bytes.clone(), "rate(a[2s])"),
+            query_rate_with_bounds(ref_a_bytes, "rate(a[2s])"),
+            "metric with its own sidecar must ignore the table-level pair"
+        );
+        assert_eq!(
+            query_rate_with_bounds(mixed_bytes, "rate(b[2s])"),
+            query_rate_with_bounds(ref_b_bytes, "rate(b[2s])"),
+            "metric with no sidecar of its own must fall back to the table-level pair"
+        );
+    }
+
+    /// No sidecars at all (neither per-metric nor table-level, and no
+    /// `duration` column) — unchanged behavior: no uncertainty band.
+    #[test]
+    fn table_with_neither_window_kind_has_no_bands() {
+        let a_vals = [10u64, 20, 35, 50];
+        let table = vec![
+            ts_field_array(),
+            (
+                counter_field("a"),
+                Arc::new(UInt64Array::from(a_vals.to_vec())) as ArrayRef,
+            ),
+        ];
+        let out = query_rate_with_bounds(build_table(table), "rate(a[2s])");
+        assert!(
+            !out.contains("intervals: Some"),
+            "expected no uncertainty band without any window columns: {out}"
+        );
+    }
+
+    /// A metric literally named `:window_begin` (or `:window_width`) must
+    /// never surface as a queryable series — the bare name is reserved for
+    /// the table-level window pair regardless of what metadata the column
+    /// carries.
+    #[test]
+    fn bare_window_names_are_reserved_even_with_metric_metadata() {
+        let table = vec![
+            ts_field_array(),
+            (
+                counter_field("a"),
+                Arc::new(UInt64Array::from(vec![1u64, 2, 3, 4])) as ArrayRef,
+            ),
+            (
+                // Masquerading as a real counter metric named ":window_begin".
+                Field::new(":window_begin", DataType::UInt64, true).with_metadata(HashMap::from([
+                    ("metric".to_string(), ":window_begin".to_string()),
+                    ("metric_type".to_string(), "counter".to_string()),
+                ])),
+                Arc::new(UInt64Array::from(vec![1u64, 1, 1, 1])) as ArrayRef,
+            ),
+        ];
+        let reader = ParquetReader::open_bytes(build_table(table)).unwrap();
+        assert_eq!(
+            reader.counter_names(),
+            vec!["a".to_string()],
+            "a column physically named ':window_begin' must never appear as a metric, \
+             even with metric metadata claiming otherwise: {:?}",
+            reader.counter_names()
         );
     }
 }

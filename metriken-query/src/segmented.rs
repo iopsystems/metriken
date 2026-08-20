@@ -1313,6 +1313,62 @@ mod tests {
         buf
     }
 
+    /// Table-level variant of [`segment_windowed`]: TWO counters sharing one
+    /// bare `:window_begin`/`:window_width` pair (no per-metric sidecars),
+    /// with rows `(ts, value_a, value_b, begin_offset, width)`.
+    fn segment_table_windowed(rows: &[(u64, u64, u64, i64, u64)]) -> Vec<u8> {
+        use arrow::array::Int64Array;
+
+        let counter_meta = |name: &str| {
+            let mut meta = HashMap::new();
+            meta.insert("metric".to_string(), name.to_string());
+            meta.insert("metric_type".to_string(), "counter".to_string());
+            meta
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("cpu_cycles", DataType::UInt64, true)
+                .with_metadata(counter_meta("cpu_cycles")),
+            Field::new("cpu_instructions", DataType::UInt64, true)
+                .with_metadata(counter_meta("cpu_instructions")),
+            Field::new(":window_begin", DataType::Int64, true),
+            Field::new(":window_width", DataType::UInt64, true),
+        ]));
+
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some("1000".to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+
+        let ts: Vec<u64> = rows.iter().map(|(t, ..)| *t).collect();
+        let a_vals: Vec<u64> = rows.iter().map(|(_, a, ..)| *a).collect();
+        let b_vals: Vec<u64> = rows.iter().map(|(_, _, b, _, _)| *b).collect();
+        let begins: Vec<i64> = rows.iter().map(|(_, _, _, b, _)| *b).collect();
+        let widths: Vec<u64> = rows.iter().map(|(_, _, _, _, w)| *w).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(ts)) as ArrayRef,
+                Arc::new(UInt64Array::from(a_vals)) as ArrayRef,
+                Arc::new(UInt64Array::from(b_vals)) as ArrayRef,
+                Arc::new(Int64Array::from(begins)) as ArrayRef,
+                Arc::new(UInt64Array::from(widths)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
     #[test]
     fn union_names_single_series_across_segments() {
         let a = segment(
@@ -1584,6 +1640,76 @@ mod tests {
             panic!("expected matrix result");
         };
         assert!(result.iter().all(|s| s.intervals.is_none()));
+    }
+
+    /// Table-level windows (bare `:window_begin`/`:window_width`, shared by
+    /// every metric in the table) must splice across segments exactly like
+    /// per-metric sidecars do: identical output to a single unsplit table,
+    /// and both metrics sharing the table get a boundary-spanning band.
+    #[test]
+    fn table_level_windows_splice_across_segments() {
+        let rows_all = [
+            (
+                1_000_000_000u64,
+                10u64,
+                100u64,
+                -5_000_000i64,
+                10_000_000u64,
+            ),
+            (2_000_000_000, 20, 200, -4_000_000, 8_000_000),
+            (3_000_000_000, 35, 350, -6_000_000, 12_000_000),
+            (4_000_000_000, 50, 500, -5_000_000, 9_000_000),
+        ];
+        let single = vec![segment_table_windowed(&rows_all)];
+        let split = vec![
+            segment_table_windowed(&rows_all[..2]),
+            segment_table_windowed(&rows_all[2..]),
+        ];
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let a = SegmentedParquetReader::open_bytes_with_pool(single, Arc::clone(&pool)).unwrap();
+        let b = SegmentedParquetReader::open_bytes_with_pool(split, pool).unwrap();
+
+        // The cross-segment identity index (built from `counter_columns`,
+        // which reuses `parse_schema`) must not surface the bare
+        // `:window_begin`/`:window_width` pair as phantom series.
+        assert_eq!(
+            b.counter_names(),
+            vec!["cpu_cycles".to_string(), "cpu_instructions".to_string()],
+            "table-level window columns must not become phantom series in the \
+             segmented identity index: {:?}",
+            b.counter_names()
+        );
+
+        for expr in ["rate(cpu_cycles[2s])", "rate(cpu_instructions[2s])"] {
+            let qa = a.query_range(expr, 1.0, 5.0, 1.0).unwrap();
+            let qb = b.query_range(expr, 1.0, 5.0, 1.0).unwrap();
+            assert_eq!(
+                format!("{qa:?}"),
+                format!("{qb:?}"),
+                "split-segment table-level windows must match a single unsplit table for {expr}"
+            );
+            let QueryResult::Matrix { result } = qb else {
+                panic!("expected matrix result");
+            };
+            assert_eq!(result.len(), 1, "one spliced series, not one per segment");
+
+            let intervals = result[0]
+                .intervals
+                .as_ref()
+                .expect("table-level windows must produce rate() uncertainty intervals");
+            let idx = result[0]
+                .values
+                .iter()
+                .position(|(t, _)| (*t - 3.0).abs() < 1e-9)
+                .expect("a rate() point at the segment boundary");
+            let (lo, hi) = intervals[idx];
+            let v = result[0].values[idx].1;
+            assert!(
+                lo < v && v < hi,
+                "boundary band (from the table-level window) must straddle the value \
+                 for {expr}: lo={lo} v={v} hi={hi}"
+            );
+        }
     }
 
     #[test]
