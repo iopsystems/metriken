@@ -133,6 +133,12 @@ impl<'a> Iterator for MergeReduce<'a> {
         // point value as a degenerate band [v, v].
         let mut any_bounded = false;
         let (mut lo_sum, mut hi_sum) = (0.0f64, 0.0f64);
+        // Unanimity tracking for the acquisition edges: `Some(e)` while every
+        // contributor so far carried exactly `e`, `None` the moment one
+        // differs or lacks them.
+        let mut shared_edges: Option<super::RateEdges> = None;
+        let mut edges_unanimous = true;
+        let mut seen_any = false;
 
         for c in self.children.iter_mut() {
             let take = matches!(c.peek(), Some(&p) if p.t == t);
@@ -150,6 +156,12 @@ impl<'a> Iterator for MergeReduce<'a> {
                 let (lo, hi) = p.bounds.unwrap_or((v, v));
                 if p.bounds.is_some() {
                     any_bounded = true;
+                }
+                if !seen_any {
+                    shared_edges = p.edges;
+                    seen_any = true;
+                } else if shared_edges != p.edges {
+                    edges_unanimous = false;
                 }
                 lo_sum += lo;
                 hi_sum += hi;
@@ -181,7 +193,18 @@ impl<'a> Iterator for MergeReduce<'a> {
         } else {
             None
         };
-        Some(Point { t, v, bounds })
+        let edges = if edges_unanimous { shared_edges } else { None };
+        // An aggregate keeps its edges only when every contributing point
+        // came from the SAME read. `sum(irate(cpu_usage[5m]))` over 32 CPUs is
+        // one acquisition group with one window, so it does — and keeping them
+        // is what lets a later `/ cpu_cores` see that it is crossing a table.
+        // Aggregating across groups yields no single read, hence no edges.
+        Some(Point {
+            t,
+            v,
+            bounds,
+            edges,
+        })
     }
 }
 
@@ -190,7 +213,12 @@ mod interval_tests {
     use super::*;
 
     fn one(t: u64, v: f64, b: Option<(f64, f64)>) -> Box<dyn Iterator<Item = Point>> {
-        Box::new(std::iter::once(Point { t, v, bounds: b }))
+        Box::new(std::iter::once(Point {
+            t,
+            v,
+            bounds: b,
+            edges: None,
+        }))
     }
 
     #[test]

@@ -63,6 +63,26 @@ pub(crate) use aggregate::sum_by;
 /// pipeline stay readable (and clear clippy's `type_complexity`).
 pub(crate) type Band = (f64, f64);
 
+/// The acquisition edges a rate band was derived from.
+///
+/// Kept on the point so a later binary op can RE-DERIVE the band over a wider
+/// span. When two operands come from different tables they were read at
+/// different instants, and combining them as if simultaneous costs accuracy
+/// that their own bands do not contain — see
+/// `docs/journal/2026-08-21-cross-table-uncertainty.md` in rezolus.
+///
+/// Equality of the edges is the same-read test, and it is exact rather than a
+/// heuristic: an acquisition group is one read with one window, so two points
+/// carrying identical edges came from the same read and need no widening at
+/// all.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct RateEdges {
+    /// Interpolated acquisition window at the range's left edge.
+    pub left: (f64, f64),
+    /// ... and at its right edge.
+    pub right: (f64, f64),
+}
+
 /// A single sample emitted through a streaming pipeline.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Point {
@@ -72,12 +92,21 @@ pub struct Point {
     /// rate()/irate() and propagated through scalar ops, aggregation, and
     /// series-op-series binary ops. None means exact / not applicable.
     pub bounds: Option<Band>,
+    /// Where `bounds` came from, when it came from a rate over acquisition
+    /// windows. `None` for every other producer — and for aggregated points,
+    /// which no longer correspond to a single read.
+    pub(crate) edges: Option<RateEdges>,
 }
 impl Point {
     /// A point with no uncertainty bound (the default for every producer/operator
     /// except rate/irate).
     pub fn at(t: u64, v: f64) -> Self {
-        Self { t, v, bounds: None }
+        Self {
+            t,
+            v,
+            bounds: None,
+            edges: None,
+        }
     }
 }
 
