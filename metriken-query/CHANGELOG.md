@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1]
+
+### Changed
+
+- **A binary op whose operands come from different acquisition tables now
+  widens their bands before combining them.** Two values read at different
+  instants and combined as if simultaneous is an approximation neither
+  operand's band accounted for, so cross-table results were too *narrow* —
+  the one direction a band must not be wrong in.
+
+  Each `Point` carries the acquisition edges its band came from, and equality
+  of those edges is an exact same-read test: an acquisition group is one read
+  with one window, so identical edges mean no widening at all. That is the
+  common case (`sum(irate(x[5m]))` over 32 CPUs is one group) and it stays
+  exactly as tight as before. Differing edges are widened to the union of both
+  spans first.
+
+  **Values are unchanged.** This only ever touches bands, and only ever makes
+  them wider — so a consumer that displays them will see cross-table plots
+  gain visible uncertainty they should always have had, and nothing else move.
+
 ### Added
 
 - Table-level acquisition-window columns. A bare `:window_begin`/`:window_width`
