@@ -6,7 +6,7 @@
 //! * [`CounterPairwiseRate`] — one point per consecutive sample pair at the
 //!   real sample timestamp; used by `RateMode::Raw` and by `deriv`.
 
-use super::Point;
+use super::{Point, RateEdges};
 
 /// Pair-wise rate producer over a counter sample slice. Emits one point per
 /// consecutive sample pair, stamped at the later sample, for pairs whose stamp
@@ -203,9 +203,8 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // and between the right edge's begin and the left edge's end
             // (narrowest → fastest). Widen to always contain the nominal, which
             // divides by the exact step rather than the window-derived span.
-            let bounds = self
-                .interp_window(left)
-                .zip(self.interp_window(t))
+            let window_pair = self.interp_window(left).zip(self.interp_window(t));
+            let bounds = window_pair
                 .and_then(|((b_left, e_left), (b_hi, e_hi))| {
                     let elapsed_max = (e_hi - b_left) / 1e9;
                     let elapsed_min = (b_hi - e_left) / 1e9;
@@ -216,7 +215,21 @@ impl<'a> Iterator for CounterGridRate<'a> {
                     }
                 })
                 .map(|(lo, hi)| (lo.min(v), hi.max(v)));
-            return Some(Point { t, v, bounds });
+            // Carried so a binary op against a DIFFERENT table can re-derive
+            // this band over the union of both operands' edges. Only meaningful
+            // alongside a band, so they travel together.
+            let edges = bounds.and_then(|_| {
+                window_pair.map(|(left_w, right_w)| RateEdges {
+                    left: left_w,
+                    right: right_w,
+                })
+            });
+            return Some(Point {
+                t,
+                v,
+                bounds,
+                edges,
+            });
         }
         None
     }

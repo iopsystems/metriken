@@ -35,12 +35,16 @@ use promql_parser::parser::token::TokenType;
 
 use crate::labels::Labels;
 
-use super::{Band, LabeledSeries, Point, SeriesSet};
+use super::{Band, LabeledSeries, Point, RateEdges, SeriesSet};
 
 /// Timestamp → `(value, optional band)` lookup for the right singleton in a
 /// single-right broadcast. Aliased to keep the `Rc<HashMap<…>>` readable
 /// (clears clippy's `type_complexity`).
-type RightLookup = HashMap<u64, (f64, Option<Band>)>;
+/// Materialised right-hand series for the single-right broadcast: value,
+/// band, and the acquisition edges the band came from. The edges are carried
+/// for the same reason the zip path carries them — without them this path
+/// could not tell a same-read combination from a cross-table one.
+type RightLookup = HashMap<u64, (f64, Option<Band>, Option<RateEdges>)>;
 
 /// Subset of PromQL binary operators the streaming pipeline
 /// recognises. Maps directly onto the eager `apply_binary_op`
@@ -112,18 +116,74 @@ pub(crate) fn interval_binop(op: BinOp, l: (f64, f64), r: (f64, f64)) -> Option<
     Some((lo, hi))
 }
 
-/// Combine two operands' optional bands for `op`. If either side carries a real
-/// band, propagate (the bandless side is exact, `[v, v]`); if neither does, the
-/// result has no band.
+/// Widen a band to the one it would have had over a LONGER admissible span.
+///
+/// A rate band is `increase / elapsed`, where the elapsed span runs between the
+/// interpolated window edges of the range's endpoints — widest edges give the
+/// slowest rate, narrowest the fastest. So stretching the edges scales the band
+/// by a pure ratio, and that is what is applied here rather than recomputing
+/// from a stored numerator.
+///
+/// Scaling rather than recomputing is what makes this composable. By the time a
+/// band reaches a binary op it may have been through `sum` over 32 series, an
+/// `avg`, or a scalar multiply; it is no longer any single `increase/elapsed`.
+/// But every one of those operations is linear in the increase and shares one
+/// elapsed span (they preserve edges only when every contributor came from the
+/// same read), so the SAME ratio still applies exactly.
+///
+/// Never narrows: each endpoint keeps whichever of the two is more
+/// conservative, so a degenerate or inverted span can only leave the band
+/// alone.
+fn widen_band(band: Band, own: &RateEdges, union: &RateEdges, nominal: f64) -> Band {
+    let own_max = own.right.1 - own.left.0;
+    let own_min = own.right.0 - own.left.1;
+    let union_max = union.right.1 - union.left.0;
+    let union_min = union.right.0 - union.left.1;
+    if own_max <= 0.0 || own_min <= 0.0 || union_max <= 0.0 || union_min <= 0.0 {
+        return band;
+    }
+    // lo = increase/elapsed_max, so a longer max span lowers it; hi is the
+    // mirror image.
+    let lo = band.0 * (own_max / union_max);
+    let hi = band.1 * (own_min / union_min);
+    (band.0.min(lo).min(nominal), band.1.max(hi).max(nominal))
+}
+
+/// Combine two operands' optional bands for `op`.
+///
+/// If either side carries a real band, propagate (the bandless side is exact,
+/// `[v, v]`); if neither does, the result has no band.
+///
+/// **Cross-table operands are widened first.** Two points whose acquisition
+/// edges differ were read at different instants, and combining them as if
+/// simultaneous is an approximation their own bands do not account for. Each
+/// side's band is therefore re-derived over the UNION of both sides' edges —
+/// the span within which either observation could have happened — before the
+/// two are combined. Identical edges mean the same read (an acquisition group
+/// is one read with one window), so nothing is widened, which is the common
+/// case and stays exactly as tight as before.
 fn combine_bounds(
     op: BinOp,
     lv: f64,
     lb: Option<(f64, f64)>,
+    le: Option<RateEdges>,
     rv: f64,
     rb: Option<(f64, f64)>,
+    re: Option<RateEdges>,
 ) -> Option<(f64, f64)> {
     if lb.is_none() && rb.is_none() {
         return None;
+    }
+    let (mut lb, mut rb) = (lb, rb);
+    if let (Some(l), Some(r)) = (le, re) {
+        if l != r {
+            let union = RateEdges {
+                left: (l.left.0.min(r.left.0), l.left.1.max(r.left.1)),
+                right: (l.right.0.min(r.right.0), l.right.1.max(r.right.1)),
+            };
+            lb = lb.map(|b| widen_band(b, &l, &union, lv));
+            rb = rb.map(|b| widen_band(b, &r, &union, rv));
+        }
     }
     interval_binop(op, lb.unwrap_or((lv, lv)), rb.unwrap_or((rv, rv)))
 }
@@ -173,6 +233,10 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
                     t: p.t,
                     v: r,
                     bounds,
+                    // Scaling by a constant does not move the observation: the
+                    // point still belongs to the read it came from, so a later
+                    // cross-table combination can still detect that.
+                    edges: p.edges,
                 });
             }
             // Skip on division by zero, mirroring the eager path's
@@ -276,12 +340,28 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
                     let left = self.left.next().expect("peek matched");
                     let right = self.right.next().expect("peek matched");
                     if let Some(v) = self.op.apply(left.v, right.v) {
-                        let bounds =
-                            combine_bounds(self.op, left.v, left.bounds, right.v, right.bounds);
+                        let bounds = combine_bounds(
+                            self.op,
+                            left.v,
+                            left.bounds,
+                            left.edges,
+                            right.v,
+                            right.bounds,
+                            right.edges,
+                        );
+                        // The result is a single read only when both operands
+                        // were: otherwise it belongs to no one window and must
+                        // not claim one downstream.
+                        let edges = if left.edges == right.edges {
+                            left.edges
+                        } else {
+                            None
+                        };
                         return Some(Point {
                             t: left.t,
                             v,
                             bounds,
+                            edges,
                         });
                     }
                 }
@@ -306,10 +386,16 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 
     fn next(&mut self) -> Option<Point> {
         for p in self.upstream.by_ref() {
-            if let Some(&(rv, rb)) = self.rhs.get(&p.t) {
+            if let Some(&(rv, rb, re)) = self.rhs.get(&p.t) {
                 if let Some(v) = self.op.apply(p.v, rv) {
-                    let bounds = combine_bounds(self.op, p.v, p.bounds, rv, rb);
-                    return Some(Point { t: p.t, v, bounds });
+                    let bounds = combine_bounds(self.op, p.v, p.bounds, p.edges, rv, rb, re);
+                    let edges = if p.edges == re { p.edges } else { None };
+                    return Some(Point {
+                        t: p.t,
+                        v,
+                        bounds,
+                        edges,
+                    });
                 }
             }
         }
@@ -367,7 +453,7 @@ pub fn matrix_matrix_op<'a>(
         let rhs: Rc<RightLookup> = Rc::new(
             right_singleton
                 .iter
-                .map(|p| (p.t, (p.v, p.bounds)))
+                .map(|p| (p.t, (p.v, p.bounds, p.edges)))
                 .collect(),
         );
         for left in unmatched_left {
@@ -401,11 +487,109 @@ mod interval_tests {
         assert!(interval_binop(BinOp::Div, (1.0, 2.0), (-1.0, 1.0)).is_none());
     }
 
+    /// Two operands read at DIFFERENT instants must produce a wider band than
+    /// the same two read together.
+    ///
+    /// This is the whole point of carrying acquisition edges. A group is one
+    /// read with one window, so operands from the same group carry identical
+    /// edges and combine exactly as before — no widening, no regression in
+    /// tightness. Operands from different tables were sampled at different
+    /// instants, and treating them as simultaneous is an approximation their
+    /// own bands do not contain; each is re-derived over the union of both
+    /// sides' edges first.
+    ///
+    /// Without the widening the cross-table band equals the same-table one,
+    /// which is the failure this guards: a band that is too NARROW is worse
+    /// than no band, because it claims a precision the data cannot support.
+    #[test]
+    fn cross_table_operands_widen_the_band_and_same_table_ones_do_not() {
+        // Two reads 10 ms apart, each a 1 ms window, over a 1 s range.
+        const S: f64 = 1e9;
+        let a = RateEdges {
+            left: (0.0, 1e6),
+            right: (S, S + 1e6),
+        };
+        // Same read: byte-identical edges.
+        let same = a;
+        // Different table: shifted 10 ms.
+        let other = RateEdges {
+            left: (10e6, 11e6),
+            right: (S + 10e6, S + 11e6),
+        };
+
+        let band_of = |l: RateEdges, r: RateEdges| {
+            // Nominals chosen to sit inside their own bands.
+            combine_bounds(
+                BinOp::Div,
+                100.0,
+                Some((99.0, 101.0)),
+                Some(l),
+                50.0,
+                Some((49.0, 51.0)),
+                Some(r),
+            )
+            .expect("a band is produced")
+        };
+
+        let (same_lo, same_hi) = band_of(a, same);
+        let (cross_lo, cross_hi) = band_of(a, other);
+
+        assert_eq!(
+            (same_lo, same_hi),
+            (99.0 / 51.0, 101.0 / 49.0),
+            "identical edges mean one read: the band must be exactly the \
+             interval-arithmetic combination, untouched"
+        );
+        assert!(
+            cross_hi - cross_lo > same_hi - same_lo,
+            "operands read 10 ms apart must yield a WIDER band than the same \
+             two read together: same={:?}, cross={:?}",
+            (same_lo, same_hi),
+            (cross_lo, cross_hi)
+        );
+        assert!(
+            cross_lo <= 100.0 / 50.0 && cross_hi >= 100.0 / 50.0,
+            "the widened band must still contain the nominal quotient"
+        );
+    }
+
+    /// A missing side's edges must not silently disable the widening for the
+    /// other — but with only one side known there is no union to take, so the
+    /// combination stays as it was rather than inventing a span.
+    #[test]
+    fn one_sided_edges_leave_the_band_unchanged() {
+        let e = RateEdges {
+            left: (0.0, 1e6),
+            right: (1e9, 1e9 + 1e6),
+        };
+        let with_one = combine_bounds(
+            BinOp::Div,
+            100.0,
+            Some((99.0, 101.0)),
+            Some(e),
+            50.0,
+            Some((49.0, 51.0)),
+            None,
+        );
+        let with_none = combine_bounds(
+            BinOp::Div,
+            100.0,
+            Some((99.0, 101.0)),
+            None,
+            50.0,
+            Some((49.0, 51.0)),
+            None,
+        );
+        assert_eq!(with_one, with_none);
+    }
+
     #[test]
     fn combine_bounds_none_when_both_exact() {
-        assert!(combine_bounds(BinOp::Div, 100.0, None, 10.0, None).is_none());
+        assert!(combine_bounds(BinOp::Div, 100.0, None, None, 10.0, None, None).is_none());
         // one-sided: exact numerator, banded denominator still propagates
-        assert!(combine_bounds(BinOp::Div, 100.0, None, 10.0, Some((8.0, 12.0))).is_some());
+        assert!(
+            combine_bounds(BinOp::Div, 100.0, None, None, 10.0, Some((8.0, 12.0)), None).is_some()
+        );
     }
 
     #[test]
@@ -414,11 +598,13 @@ mod interval_tests {
             t: 1,
             v: 100.0,
             bounds: Some((80.0, 120.0)),
+            edges: None,
         }));
         let r: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
             t: 1,
             v: 10.0,
             bounds: Some((8.0, 12.0)),
+            edges: None,
         }));
         let mut z = ZipMergeBinary {
             left: l.peekable(),
@@ -445,6 +631,7 @@ mod interval_tests {
             t: 1,
             v: 0.1,
             bounds: Some((-4.0, 4.0)),
+            edges: None,
         }));
         let mut sb = ScalarBroadcast {
             upstream: up,
@@ -469,6 +656,7 @@ mod interval_tests {
             t: 1,
             v: 10.0,
             bounds: Some((8.0, 12.0)),
+            edges: None,
         }));
         let mut sb = ScalarBroadcast {
             upstream: up,
