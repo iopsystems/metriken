@@ -534,7 +534,7 @@ fn test_default_mode_snaps_grid_to_round_timestamps() {
     // Explicit Grid opts match the default exactly.
     let explicit = get_matrix_values(
         &engine
-            .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Grid)
+            .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Grid, None)
             .unwrap(),
     );
     assert_eq!(vals, explicit, "default must equal RateMode::Grid");
@@ -546,7 +546,7 @@ fn test_raw_mode_emits_real_sample_timestamps() {
     // consecutive sample pair — the honest sample cadence, un-snapped.
     let engine = QueryEngine::new(Arc::new(create_phase_offset_source()));
     let result = engine
-        .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Raw)
+        .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Raw, None)
         .unwrap();
     let vals = get_matrix_values(&result);
     assert_eq!(vals.len(), 1);

@@ -506,8 +506,17 @@ impl QueryEngine {
         end: f64,
         step: f64,
         rate_mode: RateMode,
+        rate_span_ns: Option<u64>,
     ) -> Result<QueryResult, QueryError> {
-        streaming::dispatch::try_streaming(&*self.source, expr, start, end, step, rate_mode)
+        streaming::dispatch::try_streaming(
+            &*self.source,
+            expr,
+            start,
+            end,
+            step,
+            rate_mode,
+            rate_span_ns,
+        )
     }
 
     fn handle_histogram_quantiles(
@@ -681,7 +690,7 @@ impl QueryEngine {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        self.query_range_opts(query_str, start, end, step, RateMode::default())
+        self.query_range_opts(query_str, start, end, step, RateMode::default(), None)
     }
 
     pub fn query_range_opts(
@@ -691,6 +700,7 @@ impl QueryEngine {
         end: f64,
         step: f64,
         rate_mode: RateMode,
+        rate_span_ns: Option<u64>,
     ) -> Result<QueryResult, QueryError> {
         if (query_str.starts_with("histogram_quantiles(")
             || query_str.starts_with("histogram_percentiles("))
@@ -716,7 +726,7 @@ impl QueryEngine {
         }
 
         match parser::parse(query_str) {
-            Ok(expr) => self.evaluate_expr(&expr, start, end, step, rate_mode),
+            Ok(expr) => self.evaluate_expr(&expr, start, end, step, rate_mode, rate_span_ns),
             Err(err) => {
                 let error_msg = format!("{:?}", err);
                 if error_msg.contains("invalid promql query") && query_str.contains(" by ") {

@@ -110,7 +110,7 @@ impl MemoryStore {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         self.engine()
-            .query_range_opts(expr, start, end, step, opts.rate_mode)
+            .query_range_opts(expr, start, end, step, opts.rate_mode, opts.rate_span_ns)
     }
 
     /// Execute an instant PromQL query at a single timestamp.

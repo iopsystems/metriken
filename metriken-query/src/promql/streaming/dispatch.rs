@@ -45,6 +45,7 @@ pub fn try_streaming(
     end: f64,
     step: f64,
     rate_mode: RateMode,
+    rate_span_ns: Option<u64>,
 ) -> Result<QueryResult, QueryError> {
     let step_ns = (step * 1e9) as u64;
     let raw_start_ns = (start * 1e9) as u64;
@@ -63,6 +64,7 @@ pub fn try_streaming(
         step_ns,
         interval_ns: (source.interval() * 1e9) as u64,
         rate_mode,
+        rate_span_ns,
     };
 
     let result = match build(&ctx, expr)? {
@@ -99,6 +101,7 @@ struct Ctx<'a> {
     step_ns: u64,
     interval_ns: u64,
     rate_mode: RateMode,
+    rate_span_ns: Option<u64>,
 }
 
 /// One step of recursion.
@@ -381,6 +384,10 @@ where
                             ctx.start_ns,
                             ctx.end_ns,
                             ctx.step_ns,
+                            // Wider than the step only when the caller asked
+                            // for smoothing (a cross-cadence query): points
+                            // stay on the grid, each value averages over more.
+                            ctx.rate_span_ns.unwrap_or(ctx.step_ns),
                             c.windows.as_deref(),
                         )
                         .collect(),

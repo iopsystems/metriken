@@ -95,12 +95,40 @@ pub enum RateMode {
 pub struct QueryOptions {
     /// Rate/irate time-alignment mode. See [`RateMode`].
     pub rate_mode: RateMode,
+    /// Averaging span for `rate`/`irate`, in nanoseconds — the window each
+    /// value is computed over, as distinct from the spacing between values.
+    ///
+    /// `None` (the default) means "one step", which is the historical
+    /// behaviour: each point is the increase across the step that precedes it.
+    ///
+    /// Setting it wider SMOOTHS without changing point placement. That
+    /// distinction is the whole reason this exists. When a query combines a
+    /// fast source with a slow one, the points that survive are those where
+    /// both have data — the slow source's real read times — and at each of
+    /// those the two operands were sampled nearly together, which is what
+    /// keeps their combined uncertainty band tight. Coarsening the STEP to
+    /// smooth the fast side destroys that: the grid then lands where the slow
+    /// source has no reading, its window is interpolated across the whole gap,
+    /// and the band explodes (measured: 0.85% wide before, 6.7x after).
+    ///
+    /// Widening the span instead smooths the fast operand while leaving the
+    /// grid — and therefore the simultaneity — alone.
+    pub rate_span_ns: Option<u64>,
 }
 
 impl QueryOptions {
     /// Construct options selecting a specific [`RateMode`].
     pub fn with_rate_mode(rate_mode: RateMode) -> Self {
-        Self { rate_mode }
+        Self {
+            rate_mode,
+            rate_span_ns: None,
+        }
+    }
+
+    /// Set the rate averaging span. See [`QueryOptions::rate_span_ns`].
+    pub fn with_rate_span_ns(mut self, span_ns: Option<u64>) -> Self {
+        self.rate_span_ns = span_ns;
+        self
     }
 }
 
