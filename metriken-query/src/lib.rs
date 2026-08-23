@@ -511,6 +511,23 @@ pub trait MetricsSource: Send + Sync {
     fn sample_timestamps(&self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// The same rows as [`sample_timestamps`](Self::sample_timestamps), snapped
+    /// to the nominal sampling grid exactly as the query path snaps them.
+    ///
+    /// This is the form to use when deciding WHERE a series has data — for
+    /// instance to build [`QueryOptions::eval_timestamps`]. The query path
+    /// indexes samples by the snapped value, so a caller reasoning from raw
+    /// values is reasoning about instants the engine will never produce: on a
+    /// 1 s nominal grid a row recorded at 1.5 s is indexed at 2.0 s, and asking
+    /// for a value at 1.5 s falls before the series' first sample and silently
+    /// yields no point.
+    ///
+    /// Defaults to the raw form, which is correct for sources that do not
+    /// snap.
+    fn snapped_sample_timestamps(&self) -> Vec<u64> {
+        self.sample_timestamps()
+    }
 }
 
 #[cfg(test)]

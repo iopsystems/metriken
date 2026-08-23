@@ -407,6 +407,12 @@ impl ParquetReader {
     pub fn sample_timestamps(&self) -> Vec<u64> {
         self.inner.sample_timestamps()
     }
+
+    /// Sample timestamps snapped to the nominal grid, as the query path sees
+    /// them. See [`MetricsSource::snapped_sample_timestamps`].
+    pub fn snapped_sample_timestamps(&self) -> Vec<u64> {
+        self.inner.snapped_sample_timestamps()
+    }
 }
 
 impl MetricsSource for ParquetReader {
@@ -487,6 +493,10 @@ impl MetricsSource for ParquetReader {
 
     fn sample_timestamps(&self) -> Vec<u64> {
         self.sample_timestamps()
+    }
+
+    fn snapped_sample_timestamps(&self) -> Vec<u64> {
+        self.snapped_sample_timestamps()
     }
 }
 
@@ -992,6 +1002,26 @@ impl MultiParquetSource {
                         );
                     }
                 }
+            }
+        }
+        out
+    }
+
+    /// The same rows as [`Self::sample_timestamps`], snapped to the nominal
+    /// sampling grid exactly as the query path snaps them.
+    ///
+    /// Use this, not the raw form, to say WHERE a series has data. The query
+    /// path indexes samples by the snapped value, so a caller that reasons
+    /// about sample positions from raw values is reasoning about instants the
+    /// engine will never produce: on a 1 s nominal grid a row recorded at
+    /// 1.5 s is indexed at 2.0 s, and asking for a value at 1.5 s falls before
+    /// the series' first sample and yields nothing at all.
+    fn snapped_sample_timestamps(&self) -> Vec<u64> {
+        let interval_ns = (self.interval() * 1e9) as u64;
+        let mut out = self.sample_timestamps();
+        if interval_ns > 0 {
+            for t in &mut out {
+                *t = snap_timestamp(*t, interval_ns);
             }
         }
         out

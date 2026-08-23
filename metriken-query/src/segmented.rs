@@ -820,6 +820,16 @@ impl MetricsSource for SegmentedParquetReader {
         out
     }
 
+    fn snapped_sample_timestamps(&self) -> Vec<u64> {
+        // Same splice contract as the raw form; each segment snaps its own
+        // rows the way the query path will read them.
+        let mut out = Vec::new();
+        for s in &self.segments {
+            out.extend(s.snapped_sample_timestamps());
+        }
+        out
+    }
+
     fn time_range(&self) -> Option<(f64, f64)> {
         self.time_range()
     }

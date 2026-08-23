@@ -374,6 +374,26 @@ mod tests {
     /// gap and the combined uncertainty band explodes. Widening the span
     /// leaves the grid, and therefore the points where both sources really
     /// have data, exactly where they were.
+    /// The first evaluation point may coincide exactly with the first sample,
+    /// and the point that measures across from it must still be emitted.
+    ///
+    /// This is the normal case when the points come from a series' own rows,
+    /// so an interpolation that demanded a strictly-earlier sample would drop
+    /// the first value of every such query.
+    #[test]
+    fn a_first_point_on_the_first_sample_still_yields_the_next_rate() {
+        const S: u64 = 1_000_000_000;
+        let ts = [1_500_000_000u64, 4_500_000_000, 10_500_000_000];
+        let vals = [1u64, 7, 19];
+        let points: std::sync::Arc<[u64]> =
+            vec![1_500_000_000u64, 4_500_000_000, 10_500_000_000].into();
+        let pts: Vec<Point> = CounterGridRate::new(&ts, &vals, 0, 14 * S, S, S, None)
+            .at_points(points)
+            .collect();
+        let times: Vec<u64> = pts.iter().map(|p| p.t).collect();
+        assert_eq!(times, vec![4_500_000_000, 10_500_000_000], "got {times:?}");
+    }
+
     /// Explicit evaluation points land exactly where asked, even when they
     /// are IRREGULARLY spaced, and each value covers the gap it follows.
     ///

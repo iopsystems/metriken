@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   6.7x after). The span leaves the points where they are and widens only the
   window. Defaults to the step, so nothing moves unless a caller asks.
 
+- **`MetricsSource::snapped_sample_timestamps()`** — the same rows as
+  `sample_timestamps()`, snapped to the nominal grid exactly as the query path
+  snaps them. This is the form to build `eval_timestamps` from: the query path
+  indexes samples by the snapped value, so a row recorded at 1.5 s on a 1 s grid
+  is indexed at 2.0 s, and asking for 1.5 s falls before the series' first
+  sample and silently yields no point. Defaults to the raw form.
+
 ### Changed
 
 - **BREAKING: `QueryOptions` no longer implements `Copy`.** It now holds an
