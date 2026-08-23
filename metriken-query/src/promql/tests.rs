@@ -5,7 +5,7 @@ use crate::labels::Labels;
 use crate::memory::Memory;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
-use crate::{DataSource, RateMode};
+use crate::{DataSource, QueryOptions, RateMode};
 
 /// Counter climbing 100/s whose samples land at `.374s` past each second —
 /// a phase deliberately offset from any round-second evaluation grid.
@@ -534,10 +534,91 @@ fn test_default_mode_snaps_grid_to_round_timestamps() {
     // Explicit Grid opts match the default exactly.
     let explicit = get_matrix_values(
         &engine
-            .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Grid, None)
+            .query_range_opts(
+                "rate(c[1s])",
+                0.374,
+                5.374,
+                1.0,
+                &QueryOptions::with_rate_mode(RateMode::Grid),
+            )
             .unwrap(),
     );
     assert_eq!(vals, explicit, "default must equal RateMode::Grid");
+}
+
+/// A fast counter divided by a slow, IRREGULARLY sampled gauge, evaluated at
+/// the slow side's own reading times.
+///
+/// This is the cross-cadence case the option exists for. On the uniform grid,
+/// most points land where the slow gauge has no reading, so its value is held
+/// forward and the quotient is part measurement, part staleness. Worse, the
+/// slow readings are not evenly spaced — 2 s then 4 s apart here, mirroring the
+/// 30 s / 60 s spacing measured on a real recording — so no step and no phase
+/// can make a uniform grid sit on them — the readings here are deliberately
+/// off-grid (x.3 s) as well as unevenly spaced, so a grid CANNOT reproduce
+/// this result by coincidence.
+///
+/// Evaluating at the supplied timestamps puts every point where BOTH sides
+/// genuinely have data.
+#[test]
+fn eval_timestamps_place_points_on_a_slow_irregular_sources_readings() {
+    const S: u64 = 1_000_000_000;
+    let mut source = Memory::new(1000);
+    // Fast counter: every second, +100/s.
+    source.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            timestamps: (0u64..=10).map(|s| s * S).collect(),
+            values: (0u64..=10).map(|s| s * 100).collect(),
+            windows: None,
+        },
+    );
+    // Slow gauge, unevenly sampled AND off-grid: 0.3 s, 2.3 s, 6.3 s only.
+    source.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: vec![S / 10 * 3, 2 * S + S / 10 * 3, 6 * S + S / 10 * 3],
+            values: vec![2, 4, 5],
+            windows: None,
+        },
+    );
+
+    let engine = QueryEngine::new(Arc::new(source));
+    let points: Arc<[u64]> = vec![S / 10 * 3, 2 * S + S / 10 * 3, 6 * S + S / 10 * 3].into();
+    let result = engine
+        .query_range_opts(
+            "rate(c[1s]) / g",
+            0.0,
+            10.0,
+            1.0,
+            &QueryOptions::with_rate_mode(RateMode::Grid)
+                .with_eval_timestamps(Some(points.clone())),
+        )
+        .unwrap();
+
+    let vals = get_matrix_values(&result);
+    assert_eq!(vals.len(), 1, "one series expected");
+    let got: Vec<(f64, f64)> = vals[0].clone();
+
+    // Points sit on the gauge's real readings — never between them. The first
+    // supplied timestamp yields no rate (no predecessor to measure across),
+    // exactly as the grid's own start point does.
+    let times: Vec<f64> = got.iter().map(|(t, _)| *t).collect();
+    assert_eq!(times, vec![2.3, 6.3], "got {got:?}");
+
+    // 100/s over a gauge reading taken at that same instant: 100/4 then 100/5.
+    // A held-forward gauge would have divided by the STALE reading instead, so
+    // these values are what proves both sides moved together.
+    assert!(
+        (got[0].1 - 25.0).abs() < 1e-6,
+        "at 2.3s expected 25, got {got:?}"
+    );
+    assert!(
+        (got[1].1 - 20.0).abs() < 1e-6,
+        "at 6.3s expected 20, got {got:?}"
+    );
 }
 
 #[test]
@@ -546,7 +627,13 @@ fn test_raw_mode_emits_real_sample_timestamps() {
     // consecutive sample pair — the honest sample cadence, un-snapped.
     let engine = QueryEngine::new(Arc::new(create_phase_offset_source()));
     let result = engine
-        .query_range_opts("rate(c[1s])", 0.374, 5.374, 1.0, RateMode::Raw, None)
+        .query_range_opts(
+            "rate(c[1s])",
+            0.374,
+            5.374,
+            1.0,
+            &QueryOptions::with_rate_mode(RateMode::Raw),
+        )
         .unwrap();
     let vals = get_matrix_values(&result);
     assert_eq!(vals.len(), 1);

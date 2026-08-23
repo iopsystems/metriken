@@ -28,12 +28,12 @@ use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp, BinOp,
-    CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid,
-    GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp,
+    AtPoints, BinOp, CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv,
+    GaugeIdelta, GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{MatrixSample, QueryError, QueryResult};
-use crate::{DataSource, RateMode};
+use crate::{DataSource, QueryOptions, RateMode};
 
 /// Evaluate `expr` via the streaming pipeline. Returns
 /// `QueryError::Unsupported` for any AST shape the dispatcher doesn't
@@ -44,9 +44,9 @@ pub fn try_streaming(
     start: f64,
     end: f64,
     step: f64,
-    rate_mode: RateMode,
-    rate_span_ns: Option<u64>,
+    opts: &QueryOptions,
 ) -> Result<QueryResult, QueryError> {
+    let rate_mode = opts.rate_mode;
     let step_ns = (step * 1e9) as u64;
     let raw_start_ns = (start * 1e9) as u64;
     // Grid mode fixes the evaluation-grid phase to the step boundary so two
@@ -64,7 +64,8 @@ pub fn try_streaming(
         step_ns,
         interval_ns: (source.interval() * 1e9) as u64,
         rate_mode,
-        rate_span_ns,
+        rate_span_ns: opts.rate_span_ns,
+        eval_timestamps: opts.eval_timestamps.clone(),
     };
 
     let result = match build(&ctx, expr)? {
@@ -102,6 +103,24 @@ struct Ctx<'a> {
     interval_ns: u64,
     rate_mode: RateMode,
     rate_span_ns: Option<u64>,
+    /// Explicit evaluation timestamps; see [`QueryOptions::eval_timestamps`].
+    eval_timestamps: Option<std::sync::Arc<[u64]>>,
+}
+
+impl<'a> Ctx<'a> {
+    /// Apply the caller's explicit evaluation timestamps to a gauge producer,
+    /// leaving its default placement alone when there are none.
+    ///
+    /// Every gauge producer goes through here, because a binary op joins its
+    /// sides on timestamp: if one producer moved to the explicit points and
+    /// another stayed on the grid, the two would stop intersecting and the
+    /// query would return empty rather than wrong.
+    fn place<P: AtPoints>(&self, producer: P) -> P {
+        match &self.eval_timestamps {
+            Some(points) => producer.at_points(points.clone()),
+            None => producer,
+        }
+    }
 }
 
 /// One step of recursion.
@@ -378,19 +397,30 @@ where
                 .into_iter()
                 .map(|c| {
                     let pts: Vec<_> = match ctx.rate_mode {
-                        RateMode::Grid => CounterGridRate::new(
-                            &c.timestamps,
-                            &c.values,
-                            ctx.start_ns,
-                            ctx.end_ns,
-                            ctx.step_ns,
-                            // Wider than the step only when the caller asked
-                            // for smoothing (a cross-cadence query): points
-                            // stay on the grid, each value averages over more.
-                            ctx.rate_span_ns.unwrap_or(ctx.step_ns),
-                            c.windows.as_deref(),
-                        )
-                        .collect(),
+                        RateMode::Grid => {
+                            let rate = CounterGridRate::new(
+                                &c.timestamps,
+                                &c.values,
+                                ctx.start_ns,
+                                ctx.end_ns,
+                                ctx.step_ns,
+                                // Wider than the step only when the caller
+                                // asked for smoothing (a cross-cadence query):
+                                // points stay on the grid, each value averages
+                                // over more.
+                                ctx.rate_span_ns.unwrap_or(ctx.step_ns),
+                                c.windows.as_deref(),
+                            );
+                            // Explicit timestamps override the grid entirely —
+                            // placement AND averaging window both come from
+                            // them, so a value lands on a slow source's real
+                            // reading instead of being interpolated to a grid
+                            // point that source never observed.
+                            match &ctx.eval_timestamps {
+                                Some(points) => rate.at_points(points.clone()).collect(),
+                                None => rate.collect(),
+                            }
+                        }
                         RateMode::Raw => CounterPairwiseRate::new(
                             &c.timestamps,
                             &c.values,
@@ -423,16 +453,17 @@ where
                 .series
                 .into_iter()
                 .map(|g| {
-                    let pts: Vec<_> = GaugeAvgOverTime::new(
-                        &g.timestamps,
-                        &g.values,
-                        ctx.start_ns,
-                        ctx.end_ns,
-                        ctx.step_ns,
-                        range_ns,
-                        matches!(ctx.rate_mode, RateMode::Raw),
-                    )
-                    .collect();
+                    let pts: Vec<_> = ctx
+                        .place(GaugeAvgOverTime::new(
+                            &g.timestamps,
+                            &g.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                            ctx.step_ns,
+                            range_ns,
+                            matches!(ctx.rate_mode, RateMode::Raw),
+                        ))
+                        .collect();
                     LabeledSeries::new(g.labels, pts.into_iter())
                 })
                 .collect();
@@ -457,16 +488,17 @@ where
                 .series
                 .into_iter()
                 .map(|g| {
-                    let pts: Vec<_> = GaugeIdelta::new(
-                        &g.timestamps,
-                        &g.values,
-                        ctx.start_ns,
-                        ctx.end_ns,
-                        ctx.step_ns,
-                        range_ns,
-                        matches!(ctx.rate_mode, RateMode::Raw),
-                    )
-                    .collect();
+                    let pts: Vec<_> = ctx
+                        .place(GaugeIdelta::new(
+                            &g.timestamps,
+                            &g.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                            ctx.step_ns,
+                            range_ns,
+                            matches!(ctx.rate_mode, RateMode::Raw),
+                        ))
+                        .collect();
                     LabeledSeries::new(g.labels, pts.into_iter())
                 })
                 .collect();
@@ -490,15 +522,16 @@ where
                     .series
                     .into_iter()
                     .map(|g| {
-                        let pts: Vec<_> = GaugeDeriv::new(
-                            &g.timestamps,
-                            &g.values,
-                            ctx.start_ns,
-                            ctx.end_ns,
-                            ctx.step_ns,
-                            matches!(ctx.rate_mode, RateMode::Raw),
-                        )
-                        .collect();
+                        let pts: Vec<_> = ctx
+                            .place(GaugeDeriv::new(
+                                &g.timestamps,
+                                &g.values,
+                                ctx.start_ns,
+                                ctx.end_ns,
+                                ctx.step_ns,
+                                matches!(ctx.rate_mode, RateMode::Raw),
+                            ))
+                            .collect();
                         LabeledSeries::new(g.labels, pts.into_iter())
                     })
                     .collect();
@@ -622,16 +655,17 @@ where
         .series
         .into_iter()
         .map(|g| {
-            let pts: Vec<_> = GaugeStepGrid::new(
-                &g.timestamps,
-                &g.values,
-                ctx.start_ns,
-                ctx.end_ns,
-                ctx.step_ns,
-                staleness_ns,
-                matches!(ctx.rate_mode, RateMode::Raw),
-            )
-            .collect();
+            let pts: Vec<_> = ctx
+                .place(GaugeStepGrid::new(
+                    &g.timestamps,
+                    &g.values,
+                    ctx.start_ns,
+                    ctx.end_ns,
+                    ctx.step_ns,
+                    staleness_ns,
+                    matches!(ctx.rate_mode, RateMode::Raw),
+                ))
+                .collect();
             LabeledSeries::new(g.labels, pts.into_iter())
         })
         .collect();

@@ -13,50 +13,97 @@
 
 use super::Point;
 
-/// The next evaluation timestamp for a gauge producer. `Grid` walks
-/// `start + k·step` (PromQL default / [`crate::RateMode::Grid`]); `Raw`
-/// ([`crate::RateMode::Raw`]) walks the actual sample timestamps so gauge
-/// output lands on the same instants as counter `rate`/`irate` under Raw and
-/// series-op-series (e.g. `x / cpu_cores`) aligns. Returns `None` when
-/// exhausted (past `end_ns`, or grid with `step_ns == 0`).
-fn next_eval_ts(
+/// Where a gauge producer places its output points, and how it advances.
+///
+/// All four gauge producers share this so a query mixing them stays
+/// self-consistent: a binary op joins its two sides ON TIMESTAMP, so two
+/// producers that place points differently would simply fail to intersect and
+/// yield an empty series rather than a wrong one.
+///
+/// Three modes, in precedence order:
+///
+/// * `points` — the caller supplied explicit evaluation timestamps
+///   ([`crate::QueryOptions::eval_timestamps`]). Used to land values on a slow
+///   source's real readings, which are not evenly spaced and so cannot be hit
+///   by any uniform grid.
+/// * `raw` ([`crate::RateMode::Raw`]) — walk the actual sample timestamps, so
+///   gauge output lands on the same instants as counter `rate`/`irate` and
+///   series-op-series (e.g. `x / cpu_cores`) aligns.
+/// * grid ([`crate::RateMode::Grid`], the PromQL default) — walk
+///   `start + k·step`.
+pub(crate) struct Placement {
     raw: bool,
-    cursor_ns: &mut u64,
-    step_ns: u64,
-    raw_idx: &mut usize,
-    timestamps: &[u64],
-    end_ns: u64,
-) -> Option<u64> {
-    if raw {
-        if *raw_idx >= timestamps.len() {
+    cursor_ns: u64,
+    pub(crate) step_ns: u64,
+    raw_idx: usize,
+    points: Option<(std::sync::Arc<[u64]>, usize)>,
+}
+
+impl Placement {
+    fn new(raw: bool, start_ns: u64, step_ns: u64) -> Self {
+        Self {
+            raw,
+            cursor_ns: start_ns,
+            step_ns,
+            raw_idx: 0,
+            points: None,
+        }
+    }
+
+    fn at_points(mut self, points: std::sync::Arc<[u64]>) -> Self {
+        self.points = Some((points, 0));
+        self
+    }
+
+    /// The next evaluation timestamp, or `None` when exhausted (past `end_ns`,
+    /// out of points/samples, or grid with `step_ns == 0`).
+    fn next(&mut self, timestamps: &[u64], end_ns: u64) -> Option<u64> {
+        if let Some((points, idx)) = &mut self.points {
+            let t = *points.get(*idx)?;
+            *idx += 1;
+            return (t <= end_ns).then_some(t);
+        }
+        if self.raw {
+            let t = *timestamps.get(self.raw_idx)?;
+            self.raw_idx += 1;
+            return (t <= end_ns).then_some(t);
+        }
+        if self.step_ns == 0 || self.cursor_ns > end_ns {
             return None;
         }
-        let t = timestamps[*raw_idx];
-        *raw_idx += 1;
-        if t > end_ns {
-            return None;
-        }
-        Some(t)
-    } else {
-        if step_ns == 0 || *cursor_ns > end_ns {
-            return None;
-        }
-        let t = *cursor_ns;
+        let t = self.cursor_ns;
         // Saturating: an overflow lands past end_ns so the next call stops.
-        *cursor_ns = cursor_ns.saturating_add(step_ns);
+        self.cursor_ns = self.cursor_ns.saturating_add(self.step_ns);
         Some(t)
     }
 }
 
+/// A producer that can be told where to place its points. Implemented by
+/// every gauge producer so the dispatcher can apply the caller's explicit
+/// timestamps uniformly, without caring which one it holds. See [`Placement`].
+pub(crate) trait AtPoints: Sized {
+    fn at_points(self, points: std::sync::Arc<[u64]>) -> Self;
+}
+
+macro_rules! impl_at_points {
+    ($($t:ident),+ $(,)?) => {$(
+        impl<'a> AtPoints for $t<'a> {
+            fn at_points(mut self, points: std::sync::Arc<[u64]>) -> Self {
+                self.place = self.place.at_points(points);
+                self
+            }
+        }
+    )+};
+}
+
+impl_at_points!(GaugeStepGrid, GaugeAvgOverTime, GaugeIdelta, GaugeDeriv);
+
 pub struct GaugeStepGrid<'a> {
     timestamps: &'a [u64],
     values: &'a [i64],
-    cursor_ns: u64,
     end_ns: u64,
-    step_ns: u64,
     staleness_ns: u64,
-    raw: bool,
-    raw_idx: usize,
+    place: Placement,
 }
 
 impl<'a> GaugeStepGrid<'a> {
@@ -72,12 +119,9 @@ impl<'a> GaugeStepGrid<'a> {
         Self {
             timestamps,
             values,
-            cursor_ns: start_ns,
             end_ns,
-            step_ns,
             staleness_ns,
-            raw,
-            raw_idx: 0,
+            place: Placement::new(raw, start_ns, step_ns),
         }
     }
 }
@@ -87,14 +131,7 @@ impl<'a> Iterator for GaugeStepGrid<'a> {
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = next_eval_ts(
-                self.raw,
-                &mut self.cursor_ns,
-                self.step_ns,
-                &mut self.raw_idx,
-                self.timestamps,
-                self.end_ns,
-            )?;
+            let t = self.place.next(self.timestamps, self.end_ns)?;
 
             let hi = self.timestamps.partition_point(|&ts| ts <= t);
             if hi == 0 {
@@ -113,12 +150,9 @@ impl<'a> Iterator for GaugeStepGrid<'a> {
 pub struct GaugeAvgOverTime<'a> {
     timestamps: &'a [u64],
     values: &'a [i64],
-    cursor_ns: u64,
     end_ns: u64,
-    step_ns: u64,
     range_ns: u64,
-    raw: bool,
-    raw_idx: usize,
+    place: Placement,
 }
 
 impl<'a> GaugeAvgOverTime<'a> {
@@ -134,12 +168,9 @@ impl<'a> GaugeAvgOverTime<'a> {
         Self {
             timestamps,
             values,
-            cursor_ns: start_ns,
             end_ns,
-            step_ns,
             range_ns,
-            raw,
-            raw_idx: 0,
+            place: Placement::new(raw, start_ns, step_ns),
         }
     }
 }
@@ -149,14 +180,7 @@ impl<'a> Iterator for GaugeAvgOverTime<'a> {
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = next_eval_ts(
-                self.raw,
-                &mut self.cursor_ns,
-                self.step_ns,
-                &mut self.raw_idx,
-                self.timestamps,
-                self.end_ns,
-            )?;
+            let t = self.place.next(self.timestamps, self.end_ns)?;
 
             let window_start = t.saturating_sub(self.range_ns);
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
@@ -178,12 +202,9 @@ impl<'a> Iterator for GaugeAvgOverTime<'a> {
 pub struct GaugeIdelta<'a> {
     timestamps: &'a [u64],
     values: &'a [i64],
-    cursor_ns: u64,
     end_ns: u64,
-    step_ns: u64,
     range_ns: u64,
-    raw: bool,
-    raw_idx: usize,
+    place: Placement,
 }
 
 impl<'a> GaugeIdelta<'a> {
@@ -199,12 +220,9 @@ impl<'a> GaugeIdelta<'a> {
         Self {
             timestamps,
             values,
-            cursor_ns: start_ns,
             end_ns,
-            step_ns,
             range_ns,
-            raw,
-            raw_idx: 0,
+            place: Placement::new(raw, start_ns, step_ns),
         }
     }
 }
@@ -214,14 +232,7 @@ impl<'a> Iterator for GaugeIdelta<'a> {
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = next_eval_ts(
-                self.raw,
-                &mut self.cursor_ns,
-                self.step_ns,
-                &mut self.raw_idx,
-                self.timestamps,
-                self.end_ns,
-            )?;
+            let t = self.place.next(self.timestamps, self.end_ns)?;
 
             let window_start = t.saturating_sub(self.range_ns);
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
@@ -239,11 +250,8 @@ impl<'a> Iterator for GaugeIdelta<'a> {
 pub struct GaugeDeriv<'a> {
     timestamps: &'a [u64],
     values: &'a [i64],
-    cursor_ns: u64,
     end_ns: u64,
-    step_ns: u64,
-    raw: bool,
-    raw_idx: usize,
+    place: Placement,
 }
 
 impl<'a> GaugeDeriv<'a> {
@@ -258,11 +266,8 @@ impl<'a> GaugeDeriv<'a> {
         Self {
             timestamps,
             values,
-            cursor_ns: start_ns,
             end_ns,
-            step_ns,
-            raw,
-            raw_idx: 0,
+            place: Placement::new(raw, start_ns, step_ns),
         }
     }
 }
@@ -272,17 +277,10 @@ impl<'a> Iterator for GaugeDeriv<'a> {
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = next_eval_ts(
-                self.raw,
-                &mut self.cursor_ns,
-                self.step_ns,
-                &mut self.raw_idx,
-                self.timestamps,
-                self.end_ns,
-            )?;
+            let t = self.place.next(self.timestamps, self.end_ns)?;
 
-            let window_start = t.saturating_sub(self.step_ns.saturating_mul(2));
-            let window_end = t.saturating_add(self.step_ns);
+            let window_start = t.saturating_sub(self.place.step_ns.saturating_mul(2));
+            let window_end = t.saturating_add(self.place.step_ns);
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
             let hi = self.timestamps.partition_point(|&ts| ts <= window_end);
             if hi.saturating_sub(lo) < 2 {

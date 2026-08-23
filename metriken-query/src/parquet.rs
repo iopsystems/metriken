@@ -293,14 +293,8 @@ impl ParquetReader {
         step_s: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        self.engine.query_range_opts(
-            expr,
-            start_s,
-            end_s,
-            step_s,
-            opts.rate_mode,
-            opts.rate_span_ns,
-        )
+        self.engine
+            .query_range_opts(expr, start_s, end_s, step_s, opts)
     }
 
     /// Time range of data across all files in seconds, or `None` if empty.

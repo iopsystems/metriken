@@ -798,14 +798,8 @@ impl MetricsSource for SegmentedParquetReader {
         step_s: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        self.engine.query_range_opts(
-            expr,
-            start_s,
-            end_s,
-            step_s,
-            opts.rate_mode,
-            opts.rate_span_ns,
-        )
+        self.engine
+            .query_range_opts(expr, start_s, end_s, step_s, opts)
     }
 
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {

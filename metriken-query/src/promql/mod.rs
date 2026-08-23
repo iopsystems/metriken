@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::labels::Labels;
-use crate::{DataSource, RateMode};
+use crate::{DataSource, QueryOptions};
 
 mod columns;
 pub(crate) mod streaming;
@@ -505,18 +505,9 @@ impl QueryEngine {
         start: f64,
         end: f64,
         step: f64,
-        rate_mode: RateMode,
-        rate_span_ns: Option<u64>,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        streaming::dispatch::try_streaming(
-            &*self.source,
-            expr,
-            start,
-            end,
-            step,
-            rate_mode,
-            rate_span_ns,
-        )
+        streaming::dispatch::try_streaming(&*self.source, expr, start, end, step, opts)
     }
 
     fn handle_histogram_quantiles(
@@ -690,7 +681,7 @@ impl QueryEngine {
         end: f64,
         step: f64,
     ) -> Result<QueryResult, QueryError> {
-        self.query_range_opts(query_str, start, end, step, RateMode::default(), None)
+        self.query_range_opts(query_str, start, end, step, &QueryOptions::default())
     }
 
     pub fn query_range_opts(
@@ -699,8 +690,7 @@ impl QueryEngine {
         start: f64,
         end: f64,
         step: f64,
-        rate_mode: RateMode,
-        rate_span_ns: Option<u64>,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         if (query_str.starts_with("histogram_quantiles(")
             || query_str.starts_with("histogram_percentiles("))
@@ -726,7 +716,7 @@ impl QueryEngine {
         }
 
         match parser::parse(query_str) {
-            Ok(expr) => self.evaluate_expr(&expr, start, end, step, rate_mode, rate_span_ns),
+            Ok(expr) => self.evaluate_expr(&expr, start, end, step, opts),
             Err(err) => {
                 let error_msg = format!("{:?}", err);
                 if error_msg.contains("invalid promql query") && query_str.contains(" by ") {

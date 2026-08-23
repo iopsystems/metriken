@@ -90,7 +90,7 @@ pub enum RateMode {
 /// Query-evaluation options threaded into the streaming engine. Additive and
 /// `#[non_exhaustive]`: new knobs can be added without breaking callers, and
 /// `QueryOptions::default()` reproduces today's default behavior.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct QueryOptions {
     /// Rate/irate time-alignment mode. See [`RateMode`].
@@ -114,6 +114,24 @@ pub struct QueryOptions {
     /// Widening the span instead smooths the fast operand while leaving the
     /// grid — and therefore the simultaneity — alone.
     pub rate_span_ns: Option<u64>,
+    /// Evaluate at THESE timestamps instead of on a uniform grid.
+    ///
+    /// The grid is uniform by default: `start`, `start + step`, … Every value
+    /// is therefore produced wherever the grid happens to fall, which is
+    /// rarely where a slow source actually took a reading — so its value gets
+    /// held or interpolated between real observations, and anything combined
+    /// with it inherits that as uncertainty.
+    ///
+    /// A slow source's readings are not evenly spaced either. Measured on a
+    /// real recording, one sampler's rows fell 30 s apart and then 60 s apart,
+    /// so NO uniform grid can sit on them at any step or phase. Supplying the
+    /// timestamps explicitly is the only way to evaluate where the data
+    /// genuinely is.
+    ///
+    /// When set, each rate's averaging window is the gap to the preceding
+    /// timestamp — so the uniform grid is just the special case where those
+    /// gaps are all equal.
+    pub eval_timestamps: Option<std::sync::Arc<[u64]>>,
 }
 
 impl QueryOptions {
@@ -122,7 +140,15 @@ impl QueryOptions {
         Self {
             rate_mode,
             rate_span_ns: None,
+            eval_timestamps: None,
         }
+    }
+
+    /// Evaluate at an explicit timestamp list. See
+    /// [`QueryOptions::eval_timestamps`].
+    pub fn with_eval_timestamps(mut self, ts: Option<std::sync::Arc<[u64]>>) -> Self {
+        self.eval_timestamps = ts;
+        self
     }
 
     /// Set the rate averaging span. See [`QueryOptions::rate_span_ns`].

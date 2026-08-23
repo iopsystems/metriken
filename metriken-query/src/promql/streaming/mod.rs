@@ -51,7 +51,7 @@ pub(crate) use aggregate::derive_group_labels;
 pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
 pub(crate) use binary::{interval_binop, matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
 pub(crate) use deriv::StreamingDeriv;
-pub(crate) use gauge::{GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
+pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
 pub(crate) use rate::{CounterGridRate, CounterPairwiseRate};
 
 #[cfg(test)]

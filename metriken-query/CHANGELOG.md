@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0]
+
+### Added
+
+- **`QueryOptions::eval_timestamps` — evaluate at an explicit list of instants
+  rather than on the uniform grid.** Each rate's averaging window becomes the
+  gap to the preceding timestamp, so the uniform grid is simply the special
+  case where every gap is equal.
+
+  This exists for cross-cadence queries. The grid walks `start + k·step`, so
+  most of its points fall where a slow source has no reading; that source's
+  value is then held forward and combined with a fast operand as if the two
+  were simultaneous. Nor can the grid be tuned to fix it: a slow source's
+  readings are not evenly spaced either — measured on a real recording, one
+  sampler's rows fell 30 s apart and then 60 s apart, so no uniform grid sits
+  on them at any step or phase. Passing the slow source's own row timestamps
+  puts every point where both operands genuinely have data.
+
+  Applies to counter rates and to all four gauge producers, deliberately as one
+  unit: a binary op joins its two sides ON TIMESTAMP, so moving one producer
+  off the grid while another stayed would make them stop intersecting and yield
+  an empty series.
+
+- **`QueryOptions::rate_span_ns` — a rate averaging span separate from the
+  step.** A rate's value is `increase / step`, so the step was simultaneously
+  the point spacing and the averaging window, and smoothing meant coarsening
+  the step. That relocates the evaluation grid, which is destructive exactly
+  where smoothing is wanted: on a cross-cadence query the grid moves off the
+  slow source's read times, its window is interpolated across the whole gap,
+  and the combined uncertainty band explodes (measured 0.85% wide before,
+  6.7x after). The span leaves the points where they are and widens only the
+  window. Defaults to the step, so nothing moves unless a caller asks.
+
+### Changed
+
+- **BREAKING: `QueryOptions` no longer implements `Copy`.** It now holds an
+  `Arc<[u64]>` for `eval_timestamps`. It is still `Clone`; callers that relied
+  on implicit copies (`let opts = *opts;`) need `.clone()`.
+
 ## [0.19.1]
 
 ### Changed
