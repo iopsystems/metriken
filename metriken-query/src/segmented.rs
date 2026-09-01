@@ -2494,4 +2494,60 @@ mod tests {
             vec![1_000_000_007, 2_000_000_003, 3_000_000_009]
         );
     }
+
+    /// A segmented source must compose into `ParquetBuilder` alongside an
+    /// ordinary single-file reader, each carrying its own injected labels.
+    ///
+    /// This is the composition systemslab's job-spanning queries rely on: N
+    /// artifacts merged into one reader, each tagged so a single PromQL query
+    /// can slice by job. Before `source_labeled`, `MultiParquetSource` held
+    /// `Vec<(Arc<ParquetSource>, Labels)>`, so a `.rez` table -- which is a
+    /// segmented source whenever its writer sealed more than once -- could not
+    /// enter the builder at all.
+    ///
+    /// `source_labeled` takes an opaque [`CompositionSource`] rather than a
+    /// bare `Arc<dyn DataSource>`: `DataSource`'s methods return `Counters`,
+    /// `Gauges` and `HistogramStream`, so making the trait itself public would
+    /// drag the crate's internal row representations into the public API.
+    #[test]
+    fn builder_composes_a_segmented_source_alongside_a_plain_one() {
+        let plain = segment(
+            "cpu_cycles",
+            &[],
+            &[(1_000_000_000, 10), (2_000_000_000, 20)],
+        );
+        let seg_a = segment(
+            "cpu_cycles",
+            &[],
+            &[(1_000_000_000, 10), (2_000_000_000, 20)],
+        );
+        let seg_b = segment(
+            "cpu_cycles",
+            &[],
+            &[(3_000_000_000, 35), (4_000_000_000, 50)],
+        );
+
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let segmented =
+            SegmentedParquetReader::open_bytes_with_pool(vec![seg_a, seg_b], Arc::clone(&pool))
+                .unwrap();
+        let single = Arc::new(ParquetReader::open_bytes(plain).unwrap());
+
+        let combined = ParquetReader::builder()
+            .pool(pool)
+            .reader_labeled(single, [("job", "single")])
+            .source_labeled(&segmented, [("job", "segmented")])
+            .build()
+            .unwrap();
+
+        // Both children contribute a series, kept distinct by the injected
+        // label -- not merged, and not silently dropped.
+        let mut jobs: Vec<String> = combined
+            .counter_labels("cpu_cycles")
+            .into_iter()
+            .filter_map(|l| l.get("job").cloned())
+            .collect();
+        jobs.sort();
+        assert_eq!(jobs, vec!["segmented".to_string(), "single".to_string()]);
+    }
 }

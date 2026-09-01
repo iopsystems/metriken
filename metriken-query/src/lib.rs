@@ -54,7 +54,7 @@ pub mod fixtures;
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
-pub use parquet::{ParquetBuilder, ParquetReader};
+pub use parquet::{CompositionSource, ParquetBuilder, ParquetReader};
 pub use promql::{
     referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
 };
@@ -216,6 +216,23 @@ pub(crate) trait DataSource: Send + Sync {
     fn column_map(
         &self,
     ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;
+    /// Raw per-sample collection timestamps (ns since epoch), in row order --
+    /// the un-snapped `timestamp` column. Default empty for sources that do
+    /// not track one (e.g. a live `MemoryStore`).
+    ///
+    /// This is on `DataSource` rather than only on the readers because a
+    /// composite source has to gather it from its children through the trait;
+    /// it cannot reach past them into row groups.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    /// Parsed parquet column descriptors, for callers that need schema-level
+    /// detail the metric-name accessors above do not carry (histogram bucket
+    /// configs, per-column label sets). Empty for sources with no parquet
+    /// schema behind them.
+    fn columns_desc(&self) -> Vec<crate::parquet::ColDesc> {
+        Vec::new()
+    }
 }
 
 /// Public trait expressing the full read-only capability of a metrics source.

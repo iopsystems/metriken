@@ -47,7 +47,10 @@ impl ParquetReader {
         let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
         let source = ParquetSource::open(path)?;
         let inner = Arc::new(MultiParquetSource {
-            files: vec![(source, Labels::default())],
+            files: vec![(
+                Arc::new(FileSource(source)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
         });
         let ds: Arc<dyn DataSource> = inner.clone();
         Ok(Self {
@@ -69,7 +72,10 @@ impl ParquetReader {
     pub fn open_file(file: File) -> Result<Self, Box<dyn Error>> {
         let source = ParquetSource::open_file(file)?;
         let inner = Arc::new(MultiParquetSource {
-            files: vec![(source, Labels::default())],
+            files: vec![(
+                Arc::new(FileSource(source)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
         });
         let ds: Arc<dyn DataSource> = inner.clone();
         Ok(Self {
@@ -92,7 +98,10 @@ impl ParquetReader {
         let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
         let source = ParquetSource::open_with_pool(path, pool)?;
         let inner = Arc::new(MultiParquetSource {
-            files: vec![(source, Labels::default())],
+            files: vec![(
+                Arc::new(FileSource(source)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
         });
         let ds: Arc<dyn DataSource> = inner.clone();
         Ok(Self {
@@ -114,7 +123,10 @@ impl ParquetReader {
     pub fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Self, Box<dyn Error>> {
         let source = ParquetSource::open_file_with_pool(file, pool)?;
         let inner = Arc::new(MultiParquetSource {
-            files: vec![(source, Labels::default())],
+            files: vec![(
+                Arc::new(FileSource(source)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
         });
         let ds: Arc<dyn DataSource> = inner.clone();
         Ok(Self {
@@ -126,7 +138,7 @@ impl ParquetReader {
 
     /// Return the underlying `(source, labels)` pairs for use by
     /// [`ParquetBuilder::reader`] and [`ParquetBuilder::reader_labeled`].
-    pub(crate) fn sources_for_composition(&self) -> Vec<(Arc<ParquetSource>, Labels)> {
+    pub(crate) fn sources_for_composition(&self) -> Vec<(Arc<dyn DataSource>, Labels)> {
         self.inner.files.clone()
     }
 
@@ -150,8 +162,7 @@ impl ParquetReader {
     pub(crate) fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
         let mut out = std::collections::BTreeMap::new();
         for (pf, _) in &self.inner.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
+            for col in pf.columns_desc() {
                 if let ColKind::Histogram {
                     grouping_power,
                     max_value_power,
@@ -182,8 +193,7 @@ impl ParquetReader {
         let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
             std::collections::BTreeMap::new();
         for (pf, _) in &self.inner.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
+            for col in pf.columns_desc() {
                 if let ColKind::Histogram {
                     grouping_power,
                     max_value_power,
@@ -210,8 +220,7 @@ impl ParquetReader {
     pub(crate) fn counter_columns(&self) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
         for (pf, extra) in &self.inner.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
+            for col in pf.columns_desc() {
                 if matches!(col.kind, ColKind::Counter) {
                     let mut labels = col.labels;
                     for (k, v) in &extra.inner {
@@ -228,8 +237,7 @@ impl ParquetReader {
     pub(crate) fn gauge_columns(&self) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
         for (pf, extra) in &self.inner.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
+            for col in pf.columns_desc() {
                 if matches!(col.kind, ColKind::Gauge) {
                     let mut labels = col.labels;
                     for (k, v) in &extra.inner {
@@ -246,8 +254,7 @@ impl ParquetReader {
     pub(crate) fn histogram_columns(&self) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
         for (pf, extra) in &self.inner.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
+            for col in pf.columns_desc() {
                 if matches!(col.kind, ColKind::Histogram { .. }) {
                     let mut labels = col.labels;
                     for (k, v) in &extra.inner {
@@ -320,7 +327,7 @@ impl ParquetReader {
         let (start, end) = self.time_range_ns()?;
         let filter = Labels::default();
         for (pf, _extra) in &self.inner.files {
-            let counters = read_counters(pf, name, &filter, start, end, false).ok()?;
+            let counters = pf.counters(name, &filter, start, end, false)?;
             if let Some(c) = counters.series.into_iter().next() {
                 return c.windows;
             }
@@ -502,11 +509,36 @@ impl MetricsSource for ParquetReader {
 
 // ─── Builder ──────────────────────────────────────────────────────────────────
 
+/// An already-open source handed to [`ParquetBuilder::source_labeled`].
+///
+/// Opaque on purpose. The underlying [`DataSource`] trait returns the crate's
+/// internal row representations (`Counters`, `Gauges`, `HistogramStream`), so
+/// exposing the trait itself would make all of those public API and bind them
+/// to semver. This wrapper keeps composition open to callers while leaving the
+/// row types internal -- the same trade [`crate::UnionChild`] makes.
+///
+/// Built via `From<&ParquetReader>` / `From<&SegmentedParquetReader>`, which
+/// borrow (an `Arc` clone underneath) rather than consume, so the original
+/// reader stays usable after contributing to a composition.
+pub struct CompositionSource(pub(crate) Arc<dyn DataSource>);
+
+impl From<&ParquetReader> for CompositionSource {
+    fn from(reader: &ParquetReader) -> Self {
+        CompositionSource(reader.data_source())
+    }
+}
+
+impl From<&crate::SegmentedParquetReader> for CompositionSource {
+    fn from(reader: &crate::SegmentedParquetReader) -> Self {
+        CompositionSource(reader.data_source())
+    }
+}
+
 enum BuilderEntry {
     Path(std::path::PathBuf, Labels),
     Bytes(Bytes, Labels),
     OwnedFile(File, Labels),
-    Source(Arc<ParquetSource>, Labels),
+    Source(Arc<dyn DataSource>, Labels),
 }
 
 pub struct ParquetBuilder {
@@ -631,6 +663,27 @@ impl ParquetBuilder {
         self
     }
 
+    /// Compose with an already-open source -- a [`ParquetReader`] or a
+    /// [`SegmentedParquetReader`] -- merging `extra` labels into every series
+    /// it contributes.
+    ///
+    /// This is the heterogeneous counterpart to
+    /// [`reader_labeled`](Self::reader_labeled), which can only take a
+    /// `ParquetReader`. A `.rez` archive table is a segmented source whenever
+    /// its writer sealed more than once, so composing N such tables under
+    /// per-artifact labels needs this entry point.
+    ///
+    /// No I/O occurs -- the already-open handle is reused.
+    pub fn source_labeled(
+        mut self,
+        source: impl Into<CompositionSource>,
+        extra: impl Into<Labels>,
+    ) -> Self {
+        self.entries
+            .push(BuilderEntry::Source(source.into().0, extra.into()));
+        self
+    }
+
     pub fn build(self) -> Result<ParquetReader, Box<dyn Error>> {
         if self.entries.is_empty() {
             return Err("ParquetReader requires at least one file".into());
@@ -645,7 +698,7 @@ impl ParquetBuilder {
             None
         });
         let pool = self.pool;
-        let files: Result<Vec<(Arc<ParquetSource>, Labels)>, Box<dyn Error>> = self
+        let files: Result<Vec<(Arc<dyn DataSource>, Labels)>, Box<dyn Error>> = self
             .entries
             .into_iter()
             .map(|entry| match entry {
@@ -654,21 +707,21 @@ impl ParquetBuilder {
                         Some(p) => ParquetSource::open_with_pool(&path, Arc::clone(p))?,
                         None => ParquetSource::open(&path)?,
                     };
-                    Ok((src, labels))
+                    Ok((Arc::new(FileSource(src)) as Arc<dyn DataSource>, labels))
                 }
                 BuilderEntry::Bytes(bytes, labels) => {
                     let src = match &pool {
                         Some(p) => ParquetSource::open_bytes_with_pool(bytes, Arc::clone(p))?,
                         None => ParquetSource::open_bytes(bytes)?,
                     };
-                    Ok((src, labels))
+                    Ok((Arc::new(FileSource(src)) as Arc<dyn DataSource>, labels))
                 }
                 BuilderEntry::OwnedFile(file, labels) => {
                     let src = match &pool {
                         Some(p) => ParquetSource::open_file_with_pool(file, Arc::clone(p))?,
                         None => ParquetSource::open_file(file)?,
                     };
-                    Ok((src, labels))
+                    Ok((Arc::new(FileSource(src)) as Arc<dyn DataSource>, labels))
                 }
                 BuilderEntry::Source(source, labels) => Ok((source, labels)),
             })
@@ -685,8 +738,14 @@ impl ParquetBuilder {
 
 // ─── Multi-file source ────────────────────────────────────────────────────────
 
+/// Several sources presented as one, each contributing its series under its
+/// own injected labels.
+///
+/// Children are `Arc<dyn DataSource>`, not `Arc<ParquetSource>`: a `.rez`
+/// table is a segmented source whenever its writer sealed more than once, and
+/// composing those alongside plain files is what a job-spanning query needs.
 struct MultiParquetSource {
-    files: Vec<(Arc<ParquetSource>, Labels)>,
+    files: Vec<(Arc<dyn DataSource>, Labels)>,
 }
 
 /// Given a file's injected `extra` labels and the query `filter`:
@@ -739,7 +798,7 @@ impl DataSource for MultiParquetSource {
             .iter()
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
-                let counters = read_counters(pf, name, &pq_filter, start_ns, end_ns, raw).ok()?;
+                let counters = pf.counters(name, &pq_filter, start_ns, end_ns, raw)?;
                 Some((counters.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
@@ -776,7 +835,7 @@ impl DataSource for MultiParquetSource {
             .iter()
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
-                let gauges = read_gauges(pf, name, &pq_filter, start_ns, end_ns, raw).ok()?;
+                let gauges = pf.gauges(name, &pq_filter, start_ns, end_ns, raw)?;
                 Some((gauges.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
@@ -834,7 +893,7 @@ impl DataSource for MultiParquetSource {
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         let mut out = std::collections::HashMap::new();
         for (pf, _) in &self.files {
-            out.extend(pf.read_file_metadata());
+            out.extend(pf.file_metadata());
         }
         out
     }
@@ -843,7 +902,7 @@ impl DataSource for MultiParquetSource {
         // Walk files; last value wins (matches file_metadata() merge semantics).
         let mut last: Option<String> = None;
         for (pf, _) in &self.files {
-            if let Some(v) = pf.read_file_metadata_value(key) {
+            if let Some(v) = pf.metadata_get(key) {
                 last = Some(v);
             }
         }
@@ -853,14 +912,14 @@ impl DataSource for MultiParquetSource {
     fn interval(&self) -> f64 {
         self.files
             .iter()
-            .map(|(pf, _)| pf.sampling_interval_ms as f64 / 1000.0)
+            .map(|(pf, _)| pf.interval())
             .fold(f64::MAX, f64::min)
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {
         let (mut lo, mut hi): (Option<u64>, Option<u64>) = (None, None);
         for (pf, _) in &self.files {
-            if let Some((a, b)) = pf.time_range_from_stats() {
+            if let Some((a, b)) = pf.time_range() {
                 lo = Some(lo.map_or(a, |m: u64| m.min(a)));
                 hi = Some(hi.map_or(b, |m: u64| m.max(b)));
             }
@@ -871,12 +930,7 @@ impl DataSource for MultiParquetSource {
     fn counter_names(&self) -> Vec<String> {
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (pf, _) in &self.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
-                if matches!(col.kind, ColKind::Counter) {
-                    names.insert(col.name);
-                }
-            }
+            names.extend(pf.counter_names());
         }
         names.into_iter().collect()
     }
@@ -884,12 +938,7 @@ impl DataSource for MultiParquetSource {
     fn gauge_names(&self) -> Vec<String> {
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (pf, _) in &self.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
-                if matches!(col.kind, ColKind::Gauge) {
-                    names.insert(col.name);
-                }
-            }
+            names.extend(pf.gauge_names());
         }
         names.into_iter().collect()
     }
@@ -897,12 +946,7 @@ impl DataSource for MultiParquetSource {
     fn histogram_names(&self) -> Vec<String> {
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (pf, _) in &self.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
-                if matches!(col.kind, ColKind::Histogram { .. }) {
-                    names.insert(col.name);
-                }
-            }
+            names.extend(pf.histogram_names());
         }
         names.into_iter().collect()
     }
@@ -910,15 +954,11 @@ impl DataSource for MultiParquetSource {
     fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
         for (pf, extra) in &self.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
-                if matches!(col.kind, ColKind::Counter) && col.name == name {
-                    let mut labels = col.labels.inner.clone();
-                    for (k, v) in &extra.inner {
-                        labels.insert(k.clone(), v.clone());
-                    }
-                    sets.push(labels);
+            for mut labels in pf.counter_labels(name) {
+                for (k, v) in &extra.inner {
+                    labels.insert(k.clone(), v.clone());
                 }
+                sets.push(labels);
             }
         }
         sets.sort();
@@ -929,15 +969,11 @@ impl DataSource for MultiParquetSource {
     fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
         for (pf, extra) in &self.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
-                if matches!(col.kind, ColKind::Gauge) && col.name == name {
-                    let mut labels = col.labels.inner.clone();
-                    for (k, v) in &extra.inner {
-                        labels.insert(k.clone(), v.clone());
-                    }
-                    sets.push(labels);
+            for mut labels in pf.gauge_labels(name) {
+                for (k, v) in &extra.inner {
+                    labels.insert(k.clone(), v.clone());
                 }
+                sets.push(labels);
             }
         }
         sets.sort();
@@ -948,15 +984,11 @@ impl DataSource for MultiParquetSource {
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
         for (pf, extra) in &self.files {
-            let ts = pf.meta.schema().index_of("timestamp").unwrap_or(usize::MAX);
-            for col in parse_schema(pf, ts) {
-                if matches!(col.kind, ColKind::Histogram { .. }) && col.name == name {
-                    let mut labels = col.labels.inner.clone();
-                    for (k, v) in &extra.inner {
-                        labels.insert(k.clone(), v.clone());
-                    }
-                    sets.push(labels);
+            for mut labels in pf.histogram_labels(name) {
+                for (k, v) in &extra.inner {
+                    labels.insert(k.clone(), v.clone());
                 }
+                sets.push(labels);
             }
         }
         sets.sort();
@@ -986,23 +1018,7 @@ impl MultiParquetSource {
     fn sample_timestamps(&self) -> Vec<u64> {
         let mut out = Vec::new();
         for (pf, _labels) in &self.files {
-            let Ok(ts_col_idx) = pf.meta.schema().index_of("timestamp") else {
-                continue;
-            };
-            let num_rgs = pf.meta.metadata().num_row_groups();
-            for rg_idx in 0..num_rgs {
-                match read_raw_u64_rg(pf, rg_idx, ts_col_idx) {
-                    Ok(values) => out.extend(values),
-                    Err(e) => {
-                        tracing::warn!(
-                            source_id = pf.id,
-                            rg_idx,
-                            error = %e,
-                            "skipping row group in sample_timestamps",
-                        );
-                    }
-                }
-            }
+            out.extend(pf.sample_timestamps());
         }
         out
     }
@@ -1165,6 +1181,181 @@ fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
         .get("sampling_interval_ms")
         .map(|v| v.parse::<u64>().expect("bad interval"))
         .unwrap_or(1000)
+}
+
+/// A single parquet file answering the `DataSource` contract directly.
+///
+/// Before this impl, `MultiParquetSource` reached into each file through free
+/// functions (`read_counters`) and inherent methods (`time_range_from_stats`,
+/// `read_file_metadata`), which is why it could only ever hold
+/// `Arc<ParquetSource>`. Going through the trait is what lets a composite hold
+/// heterogeneous children -- a segmented source among plain ones.
+/// One parquet file as a `DataSource`.
+///
+/// A newtype rather than `impl DataSource for ParquetSource` because the
+/// inherent `ParquetSource::histogram_stream` takes `self: &Arc<Self>` (it
+/// clones the handle into the returned lazy stream), which a `&self` trait
+/// method cannot supply. Holding the `Arc` here gives it one.
+pub(crate) struct FileSource(pub(crate) Arc<ParquetSource>);
+
+impl DataSource for FileSource {
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        raw: bool,
+    ) -> Option<Counters> {
+        read_counters(&self.0, name, filter, start_ns, end_ns, raw).ok()
+    }
+
+    fn gauges(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        raw: bool,
+    ) -> Option<Gauges> {
+        read_gauges(&self.0, name, filter, start_ns, end_ns, raw).ok()
+    }
+
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        // Fully qualified: the inherent method shares this name and would
+        // otherwise win method resolution and recurse.
+        ParquetSource::histogram_stream(&self.0, name, filter, start_ns, end_ns)
+    }
+
+    fn interval(&self) -> f64 {
+        self.0.sampling_interval_ms as f64 / 1000.0
+    }
+
+    fn time_range(&self) -> Option<(u64, u64)> {
+        self.0.time_range_from_stats()
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        self.0.names_of(|k| matches!(k, ColKind::Counter))
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        self.0.names_of(|k| matches!(k, ColKind::Gauge))
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        self.0.names_of(|k| matches!(k, ColKind::Histogram { .. }))
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0.labels_of(name, |k| matches!(k, ColKind::Counter))
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0.labels_of(name, |k| matches!(k, ColKind::Gauge))
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0
+            .labels_of(name, |k| matches!(k, ColKind::Histogram { .. }))
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.0.read_file_metadata()
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.0.read_file_metadata_value(key)
+    }
+
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        // Fully qualified for the same reason as `histogram_stream` above.
+        ParquetSource::column_map(&self.0)
+    }
+
+    /// Raw `timestamp` column values in row-group order. This moved down from
+    /// `MultiParquetSource`, which used to reach through `Arc<ParquetSource>`
+    /// into `meta.schema()` and row groups to gather it -- the one piece of
+    /// genuinely file-shaped behavior that blocked the generalization.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let Ok(ts_col_idx) = self.0.meta.schema().index_of("timestamp") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for rg_idx in 0..self.0.meta.metadata().num_row_groups() {
+            match read_raw_u64_rg(&self.0, rg_idx, ts_col_idx) {
+                Ok(values) => out.extend(values),
+                Err(e) => {
+                    tracing::warn!(
+                        source_id = self.0.id,
+                        rg_idx,
+                        error = %e,
+                        "skipping row group in sample_timestamps",
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn columns_desc(&self) -> Vec<ColDesc> {
+        let ts = self
+            .0
+            .meta
+            .schema()
+            .index_of("timestamp")
+            .unwrap_or(usize::MAX);
+        parse_schema(&self.0, ts)
+    }
+}
+
+impl ParquetSource {
+    /// Schema-derived metric names whose column kind satisfies `want`.
+    fn names_of(&self, want: impl Fn(&ColKind) -> bool) -> Vec<String> {
+        let ts = self
+            .meta
+            .schema()
+            .index_of("timestamp")
+            .unwrap_or(usize::MAX);
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for col in parse_schema(self, ts) {
+            if want(&col.kind) {
+                names.insert(col.name);
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// Label sets carried by columns of metric `name` whose kind satisfies
+    /// `want`.
+    fn labels_of(
+        &self,
+        name: &str,
+        want: impl Fn(&ColKind) -> bool,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        let ts = self
+            .meta
+            .schema()
+            .index_of("timestamp")
+            .unwrap_or(usize::MAX);
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for col in parse_schema(self, ts) {
+            if want(&col.kind) && col.name == name {
+                sets.push(col.labels.inner.clone());
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
 }
 
 impl ParquetSource {
@@ -1439,7 +1630,7 @@ enum ColKind {
     },
 }
 
-struct ColDesc {
+pub(crate) struct ColDesc {
     col_idx: usize,
     name: String,
     labels: Labels,

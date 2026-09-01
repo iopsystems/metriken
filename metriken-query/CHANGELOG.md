@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ParquetBuilder::source_labeled` — compose heterogeneous sources under
+  injected labels.** `reader_labeled` takes an `Arc<ParquetReader>` and nothing
+  else, and `MultiParquetSource` held `Vec<(Arc<ParquetSource>, Labels)>`, so
+  only single-file parquet sources could ever be composed. A
+  `SegmentedParquetReader` could not enter the builder at all.
+
+  That blocked the consumer this exists for: a `.rez` archive tables its data
+  per sampler, and a table is a *segmented* source whenever its writer sealed
+  more than once. Merging N such tables under per-artifact labels — so one
+  PromQL query can span several recordings and slice by label — had no
+  expressible form.
+
+  `MultiParquetSource` now holds `Vec<(Arc<dyn DataSource>, Labels)>`, and
+  `source_labeled` accepts anything convertible into the new opaque
+  [`CompositionSource`] (`From<&ParquetReader>`, `From<&SegmentedParquetReader>`).
+  `file`, `bytes`, `file_owned`, `reader` and `reader_labeled` are unchanged.
+
+  `CompositionSource` is opaque rather than a bare `Arc<dyn DataSource>` on
+  purpose: `DataSource`'s methods return `Counters`, `Gauges` and
+  `HistogramStream`, so making the trait public would bind the crate's internal
+  row representations to semver. This is the trade `UnionChild` already makes.
+
+### Changed
+
+- `ParquetSource` reaches the composite through `DataSource` (via a `FileSource`
+  newtype — the inherent `histogram_stream` takes `self: &Arc<Self>`, which a
+  `&self` trait method cannot supply) rather than through free functions and
+  inherent methods. `sample_timestamps` moved down onto the source, since a
+  composite has to gather it through the trait instead of reaching past its
+  children into row groups. Internal only; no public behavior change.
+
 ## [0.20.1]
 
 ### Added
