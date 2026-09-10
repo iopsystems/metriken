@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.23.0]
 
 ### Changed
 
@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the display path. Paying it once here makes the next one additive.
 
 - **BREAKING: `EnvPoint` gains `interpolated`, and `Reducer::reduce` takes the
-  per-point bands and flags.** `EnvPoint` has public fields and is not
-  `#[non_exhaustive]`, so the added field breaks literal construction;
-  `reduce`'s signature changes from `(points, intervals, budget, band)` to
+  per-point bands and flags.** The added field breaks literal construction (see
+  the `#[non_exhaustive]` entry above, which lands in this same release and is
+  what stops that recurring); `reduce`'s signature changes from
+  `(points, intervals, budget, band)` to
   `(points, bands, interpolated, budget, band)`.
 
   Display mode previously reduced from `MatrixSample::intervals`, the
