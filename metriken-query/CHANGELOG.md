@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `EnvPoint` is now `#[non_exhaustive]`**, built with
+  `EnvPoint::new(t, min, lo, median, hi, max)` plus `with_band` /
+  `with_interpolated` — the same shape `MatrixSample` already uses. Literal
+  construction from another crate no longer compiles.
+
+  Done deliberately in the same release as the field addition above: that
+  addition is a breaking change ONLY because the struct could be built by
+  literal, and this type gains a field whenever a new per-point property reaches
+  the display path. Paying it once here makes the next one additive.
+
+- **BREAKING: `EnvPoint` gains `interpolated`, and `Reducer::reduce` takes the
+  per-point bands and flags.** `EnvPoint` has public fields and is not
+  `#[non_exhaustive]`, so the added field breaks literal construction;
+  `reduce`'s signature changes from `(points, intervals, budget, band)` to
+  `(points, bands, interpolated, budget, band)`.
+
+  Display mode previously reduced from `MatrixSample::intervals`, the
+  all-or-nothing band field, which goes absent for a whole series as soon as one
+  point lacks a band. A hole does exactly that, so a decimated series with one
+  unobserved stretch showed **no** uncertainty anywhere — despite having it
+  almost everywhere. It now reduces from `bands`, the lossless per-point form.
+
+  A decimated bucket is interpolated if ANY of its samples was: it is only as
+  observed as its least observed member, so this ORs rather than votes.
+  Aggregating a bucket's band now skips the samples that have none rather than
+  counting them as zero-width, so a bucket mixing observed and unobserved
+  samples reports the band the observed ones earned.
+
 ## [0.22.0]
 
 ### Changed

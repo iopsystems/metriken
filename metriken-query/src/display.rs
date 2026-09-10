@@ -28,7 +28,16 @@ use crate::promql::{HistogramHeatmapResult, Sample};
 /// decimation happens (`budget >= raw points`) each sample becomes its own
 /// point with `min == lo == median == hi == max`, so full-resolution and
 /// decimated data share one shape.
+///
+/// `#[non_exhaustive]`: build with [`EnvPoint::new`] plus
+/// [`with_band`](EnvPoint::with_band) / [`with_interpolated`](EnvPoint::with_interpolated),
+/// the same shape [`MatrixSample`](crate::MatrixSample) uses. This type gains a
+/// field whenever a new per-point property reaches the display path — the
+/// `interpolated` flag being the most recent — and each addition was a breaking
+/// release only because the struct could be built by literal. It cannot now, so
+/// the next one is additive.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EnvPoint {
     /// Representative timestamp (seconds) — the bucket's epoch-aligned boundary
     /// (a "nice" wall-clock instant), so decimated points snap to the same ticks
@@ -57,6 +66,56 @@ pub struct EnvPoint {
     /// per-sample interval highs. See [`unc_lo`](Self::unc_lo).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unc_hi: Option<f64>,
+    /// Whether this point covers time the producer did not observe.
+    ///
+    /// `true` when ANY sample in the bucket was interpolated across a hole —
+    /// a decimated bucket is only as observed as its least observed member, so
+    /// this ORs rather than votes. At native resolution it is just that
+    /// sample's own flag.
+    ///
+    /// Such a point carries no uncertainty band (`unc_lo`/`unc_hi` are `None`),
+    /// because the honest bound on an unobserved interval is not a number —
+    /// this is what distinguishes it from a measured point, and what lets a
+    /// renderer draw it differently.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interpolated: bool,
+}
+
+impl EnvPoint {
+    /// A point with no uncertainty band, not interpolated. Add either with
+    /// [`with_band`](Self::with_band) / [`with_interpolated`](Self::with_interpolated).
+    ///
+    /// The six required values are the boxplot summary: an undecimated point
+    /// has all five of `min`/`lo`/`median`/`hi`/`max` equal, so native and
+    /// decimated data share one shape.
+    pub fn new(t: f64, min: f64, lo: f64, median: f64, hi: f64, max: f64) -> Self {
+        Self {
+            t,
+            min,
+            lo,
+            median,
+            hi,
+            max,
+            unc_lo: None,
+            unc_hi: None,
+            interpolated: false,
+        }
+    }
+
+    /// Attach (or clear) the aggregated measurement-uncertainty band.
+    pub fn with_band(mut self, band: Option<(f64, f64)>) -> Self {
+        (self.unc_lo, self.unc_hi) = match band {
+            Some((lo, hi)) => (Some(lo), Some(hi)),
+            None => (None, None),
+        };
+        self
+    }
+
+    /// Mark this point as covering time the producer did not observe.
+    pub fn with_interpolated(mut self, interpolated: bool) -> Self {
+        self.interpolated = interpolated;
+        self
+    }
 }
 
 /// A decimated series plus the provenance a client needs to decide whether
@@ -151,12 +210,13 @@ impl Reducer {
     pub fn reduce(
         &self,
         points: &[(f64, f64)],
-        intervals: Option<&[(f64, f64)]>,
+        bands: Option<&[Option<(f64, f64)>]>,
+        interpolated: Option<&[bool]>,
         budget: usize,
         band: [f64; 2],
     ) -> Vec<EnvPoint> {
         match self {
-            Reducer::Boxplot => reduce_boxplot(points, intervals, budget, band),
+            Reducer::Boxplot => reduce_boxplot(points, bands, interpolated, budget, band),
         }
     }
 }
@@ -169,16 +229,18 @@ impl Reducer {
 /// `budget == 0` or the series fits the budget.
 fn reduce_boxplot(
     points: &[(f64, f64)],
-    intervals: Option<&[(f64, f64)]>,
+    bands: Option<&[Option<(f64, f64)>]>,
+    interpolated: Option<&[bool]>,
     budget: usize,
     band: [f64; 2],
 ) -> Vec<EnvPoint> {
     if points.is_empty() {
         return Vec::new();
     }
-    // Only honor a uncertainty band that is parallel to `points`; a length
-    // mismatch means we can't trust the alignment, so drop it.
-    let intervals = intervals.filter(|iv| iv.len() == points.len());
+    // Only honor arrays that are parallel to `points`; a length mismatch means
+    // we can't trust the alignment, so drop them.
+    let bands = bands.filter(|b| b.len() == points.len());
+    let interpolated = interpolated.filter(|f| f.len() == points.len());
     // No decimation needed: each sample becomes its own degenerate boxplot,
     // carrying its own exact uncertainty interval (so native and decimated
     // bands are the same shape).
@@ -193,8 +255,9 @@ fn reduce_boxplot(
                 median: v,
                 hi: v,
                 max: v,
-                unc_lo: intervals.map(|iv| iv[i].0),
-                unc_hi: intervals.map(|iv| iv[i].1),
+                unc_lo: bands.and_then(|b| b[i]).map(|(lo, _)| lo),
+                unc_hi: bands.and_then(|b| b[i]).map(|(_, hi)| hi),
+                interpolated: interpolated.is_some_and(|f| f[i]),
             })
             .collect();
     }
@@ -223,8 +286,9 @@ fn reduce_boxplot(
         while j < points.len() && bucket_of(points[j].0) == bucket {
             j += 1;
         }
-        let unc = intervals.map(|iv| &iv[i..j]);
-        let mut ep = boxplot_of(&points[i..j], unc, band);
+        let unc = bands.map(|b| &b[i..j]);
+        let interp = interpolated.map(|f| &f[i..j]);
+        let mut ep = boxplot_of(&points[i..j], unc, interp, band);
         ep.t = bucket as f64 * bw;
         out.push(ep);
         i = j;
@@ -256,17 +320,26 @@ fn nice_bucket_secs(raw: f64) -> f64 {
 /// the inner band at the `band` quantiles and, when `unc` is present, the
 /// bucket's aggregated measurement-uncertainty band (median of the per-sample
 /// interval lows/highs — robust, like the median line).
-fn boxplot_of(bucket: &[(f64, f64)], unc: Option<&[(f64, f64)]>, band: [f64; 2]) -> EnvPoint {
+fn boxplot_of(
+    bucket: &[(f64, f64)],
+    unc: Option<&[Option<(f64, f64)>]>,
+    interpolated: Option<&[bool]>,
+    band: [f64; 2],
+) -> EnvPoint {
     debug_assert!(!bucket.is_empty());
     let t = (bucket[0].0 + bucket[bucket.len() - 1].0) / 2.0;
 
     let mut values: Vec<f64> = bucket.iter().map(|&(_, v)| v).collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Samples with no band of their own are skipped rather than counted as
+    // zero-width: a bucket mixing observed and unobserved samples reports the
+    // band of the observed ones, and a bucket where none had a band reports no
+    // band at all.
     let (unc_lo, unc_hi) = match unc {
-        Some(iv) if !iv.is_empty() => {
-            let mut los: Vec<f64> = iv.iter().map(|&(lo, _)| lo).collect();
-            let mut his: Vec<f64> = iv.iter().map(|&(_, hi)| hi).collect();
+        Some(iv) if iv.iter().any(Option::is_some) => {
+            let mut los: Vec<f64> = iv.iter().filter_map(|b| b.map(|(lo, _)| lo)).collect();
+            let mut his: Vec<f64> = iv.iter().filter_map(|b| b.map(|(_, hi)| hi)).collect();
             los.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             his.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             (
@@ -286,6 +359,8 @@ fn boxplot_of(bucket: &[(f64, f64)], unc: Option<&[(f64, f64)]>, band: [f64; 2])
         max: values[values.len() - 1],
         unc_lo,
         unc_hi,
+        // A bucket is only as observed as its least observed member.
+        interpolated: interpolated.is_some_and(|f| f.iter().any(|&x| x)),
     }
 }
 
@@ -320,13 +395,13 @@ mod tests {
 
     #[test]
     fn empty_input_yields_empty() {
-        assert!(reduce_boxplot(&[], None, 100, IQR).is_empty());
+        assert!(reduce_boxplot(&[], None, None, 100, IQR).is_empty());
     }
 
     #[test]
     fn under_budget_is_identity() {
         let p = pts(&[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]);
-        let out = reduce_boxplot(&p, None, 100, IQR);
+        let out = reduce_boxplot(&p, None, None, 100, IQR);
         assert_eq!(out.len(), 3);
         for (i, e) in out.iter().enumerate() {
             assert_eq!(e.t, p[i].0);
@@ -338,7 +413,7 @@ mod tests {
     #[test]
     fn budget_zero_is_identity() {
         let p = pts(&[(0.0, 5.0), (1.0, 9.0)]);
-        let out = reduce_boxplot(&p, None, 0, IQR);
+        let out = reduce_boxplot(&p, None, None, 0, IQR);
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].median, 9.0);
     }
@@ -346,7 +421,7 @@ mod tests {
     #[test]
     fn over_budget_is_bounded() {
         let p: Vec<(f64, f64)> = (0..1000).map(|i| (i as f64, i as f64)).collect();
-        let out = reduce_boxplot(&p, None, 50, IQR);
+        let out = reduce_boxplot(&p, None, None, 50, IQR);
         assert!(
             out.len() <= 50,
             "output bounded by budget, got {}",
@@ -361,7 +436,7 @@ mod tests {
         // 10), the spike's bucket must keep median≈1.0 (robust) but max=100.0.
         let mut p: Vec<(f64, f64)> = (0..40).map(|i| (i as f64, 1.0)).collect();
         p[20].1 = 100.0;
-        let out = reduce_boxplot(&p, None, 4, IQR);
+        let out = reduce_boxplot(&p, None, None, 4, IQR);
         assert!(out.len() <= 4);
 
         let max_max = out.iter().map(|e| e.max).fold(f64::MIN, f64::max);
@@ -382,7 +457,7 @@ mod tests {
         // wall-clock boundaries as the axis ticks) — not the sample-midpoint
         // times (e.g. 1004.87) the old reducer produced.
         let p: Vec<(f64, f64)> = (0..200).map(|i| (1000.37 + i as f64, i as f64)).collect();
-        let out = reduce_boxplot(&p, None, 20, IQR);
+        let out = reduce_boxplot(&p, None, None, 20, IQR);
         assert!(out.len() > 1 && out.len() <= 21, "len {}", out.len());
         for e in &out {
             let m = e.t / 10.0;
@@ -404,7 +479,7 @@ mod tests {
             (3.0, 20.0),
             (4.0, 40.0),
         ]);
-        let out = reduce_boxplot(&p, None, 1, IQR);
+        let out = reduce_boxplot(&p, None, None, 1, IQR);
         assert_eq!(out.len(), 1);
         let e = out[0];
         assert_eq!(e.min, 10.0);
@@ -427,8 +502,8 @@ mod tests {
             (3.0, 20.0),
             (4.0, 40.0),
         ]);
-        let iqr = reduce_boxplot(&p, None, 1, [0.25, 0.75])[0];
-        let wide = reduce_boxplot(&p, None, 1, [0.10, 0.90])[0];
+        let iqr = reduce_boxplot(&p, None, None, 1, [0.25, 0.75])[0];
+        let wide = reduce_boxplot(&p, None, None, 1, [0.10, 0.90])[0];
         assert_eq!((wide.min, wide.median, wide.max), (10.0, 30.0, 50.0));
         assert!(
             wide.lo < iqr.lo,
@@ -450,7 +525,7 @@ mod tests {
     #[test]
     fn timestamps_ascending_and_within_range() {
         let p: Vec<(f64, f64)> = (0..500).map(|i| (i as f64 * 2.0, (i % 7) as f64)).collect();
-        let out = reduce_boxplot(&p, None, 30, IQR);
+        let out = reduce_boxplot(&p, None, None, 30, IQR);
         assert!(out.len() <= 30);
         for w in out.windows(2) {
             assert!(w[1].t > w[0].t, "timestamps strictly ascending");
@@ -464,7 +539,7 @@ mod tests {
         let p: Vec<(f64, f64)> = (0..300)
             .map(|i| (i as f64, ((i * 7 % 13) as f64) - 6.0))
             .collect();
-        let out = reduce_boxplot(&p, None, 20, IQR);
+        let out = reduce_boxplot(&p, None, None, 20, IQR);
         for e in &out {
             assert!(
                 e.min <= e.lo && e.lo <= e.median && e.median <= e.hi && e.hi <= e.max,
@@ -485,8 +560,8 @@ mod tests {
     fn reducer_dispatch_matches_free_fn() {
         let p = pts(&[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]);
         assert_eq!(
-            Reducer::Boxplot.reduce(&p, None, 2, IQR),
-            reduce_boxplot(&p, None, 2, IQR)
+            Reducer::Boxplot.reduce(&p, None, None, 2, IQR),
+            reduce_boxplot(&p, None, None, 2, IQR)
         );
     }
 
@@ -511,7 +586,7 @@ mod tests {
     #[test]
     fn no_intervals_yields_no_uncertainty_band() {
         let p = pts(&[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]);
-        for e in reduce_boxplot(&p, None, 100, IQR) {
+        for e in reduce_boxplot(&p, None, None, 100, IQR) {
             assert_eq!((e.unc_lo, e.unc_hi), (None, None));
         }
     }
@@ -522,12 +597,12 @@ mod tests {
         // interval verbatim — this is what makes zoomed-in and decimated bands
         // the same shape.
         let p = pts(&[(0.0, 10.0), (1.0, 20.0), (2.0, 30.0)]);
-        let iv = vec![(9.0, 11.0), (18.0, 22.0), (28.0, 33.0)];
-        let out = reduce_boxplot(&p, Some(&iv), 100, IQR);
+        let iv = vec![Some((9.0, 11.0)), Some((18.0, 22.0)), Some((28.0, 33.0))];
+        let out = reduce_boxplot(&p, Some(&iv), None, 100, IQR);
         assert_eq!(out.len(), 3);
         for (i, e) in out.iter().enumerate() {
-            assert_eq!(e.unc_lo, Some(iv[i].0));
-            assert_eq!(e.unc_hi, Some(iv[i].1));
+            assert_eq!(e.unc_lo, iv[i].map(|(lo, _)| lo));
+            assert_eq!(e.unc_hi, iv[i].map(|(_, hi)| hi));
         }
     }
 
@@ -539,8 +614,13 @@ mod tests {
         let p = pts(&[(0.0, 30.0), (1.0, 10.0), (2.0, 50.0), (3.0, 20.0)]);
         // lows  {9,10,10,11} -> median 10 ; highs {11,13,14,20} -> median 13.5.
         // (Each edge is aggregated independently, so the pairing doesn't matter.)
-        let iv = vec![(9.0, 11.0), (10.0, 13.0), (10.0, 14.0), (11.0, 20.0)];
-        let out = reduce_boxplot(&p, Some(&iv), 1, IQR);
+        let iv = vec![
+            Some((9.0, 11.0)),
+            Some((10.0, 13.0)),
+            Some((10.0, 14.0)),
+            Some((11.0, 20.0)),
+        ];
+        let out = reduce_boxplot(&p, Some(&iv), None, 1, IQR);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].unc_lo, Some(10.0));
         assert_eq!(out[0].unc_hi, Some(13.5));
@@ -551,10 +631,76 @@ mod tests {
         // A band that isn't parallel to points can't be trusted to align, so it
         // is dropped rather than mis-attributed.
         let p = pts(&[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]);
-        let iv = vec![(0.5, 1.5)]; // wrong length
-        for e in reduce_boxplot(&p, Some(&iv), 100, IQR) {
+        let iv = vec![Some((0.5, 1.5))]; // wrong length
+        for e in reduce_boxplot(&p, Some(&iv), None, 100, IQR) {
             assert_eq!((e.unc_lo, e.unc_hi), (None, None));
         }
+    }
+
+    /// A decimated bucket is only as observed as its least observed member.
+    ///
+    /// Averaging or voting would let a mostly-observed bucket present as fully
+    /// measured, which is the opposite of what the flag is for: it exists so a
+    /// renderer can mark what nobody watched.
+    #[test]
+    fn a_bucket_is_interpolated_if_any_of_its_samples_was() {
+        let p = pts(&[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]);
+
+        let none = vec![false, false, false, false];
+        let out = reduce_boxplot(&p, None, Some(&none), 1, IQR);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].interpolated, "no sample interpolated");
+
+        let one = vec![false, false, true, false];
+        let out = reduce_boxplot(&p, None, Some(&one), 1, IQR);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].interpolated,
+            "one interpolated sample taints the bucket"
+        );
+    }
+
+    /// Undecimated, each sample keeps its own flag.
+    #[test]
+    fn native_resolution_carries_each_sample_own_flag() {
+        let p = pts(&[(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]);
+        let flags = vec![false, true, false];
+        let out = reduce_boxplot(&p, None, Some(&flags), 0, IQR);
+        assert_eq!(
+            out.iter().map(|e| e.interpolated).collect::<Vec<_>>(),
+            vec![false, true, false],
+        );
+    }
+
+    /// A bucket mixing banded and band-less samples reports the banded ones.
+    ///
+    /// Before per-point bands reached this path, one missing band took the
+    /// whole series' uncertainty with it — the display path read the
+    /// all-or-nothing `intervals`, which goes absent as soon as a single point
+    /// lacks a band. Skipping the `None`s keeps the band a bucket has actually
+    /// earned; counting them as zero-width would drag it toward the median.
+    #[test]
+    fn a_bucket_bands_only_the_samples_that_have_one() {
+        // Four points spanning 0..3 land in one epoch-aligned bucket (the
+        // nice width for that span is 5s), so this is a single-bucket assertion.
+        let p = pts(&[(0.0, 10.0), (1.0, 20.0), (2.0, 30.0), (3.0, 40.0)]);
+        let bands = vec![Some((9.0, 11.0)), None, Some((29.0, 31.0)), None];
+        let out = reduce_boxplot(&p, Some(&bands), None, 1, IQR);
+        assert_eq!(out.len(), 1);
+        // Medians over the two present edges: lows {9,29}, highs {11,31}.
+        assert_eq!(out[0].unc_lo, Some(19.0));
+        assert_eq!(out[0].unc_hi, Some(21.0));
+    }
+
+    /// A bucket where nothing had a band reports none, rather than a degenerate
+    /// zero-width one.
+    #[test]
+    fn a_bucket_with_no_bands_at_all_reports_none() {
+        let p = pts(&[(0.0, 10.0), (1.0, 20.0), (2.0, 30.0), (3.0, 40.0)]);
+        let bands = vec![None, None, None, None];
+        let out = reduce_boxplot(&p, Some(&bands), None, 1, IQR);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].unc_lo, out[0].unc_hi), (None, None));
     }
 
     #[test]
@@ -568,6 +714,7 @@ mod tests {
             max: 1.0,
             unc_lo: Some(0.9),
             unc_hi: Some(1.1),
+            interpolated: false,
         };
         let without = EnvPoint {
             t: 0.0,
@@ -578,6 +725,7 @@ mod tests {
             max: 1.0,
             unc_lo: None,
             unc_hi: None,
+            interpolated: false,
         };
         let s_with = serde_json::to_string(&with).unwrap();
         assert!(

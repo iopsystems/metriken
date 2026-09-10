@@ -321,9 +321,16 @@ pub trait MetricsSource: Send + Sync {
                     .into_iter()
                     .map(|s| {
                         let raw_points = s.values.len() as u64;
+                        // `bands`, not `intervals`: the legacy field is
+                        // all-or-nothing and goes absent for the whole series
+                        // as soon as one point lacks a band, which is exactly
+                        // what a hole causes — display mode would then show no
+                        // uncertainty at all for a series that has it almost
+                        // everywhere.
                         let points = opts.reducer.reduce(
                             &s.values,
-                            s.intervals.as_deref(),
+                            s.bands.as_deref(),
+                            s.interpolated.as_deref(),
                             opts.budget,
                             opts.band,
                         );
