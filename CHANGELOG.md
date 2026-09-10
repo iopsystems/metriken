@@ -126,6 +126,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the V2 invariant that the metadata copy cannot disagree with the
   embedded config.
 
+### metriken-query 0.23.0
+
+- **Changed (breaking):** display-mode decimation carries the interpolated
+  flag and the per-point bands. `EnvPoint` gains `interpolated: bool`, and
+  `Reducer::reduce` takes `(points, bands, interpolated, budget, band)` where it
+  took `(points, intervals, budget, band)`. `EnvPoint` has public fields and is
+  not `#[non_exhaustive]`, so the added field breaks literal construction.
+
+  The reducer read `MatrixSample::intervals`, the all-or-nothing band field,
+  which goes absent for a whole series as soon as one point lacks a band — and a
+  hole does exactly that. So a decimated series with one unobserved stretch
+  showed NO uncertainty band anywhere, despite having one almost everywhere. It
+  now reduces from `bands`, the lossless per-point form added in 0.22.
+
+  A decimated bucket is interpolated if ANY of its samples was — it is only as
+  observed as its least observed member, so this ORs rather than votes — and a
+  bucket's band now skips the samples that have none rather than counting them
+  as zero-width.
+
 ### metriken-query 0.22.0
 
 - **Changed (breaking):** requires `metriken-exposition` 0.20 (see that entry).
