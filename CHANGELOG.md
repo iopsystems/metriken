@@ -137,8 +137,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Changed (breaking):** display-mode decimation carries the interpolated
   flag and the per-point bands. `EnvPoint` gains `interpolated: bool`, and
   `Reducer::reduce` takes `(points, bands, interpolated, budget, band)` where it
-  took `(points, intervals, budget, band)`. `EnvPoint` has public fields and is
-  not `#[non_exhaustive]`, so the added field breaks literal construction.
+  took `(points, intervals, budget, band)`. The added field breaks literal
+  construction, which is what the entry above makes a one-time cost.
 
   The reducer read `MatrixSample::intervals`, the all-or-nothing band field,
   which goes absent for a whole series as soon as one point lacks a band — and a
