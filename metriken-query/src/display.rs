@@ -28,7 +28,16 @@ use crate::promql::{HistogramHeatmapResult, Sample};
 /// decimation happens (`budget >= raw points`) each sample becomes its own
 /// point with `min == lo == median == hi == max`, so full-resolution and
 /// decimated data share one shape.
+///
+/// `#[non_exhaustive]`: build with [`EnvPoint::new`] plus
+/// [`with_band`](EnvPoint::with_band) / [`with_interpolated`](EnvPoint::with_interpolated),
+/// the same shape [`MatrixSample`](crate::MatrixSample) uses. This type gains a
+/// field whenever a new per-point property reaches the display path — the
+/// `interpolated` flag being the most recent — and each addition was a breaking
+/// release only because the struct could be built by literal. It cannot now, so
+/// the next one is additive.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EnvPoint {
     /// Representative timestamp (seconds) — the bucket's epoch-aligned boundary
     /// (a "nice" wall-clock instant), so decimated points snap to the same ticks
@@ -70,6 +79,43 @@ pub struct EnvPoint {
     /// renderer draw it differently.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interpolated: bool,
+}
+
+impl EnvPoint {
+    /// A point with no uncertainty band, not interpolated. Add either with
+    /// [`with_band`](Self::with_band) / [`with_interpolated`](Self::with_interpolated).
+    ///
+    /// The six required values are the boxplot summary: an undecimated point
+    /// has all five of `min`/`lo`/`median`/`hi`/`max` equal, so native and
+    /// decimated data share one shape.
+    pub fn new(t: f64, min: f64, lo: f64, median: f64, hi: f64, max: f64) -> Self {
+        Self {
+            t,
+            min,
+            lo,
+            median,
+            hi,
+            max,
+            unc_lo: None,
+            unc_hi: None,
+            interpolated: false,
+        }
+    }
+
+    /// Attach (or clear) the aggregated measurement-uncertainty band.
+    pub fn with_band(mut self, band: Option<(f64, f64)>) -> Self {
+        (self.unc_lo, self.unc_hi) = match band {
+            Some((lo, hi)) => (Some(lo), Some(hi)),
+            None => (None, None),
+        };
+        self
+    }
+
+    /// Mark this point as covering time the producer did not observe.
+    pub fn with_interpolated(mut self, interpolated: bool) -> Self {
+        self.interpolated = interpolated;
+        self
+    }
 }
 
 /// A decimated series plus the provenance a client needs to decide whether

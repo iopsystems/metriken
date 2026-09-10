@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-query 0.23.0
 
+- **Changed (breaking):** `EnvPoint` is `#[non_exhaustive]`, constructed with
+  `EnvPoint::new` plus `with_band`/`with_interpolated` (the shape `MatrixSample`
+  already uses). Literal construction from another crate no longer compiles.
+  Taken in the same release as the field addition below, since that addition is
+  breaking only because the struct could be built by literal — paying it once
+  makes the next field additive.
 - **Changed (breaking):** display-mode decimation carries the interpolated
   flag and the per-point bands. `EnvPoint` gains `interpolated: bool`, and
   `Reducer::reduce` takes `(points, bands, interpolated, budget, band)` where it

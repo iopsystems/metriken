@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `EnvPoint` is now `#[non_exhaustive]`**, built with
+  `EnvPoint::new(t, min, lo, median, hi, max)` plus `with_band` /
+  `with_interpolated` — the same shape `MatrixSample` already uses. Literal
+  construction from another crate no longer compiles.
+
+  Done deliberately in the same release as the field addition above: that
+  addition is a breaking change ONLY because the struct could be built by
+  literal, and this type gains a field whenever a new per-point property reaches
+  the display path. Paying it once here makes the next one additive.
+
 - **BREAKING: `EnvPoint` gains `interpolated`, and `Reducer::reduce` takes the
   per-point bands and flags.** `EnvPoint` has public fields and is not
   `#[non_exhaustive]`, so the added field breaks literal construction;
