@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duration — callers must not block, await, or re-enter the group inside it.
   Additive: existing implementors keep compiling on the defaults.
 
-### metriken 0.10.1
+### metriken 0.11.0
 
 - **Changed (breaking):** an owned `CounterGroup` entry that has never been
   written now reads back as `None` rather than `Some(0)`, matching what
@@ -42,10 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sentinel — and a zero there is a real starting value, with membership derived
   from the map's registered entries rather than from value presence. `load()`
   still returns values raw, sentinel included, to stay index-aligned; use
-  `value()` for a per-entry `Option`. **This needs a 0.11.0 minor bump before
-  release** (`metriken/Cargo.toml`, and the `metriken = "0.10.0"` pin in
-  `metriken-exposition/Cargo.toml`) — it is filed here under the in-progress
-  version rather than bumped unilaterally.
+  `value()` for a per-entry `Option`.
+### metriken 0.10.1
+
 - **Added:** `with_metadata` on `CounterGroup`, `GaugeGroup`, `HistogramGroup`,
   `WindowedCounterGroup`, and `WindowedGaugeGroup` — runs a closure against
   `Option<&HashMap<String, String>>` while holding the group's metadata read
@@ -62,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `for_each_metadata` that forwards to the inner group. Additive throughout —
   `load_metadata` and every existing signature are unchanged. Requires
   metriken-core 0.3.1 for the trait defaults it overrides.
+
+### metriken-exposition 0.20.0
+
+- **Changed (breaking):** requires `metriken` 0.11. No API change of its own —
+  but `metriken` 0.11 changes `CounterGroup::value()` for unwritten entries, and
+  a consumer cannot hold both 0.10 and 0.11 in one tree and still have the group
+  types unify. Consumers move in lockstep.
 
 ### metriken-exposition 0.19.0
 
@@ -120,7 +126,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the V2 invariant that the metadata copy cannot disagree with the
   embedded config.
 
-### metriken-query 0.21.1
+### metriken-query 0.22.0
+
+- **Changed (breaking):** requires `metriken-exposition` 0.20 (see that entry).
+- **Fixed (performance):** a parquet source parses its schema once instead of
+  per lookup. `parse_schema` walks every field in the file and eight call sites
+  re-ran it, so any "for each metric name" loop was O(names x columns) with
+  nothing memoised — `MetricsSource::total_series_count` is exactly that loop
+  and nothing overrides the default, so every consumer paid it. Measured on a
+  950-column, 14,210-series recording: `total_series_count()` 542 ms -> 12.9 ms
+  (5.6 ms warm), and a dashboard section render 598 ms -> 5.3 ms. The parse
+  depends only on `meta`, which never changes after construction, so the cache
+  needs no invalidation. Costs one `Vec<ColDesc>` per open source for its
+  lifetime.
 
 - **Fixed:** `rate`/`irate` no longer fabricate an acquisition window at a
   timestamp the producer never read. `interp_window` interpolates a window

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0]
+
+### Changed
+
+- **Requires `metriken-exposition` 0.20** (and through it `metriken` 0.11).
+  No API of this crate broke; the dependency crosses a breaking boundary, so
+  consumers move in lockstep.
+- **`rate`/`irate` no longer fabricate an acquisition window at a timestamp the
+  producer never read.** Interpolating a window between two bracketing samples
+  is right when a grid edge falls between adjacent reads, but across a hole — a
+  series null for a stretch — it invented a read and the band claimed a
+  precision nobody measured. Such a point now carries its value and no band,
+  flagged by the new `Point::interpolated`. The value across a hole is
+  unchanged: the total is known even though its distribution inside it is not.
+
+### Added
+
+- **`MatrixSample::bands`** — the per-value uncertainty band, present when ANY
+  value has one, with `None` at the values that do not. `intervals` is
+  all-or-nothing by construction and reports `None` for the whole series as
+  soon as one point lacks a band; `bands` is the lossless view. Additive:
+  `intervals` keeps its type and behaviour.
+- **`MatrixSample::interpolated`** — which values span a stretch the producer
+  did not read. A renderer needs this to draw an interpolated point differently
+  from a measured one; an uncertainty band cannot express it, because the
+  honest bound on an unobserved interval is not a number. Propagates through
+  scalar ops, aggregation and series-op-series the way bands do, and takes the
+  band with it: a result combining an interpolated operand carries no band.
+
+### Fixed
+
+- **A parquet source parses its schema once instead of per lookup.** Eight call
+  sites re-ran `parse_schema`, which walks every field in the file, so any "for
+  each metric name" loop was O(names x columns) with nothing memoised. Measured
+  on a 950-column, 14,210-series recording: `total_series_count()` 542 ms ->
+  12.9 ms (5.6 ms warm); a dashboard section render 598 ms -> 5.3 ms.
+
 ## [0.21.0]
 
 ### Added
