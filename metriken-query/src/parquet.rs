@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
@@ -1168,6 +1168,13 @@ pub(crate) struct ParquetSource {
     sampling_interval_ms: u64,
     /// Optional shared buffer pool for decoded row-group blocks.
     pool: Option<Arc<BufferPool>>,
+    /// The parsed schema, computed on first use.
+    ///
+    /// `parse_schema` walks every field in the file, so re-running it per
+    /// lookup makes any "for each metric name" loop O(names x columns). It
+    /// depends only on `meta`, which never changes after construction, so
+    /// there is nothing to invalidate.
+    columns: OnceLock<Vec<ColDesc>>,
 }
 
 fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
@@ -1307,28 +1314,40 @@ impl DataSource for FileSource {
     }
 
     fn columns_desc(&self) -> Vec<ColDesc> {
-        let ts = self
-            .0
-            .meta
-            .schema()
-            .index_of("timestamp")
-            .unwrap_or(usize::MAX);
-        parse_schema(&self.0, ts)
+        self.0.columns().to_vec()
     }
 }
 
 impl ParquetSource {
+    /// The parsed schema, parsed once and reused.
+    ///
+    /// One shared parse serves every caller even though they do *not* derive
+    /// `ts_col_idx` the same way. They resolve the same column -- each is
+    /// `index_of("timestamp")` -- and differ only in how they treat its
+    /// absence: the readers bail (`.ok()?`, `.map_err(..)?`) while the schema
+    /// helpers fall back to `usize::MAX`, which is what is cached here.
+    /// `parse_schema` spends the index solely on skipping that column, so
+    /// where the column exists every caller agrees on the parse, and where it
+    /// does not the callers that would have disagreed return before reaching
+    /// this cache. See
+    /// `a_source_with_no_timestamp_column_still_parses_and_reads_nothing`.
+    fn columns(&self) -> &[ColDesc] {
+        self.columns.get_or_init(|| {
+            let ts = self
+                .meta
+                .schema()
+                .index_of("timestamp")
+                .unwrap_or(usize::MAX);
+            parse_schema(self, ts)
+        })
+    }
+
     /// Schema-derived metric names whose column kind satisfies `want`.
     fn names_of(&self, want: impl Fn(&ColKind) -> bool) -> Vec<String> {
-        let ts = self
-            .meta
-            .schema()
-            .index_of("timestamp")
-            .unwrap_or(usize::MAX);
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for col in parse_schema(self, ts) {
+        for col in self.columns() {
             if want(&col.kind) {
-                names.insert(col.name);
+                names.insert(col.name.clone());
             }
         }
         names.into_iter().collect()
@@ -1341,13 +1360,8 @@ impl ParquetSource {
         name: &str,
         want: impl Fn(&ColKind) -> bool,
     ) -> Vec<std::collections::BTreeMap<String, String>> {
-        let ts = self
-            .meta
-            .schema()
-            .index_of("timestamp")
-            .unwrap_or(usize::MAX);
         let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
-        for col in parse_schema(self, ts) {
+        for col in self.columns() {
             if want(&col.kind) && col.name == name {
                 sets.push(col.labels.inner.clone());
             }
@@ -1369,6 +1383,7 @@ impl ParquetSource {
             meta,
             sampling_interval_ms,
             pool: None,
+            columns: OnceLock::new(),
         }))
     }
 
@@ -1381,6 +1396,7 @@ impl ParquetSource {
             meta,
             sampling_interval_ms,
             pool: None,
+            columns: OnceLock::new(),
         }))
     }
 
@@ -1393,6 +1409,7 @@ impl ParquetSource {
             meta,
             sampling_interval_ms,
             pool: None,
+            columns: OnceLock::new(),
         }))
     }
 
@@ -1406,6 +1423,7 @@ impl ParquetSource {
             meta,
             sampling_interval_ms,
             pool: Some(pool),
+            columns: OnceLock::new(),
         }))
     }
 
@@ -1421,6 +1439,7 @@ impl ParquetSource {
             meta,
             sampling_interval_ms,
             pool: Some(pool),
+            columns: OnceLock::new(),
         }))
     }
 
@@ -1433,6 +1452,7 @@ impl ParquetSource {
             meta,
             sampling_interval_ms,
             pool: Some(pool),
+            columns: OnceLock::new(),
         }))
     }
 
@@ -1520,13 +1540,15 @@ impl ParquetSource {
         let interval_ns = self.sampling_interval_ms * 1_000_000;
         let num_rgs = self.meta.metadata().num_row_groups();
 
-        let col_descs: Vec<ColDesc> = parse_schema(self, ts_col_idx)
-            .into_iter()
+        let col_descs: Vec<ColDesc> = self
+            .columns()
+            .iter()
             .filter(|c| {
                 matches!(c.kind, ColKind::Histogram { .. })
                     && c.name == name
                     && (filter.inner.is_empty() || c.labels.matches(filter))
             })
+            .cloned()
             .collect();
 
         if col_descs.is_empty() {
@@ -1575,16 +1597,11 @@ impl ParquetSource {
     }
 
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
-        let ts_col_idx = self
-            .meta
-            .schema()
-            .index_of("timestamp")
-            .unwrap_or(usize::MAX);
         let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
-        for c in parse_schema(self, ts_col_idx) {
-            out.entry(c.name)
+        for c in self.columns() {
+            out.entry(c.name.clone())
                 .or_default()
-                .insert(c.labels, c.column_name);
+                .insert(c.labels.clone(), c.column_name.clone());
         }
         out
     }
@@ -1621,6 +1638,7 @@ fn rg_classify(rg: &RowGroupMetaData, ts_col_idx: usize, start_ns: u64, end_ns: 
 
 // ─── Schema parsing ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 enum ColKind {
     Counter,
     Gauge,
@@ -1630,6 +1648,7 @@ enum ColKind {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct ColDesc {
     col_idx: usize,
     name: String,
@@ -2190,13 +2209,15 @@ fn read_counters(
     let interval_ns = pf.sampling_interval_ms * 1_000_000;
     let num_rgs = pf.meta.metadata().num_row_groups();
 
-    let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx)
-        .into_iter()
+    let cols: Vec<ColDesc> = pf
+        .columns()
+        .iter()
         .filter(|c| {
             matches!(c.kind, ColKind::Counter)
                 && c.name == name
                 && (filter.inner.is_empty() || c.labels.matches(filter))
         })
+        .cloned()
         .collect();
     if cols.is_empty() {
         return Ok(Counters { series: vec![] });
@@ -2316,13 +2337,15 @@ fn read_gauges(
     let interval_ns = pf.sampling_interval_ms * 1_000_000;
     let num_rgs = pf.meta.metadata().num_row_groups();
 
-    let cols: Vec<ColDesc> = parse_schema(pf, ts_col_idx)
-        .into_iter()
+    let cols: Vec<ColDesc> = pf
+        .columns()
+        .iter()
         .filter(|c| {
             matches!(c.kind, ColKind::Gauge)
                 && c.name == name
                 && (filter.inner.is_empty() || c.labels.matches(filter))
         })
+        .cloned()
         .collect();
     if cols.is_empty() {
         return Ok(Gauges { series: vec![] });
@@ -2676,6 +2699,97 @@ mod tests {
         let bytes = build_parquet_with_timestamps(&raw, 1000);
         let reader = ParquetReader::open_bytes(bytes).unwrap();
         assert_eq!(reader.sample_timestamps(), raw);
+    }
+
+    /// The parsed schema is computed once per source and reused.
+    ///
+    /// Every "for each metric name" loop -- `total_series_count`, `has_metric`,
+    /// a dashboard deciding which service templates a recording needs -- goes
+    /// through a per-name lookup, and each lookup used to re-walk every field
+    /// in the file. That made those loops O(names x columns): ~540ms on a real
+    /// 950-column recording, paid per call with nothing memoised.
+    ///
+    /// Slice identity is the assertion because it proves the parse did not
+    /// repeat; a timing budget would be flaky on a loaded machine.
+    #[test]
+    fn the_parsed_schema_is_parsed_once() {
+        let bytes = build_parquet_with_timestamps(&[1_000_000_000, 2_000_000_000], 1000);
+        let source = ParquetSource::open_bytes(bytes.into()).expect("fixture parquet is valid");
+
+        let first = source.columns().as_ptr();
+        let second = source.columns().as_ptr();
+        assert_eq!(
+            first, second,
+            "columns() re-parsed the schema instead of reusing the cached parse"
+        );
+
+        // The cached parse still answers the questions built on it.
+        assert_eq!(
+            source.names_of(|k| matches!(k, ColKind::Gauge)),
+            vec!["dummy_gauge".to_string()]
+        );
+        assert_eq!(
+            source.labels_of("dummy_gauge", |k| matches!(k, ColKind::Gauge)),
+            vec![std::collections::BTreeMap::new()]
+        );
+    }
+
+    /// A parquet with no `timestamp` column at all.
+    ///
+    /// This is the one case where the call sites disagree. They all resolve
+    /// the same column -- `index_of("timestamp")` -- but differ in what they
+    /// do when it is missing: the readers bail (`.ok()?`,
+    /// `.map_err(..)?`) while the schema helpers fall back to `usize::MAX`.
+    /// The cache uses the fallback, and `parse_schema` spends the index
+    /// solely on skipping that column, so the sites that would have
+    /// disagreed never reach the cached parse -- they return before touching
+    /// it. This pins that reasoning.
+    #[test]
+    fn a_source_with_no_timestamp_column_still_parses_and_reads_nothing() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "lonely_gauge",
+            DataType::Int64,
+            true,
+        )
+        .with_metadata(HashMap::from([
+            ("metric".to_string(), "lonely_gauge".to_string()),
+            ("metric_type".to_string(), "gauge".to_string()),
+        ]))]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2])) as ArrayRef],
+        )
+        .unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let source = ParquetSource::open_bytes(buf.into()).expect("a parquet without a timestamp");
+
+        // The schema helpers see the column, because nothing was skipped.
+        assert_eq!(
+            source.names_of(|k| matches!(k, ColKind::Gauge)),
+            vec!["lonely_gauge".to_string()]
+        );
+        // And the cache is still a cache.
+        assert_eq!(source.columns().as_ptr(), source.columns().as_ptr());
+
+        // The readers bail before they would consult it.
+        assert!(read_gauges(
+            &source,
+            "lonely_gauge",
+            &Labels::default(),
+            0,
+            u64::MAX,
+            false
+        )
+        .is_err());
     }
 
     #[test]
