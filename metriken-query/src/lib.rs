@@ -161,26 +161,14 @@ impl QueryOptions {
 }
 
 pub(crate) trait DataSource: Send + Sync {
-    /// `raw` requests the un-snapped acquisition timestamps (RateMode::Raw) —
-    /// the actual per-sample times — instead of the default nominal-grid-snapped
-    /// timestamps the query path normally emits. Sources with no snapping (live
-    /// MemoryStore) ignore it.
-    fn counters(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Counters>;
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Gauges>;
+    /// A source emits every sample at the timestamp it was recorded with.
+    /// These used to take a `raw` flag to ask for that instead of a
+    /// rounded-to-the-nominal-grid copy; there is no longer a second form to
+    /// choose between. RateMode::Raw still selects point PLACEMENT in the
+    /// streaming layer — see `Placement`.
+    fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64)
+        -> Option<Counters>;
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
     fn histogram_stream(
         &self,
         name: &str,
@@ -216,9 +204,9 @@ pub(crate) trait DataSource: Send + Sync {
     fn column_map(
         &self,
     ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>>;
-    /// Raw per-sample collection timestamps (ns since epoch), in row order --
-    /// the un-snapped `timestamp` column. Default empty for sources that do
-    /// not track one (e.g. a live `MemoryStore`).
+    /// Per-sample collection timestamps (ns since epoch), in row order — the
+    /// `timestamp` column as recorded. Default empty for sources that do not
+    /// track one (e.g. a live `MemoryStore`).
     ///
     /// This is on `DataSource` rather than only on the readers because a
     /// composite source has to gather it from its children through the trait;
@@ -531,28 +519,17 @@ pub trait MetricsSource: Send + Sync {
     /// exact nanosecond timestamps without floating-point precision loss.
     fn time_range_ns(&self) -> Option<(u64, u64)>;
 
-    /// Raw per-sample collection timestamps (ns since epoch), ascending, in
-    /// row order — the un-snapped `timestamp` column. Default empty for
-    /// sources that don't track it (e.g. live `MemoryStore`).
+    /// Per-sample collection timestamps (ns since epoch), ascending, in row
+    /// order — the `timestamp` column, as recorded. Default empty for sources
+    /// that don't track it (e.g. live `MemoryStore`).
+    ///
+    /// These are the instants the query path reads, so this is also the form
+    /// to use when deciding WHERE a series has data — for instance to build
+    /// [`QueryOptions::eval_timestamps`]. A parquet source used to round them
+    /// to a nominal grid, which is why a `snapped_sample_timestamps` companion
+    /// existed; nothing rounds them now.
     fn sample_timestamps(&self) -> Vec<u64> {
         Vec::new()
-    }
-
-    /// The same rows as [`sample_timestamps`](Self::sample_timestamps), snapped
-    /// to the nominal sampling grid exactly as the query path snaps them.
-    ///
-    /// This is the form to use when deciding WHERE a series has data — for
-    /// instance to build [`QueryOptions::eval_timestamps`]. The query path
-    /// indexes samples by the snapped value, so a caller reasoning from raw
-    /// values is reasoning about instants the engine will never produce: on a
-    /// 1 s nominal grid a row recorded at 1.5 s is indexed at 2.0 s, and asking
-    /// for a value at 1.5 s falls before the series' first sample and silently
-    /// yields no point.
-    ///
-    /// Defaults to the raw form, which is correct for sources that do not
-    /// snap.
-    fn snapped_sample_timestamps(&self) -> Vec<u64> {
-        self.sample_timestamps()
     }
 }
 

@@ -533,7 +533,6 @@ impl DataSource for SegmentedSource {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
-        raw: bool,
     ) -> Option<Counters> {
         // Slots sized/positioned from the open-time identity index: O(1)
         // per incoming sample instead of the O(series) `Vec` scan splicing
@@ -546,7 +545,7 @@ impl DataSource for SegmentedSource {
         }
         let mut slots: Vec<Option<Counter>> = (0..order.len()).map(|_| None).collect();
         for seg in &self.segments {
-            let Some(chunk) = seg.counters(name, filter, start_ns, end_ns, raw) else {
+            let Some(chunk) = seg.counters(name, filter, start_ns, end_ns) else {
                 continue;
             };
             for c in chunk.series {
@@ -573,21 +572,14 @@ impl DataSource for SegmentedSource {
         }
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Gauges> {
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let order = self.gauge_identity.order(name);
         if order.is_empty() {
             return None;
         }
         let mut slots: Vec<Option<Gauge>> = (0..order.len()).map(|_| None).collect();
         for seg in &self.segments {
-            let Some(chunk) = seg.gauges(name, filter, start_ns, end_ns, raw) else {
+            let Some(chunk) = seg.gauges(name, filter, start_ns, end_ns) else {
                 continue;
             };
             for g in chunk.series {
@@ -811,21 +803,11 @@ impl MetricsSource for SegmentedParquetReader {
     }
 
     fn sample_timestamps(&self) -> Vec<u64> {
-        // Raw (un-snapped) per-sample timestamps, concatenated in segment
-        // order — same splice contract as the query path, no sort/dedup.
+        // Per-sample timestamps, concatenated in segment order — same splice
+        // contract as the query path, no sort/dedup.
         let mut out = Vec::new();
         for s in &self.segments {
             out.extend(s.sample_timestamps());
-        }
-        out
-    }
-
-    fn snapped_sample_timestamps(&self) -> Vec<u64> {
-        // Same splice contract as the raw form; each segment snaps its own
-        // rows the way the query path will read them.
-        let mut out = Vec::new();
-        for s in &self.segments {
-            out.extend(s.snapped_sample_timestamps());
         }
         out
     }

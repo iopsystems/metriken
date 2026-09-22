@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **BREAKING: the parquet read path no longer rounds timestamps to a nominal
+  sampling grid.** Every timestamp it decoded was replaced with
+  `round(ts / sampling_interval_ms)`. That discarded the one thing a recording
+  states exactly — when each row was read — in favour of a figure it merely
+  declares, and a file that declared the wrong one, or omitted the key (the
+  reader then assumed 1000 ms), had its rows moved rather than merely described
+  oddly. At a 100 ms cadence all ten rows of a second landed on one instant and
+  nine of the ten values were lost, so a sub-second query returned
+  held-forward copies of each second's survivor instead of the signal.
+
+  The declared interval is still read and is still the staleness hint, where
+  being approximate costs nothing. `MemoryStore::ingest_snapshot` likewise
+  stores a snapshot at the timestamp it carries.
+
+  Callers reading a sub-second recording will see values change — that is the
+  fix. Callers on a 1 s cadence see sample timestamps keep their sub-second
+  offsets instead of being rounded to the second.
+
+### Changed
+
+- **BREAKING: `MetricsSource::snapped_sample_timestamps` and
+  `ParquetReader::snapped_sample_timestamps` are removed.** They existed to
+  show a caller what the rounding had done to the instants a series has data
+  at, so that `QueryOptions::eval_timestamps` could be built against them.
+  `sample_timestamps` is that answer for every source now.
+
+  The internal `DataSource::counters`/`gauges` lost their `raw` parameter for
+  the same reason: it chose between the rounded and unrounded forms, and there
+  is one form. `RateMode::Raw` is unaffected — it still selects point
+  placement in the streaming layer.
+
 ## [0.23.0]
 
 ### Changed

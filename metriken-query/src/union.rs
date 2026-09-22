@@ -138,22 +138,14 @@ impl DataSource for UnionSource {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
-        raw: bool,
     ) -> Option<Counters> {
         let i = *self.counter_index.get(name)?;
-        self.children[i].counters(name, filter, start_ns, end_ns, raw)
+        self.children[i].counters(name, filter, start_ns, end_ns)
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Gauges> {
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let i = *self.gauge_index.get(name)?;
-        self.children[i].gauges(name, filter, start_ns, end_ns, raw)
+        self.children[i].gauges(name, filter, start_ns, end_ns)
     }
 
     fn histogram_stream(
