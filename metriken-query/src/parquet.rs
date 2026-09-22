@@ -327,7 +327,7 @@ impl ParquetReader {
         let (start, end) = self.time_range_ns()?;
         let filter = Labels::default();
         for (pf, _extra) in &self.inner.files {
-            let counters = pf.counters(name, &filter, start, end, false)?;
+            let counters = pf.counters(name, &filter, start, end)?;
             if let Some(c) = counters.series.into_iter().next() {
                 return c.windows;
             }
@@ -408,17 +408,10 @@ impl ParquetReader {
         self.engine.columns(query)
     }
 
-    /// Raw per-sample collection timestamps (ns since epoch), ascending, in
-    /// row order — the un-snapped `timestamp` column, concatenated across
-    /// all files. Unlike query results, this is never gridded or rounded.
+    /// Per-sample collection timestamps (ns since epoch), ascending, in row
+    /// order — the `timestamp` column, concatenated across all files.
     pub fn sample_timestamps(&self) -> Vec<u64> {
         self.inner.sample_timestamps()
-    }
-
-    /// Sample timestamps snapped to the nominal grid, as the query path sees
-    /// them. See [`MetricsSource::snapped_sample_timestamps`].
-    pub fn snapped_sample_timestamps(&self) -> Vec<u64> {
-        self.inner.snapped_sample_timestamps()
     }
 }
 
@@ -500,10 +493,6 @@ impl MetricsSource for ParquetReader {
 
     fn sample_timestamps(&self) -> Vec<u64> {
         self.sample_timestamps()
-    }
-
-    fn snapped_sample_timestamps(&self) -> Vec<u64> {
-        self.snapped_sample_timestamps()
     }
 }
 
@@ -791,14 +780,13 @@ impl DataSource for MultiParquetSource {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
-        raw: bool,
     ) -> Option<Counters> {
         let series: Vec<Counter> = self
             .files
             .iter()
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
-                let counters = pf.counters(name, &pq_filter, start_ns, end_ns, raw)?;
+                let counters = pf.counters(name, &pq_filter, start_ns, end_ns)?;
                 Some((counters.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
@@ -822,20 +810,13 @@ impl DataSource for MultiParquetSource {
         }
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Gauges> {
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let series: Vec<Gauge> = self
             .files
             .iter()
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
-                let gauges = pf.gauges(name, &pq_filter, start_ns, end_ns, raw)?;
+                let gauges = pf.gauges(name, &pq_filter, start_ns, end_ns)?;
                 Some((gauges.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
@@ -1012,33 +993,12 @@ impl DataSource for MultiParquetSource {
 }
 
 impl MultiParquetSource {
-    /// Raw `timestamp` column values across every file, in file-list then
-    /// row-group order — un-snapped, unlike the query path (`read_timestamps`)
-    /// which rounds to the nominal sampling grid.
+    /// `timestamp` column values across every file, in file-list then
+    /// row-group order.
     fn sample_timestamps(&self) -> Vec<u64> {
         let mut out = Vec::new();
         for (pf, _labels) in &self.files {
             out.extend(pf.sample_timestamps());
-        }
-        out
-    }
-
-    /// The same rows as [`Self::sample_timestamps`], snapped to the nominal
-    /// sampling grid exactly as the query path snaps them.
-    ///
-    /// Use this, not the raw form, to say WHERE a series has data. The query
-    /// path indexes samples by the snapped value, so a caller that reasons
-    /// about sample positions from raw values is reasoning about instants the
-    /// engine will never produce: on a 1 s nominal grid a row recorded at
-    /// 1.5 s is indexed at 2.0 s, and asking for a value at 1.5 s falls before
-    /// the series' first sample and yields nothing at all.
-    fn snapped_sample_timestamps(&self) -> Vec<u64> {
-        let interval_ns = (self.interval() * 1e9) as u64;
-        let mut out = self.sample_timestamps();
-        if interval_ns > 0 {
-            for t in &mut out {
-                *t = snap_timestamp(*t, interval_ns);
-            }
         }
         out
     }
@@ -1212,20 +1172,12 @@ impl DataSource for FileSource {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
-        raw: bool,
     ) -> Option<Counters> {
-        read_counters(&self.0, name, filter, start_ns, end_ns, raw).ok()
+        read_counters(&self.0, name, filter, start_ns, end_ns).ok()
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Gauges> {
-        read_gauges(&self.0, name, filter, start_ns, end_ns, raw).ok()
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        read_gauges(&self.0, name, filter, start_ns, end_ns).ok()
     }
 
     fn histogram_stream(
@@ -1537,7 +1489,6 @@ impl ParquetSource {
         end_ns: u64,
     ) -> Option<HistogramStream> {
         let ts_col_idx = self.meta.schema().index_of("timestamp").ok()?;
-        let interval_ns = self.sampling_interval_ms * 1_000_000;
         let num_rgs = self.meta.metadata().num_row_groups();
 
         let col_descs: Vec<ColDesc> = self
@@ -1582,7 +1533,6 @@ impl ParquetSource {
         let cursor = ParquetHistogramCursor {
             pf: Arc::clone(self),
             ts_col_idx,
-            interval_ns,
             start_ns,
             end_ns,
             col_descs,
@@ -1813,12 +1763,6 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
 
 // ─── Timestamp reader ─────────────────────────────────────────────────────────
 
-fn snap_timestamp(ts: u64, interval_ns: u64) -> u64 {
-    (ts + interval_ns / 2)
-        .checked_div(interval_ns)
-        .map_or(ts, |q| q * interval_ns)
-}
-
 /// Run a parquet decode block, catching any panic from the parquet crate so a
 /// malformed file (e.g. dictionary pages out of order — apache/arrow-rs has
 /// known panics like "Decoder for dict should have been set") doesn't crash
@@ -1870,11 +1814,20 @@ fn ensure_panic_hook_installed() {
     });
 }
 
+/// The `timestamp` column of one row group, as recorded.
+///
+/// These used to be rounded to a nominal sampling grid derived from the
+/// file's `sampling_interval_ms`. That discarded the one thing the file
+/// states exactly — when each row was read — in favour of a value it only
+/// declares, and a file that declared the wrong one (or, lacking the key,
+/// inherited the 1000 ms default) had its rows moved: at a 100 ms cadence all
+/// ten rows of a second landed on the same instant and nine of the ten values
+/// were lost. A cadence is still useful as a staleness hint, where being
+/// approximate costs nothing; it has no business rewriting the data.
 fn read_timestamps(
     pf: &ParquetSource,
     rg_idx: usize,
     ts_col_idx: usize,
-    interval_ns: u64,
 ) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
     let key = CacheKey {
         source_id: pf.id,
@@ -1918,9 +1871,7 @@ fn read_timestamps(
                     .downcast_ref::<UInt64Array>()
                     .ok_or::<Box<dyn Error>>("timestamp column is not UInt64".into())?;
                 out.reserve(arr.len());
-                for v in arr.iter() {
-                    out.push(v.map(|raw| snap_timestamp(raw, interval_ns)));
-                }
+                out.extend(arr.iter());
             }
             Ok(out)
         });
@@ -1949,11 +1900,11 @@ fn read_timestamps(
     Ok(result)
 }
 
-/// Read raw UInt64 values from `col_idx` in a single row group, in row
-/// order, dropping nulls. Unlike `read_timestamps`, this does NOT snap to
-/// the sampling grid and does NOT go through the buffer pool (which caches
-/// only the snapped form) — callers that need the true on-disk values
-/// (e.g. jitter visualization) need the untouched column.
+/// Read UInt64 values from `col_idx` in a single row group, in row order,
+/// dropping nulls. Unlike `read_timestamps` this returns a dense `Vec<u64>`
+/// rather than a nullable one and does not go through the buffer pool, which
+/// is what a caller reading a column for its own sake (e.g. jitter
+/// visualization) wants.
 fn read_raw_u64_rg(
     pf: &ParquetSource,
     rg_idx: usize,
@@ -2193,7 +2144,6 @@ fn read_counters(
     filter: &Labels,
     start_ns: u64,
     end_ns: u64,
-    raw: bool,
 ) -> Result<Counters, Box<dyn Error>> {
     let ts_col_idx = pf
         .meta
@@ -2206,7 +2156,6 @@ fn read_counters(
     // [begin, begin+elapsed] formula the agent uses, just per-snapshot. Lets old
     // (windowless) recordings carry rate() uncertainty.
     let dur_col_idx = pf.meta.schema().index_of("duration").ok();
-    let interval_ns = pf.sampling_interval_ms * 1_000_000;
     let num_rgs = pf.meta.metadata().num_row_groups();
 
     let cols: Vec<ColDesc> = pf
@@ -2248,15 +2197,12 @@ fn read_counters(
             RgClass::Before | RgClass::After => continue,
             _ => {}
         }
-        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
-        // Window offsets were written by the recorder relative to the RAW
-        // (un-snapped) timestamp, and `time_range`/the stats bounds are raw too,
-        // so filter and reconstruct windows against the raw column; the emitted
-        // point keeps the snapped grid for cross-series alignment. (The ts column
-        // is non-nullable, so the raw Vec aligns 1:1 with the snapped one; guard
-        // on length and fall back to snapped if that ever fails to hold.)
-        let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
-        let raw_aligned = raw_ts.len() == timestamps.len();
+        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx)?;
+        // Window offsets were written by the recorder relative to the row's
+        // own timestamp, which is what `read_timestamps` now returns — so the
+        // column this reconstructs windows against and the column the point is
+        // emitted at are the same one. They were not while the read path
+        // snapped, which is why this used to decode the column a second time.
         // Per-snapshot collection duration for the fleet fallback window.
         let durations = dur_col_idx
             .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
@@ -2278,12 +2224,13 @@ fn read_counters(
                 .transpose()?;
             for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
-                    let base = if raw_aligned { raw_ts[row] } else { *ts };
+                    let base = *ts;
                     if base >= start_ns && base <= end_ns {
-                        // Raw mode emits at the actual (un-snapped) acquisition
-                        // time; the default grid path emits the snapped nominal
-                        // timestamp for cross-series alignment.
-                        ts_acc[i].push(if raw { base } else { *ts });
+                        // One timestamp, both modes: the row's own. `raw`
+                        // still selects point PLACEMENT in the streaming
+                        // layer (see `Placement`), but there is no longer a
+                        // second, rounded timestamp for it to choose between.
+                        ts_acc[i].push(base);
                         val_acc[i].push(*v);
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
@@ -2325,7 +2272,6 @@ fn read_gauges(
     filter: &Labels,
     start_ns: u64,
     end_ns: u64,
-    raw: bool,
 ) -> Result<Gauges, Box<dyn Error>> {
     let ts_col_idx = pf
         .meta
@@ -2334,7 +2280,6 @@ fn read_gauges(
         .map_err(|_| "missing timestamp")?;
     // Snapshot collection duration for the fleet fallback window (see read_counters).
     let dur_col_idx = pf.meta.schema().index_of("duration").ok();
-    let interval_ns = pf.sampling_interval_ms * 1_000_000;
     let num_rgs = pf.meta.metadata().num_row_groups();
 
     let cols: Vec<ColDesc> = pf
@@ -2374,12 +2319,9 @@ fn read_gauges(
             RgClass::Before | RgClass::After => continue,
             _ => {}
         }
-        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx, interval_ns)?;
-        // See read_counters: windows and the stats time range live in RAW
-        // timestamp space, so filter and anchor windows on the raw column while
-        // emitting the snapped grid point for alignment.
-        let raw_ts = read_raw_u64_rg(pf, rg_idx, ts_col_idx)?;
-        let raw_aligned = raw_ts.len() == timestamps.len();
+        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx)?;
+        // See read_counters: the window anchor and the emitted point are the
+        // same timestamp now that nothing rounds it.
         let durations = dur_col_idx
             .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
             .transpose()?;
@@ -2400,12 +2342,13 @@ fn read_gauges(
                 .transpose()?;
             for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
-                    let base = if raw_aligned { raw_ts[row] } else { *ts };
+                    let base = *ts;
                     if base >= start_ns && base <= end_ns {
-                        // Raw mode emits at the actual (un-snapped) acquisition
-                        // time; the default grid path emits the snapped nominal
-                        // timestamp for cross-series alignment.
-                        ts_acc[i].push(if raw { base } else { *ts });
+                        // One timestamp, both modes: the row's own. `raw`
+                        // still selects point PLACEMENT in the streaming
+                        // layer (see `Placement`), but there is no longer a
+                        // second, rounded timestamp for it to choose between.
+                        ts_acc[i].push(base);
                         val_acc[i].push(*v);
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
@@ -2448,7 +2391,6 @@ fn read_gauges(
 struct ParquetHistogramCursor {
     pf: Arc<ParquetSource>,
     ts_col_idx: usize,
-    interval_ns: u64,
     start_ns: u64,
     end_ns: u64,
     /// Pre-filtered histogram columns for this metric, in series-index order.
@@ -2464,9 +2406,7 @@ impl ParquetHistogramCursor {
     /// Returns false if no more row groups remain.
     fn fill_next_rg(&mut self) -> bool {
         while let Some(rg_idx) = self.rg_queue.pop_front() {
-            let Ok(timestamps) =
-                read_timestamps(&self.pf, rg_idx, self.ts_col_idx, self.interval_ns)
-            else {
+            let Ok(timestamps) = read_timestamps(&self.pf, rg_idx, self.ts_col_idx) else {
                 continue;
             };
 
@@ -2688,7 +2628,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_timestamps_returns_raw_unsnapped_values() {
+    fn sample_timestamps_are_the_recorded_values() {
         // 1s nominal interval, but samples are jittered off the grid.
         let raw: Vec<u64> = vec![
             1_000_000_000, // t0
@@ -2699,6 +2639,78 @@ mod tests {
         let bytes = build_parquet_with_timestamps(&raw, 1000);
         let reader = ParquetReader::open_bytes(bytes).unwrap();
         assert_eq!(reader.sample_timestamps(), raw);
+    }
+
+    /// One row per gauge value, so a collapsed row is visible as a repeated
+    /// value rather than only as a missing timestamp.
+    fn build_parquet_counting_rows(raw: &[u64], sampling_interval_ms: u64) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("dummy_gauge", DataType::Int64, true).with_metadata(HashMap::from([
+                ("metric".to_string(), "dummy_gauge".to_string()),
+                ("metric_type".to_string(), "gauge".to_string()),
+            ])),
+        ]));
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some(sampling_interval_ms.to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        let ts_array = Arc::new(UInt64Array::from(raw.to_vec())) as ArrayRef;
+        let values: Vec<i64> = (0..raw.len() as i64).collect();
+        let gauge_array = Arc::new(Int64Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ts_array, gauge_array]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// A file's declared `sampling_interval_ms` does not move its rows.
+    ///
+    /// The read path used to round every timestamp to that declared grid. A
+    /// file whose declaration was wrong — or absent, which the reader treats
+    /// as 1000 ms — therefore lost data rather than merely being described
+    /// oddly: at a 100 ms cadence all ten rows of a second rounded onto the
+    /// same instant, and only one of the ten values survived to be read back.
+    /// This file declares exactly that wrong interval.
+    ///
+    /// The assertion is on VALUES, not on how many points come back. A range
+    /// query emits one point per `start + k·step` whatever the data does, so a
+    /// point count is fixed by the query and would pass either way; it is the
+    /// values that reveal nine rows in ten having been thrown away and the
+    /// survivor held forward in their place.
+    #[test]
+    fn a_wrong_declared_interval_does_not_move_the_rows() {
+        // 100 ms cadence, declared as 1 s. Row i carries the value i.
+        let raw: Vec<u64> = (0..25).map(|i| 1_000_000_000 + i * 100_000_000).collect();
+        let bytes = build_parquet_counting_rows(&raw, 1000);
+        let reader = ParquetReader::open_bytes(bytes).unwrap();
+        assert_eq!(reader.sample_timestamps(), raw);
+
+        let result = reader
+            .query_range("dummy_gauge", 1.0, 3.4, 0.1)
+            .expect("a sub-second range query must answer");
+        let QueryResult::Matrix { result } = result else {
+            panic!("expected a matrix, got {result:?}");
+        };
+        let values: Vec<f64> = result
+            .first()
+            .expect("one series")
+            .values
+            .iter()
+            .map(|(_, v)| *v)
+            .collect();
+        let expected: Vec<f64> = (0..25).map(|i| i as f64).collect();
+        assert_eq!(
+            values, expected,
+            "every row read back at its own instant; a rounded grid would repeat \
+             each second's surviving value ten times"
+        );
     }
 
     /// The parsed schema is computed once per source and reused.
@@ -2781,15 +2793,7 @@ mod tests {
         assert_eq!(source.columns().as_ptr(), source.columns().as_ptr());
 
         // The readers bail before they would consult it.
-        assert!(read_gauges(
-            &source,
-            "lonely_gauge",
-            &Labels::default(),
-            0,
-            u64::MAX,
-            false
-        )
-        .is_err());
+        assert!(read_gauges(&source, "lonely_gauge", &Labels::default(), 0, u64::MAX).is_err());
     }
 
     #[test]

@@ -266,27 +266,19 @@ impl DataSource for MemoryStoreInner {
         filter: &Labels,
         start_ns: u64,
         end_ns: u64,
-        raw: bool,
     ) -> Option<Counters> {
-        // Live in-memory samples aren't grid-snapped, so `raw` is a no-op here.
+        // Nothing rounds a sample's timestamp, so `raw` is a no-op here.
         self.memory
             .read()
             .unwrap()
-            .counters(name, filter, start_ns, end_ns, raw)
+            .counters(name, filter, start_ns, end_ns)
     }
 
-    fn gauges(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-        raw: bool,
-    ) -> Option<Gauges> {
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         self.memory
             .read()
             .unwrap()
-            .gauges(name, filter, start_ns, end_ns, raw)
+            .gauges(name, filter, start_ns, end_ns)
     }
 
     fn histogram_stream(
@@ -430,9 +422,11 @@ impl MetricsSource for MemoryStore {
 
 #[cfg(feature = "ingest")]
 impl MemoryStore {
-    /// Ingest a single snapshot into the store. Snapshot timestamp is snapped
-    /// to the nearest sampling-interval boundary so multiple samplers within
-    /// one collection cycle align.
+    /// Ingest a single snapshot into the store, at the timestamp the snapshot
+    /// carries. Every metric in one snapshot shares that timestamp, so they
+    /// align by construction; this used to additionally round it to the
+    /// store's nominal interval, which moved readings the producer had already
+    /// timed exactly.
     ///
     /// For histograms: a `HistogramSnapshot` is stored representing the
     /// cumulative (running) bucket counts. Quantile/rate computations are
@@ -447,8 +441,7 @@ impl MemoryStore {
             .as_nanos() as u64;
 
         let mut memory = self.state.memory.write().unwrap();
-        let interval_ns = memory.interval_ms() * 1_000_000;
-        let ts = snap_timestamp(raw_ts, interval_ns);
+        let ts = raw_ts;
 
         for counter in snapshot.counters() {
             let (name, labels) = extract_name_labels(&counter.metadata, &counter.name);
@@ -467,14 +460,6 @@ impl MemoryStore {
             memory.upsert_histogram_sample(&name, labels, config, ts, snap);
         }
     }
-}
-
-#[cfg(feature = "ingest")]
-fn snap_timestamp(raw_ts: u64, interval_ns: u64) -> u64 {
-    if interval_ns == 0 {
-        return raw_ts;
-    }
-    ((raw_ts + interval_ns / 2) / interval_ns) * interval_ns
 }
 
 #[cfg(feature = "ingest")]

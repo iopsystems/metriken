@@ -384,13 +384,7 @@ where
             let data_start = ctx.start_ns.saturating_sub(lookback);
             let counters = ctx
                 .source
-                .counters(
-                    metric_name,
-                    &filter,
-                    data_start,
-                    ctx.end_ns,
-                    matches!(ctx.rate_mode, RateMode::Raw),
-                )
+                .counters(metric_name, &filter, data_start, ctx.end_ns)
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = counters
                 .series
@@ -441,13 +435,7 @@ where
         "avg_over_time" => {
             let gauges = ctx
                 .source
-                .gauges(
-                    metric_name,
-                    &filter,
-                    data_start,
-                    ctx.end_ns,
-                    matches!(ctx.rate_mode, RateMode::Raw),
-                )
+                .gauges(metric_name, &filter, data_start, ctx.end_ns)
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = gauges
                 .series
@@ -476,13 +464,7 @@ where
         "idelta" => {
             let gauges = ctx
                 .source
-                .gauges(
-                    metric_name,
-                    &filter,
-                    data_start,
-                    ctx.end_ns,
-                    matches!(ctx.rate_mode, RateMode::Raw),
-                )
+                .gauges(metric_name, &filter, data_start, ctx.end_ns)
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = gauges
                 .series
@@ -511,13 +493,10 @@ where
         "deriv" => {
             // Try gauge path first; fall back to counter 2nd-derivative.
             let deriv_data_start = ctx.start_ns.saturating_sub(ctx.step_ns.saturating_mul(2));
-            if let Some(gauges) = ctx.source.gauges(
-                metric_name,
-                &filter,
-                deriv_data_start,
-                ctx.end_ns,
-                matches!(ctx.rate_mode, RateMode::Raw),
-            ) {
+            if let Some(gauges) =
+                ctx.source
+                    .gauges(metric_name, &filter, deriv_data_start, ctx.end_ns)
+            {
                 let series: SeriesSet<'a> = gauges
                     .series
                     .into_iter()
@@ -543,13 +522,7 @@ where
             }
             let counters = ctx
                 .source
-                .counters(
-                    metric_name,
-                    &filter,
-                    deriv_data_start,
-                    ctx.end_ns,
-                    matches!(ctx.rate_mode, RateMode::Raw),
-                )
+                .counters(metric_name, &filter, deriv_data_start, ctx.end_ns)
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
             let series: SeriesSet<'a> = counters
                 .series
@@ -642,13 +615,7 @@ where
 
     let gauges = ctx
         .source
-        .gauges(
-            metric_name,
-            &filter,
-            data_start,
-            ctx.end_ns,
-            matches!(ctx.rate_mode, RateMode::Raw),
-        )
+        .gauges(metric_name, &filter, data_start, ctx.end_ns)
         .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
 
     let series: SeriesSet<'a> = gauges

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.24.0
+
+- **Fixed (breaking):** the parquet read path no longer rounds timestamps to a
+  nominal sampling grid. Every timestamp it decoded used to be replaced with
+  `round(ts / sampling_interval_ms)`, which discarded the one thing the file
+  states exactly — when each row was read — in favour of a value it merely
+  declares. A file whose declaration was wrong, or absent (the reader assumed
+  1000 ms), therefore lost data rather than being described oddly: at a 100 ms
+  cadence all ten rows of a second landed on one instant and nine of the ten
+  values were dropped, so a sub-second query returned held-forward copies of
+  each second's survivor. The declared interval is still read, and is still the
+  staleness hint, where being approximate costs nothing. `MemoryStore` likewise
+  ingests a snapshot at the timestamp it carries.
+- **Changed (breaking):** `MetricsSource::snapped_sample_timestamps` and
+  `ParquetReader::snapped_sample_timestamps` are removed. They existed to
+  expose what the rounding did to a caller deciding where a series has data;
+  `sample_timestamps` is now that answer for every source. The internal
+  `DataSource::counters`/`gauges` lost their `raw` parameter for the same
+  reason — it selected between the two forms, and there is one. `RateMode::Raw`
+  is unaffected: it still selects point placement in the streaming layer.
+
 ### metriken-core 0.3.1
 
 - **Added:** `with_metadata`/`for_each_metadata` default methods on
