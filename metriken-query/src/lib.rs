@@ -60,6 +60,7 @@ pub use promql::{
     referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
 };
 pub use segmented::SegmentedParquetReader;
+pub use types::HistogramSnapshot;
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
 use histogram_stream::HistogramStream;

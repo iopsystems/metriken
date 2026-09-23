@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.26.0
+
+- **Added:** `MemoryStore` takes whole series: `insert_counter_series`,
+  `insert_gauge_series` and `insert_histogram_series` add a series with its
+  timestamps, values and — for counters and gauges — the per-sample
+  acquisition windows that `rate()`/`irate()` turn into uncertainty bounds,
+  which the ingest path could not carry. `set_sample_timestamps` declares
+  the rows a store assembled from a table stands for; without it the store
+  reports the union of its series' timestamps. `UnionChild` composes a
+  `MemoryStore` beside parquet readers, `HistogramSnapshot` is public, and
+  `Labels` converts from a `BTreeMap<String, String>`. For a reader that
+  builds series itself — one that splits a table's columns by occupant
+  through an identity index — and hands them to the engine.
+- **Fixed:** a `MemoryStore` counter or gauge series that carried windows had
+  them dropped on read; they are sliced with the samples now.
+
 ### metriken-core 0.3.2
 
 - **Added:** `metadata_version()` on `CounterGroupMetric`, `GaugeGroupMetric`
