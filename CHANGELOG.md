@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.25.0
+
+- **Added:** `is_internal_label(name)`, `is_storage_key(key)` and
+  `STORAGE_KEYS` are public. A label whose name begins with `__` is internal,
+  following Prometheus: part of a series' identity and matchable in a
+  selector, and dropped by `without` and by default binary-op matching
+  alongside `__name__`. This crate emits internal labels on every result;
+  hiding them from listings and legends is the consumer's contract, which is
+  why the predicate is public. The engine's own internal labels are
+  `__name__` and `__run__`; a reader above this crate may add its own under
+  the same rule. Consumers that check for `__name__` by name should use the
+  predicate.
+- **Changed (breaking):** `without (...)` and `ignoring (...)` drop every
+  label whose name begins with `__`; `__name__` was the only one dropped
+  before. Default binary-op matching ignores the same set. The observable
+  difference today is on a histogram whose bucket configuration changed
+  mid-recording: `histogram_mean without (cpu) (latency{__run__="1"})`
+  returned series labelled `{__name__, __run__="1"}` and now returns
+  `{__name__}`. The values are the same, because a run is selected before
+  any aggregation and runs are never merged; a consumer keying on the full
+  result label set sees the change. It is what lets a reader split a series
+  by incarnation without breaking `a / sum(a)`.
+- **Fixed (breaking):** the `ingest` loader and the parquet loader derive
+  labels from one function (`Labels::from_metadata`) and one storage-key
+  list. They had drifted: the live path kept `grouping_power` and
+  `max_value_power` as labels where the parquet path stripped them, so a
+  recording viewed live carried two extra labels per histogram series that
+  the same recording read from disk did not. Those two labels are gone from
+  the live path. `STORAGE_KEYS` is pinned by a test, and each loader has a
+  test that a histogram column carrying every storage key yields no label
+  from them.
+
 ### metriken-query 0.24.0
 
 - **Fixed (breaking):** the parquet read path no longer rounds timestamps to a

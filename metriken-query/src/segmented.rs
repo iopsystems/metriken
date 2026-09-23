@@ -432,11 +432,11 @@ fn merge_gauge(a: &mut Gauge, g: Gauge) {
 /// histogram identity that [`HistogramRunIndex`] found split across
 /// incompatible configs.
 ///
-/// `__run__` is therefore a RESERVED label name (mirroring how
-/// `:window_begin`/`:window_width` are reserved column-name suffixes, see
-/// parquet.rs) — a real user label with that name (e.g. from `record
-/// --label __run__=x`) would otherwise be silently overwritten here, which
-/// is exactly the silent-coercion class this feature exists to prevent.
+/// `__run__` is therefore a RESERVED label name — an internal label under
+/// the `__` rule (`labels::is_internal_label`), like `__name__` — a real user
+/// label with that name (e.g. from `record --label __run__=x`) would
+/// otherwise be silently overwritten here, which is exactly the
+/// silent-coercion class this feature exists to prevent.
 fn relabel_with_run(mut stream: HistogramStream, run: usize) -> HistogramStream {
     for labels in &mut stream.meta.series {
         debug_assert!(
@@ -2086,6 +2086,36 @@ mod tests {
         };
         assert_eq!(result.len(), 1);
         assert!(result[0].values.iter().any(|(_, v)| *v > 0.0));
+    }
+
+    /// The parquet loader's twin of `ingest_does_not_turn_histogram_configuration_into_labels`:
+    /// a histogram column whose field metadata carries the storage keys yields
+    /// a label set with none of them. Both loaders derive labels from
+    /// `Labels::from_metadata`, so this and its twin are what notice a
+    /// pre-filter added to one loader and not the other — the shape the
+    /// drift had before the shared list existed.
+    #[test]
+    fn parquet_does_not_turn_histogram_configuration_into_labels() {
+        let n = ::histogram::Config::new(3, 8).unwrap().total_buckets();
+        let seg = segment_histogram("latency", 3, 8, &[(1_000_000_000, vec![1; n])]);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+
+        let single = ParquetReader::open_bytes_with_pool(seg.clone(), Arc::clone(&pool)).unwrap();
+        let labels = single.histogram_labels("latency");
+        assert_eq!(
+            labels,
+            vec![BTreeMap::new()],
+            "single-file reader: {labels:?}"
+        );
+
+        let segmented =
+            SegmentedParquetReader::open_bytes_with_pool(vec![seg], Arc::clone(&pool)).unwrap();
+        let labels = segmented.histogram_labels("latency");
+        assert_eq!(
+            labels,
+            vec![BTreeMap::new()],
+            "segmented reader: {labels:?}"
+        );
     }
 
     #[test]

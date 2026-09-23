@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use promql_parser::parser::token::TokenType;
 
-use crate::labels::Labels;
+use crate::labels::{is_internal_label, Labels};
 
 use super::{Band, LabeledSeries, Point, RateEdges, SeriesSet};
 
@@ -289,8 +289,11 @@ fn match_key(labels: &Labels, spec: MatchSpec<'_>) -> BTreeMap<String, String> {
     let mut k = BTreeMap::new();
     match spec {
         MatchSpec::Default => {
+            // Default matching is on the visible label set: internal labels
+            // (`__name__`, `__run__`, a reader's `__incarnation__`) are
+            // identity within one side, not a key to join the two sides on.
             for (key, val) in &labels.inner {
-                if key != "__name__" {
+                if !is_internal_label(key) {
                     k.insert(key.clone(), val.clone());
                 }
             }
@@ -304,7 +307,7 @@ fn match_key(labels: &Labels, spec: MatchSpec<'_>) -> BTreeMap<String, String> {
         }
         MatchSpec::Exclude(list) => {
             for (key, val) in &labels.inner {
-                if key == "__name__" || list.iter().any(|x| x == key) {
+                if is_internal_label(key) || list.iter().any(|x| x == key) {
                     continue;
                 }
                 k.insert(key.clone(), val.clone());
@@ -481,6 +484,37 @@ pub fn matrix_matrix_op<'a>(
     }
 
     out
+}
+
+#[cfg(test)]
+mod match_key_tests {
+    use super::*;
+
+    /// Default matching joins the two sides on their visible labels. An
+    /// internal label is identity within one side, and a key that must be
+    /// equal on both sides would make `a / b` between a series and its own
+    /// aggregate fail whenever the reader had split the series by
+    /// incarnation.
+    #[test]
+    fn default_matching_ignores_internal_labels() {
+        let left = Labels::from([("__name__", "a"), ("__incarnation__", "x"), ("cpu", "1")]);
+        let right = Labels::from([("__name__", "b"), ("cpu", "1")]);
+        assert_eq!(
+            match_key(&left, MatchSpec::Default),
+            match_key(&right, MatchSpec::Default)
+        );
+        let excl = ["mode".to_string()];
+        assert_eq!(
+            match_key(&left, MatchSpec::Exclude(&excl)),
+            match_key(&right, MatchSpec::Exclude(&excl))
+        );
+        // `on(__incarnation__)` still names it explicitly.
+        let on = ["__incarnation__".to_string()];
+        assert_ne!(
+            match_key(&left, MatchSpec::Include(&on)),
+            match_key(&right, MatchSpec::Include(&on))
+        );
+    }
 }
 
 #[cfg(test)]
