@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`SegmentedParquetReader` fetches segments on demand.** `open_with_pool`
+  takes a `SegmentStore`, a trait that supplies a table's segment bytes by
+  position; `InMemorySegments` is the store over bytes already in hand, and
+  `open_bytes_with_pool` wraps one, unchanged. Open reads each segment's
+  footer once to build the identity indexes, a per-segment time span and the
+  column map, and keeps neither the bytes nor the parsed footer. A query
+  fetches only the segments whose span it touches, through a cache bounded
+  by the pool's byte budget (`BufferPool::max_bytes`), and a segment the
+  store has lost since open is skipped. `segment_count` counts gone segments
+  too; `cached_segments` reports the cache.
+
+  Before this, every segment's bytes and parsed footer stayed resident for
+  the reader's life. On a 1.3 GB, ten-hour archive whose task table had 159
+  segments of up to 2,851 columns, building the dashboard held 4.1 GB.
+
+### Fixed
+
+- A `MultiParquetSource` reached through `dyn DataSource` reported no sample
+  timestamps: the inherent method had them and the trait method returned its
+  empty default. The segmented reader now reaches its segments that way.
+
 ## [0.26.0] - 2026-09-23
 
 ### Added

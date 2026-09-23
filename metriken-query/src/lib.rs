@@ -59,7 +59,7 @@ pub use parquet::{CompositionSource, ParquetBuilder, ParquetReader};
 pub use promql::{
     referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
 };
-pub use segmented::SegmentedParquetReader;
+pub use segmented::{InMemorySegments, SegmentBytes, SegmentStore, SegmentedParquetReader};
 pub use types::HistogramSnapshot;
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
@@ -222,6 +222,16 @@ pub(crate) trait DataSource: Send + Sync {
     /// schema behind them.
     fn columns_desc(&self) -> Vec<crate::parquet::ColDesc> {
         Vec::new()
+    }
+    /// Columns in the source's schema, for sizing what an open reader holds.
+    /// Zero for a source without one.
+    fn column_count(&self) -> usize {
+        0
+    }
+    /// Bytes the source keeps in memory for its data — the whole file for one
+    /// opened from bytes, nothing for one that reads a file on demand.
+    fn resident_bytes(&self) -> usize {
+        0
     }
 }
 
