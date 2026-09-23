@@ -17,6 +17,42 @@ pub trait HistogramMetric: Send + Sync + 'static {
     fn load(&self) -> Option<histogram::Histogram>;
 }
 
+/// The default `metadata_version` for a group that cannot count its own
+/// mutations: a 64-bit FNV-1a over every entry's index and sorted labels.
+/// Order-independent, so two snapshots with the same content hash the same
+/// whatever order the store iterates in.
+fn metadata_version_by_content(snapshot: &[(usize, HashMap<String, String>)]) -> u64 {
+    let mut entries: Vec<(usize, Vec<(&str, &str)>)> = snapshot
+        .iter()
+        .map(|(idx, m)| {
+            let mut pairs: Vec<(&str, &str)> =
+                m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.sort_unstable();
+            (*idx, pairs)
+        })
+        .collect();
+    entries.sort_unstable();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fold = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    fold(&(entries.len() as u64).to_le_bytes());
+    for (idx, pairs) in &entries {
+        fold(&(*idx as u64).to_le_bytes());
+        fold(&(pairs.len() as u64).to_le_bytes());
+        for (k, v) in pairs {
+            fold(&(k.len() as u64).to_le_bytes());
+            fold(k.as_bytes());
+            fold(&(v.len() as u64).to_le_bytes());
+            fold(v.as_bytes());
+        }
+    }
+    h
+}
+
 /// Trait for a group of counter metrics with per-entry metadata.
 ///
 /// Counter groups store a dense array of `u64` values indexed by `usize`,
@@ -36,6 +72,30 @@ pub trait CounterGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed, and never changes otherwise.
+    ///
+    /// The contract: two calls returning the same value mean no metadata of
+    /// any entry changed between them. It lets a reader that caches
+    /// something derived from the metadata — a schema, a hash of every
+    /// entry's labels — decide whether that cache is still current in O(1)
+    /// instead of re-reading every entry. The reader must take the version
+    /// BEFORE reading the metadata it validates: a mutation landing between
+    /// the two then shows on the next check and costs one re-read, where the
+    /// other order could pair a new version with old data and be believed
+    /// indefinitely.
+    ///
+    /// The default is a hash of every entry's metadata, which is correct for
+    /// any implementor but costs a full read of the metadata per call — the
+    /// very cost this method exists to remove. A type whose metadata store
+    /// can count its own mutations should override it with that counter, as
+    /// metriken's own groups do. A default that returned a constant would
+    /// have been cheaper and wrong: a cache validated by it would serve
+    /// stale entries silently.
+    fn metadata_version(&self) -> u64 {
+        metadata_version_by_content(&self.metadata_snapshot())
+    }
 
     /// Visit the metadata for the entry at `idx` without cloning it.
     ///
@@ -97,6 +157,30 @@ pub trait GaugeGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed, and never changes otherwise.
+    ///
+    /// The contract: two calls returning the same value mean no metadata of
+    /// any entry changed between them. It lets a reader that caches
+    /// something derived from the metadata — a schema, a hash of every
+    /// entry's labels — decide whether that cache is still current in O(1)
+    /// instead of re-reading every entry. The reader must take the version
+    /// BEFORE reading the metadata it validates: a mutation landing between
+    /// the two then shows on the next check and costs one re-read, where the
+    /// other order could pair a new version with old data and be believed
+    /// indefinitely.
+    ///
+    /// The default is a hash of every entry's metadata, which is correct for
+    /// any implementor but costs a full read of the metadata per call — the
+    /// very cost this method exists to remove. A type whose metadata store
+    /// can count its own mutations should override it with that counter, as
+    /// metriken's own groups do. A default that returned a constant would
+    /// have been cheaper and wrong: a cache validated by it would serve
+    /// stale entries silently.
+    fn metadata_version(&self) -> u64 {
+        metadata_version_by_content(&self.metadata_snapshot())
+    }
 
     /// Visit the metadata for the entry at `idx` without cloning it.
     ///
@@ -161,6 +245,30 @@ pub trait HistogramGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed, and never changes otherwise.
+    ///
+    /// The contract: two calls returning the same value mean no metadata of
+    /// any entry changed between them. It lets a reader that caches
+    /// something derived from the metadata — a schema, a hash of every
+    /// entry's labels — decide whether that cache is still current in O(1)
+    /// instead of re-reading every entry. The reader must take the version
+    /// BEFORE reading the metadata it validates: a mutation landing between
+    /// the two then shows on the next check and costs one re-read, where the
+    /// other order could pair a new version with old data and be believed
+    /// indefinitely.
+    ///
+    /// The default is a hash of every entry's metadata, which is correct for
+    /// any implementor but costs a full read of the metadata per call — the
+    /// very cost this method exists to remove. A type whose metadata store
+    /// can count its own mutations should override it with that counter, as
+    /// metriken's own groups do. A default that returned a constant would
+    /// have been cheaper and wrong: a cache validated by it would serve
+    /// stale entries silently.
+    fn metadata_version(&self) -> u64 {
+        metadata_version_by_content(&self.metadata_snapshot())
+    }
 
     /// Visit the metadata for the entry at `idx` without cloning it.
     ///
@@ -345,4 +453,51 @@ mod tests {
         DefaultOnlyHistogramGroup,
         HistogramGroupMetric
     );
+
+    /// The default version is content-derived: it changes when an entry's
+    /// metadata changes and is stable across the store's iteration order,
+    /// so an implementor that leaves it in place gets a correct, if
+    /// expensive, signal rather than a constant.
+    #[test]
+    fn the_default_metadata_version_follows_the_content() {
+        let a = vec![(
+            3usize,
+            HashMap::from([("comm".to_string(), "redis".to_string())]),
+        )];
+        let b = vec![(
+            3usize,
+            HashMap::from([("comm".to_string(), "valkey".to_string())]),
+        )];
+        let a2 = vec![(
+            3usize,
+            HashMap::from([
+                ("comm".to_string(), "redis".to_string()),
+                ("pid".to_string(), "1".to_string()),
+            ]),
+        )];
+        assert_eq!(
+            metadata_version_by_content(&a),
+            metadata_version_by_content(&a)
+        );
+        assert_ne!(
+            metadata_version_by_content(&a),
+            metadata_version_by_content(&b)
+        );
+        assert_ne!(
+            metadata_version_by_content(&a),
+            metadata_version_by_content(&a2)
+        );
+        // Two entries in either order.
+        let x = vec![a[0].clone(), b[0].clone()];
+        let y = vec![b[0].clone(), a[0].clone()];
+        assert_eq!(
+            metadata_version_by_content(&x),
+            metadata_version_by_content(&y)
+        );
+        // And the fakes, which do not override, get the default.
+        let fake = DefaultOnlyCounterGroup {
+            metadata: HashMap::from([(3usize, a[0].1.clone())]),
+        };
+        assert_eq!(fake.metadata_version(), metadata_version_by_content(&a));
+    }
 }

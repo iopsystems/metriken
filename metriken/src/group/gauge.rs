@@ -216,6 +216,13 @@ impl GaugeGroup {
         self.metadata.load(idx)
     }
 
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed. See `CounterGroupMetric::metadata_version` for the
+    /// contract and the read ordering it needs.
+    pub fn metadata_version(&self) -> u64 {
+        self.metadata.version()
+    }
+
     /// Run `f` with a borrowed view of the metadata for the entry at `idx`,
     /// without cloning the underlying map.
     ///
@@ -326,6 +333,10 @@ impl GaugeGroupMetric for GaugeGroup {
 
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
         self.metadata.snapshot()
+    }
+
+    fn metadata_version(&self) -> u64 {
+        GaugeGroup::metadata_version(self)
     }
 
     fn with_metadata(&self, idx: usize, f: &mut dyn FnMut(Option<&HashMap<String, String>>)) {
