@@ -77,6 +77,15 @@ impl From<&SegmentedParquetReader> for UnionChild {
     }
 }
 
+/// A store assembled in memory composes like a reader: a `.rez` table whose
+/// series were split by occupant through the identity index sits beside the
+/// tables read straight from parquet.
+impl From<&crate::MemoryStore> for UnionChild {
+    fn from(store: &crate::MemoryStore) -> Self {
+        UnionChild(store.data_source())
+    }
+}
+
 /// `name -> index into children that owns it`.
 type Index = HashMap<String, usize>;
 

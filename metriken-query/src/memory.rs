@@ -15,6 +15,11 @@ pub(crate) struct Memory {
     gauges: HashMap<String, Vec<Gauge>>,
     histograms: HashMap<String, Vec<Histogram>>,
     interval_ms: u64,
+    /// The row timestamps a caller declared, if it did. See
+    /// [`DataSource::sample_timestamps`]; a source assembled from a table
+    /// knows its rows, and a series-by-series union would not recover a row
+    /// that every series skipped.
+    sample_timestamps: Option<Vec<u64>>,
 }
 
 impl Memory {
@@ -24,7 +29,33 @@ impl Memory {
             gauges: HashMap::new(),
             histograms: HashMap::new(),
             interval_ms,
+            sample_timestamps: None,
         }
+    }
+
+    /// Add a whole counter series, windows included. A second series with
+    /// the same name and labels is kept as a second series — this is not
+    /// the sample-level upsert `ingest` does.
+    pub(crate) fn push_counter_series(&mut self, name: &str, counter: Counter) {
+        self.counters
+            .entry(name.to_string())
+            .or_default()
+            .push(counter);
+    }
+
+    pub(crate) fn push_gauge_series(&mut self, name: &str, gauge: Gauge) {
+        self.gauges.entry(name.to_string()).or_default().push(gauge);
+    }
+
+    pub(crate) fn push_histogram_series(&mut self, name: &str, histogram: Histogram) {
+        self.histograms
+            .entry(name.to_string())
+            .or_default()
+            .push(histogram);
+    }
+
+    pub(crate) fn set_sample_timestamps(&mut self, ts: Vec<u64>) {
+        self.sample_timestamps = Some(ts);
     }
 
     pub(crate) fn set_interval_ms(&mut self, ms: u64) {
@@ -160,8 +191,8 @@ impl DataSource for Memory {
                 Counter {
                     labels: c.labels.clone(),
                     timestamps: c.timestamps[r.clone()].to_vec(),
-                    values: c.values[r].to_vec(),
-                    windows: None,
+                    values: c.values[r.clone()].to_vec(),
+                    windows: c.windows.as_ref().map(|w| w[r].to_vec()),
                 }
             })
             .filter(|c| !c.timestamps.is_empty())
@@ -183,8 +214,8 @@ impl DataSource for Memory {
                 Gauge {
                     labels: g.labels.clone(),
                     timestamps: g.timestamps[r.clone()].to_vec(),
-                    values: g.values[r].to_vec(),
-                    windows: None,
+                    values: g.values[r.clone()].to_vec(),
+                    windows: g.windows.as_ref().map(|w| w[r].to_vec()),
                 }
             })
             .filter(|g| !g.timestamps.is_empty())
@@ -319,6 +350,28 @@ impl DataSource for Memory {
             update(&mut min_ns, &mut max_ns, &series.timestamps);
         }
         min_ns.zip(max_ns)
+    }
+
+    fn sample_timestamps(&self) -> Vec<u64> {
+        if let Some(ts) = &self.sample_timestamps {
+            return ts.clone();
+        }
+        // Not declared: the union of every series' timestamps. A live store
+        // fed sample by sample has no rows of its own, and this is what its
+        // rows amount to.
+        let mut out: Vec<u64> = Vec::new();
+        for series in self.counters.values().flatten() {
+            out.extend_from_slice(&series.timestamps);
+        }
+        for series in self.gauges.values().flatten() {
+            out.extend_from_slice(&series.timestamps);
+        }
+        for series in self.histograms.values().flatten() {
+            out.extend_from_slice(&series.timestamps);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {

@@ -5,7 +5,7 @@ use crate::histogram_stream::HistogramStream;
 use crate::labels::Labels;
 use crate::memory::Memory;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
-use crate::types::{Counters, Gauges};
+use crate::types::{Counter, Counters, Gauge, Gauges, Histogram, HistogramSnapshot};
 use crate::{DataSource, MetricsSource, QueryOptions};
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -36,6 +36,110 @@ impl MemoryStore {
     #[cfg(test)]
     pub(crate) fn from_inner(inner: Arc<MemoryStoreInner>) -> Self {
         Self { state: inner }
+    }
+
+    /// This store as a union child's data source.
+    pub(crate) fn data_source(&self) -> Arc<dyn DataSource> {
+        Arc::clone(&self.state) as Arc<dyn DataSource>
+    }
+
+    /// Add a whole counter series.
+    ///
+    /// For a caller that assembled series itself — a reader that split a
+    /// table's columns by occupant, say — rather than one feeding snapshots
+    /// through `ingest_snapshot`. `windows` are the per-sample acquisition
+    /// windows `(begin_ns, end_ns)` that `rate()`/`irate()` turn into
+    /// uncertainty bounds; a source that has them should pass them, since
+    /// the engine cannot reconstruct them. `timestamps` must be ascending.
+    /// A second series with the same name and labels is a second series;
+    /// nothing is merged.
+    pub fn insert_counter_series(
+        &self,
+        name: &str,
+        labels: impl Into<Labels>,
+        timestamps: Vec<u64>,
+        values: Vec<u64>,
+        windows: Option<Vec<(u64, u64)>>,
+    ) -> Result<(), String> {
+        check_series(
+            name,
+            timestamps.len(),
+            values.len(),
+            windows.as_ref().map(Vec::len),
+        )?;
+        self.state.memory.write().unwrap().push_counter_series(
+            name,
+            Counter {
+                labels: labels.into(),
+                timestamps,
+                values,
+                windows,
+            },
+        );
+        Ok(())
+    }
+
+    /// Add a whole gauge series. See [`insert_counter_series`](Self::insert_counter_series).
+    pub fn insert_gauge_series(
+        &self,
+        name: &str,
+        labels: impl Into<Labels>,
+        timestamps: Vec<u64>,
+        values: Vec<i64>,
+        windows: Option<Vec<(u64, u64)>>,
+    ) -> Result<(), String> {
+        check_series(
+            name,
+            timestamps.len(),
+            values.len(),
+            windows.as_ref().map(Vec::len),
+        )?;
+        self.state.memory.write().unwrap().push_gauge_series(
+            name,
+            Gauge {
+                labels: labels.into(),
+                timestamps,
+                values,
+                windows,
+            },
+        );
+        Ok(())
+    }
+
+    /// Add a whole histogram series: one cumulative sparse snapshot per
+    /// sample, all under one bucket configuration. See
+    /// [`insert_counter_series`](Self::insert_counter_series).
+    pub fn insert_histogram_series(
+        &self,
+        name: &str,
+        labels: impl Into<Labels>,
+        config: ::histogram::Config,
+        timestamps: Vec<u64>,
+        snapshots: Vec<HistogramSnapshot>,
+    ) -> Result<(), String> {
+        check_series(name, timestamps.len(), snapshots.len(), None)?;
+        self.state.memory.write().unwrap().push_histogram_series(
+            name,
+            Histogram {
+                labels: labels.into(),
+                config,
+                timestamps,
+                snapshots,
+            },
+        );
+        Ok(())
+    }
+
+    /// Declare the row timestamps this store stands for, for a caller that
+    /// assembled it from a table and knows its rows. Without this a store
+    /// reports the union of its series' timestamps, which cannot include a
+    /// row every series skipped.
+    pub fn set_sample_timestamps(&self, timestamps: Vec<u64>) {
+        self.state
+            .memory
+            .write()
+            .unwrap()
+            .set_sample_timestamps(timestamps);
     }
 
     /// Set or replace the display name.
@@ -259,6 +363,30 @@ impl MemoryStoreBuilder {
 
 /// Implement `DataSource` on the inner so `QueryEngine` can hold
 /// `Arc<MemoryStoreInner>` directly, without an extra allocation.
+/// A series' parallel vectors must agree in length, or a sample would carry
+/// another sample's value. Said at insert, where the caller can act on it,
+/// rather than as an index panic inside a query.
+fn check_series(
+    name: &str,
+    timestamps: usize,
+    values: usize,
+    windows: Option<usize>,
+) -> Result<(), String> {
+    if timestamps != values {
+        return Err(format!(
+            "series {name}: {timestamps} timestamps but {values} values"
+        ));
+    }
+    if let Some(w) = windows {
+        if w != timestamps {
+            return Err(format!(
+                "series {name}: {timestamps} timestamps but {w} windows"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl DataSource for MemoryStoreInner {
     fn counters(
         &self,
@@ -337,6 +465,10 @@ impl DataSource for MemoryStoreInner {
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
         self.memory.read().unwrap().column_map()
     }
+
+    fn sample_timestamps(&self) -> Vec<u64> {
+        self.memory.read().unwrap().sample_timestamps()
+    }
 }
 
 // ─── MetricsSource on MemoryStore ─────────────────────────────────────────────
@@ -391,6 +523,10 @@ impl MetricsSource for MemoryStore {
 
     fn file_metadata(&self) -> HashMap<String, String> {
         MemoryStore::file_metadata(self)
+    }
+
+    fn sample_timestamps(&self) -> Vec<u64> {
+        DataSource::sample_timestamps(&*self.state)
     }
 
     fn counter_names(&self) -> Vec<String> {
@@ -775,5 +911,198 @@ mod ingest_tests {
             }
             other => panic!("expected Series, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod series_tests {
+    use crate::{MetricsSource, QueryResult};
+
+    const S: u64 = 1_000_000_000;
+
+    fn matrix(r: Result<QueryResult, crate::QueryError>) -> Vec<crate::MatrixSample> {
+        match r.expect("query resolves") {
+            QueryResult::Matrix { result } => result,
+            other => panic!("expected a matrix, got {other:?}"),
+        }
+    }
+
+    /// The point of the series API: windows reach the engine. A counter
+    /// series inserted with acquisition windows yields `rate()` bounds; the
+    /// same series without them yields none. The ingest path could never do
+    /// this, and a reader that assembles series itself must not lose it.
+    #[test]
+    fn windows_on_an_inserted_series_become_rate_bounds() {
+        let with = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let without = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let ts: Vec<u64> = (0..6).map(|i| 1000 * S + i * S).collect();
+        let values: Vec<u64> = (0..6).map(|i| i * 10).collect();
+        // Each read took 10 ms, ending at its timestamp.
+        let windows: Vec<(u64, u64)> = ts.iter().map(|t| (t - 10_000_000, *t)).collect();
+        with.insert_counter_series(
+            "ops",
+            [("cpu", "0")],
+            ts.clone(),
+            values.clone(),
+            Some(windows),
+        )
+        .unwrap();
+        without
+            .insert_counter_series("ops", [("cpu", "0")], ts, values, None)
+            .unwrap();
+
+        let q =
+            |s: &crate::MemoryStore| matrix(s.query_range("rate(ops[2s])", 1001.0, 1005.0, 1.0));
+        let banded = q(&with);
+        let bare = q(&without);
+        assert_eq!(banded.len(), 1);
+        assert!(!banded[0].values.is_empty());
+        assert!(
+            banded[0].intervals.as_ref().is_some_and(|b| !b.is_empty()),
+            "windows must surface as bounds: {:?}",
+            banded[0].intervals
+        );
+        assert!(bare[0].intervals.is_none(), "no windows, no bounds");
+        // And the values themselves agree: 10/s either way.
+        for (_, v) in &banded[0].values {
+            assert!((v - 10.0).abs() < 1e-6, "{v}");
+        }
+    }
+
+    /// Two series with identical visible labels and different `__uid__`s are
+    /// two series — the reader's PID-reuse split — and `without` folds them.
+    #[test]
+    fn series_that_differ_only_by_an_internal_label_stay_distinct() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let ts: Vec<u64> = (0..4).map(|i| 1000 * S + i * S).collect();
+        let a: std::collections::BTreeMap<String, String> = [("comm", "redis"), ("__uid__", "a")]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        let b: std::collections::BTreeMap<String, String> = [("comm", "redis"), ("__uid__", "b")]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        store
+            .insert_gauge_series("rss", a, ts.clone(), vec![1, 1, 1, 1], None)
+            .unwrap();
+        store
+            .insert_gauge_series("rss", b, ts, vec![2, 2, 2, 2], None)
+            .unwrap();
+
+        assert_eq!(store.gauge_labels("rss").len(), 2);
+        let both = matrix(store.query_range("rss", 1000.0, 1003.0, 1.0));
+        assert_eq!(both.len(), 2, "two occupants, two series");
+        let summed = matrix(store.query_range("sum without (__uid__) (rss)", 1000.0, 1003.0, 1.0));
+        assert_eq!(summed.len(), 1);
+        assert!(summed[0]
+            .values
+            .iter()
+            .all(|(_, v)| (*v - 3.0).abs() < 1e-9));
+    }
+
+    /// A store assembled from a table declares its rows; one fed sample by
+    /// sample reports the union of what it holds. A row every series skipped
+    /// exists only in the declaration.
+    #[test]
+    fn sample_timestamps_are_declared_or_derived() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        store
+            .insert_counter_series("a", [("k", "1")], vec![S, 3 * S], vec![0, 1], None)
+            .unwrap();
+        store
+            .insert_counter_series("b", [("k", "1")], vec![2 * S, 3 * S], vec![0, 1], None)
+            .unwrap();
+        assert_eq!(
+            store.sample_timestamps(),
+            vec![S, 2 * S, 3 * S],
+            "derived: the union"
+        );
+        store.set_sample_timestamps(vec![S, 2 * S, 3 * S, 4 * S]);
+        assert_eq!(
+            store.sample_timestamps().len(),
+            4,
+            "declared: the table's rows"
+        );
+    }
+
+    /// Parallel vectors of unequal length are refused at insert, where the
+    /// caller can act on it, not as an index panic inside a query.
+    #[test]
+    fn a_ragged_series_is_refused() {
+        let store = crate::MemoryStore::builder().build();
+        let err = store
+            .insert_counter_series("x", [("k", "1")], vec![1, 2, 3], vec![1, 2], None)
+            .expect_err("values short");
+        assert!(
+            err.contains("x") && err.contains("3") && err.contains("2"),
+            "{err}"
+        );
+        let err = store
+            .insert_gauge_series("y", (), vec![1, 2], vec![1, 2], Some(vec![(0, 1)]))
+            .expect_err("windows short");
+        assert!(err.contains("windows"), "{err}");
+        assert!(
+            store.counter_names().is_empty() && store.gauge_names().is_empty(),
+            "nothing landed"
+        );
+    }
+
+    /// An assembled store sits beside other children in a union and answers
+    /// for its names.
+    #[test]
+    fn a_memory_store_composes_as_a_union_child() {
+        let a = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let b = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let ts: Vec<u64> = (0..3).map(|i| 1000 * S + i * S).collect();
+        a.insert_counter_series("left", [("k", "1")], ts.clone(), vec![0, 1, 2], None)
+            .unwrap();
+        b.insert_gauge_series("right", [("k", "1")], ts, vec![5, 5, 5], None)
+            .unwrap();
+        let union = crate::UnionMetricsSource::try_new(vec![
+            crate::UnionChild::from(&a),
+            crate::UnionChild::from(&b),
+        ])
+        .expect("disjoint names");
+        assert_eq!(union.counter_names(), vec!["left".to_string()]);
+        assert_eq!(union.gauge_names(), vec!["right".to_string()]);
+        let m = matrix(union.query_range("right", 1000.0, 1002.0, 1.0));
+        assert_eq!(m.len(), 1);
+    }
+
+    /// A histogram series inserted whole is queryable like an ingested one.
+    #[test]
+    fn a_histogram_series_inserted_whole_is_queryable() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let config = ::histogram::Config::new(7, 64).unwrap();
+        let mut h = ::histogram::Histogram::with_config(&config);
+        let mut snapshots = Vec::new();
+        let mut ts = Vec::new();
+        for i in 0..4u64 {
+            h.increment(1_000 * (i + 1)).unwrap();
+            snapshots.push(super::histogram_to_snapshot(&h));
+            ts.push(1000 * S + i * S);
+        }
+        store
+            .insert_histogram_series("latency", [("op", "read")], config, ts, snapshots)
+            .unwrap();
+        assert_eq!(store.histogram_names(), vec!["latency".to_string()]);
+        assert_eq!(store.histogram_labels("latency").len(), 1);
+        let m = matrix(store.query_range("histogram_mean(latency)", 1001.0, 1003.0, 1.0));
+        assert!(!m.is_empty() && !m[0].values.is_empty(), "{m:?}");
     }
 }

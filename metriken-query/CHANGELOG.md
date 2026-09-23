@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`MemoryStore` takes whole series.** `insert_counter_series`,
+  `insert_gauge_series` and `insert_histogram_series` add a series with its
+  timestamps, values and, for counters and gauges, per-sample acquisition
+  windows, which `rate()`/`irate()` turn into uncertainty bounds and which
+  the snapshot ingest path cannot carry. `set_sample_timestamps` declares the
+  rows a store assembled from a table stands for; unset, the store reports
+  the union of its series' timestamps. A `UnionChild` and a
+  `CompositionSource` can be built from a `MemoryStore`, so an assembled
+  store composes beside parquet readers.
+  `HistogramSnapshot` is public; `Labels` converts from a
+  `BTreeMap<String, String>`.
+
+  For a reader that builds series itself — a `.rez` table whose slot columns
+  are split by occupant through an identity index — rather than reading
+  series off parquet field metadata.
+
+### Fixed
+
+- A `MemoryStore` counter or gauge series that carried windows had them
+  dropped on every read (`windows: None`). They are sliced with the samples.
+
 ## [0.25.0]
 
 ### Changed

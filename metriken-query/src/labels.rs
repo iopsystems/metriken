@@ -115,6 +115,12 @@ impl From<&[(&str, &str)]> for Labels {
     }
 }
 
+impl From<BTreeMap<String, String>> for Labels {
+    fn from(inner: BTreeMap<String, String>) -> Self {
+        Labels { inner }
+    }
+}
+
 impl From<()> for Labels {
     fn from(_other: ()) -> Self {
         Labels::default()

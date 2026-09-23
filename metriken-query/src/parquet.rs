@@ -523,6 +523,14 @@ impl From<&crate::SegmentedParquetReader> for CompositionSource {
     }
 }
 
+/// A store assembled in memory composes like a reader — the same reason
+/// [`crate::UnionChild`] takes one.
+impl From<&crate::MemoryStore> for CompositionSource {
+    fn from(store: &crate::MemoryStore) -> Self {
+        CompositionSource(store.data_source())
+    }
+}
+
 enum BuilderEntry {
     Path(std::path::PathBuf, Labels),
     Bytes(Bytes, Labels),
