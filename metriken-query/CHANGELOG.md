@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0]
+
+### Changed
+
+- **BREAKING: a label whose name begins with `__` is internal.** Following
+  Prometheus's data model ("label names beginning with `__` MUST be reserved
+  for internal use"), an internal label is part of a series' identity and
+  matchable in a selector, and `without (...)`, `ignoring (...)` and default
+  binary-op matching drop every such label, where each dropped only
+  `__name__` before. `is_internal_label(name)` is the public predicate;
+  consumers that checked for `__name__` by name should use it.
+
+  This crate emits internal labels on every result it returns. Hiding them
+  from listings and legends is the consumer's contract, not done here.
+
+  The engine's own internal labels are `__name__` and `__run__` (a histogram
+  whose bucket configuration changed mid-recording). The observable change
+  today is on such a histogram: `histogram_mean without (cpu) (latency{__run__="1"})`
+  returned series labelled `{__name__, __run__="1"}` and now returns
+  `{__name__}`. The values are unchanged, because a run is selected before
+  any aggregation and runs are never merged; a consumer keying on the full
+  result label set sees the difference.
+
+### Fixed
+
+- **BREAKING: the `ingest` loader and the parquet loader derive labels from
+  one storage-key list.** They had drifted: the live path kept
+  `grouping_power` and `max_value_power` as labels where the parquet path
+  stripped them, so a recording viewed live carried two extra labels per
+  histogram series that the same recording read from disk did not. Those two
+  labels are gone from the live path. Both loaders call
+  `Labels::from_metadata` against `STORAGE_KEYS` (`metric`, `metric_type`,
+  `unit`, `grouping_power`, `max_value_power`), the parquet loader reads the
+  histogram configuration without removing the keys ahead of it, and each
+  loader has a test that a histogram column carrying every storage key yields
+  no label from them.
+
+### Added
+
+- `is_internal_label`, `is_storage_key` and `STORAGE_KEYS` (a `&[&str]`) are
+  public, for readers and consumers above this crate that apply the same
+  rules to labels or read column metadata directly.
+
 ## [0.24.0]
 
 ### Fixed
