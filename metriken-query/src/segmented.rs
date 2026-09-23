@@ -6,7 +6,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use lru::LruCache;
 
 use crate::histogram_stream::{HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
@@ -16,71 +19,193 @@ use crate::{
     BufferPool, DataSource, MetricsSource, ParquetReader, QueryError, QueryOptions, QueryResult,
 };
 
-/// Reads an ordered list of parquet segments (byte blobs) that together form
-/// one logical per-sampler table, and presents them as a single
-/// [`MetricsSource`] with a unioned identity surface: the same `(name,
-/// labels)` pair appearing in more than one segment is ONE series, not one
-/// per segment (unlike `MultiParquetSource`, which duplicates same-identity
-/// series across files).
+/// Where a segmented table's bytes come from, fetched on demand.
 ///
-/// Opening is footer-only per segment, via
-/// [`ParquetReader::open_bytes_with_pool`] — no row-group data is decoded
-/// until a query touches it.
+/// A reader used to be handed every segment's bytes up front and keep them
+/// for its life, plus a parsed footer for each. On a long recording that is
+/// the whole table resident before a query has asked for anything: measured
+/// at 4.1 GB after building the dashboard of a 1.3 GB, ten-hour archive, of
+/// which the segment bytes were 1.27 GB and parsed footers most of the rest.
+/// With a store, open reads each segment once to build its catalog and
+/// identity indexes and then lets it go; a query fetches the segments its
+/// time range touches, through a bounded cache.
+///
+/// Segments are in logical (time) order, so `idx` is a position, not an id.
+pub trait SegmentStore: Send + Sync {
+    /// How many segments the table has.
+    fn len(&self) -> usize;
+
+    /// The bytes of segment `idx`.
+    ///
+    /// `Ok(None)` means the segment no longer exists — a rolling buffer's
+    /// retention took it since the store was built — and the reader skips
+    /// it. `Err` is a read failure and is reported.
+    fn bytes(&self, idx: usize) -> SegmentBytes;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What [`SegmentStore::bytes`] returns: the segment, `None` if it is gone,
+/// or the read failure.
+pub type SegmentBytes = Result<Option<Bytes>, Box<dyn Error + Send + Sync>>;
+
+/// A store over bytes already in memory: the tar archive, the tests, and
+/// any caller of the original [`SegmentedParquetReader::open_bytes_with_pool`].
+pub struct InMemorySegments(Vec<Bytes>);
+
+impl InMemorySegments {
+    pub fn new(segments: Vec<Vec<u8>>) -> Self {
+        Self(segments.into_iter().map(Bytes::from).collect())
+    }
+}
+
+impl SegmentStore for InMemorySegments {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn bytes(&self, idx: usize) -> SegmentBytes {
+        Ok(self.0.get(idx).cloned())
+    }
+}
+
+/// Reads an ordered list of parquet segments that together form one logical
+/// per-sampler table, and presents them as a single [`MetricsSource`] with a
+/// unioned identity surface: the same `(name, labels)` pair appearing in
+/// more than one segment is ONE series, not one per segment (unlike
+/// `MultiParquetSource`, which duplicates same-identity series across files).
+///
+/// Open reads each segment's footer once, through the [`SegmentStore`], to
+/// build the identity indexes and a per-segment catalog (time span,
+/// interval), and keeps neither the bytes nor the parsed footer. A query
+/// fetches only the segments whose span it touches, and each of those
+/// decodes only the row groups the query's time range touches; opened
+/// segments are held in a cache bounded by the pool's byte budget.
 ///
 /// Queries (`query_range` / `query` / `columns`) evaluate over a
 /// [`DataSource`] that splices raw per-series samples across segments in
 /// segment order, *below* PromQL evaluation — so range functions like
 /// `rate()` see one continuous timeline and boundary-spanning windows are
-/// computed on complete data. Each segment decodes only the row groups the
-/// query's time range touches.
+/// computed on complete data.
 pub struct SegmentedParquetReader {
-    /// Segments in logical (time) order. Each is opened footer-only and all
-    /// share `pool`'s decode-cache budget.
-    segments: Vec<ParquetReader>,
+    source: Arc<SegmentedSource>,
     /// PromQL engine over the splicing [`SegmentedSource`].
     engine: QueryEngine,
 }
 
 impl SegmentedParquetReader {
-    /// Open `segments` (raw parquet bytes, in logical/time order) footer-only,
-    /// wiring every segment to the same shared `pool` for decoded row-group
-    /// caching. No row-group data is read here.
+    /// Open `segments` (raw parquet bytes, in logical/time order) that are
+    /// already in memory. The bytes stay resident for the reader's life; see
+    /// [`open_with_pool`](Self::open_with_pool) for the on-demand form.
     pub fn open_bytes_with_pool(
         segments: Vec<Vec<u8>>,
         pool: Arc<BufferPool>,
     ) -> Result<Self, Box<dyn Error>> {
-        if segments.is_empty() {
+        Self::open_with_pool(Arc::new(InMemorySegments::new(segments)), pool)
+    }
+
+    /// Open a table whose segments `store` supplies on demand.
+    ///
+    /// Reads every segment once here, footer-only, and keeps only what
+    /// answers questions without the bytes: which series exist (per metric
+    /// kind), each segment's time span and interval, the histogram run
+    /// index, the merged file metadata and the column map. Nothing is
+    /// decoded. The cache of opened segments is bounded by
+    /// `pool.max_bytes()`, counted in segment bytes; it always holds at
+    /// least the segment most recently opened.
+    pub fn open_with_pool(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        if store.is_empty() {
             return Err("SegmentedParquetReader requires at least one segment".into());
         }
-        let segments = segments
-            .into_iter()
-            .map(|bytes| ParquetReader::open_bytes_with_pool(bytes, pool.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        check_histogram_configs(&segments)?;
 
-        // Open-time, footer-only identity indexes (see `SeriesIdentity` /
-        // `HistogramRunIndex` docs): a single schema pass per segment per
-        // metric kind, reused by every query so splicing never re-derives
-        // series identity by linear scan.
-        let counter_identity = SeriesIdentity::build(&segments, ParquetReader::counter_columns);
-        let gauge_identity = SeriesIdentity::build(&segments, ParquetReader::gauge_columns);
-        let histogram_identity = SeriesIdentity::build(&segments, ParquetReader::histogram_columns);
-        let histogram_runs = HistogramRunIndex::build(&segments);
+        let mut catalog: Vec<SegmentCatalog> = Vec::with_capacity(store.len());
+        let mut counter_identity = SeriesIdentity::default();
+        let mut gauge_identity = SeriesIdentity::default();
+        let mut histogram_identity = SeriesIdentity::default();
+        let mut histogram_runs = HistogramRunIndex::default();
+        let mut file_metadata: HashMap<String, String> = HashMap::new();
+        let mut column_map: HashMap<String, HashMap<Labels, String>> = HashMap::new();
+        let mut opened = 0usize;
 
-        let source = SegmentedSource {
-            segments: segments.iter().map(ParquetReader::data_source).collect(),
+        for idx in 0..store.len() {
+            let Some(bytes) = store.bytes(idx).map_err(|e| e.to_string())? else {
+                // Gone between the store's construction and now. The
+                // catalog keeps its place so indices stay positions.
+                catalog.push(SegmentCatalog::GONE);
+                continue;
+            };
+            let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
+            check_histogram_configs(idx, &seg)?;
+            counter_identity.extend(seg.counter_columns());
+            gauge_identity.extend(seg.gauge_columns());
+            let histogram_columns = seg.histogram_columns();
+            histogram_runs.observe(idx, seg.histogram_configs());
+            histogram_runs.observe_labels(idx, &histogram_columns);
+            histogram_identity.extend(histogram_columns);
+            for (metric, cols) in seg.data_source().column_map() {
+                // Mirror the run tagging `histogram_stream` and
+                // `histogram_labels` apply. `QueryEngine::columns` requires
+                // every filter key to be PRESENT on the label set, so without
+                // `__run__` here a run-qualified selector resolves to no
+                // columns at all — and the only production consumer
+                // (rezolus' `RezReader`) routes every query through
+                // `columns()` first, so it would reject
+                // `histogram_mean(latency{__run__="1"})` outright and leave
+                // the conflict policy's documented escape hatch unreachable.
+                //
+                // Tagged for every histogram the run index knows, not just the
+                // drifted ones, so `__run__="0"` also addresses a metric that
+                // never drifted — matching `histogram_stream`, which accepts
+                // run 0 in the single-run case. These labels are routing keys,
+                // never user-visible series labels (that is `histogram_labels`,
+                // which still only tags an actual conflict).
+                let run = histogram_runs.segment_run(&metric, idx);
+                let entry = column_map.entry(metric).or_default();
+                for (mut labels, col) in cols {
+                    if let Some(run) = run {
+                        labels.inner.insert("__run__".to_string(), run.to_string());
+                    }
+                    entry.entry(labels).or_insert(col);
+                }
+            }
+            // Last segment wins on collision.
+            file_metadata.extend(seg.file_metadata());
+            catalog.push(SegmentCatalog {
+                span: seg.time_range_ns(),
+                interval: seg.interval(),
+                present: true,
+            });
+            opened += 1;
+        }
+        if opened == 0 {
+            return Err("every segment of the table was gone by the time it was opened".into());
+        }
+        histogram_runs.report();
+
+        let source = Arc::new(SegmentedSource {
+            store,
+            catalog,
+            cache: Mutex::new(SegmentCache::new(pool.max_bytes())),
+            pool,
             counter_identity,
             gauge_identity,
             histogram_identity,
             histogram_runs,
-        };
-        let engine = QueryEngine::new(Arc::new(source));
-        Ok(Self { segments, engine })
+            file_metadata,
+            column_map,
+        });
+        let engine = QueryEngine::new(Arc::clone(&source) as Arc<dyn DataSource>);
+        Ok(Self { source, engine })
     }
 
-    /// Number of segments backing this reader.
+    /// Number of segments backing this reader, gone ones included.
     pub fn segment_count(&self) -> usize {
-        self.segments.len()
+        self.source.catalog.len()
     }
 
     /// The reader's spliced [`DataSource`] (the same [`SegmentedSource`]
@@ -94,7 +219,7 @@ impl SegmentedParquetReader {
 
     // Introspection routes through `self.engine` — the same `QueryEngine` the
     // queries use, over the same [`SegmentedSource`]. `ParquetReader` does the
-    // same (see `parquet.rs`). Re-deriving the union here from `self.segments`
+    // same (see `parquet.rs`). Re-deriving the union here from the store
     // would be a second implementation of the same semantics that nothing
     // keeps in step with the one queries actually see.
 
@@ -148,7 +273,7 @@ impl SegmentedParquetReader {
     }
 
     /// Key-value metadata merged across all segment footers (last segment,
-    /// in `segments` order, wins on key collision).
+    /// in store order, wins on key collision).
     pub fn file_metadata(&self) -> HashMap<String, String> {
         self.engine.file_metadata()
     }
@@ -169,6 +294,87 @@ impl SegmentedParquetReader {
     /// Returns an empty string if absent.
     pub fn version(&self) -> String {
         self.metadata_get("version").unwrap_or_default()
+    }
+
+    /// How many segments the cache currently holds open, and their bytes.
+    /// For tests and diagnostics.
+    pub fn cached_segments(&self) -> (usize, usize) {
+        let cache = self.source.cache.lock().unwrap_or_else(|e| e.into_inner());
+        (cache.entries.len(), cache.bytes)
+    }
+}
+
+/// What open keeps about one segment once its footer has been read and
+/// dropped: enough to decide whether a query touches it without fetching it.
+#[derive(Clone, Copy, Debug)]
+struct SegmentCatalog {
+    /// Row-time span from the footer's statistics; `None` when the segment
+    /// has no timestamp statistics, which makes it a candidate for every
+    /// query.
+    span: Option<(u64, u64)>,
+    /// Declared sampling interval, seconds.
+    interval: f64,
+    /// False for a segment the store no longer had at open. Never fetched.
+    present: bool,
+}
+
+impl SegmentCatalog {
+    const GONE: Self = Self {
+        span: None,
+        interval: f64::MAX,
+        present: false,
+    };
+
+    /// Whether a query over `[start_ns, end_ns]` can touch this segment.
+    fn touches(&self, start_ns: u64, end_ns: u64) -> bool {
+        self.present
+            && match self.span {
+                Some((lo, hi)) => lo <= end_ns && hi >= start_ns,
+                None => true,
+            }
+    }
+}
+
+/// Opened segments, most recently used last, bounded by what they hold.
+///
+/// A segment is fetched from the store and its footer parsed when a query
+/// first touches it; the next query over the same range finds it here. Each
+/// entry is charged [`ParquetReader::resident_estimate`] — its bytes plus
+/// what its parsed footer and column descriptors take, which on a wide
+/// table is more than the bytes — against the budget the pool already asks
+/// the operator for.
+struct SegmentCache {
+    entries: LruCache<usize, (Arc<ParquetReader>, usize)>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl SegmentCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, idx: usize) -> Option<Arc<ParquetReader>> {
+        self.entries.get(&idx).map(|(seg, _)| Arc::clone(seg))
+    }
+
+    /// Insert, then evict least recently used entries until within budget —
+    /// never the one just inserted, so a segment larger than the whole
+    /// budget still opens.
+    fn insert(&mut self, idx: usize, seg: Arc<ParquetReader>, size: usize) {
+        if let Some((_, old)) = self.entries.push(idx, (seg, size)) {
+            self.bytes = self.bytes.saturating_sub(old.1);
+        }
+        self.bytes += size;
+        while self.bytes > self.max_bytes && self.entries.len() > 1 {
+            if let Some((_, (_, freed))) = self.entries.pop_lru() {
+                self.bytes = self.bytes.saturating_sub(freed);
+            }
+        }
     }
 }
 
@@ -194,23 +400,21 @@ impl SegmentedParquetReader {
 ///
 /// Reads parquet field metadata only (via
 /// [`ParquetReader::histogram_config_variants`]) — no row-group decode.
-fn check_histogram_configs(segments: &[ParquetReader]) -> Result<(), Box<dyn Error>> {
-    for (idx, segment) in segments.iter().enumerate() {
-        for (name, configs) in segment.histogram_config_variants() {
-            if configs.len() > 1 {
-                let detail = configs
-                    .iter()
-                    .map(|(gp, mvp)| format!("grouping_power={gp}, max_value_power={mvp}"))
-                    .collect::<Vec<_>>()
-                    .join(" and ");
-                return Err(format!(
-                    "segment {idx} has multiple histogram columns for metric '{name}' under \
-                     different configs ({detail}); ParquetSource::histogram_stream decodes \
-                     every column for a metric name under ONE shared config, so these buckets \
-                     cannot be separated within a single segment"
-                )
-                .into());
-            }
+fn check_histogram_configs(idx: usize, segment: &ParquetReader) -> Result<(), Box<dyn Error>> {
+    for (name, configs) in segment.histogram_config_variants() {
+        if configs.len() > 1 {
+            let detail = configs
+                .iter()
+                .map(|(gp, mvp)| format!("grouping_power={gp}, max_value_power={mvp}"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            return Err(format!(
+                "segment {idx} has multiple histogram columns for metric '{name}' under \
+                 different configs ({detail}); ParquetSource::histogram_stream decodes \
+                 every column for a metric name under ONE shared config, so these buckets \
+                 cannot be separated within a single segment"
+            )
+            .into());
         }
     }
     Ok(())
@@ -231,6 +435,10 @@ fn check_histogram_configs(segments: &[ParquetReader]) -> Result<(), Box<dyn Err
 /// [`Self::position`] to place each incoming sample directly;
 /// [`splice_histogram_streams`] does the same for histogram series.
 ///
+/// It is also what answers `*_names` and `*_labels` once the footers are
+/// gone: the union of every segment's identity, which is what those used
+/// to compute from the footers per call.
+///
 /// Position order is "first appearance across segments, in segment order" —
 /// the same ordering contract splicing has always promised
 /// (`two_label_sets_splice_independently_across_three_segments` is the
@@ -246,25 +454,16 @@ struct SeriesIdentity {
 }
 
 impl SeriesIdentity {
-    /// Build from one schema pass per segment (`columns_for`), independent
-    /// of metric name — avoids re-scanning the schema once per name.
-    fn build(
-        segments: &[ParquetReader],
-        columns_for: impl Fn(&ParquetReader) -> Vec<(String, Labels)>,
-    ) -> Self {
-        let mut order: HashMap<String, Vec<Labels>> = HashMap::new();
-        let mut pos: HashMap<String, HashMap<Labels, usize>> = HashMap::new();
-        for seg in segments {
-            for (name, labels) in columns_for(seg) {
-                let list = order.entry(name.clone()).or_default();
-                let p = pos.entry(name).or_default();
-                if !p.contains_key(&labels) {
-                    p.insert(labels.clone(), list.len());
-                    list.push(labels);
-                }
+    /// Fold one segment's columns in, in its schema order.
+    fn extend(&mut self, columns: impl IntoIterator<Item = (String, Labels)>) {
+        for (name, labels) in columns {
+            let list = self.order.entry(name.clone()).or_default();
+            let p = self.pos.entry(name).or_default();
+            if !p.contains_key(&labels) {
+                p.insert(labels.clone(), list.len());
+                list.push(labels);
             }
         }
-        Self { order, pos }
     }
 
     /// Ordered distinct label sets for `name` (empty if `name` is unknown).
@@ -275,6 +474,22 @@ impl SeriesIdentity {
     /// O(1) position of `labels` within `name`'s series, if known.
     fn position(&self, name: &str, labels: &Labels) -> Option<usize> {
         self.pos.get(name)?.get(labels).copied()
+    }
+
+    /// Every name, sorted.
+    fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.order.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The label sets of `name` as the listing surface reports them:
+    /// sorted, and deduplicated by construction.
+    fn labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        let mut sets: Vec<BTreeMap<String, String>> =
+            self.order(name).iter().map(|l| l.inner.clone()).collect();
+        sets.sort();
+        sets
     }
 }
 
@@ -300,27 +515,48 @@ struct HistogramRunIndex {
     runs: HashMap<String, Vec<(u8, u8)>>,
     /// name -> (segment index -> run index).
     segment_run: HashMap<String, HashMap<usize, usize>>,
+    /// name -> the label sets seen under each run, for the listing surface
+    /// once the footers are gone.
+    run_labels: HashMap<String, Vec<RunLabels>>,
 }
 
+/// One label set of a histogram, and the run it was seen under.
+type RunLabels = (usize, BTreeMap<String, String>);
+
 impl HistogramRunIndex {
-    fn build(segments: &[ParquetReader]) -> Self {
-        let mut runs: HashMap<String, Vec<(u8, u8)>> = HashMap::new();
-        let mut segment_run: HashMap<String, HashMap<usize, usize>> = HashMap::new();
-        for (idx, seg) in segments.iter().enumerate() {
-            for (name, config) in seg.histogram_configs() {
-                let list = runs.entry(name.clone()).or_default();
-                let run = list.iter().position(|c| *c == config).unwrap_or_else(|| {
-                    list.push(config);
-                    list.len() - 1
-                });
-                segment_run.entry(name).or_default().insert(idx, run);
+    /// Fold one segment's histogram configs in.
+    fn observe(&mut self, idx: usize, configs: BTreeMap<String, (u8, u8)>) {
+        for (name, config) in configs {
+            let list = self.runs.entry(name.clone()).or_default();
+            let run = list.iter().position(|c| *c == config).unwrap_or_else(|| {
+                list.push(config);
+                list.len() - 1
+            });
+            self.segment_run.entry(name).or_default().insert(idx, run);
+        }
+    }
+
+    /// Record the label sets a segment carries for its histograms, under the
+    /// run that segment belongs to. Called after [`observe`](Self::observe)
+    /// for the same segment.
+    fn observe_labels(&mut self, idx: usize, columns: &[(String, Labels)]) {
+        for (name, labels) in columns {
+            let Some(run) = self.segment_run(name, idx) else {
+                continue;
+            };
+            let list = self.run_labels.entry(name.clone()).or_default();
+            if !list.iter().any(|(r, l)| *r == run && *l == labels.inner) {
+                list.push((run, labels.inner.clone()));
             }
         }
-        // Split, warn, never coerce: log the conflict ONCE per open (not
-        // once per query) for every name that resolved to more than one
-        // run, naming the metric and each run's config so an operator can
-        // tell a genuine agent restart from a misconfigured recorder.
-        for (name, configs) in &runs {
+    }
+
+    /// Split, warn, never coerce: log the conflict ONCE per open (not once
+    /// per query) for every name that resolved to more than one run, naming
+    /// the metric and each run's config so an operator can tell a genuine
+    /// agent restart from a misconfigured recorder.
+    fn report(&self) {
+        for (name, configs) in &self.runs {
             if configs.len() > 1 {
                 let detail = configs
                     .iter()
@@ -337,7 +573,6 @@ impl HistogramRunIndex {
                 );
             }
         }
-        Self { runs, segment_run }
     }
 
     /// Number of distinct runs for `name`. `1` (or `0` for an unknown name)
@@ -353,23 +588,6 @@ impl HistogramRunIndex {
     }
 }
 
-use crate::util::union_names;
-
-/// Deduplicated union of label sets across segments. Mirrors the
-/// sort-then-dedup pattern `MultiParquetSource` uses for its own
-/// (non-splicing) union of `*_labels()` results.
-fn union_labels<I: IntoIterator<Item = Vec<BTreeMap<String, String>>>>(
-    lists: I,
-) -> Vec<BTreeMap<String, String>> {
-    let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
-    for list in lists {
-        sets.extend(list);
-    }
-    sets.sort();
-    sets.dedup();
-    sets
-}
-
 /// The splicing [`DataSource`] the PromQL engine evaluates over: raw
 /// per-series samples from each segment, concatenated in segment order,
 /// with same-`(name, labels)` series merged into ONE series. Splicing at
@@ -381,8 +599,14 @@ fn union_labels<I: IntoIterator<Item = Vec<BTreeMap<String, String>>>>(
 /// Timestamps are NOT sorted or deduplicated: a spliced series carries
 /// exactly the samples a single-file table with the same rows would.
 struct SegmentedSource {
-    /// Per-segment sample providers, in logical (time) order.
-    segments: Vec<Arc<dyn DataSource>>,
+    /// Where segment bytes come from when a query needs them.
+    store: Arc<dyn SegmentStore>,
+    /// One entry per segment, in store order.
+    catalog: Vec<SegmentCatalog>,
+    /// Segments opened by queries, bounded by bytes.
+    cache: Mutex<SegmentCache>,
+    /// Decode cache every opened segment is wired to.
+    pool: Arc<BufferPool>,
     /// Open-time identity indexes (see [`SeriesIdentity`]) used to splice
     /// counters/gauges/histograms in O(1) per sample instead of scanning
     /// the already-spliced accumulator.
@@ -392,6 +616,72 @@ struct SegmentedSource {
     /// Cross-segment histogram config-conflict resolution (see
     /// [`HistogramRunIndex`]).
     histogram_runs: HistogramRunIndex,
+    /// Merged across segments at open, last wins.
+    file_metadata: HashMap<String, String>,
+    /// Built at open from every segment's columns; see `column_map`.
+    column_map: HashMap<String, HashMap<Labels, String>>,
+}
+
+impl SegmentedSource {
+    /// Segment `idx`, opened footer-only — from the cache, or fetched from
+    /// the store and cached. `None` when the store no longer has it.
+    fn segment(&self, idx: usize) -> Result<Option<Arc<ParquetReader>>, Box<dyn Error>> {
+        if let Some(seg) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(idx)
+        {
+            return Ok(Some(seg));
+        }
+        // Fetched and parsed outside the lock: two queries racing on one
+        // segment open it twice, which costs a parse and nothing else.
+        let Some(bytes) = self.store.bytes(idx).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let seg = Arc::new(ParquetReader::open_bytes_with_pool(
+            bytes,
+            Arc::clone(&self.pool),
+        )?);
+        let size = seg.resident_estimate();
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(idx, Arc::clone(&seg), size);
+        Ok(Some(seg))
+    }
+
+    /// The segments a query over `[start_ns, end_ns]` touches, opened as
+    /// the caller reaches them, in order.
+    ///
+    /// An iterator and not a `Vec` on purpose: a collected list would hold
+    /// every touched segment open at once for the whole query, and the cache
+    /// bound would then bound nothing — a query over a wide table's full
+    /// range would have the whole table resident again, which is what this
+    /// store exists to avoid. Opened one at a time, a segment lives for its
+    /// own decode and then only as long as the cache keeps it.
+    ///
+    /// A segment the store has lost is skipped; a read failure is logged and
+    /// the segment skipped, since a `DataSource` method has no error to
+    /// return and a partial answer is what the caller can use.
+    fn touched(
+        &self,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> impl Iterator<Item = (usize, Arc<ParquetReader>)> + '_ {
+        self.catalog
+            .iter()
+            .enumerate()
+            .filter(move |(_, entry)| entry.touches(start_ns, end_ns))
+            .filter_map(move |(idx, _)| match self.segment(idx) {
+                Ok(Some(seg)) => Some((idx, seg)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(segment = idx, "fetching a segment: {e}");
+                    None
+                }
+            })
+    }
 }
 
 /// Merge `c`'s samples into the already-accumulated series `a` (same
@@ -544,8 +834,8 @@ impl DataSource for SegmentedSource {
             return None;
         }
         let mut slots: Vec<Option<Counter>> = (0..order.len()).map(|_| None).collect();
-        for seg in &self.segments {
-            let Some(chunk) = seg.counters(name, filter, start_ns, end_ns) else {
+        for (_, seg) in self.touched(start_ns, end_ns) {
+            let Some(chunk) = seg.data_source().counters(name, filter, start_ns, end_ns) else {
                 continue;
             };
             for c in chunk.series {
@@ -578,8 +868,8 @@ impl DataSource for SegmentedSource {
             return None;
         }
         let mut slots: Vec<Option<Gauge>> = (0..order.len()).map(|_| None).collect();
-        for seg in &self.segments {
-            let Some(chunk) = seg.gauges(name, filter, start_ns, end_ns) else {
+        for (_, seg) in self.touched(start_ns, end_ns) {
+            let Some(chunk) = seg.data_source().gauges(name, filter, start_ns, end_ns) else {
                 continue;
             };
             for g in chunk.series {
@@ -626,9 +916,11 @@ impl DataSource for SegmentedSource {
                 Some(_) => return None,
             }
             let streams: Vec<HistogramStream> = self
-                .segments
-                .iter()
-                .filter_map(|seg| seg.histogram_stream(name, &effective, start_ns, end_ns))
+                .touched(start_ns, end_ns)
+                .filter_map(|(_, seg)| {
+                    seg.data_source()
+                        .histogram_stream(name, &effective, start_ns, end_ns)
+                })
                 .collect();
             return splice_histogram_streams(name, &self.histogram_identity, streams);
         }
@@ -650,11 +942,12 @@ impl DataSource for SegmentedSource {
         };
 
         let streams: Vec<HistogramStream> = self
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|&(idx, _)| self.histogram_runs.segment_run(name, idx) == Some(want_run))
-            .filter_map(|(_, seg)| seg.histogram_stream(name, &inner_filter, start_ns, end_ns))
+            .touched(start_ns, end_ns)
+            .filter(|(idx, _)| self.histogram_runs.segment_run(name, *idx) == Some(want_run))
+            .filter_map(|(_, seg)| {
+                seg.data_source()
+                    .histogram_stream(name, &inner_filter, start_ns, end_ns)
+            })
             .collect();
 
         let spliced = splice_histogram_streams(name, &self.histogram_identity, streams)?;
@@ -662,16 +955,17 @@ impl DataSource for SegmentedSource {
     }
 
     fn interval(&self) -> f64 {
-        self.segments
+        self.catalog
             .iter()
-            .map(|s| s.interval())
+            .filter(|c| c.present)
+            .map(|c| c.interval)
             .fold(f64::MAX, f64::min)
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {
-        self.segments
+        self.catalog
             .iter()
-            .filter_map(|s| s.time_range())
+            .filter_map(|c| c.span)
             .fold(None, |acc, (lo, hi)| match acc {
                 None => Some((lo, hi)),
                 Some((alo, ahi)) => Some((alo.min(lo), ahi.max(hi))),
@@ -679,28 +973,28 @@ impl DataSource for SegmentedSource {
     }
 
     fn counter_names(&self) -> Vec<String> {
-        union_names(self.segments.iter().map(|s| s.counter_names()))
+        self.counter_identity.names()
     }
 
     fn gauge_names(&self) -> Vec<String> {
-        union_names(self.segments.iter().map(|s| s.gauge_names()))
+        self.gauge_identity.names()
     }
 
     fn histogram_names(&self) -> Vec<String> {
-        union_names(self.segments.iter().map(|s| s.histogram_names()))
+        self.histogram_identity.names()
     }
 
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        union_labels(self.segments.iter().map(|s| s.counter_labels(name)))
+        self.counter_identity.labels(name)
     }
 
     fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        union_labels(self.segments.iter().map(|s| s.gauge_labels(name)))
+        self.gauge_identity.labels(name)
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         if self.histogram_runs.run_count(name) <= 1 {
-            return union_labels(self.segments.iter().map(|s| s.histogram_labels(name)));
+            return self.histogram_identity.labels(name);
         }
         // Conflict: surface each run's label sets tagged with `__run__` so
         // the split is addressable (`histogram_mean(latency{__run__="1"})`).
@@ -708,19 +1002,21 @@ impl DataSource for SegmentedSource {
         // real user label with this name would otherwise be silently
         // overwritten below.
         let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
-        for (idx, seg) in self.segments.iter().enumerate() {
-            let Some(run) = self.histogram_runs.segment_run(name, idx) else {
-                continue;
-            };
-            for mut labels in seg.histogram_labels(name) {
-                debug_assert!(
-                    !labels.contains_key("__run__"),
-                    "'__run__' is a reserved label name; a real label with this name would be \
-                     silently overwritten by the run-disambiguation policy"
-                );
-                labels.insert("__run__".to_string(), run.to_string());
-                sets.push(labels);
-            }
+        for (run, labels) in self
+            .histogram_runs
+            .run_labels
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            let mut labels = labels.clone();
+            debug_assert!(
+                !labels.contains_key("__run__"),
+                "'__run__' is a reserved label name; a real label with this name would be \
+                 silently overwritten by the run-disambiguation policy"
+            );
+            labels.insert("__run__".to_string(), run.to_string());
+            sets.push(labels);
         }
         sets.sort();
         sets.dedup();
@@ -728,54 +1024,23 @@ impl DataSource for SegmentedSource {
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {
-        let mut out = HashMap::new();
-        for s in &self.segments {
-            out.extend(s.file_metadata());
-        }
-        out
+        self.file_metadata.clone()
     }
 
     fn metadata_get(&self, key: &str) -> Option<String> {
-        // Last segment wins on collision, matching file_metadata().
-        let mut last = None;
-        for s in &self.segments {
-            if let Some(v) = s.metadata_get(key) {
-                last = Some(v);
-            }
-        }
-        last
+        self.file_metadata.get(key).cloned()
     }
 
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
-        let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
-        for (idx, s) in self.segments.iter().enumerate() {
-            for (metric, cols) in s.column_map() {
-                // Mirror the run tagging that `histogram_stream` and
-                // `histogram_labels` apply. `QueryEngine::columns` requires
-                // every filter key to be PRESENT on the label set, so without
-                // `__run__` here a run-qualified selector resolves to no
-                // columns at all — and the only production consumer
-                // (rezolus' `RezReader`) routes every query through
-                // `columns()` first, so it would reject
-                // `histogram_mean(latency{__run__="1"})` outright and leave
-                // the conflict policy's documented escape hatch unreachable.
-                //
-                // Tagged for every histogram the run index knows, not just the
-                // drifted ones, so `__run__="0"` also addresses a metric that
-                // never drifted — matching `histogram_stream`, which accepts
-                // run 0 in the single-run case. These labels are routing keys,
-                // never user-visible series labels (that is `histogram_labels`,
-                // which still only tags an actual conflict).
-                let run = self.histogram_runs.segment_run(&metric, idx);
-                let entry = out.entry(metric).or_default();
-                match run {
-                    Some(run) => entry.extend(cols.into_iter().map(|(mut labels, col)| {
-                        labels.inner.insert("__run__".to_string(), run.to_string());
-                        (labels, col)
-                    })),
-                    None => entry.extend(cols),
-                }
-            }
+        self.column_map.clone()
+    }
+
+    fn sample_timestamps(&self) -> Vec<u64> {
+        // Per-sample timestamps, concatenated in segment order — same splice
+        // contract as the query path, no sort/dedup. Touches every segment.
+        let mut out = Vec::new();
+        for (_, seg) in self.touched(0, u64::MAX) {
+            out.extend(seg.data_source().sample_timestamps());
         }
         out
     }
@@ -803,13 +1068,7 @@ impl MetricsSource for SegmentedParquetReader {
     }
 
     fn sample_timestamps(&self) -> Vec<u64> {
-        // Per-sample timestamps, concatenated in segment order — same splice
-        // contract as the query path, no sort/dedup.
-        let mut out = Vec::new();
-        for s in &self.segments {
-            out.extend(s.sample_timestamps());
-        }
-        out
+        DataSource::sample_timestamps(&*self.source)
     }
 
     fn time_range(&self) -> Option<(f64, f64)> {
@@ -2343,7 +2602,7 @@ mod tests {
         // exercises end-to-end: two segments with different powers for the
         // same name must resolve to two runs, each segment assigned to its
         // own run in first-appearance order. This is also where
-        // `HistogramRunIndex::build` logs the "splitting into __run__
+        // `HistogramRunIndex::report` logs the "splitting into __run__
         // series" warning (see its doc comment) — once per open, not once
         // per query.
         let n2 = ::histogram::Config::new(2, 8).unwrap().total_buckets();
@@ -2359,7 +2618,11 @@ mod tests {
         )
         .unwrap();
 
-        let index = HistogramRunIndex::build(&[seg_a, seg_b]);
+        let mut index = HistogramRunIndex::default();
+        for (idx, seg) in [seg_a, seg_b].iter().enumerate() {
+            index.observe(idx, seg.histogram_configs());
+        }
+        index.report();
         assert_eq!(
             index.run_count("latency"),
             2,
@@ -2561,5 +2824,171 @@ mod tests {
             .collect();
         jobs.sort();
         assert_eq!(jobs, vec!["segmented".to_string(), "single".to_string()]);
+    }
+
+    /// A store that counts fetches, and can be told to forget a segment.
+    struct CountingStore {
+        segments: Vec<Vec<u8>>,
+        fetched: Mutex<Vec<usize>>,
+        gone: Mutex<std::collections::HashSet<usize>>,
+    }
+
+    impl CountingStore {
+        fn new(segments: Vec<Vec<u8>>) -> Arc<Self> {
+            Arc::new(Self {
+                segments,
+                fetched: Mutex::new(Vec::new()),
+                gone: Mutex::new(Default::default()),
+            })
+        }
+
+        fn fetched(&self) -> Vec<usize> {
+            std::mem::take(&mut *self.fetched.lock().unwrap())
+        }
+    }
+
+    impl SegmentStore for CountingStore {
+        fn len(&self) -> usize {
+            self.segments.len()
+        }
+
+        fn bytes(&self, idx: usize) -> SegmentBytes {
+            self.fetched.lock().unwrap().push(idx);
+            if self.gone.lock().unwrap().contains(&idx) {
+                return Ok(None);
+            }
+            Ok(self.segments.get(idx).map(|b| Bytes::from(b.clone())))
+        }
+    }
+
+    /// Three one-second segments at 1s, 3s and 5s, one series.
+    fn three_segments() -> Vec<Vec<u8>> {
+        vec![
+            segment("c", &[], &[(1_000_000_000, 10)]),
+            segment("c", &[], &[(3_000_000_000, 30)]),
+            segment("c", &[], &[(5_000_000_000, 50)]),
+        ]
+    }
+
+    /// Open reads every segment exactly once and keeps none of them; a
+    /// query fetches only the segments whose span it touches, and the
+    /// listing surface answers from what open kept.
+    #[test]
+    fn open_reads_each_segment_once_and_a_query_fetches_only_what_it_touches() {
+        let store = CountingStore::new(three_segments());
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
+        assert_eq!(store.fetched(), vec![0, 1, 2], "open: each once, in order");
+        assert_eq!(r.cached_segments().0, 0, "open keeps no segment");
+
+        assert_eq!(r.counter_names(), vec!["c".to_string()]);
+        assert_eq!(r.counter_labels("c").len(), 1);
+        assert_eq!(r.time_range_ns(), Some((1_000_000_000, 5_000_000_000)));
+        assert_eq!(
+            store.fetched(),
+            Vec::<usize>::new(),
+            "listing needs no bytes"
+        );
+
+        // A range over the middle second touches the middle segment only.
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
+        assert_eq!(store.fetched(), vec![1]);
+        assert_eq!(r.cached_segments().0, 1);
+
+        // Again: served from the cache.
+        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
+        assert_eq!(store.fetched(), Vec::<usize>::new());
+
+        // The whole range: the two not yet cached.
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        assert_eq!(store.fetched(), vec![0, 2]);
+        assert_eq!(r.cached_segments().0, 3);
+    }
+
+    /// The cache is bounded by segment bytes and keeps the most recently
+    /// used, never fewer than one.
+    #[test]
+    fn the_segment_cache_evicts_least_recently_used_within_its_byte_budget() {
+        let segments = three_segments();
+        // What one opened segment is charged: its bytes plus the footer
+        // estimate, the same figure the cache uses.
+        let one =
+            ParquetReader::open_bytes_with_pool(segments[0].clone(), BufferPool::new(1 << 20))
+                .unwrap()
+                .resident_estimate();
+        let store = CountingStore::new(segments);
+        // Room for two segments, not three.
+        let pool = BufferPool::new(2 * one + one / 2);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        store.fetched();
+        let (n, bytes) = r.cached_segments();
+        assert_eq!(n, 2, "two fit, the first opened was evicted");
+        assert!(bytes <= 2 * one + one / 2);
+
+        // The last two opened are the ones held: a query touching only the
+        // last segment fetches nothing, one touching the first fetches it.
+        let _ = r.query_range_opts("irate(c[1s])", 4.5, 5.5, 1.0, &opts);
+        assert_eq!(store.fetched(), Vec::<usize>::new());
+        let _ = r.query_range_opts("irate(c[1s])", 0.5, 1.5, 1.0, &opts);
+        assert_eq!(store.fetched(), vec![0]);
+
+        // A budget smaller than one segment still opens one at a time.
+        let store = CountingStore::new(three_segments());
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1)).unwrap();
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        assert_eq!(r.cached_segments().0, 1);
+    }
+
+    /// A segment the store has lost since open — a rolling buffer's
+    /// retention — is skipped, and the rest still answer.
+    #[test]
+    fn a_segment_lost_after_open_is_skipped() {
+        let store = CountingStore::new(three_segments());
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
+        store.gone.lock().unwrap().insert(0);
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let QueryResult::Matrix { result } = r
+            .query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts)
+            .unwrap()
+        else {
+            panic!("matrix");
+        };
+        // Samples at 3s and 5s remain: one pairwise rate, at 5s. With the
+        // lost segment there would be a second, at 3s.
+        let points: Vec<(f64, f64)> = result[0].values.clone();
+        assert_eq!(
+            points,
+            vec![(5.0, 10.0)],
+            "the lost segment's sample is gone: {points:?}"
+        );
+        assert_eq!(r.segment_count(), 3, "the catalog still counts it");
+    }
+
+    /// A store that has lost a segment BEFORE open still opens; one that has
+    /// lost every segment does not.
+    #[test]
+    fn open_tolerates_a_gone_segment_but_not_all_of_them() {
+        let store = CountingStore::new(three_segments());
+        store.gone.lock().unwrap().insert(1);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1 << 20))
+            .unwrap();
+        assert_eq!(r.time_range_ns(), Some((1_000_000_000, 5_000_000_000)));
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        assert_eq!(
+            store.fetched().iter().filter(|i| **i == 1).count(),
+            1,
+            "only open asked for the gone segment; the query never did"
+        );
+
+        let store = CountingStore::new(three_segments());
+        for i in 0..3 {
+            store.gone.lock().unwrap().insert(i);
+        }
+        assert!(SegmentedParquetReader::open_with_pool(store, BufferPool::new(1 << 20)).is_err());
     }
 }

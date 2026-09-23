@@ -151,6 +151,26 @@ impl ParquetReader {
         self.inner.clone()
     }
 
+    /// What this reader holds in memory while open, estimated: its bytes if
+    /// it was opened from bytes, plus a per-column charge for the parsed
+    /// footer and column descriptors.
+    ///
+    /// A footer's parsed form is not measurable cheaply, so it is estimated
+    /// from the one thing that scales it, the column count. Measured on a
+    /// task table with ~2,500 columns per segment: 4.2 MB of parquet parsed
+    /// into roughly 5–6 MB of arrow schema, column-chunk metadata and label
+    /// maps, so 2 KiB per column is the working figure. What this feeds is a
+    /// cache bound, where being off by a factor of two costs a cache half as
+    /// deep, not correctness.
+    pub(crate) fn resident_estimate(&self) -> usize {
+        const PER_COLUMN: usize = 2048;
+        self.inner
+            .files
+            .iter()
+            .map(|(f, _)| f.resident_bytes() + PER_COLUMN * f.column_count())
+            .sum()
+    }
+
     /// Histogram `(grouping_power, max_value_power)` per metric name, read from
     /// parquet **field metadata only** — no row group is touched.
     ///
@@ -998,6 +1018,14 @@ impl DataSource for MultiParquetSource {
         }
         out
     }
+
+    /// Through the trait as well as the inherent method: a composite holding
+    /// this source as a `dyn DataSource` (the segmented reader) got the
+    /// trait's empty default here, while `ParquetReader::sample_timestamps`
+    /// on the concrete type got the rows.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        MultiParquetSource::sample_timestamps(self)
+    }
 }
 
 impl MultiParquetSource {
@@ -1275,6 +1303,17 @@ impl DataSource for FileSource {
 
     fn columns_desc(&self) -> Vec<ColDesc> {
         self.0.columns().to_vec()
+    }
+
+    fn column_count(&self) -> usize {
+        self.0.meta.schema().fields().len()
+    }
+
+    fn resident_bytes(&self) -> usize {
+        match &self.0.backing {
+            ParquetBacking::Bytes(b) => b.len(),
+            ParquetBacking::File(_) => 0,
+        }
     }
 }
 
