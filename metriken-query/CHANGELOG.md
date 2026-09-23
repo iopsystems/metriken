@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   windows, which `rate()`/`irate()` turn into uncertainty bounds and which
   the snapshot ingest path cannot carry. `set_sample_timestamps` declares the
   rows a store assembled from a table stands for; unset, the store reports
-  the union of its series' timestamps. A `UnionChild` can be built from a
-  `MemoryStore`, so an assembled store composes beside parquet readers.
+  the union of its series' timestamps. A `UnionChild` and a
+  `CompositionSource` can be built from a `MemoryStore`, so an assembled
+  store composes beside parquet readers.
   `HistogramSnapshot` is public; `Labels` converts from a
   `BTreeMap<String, String>`.
 
