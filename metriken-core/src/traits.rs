@@ -37,6 +37,24 @@ pub trait CounterGroupMetric: Send + Sync + 'static {
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
 
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed, and never changes otherwise.
+    ///
+    /// The contract: two calls returning the same value mean no metadata of
+    /// any entry changed between them. It lets a reader that caches
+    /// something derived from the metadata — a schema, a hash of every
+    /// entry's labels — decide whether that cache is still current in O(1)
+    /// instead of re-reading every entry. The reader must take the version
+    /// BEFORE reading the metadata it validates: a mutation landing between
+    /// the two then shows on the next check and costs one re-read, where the
+    /// other order could pair a new version with old data and be believed
+    /// indefinitely.
+    ///
+    /// Required rather than defaulted so that a type with mutable metadata
+    /// cannot forget it: a default that never moved would make every such
+    /// cache serve stale entries silently.
+    fn metadata_version(&self) -> u64;
+
     /// Visit the metadata for the entry at `idx` without cloning it.
     ///
     /// The implementation may hold an internal read lock for the duration of
@@ -97,6 +115,24 @@ pub trait GaugeGroupMetric: Send + Sync + 'static {
 
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
+
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed, and never changes otherwise.
+    ///
+    /// The contract: two calls returning the same value mean no metadata of
+    /// any entry changed between them. It lets a reader that caches
+    /// something derived from the metadata — a schema, a hash of every
+    /// entry's labels — decide whether that cache is still current in O(1)
+    /// instead of re-reading every entry. The reader must take the version
+    /// BEFORE reading the metadata it validates: a mutation landing between
+    /// the two then shows on the next check and costs one re-read, where the
+    /// other order could pair a new version with old data and be believed
+    /// indefinitely.
+    ///
+    /// Required rather than defaulted so that a type with mutable metadata
+    /// cannot forget it: a default that never moved would make every such
+    /// cache serve stale entries silently.
+    fn metadata_version(&self) -> u64;
 
     /// Visit the metadata for the entry at `idx` without cloning it.
     ///
@@ -162,6 +198,24 @@ pub trait HistogramGroupMetric: Send + Sync + 'static {
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
 
+    /// A value that changes whenever any entry's metadata is set, added to
+    /// or removed, and never changes otherwise.
+    ///
+    /// The contract: two calls returning the same value mean no metadata of
+    /// any entry changed between them. It lets a reader that caches
+    /// something derived from the metadata — a schema, a hash of every
+    /// entry's labels — decide whether that cache is still current in O(1)
+    /// instead of re-reading every entry. The reader must take the version
+    /// BEFORE reading the metadata it validates: a mutation landing between
+    /// the two then shows on the next check and costs one re-read, where the
+    /// other order could pair a new version with old data and be believed
+    /// indefinitely.
+    ///
+    /// Required rather than defaulted so that a type with mutable metadata
+    /// cannot forget it: a default that never moved would make every such
+    /// cache serve stale entries silently.
+    fn metadata_version(&self) -> u64;
+
     /// Visit the metadata for the entry at `idx` without cloning it.
     ///
     /// The implementation may hold an internal read lock for the duration of
@@ -224,6 +278,10 @@ mod tests {
         fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
             self.metadata.iter().map(|(k, v)| (*k, v.clone())).collect()
         }
+        fn metadata_version(&self) -> u64 {
+            // This fake's metadata never changes.
+            0
+        }
     }
 
     struct DefaultOnlyGaugeGroup {
@@ -245,6 +303,10 @@ mod tests {
         }
         fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
             self.metadata.iter().map(|(k, v)| (*k, v.clone())).collect()
+        }
+        fn metadata_version(&self) -> u64 {
+            // This fake's metadata never changes.
+            0
         }
     }
 
@@ -270,6 +332,10 @@ mod tests {
         }
         fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)> {
             self.metadata.iter().map(|(k, v)| (*k, v.clone())).collect()
+        }
+        fn metadata_version(&self) -> u64 {
+            // This fake's metadata never changes.
+            0
         }
     }
 

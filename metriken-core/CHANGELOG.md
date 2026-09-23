@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+- **BREAKING:** `metadata_version()` on `CounterGroupMetric`, `GaugeGroupMetric`
+  and `HistogramGroupMetric` — changes whenever any entry's metadata changes,
+  never otherwise; required, not defaulted. Lets a cache derived from the
+  metadata be validated in O(1). Take it before reading the metadata it
+  validates.
+
 ## 0.3.0
 ### Added
 - `Window` acquisition-window type (`begin_ns`/`end_ns`, opt-in serde).
