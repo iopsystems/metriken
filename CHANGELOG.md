@@ -7,24 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-core 0.4.0
+### metriken-core 0.3.2
 
-- **Added (breaking):** `metadata_version()` on `CounterGroupMetric`,
-  `GaugeGroupMetric` and `HistogramGroupMetric`: a value that changes whenever
-  any entry's metadata is set, added to or removed, and never otherwise. It
-  lets a reader that caches something derived from the metadata (a schema, a
-  hash of every entry's labels) decide in O(1) whether the cache is current,
-  instead of re-reading every entry every tick. Required rather than
-  defaulted, so a type with mutable metadata cannot forget it and serve a
-  stale cache silently. The reader must take the version before reading the
-  metadata it validates; the doc says why.
+- **Added:** `metadata_version()` on `CounterGroupMetric`, `GaugeGroupMetric`
+  and `HistogramGroupMetric`: a value that changes whenever any entry's
+  metadata is set, added to or removed, and never otherwise. It lets a
+  reader that caches something derived from the metadata (a schema, a hash
+  of every entry's labels) decide in O(1) whether the cache is current,
+  instead of re-reading every entry every tick. Defaulted to a hash of the
+  metadata snapshot — correct for any implementor, but a full read per call,
+  so a type that can count its own mutations should override it. The reader
+  must take the version before reading the metadata it validates; the doc
+  says why.
 
-### metriken 0.12.0
+### metriken 0.11.1
 
 - **Added:** `metadata_version()` on `CounterGroup`, `GaugeGroup`,
   `HistogramGroup` and `ShardedCounterGroup`, backed by a counter in the
   shared metadata store that every mutation path bumps under the write lock.
-  Implements the new `metriken-core` trait method.
+  Overrides the `metriken-core` default with an O(1) load.
 
 ### metriken-query 0.25.0
 
