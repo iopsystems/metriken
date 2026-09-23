@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use crate::labels::Labels;
+use crate::labels::{is_internal_label, Labels};
 
 use super::{LabeledSeries, Point, SeriesSet};
 
@@ -81,8 +81,12 @@ pub(crate) fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Lab
             }
         }
         GroupBy::Exclude(without) => {
+            // Internal labels go with the named ones: an aggregate is over a
+            // set of series, and which incarnation or run each input was is
+            // meaningless for the sum. `__name__` was always dropped here;
+            // the rule is now the prefix, not the one name.
             for (k, v) in &labels.inner {
-                if k == "__name__" {
+                if is_internal_label(k) {
                     continue;
                 }
                 if without.iter().any(|x| x == k) {
@@ -217,6 +221,44 @@ impl<'a> Iterator for MergeReduce<'a> {
             edges,
             interpolated: any_interpolated,
         })
+    }
+}
+
+#[cfg(test)]
+mod group_label_tests {
+    use super::*;
+
+    /// `without` drops every internal label, not only `__name__`: an
+    /// aggregate is over a set of series, and which run or incarnation each
+    /// input was is meaningless for the result. Two series that differ only
+    /// in an internal label must land in one group.
+    #[test]
+    fn without_drops_internal_labels_as_it_drops_name() {
+        let a = Labels::from([
+            ("__name__", "cpu"),
+            ("__run__", "0"),
+            ("__incarnation__", "a"),
+            ("cpu", "1"),
+            ("mode", "user"),
+        ]);
+        let b = Labels::from([("__incarnation__", "b"), ("cpu", "1"), ("mode", "user")]);
+        let without = ["mode".to_string()];
+        let ga = derive_group_labels(&a, GroupBy::Exclude(&without));
+        let gb = derive_group_labels(&b, GroupBy::Exclude(&without));
+        assert_eq!(ga, Labels::from([("cpu", "1")]), "{ga:?}");
+        assert_eq!(ga, gb, "the two incarnations aggregate as one");
+    }
+
+    /// `by` is unchanged: it keeps exactly what it names, and naming an
+    /// internal label is how a caller asks to keep the split.
+    #[test]
+    fn by_keeps_an_internal_label_when_asked() {
+        let a = Labels::from([("__run__", "1"), ("cpu", "1")]);
+        let by = ["__run__".to_string()];
+        assert_eq!(
+            derive_group_labels(&a, GroupBy::Include(&by)),
+            Labels::from([("__run__", "1")])
+        );
     }
 }
 

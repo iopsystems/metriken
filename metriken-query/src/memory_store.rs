@@ -584,6 +584,54 @@ mod ingest_tests {
         })
     }
 
+    /// The live path and the recorded path must agree on which keys are
+    /// labels. They did not: a histogram ingested from a snapshot kept
+    /// `grouping_power` and `max_value_power` as labels, while the same
+    /// histogram read from parquet had them stripped, so a recording carried
+    /// two extra labels per histogram series when viewed live. Both loaders
+    /// now go through `Labels::from_metadata`; this pins the live side.
+    #[test]
+    fn ingest_does_not_turn_histogram_configuration_into_labels() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("metric".to_string(), "latency".to_string());
+        metadata.insert("metric_type".to_string(), "histogram".to_string());
+        metadata.insert("unit".to_string(), "nanoseconds".to_string());
+        metadata.insert("grouping_power".to_string(), "7".to_string());
+        metadata.insert("max_value_power".to_string(), "64".to_string());
+        metadata.insert("op".to_string(), "read".to_string());
+        let mut h = ::histogram::Histogram::new(7, 64).unwrap();
+        h.increment(1_000).unwrap();
+        let snap = metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
+            duration: Duration::from_secs(0),
+            metadata: HashMap::new(),
+            counters: vec![],
+            gauges: vec![],
+            histograms: vec![metriken_exposition::Histogram::new(
+                "latency".to_string(),
+                h,
+                metadata,
+            )],
+        });
+        store.ingest_snapshot(snap);
+
+        let labels = store.histogram_labels("latency");
+        assert_eq!(labels.len(), 1);
+        let only: Vec<(&str, &str)> = labels[0]
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            only,
+            vec![("op", "read")],
+            "storage keys must not survive as labels: {:?}",
+            labels[0]
+        );
+    }
+
     #[test]
     fn test_ingest_counter_basic() {
         let store = crate::MemoryStore::builder()

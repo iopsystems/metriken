@@ -122,8 +122,9 @@ impl Memory {
 
 /// Extract metric name and label set from snapshot metadata.
 /// If `metadata` has a `"metric"` key, use it as the name; otherwise fall back
-/// to `default_name` (the snapshot's `.name` field). Drop reserved keys
-/// (`metric`, `metric_type`, `unit`) before constructing labels.
+/// to `default_name` (the snapshot's `.name` field). The labels are everything
+/// that is not a storage key — the same rule, from the same function, as the
+/// parquet loader (`Labels::from_metadata`).
 #[cfg(feature = "ingest")]
 pub(crate) fn extract_name_labels(
     metadata: &std::collections::HashMap<String, String>,
@@ -133,16 +134,7 @@ pub(crate) fn extract_name_labels(
         .get("metric")
         .cloned()
         .unwrap_or_else(|| default_name.to_string());
-    let mut inner = std::collections::BTreeMap::new();
-    for (k, v) in metadata {
-        match k.as_str() {
-            "metric" | "metric_type" | "unit" => continue,
-            _ => {
-                inner.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    (name, Labels { inner })
+    (name, Labels::from_metadata(metadata.iter()))
 }
 
 fn slice_range(timestamps: &[u64], start_ns: u64, end_ns: u64) -> std::ops::Range<usize> {

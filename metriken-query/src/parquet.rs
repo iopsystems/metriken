@@ -1715,15 +1715,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 meta.remove("grouping_power").and_then(|v| v.parse().ok());
             let max_value_power: Option<u8> =
                 meta.remove("max_value_power").and_then(|v| v.parse().ok());
-            let mut labels = Labels::default();
-            for (k, v) in meta.iter() {
-                match k.as_str() {
-                    "metric" | "metric_type" | "unit" => continue,
-                    _ => {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
-                }
-            }
+            let labels = Labels::from_metadata(meta.iter());
             let kind = match field.data_type() {
                 DataType::UInt64 => ColKind::Counter,
                 DataType::Int64 => ColKind::Gauge,

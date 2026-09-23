@@ -53,6 +53,7 @@ pub mod fixtures;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
+pub use labels::{is_internal_label, is_storage_key, STORAGE_KEYS};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{CompositionSource, ParquetBuilder, ParquetReader};
 pub use promql::{

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.25.0
+
+- **Added:** `is_internal_label(name)`, `is_storage_key(key)` and
+  `STORAGE_KEYS` are public. A label whose name begins with `__` is internal,
+  following Prometheus: part of a series' identity and matchable in a
+  selector, dropped by `without` and by default binary-op matching alongside
+  `__name__`, and hidden by consumers building listings and legends. The
+  engine's own internal labels are `__name__` and `__run__`; a reader above
+  this crate may add its own under the same rule. Consumers that used to check
+  for `__name__` by name should use the predicate.
+- **Fixed:** the `ingest` loader and the parquet loader now derive labels from
+  one function (`Labels::from_metadata`) and one storage-key list. They had
+  drifted: the live path kept `grouping_power` and `max_value_power` as
+  labels where the parquet path stripped them, so a recording viewed live
+  carried two extra labels per histogram series that the same recording read
+  from disk did not. `STORAGE_KEYS` is pinned by a test so the two cannot
+  drift again.
+- **Changed:** `without (...)` and `ignoring (...)` drop every internal label,
+  not only `__name__`; default binary-op matching ignores every internal
+  label, not only `__name__`. For today's data this changes nothing — the
+  only other internal label, `__run__`, was already stripped from selectors
+  before matching — and it is what lets a reader split a series by
+  incarnation without breaking `a / sum(a)`.
+
 ### metriken-query 0.24.0
 
 - **Fixed (breaking):** the parquet read path no longer rounds timestamps to a

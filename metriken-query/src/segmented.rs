@@ -432,11 +432,11 @@ fn merge_gauge(a: &mut Gauge, g: Gauge) {
 /// histogram identity that [`HistogramRunIndex`] found split across
 /// incompatible configs.
 ///
-/// `__run__` is therefore a RESERVED label name (mirroring how
-/// `:window_begin`/`:window_width` are reserved column-name suffixes, see
-/// parquet.rs) — a real user label with that name (e.g. from `record
-/// --label __run__=x`) would otherwise be silently overwritten here, which
-/// is exactly the silent-coercion class this feature exists to prevent.
+/// `__run__` is therefore a RESERVED label name — an internal label under
+/// the `__` rule (`labels::is_internal_label`), like `__name__` — a real user
+/// label with that name (e.g. from `record --label __run__=x`) would
+/// otherwise be silently overwritten here, which is exactly the
+/// silent-coercion class this feature exists to prevent.
 fn relabel_with_run(mut stream: HistogramStream, run: usize) -> HistogramStream {
     for labels in &mut stream.meta.series {
         debug_assert!(
