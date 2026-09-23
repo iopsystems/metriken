@@ -1674,7 +1674,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             if col_idx == ts_col_idx {
                 return None;
             }
-            let mut meta = field.metadata().clone();
+            let meta = field.metadata().clone();
             let column_name = field.name().to_string();
             // Acquisition-window sidecar columns (`<m>:window_begin` Int64,
             // `<m>:window_width` UInt64 — per-metric; or the bare
@@ -1711,10 +1711,15 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                     .unwrap_or(&column_name)
                     .to_string()
             });
+            // Read, not removed: `Labels::from_metadata` is what keeps the
+            // histogram configuration out of the label set, for this loader
+            // and the `ingest` one alike. Removing the keys here too would
+            // let this path keep working if the shared list regressed, and
+            // then the two loaders could drift again without a test noticing.
             let grouping_power: Option<u8> =
-                meta.remove("grouping_power").and_then(|v| v.parse().ok());
+                meta.get("grouping_power").and_then(|v| v.parse().ok());
             let max_value_power: Option<u8> =
-                meta.remove("max_value_power").and_then(|v| v.parse().ok());
+                meta.get("max_value_power").and_then(|v| v.parse().ok());
             let labels = Labels::from_metadata(meta.iter());
             let kind = match field.data_type() {
                 DataType::UInt64 => ColKind::Counter,

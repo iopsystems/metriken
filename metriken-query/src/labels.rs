@@ -9,8 +9,16 @@ use std::collections::BTreeMap;
 /// consults this one list: the parquet path and the `ingest` path used to
 /// keep separate lists that had drifted by the two histogram keys, so the
 /// same recording carried two extra labels per histogram when viewed live.
-/// `storage_keys_are_pinned` holds the list still.
-pub const STORAGE_KEYS: [&str; 5] = [
+///
+/// `storage_keys_are_pinned` holds the list still, and each loader has a
+/// test that a histogram column carrying every key here yields no labels
+/// from them (`ingest_does_not_turn_histogram_configuration_into_labels`,
+/// `parquet_does_not_turn_histogram_configuration_into_labels`), so a
+/// pre-filter added to one loader cannot make them disagree unnoticed.
+///
+/// A slice rather than an array so that adding a key is not a change to a
+/// public type.
+pub const STORAGE_KEYS: &[&str] = &[
     "metric",
     "metric_type",
     "unit",
@@ -29,9 +37,17 @@ pub fn is_storage_key(key: &str) -> bool {
 /// The rule is Prometheus's: "label names beginning with `__` MUST be
 /// reserved for internal Prometheus use". An internal label is part of a
 /// series' identity and matchable in a selector — `foo{__run__="1"}` works —
-/// but it is dropped by `without` and by default binary-op matching alongside
-/// `__name__`, and consumers building listings and legends hide it. Nothing
-/// on disk uses the prefix, so an archive cannot collide with one.
+/// and it is dropped by `without` and by default binary-op matching alongside
+/// `__name__`.
+///
+/// This crate emits internal labels on every result it returns. Hiding them
+/// from listings and legends is the consumer's contract, not something done
+/// here, which is why the predicate is public.
+///
+/// No writer in this workspace emits a `__` key into column metadata, and
+/// the loader does not check for one: a key with the prefix that did arrive
+/// would be kept as a label (the loaders strip only storage keys) and could
+/// collide with a label the engine injects.
 ///
 /// The engine's own internal labels are `__name__` (the series name) and
 /// `__run__` (a histogram whose bucket configuration changed mid-recording).
@@ -51,7 +67,9 @@ impl Labels {
     ///
     /// The one place metadata becomes labels, for both loaders, so they
     /// cannot disagree about which keys are labels.
-    pub fn from_metadata<'a, K, V>(metadata: impl IntoIterator<Item = (&'a K, &'a V)>) -> Self
+    pub(crate) fn from_metadata<'a, K, V>(
+        metadata: impl IntoIterator<Item = (&'a K, &'a V)>,
+    ) -> Self
     where
         K: AsRef<str> + 'a,
         V: AsRef<str> + 'a,
@@ -181,7 +199,7 @@ mod tests {
     fn storage_keys_are_pinned() {
         assert_eq!(
             STORAGE_KEYS,
-            [
+            &[
                 "metric",
                 "metric_type",
                 "unit",
