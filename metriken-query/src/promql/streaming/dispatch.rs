@@ -382,22 +382,22 @@ where
                 RateMode::Raw => range_ns,
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
-            let counters = ctx
+            let streams = ctx
                 .source
-                .counters(metric_name, &filter, data_start, ctx.end_ns)
+                .counter_streams(metric_name, &filter, data_start, ctx.end_ns)
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
-            // Each series is its producer, pulled lazily by whatever
-            // consumes it: an aggregate holds one buffered point per series,
-            // not every series' points. Collecting here used to be most of a
-            // query's memory on a wide table.
-            let series: SeriesSet<'a> = counters
-                .series
+            // Each series is its producer over its own sample stream, pulled
+            // by whatever consumes it: an aggregate holds one buffered point
+            // per series and each producer one interval's worth of samples,
+            // not every series' every sample. Collecting here used to be
+            // most of a query's memory on a wide table.
+            let series: SeriesSet<'a> = streams
                 .into_iter()
-                .map(|c| match ctx.rate_mode {
+                .map(|stream| match ctx.rate_mode {
                     RateMode::Grid => {
-                        let rate = CounterGridRate::new(
-                            c.timestamps,
-                            &c.values,
+                        let rate = CounterGridRate::from_stream(
+                            stream.samples,
+                            stream.windowed,
                             ctx.start_ns,
                             ctx.end_ns,
                             ctx.step_ns,
@@ -406,7 +406,6 @@ where
                             // points stay on the grid, each value averages
                             // over more.
                             ctx.rate_span_ns.unwrap_or(ctx.step_ns),
-                            c.windows,
                         );
                         // Explicit timestamps override the grid entirely —
                         // placement AND averaging window both come from
@@ -415,14 +414,14 @@ where
                         // point that source never observed.
                         match &ctx.eval_timestamps {
                             Some(points) => {
-                                LabeledSeries::new(c.labels, rate.at_points(points.clone()))
+                                LabeledSeries::new(stream.labels, rate.at_points(points.clone()))
                             }
-                            None => LabeledSeries::new(c.labels, rate),
+                            None => LabeledSeries::new(stream.labels, rate),
                         }
                     }
                     RateMode::Raw => LabeledSeries::new(
-                        c.labels,
-                        CounterPairwiseRate::new(c.timestamps, c.values, ctx.start_ns, ctx.end_ns),
+                        stream.labels,
+                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns),
                     ),
                 })
                 .collect();

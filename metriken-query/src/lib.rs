@@ -62,7 +62,20 @@ pub use promql::{
 pub use segmented::{
     ColumnRelabel, InMemorySegments, Run, SegmentBytes, SegmentStore, SegmentedParquetReader,
 };
-pub use types::HistogramSnapshot;
+pub use types::{CounterSample, CounterStream, HistogramSnapshot};
+
+/// Where a counter column sits in a parquet schema: its own index and, if it
+/// carries acquisition windows, its begin/width sidecar columns. What
+/// [`DataSource::counter_column`] takes, so a reader that indexed a table's
+/// columns at open can read one back without re-parsing the schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterColumnRef {
+    pub name: String,
+    pub labels: Labels,
+    pub col_idx: usize,
+    pub begin_col: Option<usize>,
+    pub width_col: Option<usize>,
+}
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
 use histogram_stream::HistogramStream;
@@ -171,6 +184,41 @@ pub(crate) trait DataSource: Send + Sync {
     /// streaming layer — see `Placement`.
     fn counters(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64)
         -> Option<Counters>;
+    /// The counter series as streams — see [`CounterStream`]. The default
+    /// materializes through [`counters`](Self::counters); a source that can
+    /// read one series at a time overrides it.
+    fn counter_streams<'s>(
+        &'s self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<CounterStream<'s>>> {
+        let counters = self.counters(name, filter, start_ns, end_ns)?;
+        Some(
+            counters
+                .series
+                .into_iter()
+                .map(CounterStream::from)
+                .collect(),
+        )
+    }
+    /// Every counter column of this source's parquet schema, with what a
+    /// direct read of it needs. Empty for a source without a parquet schema.
+    fn counter_column_refs(&self) -> Vec<CounterColumnRef> {
+        Vec::new()
+    }
+    /// Read one counter column by its schema position, every row group the
+    /// range touches. `None` for a source without a parquet schema.
+    fn counter_column(
+        &self,
+        col: &CounterColumnRef,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<types::Counter> {
+        let _ = (col, start_ns, end_ns);
+        None
+    }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
     fn histogram_stream(
         &self,

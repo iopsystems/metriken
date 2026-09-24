@@ -194,6 +194,7 @@ impl SegmentedParquetReader {
         let mut histogram_runs = HistogramRunIndex::default();
         let mut file_metadata: HashMap<String, String> = HashMap::new();
         let mut column_map: HashMap<String, HashMap<Labels, String>> = HashMap::new();
+        let mut counter_columns: CounterColumns = HashMap::new();
         let mut opened = 0usize;
 
         for idx in 0..store.len() {
@@ -220,6 +221,28 @@ impl SegmentedParquetReader {
                 }
             };
             counter_identity.extend(presented(seg.counter_columns()));
+            // Where each counter series' samples are, by segment: the
+            // column, located once here so a stream can read it back
+            // without a schema scan. A relabelled column feeds every series
+            // it can present as.
+            for col in seg.counter_column_refs() {
+                let sets = match &relabel {
+                    Some(r) => r
+                        .identities(&col.name, &col.labels)
+                        .unwrap_or_else(|| vec![col.labels.clone()]),
+                    None => vec![col.labels.clone()],
+                };
+                let by_series = counter_columns.entry(col.name.clone()).or_default();
+                for labels in sets {
+                    let Some(pos) = counter_identity.position(&col.name, &labels) else {
+                        continue;
+                    };
+                    if by_series.len() <= pos {
+                        by_series.resize_with(pos + 1, Vec::new);
+                    }
+                    by_series[pos].push((idx, col.clone()));
+                }
+            }
             gauge_identity.extend(presented(seg.gauge_columns()));
             let histogram_columns = presented(seg.histogram_columns());
             histogram_runs.observe(idx, seg.histogram_configs());
@@ -285,6 +308,7 @@ impl SegmentedParquetReader {
             histogram_runs,
             file_metadata,
             column_map,
+            counter_columns,
         });
         let engine = QueryEngine::new(Arc::clone(&source) as Arc<dyn DataSource>);
         Ok(Self { source, engine })
@@ -709,7 +733,13 @@ struct SegmentedSource {
     file_metadata: HashMap<String, String>,
     /// Built at open from every segment's columns; see `column_map`.
     column_map: HashMap<String, HashMap<Labels, String>>,
+    /// name -> per series position, the `(segment, column)` pairs its
+    /// samples come from, in segment order. What `counter_streams` reads.
+    counter_columns: CounterColumns,
 }
+
+/// name -> series position -> the segments and columns that feed it.
+type CounterColumns = HashMap<String, Vec<Vec<(usize, crate::CounterColumnRef)>>>;
 
 impl SegmentedSource {
     /// The filter a segment is asked with: the query's own, unless a
@@ -1082,6 +1112,76 @@ impl DataSource for SegmentedSource {
             None
         } else {
             Some(Counters { series })
+        }
+    }
+
+    /// One stream per series the filter accepts, each reading its own column
+    /// out of each touched segment as it is pulled. What `counters` holds
+    /// all at once, this holds one segment's worth of one series at a time;
+    /// an aggregate pulling every series in lockstep keeps the segment they
+    /// are all reading in the cache and the decoded columns in the pool.
+    fn counter_streams<'s>(
+        &'s self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<crate::CounterStream<'s>>> {
+        let order = self.counter_identity.order(name);
+        if order.is_empty() {
+            return None;
+        }
+        let columns = self.counter_columns.get(name)?;
+        let name: Arc<str> = Arc::from(name);
+        let mut out = Vec::new();
+        for (pos, labels) in order.iter().enumerate() {
+            if !labels.matches(filter) {
+                continue;
+            }
+            let Some(locations) = columns.get(pos) else {
+                continue;
+            };
+            let windowed = locations
+                .first()
+                .is_some_and(|(_, c)| c.begin_col.is_some() && c.width_col.is_some());
+            let labels = labels.clone();
+            let series_labels = labels.clone();
+            let name = Arc::clone(&name);
+            let samples = locations
+                .iter()
+                .filter(move |(idx, _)| self.catalog[*idx].touches(start_ns, end_ns))
+                .filter_map(move |(idx, col)| {
+                    let seg = match self.segment(*idx) {
+                        Ok(Some(seg)) => seg,
+                        Ok(None) => return None,
+                        Err(e) => {
+                            tracing::warn!(segment = idx, "fetching a segment: {e}");
+                            return None;
+                        }
+                    };
+                    let chunk = seg.counter_column(col, start_ns, end_ns)?;
+                    // A relabelled column carries every occupant's samples;
+                    // this stream is one occupant's.
+                    let pieces =
+                        relabel_counter(self.relabel.as_deref(), &name, &Labels::default(), chunk);
+                    let mine: Vec<Counter> = pieces
+                        .into_iter()
+                        .filter(|c| c.labels == series_labels)
+                        .collect();
+                    Some(mine)
+                })
+                .flatten()
+                .flat_map(|c| crate::CounterStream::from(c).samples);
+            out.push(crate::CounterStream {
+                labels,
+                windowed,
+                samples: Box::new(samples),
+            });
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
         }
     }
 
