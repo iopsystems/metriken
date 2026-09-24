@@ -491,6 +491,12 @@ impl MetricsSource for ParquetReader {
         self.interval()
     }
 
+    /// Asks each composed child rather than walking the merged labels, so a
+    /// lazy child can answer without loading.
+    fn total_series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
     fn source(&self) -> String {
         self.source()
     }
@@ -862,6 +868,45 @@ impl DataSource for MultiParquetSource {
         }
     }
 
+    /// Each child's streams under its injected labels, concatenated the way
+    /// `counters` concatenates series. Without this a composed reader fell to
+    /// the trait default and materialized every child's every series through
+    /// `counters` before a rate could start — the whole table again, which
+    /// the segmented reader's streams exist to avoid.
+    fn counter_streams<'s>(
+        &'s self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<crate::CounterStream<'s>>> {
+        let mut out: Vec<crate::CounterStream<'s>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let Some(pq_filter) = resolve_filter(extra, filter) else {
+                continue;
+            };
+            let Some(streams) = pf.counter_streams(name, &pq_filter, start_ns, end_ns) else {
+                continue;
+            };
+            for mut stream in streams {
+                for (k, v) in &extra.inner {
+                    debug_assert!(
+                        !stream.labels.inner.contains_key(k),
+                        "injected label key '{}' conflicts with native parquet label",
+                        k
+                    );
+                    stream.labels.inner.insert(k.clone(), v.clone());
+                }
+                out.push(stream);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let series: Vec<Gauge> = self
             .files
@@ -1050,9 +1095,73 @@ impl DataSource for MultiParquetSource {
     fn sample_timestamps(&self) -> Vec<u64> {
         MultiParquetSource::sample_timestamps(self)
     }
+
+    /// The sum of every child's count, less the series that several children
+    /// share. Asking each child lets a lazy child answer from its catalog.
+    ///
+    /// Two children can share a series only if they hold the same metric
+    /// name of the same kind and their injected labels agree on every key
+    /// they both set. Metric names are free from every child, so only the
+    /// names that pass both tests are walked, and only across the children
+    /// holding them. For each such name the correction is the per-child label
+    /// count less the merged, deduplicated count -- what the full label walk
+    /// would have counted once.
+    fn series_count(&self) -> usize {
+        type Names = fn(&dyn DataSource) -> Vec<String>;
+        type LabelSets =
+            fn(&dyn DataSource, &str) -> Vec<std::collections::BTreeMap<String, String>>;
+        let kinds: [(Names, LabelSets); 3] = [
+            (|s| s.counter_names(), |s, n| s.counter_labels(n)),
+            (|s| s.gauge_names(), |s, n| s.gauge_labels(n)),
+            (|s| s.histogram_names(), |s, n| s.histogram_labels(n)),
+        ];
+
+        let mut total: usize = self.files.iter().map(|(pf, _)| pf.series_count()).sum();
+        for (names, label_sets) in kinds {
+            let mut holders: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (i, (pf, _)) in self.files.iter().enumerate() {
+                for name in names(pf.as_ref()) {
+                    holders.entry(name).or_default().push(i);
+                }
+            }
+            for (name, idx) in holders {
+                if !self.may_share_series(&idx) {
+                    continue;
+                }
+                let mut merged = std::collections::BTreeSet::new();
+                let mut per_child = 0;
+                for &i in &idx {
+                    let (pf, extra) = &self.files[i];
+                    for mut labels in label_sets(pf.as_ref(), &name) {
+                        per_child += 1;
+                        for (k, v) in &extra.inner {
+                            labels.insert(k.clone(), v.clone());
+                        }
+                        merged.insert(labels);
+                    }
+                }
+                total -= per_child - merged.len();
+            }
+        }
+        total
+    }
 }
 
 impl MultiParquetSource {
+    /// Whether any two of these children could hold the same series. Two
+    /// children whose injected labels set one key to different values
+    /// cannot: every series of one differs from every series of the other
+    /// in that label.
+    fn may_share_series(&self, children: &[usize]) -> bool {
+        children.iter().enumerate().any(|(n, &a)| {
+            children[n + 1..].iter().any(|&b| {
+                let (x, y) = (&self.files[a].1.inner, &self.files[b].1.inner);
+                x.iter().all(|(k, v)| y.get(k).is_none_or(|w| w == v))
+            })
+        })
+    }
+
     /// `timestamp` column values across every file, in file-list then
     /// row-group order.
     fn sample_timestamps(&self) -> Vec<u64> {
