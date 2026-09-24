@@ -151,6 +151,28 @@ impl ParquetReader {
         self.inner.clone()
     }
 
+    /// The counter columns of a single-file reader (a segment), located for
+    /// [`counter_column`](Self::counter_column). Empty for a multi-file one.
+    pub(crate) fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
+        match self.inner.files.as_slice() {
+            [(f, _)] => f.counter_column_refs(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One counter column of a single-file reader, read directly.
+    pub(crate) fn counter_column(
+        &self,
+        at: &crate::ColumnPosition,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::ColumnChunk> {
+        match self.inner.files.as_slice() {
+            [(f, _)] => f.counter_column(at, start_ns, end_ns),
+            _ => None,
+        }
+    }
+
     /// What this reader holds in memory while open, estimated: its bytes if
     /// it was opened from bytes, plus a per-column charge for the parsed
     /// footer and column descriptors.
@@ -1173,6 +1195,14 @@ pub(crate) struct ParquetSource {
     /// depends only on `meta`, which never changes after construction, so
     /// there is nothing to invalidate.
     columns: OnceLock<Vec<ColDesc>>,
+    /// The `timestamp` and `duration` column positions, resolved once.
+    ///
+    /// `Schema::index_of` scans the fields by name and, when the name is
+    /// absent, formats every field name into its error. A `.rez` segment has
+    /// no `duration` column, so asking per column read on a 2,500-column
+    /// table formatted 2,500 names a million times over one query — a third
+    /// of its CPU, measured.
+    fixed_cols: OnceLock<(Option<usize>, Option<usize>)>,
 }
 
 fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
@@ -1307,6 +1337,43 @@ impl DataSource for FileSource {
         self.0.columns().to_vec()
     }
 
+    fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
+        self.0
+            .columns()
+            .iter()
+            .filter(|c| matches!(c.kind, ColKind::Counter))
+            .map(|c| crate::CounterColumnRef {
+                name: c.name.clone(),
+                labels: c.labels.clone(),
+                position: crate::ColumnPosition {
+                    col_idx: c.col_idx as u32,
+                    begin_col: c.begin_col.map(|i| i as u32),
+                    width_col: c.width_col.map(|i| i as u32),
+                },
+            })
+            .collect()
+    }
+
+    fn counter_column(
+        &self,
+        at: &crate::ColumnPosition,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::ColumnChunk> {
+        match read_counter_column(&self.0, at, start_ns, end_ns) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    source_id = self.0.id,
+                    col_idx = at.col_idx,
+                    error = %e,
+                    "reading a counter column"
+                );
+                None
+            }
+        }
+    }
+
     fn column_count(&self) -> usize {
         self.0.meta.schema().fields().len()
     }
@@ -1320,6 +1387,17 @@ impl DataSource for FileSource {
 }
 
 impl ParquetSource {
+    /// `(timestamp, duration)` column positions, resolved once per source.
+    fn fixed_cols(&self) -> (Option<usize>, Option<usize>) {
+        *self.fixed_cols.get_or_init(|| {
+            let schema = self.meta.schema();
+            (
+                schema.index_of("timestamp").ok(),
+                schema.index_of("duration").ok(),
+            )
+        })
+    }
+
     /// The parsed schema, parsed once and reused.
     ///
     /// One shared parse serves every caller even though they do *not* derive
@@ -1385,6 +1463,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: None,
             columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
         }))
     }
 
@@ -1398,6 +1477,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: None,
             columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
         }))
     }
 
@@ -1411,6 +1491,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: None,
             columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
         }))
     }
 
@@ -1425,6 +1506,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: Some(pool),
             columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
         }))
     }
 
@@ -1441,6 +1523,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: Some(pool),
             columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
         }))
     }
 
@@ -1454,6 +1537,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: Some(pool),
             columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
         }))
     }
 
@@ -2182,6 +2266,76 @@ fn resolve_window(
             None => (base, base),
         },
     }
+}
+
+/// One counter column by schema position: the same rows, values and
+/// reconstructed windows [`read_counters`] produces for it, without the
+/// schema scan that finds it. For a reader that located the column at open
+/// and reads it back one segment at a time.
+fn read_counter_column(
+    pf: &ParquetSource,
+    at: &crate::ColumnPosition,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<crate::ColumnChunk, Box<dyn Error>> {
+    let (ts_col_idx, dur_col_idx) = pf.fixed_cols();
+    let ts_col_idx = ts_col_idx.ok_or("missing timestamp")?;
+    let col_idx = at.col_idx as usize;
+    let begin_col = at.begin_col.map(|i| i as usize);
+    let width_col = at.width_col.map(|i| i as usize);
+    let num_rgs = pf.meta.metadata().num_row_groups();
+    let mut timestamps: Vec<u64> = Vec::new();
+    let mut values: Vec<u64> = Vec::new();
+    let windowed = (begin_col.is_some() && width_col.is_some()) || dur_col_idx.is_some();
+    let mut windows: Option<Vec<(u64, u64)>> = windowed.then(Vec::new);
+
+    for rg_idx in 0..num_rgs {
+        match rg_classify(
+            pf.meta.metadata().row_group(rg_idx),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+        ) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let ts = read_timestamps(pf, rg_idx, ts_col_idx)?;
+        let vals = read_counter_values_per_rg(pf, rg_idx, col_idx)?;
+        let durations = dur_col_idx
+            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+            .transpose()?;
+        let begins = begin_col
+            .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
+            .transpose()?;
+        let widths = width_col
+            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
+            .transpose()?;
+        for (row, (ts_opt, val_opt)) in ts.iter().zip(vals.iter()).enumerate() {
+            let (Some(base), Some(v)) = (ts_opt, val_opt) else {
+                continue;
+            };
+            let base = *base;
+            if base < start_ns || base > end_ns {
+                continue;
+            }
+            timestamps.push(base);
+            values.push(*v);
+            if let Some(w) = windows.as_mut() {
+                let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                let dur = durations
+                    .as_ref()
+                    .and_then(|d| d.get(row).copied())
+                    .flatten();
+                w.push(resolve_window(base, bo, wd, dur));
+            }
+        }
+    }
+    Ok(crate::ColumnChunk {
+        timestamps,
+        values,
+        windows,
+    })
 }
 
 fn read_counters(

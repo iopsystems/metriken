@@ -382,48 +382,47 @@ where
                 RateMode::Raw => range_ns,
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
-            let counters = ctx
+            let streams = ctx
                 .source
-                .counters(metric_name, &filter, data_start, ctx.end_ns)
+                .counter_streams(metric_name, &filter, data_start, ctx.end_ns)
                 .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
-            let series: SeriesSet<'a> = counters
-                .series
+            // Each series is its producer over its own sample stream, pulled
+            // by whatever consumes it: an aggregate holds one buffered point
+            // per series and each producer one interval's worth of samples,
+            // not every series' every sample. Collecting here used to be
+            // most of a query's memory on a wide table.
+            let series: SeriesSet<'a> = streams
                 .into_iter()
-                .map(|c| {
-                    let pts: Vec<_> = match ctx.rate_mode {
-                        RateMode::Grid => {
-                            let rate = CounterGridRate::new(
-                                &c.timestamps,
-                                &c.values,
-                                ctx.start_ns,
-                                ctx.end_ns,
-                                ctx.step_ns,
-                                // Wider than the step only when the caller
-                                // asked for smoothing (a cross-cadence query):
-                                // points stay on the grid, each value averages
-                                // over more.
-                                ctx.rate_span_ns.unwrap_or(ctx.step_ns),
-                                c.windows.as_deref(),
-                            );
-                            // Explicit timestamps override the grid entirely —
-                            // placement AND averaging window both come from
-                            // them, so a value lands on a slow source's real
-                            // reading instead of being interpolated to a grid
-                            // point that source never observed.
-                            match &ctx.eval_timestamps {
-                                Some(points) => rate.at_points(points.clone()).collect(),
-                                None => rate.collect(),
-                            }
-                        }
-                        RateMode::Raw => CounterPairwiseRate::new(
-                            &c.timestamps,
-                            &c.values,
+                .map(|stream| match ctx.rate_mode {
+                    RateMode::Grid => {
+                        let rate = CounterGridRate::from_stream(
+                            stream.samples,
+                            stream.windowed,
                             ctx.start_ns,
                             ctx.end_ns,
-                        )
-                        .collect(),
-                    };
-                    LabeledSeries::new(c.labels, pts.into_iter())
+                            ctx.step_ns,
+                            // Wider than the step only when the caller
+                            // asked for smoothing (a cross-cadence query):
+                            // points stay on the grid, each value averages
+                            // over more.
+                            ctx.rate_span_ns.unwrap_or(ctx.step_ns),
+                        );
+                        // Explicit timestamps override the grid entirely —
+                        // placement AND averaging window both come from
+                        // them, so a value lands on a slow source's real
+                        // reading instead of being interpolated to a grid
+                        // point that source never observed.
+                        match &ctx.eval_timestamps {
+                            Some(points) => {
+                                LabeledSeries::new(stream.labels, rate.at_points(points.clone()))
+                            }
+                            None => LabeledSeries::new(stream.labels, rate),
+                        }
+                    }
+                    RateMode::Raw => LabeledSeries::new(
+                        stream.labels,
+                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns),
+                    ),
                 })
                 .collect();
             Ok(Built::Series {
@@ -441,18 +440,16 @@ where
                 .series
                 .into_iter()
                 .map(|g| {
-                    let pts: Vec<_> = ctx
-                        .place(GaugeAvgOverTime::new(
-                            &g.timestamps,
-                            &g.values,
-                            ctx.start_ns,
-                            ctx.end_ns,
-                            ctx.step_ns,
-                            range_ns,
-                            matches!(ctx.rate_mode, RateMode::Raw),
-                        ))
-                        .collect();
-                    LabeledSeries::new(g.labels, pts.into_iter())
+                    let producer = ctx.place(GaugeAvgOverTime::new(
+                        g.timestamps,
+                        g.values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
+                    ));
+                    LabeledSeries::new(g.labels, producer)
                 })
                 .collect();
             Ok(Built::Series {
@@ -470,18 +467,16 @@ where
                 .series
                 .into_iter()
                 .map(|g| {
-                    let pts: Vec<_> = ctx
-                        .place(GaugeIdelta::new(
-                            &g.timestamps,
-                            &g.values,
-                            ctx.start_ns,
-                            ctx.end_ns,
-                            ctx.step_ns,
-                            range_ns,
-                            matches!(ctx.rate_mode, RateMode::Raw),
-                        ))
-                        .collect();
-                    LabeledSeries::new(g.labels, pts.into_iter())
+                    let producer = ctx.place(GaugeIdelta::new(
+                        g.timestamps,
+                        g.values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
+                    ));
+                    LabeledSeries::new(g.labels, producer)
                 })
                 .collect();
             Ok(Built::Series {
@@ -501,17 +496,15 @@ where
                     .series
                     .into_iter()
                     .map(|g| {
-                        let pts: Vec<_> = ctx
-                            .place(GaugeDeriv::new(
-                                &g.timestamps,
-                                &g.values,
-                                ctx.start_ns,
-                                ctx.end_ns,
-                                ctx.step_ns,
-                                matches!(ctx.rate_mode, RateMode::Raw),
-                            ))
-                            .collect();
-                        LabeledSeries::new(g.labels, pts.into_iter())
+                        let producer = ctx.place(GaugeDeriv::new(
+                            g.timestamps,
+                            g.values,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                            ctx.step_ns,
+                            matches!(ctx.rate_mode, RateMode::Raw),
+                        ));
+                        LabeledSeries::new(g.labels, producer)
                     })
                     .collect();
                 return Ok(Built::Series {
@@ -531,12 +524,11 @@ where
                     // deriv wraps the pairwise rate in StreamingDeriv, which does
                     // its own windowing and needs the pre-start lookback, so no
                     // start bound here (0).
-                    let rate_iter =
-                        CounterPairwiseRate::new(&c.timestamps, &c.values, 0, ctx.end_ns);
-                    let pts: Vec<_> =
-                        StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
-                            .collect();
-                    LabeledSeries::new(c.labels, pts.into_iter())
+                    let rate_iter = CounterPairwiseRate::new(c.timestamps, c.values, 0, ctx.end_ns);
+                    LabeledSeries::new(
+                        c.labels,
+                        StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns),
+                    )
                 })
                 .collect();
             Ok(Built::Series {
@@ -622,18 +614,16 @@ where
         .series
         .into_iter()
         .map(|g| {
-            let pts: Vec<_> = ctx
-                .place(GaugeStepGrid::new(
-                    &g.timestamps,
-                    &g.values,
-                    ctx.start_ns,
-                    ctx.end_ns,
-                    ctx.step_ns,
-                    staleness_ns,
-                    matches!(ctx.rate_mode, RateMode::Raw),
-                ))
-                .collect();
-            LabeledSeries::new(g.labels, pts.into_iter())
+            let producer = ctx.place(GaugeStepGrid::new(
+                g.timestamps,
+                g.values,
+                ctx.start_ns,
+                ctx.end_ns,
+                ctx.step_ns,
+                staleness_ns,
+                matches!(ctx.rate_mode, RateMode::Raw),
+            ));
+            LabeledSeries::new(g.labels, producer)
         })
         .collect();
     Ok(Built::Series {

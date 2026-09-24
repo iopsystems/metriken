@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`rate()`/`irate()` stream their samples.** `DataSource::counter_streams`
+  hands out one `CounterStream` per series, its `CounterSample`s produced
+  as they are pulled; the default materializes through `counters`, and the
+  segmented reader implements it natively by reading one column of one
+  segment at a time, from positions it indexed at open (`CounterColumnRef`
+  and `ColumnPosition` from `counter_column_refs`, read back with
+  `counter_column` as a `ColumnChunk`). The grid and pairwise rate
+  producers consume a stream and keep only the samples that bracket the
+  current interval; the gauge producers own their samples; and the
+  dispatcher hands each series its producer as the series' iterator rather
+  than collecting its points into a `Vec` first. An aggregate over many
+  series holds one buffered point and one interval's samples per series
+  while it runs. Results are unchanged; the producers' constructors take
+  owned vectors or a stream.
+
+  Before this, every series' every sample was resident before the first
+  point was computed, and then every producer's points beside them. On a
+  ten-hour archive's 6,644-task table, `sum(rate())` over every series
+  peaked at 10.3 GB; it peaks at 1.4 GB now.
+
+### Fixed
+
+- The `timestamp` and `duration` column positions are resolved once per
+  parquet source. `Schema::index_of` formats every field name into its
+  error when the name is absent, and a `.rez` segment has no `duration`
+  column, so a lookup per column read on a 2,500-column table was a third
+  of a query's CPU.
+- A rate's typical sample spacing (the hole-versus-jitter threshold for its
+  band) is computed once per series rather than, with a clone and a sort,
+  per emitted point.
+
 ## [0.28.0] - 2026-09-23
 
 ### Added

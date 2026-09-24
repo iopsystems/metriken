@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.29.0
+
+- **Changed:** `rate()`/`irate()` read each series as a sample stream and
+  hold one interval's worth of it. `DataSource::counter_streams` hands out
+  a `CounterStream` per series (`CounterSample`s produced as pulled; the
+  default materializes through `counters`); the segmented reader implements
+  it natively, reading one column of one segment at a time from positions
+  it indexed at open (`CounterColumnRef`, `ColumnPosition`,
+  `DataSource::counter_column`, `ColumnChunk`). The grid and pairwise rate
+  producers consume a stream, keeping only the samples that bracket the
+  current interval; the gauge producers own their samples; and the
+  dispatcher hands each series its producer as the series' iterator rather
+  than collecting its points first. Results are unchanged. Measured on a
+  ten-hour archive's 6,644-task table, `sum(rate())` over every series:
+  10.3 GB before, 1.4 GB after.
+- **Fixed:** two per-call costs the profile found on the way — the
+  `timestamp`/`duration` column positions are resolved once per source
+  (`Schema::index_of` formats every field name into its error when the
+  name is absent, and a `.rez` segment has no `duration` column), and a
+  rate's typical sample spacing is computed once per series rather than
+  per point.
+
 ### metriken-query 0.28.0
 
 - **Added:** `ColumnRelabel`, identity that varies with time, and
