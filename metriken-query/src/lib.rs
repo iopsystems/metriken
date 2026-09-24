@@ -53,18 +53,19 @@ pub mod fixtures;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
-pub use labels::{is_internal_label, is_storage_key, STORAGE_KEYS};
+pub use labels::{is_internal_label, is_storage_key, Labels, STORAGE_KEYS};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{CompositionSource, ParquetBuilder, ParquetReader};
 pub use promql::{
     referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
 };
-pub use segmented::{InMemorySegments, SegmentBytes, SegmentStore, SegmentedParquetReader};
+pub use segmented::{
+    ColumnRelabel, InMemorySegments, Run, SegmentBytes, SegmentStore, SegmentedParquetReader,
+};
 pub use types::HistogramSnapshot;
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
 use histogram_stream::HistogramStream;
-use labels::Labels;
 use types::{Counters, Gauges};
 
 /// How `rate()` / `irate()` are aligned to the evaluation grid.
