@@ -62,19 +62,29 @@ pub use promql::{
 pub use segmented::{
     ColumnRelabel, InMemorySegments, Run, SegmentBytes, SegmentStore, SegmentedParquetReader,
 };
-pub use types::{CounterSample, CounterStream, HistogramSnapshot};
+pub use types::{ColumnChunk, CounterSample, CounterStream, HistogramSnapshot};
 
-/// Where a counter column sits in a parquet schema: its own index and, if it
-/// carries acquisition windows, its begin/width sidecar columns. What
-/// [`DataSource::counter_column`] takes, so a reader that indexed a table's
-/// columns at open can read one back without re-parsing the schema.
+/// A counter column of a parquet schema, as a reader indexes it at open:
+/// which metric and label set it carries, and where to read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CounterColumnRef {
     pub name: String,
     pub labels: Labels,
-    pub col_idx: usize,
-    pub begin_col: Option<usize>,
-    pub width_col: Option<usize>,
+    pub position: ColumnPosition,
+}
+
+/// Where a column sits in a parquet schema: its own index and, if it
+/// carries acquisition windows, its begin/width sidecar columns. What
+/// [`DataSource::counter_column`] takes, so a reader that indexed a table's
+/// columns at open can read one back without re-parsing the schema. Small on
+/// purpose — a reader keeps one per column per segment, which on a wide
+/// table is hundreds of thousands — so it carries positions and nothing
+/// that names the column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnPosition {
+    pub col_idx: u32,
+    pub begin_col: Option<u32>,
+    pub width_col: Option<u32>,
 }
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
@@ -212,11 +222,11 @@ pub(crate) trait DataSource: Send + Sync {
     /// range touches. `None` for a source without a parquet schema.
     fn counter_column(
         &self,
-        col: &CounterColumnRef,
+        at: &ColumnPosition,
         start_ns: u64,
         end_ns: u64,
-    ) -> Option<types::Counter> {
-        let _ = (col, start_ns, end_ns);
+    ) -> Option<types::ColumnChunk> {
+        let _ = (at, start_ns, end_ns);
         None
     }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;

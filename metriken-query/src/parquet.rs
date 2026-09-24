@@ -163,12 +163,12 @@ impl ParquetReader {
     /// One counter column of a single-file reader, read directly.
     pub(crate) fn counter_column(
         &self,
-        col: &crate::CounterColumnRef,
+        at: &crate::ColumnPosition,
         start_ns: u64,
         end_ns: u64,
-    ) -> Option<Counter> {
+    ) -> Option<crate::ColumnChunk> {
         match self.inner.files.as_slice() {
-            [(f, _)] => f.counter_column(col, start_ns, end_ns),
+            [(f, _)] => f.counter_column(at, start_ns, end_ns),
             _ => None,
         }
     }
@@ -1345,25 +1345,27 @@ impl DataSource for FileSource {
             .map(|c| crate::CounterColumnRef {
                 name: c.name.clone(),
                 labels: c.labels.clone(),
-                col_idx: c.col_idx,
-                begin_col: c.begin_col,
-                width_col: c.width_col,
+                position: crate::ColumnPosition {
+                    col_idx: c.col_idx as u32,
+                    begin_col: c.begin_col.map(|i| i as u32),
+                    width_col: c.width_col.map(|i| i as u32),
+                },
             })
             .collect()
     }
 
     fn counter_column(
         &self,
-        col: &crate::CounterColumnRef,
+        at: &crate::ColumnPosition,
         start_ns: u64,
         end_ns: u64,
-    ) -> Option<Counter> {
-        match read_counter_column(&self.0, col, start_ns, end_ns) {
+    ) -> Option<crate::ColumnChunk> {
+        match read_counter_column(&self.0, at, start_ns, end_ns) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(
                     source_id = self.0.id,
-                    col_idx = col.col_idx,
+                    col_idx = at.col_idx,
                     error = %e,
                     "reading a counter column"
                 );
@@ -2272,16 +2274,19 @@ fn resolve_window(
 /// and reads it back one segment at a time.
 fn read_counter_column(
     pf: &ParquetSource,
-    col: &crate::CounterColumnRef,
+    at: &crate::ColumnPosition,
     start_ns: u64,
     end_ns: u64,
-) -> Result<Counter, Box<dyn Error>> {
+) -> Result<crate::ColumnChunk, Box<dyn Error>> {
     let (ts_col_idx, dur_col_idx) = pf.fixed_cols();
     let ts_col_idx = ts_col_idx.ok_or("missing timestamp")?;
+    let col_idx = at.col_idx as usize;
+    let begin_col = at.begin_col.map(|i| i as usize);
+    let width_col = at.width_col.map(|i| i as usize);
     let num_rgs = pf.meta.metadata().num_row_groups();
     let mut timestamps: Vec<u64> = Vec::new();
     let mut values: Vec<u64> = Vec::new();
-    let windowed = (col.begin_col.is_some() && col.width_col.is_some()) || dur_col_idx.is_some();
+    let windowed = (begin_col.is_some() && width_col.is_some()) || dur_col_idx.is_some();
     let mut windows: Option<Vec<(u64, u64)>> = windowed.then(Vec::new);
 
     for rg_idx in 0..num_rgs {
@@ -2295,16 +2300,14 @@ fn read_counter_column(
             _ => {}
         }
         let ts = read_timestamps(pf, rg_idx, ts_col_idx)?;
-        let vals = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
+        let vals = read_counter_values_per_rg(pf, rg_idx, col_idx)?;
         let durations = dur_col_idx
             .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
             .transpose()?;
-        let begins = col
-            .begin_col
+        let begins = begin_col
             .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
             .transpose()?;
-        let widths = col
-            .width_col
+        let widths = width_col
             .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
             .transpose()?;
         for (row, (ts_opt, val_opt)) in ts.iter().zip(vals.iter()).enumerate() {
@@ -2328,8 +2331,7 @@ fn read_counter_column(
             }
         }
     }
-    Ok(Counter {
-        labels: col.labels.clone(),
+    Ok(crate::ColumnChunk {
         timestamps,
         values,
         windows,

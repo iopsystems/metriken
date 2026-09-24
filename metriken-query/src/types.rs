@@ -48,6 +48,26 @@ pub struct Counters {
     pub series: Vec<Counter>,
 }
 
+/// One column's samples out of one parquet source: what a direct read by
+/// position returns. The caller knows whose it is.
+pub struct ColumnChunk {
+    pub timestamps: Vec<u64>,
+    pub values: Vec<u64>,
+    pub windows: Option<Vec<(u64, u64)>>,
+}
+
+impl ColumnChunk {
+    /// As a series under `labels`.
+    pub fn labeled(self, labels: Labels) -> Counter {
+        Counter {
+            labels,
+            timestamps: self.timestamps,
+            values: self.values,
+            windows: self.windows,
+        }
+    }
+}
+
 /// One counter reading, as a stream carries it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CounterSample {

@@ -232,15 +232,31 @@ impl SegmentedParquetReader {
                         .unwrap_or_else(|| vec![col.labels.clone()]),
                     None => vec![col.labels.clone()],
                 };
-                let by_series = counter_columns.entry(col.name.clone()).or_default();
+                let table = counter_columns.entry(col.name.clone()).or_default();
+                // The column's own labels, interned: one copy per distinct
+                // set rather than one per segment it appears in.
+                let column_labels = match table.labels_index.get(&col.labels) {
+                    Some(i) => *i,
+                    None => {
+                        table.labels.push(col.labels.clone());
+                        table
+                            .labels_index
+                            .insert(col.labels.clone(), table.labels.len() - 1);
+                        table.labels.len() - 1
+                    }
+                } as u32;
                 for labels in sets {
                     let Some(pos) = counter_identity.position(&col.name, &labels) else {
                         continue;
                     };
-                    if by_series.len() <= pos {
-                        by_series.resize_with(pos + 1, Vec::new);
+                    if table.by_series.len() <= pos {
+                        table.by_series.resize_with(pos + 1, Vec::new);
                     }
-                    by_series[pos].push((idx, col.clone()));
+                    table.by_series[pos].push(Location {
+                        segment: idx as u32,
+                        column_labels,
+                        position: col.position,
+                    });
                 }
             }
             gauge_identity.extend(presented(seg.gauge_columns()));
@@ -738,8 +754,27 @@ struct SegmentedSource {
     counter_columns: CounterColumns,
 }
 
-/// name -> series position -> the segments and columns that feed it.
-type CounterColumns = HashMap<String, Vec<Vec<(usize, crate::CounterColumnRef)>>>;
+/// name -> where each series' samples are.
+type CounterColumns = HashMap<String, ColumnTable>;
+
+/// For one metric: the distinct column label sets, and per series position
+/// the columns that feed it, in segment order.
+#[derive(Default)]
+struct ColumnTable {
+    labels: Vec<Labels>,
+    labels_index: HashMap<Labels, usize>,
+    by_series: Vec<Vec<Location>>,
+}
+
+/// One column of one segment. Sixteen bytes, because a wide table has
+/// hundreds of thousands of these and they live for the reader.
+#[derive(Clone, Copy, Debug)]
+struct Location {
+    segment: u32,
+    /// Index into [`ColumnTable::labels`].
+    column_labels: u32,
+    position: crate::ColumnPosition,
+}
 
 impl SegmentedSource {
     /// The filter a segment is asked with: the query's own, unless a
@@ -1131,27 +1166,28 @@ impl DataSource for SegmentedSource {
         if order.is_empty() {
             return None;
         }
-        let columns = self.counter_columns.get(name)?;
+        let table = self.counter_columns.get(name)?;
         let name: Arc<str> = Arc::from(name);
         let mut out = Vec::new();
         for (pos, labels) in order.iter().enumerate() {
             if !labels.matches(filter) {
                 continue;
             }
-            let Some(locations) = columns.get(pos) else {
+            let Some(locations) = table.by_series.get(pos) else {
                 continue;
             };
             let windowed = locations
                 .first()
-                .is_some_and(|(_, c)| c.begin_col.is_some() && c.width_col.is_some());
+                .is_some_and(|l| l.position.begin_col.is_some() && l.position.width_col.is_some());
             let labels = labels.clone();
             let series_labels = labels.clone();
             let name = Arc::clone(&name);
             let samples = locations
                 .iter()
-                .filter(move |(idx, _)| self.catalog[*idx].touches(start_ns, end_ns))
-                .filter_map(move |(idx, col)| {
-                    let seg = match self.segment(*idx) {
+                .filter(move |l| self.catalog[l.segment as usize].touches(start_ns, end_ns))
+                .filter_map(move |l| {
+                    let idx = l.segment as usize;
+                    let seg = match self.segment(idx) {
                         Ok(Some(seg)) => seg,
                         Ok(None) => return None,
                         Err(e) => {
@@ -1159,7 +1195,9 @@ impl DataSource for SegmentedSource {
                             return None;
                         }
                     };
-                    let chunk = seg.counter_column(col, start_ns, end_ns)?;
+                    let chunk = seg
+                        .counter_column(&l.position, start_ns, end_ns)?
+                        .labeled(table.labels[l.column_labels as usize].clone());
                     // A relabelled column carries every occupant's samples;
                     // this stream is one occupant's.
                     let pieces =
@@ -3552,5 +3590,120 @@ mod tests {
                 s.metric["who"]
             );
         }
+    }
+
+    /// The streams a segmented source hands out carry the same samples the
+    /// materialized read does, series for series, relabelling included —
+    /// and a grid `rate()` over them, which is what queries use now,
+    /// matches the vector form point for point.
+    #[test]
+    fn counter_streams_match_the_materialized_read() {
+        let s0 = segment_labeled(
+            "c",
+            "slot",
+            &[1_000_000_000, 2_000_000_000],
+            &[("7", vec![10, 20]), ("8", vec![5, 6])],
+        );
+        let s1 = segment_labeled(
+            "c",
+            "slot",
+            &[3_000_000_000, 4_000_000_000],
+            &[("7", vec![30, 40]), ("8", vec![7, 8])],
+        );
+        let r = SegmentedParquetReader::open_relabeled_with_pool(
+            Arc::new(InMemorySegments::new(vec![s0, s1])),
+            BufferPool::new(1 << 20),
+            Arc::new(HandOver { cut: 2_500_000_000 }),
+        )
+        .unwrap();
+        let source = r.data_source();
+        let whole = source
+            .counters("c", &Labels::default(), 0, u64::MAX)
+            .unwrap();
+        let streams = source
+            .counter_streams("c", &Labels::default(), 0, u64::MAX)
+            .unwrap();
+        assert_eq!(streams.len(), whole.series.len(), "one stream per series");
+        assert_eq!(streams.len(), 4, "two slots, two occupants each");
+        for (stream, series) in streams.into_iter().zip(whole.series) {
+            assert_eq!(stream.labels, series.labels);
+            assert_eq!(stream.windowed, series.windows.is_some());
+            let samples: Vec<crate::CounterSample> = stream.samples.collect();
+            assert_eq!(
+                samples.iter().map(|s| (s.ts, s.value)).collect::<Vec<_>>(),
+                series
+                    .timestamps
+                    .iter()
+                    .copied()
+                    .zip(series.values.iter().copied())
+                    .collect::<Vec<_>>(),
+                "{:?}",
+                series.labels
+            );
+        }
+
+        // And through the engine: grid rate over the streams.
+        let QueryResult::Matrix { result } = r.query_range("rate(c[1s])", 0.0, 5.0, 1.0).unwrap()
+        else {
+            panic!("matrix");
+        };
+        type Row = (String, String, Vec<(f64, f64)>);
+        let mut got: Vec<Row> = result
+            .into_iter()
+            .map(|s| (s.metric["slot"].clone(), s.metric["who"].clone(), s.values))
+            .collect();
+        got.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        assert_eq!(
+            got,
+            vec![
+                ("7".to_string(), "a".to_string(), vec![(2.0, 10.0)]),
+                ("7".to_string(), "b".to_string(), vec![(4.0, 10.0)]),
+                ("8".to_string(), "a".to_string(), vec![(2.0, 1.0)]),
+                ("8".to_string(), "b".to_string(), vec![(4.0, 1.0)]),
+            ]
+        );
+    }
+
+    fn lb(pairs: &[(&str, &str)]) -> Labels {
+        Labels {
+            inner: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// A stream reads only the segments its series has columns in and the
+    /// query's range touches: a series absent from a segment costs no
+    /// fetch, and a range over one segment fetches that one.
+    #[test]
+    fn a_stream_fetches_only_the_segments_that_feed_it() {
+        let s0 = segment_labeled("c", "k", &[1_000_000_000], &[("x", vec![1])]);
+        let s1 = segment_labeled("c", "k", &[2_000_000_000], &[("y", vec![1])]);
+        let s2 = segment_labeled("c", "k", &[3_000_000_000], &[("x", vec![2])]);
+        let store = CountingStore::new(vec![s0, s1, s2]);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1 << 20))
+            .unwrap();
+        store.fetched();
+        let source = r.data_source();
+        let mut x = source
+            .counter_streams("c", &lb(&[("k", "x")]), 0, u64::MAX)
+            .unwrap();
+        let samples: Vec<_> = x.remove(0).samples.collect();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            store.fetched(),
+            vec![0, 2],
+            "the segment without x is never read"
+        );
+        let mut y = source
+            .counter_streams("c", &lb(&[("k", "y")]), 0, 1_500_000_000)
+            .unwrap();
+        assert_eq!(y.remove(0).samples.count(), 0);
+        assert_eq!(
+            store.fetched(),
+            Vec::<usize>::new(),
+            "out of range: nothing fetched"
+        );
     }
 }
