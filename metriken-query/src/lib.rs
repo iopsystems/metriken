@@ -39,6 +39,7 @@ pub(crate) mod buffer_pool;
 pub mod display;
 pub(crate) mod histogram_stream;
 pub(crate) mod labels;
+pub(crate) mod lazy;
 pub(crate) mod memory;
 pub(crate) mod memory_store;
 pub mod parquet;
@@ -54,6 +55,7 @@ pub mod fixtures;
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use labels::{is_internal_label, is_storage_key, Labels, STORAGE_KEYS};
+pub use lazy::CompositionCatalog;
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{CompositionSource, ParquetBuilder, ParquetReader};
 pub use promql::{
@@ -292,6 +294,30 @@ pub(crate) trait DataSource: Send + Sync {
     fn resident_bytes(&self) -> usize {
         0
     }
+    /// Number of distinct series across all metric types: the label-set
+    /// count of every name. On `DataSource` so a composite can ask each
+    /// child, letting a lazy child answer from its catalog instead of
+    /// loading to walk its labels.
+    fn series_count(&self) -> usize {
+        label_walk_series_count(self)
+    }
+}
+
+/// The label-set count of every name: the default
+/// [`DataSource::series_count`], and the fallback for a composite whose
+/// children may share series.
+pub(crate) fn label_walk_series_count<S: DataSource + ?Sized>(source: &S) -> usize {
+    let mut count = 0;
+    for name in source.counter_names() {
+        count += source.counter_labels(&name).len();
+    }
+    for name in source.gauge_names() {
+        count += source.gauge_labels(&name).len();
+    }
+    for name in source.histogram_names() {
+        count += source.histogram_labels(&name).len();
+    }
+    count
 }
 
 /// Public trait expressing the full read-only capability of a metrics source.

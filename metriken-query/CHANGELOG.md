@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`CompositionSource::lazy`: a composition child that loads on demand.**
+  It takes a `CompositionCatalog` (metric names by kind, time range,
+  interval, metadata, an optional series count) and a loader. Names, time
+  range and metadata answer from the catalog; the loader runs at most once,
+  the first time a data or label call names a metric in the catalog, and a
+  loader returning `Ok(None)` (evicted) or `Err` (logged) leaves the child
+  empty. A composed reader's `total_series_count` asks each child through
+  the new `DataSource::series_count`, so a lazy child with a catalog count
+  answers without loading; series that several children could share — the
+  same metric name and kind, with injected labels that do not conflict —
+  are walked and deduplicated across just those children. Composing a
+  `.rez` archive used to open every table up front: 14 s and 4 GB on a
+  1.28 GB archive, before the segmented reader stopped holding bytes.
+- `MultiParquetSource` and a lazy child hand out `counter_streams`, so a
+  composed `rate()` streams each series as an uncomposed one does rather
+  than materializing every child's series first.
+
 ## [0.29.0] - 2026-09-23
 
 ### Changed

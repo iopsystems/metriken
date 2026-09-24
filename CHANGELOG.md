@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.30.0
+
+- **Added:** `CompositionSource::lazy` and `CompositionCatalog`: a
+  composition child that answers names, time range and metadata from its
+  catalog and loads its source at most once, the first time a query or
+  label lookup names one of its metrics. `DataSource::series_count` lets a
+  composed reader's `total_series_count` ask each child, so a lazy child
+  with a catalog count answers without loading. Composed readers and lazy
+  children hand out `counter_streams`, so a composed `rate()` streams.
+
 ### metriken-query 0.29.0
 
 - **Changed:** `rate()`/`irate()` read each series as a sample stream and
