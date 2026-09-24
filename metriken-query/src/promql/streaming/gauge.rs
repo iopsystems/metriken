@@ -1,9 +1,9 @@
 //! Gauge-side streaming producers.
 //!
-//! All operate on a borrowed `&[(u64, i64)]` slice (the gauge sample
-//! storage) and emit `f64` values at step-aligned timestamps. State
-//! is the cursor plus, for the windowed forms, the indices into the
-//! source slice — no buffering of the input.
+//! All own their sample vectors (see `CounterPairwiseRate::new` for why a
+//! producer owns rather than borrows) and emit `f64` values at step-aligned
+//! timestamps. State is the cursor plus, for the windowed forms, the indices
+//! into the samples — no buffering beyond the input itself.
 //!
 //! * [`GaugeStepGrid`] — bare `metric{matchers}` selector at each tick,
 //!   subject to the staleness rule.
@@ -87,7 +87,7 @@ pub(crate) trait AtPoints: Sized {
 
 macro_rules! impl_at_points {
     ($($t:ident),+ $(,)?) => {$(
-        impl<'a> AtPoints for $t<'a> {
+        impl AtPoints for $t {
             fn at_points(mut self, points: std::sync::Arc<[u64]>) -> Self {
                 self.place = self.place.at_points(points);
                 self
@@ -98,18 +98,18 @@ macro_rules! impl_at_points {
 
 impl_at_points!(GaugeStepGrid, GaugeAvgOverTime, GaugeIdelta, GaugeDeriv);
 
-pub struct GaugeStepGrid<'a> {
-    timestamps: &'a [u64],
-    values: &'a [i64],
+pub struct GaugeStepGrid {
+    timestamps: Vec<u64>,
+    values: Vec<i64>,
     end_ns: u64,
     staleness_ns: u64,
     place: Placement,
 }
 
-impl<'a> GaugeStepGrid<'a> {
+impl GaugeStepGrid {
     pub fn new(
-        timestamps: &'a [u64],
-        values: &'a [i64],
+        timestamps: Vec<u64>,
+        values: Vec<i64>,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -126,12 +126,12 @@ impl<'a> GaugeStepGrid<'a> {
     }
 }
 
-impl<'a> Iterator for GaugeStepGrid<'a> {
+impl Iterator for GaugeStepGrid {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = self.place.next(self.timestamps, self.end_ns)?;
+            let t = self.place.next(&self.timestamps, self.end_ns)?;
 
             let hi = self.timestamps.partition_point(|&ts| ts <= t);
             if hi == 0 {
@@ -147,18 +147,18 @@ impl<'a> Iterator for GaugeStepGrid<'a> {
     }
 }
 
-pub struct GaugeAvgOverTime<'a> {
-    timestamps: &'a [u64],
-    values: &'a [i64],
+pub struct GaugeAvgOverTime {
+    timestamps: Vec<u64>,
+    values: Vec<i64>,
     end_ns: u64,
     range_ns: u64,
     place: Placement,
 }
 
-impl<'a> GaugeAvgOverTime<'a> {
+impl GaugeAvgOverTime {
     pub fn new(
-        timestamps: &'a [u64],
-        values: &'a [i64],
+        timestamps: Vec<u64>,
+        values: Vec<i64>,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -175,12 +175,12 @@ impl<'a> GaugeAvgOverTime<'a> {
     }
 }
 
-impl<'a> Iterator for GaugeAvgOverTime<'a> {
+impl Iterator for GaugeAvgOverTime {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = self.place.next(self.timestamps, self.end_ns)?;
+            let t = self.place.next(&self.timestamps, self.end_ns)?;
 
             let window_start = t.saturating_sub(self.range_ns);
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
@@ -199,18 +199,18 @@ impl<'a> Iterator for GaugeAvgOverTime<'a> {
     }
 }
 
-pub struct GaugeIdelta<'a> {
-    timestamps: &'a [u64],
-    values: &'a [i64],
+pub struct GaugeIdelta {
+    timestamps: Vec<u64>,
+    values: Vec<i64>,
     end_ns: u64,
     range_ns: u64,
     place: Placement,
 }
 
-impl<'a> GaugeIdelta<'a> {
+impl GaugeIdelta {
     pub fn new(
-        timestamps: &'a [u64],
-        values: &'a [i64],
+        timestamps: Vec<u64>,
+        values: Vec<i64>,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -227,12 +227,12 @@ impl<'a> GaugeIdelta<'a> {
     }
 }
 
-impl<'a> Iterator for GaugeIdelta<'a> {
+impl Iterator for GaugeIdelta {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = self.place.next(self.timestamps, self.end_ns)?;
+            let t = self.place.next(&self.timestamps, self.end_ns)?;
 
             let window_start = t.saturating_sub(self.range_ns);
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
@@ -247,17 +247,17 @@ impl<'a> Iterator for GaugeIdelta<'a> {
     }
 }
 
-pub struct GaugeDeriv<'a> {
-    timestamps: &'a [u64],
-    values: &'a [i64],
+pub struct GaugeDeriv {
+    timestamps: Vec<u64>,
+    values: Vec<i64>,
     end_ns: u64,
     place: Placement,
 }
 
-impl<'a> GaugeDeriv<'a> {
+impl GaugeDeriv {
     pub fn new(
-        timestamps: &'a [u64],
-        values: &'a [i64],
+        timestamps: Vec<u64>,
+        values: Vec<i64>,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -272,12 +272,12 @@ impl<'a> GaugeDeriv<'a> {
     }
 }
 
-impl<'a> Iterator for GaugeDeriv<'a> {
+impl Iterator for GaugeDeriv {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let t = self.place.next(self.timestamps, self.end_ns)?;
+            let t = self.place.next(&self.timestamps, self.end_ns)?;
 
             let window_start = t.saturating_sub(self.place.step_ns.saturating_mul(2));
             let window_end = t.saturating_add(self.place.step_ns);
@@ -322,8 +322,8 @@ mod tests {
         let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
         let vals = [10i64, 20, 30];
         let pts: Vec<Point> = GaugeStepGrid::new(
-            &ts,
-            &vals,
+            ts.to_vec(),
+            vals.to_vec(),
             0,
             3_000_000_000,
             1_000_000_000,
@@ -347,8 +347,8 @@ mod tests {
         let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
         let vals = [10i64, 20, 30];
         let pts: Vec<Point> = GaugeStepGrid::new(
-            &ts,
-            &vals,
+            ts.to_vec(),
+            vals.to_vec(),
             0,
             3_000_000_000,
             1_000_000_000,

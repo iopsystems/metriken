@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.29.0
+
+- **Changed:** the streaming producers (`CounterGridRate`,
+  `CounterPairwiseRate`, `GaugeStepGrid`, `GaugeAvgOverTime`, `GaugeIdelta`,
+  `GaugeDeriv`) own their samples instead of borrowing them, and the
+  dispatcher hands each series its producer as the series' iterator rather
+  than collecting the producer's points into a `Vec` first. An aggregate
+  over many series now holds one buffered point per series while it runs.
+  Measured on a ten-hour archive's 6,644-task table, `sum(rate())` over
+  every series: the collected points were most of a 10 GB query.
+
 ### metriken-query 0.28.0
 
 - **Added:** `ColumnRelabel`, identity that varies with time, and

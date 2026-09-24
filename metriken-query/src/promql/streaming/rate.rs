@@ -14,16 +14,22 @@ use super::{Point, RateEdges};
 /// (for context), so the `start_ns` bound is what keeps a windowed/zoomed query
 /// from spilling points before the requested window — mirroring how the grid
 /// producer's cursor starts at `start_ns`.
-pub struct CounterPairwiseRate<'a> {
-    timestamps: &'a [u64],
-    values: &'a [u64],
+pub struct CounterPairwiseRate {
+    timestamps: Vec<u64>,
+    values: Vec<u64>,
     cursor: usize,
     start_ns: u64,
     end_ns: u64,
 }
 
-impl<'a> CounterPairwiseRate<'a> {
-    pub fn new(timestamps: &'a [u64], values: &'a [u64], start_ns: u64, end_ns: u64) -> Self {
+impl CounterPairwiseRate {
+    /// Owns its samples: a producer is the series' iterator for the rest of
+    /// the pipeline, so its input lives exactly as long as it is being
+    /// consumed and no longer — the dispatcher used to collect every
+    /// producer's points into a `Vec` because a borrowing producer could not
+    /// outlive the samples it borrowed, and on a wide table those vectors
+    /// were most of a query's memory.
+    pub fn new(timestamps: Vec<u64>, values: Vec<u64>, start_ns: u64, end_ns: u64) -> Self {
         Self {
             timestamps,
             values,
@@ -34,7 +40,7 @@ impl<'a> CounterPairwiseRate<'a> {
     }
 }
 
-impl<'a> Iterator for CounterPairwiseRate<'a> {
+impl Iterator for CounterPairwiseRate {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
@@ -79,8 +85,8 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
 /// interval. A grid point is emitted only when both interval edges fall
 /// within the observed sample range `[first_ts, last_ts]`; no extrapolation
 /// beyond observed data (leading/trailing partial intervals are dropped).
-pub struct CounterGridRate<'a> {
-    timestamps: &'a [u64],
+pub struct CounterGridRate {
+    timestamps: Vec<u64>,
     /// Reset-adjusted monotone cumulative counter, aligned with `timestamps`.
     cum: Vec<f64>,
     cursor_ns: u64,
@@ -100,20 +106,21 @@ pub struct CounterGridRate<'a> {
     /// combined value simultaneous with its slow operand instead of
     /// interpolating that operand across the gap.
     points: Option<(std::sync::Arc<[u64]>, usize)>,
-    windows: Option<&'a [(u64, u64)]>,
+    windows: Option<Vec<(u64, u64)>>,
     done: bool,
 }
 
-impl<'a> CounterGridRate<'a> {
+impl CounterGridRate {
+    /// Owns its samples; see [`CounterPairwiseRate::new`] for why.
     pub fn new(
-        timestamps: &'a [u64],
-        values: &'a [u64],
+        timestamps: Vec<u64>,
+        values: &[u64],
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
         // Averaging window per point; see the field of the same name.
         span_ns: u64,
-        windows: Option<&'a [(u64, u64)]>,
+        windows: Option<Vec<(u64, u64)>>,
     ) -> Self {
         // Reset-adjusted cumulative: same convention as CounterRate's
         // total_increase (a decrease is treated as a fresh counter start,
@@ -133,6 +140,7 @@ impl<'a> CounterGridRate<'a> {
                 cum.push(acc);
             }
         }
+        let done = step_ns == 0 || timestamps.len() < 2;
         Self {
             timestamps,
             cum,
@@ -142,7 +150,7 @@ impl<'a> CounterGridRate<'a> {
             span_ns: span_ns.max(1),
             points: None,
             windows,
-            done: step_ns == 0 || timestamps.len() < 2,
+            done,
         }
     }
 
@@ -150,7 +158,7 @@ impl<'a> CounterGridRate<'a> {
     /// Returns `None` when `edge` is outside the observed sample range (no
     /// extrapolation).
     fn interp(&self, edge: u64) -> Option<f64> {
-        let ts = self.timestamps;
+        let ts = &self.timestamps;
         let last = *ts.last()?;
         if edge < ts[0] || edge > last {
             return None;
@@ -184,7 +192,7 @@ impl<'a> CounterGridRate<'a> {
     /// even when the cadence jitters, while a hole spanning several missing
     /// samples does not.
     fn sampled_window(&self, edge: u64) -> Option<(f64, f64)> {
-        let ts = self.timestamps;
+        let ts = &self.timestamps;
         if ts.len() < 2 {
             return self.interp_window(edge);
         }
@@ -214,8 +222,8 @@ impl<'a> CounterGridRate<'a> {
     /// is attributable to the grid edge rather than the nearest raw sample.
     /// `None` when there are no windows or `edge` is outside the sample range.
     fn interp_window(&self, edge: u64) -> Option<(f64, f64)> {
-        let w = self.windows?;
-        let ts = self.timestamps;
+        let w = self.windows.as_ref()?;
+        let ts = &self.timestamps;
         let last = *ts.last()?;
         if edge < ts[0] || edge > last {
             return None;
@@ -235,7 +243,7 @@ impl<'a> CounterGridRate<'a> {
     }
 }
 
-impl<'a> CounterGridRate<'a> {
+impl CounterGridRate {
     /// Evaluate at `points` rather than on the uniform grid. Each emitted
     /// value covers the gap from the previous point, so the caller's choice of
     /// timestamps sets both placement AND averaging window.
@@ -245,7 +253,7 @@ impl<'a> CounterGridRate<'a> {
     }
 }
 
-impl<'a> Iterator for CounterGridRate<'a> {
+impl Iterator for CounterGridRate {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
@@ -352,7 +360,7 @@ mod tests {
         let ts = [0u64, 1_000_000_000, 2_000_000_000, 3_000_000_000];
         let vals = [0u64, 100, 200, 300];
         let pts: Vec<Point> = CounterGridRate::new(
-            &ts,
+            ts.to_vec(),
             &vals,
             0,             // start_ns (already snapped by the caller)
             3_000_000_000, // end_ns
@@ -386,8 +394,16 @@ mod tests {
         // 50ms acquisition window ending at each sample.
         let windows: Vec<(u64, u64)> = ts.iter().map(|&t| (t - 50_000_000, t)).collect();
 
-        let pts: Vec<Point> =
-            CounterGridRate::new(&ts, &vals, 3 * S, 9 * S, S, S, Some(&windows)).collect();
+        let pts: Vec<Point> = CounterGridRate::new(
+            ts.to_vec(),
+            &vals,
+            3 * S,
+            9 * S,
+            S,
+            S,
+            Some(windows.clone()),
+        )
+        .collect();
 
         let observed: Vec<(u64, bool, bool)> = pts
             .iter()
@@ -434,8 +450,16 @@ mod tests {
         let ts = [3 * S, 4 * S, 5 * S, 8 * S, 9 * S];
         let vals = [100u64, 200, 300, 700, 800];
         let windows: Vec<(u64, u64)> = ts.iter().map(|&t| (t - 50_000_000, t)).collect();
-        let pts: Vec<Point> =
-            CounterGridRate::new(&ts, &vals, 3 * S, 9 * S, S, S, Some(&windows)).collect();
+        let pts: Vec<Point> = CounterGridRate::new(
+            ts.to_vec(),
+            &vals,
+            3 * S,
+            9 * S,
+            S,
+            S,
+            Some(windows.clone()),
+        )
+        .collect();
 
         let series = vec![LabeledSeries::new(Default::default(), pts.into_iter())];
         let out = collect_to_matrix(series, Some("probe"));
@@ -524,7 +548,8 @@ mod tests {
         let windows: Vec<(u64, u64)> = ts.iter().map(|&t| (t - 50_000_000, t)).collect();
 
         let pts: Vec<Point> =
-            CounterGridRate::new(&ts, &vals, 0, 3 * S, S, S, Some(&windows)).collect();
+            CounterGridRate::new(ts.to_vec(), &vals, 0, 3 * S, S, S, Some(windows.clone()))
+                .collect();
 
         assert_eq!(pts.len(), 1);
         assert!(
@@ -543,7 +568,7 @@ mod tests {
         let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
         let vals = [0u64, 100, 200];
         let pts: Vec<Point> = CounterGridRate::new(
-            &ts,
+            ts.to_vec(),
             &vals,
             0,
             3_000_000_000,
@@ -565,7 +590,7 @@ mod tests {
         let ts = [0u64, 1_000_000_000, 2_000_000_000, 3_000_000_000];
         let vals = [0u64, 100, 50, 150];
         let pts: Vec<Point> = CounterGridRate::new(
-            &ts,
+            ts.to_vec(),
             &vals,
             0,
             3_000_000_000,
@@ -604,7 +629,7 @@ mod tests {
         let vals = [1u64, 7, 19];
         let points: std::sync::Arc<[u64]> =
             vec![1_500_000_000u64, 4_500_000_000, 10_500_000_000].into();
-        let pts: Vec<Point> = CounterGridRate::new(&ts, &vals, 0, 14 * S, S, S, None)
+        let pts: Vec<Point> = CounterGridRate::new(ts.to_vec(), &vals, 0, 14 * S, S, S, None)
             .at_points(points)
             .collect();
         let times: Vec<u64> = pts.iter().map(|p| p.t).collect();
@@ -629,7 +654,7 @@ mod tests {
 
         // 30 s / 60 s in miniature: gaps of 2 s then 4 s.
         let points: std::sync::Arc<[u64]> = vec![2 * S, 4 * S, 8 * S].into();
-        let pts: Vec<Point> = CounterGridRate::new(&ts, &vals, 0, 10 * S, S, S, None)
+        let pts: Vec<Point> = CounterGridRate::new(ts.to_vec(), &vals, 0, 10 * S, S, S, None)
             .at_points(points)
             .collect();
 
@@ -659,7 +684,16 @@ mod tests {
         let vals: [u64; 7] = [0, 0, 200, 200, 400, 400, 600];
 
         let at = |span: u64| -> Vec<Point> {
-            CounterGridRate::new(&ts, &vals, 0, 6_000_000_000, 1_000_000_000, span, None).collect()
+            CounterGridRate::new(
+                ts.to_vec(),
+                &vals,
+                0,
+                6_000_000_000,
+                1_000_000_000,
+                span,
+                None,
+            )
+            .collect()
         };
 
         let narrow = at(1_000_000_000);
@@ -700,13 +734,13 @@ mod tests {
             (2_980_000_000u64, 3_000_000_000u64),
         ];
         let pts: Vec<Point> = CounterGridRate::new(
-            &ts,
+            ts.to_vec(),
             &vals,
             0,
             3_000_000_000,
             1_000_000_000,
             1_000_000_000,
-            Some(&windows),
+            Some(windows.to_vec()),
         )
         .collect();
         // t=1s dropped (left edge 0 precedes first sample); emit t=2s, t=3s.

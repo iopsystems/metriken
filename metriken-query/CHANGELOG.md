@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Series are produced lazily.** The streaming producers
+  (`CounterGridRate`, `CounterPairwiseRate`, `GaugeStepGrid`,
+  `GaugeAvgOverTime`, `GaugeIdelta`, `GaugeDeriv`) own their samples, and
+  the dispatcher hands each series its producer as the series' iterator. The
+  producers used to borrow the samples the source returned, so they could
+  not outlive them, so the dispatcher collected every producer's points into
+  a `Vec` before the pipeline ran — for a `sum(rate())` over 6,644 series of
+  a ten-hour table, tens of millions of points resident at once, most of a
+  10 GB query. An aggregate now holds one buffered point per series. The
+  producers' constructors take `Vec`s; the results are unchanged.
+
 ## [0.28.0] - 2026-09-23
 
 ### Added
