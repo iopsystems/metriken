@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.28.0
+
+- **Added:** `ColumnRelabel`, identity that varies with time, and
+  `SegmentedParquetReader::open_relabeled_with_pool` to open a table with
+  one. At open a column contributes every label set it can present as; at
+  query time its samples are cut into runs by occupant (`split`), histogram
+  rows relabelled by timestamp (`at`), and a filter on a key the relabelling
+  supplies is turned into one the columns can answer (`segment_filter`) and
+  applied to the relabelled runs afterwards. For a reader whose archive says
+  who held each slot and when, without decoding the table to split it.
+  `Labels` is public, since the hook takes it.
+
 ### metriken-query 0.27.0
 
 - **Added:** `SegmentedParquetReader::open_with_pool` takes a `SegmentStore`,

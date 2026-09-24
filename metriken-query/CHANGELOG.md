@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`ColumnRelabel`: identity that varies with time.**
+  `SegmentedParquetReader::open_relabeled_with_pool` opens a table with one.
+  At open each column contributes every label set it can present as
+  (`identities`), which is what the identity indexes, the listings and the
+  column map are built from. At query time a counter or gauge column's
+  samples are cut into runs by occupant (`split`) and histogram rows are
+  relabelled one at a time by timestamp (`at`); each run is a piece of the
+  series it presents as, spliced across segments like any other. A filter on
+  a key the relabelling supplies is not on the column, so `segment_filter`
+  turns it into one the columns can answer (a slot alternation, say) and the
+  original is applied to the relabelled runs afterwards.
+
+  For a `.rez` reader whose identity index says who held each slot and
+  when: it used to decode the whole table into a `MemoryStore` to split it,
+  which on a ten-hour archive's task table is the whole table in memory.
+
+- `Labels` is public: the hook takes and returns it.
+
 ## [0.27.0] - 2026-09-23
 
 ### Added

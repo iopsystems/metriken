@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -50,6 +51,50 @@ pub trait SegmentStore: Send + Sync {
 /// What [`SegmentStore::bytes`] returns: the segment, `None` if it is gone,
 /// or the read failure.
 pub type SegmentBytes = Result<Option<Bytes>, Box<dyn Error + Send + Sync>>;
+
+/// Identity that varies with time: what a column's samples are attributed
+/// to depends on when they were taken.
+///
+/// A table's column is a slot, and a slot changes hands — a task exits and
+/// another lands in its place. The column's own labels say what the slot
+/// meant when the segment was written, or, once identity leaves column
+/// metadata, only which slot it is. The archive knows who held the slot and
+/// when; this is how it tells the reader. The reader asks at open what
+/// label sets each column can present as (for the identity indexes and the
+/// listings), and at query time how to cut a column's samples into runs by
+/// occupant. It never sees the index itself.
+///
+/// The filter question is the subtle one. A query's label filter is applied
+/// inside a segment against column labels, and a key the relabelling
+/// supplies (`comm`, say) is not on the column, so the segment would match
+/// nothing. [`segment_filter`](Self::segment_filter) is where the
+/// implementation turns such a filter into one the columns can answer, and
+/// the reader applies the original filter to the relabelled runs afterwards.
+pub trait ColumnRelabel: Send + Sync {
+    /// Every label set a column of metric `name` with `labels` presents as
+    /// over the recording, in first-appearance order. `None` leaves the
+    /// column as it is.
+    fn identities(&self, name: &str, labels: &Labels) -> Option<Vec<Labels>>;
+
+    /// Cut a column's samples, taken at ascending `timestamps`, into runs
+    /// that each present as one label set. The runs cover every sample, in
+    /// order. `None` leaves the column as it is.
+    fn split(&self, name: &str, labels: &Labels, timestamps: &[u64]) -> Option<Vec<Run>>;
+
+    /// What one sample of the column presents as. `None` leaves it as it is.
+    fn at(&self, name: &str, labels: &Labels, timestamp: u64) -> Option<Labels>;
+
+    /// The filter to ask a segment with, given the query's. Default: the
+    /// query's own.
+    fn segment_filter(&self, name: &str, filter: &Labels) -> Labels {
+        let _ = name;
+        filter.clone()
+    }
+}
+
+/// One run of a relabelled column: the labels its samples present as, and
+/// which samples (a range of indices into the column's own).
+pub type Run = (Labels, Range<usize>);
 
 /// A store over bytes already in memory: the tar archive, the tests, and
 /// any caller of the original [`SegmentedParquetReader::open_bytes_with_pool`].
@@ -119,6 +164,25 @@ impl SegmentedParquetReader {
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::open(store, pool, None)
+    }
+
+    /// [`open_with_pool`](Self::open_with_pool) with a [`ColumnRelabel`]:
+    /// the identity indexes are built from what each column can present as,
+    /// and every query cuts its samples by occupant before splicing.
+    pub fn open_relabeled_with_pool(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+        relabel: Arc<dyn ColumnRelabel>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::open(store, pool, Some(relabel))
+    }
+
+    fn open(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+        relabel: Option<Arc<dyn ColumnRelabel>>,
+    ) -> Result<Self, Box<dyn Error>> {
         if store.is_empty() {
             return Err("SegmentedParquetReader requires at least one segment".into());
         }
@@ -141,9 +205,23 @@ impl SegmentedParquetReader {
             };
             let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
             check_histogram_configs(idx, &seg)?;
-            counter_identity.extend(seg.counter_columns());
-            gauge_identity.extend(seg.gauge_columns());
-            let histogram_columns = seg.histogram_columns();
+            // Each column contributes every label set it can present as —
+            // one, unless a relabelling says otherwise.
+            let presented = |columns: Vec<(String, Labels)>| -> Vec<(String, Labels)> {
+                match &relabel {
+                    None => columns,
+                    Some(r) => columns
+                        .into_iter()
+                        .flat_map(|(name, labels)| {
+                            let sets = r.identities(&name, &labels).unwrap_or_else(|| vec![labels]);
+                            sets.into_iter().map(move |l| (name.clone(), l))
+                        })
+                        .collect(),
+                }
+            };
+            counter_identity.extend(presented(seg.counter_columns()));
+            gauge_identity.extend(presented(seg.gauge_columns()));
+            let histogram_columns = presented(seg.histogram_columns());
             histogram_runs.observe(idx, seg.histogram_configs());
             histogram_runs.observe_labels(idx, &histogram_columns);
             histogram_identity.extend(histogram_columns);
@@ -165,12 +243,20 @@ impl SegmentedParquetReader {
                 // never user-visible series labels (that is `histogram_labels`,
                 // which still only tags an actual conflict).
                 let run = histogram_runs.segment_run(&metric, idx);
-                let entry = column_map.entry(metric).or_default();
-                for (mut labels, col) in cols {
-                    if let Some(run) = run {
-                        labels.inner.insert("__run__".to_string(), run.to_string());
+                let entry = column_map.entry(metric.clone()).or_default();
+                for (labels, col) in cols {
+                    let sets = match &relabel {
+                        Some(r) => r
+                            .identities(&metric, &labels)
+                            .unwrap_or_else(|| vec![labels]),
+                        None => vec![labels],
+                    };
+                    for mut labels in sets {
+                        if let Some(run) = run {
+                            labels.inner.insert("__run__".to_string(), run.to_string());
+                        }
+                        entry.entry(labels).or_insert_with(|| col.clone());
                     }
-                    entry.entry(labels).or_insert(col);
                 }
             }
             // Last segment wins on collision.
@@ -192,6 +278,7 @@ impl SegmentedParquetReader {
             catalog,
             cache: Mutex::new(SegmentCache::new(pool.max_bytes())),
             pool,
+            relabel,
             counter_identity,
             gauge_identity,
             histogram_identity,
@@ -607,6 +694,8 @@ struct SegmentedSource {
     cache: Mutex<SegmentCache>,
     /// Decode cache every opened segment is wired to.
     pool: Arc<BufferPool>,
+    /// Time-varying identity for the columns, if the archive has one.
+    relabel: Option<Arc<dyn ColumnRelabel>>,
     /// Open-time identity indexes (see [`SeriesIdentity`]) used to splice
     /// counters/gauges/histograms in O(1) per sample instead of scanning
     /// the already-spliced accumulator.
@@ -623,6 +712,16 @@ struct SegmentedSource {
 }
 
 impl SegmentedSource {
+    /// The filter a segment is asked with: the query's own, unless a
+    /// relabelling has keys the columns do not carry — see
+    /// [`ColumnRelabel::segment_filter`].
+    fn segment_filter(&self, name: &str, filter: &Labels) -> Labels {
+        match &self.relabel {
+            Some(r) => r.segment_filter(name, filter),
+            None => filter.clone(),
+        }
+    }
+
     /// Segment `idx`, opened footer-only — from the cache, or fetched from
     /// the store and cached. `None` when the store no longer has it.
     fn segment(&self, idx: usize) -> Result<Option<Arc<ParquetReader>>, Box<dyn Error>> {
@@ -684,6 +783,65 @@ impl SegmentedSource {
     }
 }
 
+/// Cut one column's samples from one segment into the runs a relabelling
+/// says they present as, keeping only the runs the query's filter accepts.
+/// Without a relabelling the series is one run, its own labels, already
+/// filtered by the segment.
+fn relabel_counter(
+    relabel: Option<&dyn ColumnRelabel>,
+    name: &str,
+    filter: &Labels,
+    c: Counter,
+) -> Vec<Counter> {
+    let Some(r) = relabel else {
+        return vec![c];
+    };
+    let Some(runs) = r.split(name, &c.labels, &c.timestamps) else {
+        return if c.labels.matches(filter) {
+            vec![c]
+        } else {
+            Vec::new()
+        };
+    };
+    runs.into_iter()
+        .filter(|(labels, _)| labels.matches(filter))
+        .map(|(labels, range)| Counter {
+            labels,
+            timestamps: c.timestamps[range.clone()].to_vec(),
+            values: c.values[range.clone()].to_vec(),
+            windows: c.windows.as_ref().map(|w| w[range].to_vec()),
+        })
+        .collect()
+}
+
+/// Gauge twin of [`relabel_counter`].
+fn relabel_gauge(
+    relabel: Option<&dyn ColumnRelabel>,
+    name: &str,
+    filter: &Labels,
+    g: Gauge,
+) -> Vec<Gauge> {
+    let Some(r) = relabel else {
+        return vec![g];
+    };
+    let Some(runs) = r.split(name, &g.labels, &g.timestamps) else {
+        return if g.labels.matches(filter) {
+            vec![g]
+        } else {
+            Vec::new()
+        };
+    };
+    runs.into_iter()
+        .filter(|(labels, _)| labels.matches(filter))
+        .map(|(labels, range)| Gauge {
+            labels,
+            timestamps: g.timestamps[range.clone()].to_vec(),
+            values: g.values[range.clone()].to_vec(),
+            windows: g.windows.as_ref().map(|w| w[range].to_vec()),
+        })
+        .collect()
+}
+
 /// Merge `c`'s samples into the already-accumulated series `a` (same
 /// identity; concatenate in arrival order).
 ///
@@ -737,6 +895,63 @@ fn relabel_with_run(mut stream: HistogramStream, run: usize) -> HistogramStream 
         labels.inner.insert("__run__".to_string(), run.to_string());
     }
     stream
+}
+
+/// Relabel one segment's histogram stream row by row: each row's series
+/// becomes whatever its column presents as at the row's timestamp, and rows
+/// the query's filter does not accept are dropped. Without a relabelling
+/// the stream passes through.
+///
+/// Row by row because a histogram stream is one; the runs `split` gives a
+/// counter have no equivalent here. An implementation answering `at` for
+/// ascending timestamps of one column can keep its place.
+fn relabel_histogram_stream(
+    relabel: Option<Arc<dyn ColumnRelabel>>,
+    name: &str,
+    filter: &Labels,
+    stream: HistogramStream,
+) -> HistogramStream {
+    let Some(relabel) = relabel else {
+        return stream;
+    };
+    let name = name.to_string();
+    let filter = filter.clone();
+    let base = stream.meta.series.clone();
+    // The relabelled series list grows as rows arrive; the meta must be
+    // complete before the rows are consumed, so it is built from every
+    // identity each column can present as, in column order, and rows map
+    // into it.
+    let mut series: Vec<Labels> = Vec::new();
+    let mut position: HashMap<Labels, usize> = HashMap::new();
+    for labels in &base {
+        let sets = relabel
+            .identities(&name, labels)
+            .unwrap_or_else(|| vec![labels.clone()]);
+        for l in sets {
+            if !position.contains_key(&l) {
+                position.insert(l.clone(), series.len());
+                series.push(l);
+            }
+        }
+    }
+    let rows = stream.rows.filter_map(move |mut row| {
+        let column = &base[row.series_idx];
+        let labels = relabel
+            .at(&name, column, row.timestamp)
+            .unwrap_or_else(|| column.clone());
+        if !labels.matches(&filter) {
+            return None;
+        }
+        row.series_idx = *position.get(&labels)?;
+        Some(row)
+    });
+    HistogramStream {
+        meta: HistogramStreamMeta {
+            config: stream.meta.config,
+            series,
+        },
+        rows: Box::new(rows),
+    }
 }
 
 /// Chain per-segment histogram streams (all belonging to the same run — see
@@ -834,11 +1049,19 @@ impl DataSource for SegmentedSource {
             return None;
         }
         let mut slots: Vec<Option<Counter>> = (0..order.len()).map(|_| None).collect();
+        let seg_filter = self.segment_filter(name, filter);
         for (_, seg) in self.touched(start_ns, end_ns) {
-            let Some(chunk) = seg.data_source().counters(name, filter, start_ns, end_ns) else {
+            let Some(chunk) = seg
+                .data_source()
+                .counters(name, &seg_filter, start_ns, end_ns)
+            else {
                 continue;
             };
-            for c in chunk.series {
+            for c in chunk
+                .series
+                .into_iter()
+                .flat_map(|c| relabel_counter(self.relabel.as_deref(), name, filter, c))
+            {
                 match self.counter_identity.position(name, &c.labels) {
                     Some(pos) => match &mut slots[pos] {
                         Some(a) => merge_counter(a, c),
@@ -868,11 +1091,19 @@ impl DataSource for SegmentedSource {
             return None;
         }
         let mut slots: Vec<Option<Gauge>> = (0..order.len()).map(|_| None).collect();
+        let seg_filter = self.segment_filter(name, filter);
         for (_, seg) in self.touched(start_ns, end_ns) {
-            let Some(chunk) = seg.data_source().gauges(name, filter, start_ns, end_ns) else {
+            let Some(chunk) = seg
+                .data_source()
+                .gauges(name, &seg_filter, start_ns, end_ns)
+            else {
                 continue;
             };
-            for g in chunk.series {
+            for g in chunk
+                .series
+                .into_iter()
+                .flat_map(|g| relabel_gauge(self.relabel.as_deref(), name, filter, g))
+            {
                 match self.gauge_identity.position(name, &g.labels) {
                     Some(pos) => match &mut slots[pos] {
                         Some(a) => merge_gauge(a, g),
@@ -915,12 +1146,14 @@ impl DataSource for SegmentedSource {
                 Some(v) if v == "0" => {}
                 Some(_) => return None,
             }
+            let seg_filter = self.segment_filter(name, &effective);
             let streams: Vec<HistogramStream> = self
                 .touched(start_ns, end_ns)
                 .filter_map(|(_, seg)| {
                     seg.data_source()
-                        .histogram_stream(name, &effective, start_ns, end_ns)
+                        .histogram_stream(name, &seg_filter, start_ns, end_ns)
                 })
+                .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &effective, s))
                 .collect();
             return splice_histogram_streams(name, &self.histogram_identity, streams);
         }
@@ -941,13 +1174,15 @@ impl DataSource for SegmentedSource {
             None => (0usize, filter.clone()),
         };
 
+        let seg_filter = self.segment_filter(name, &inner_filter);
         let streams: Vec<HistogramStream> = self
             .touched(start_ns, end_ns)
             .filter(|(idx, _)| self.histogram_runs.segment_run(name, *idx) == Some(want_run))
             .filter_map(|(_, seg)| {
                 seg.data_source()
-                    .histogram_stream(name, &inner_filter, start_ns, end_ns)
+                    .histogram_stream(name, &seg_filter, start_ns, end_ns)
             })
+            .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &inner_filter, s))
             .collect();
 
         let spliced = splice_histogram_streams(name, &self.histogram_identity, streams)?;
@@ -1321,6 +1556,17 @@ mod tests {
         max_value_power: u8,
         rows: &[(u64, Vec<u64>)],
     ) -> Vec<u8> {
+        segment_histogram_labeled(name, grouping_power, max_value_power, &[], rows)
+    }
+
+    /// [`segment_histogram`] with labels on the column.
+    fn segment_histogram_labeled(
+        name: &str,
+        grouping_power: u8,
+        max_value_power: u8,
+        labels: &[(&str, &str)],
+        rows: &[(u64, Vec<u64>)],
+    ) -> Vec<u8> {
         use arrow::array::ListArray;
         use arrow::buffer::OffsetBuffer;
 
@@ -1329,6 +1575,9 @@ mod tests {
         meta.insert("metric_type".to_string(), "histogram".to_string());
         meta.insert("grouping_power".to_string(), grouping_power.to_string());
         meta.insert("max_value_power".to_string(), max_value_power.to_string());
+        for (k, v) in labels {
+            meta.insert(k.to_string(), v.to_string());
+        }
 
         let item = Arc::new(Field::new("item", DataType::UInt64, true));
         let schema = Arc::new(Schema::new(vec![
@@ -2990,5 +3239,218 @@ mod tests {
             store.gone.lock().unwrap().insert(i);
         }
         assert!(SegmentedParquetReader::open_with_pool(store, BufferPool::new(1 << 20)).is_err());
+    }
+
+    /// A relabelling that says slot columns (`slot=<n>`) were held by
+    /// `who=a` until `cut` and `who=b` from then on, and knows the filter
+    /// key it supplies.
+    struct HandOver {
+        cut: u64,
+    }
+
+    impl HandOver {
+        fn who(&self, ts: u64) -> &'static str {
+            if ts < self.cut {
+                "a"
+            } else {
+                "b"
+            }
+        }
+
+        fn with(labels: &Labels, who: &str) -> Labels {
+            let mut l = labels.clone();
+            l.inner.insert("who".to_string(), who.to_string());
+            l
+        }
+    }
+
+    impl ColumnRelabel for HandOver {
+        fn identities(&self, _name: &str, labels: &Labels) -> Option<Vec<Labels>> {
+            labels
+                .inner
+                .contains_key("slot")
+                .then(|| vec![Self::with(labels, "a"), Self::with(labels, "b")])
+        }
+
+        fn split(&self, _name: &str, labels: &Labels, timestamps: &[u64]) -> Option<Vec<Run>> {
+            if !labels.inner.contains_key("slot") {
+                return None;
+            }
+            let first_b = timestamps.partition_point(|ts| *ts < self.cut);
+            let mut runs = Vec::new();
+            if first_b > 0 {
+                runs.push((Self::with(labels, "a"), 0..first_b));
+            }
+            if first_b < timestamps.len() {
+                runs.push((Self::with(labels, "b"), first_b..timestamps.len()));
+            }
+            Some(runs)
+        }
+
+        fn at(&self, _name: &str, labels: &Labels, timestamp: u64) -> Option<Labels> {
+            labels
+                .inner
+                .contains_key("slot")
+                .then(|| Self::with(labels, self.who(timestamp)))
+        }
+
+        fn segment_filter(&self, _name: &str, filter: &Labels) -> Labels {
+            // `who` is ours; the columns cannot answer it. Everything else
+            // passes through.
+            let mut f = filter.clone();
+            f.inner.remove("who");
+            f
+        }
+    }
+
+    /// A relabelled column lists every identity it can present as, and a
+    /// query cuts its samples at the handover: each occupant's series has
+    /// only its own samples, spliced across segments.
+    #[test]
+    fn a_relabelled_column_splits_by_occupant_across_segments() {
+        let s0 = segment_labeled(
+            "c",
+            "slot",
+            &[1_000_000_000, 2_000_000_000],
+            &[("7", vec![10, 20])],
+        );
+        let s1 = segment_labeled(
+            "c",
+            "slot",
+            &[3_000_000_000, 4_000_000_000],
+            &[("7", vec![30, 40])],
+        );
+        let r = SegmentedParquetReader::open_relabeled_with_pool(
+            Arc::new(InMemorySegments::new(vec![s0, s1])),
+            BufferPool::new(1 << 20),
+            Arc::new(HandOver { cut: 2_500_000_000 }),
+        )
+        .unwrap();
+
+        let labels = r.counter_labels("c");
+        assert_eq!(labels.len(), 2, "one column, two occupants: {labels:?}");
+        assert!(labels.iter().all(|l| l["slot"] == "7"));
+        assert_eq!(
+            labels.iter().map(|l| l["who"].as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let QueryResult::Matrix { result } = r
+            .query_range_opts("irate(c[1s])", 0.0, 5.0, 1.0, &opts)
+            .unwrap()
+        else {
+            panic!("matrix");
+        };
+        let mut by_who: Vec<(String, Vec<(f64, f64)>)> = result
+            .into_iter()
+            .map(|s| (s.metric["who"].clone(), s.values))
+            .collect();
+        by_who.sort_by(|a, b| a.0.cmp(&b.0));
+        // a holds 1s and 2s: one pairwise rate at 2s. b holds 3s and 4s:
+        // one at 4s. Nothing crosses the handover.
+        assert_eq!(
+            by_who,
+            vec![
+                ("a".to_string(), vec![(2.0, 10.0)]),
+                ("b".to_string(), vec![(4.0, 10.0)]),
+            ]
+        );
+    }
+
+    /// A filter on a key the relabelling supplies is answered after the
+    /// split, with the segment asked a filter it can answer.
+    #[test]
+    fn a_filter_on_a_relabelled_key_selects_the_occupant() {
+        let s0 = segment_labeled(
+            "c",
+            "slot",
+            &[1_000_000_000, 2_000_000_000],
+            &[("7", vec![10, 20])],
+        );
+        let s1 = segment_labeled(
+            "c",
+            "slot",
+            &[3_000_000_000, 4_000_000_000],
+            &[("7", vec![30, 40])],
+        );
+        let r = SegmentedParquetReader::open_relabeled_with_pool(
+            Arc::new(InMemorySegments::new(vec![s0, s1])),
+            BufferPool::new(1 << 20),
+            Arc::new(HandOver { cut: 2_500_000_000 }),
+        )
+        .unwrap();
+        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let QueryResult::Matrix { result } = r
+            .query_range_opts("irate(c{who=\"b\"}[1s])", 0.0, 5.0, 1.0, &opts)
+            .unwrap()
+        else {
+            panic!("matrix");
+        };
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].metric["who"], "b");
+        assert_eq!(result[0].values, vec![(4.0, 10.0)]);
+
+        // A key the columns do carry still narrows inside the segment.
+        assert!(
+            r.query_range_opts("irate(c{slot=\"8\"}[1s])", 0.0, 5.0, 1.0, &opts)
+                .map(|q| matches!(q, QueryResult::Matrix { result } if result.is_empty()))
+                .unwrap_or(true),
+            "no such slot"
+        );
+    }
+
+    /// Histogram rows are relabelled one at a time by their timestamp, and
+    /// the two occupants read as two series.
+    #[test]
+    fn histogram_rows_are_relabelled_by_timestamp() {
+        // Cumulative snapshots growing by 5 a second. The count reducer
+        // emits each series' delta between consecutive rows, so each
+        // occupant's two rows yield one point of 5 — and a row that crossed
+        // the handover would show as a delta of 10 on the wrong side.
+        let n = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let at = |k: u64| {
+            let mut b = vec![0u64; n];
+            b[3] = 5 * k;
+            b
+        };
+        let seg = segment_histogram_labeled(
+            "latency",
+            2,
+            8,
+            &[("slot", "7")],
+            &[
+                (1_000_000_000, at(1)),
+                (2_000_000_000, at(2)),
+                (3_000_000_000, at(3)),
+                (4_000_000_000, at(4)),
+            ],
+        );
+        let r = SegmentedParquetReader::open_relabeled_with_pool(
+            Arc::new(InMemorySegments::new(vec![seg])),
+            BufferPool::new(1 << 20),
+            Arc::new(HandOver { cut: 2_500_000_000 }),
+        )
+        .unwrap();
+        let labels = r.histogram_labels("latency");
+        assert_eq!(labels.len(), 2, "{labels:?}");
+
+        let QueryResult::Matrix { result } = r
+            .query_range("histogram_count by (who) (latency)", 0.0, 5.0, 1.0)
+            .unwrap()
+        else {
+            panic!("matrix");
+        };
+        let mut whos: Vec<String> = result.iter().map(|s| s.metric["who"].clone()).collect();
+        whos.sort();
+        assert_eq!(whos, vec!["a".to_string(), "b".to_string()]);
+        for s in &result {
+            let pts: Vec<f64> = s.values.iter().map(|(_, v)| *v).collect();
+            assert!(
+                !pts.is_empty() && pts.iter().all(|v| *v == 5.0),
+                "each occupant sees only its own rows, one delta of 5: {} -> {pts:?}",
+                s.metric["who"]
+            );
+        }
     }
 }
