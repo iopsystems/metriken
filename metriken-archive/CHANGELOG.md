@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kept for the recording, so a stream never mixes long and wide WAL rows.
   A group with no members, and a long row with no occupant present, are
   not written.
+  A long group's metric columns are kept for the recording and only grow,
+  so a change of membership re-lays out the new schema over them without
+  rebuilding the columns.
 
 ### Changed
 
