@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Encoder::for_streams`: the segment encoder for an archive this process
+  is not writing (a copy, a ranged dump), built from the archive's stream
+  list. A stream is long when its occupant stream is present, as a reader
+  decides. Its version matches the writer's, so dendro's
+  `copy_sources_into` accepts it for a live archive.
+
 ## [0.2.3] - 2026-09-28
 
 ### Added
