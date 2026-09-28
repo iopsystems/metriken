@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `wal`: the write-ahead log's row format, phase 2 of
+  `docs/journal/2026-09-28-high-cardinality-stack.md`, moved from rezolus's
+  `crates/rez`. `WalGroupRow` (a group's values for one tick, one window,
+  the schema when anchoring), `WalCell` and `WalValue` (a row of
+  individually windowed metrics), their msgpack codec,
+  `materialize_wal_tail` (a live tail as a segment, dispatching on
+  `is_group_table_key`), and `wal_group_row_approx_bytes`. Materialization
+  takes any row type implementing `WalRowSource`, so a container's rows are
+  read where they are.
+
 ## [0.1.1] - 2026-09-28
 
 ### Added

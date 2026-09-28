@@ -10,6 +10,8 @@ mod parquet;
 mod prometheus;
 #[cfg(feature = "segment")]
 mod segment;
+#[cfg(feature = "segment")]
+pub use segment::{group_approx_bytes, wal_group_row};
 mod snapshot;
 mod snapshotter;
 

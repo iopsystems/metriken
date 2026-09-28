@@ -1,6 +1,6 @@
 # A high-cardinality metrics stack: what belongs in metriken, dendro and rezolus
 
-**Status:** OPEN. Boundaries agreed 2026-09-28. Phase 1 done (below):
+**Status:** OPEN. Boundaries agreed 2026-09-28. Phases 1 and 2 done (below):
 `metriken-segment` holds the wide layout, the long layout and the occupant
 stream. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
 then built on this stack rather than moved onto it afterwards (decided
@@ -114,10 +114,27 @@ moved:
      the two schemas to the same bytes and hash. rezolus's table-builder
      and round-trip tests pass unchanged against the moved code, except
      one that read a private builder field, which moved with the builder.
-2. **The wire form and stream protocol in `metriken-exposition`.** This
-   covers `WalGroupRow` and the `/metrics/stream` endpoint (rezolus
-   `src/agent/exposition/http/`). It comes before the writer because the
-   writer's input is these rows.
+2. **The wire form.** Done, with its scope narrowed by what the code turned
+   out to be:
+   - `/metrics/stream` has no framing of its own: it sends dendro's
+     replication frames, and each row's payload is an encoded
+     `WalGroupRow`. So what moved is the row, not a protocol.
+   - The row format and the materialization of a WAL tail went to
+     `metriken-segment` (`wal`), not metriken-exposition: the browser
+     reader materializes tails and cannot depend on exposition. It takes
+     any row type through a `WalRowSource` trait.
+   - Building a row from a `GroupSnapshot` (`wal_group_row`) and its size
+     meter (`group_approx_bytes`) went to metriken-exposition, with the
+     test pinning that meter to the decoded row's.
+   - Not moved: the group builder (rezolus's `create_v3`, which walks the
+     registry into group snapshots) is tied to rezolus's acquisition-group
+     registry and sampler attribution. Making it generic is phase 5's
+     question (families of metrics), so it moves then, with the
+     `/metrics/stream` endpoint. The identity index (`IndexEntry`,
+     `SourceIndex`) stays in rezolus: the long layout's occupant stream
+     replaces it.
+   - rezolus's unused pre-dendro stream framing (`wire::StreamFrame` and
+     its codec) was deleted rather than moved.
 3. **The archive reader in `metriken-archive`.** The generic parts of
    rezolus's `RezReader` move here: the `Catalog` trait
    (`crates/rez/src/catalog.rs`), the stream union, and cross-cadence
