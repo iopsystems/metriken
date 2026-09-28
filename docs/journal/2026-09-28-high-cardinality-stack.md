@@ -78,8 +78,9 @@ from rezolus.
 - **`metriken-exposition`**: gains the row form of a group snapshot
   (`WalGroupRow`) and the `/metrics/stream` protocol, so any metriken
   service can be streamed by a recorder.
-- **`metriken`**: gains groups with slots and occupant identity (see
-  "Dynamic slots", below).
+- **`metriken`**: gains slot identity for fixed-capacity groups, and
+  registration ids and families for the dynamic registry (see "Members
+  that come and go", below).
 
 ## Phases
 
@@ -109,10 +110,10 @@ moved:
    step 3: a dendro-backed writer that writes groups with slots long, with
    their occupant stream, and materializes a long table's WAL tail as long.
    rezolus's recorder and hindsight use it with rezolus's defaults.
-5. **Groups with slots and identity in `metriken`.** This covers slot
-   identity, `__uid__` minting and dynamic slots. It needs its own design
-   entry (see below). Phases 1–4 don't depend on it: they take occupants
-   from any source.
+5. **Members that come and go, in `metriken`.** Slot identity and `__uid__`
+   minting move here for fixed-capacity groups. The dynamic registry gains
+   registration ids and families (see below). It gets its own design entry.
+   Phases 1–4 don't depend on it: they take occupants from any source.
 6. **rezolus 6.0** builds on the result: the agent uses metriken's groups
    and identity and its stream endpoint, and the recorder, hindsight and
    viewer use `metriken-archive`.
@@ -120,18 +121,52 @@ moved:
 Each phase lands as its own PR and release. Where a public path changes,
 the old one is re-exported for one release.
 
-## Dynamic slots
+## Members that come and go: two sources, one output
 
-metriken's groups have a fixed capacity: `CounterGroup::new(entries)`
-(`metriken/src/group/counter.rs:84`). rezolus's per-thread group is sized at
-`MAX_PID` (4,194,304), which suits a key space the kernel assigns and
-bounds. A cache server's tenants or connections are not bounded that way.
-Its slots have to be assigned at runtime, given an identity when assigned,
-and freed when the member leaves, so the recorder sees a new occupant when
-a slot is reused. This is new design, and phase 5 gets its own entry
-before it is built. The storage side does not depend on it, since the long
-layout and the occupant stream take occupants from any source. Only
-phase 5 waits on that design.
+metriken already registers metrics at runtime. `MetricBuilder::new(name)
+.metadata(k, v).build(metric)` (`metriken-core/src/dynmetrics.rs:63`)
+registers a metric with its labels, and dropping it unregisters it
+(`impl Drop for DynPinnedMetric`, `:276`). A service can create a counter
+when a tenant appears and drop it when the tenant leaves. That is the
+lifecycle a service's members need. Three things stand between it and the
+long layout:
+
+1. **No stable identity per registration.** The registry keys a dynamic
+   metric by its address (`key_for`, `dynmetrics.rs:35`), which is reused
+   after a free. The snapshotter names columns by position in the metric
+   list (`format!("{metric_id}")`, `metriken-exposition/src/snapshotter.rs:68`),
+   so a column index means a different metric once members come and go.
+   Neither can be an occupant. A registration id that is never reused (a
+   counter) can, and it becomes the occupant and `__uid__`.
+2. **No grouping.** The snapshotter produces V1/V2 snapshots: one metric
+   per column, the wide shape. Acquisition groups (`SnapshotV3`) are
+   assembled in rezolus's agent (`src/agent/exposition/http/snapshot.rs`).
+   To be written long, a family of dynamic metrics (one name, one member
+   per tenant) has to become one group whose members are occupants. The
+   group builder moves here in phase 2 in any case.
+3. **Cost per member is unmeasured at scale.** Each dynamic metric is a
+   boxed allocation registered under a global `RwLock`, and every snapshot
+   walks the registry. That is fine for thousands of members. Its cost at
+   hundreds of thousands is to be measured, not assumed.
+
+rezolus does not use the dynamic registry for its samplers, and should not.
+Its members are BPF map entries, arrays indexed by TID or css id that the
+agent reads in bulk via mmap. Registering a metric per thread would add an
+allocation and a registry lock to every thread start, for data the kernel
+already keeps. Those stay fixed-capacity groups (`CounterGroup::new(entries)`,
+`metriken/src/group/counter.rs:84`) with slot identity (rezolus
+`SlotIdentity`) on top.
+
+So metriken ends up with two sources of members:
+
+- **fixed-capacity groups with slot identity**, for bulk-read sources;
+- **the dynamic registry, with registration ids and families**, for
+  services.
+
+Both produce the same thing in a snapshot: a group, its occupants and
+their labels, which the writer stores long. Phase 5 builds both on what
+exists. Its entry settles how a family is declared, what the occupant
+number is for a dynamic member, and the per-member cost at scale.
 
 ## Open questions
 
