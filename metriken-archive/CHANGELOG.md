@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The writer seals segments with zstd level 3 by default, where it used
+  the segment format's LZ4. `WriterConfig::compression` sets the codec
+  (re-exported `Compression`, `ZstdLevel`). On replayed recordings zstd-3
+  was 55–57% smaller than LZ4 for about 4% more encode time, with the same
+  tick latency and query time. `Encoder::for_streams` seals with it too.
+  Readers already decode zstd; a tail a reader rebuilds in memory keeps the
+  default codec.
+
 ## [0.2.4] - 2026-09-28
 
 ### Added

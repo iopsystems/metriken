@@ -17,8 +17,9 @@ use crate::builder::{
     Cell, CellValue, GroupTableBuilder, TableBuilder, HISTOGRAM_BUCKET_BYTES, VALUE_SLOT_BYTES,
     WINDOW_SLOT_BYTES,
 };
-use crate::table::write_table_parquet;
+use crate::table::{segment_writer_props, write_table_parquet_with};
 use crate::window::Window;
+use parquet::file::properties::WriterProperties;
 
 /// A WAL row as materialization needs it: when it was taken and its
 /// encoded payload. A container implements this for its own row type, so
@@ -127,6 +128,7 @@ pub enum WalValue {
 fn materialize_sampler_wal_tail(
     sampler: &str,
     rows: &[impl WalRowSource],
+    props: WriterProperties,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Ok(None);
@@ -199,7 +201,7 @@ fn materialize_sampler_wal_tail(
         builder.push_row(row.ts(), row.wall_offset(), &cells);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet(&builder.finish())?,
+        bytes: write_table_parquet_with(&builder.finish(), props)?,
         rows: row_count,
         first_ts,
     }))
@@ -271,10 +273,21 @@ pub fn materialize_wal_tail(
     table_key: &str,
     rows: &[impl WalRowSource],
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
+    materialize_wal_tail_with(table_key, rows, segment_writer_props())
+}
+
+/// [`materialize_wal_tail`] with the caller's writer properties: a writer
+/// sealing with another codec. A reader rebuilding a tail in memory keeps the
+/// default, which is the faster to encode.
+pub fn materialize_wal_tail_with(
+    table_key: &str,
+    rows: &[impl WalRowSource],
+    props: WriterProperties,
+) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if is_group_table_key(table_key) {
-        materialize_group_wal_tail(table_key, rows)
+        materialize_group_wal_tail(table_key, rows, props)
     } else {
-        materialize_sampler_wal_tail(table_key, rows)
+        materialize_sampler_wal_tail(table_key, rows, props)
     }
 }
 
@@ -348,6 +361,7 @@ pub fn decode_wal_group_row(bytes: &[u8]) -> Result<WalGroupRow, String> {
 fn materialize_group_wal_tail(
     table_key: &str,
     rows: &[impl WalRowSource],
+    props: WriterProperties,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Ok(None);
@@ -405,7 +419,7 @@ fn materialize_group_wal_tail(
         return Ok(None);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet(&builder.finish())?,
+        bytes: write_table_parquet_with(&builder.finish(), props)?,
         rows: row_count,
         // `row_count > 0` implies the loop pushed at least one row, which is
         // exactly when `first_ts` gets set — never `None` here.
@@ -497,6 +511,17 @@ pub fn materialize_long_wal_tail(
     rows: &[impl WalRowSource],
     sort: bool,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
+    materialize_long_wal_tail_with(table_key, rows, sort, segment_writer_props())
+}
+
+/// [`materialize_long_wal_tail`] with the caller's writer properties, as
+/// [`materialize_wal_tail_with`].
+pub fn materialize_long_wal_tail_with(
+    table_key: &str,
+    rows: &[impl WalRowSource],
+    sort: bool,
+    props: WriterProperties,
+) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     let mut builder = crate::long_table::LongTableBuilder::new();
     let mut current: Option<((u64, u64), crate::schema::GroupSchema)> = None;
     let mut warned = false;
@@ -537,7 +562,7 @@ pub fn materialize_long_wal_tail(
         return Ok(None);
     }
     Ok(Some(MaterializedTail {
-        bytes: builder.finish(sort)?,
+        bytes: builder.finish_with(sort, props)?,
         rows,
         first_ts: first_ts.expect("a non-empty table has a first row"),
     }))

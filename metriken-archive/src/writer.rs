@@ -35,6 +35,22 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// reader can refuse one it does not know.
 pub const ENCODER_VERSION: &str = "metriken-archive/1";
 
+pub use parquet::basic::{Compression, ZstdLevel};
+
+/// zstd at level 3, the writer's default codec.
+fn default_compression() -> Compression {
+    Compression::ZSTD(ZstdLevel::try_new(3).expect("3 is a valid zstd level"))
+}
+
+/// Parquet writer properties for sealed segments: the segment format's,
+/// with the writer's codec.
+fn sealed_props(compression: Compression) -> parquet::file::properties::WriterProperties {
+    metriken_segment::table::segment_writer_props()
+        .into_builder()
+        .set_compression(compression)
+        .build()
+}
+
 /// How a writer records.
 pub struct WriterConfig {
     /// When a stream's open segment is sealed.
@@ -42,10 +58,15 @@ pub struct WriterConfig {
     /// Row time between restatements of a long table's live occupants.
     pub restate_every_ns: u64,
     /// Sort a long segment by `(occupant, timestamp)` at seal. Off by
-    /// default: on replayed recordings, arrival order was 6–20% smaller at
-    /// 100 ms and no slower on the tick path (see the writer's journal
-    /// entry). Sorting belongs at compaction.
+    /// default, to keep the cost at seal low; sorting belongs at compaction.
+    /// On replayed recordings it was 6–32% smaller on real hosts and 6–20%
+    /// larger on synthetic churn (see the writer's journal entry).
     pub sort_long: bool,
+    /// The codec every sealed segment is written with. zstd level 3 by
+    /// default: on replayed recordings it was 55–57% smaller than LZ4 for
+    /// about 4% more encode time, with the same tick latency and query time.
+    /// Readers decode either.
+    pub compression: Compression,
     /// Write groups with slots long. Off writes every group one row per
     /// tick, which is only useful to compare the two.
     pub long_groups: bool,
@@ -58,6 +79,7 @@ impl Default for WriterConfig {
             restate_every_ns: 300_000_000_000,
             sort_long: false,
             long_groups: true,
+            compression: default_compression(),
         }
     }
 }
@@ -71,6 +93,8 @@ type LongStreams = Arc<Mutex<HashSet<String>>>;
 pub struct Encoder {
     long: LongStreams,
     sort_long: bool,
+    /// Writer properties for every segment this encoder seals.
+    props: parquet::file::properties::WriterProperties,
 }
 
 impl Encoder {
@@ -90,6 +114,7 @@ impl Encoder {
         Self {
             long: Arc::new(Mutex::new(long)),
             sort_long: false,
+            props: sealed_props(default_compression()),
         }
     }
 }
@@ -132,9 +157,7 @@ impl SegmentEncoder for Encoder {
                 return Ok(None);
             }
             let refs: Vec<(u64, &Occupant)> = decoded.iter().map(|(t, o)| (*t, o)).collect();
-            let bytes =
-                occupants::encode_segment(&refs, metriken_segment::table::segment_writer_props())
-                    .map_err(boxed)?;
+            let bytes = occupants::encode_segment(&refs, self.props.clone()).map_err(boxed)?;
             return Ok(Some(Segment {
                 bytes,
                 rows: rows.len() as u64,
@@ -150,9 +173,14 @@ impl SegmentEncoder for Encoder {
             .unwrap_or_else(|e| e.into_inner())
             .contains(stream);
         let tail = if long {
-            wal::materialize_long_wal_tail(stream, &adapted, self.sort_long)
+            wal::materialize_long_wal_tail_with(
+                stream,
+                &adapted,
+                self.sort_long,
+                self.props.clone(),
+            )
         } else {
-            wal::materialize_wal_tail(stream, &adapted)
+            wal::materialize_wal_tail_with(stream, &adapted, self.props.clone())
         }
         .map_err(boxed)?;
         // dendro counts the WAL rows a segment consumes; a long segment has
@@ -193,6 +221,7 @@ impl ArchiveWriter {
         let encoder = Encoder {
             long: Arc::clone(&long),
             sort_long: config.sort_long,
+            props: sealed_props(config.compression),
         };
         let inner = Writer::create(path, Box::new(encoder)).map_err(boxed)?;
         Ok(Self {

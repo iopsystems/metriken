@@ -161,7 +161,18 @@ impl LongTableBuilder {
     /// Encode the table as a long segment. With `sort`, rows are ordered by
     /// `(occupant, timestamp)`, which lets a single-occupant read decode only
     /// its pages; otherwise they stay in arrival order.
-    pub fn finish(mut self, sort: bool) -> Result<Vec<u8>, crate::table::Error> {
+    pub fn finish(self, sort: bool) -> Result<Vec<u8>, crate::table::Error> {
+        self.finish_with(sort, segment_writer_props())
+    }
+
+    /// [`finish`](Self::finish) with the caller's writer properties, for a
+    /// writer that seals with another codec. The layout markers are added to
+    /// whatever key-value metadata `props` carries.
+    pub fn finish_with(
+        mut self,
+        sort: bool,
+        props: parquet::file::properties::WriterProperties,
+    ) -> Result<Vec<u8>, crate::table::Error> {
         let rows = self.timestamps.len();
         for name in &self.order {
             self.columns.get_mut(name).expect("ordered").pad(rows);
@@ -244,7 +255,7 @@ impl LongTableBuilder {
                 encode_occupant_ranges(self.occupants.iter().copied()),
             ),
         ];
-        let props = segment_writer_props()
+        let props = props
             .into_builder()
             .set_key_value_metadata(Some(kv))
             .build();

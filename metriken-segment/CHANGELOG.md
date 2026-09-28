@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `*_with` variants that take the caller's parquet writer properties, for a
+  writer sealing with another codec than `segment_writer_props`'s:
+  `table::write_table_parquet_with`, `LongTableBuilder::finish_with`,
+  `wal::materialize_wal_tail_with` and `wal::materialize_long_wal_tail_with`.
+  The existing functions are unchanged and keep the default.
+
 ## [0.1.3] - 2026-09-28
 
 ### Added
