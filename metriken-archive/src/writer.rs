@@ -73,6 +73,27 @@ pub struct Encoder {
     sort_long: bool,
 }
 
+impl Encoder {
+    /// The encoder for an archive this process is not writing: a copy, a
+    /// ranged dump, a compaction. `streams` is the archive's stream list
+    /// (`Archive::all_streams`, every source's); a stream is long when its
+    /// occupant stream is among them, which is how a reader decides too.
+    ///
+    /// The writer's own encoder learns which streams are long from its
+    /// recorders; a second process has only the archive to go on.
+    pub fn for_streams<'a>(streams: impl IntoIterator<Item = &'a str>) -> Self {
+        let long = streams
+            .into_iter()
+            .filter_map(occupants::table_of)
+            .map(str::to_string)
+            .collect();
+        Self {
+            long: Arc::new(Mutex::new(long)),
+            sort_long: false,
+        }
+    }
+}
+
 /// A dendro WAL row, as metriken-segment's materialization reads one.
 struct Row<'a>(&'a DWalRow);
 

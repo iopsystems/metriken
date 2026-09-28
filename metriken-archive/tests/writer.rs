@@ -484,3 +484,35 @@ fn a_v2_snapshot_is_written_one_table_per_sampler() {
         "the table sealed more than once, so a later segment had to carry its metadata again"
     );
 }
+
+/// An encoder built from an archive's stream list re-encodes a long table's
+/// unsealed rows as long, and its version matches the writer's, so dendro
+/// accepts it for a ranged copy of a live archive.
+#[test]
+fn an_encoder_for_an_archives_streams_copies_a_live_long_table() {
+    use dendro::archive::{Archive, ArchiveMut};
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    use metriken_archive::writer::Encoder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("live.dendro");
+    record(&src, true, false, None);
+
+    let archive = Archive::open(&src).unwrap();
+    let mut streams = Vec::new();
+    for s in archive.read_sources().unwrap() {
+        streams.extend(archive.all_streams(s.id).unwrap());
+    }
+    let encoder = Encoder::for_streams(streams.iter().map(String::as_str));
+    let dst = dir.path().join("copy.dendro");
+    let mut out = ArchiveMut::create(&dst).unwrap();
+    out.transaction(|tx| copy_sources_into(&archive, tx, &CopySpec::everything(), &encoder))
+        .unwrap();
+    drop(out);
+
+    let (a, b) = (open(&src), open(&dst));
+    for q in QUERIES {
+        let (x, y) = (answer(&a, q, 0), answer(&b, q, 0));
+        assert_eq!(x.as_ref().map(|r| &r.0), y.as_ref().map(|r| &r.0), "{q}");
+    }
+}
