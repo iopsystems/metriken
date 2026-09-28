@@ -8,6 +8,8 @@ mod convert;
 #[cfg(feature = "parquet")]
 mod parquet;
 mod prometheus;
+#[cfg(feature = "segment")]
+mod segment;
 mod snapshot;
 mod snapshotter;
 

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The wide layout, phase 1b of `docs/journal/2026-09-28-high-cardinality-stack.md`,
+  moved from rezolus's `crates/rez` without changing behaviour:
+  - `table`: `Table`, `Column`, `Values` (rezolus's `RezTable`,
+    `RezColumn`, `RezValues`), `write_table_parquet`, `read_table_parquet`,
+    `table_to_batch`, `segment_writer_props`, and the `:wall_offset`,
+    `:window_begin` and `:window_width` column names.
+  - `builder`: `TableBuilder` and `GroupTableBuilder`, their `Cell` and
+    `CellValue` input, and the per-cell size constants a writer meters
+    segments with. `TableBuilder` gains `last_key`/`set_last_key` and
+    `columns` accessors, and `approx_bytes` and `col_len` are public.
+  - `schema`: `GroupSchema` and `MetricDesc`, the wasm-safe mirror of
+    metriken-exposition's, and `fnv1a_128`.
+  - `window`: `Window`.
+- A `metriken` feature: `From` conversions to and from `metriken::Window`.
+
 ## [0.1.0] - 2026-09-28
 
 ### Added

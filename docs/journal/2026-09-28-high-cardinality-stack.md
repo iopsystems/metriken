@@ -1,7 +1,8 @@
 # A high-cardinality metrics stack: what belongs in metriken, dendro and rezolus
 
-**Status:** OPEN. Boundaries agreed 2026-09-28. Phase 1a done (below):
-`metriken-segment` holds the long layout and the occupant stream. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
+**Status:** OPEN. Boundaries agreed 2026-09-28. Phase 1 done (below):
+`metriken-segment` holds the wide layout, the long layout and the occupant
+stream. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
 then built on this stack rather than moved onto it afterwards (decided
 2026-09-28).
 
@@ -102,7 +103,17 @@ moved:
      the `ColumnRelabel` that applies an occupant's labels, went to
      metriken-query instead, because it is read-side and uses
      metriken-query's types.
-   - **1b, next:** the wide segment writer.
+   - **1b, done:** the wide segment writer moved from rezolus's `rez.rs`:
+     the table model, parquet encode and decode, both builders and their
+     `Cell` input, and the `GroupSchema`/`MetricDesc` mirror and `Window`
+     they use. The conversions from `metriken`'s and
+     metriken-exposition's types, which rezolus could no longer implement
+     under the orphan rule, went to their natural owners: `Window` behind
+     metriken-segment's `metriken` feature, the schema in
+     metriken-exposition's new `segment` feature, with the tests pinning
+     the two schemas to the same bytes and hash. rezolus's table-builder
+     and round-trip tests pass unchanged against the moved code, except
+     one that read a private builder field, which moved with the builder.
 2. **The wire form and stream protocol in `metriken-exposition`.** This
    covers `WalGroupRow` and the `/metrics/stream` endpoint (rezolus
    `src/agent/exposition/http/`). It comes before the writer because the

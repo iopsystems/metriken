@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-segment 0.1.1
+
+- **Added:** the wide layout, moved from rezolus: `table` (the table model,
+  its parquet encoding and decoding, the sidecar column names and writer
+  settings), `builder` (`TableBuilder`, `GroupTableBuilder`, and their
+  `Cell` input), `schema` (a group's membership, the wasm-safe mirror of
+  `metriken_exposition::GroupSchema`) and `window`. A `metriken` feature
+  adds `From` conversions to and from `metriken::Window`.
+
+### metriken-exposition 0.21.0
+
+- **Added:** a `segment` feature (on by default) converting `GroupSchema`
+  and `MetricDesc` into `metriken-segment`'s mirror of them, with the tests
+  that pin the two to the same msgpack bytes and hash.
+
 ### metriken-segment 0.1.0
 
 - **Added:** the crate, the parquet segment format shared by writers and

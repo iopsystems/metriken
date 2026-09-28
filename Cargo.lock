@@ -889,12 +889,13 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "arrow",
  "chrono",
  "histogram",
  "metriken",
+ "metriken-segment",
  "parquet",
  "rmp-serde",
  "serde",
@@ -924,13 +925,16 @@ dependencies = [
 
 [[package]]
 name = "metriken-segment"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "bytes",
+ "histogram",
+ "metriken",
  "parquet",
  "rmp-serde",
  "serde",
+ "tracing",
 ]
 
 [[package]]
