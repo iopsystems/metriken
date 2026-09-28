@@ -1,8 +1,8 @@
 # A high-cardinality metrics stack: what belongs in metriken, dendro and rezolus
 
-**Status:** OPEN. Boundaries agreed 2026-09-28. Phases 1 and 2 done (below):
-`metriken-segment` holds the wide layout, the long layout and the occupant
-stream. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
+**Status:** OPEN. Boundaries agreed 2026-09-28. Phases 1–3 done (below):
+`metriken-segment` holds the wide layout, the long layout, the occupant
+stream and the WAL row format; `metriken-archive` holds the reader. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
 then built on this stack rather than moved onto it afterwards (decided
 2026-09-28).
 
@@ -142,6 +142,18 @@ moved:
    A/B slots, `--recording` selectors) and the `.rez` catalog. It comes
    before the writer so the writer's tests read what they write through
    the real reader.
+
+   Done. `ArchiveReader` is `RezReader` moved, and every rezolus reader
+   test passes unchanged against it. The seams:
+   - The catalog trait has archive-owned row types. Reopening a file is a
+     `Reopen` closure the caller supplies, where it had been a path plus
+     rezolus's container enum.
+   - rezolus's identity index (caller rows written by `record --stream`) is
+     read through an `IndexRelabel` hook that rezolus implements. Long
+     tables' occupant streams are read by the archive itself.
+   - `RezReader` is now a rezolus wrapper that derefs to `ArchiveReader`,
+     so rezolus's call sites are unchanged. Recognizing `.rez` v1/v2/v3
+     stays in rezolus.
 4. **The archive writer in `metriken-archive`.** This is rezolus's 6.0
    step 3: a dendro-backed writer that writes groups with slots long, with
    their occupant stream, and materializes a long table's WAL tail as long.
