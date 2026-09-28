@@ -265,8 +265,23 @@ impl Layout {
         }
     }
 
-    /// Lay a group out: long if any member carries a slot `id`.
-    fn of(schema: Arc<GroupSchema>, long_groups: bool) -> Self {
+    /// Whether a group with this schema is written long: any member
+    /// carries a slot `id`.
+    fn slotted(schema: &GroupSchema) -> bool {
+        schema
+            .counters
+            .iter()
+            .chain(&schema.gauges)
+            .chain(&schema.histograms)
+            .any(|d| d.metadata.contains_key("id"))
+    }
+
+    /// Lay a group out, long or one row per tick. A member without an `id`
+    /// in a long group is the occupant of slot `""`.
+    fn of(schema: Arc<GroupSchema>, long: bool) -> Self {
+        if !long {
+            return Layout::Wide(schema);
+        }
         let members = || {
             schema
                 .counters
@@ -274,9 +289,6 @@ impl Layout {
                 .chain(&schema.gauges)
                 .chain(&schema.histograms)
         };
-        if !long_groups || !members().any(|d| d.metadata.contains_key("id")) {
-            return Layout::Wide(schema);
-        }
         // A label is the occupant's when every metric of a slot agrees on
         // it (`comm`, `pid`, `id`, `__uid__`), and the metric column's when
         // it differs between a slot's metrics (`op` on a per-op table).
@@ -384,6 +396,10 @@ const SCHEMA_RING_LEN: usize = 3;
 struct GroupState {
     /// Dedup: the window end (or tick) of the last row written.
     last_key: Option<u64>,
+    /// Whether the group is written long. Decided by the first schema with
+    /// members and kept for the recording: a stream holds one kind of WAL
+    /// row, and a reader tells them apart by the occupant stream.
+    long: Option<bool>,
     layouts: VecDeque<((u64, u64), Arc<Layout>)>,
     /// Whether this segment's WAL already carries the schema of the given
     /// hash (wide: the group's; long: the metric columns').
@@ -402,7 +418,10 @@ impl GroupState {
                 return Some(Arc::clone(l));
             }
             let seg: GroupSchema = schema.as_ref().into();
-            let layout = Arc::new(Layout::of(Arc::new(seg), long_groups));
+            let long = *self
+                .long
+                .get_or_insert_with(|| long_groups && Layout::slotted(&seg));
+            let layout = Arc::new(Layout::of(Arc::new(seg), long));
             if self.layouts.len() == SCHEMA_RING_LEN {
                 self.layouts.pop_back();
             }
@@ -480,6 +499,12 @@ impl SourceRecorder {
         let state = self.groups.entry(g.name.clone()).or_default();
         let key = g.window.map(|w| w.end_ns).unwrap_or(ts);
         if state.last_key == Some(key) {
+            return Ok(());
+        }
+        // A group with no members has no values to record, and its schema
+        // must not decide whether the group is long.
+        if g.counters.is_empty() && g.gauges.is_empty() && g.histograms.is_empty() {
+            state.last_key = Some(key);
             return Ok(());
         }
         let Some(layout) = state.layout(g, long_groups) else {
@@ -563,6 +588,12 @@ impl SourceRecorder {
                     state.seen.insert(number, slot.labels.clone());
                     occ.occupant = number;
                     present.push(occ);
+                }
+                // A tick with no occupant present has nothing to record, and
+                // writing it could put rows in a long stream before its
+                // occupant stream exists.
+                if present.is_empty() {
+                    return Ok(());
                 }
                 let anchor = state.anchored.insert(l.schema_hash);
                 let row = WalLongRow {

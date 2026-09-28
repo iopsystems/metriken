@@ -156,6 +156,15 @@ long layout's builder and WAL row in metriken-segment
   schema rather than per stream, and it needs no key list. A column is one
   fixed metadata set, named for its `metric`, with a `#N` suffix when a
   group holds the metric more than once; readers match on metadata.
+- **A group's layout is decided once.** The first schema with members
+  decides whether a group is long, and the decision holds for the
+  recording. Deciding per schema let a group that once sent no `id`
+  members (or no members) write a wide row into a long stream, which the
+  long materializer cannot decode. A member without an `id` in a long
+  group is the occupant of slot `""`. A group with no members writes
+  nothing, and neither does a long row with no occupant present: such a
+  row could land in a long stream before its occupant stream exists, and
+  a reader tells a long table by that stream.
 - **Ingest is V3 only.** V1/V2 snapshots are ignored. Agents older than
   acquisition groups are a follow-up, not needed by rezolus 6.0's own
   agent.
@@ -173,11 +182,19 @@ long layout's builder and WAL row in metriken-segment
 - **The reader's tail** of a long table is materialized in arrival order,
   not sorted.
 
+**Found by the tests:** metriken-query decoded a null histogram cell as a
+histogram of zeros, so in a wide table a member's first reading counted in
+full when an earlier row of its segment was null, and not at all when the
+segment began there (fixed in metriken#180). The long table has no nulls,
+which is how the two disagreed.
+
 **Tests** (`metriken-archive/tests/writer.rs`) record the same snapshots
 twice, long and with `long_groups` off (every group one row per tick), and
 require the same answers through `ArchiveReader` for rates, sums by an
 occupant label and by a column label, selection by `__uid__`, a fixed
-group's gauge and a histogram quantile. `__occupant__` must appear on the
+group's gauge, a member without a slot in a slotted group, and a histogram
+quantile. The fixture includes a tick where the slotted group has no
+members. `__occupant__` must appear on the
 long series and never on the wide. They run finalized, from the live WAL
 tail, and after eviction at a cutoff past the last restatement; that last
 test fails with the eviction lag removed.

@@ -17,9 +17,13 @@ const BASE: u64 = 1_700_000_000 * S;
 const TICKS: u64 = 24;
 
 /// Who holds each slot at tick `t`: `(slot, comm, pid, uid)`. Slot 0 changes
-/// hands at tick 10, slot 2 exists for ticks 5..15.
+/// hands at tick 10, slot 2 exists for ticks 5..15, and at tick 3 the group
+/// has no members at all.
 fn occupants(t: u64) -> Vec<(u64, &'static str, u64, &'static str)> {
     let mut v = Vec::new();
+    if t == 3 {
+        return v;
+    }
     v.push(if t < 10 {
         (0, "nginx", 100, "a0")
     } else {
@@ -89,6 +93,19 @@ fn snapshot(t: u64) -> Snapshot {
         h.add(pid, t + 1).unwrap();
         histograms.push(Some(h));
     }
+    // A member with no slot, beside the slotted ones: in a long group it
+    // is the occupant of slot "".
+    let mut gauges = Vec::new();
+    if t != 3 {
+        schema.gauges.push(MetricDesc {
+            name: "8".to_string(),
+            metadata: [("metric", "threads_total"), ("sampler", "threads")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        });
+        gauges.push(Some(occupants(t).len() as i64));
+    }
     let hash = schema.hash();
     let threads = GroupSnapshot {
         name: "threads/tasks".to_string(),
@@ -96,7 +113,7 @@ fn snapshot(t: u64) -> Snapshot {
         schema: Some(Arc::new(schema)),
         window,
         counters,
-        gauges: Vec::new(),
+        gauges,
         histograms,
     };
     let fixed_schema = GroupSchema {
@@ -221,6 +238,7 @@ const QUERIES: &[&str] = &[
     "rate(syscalls{op=\"write\", comm=\"cron\"}[3s])",
     "irate(cpu_time{__uid__=\"c0\"}[3s])",
     "mem_free",
+    "threads_total",
     "histogram_quantile(0.5, latency)",
 ];
 
