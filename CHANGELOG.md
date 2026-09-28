@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-archive 0.1.0
+
+- **Added:** the crate, `ArchiveReader` and the `Catalog` trait with dendro's
+  implementation, moved from rezolus's `RezReader`. It is the only metriken
+  crate that depends on dendro.
+
 ### metriken-segment 0.1.2
 
 - **Added:** `wal`, the write-ahead log's row format (`WalGroupRow`,
