@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-09-28
+
+### Changed
+
+- Depends on metriken-exposition 0.21.0 (was 0.20.0). The `ingest` path
+  takes that crate's `Snapshot`, so a caller on 0.20.0 has to move with it.
+  metriken-segment 0.1.1 (the wide layout moved in from rezolus) is picked
+  up by the existing `0.1` requirement.
+
 ## [0.32.0] - 2026-09-28
 
 ### Added
