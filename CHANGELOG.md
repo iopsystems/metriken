@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.33.0
+
+- **Changed:** depends on metriken-exposition 0.21.0.
+
 ### metriken-segment 0.1.1
 
 - **Added:** the wide layout, moved from rezolus: `table` (the table model,
