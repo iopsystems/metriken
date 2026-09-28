@@ -154,7 +154,8 @@ moved:
    - `RezReader` is now a rezolus wrapper that derefs to `ArchiveReader`,
      so rezolus's call sites are unchanged. Recognizing `.rez` v1/v2/v3
      stays in rezolus.
-4. **The archive writer in `metriken-archive`.** This is rezolus's 6.0
+4. **The archive writer in `metriken-archive`** (design:
+   [the archive writer](2026-09-28-archive-writer.md)). This is rezolus's 6.0
    step 3: a dendro-backed writer that writes groups with slots long, with
    their occupant stream, and materializes a long table's WAL tail as long.
    rezolus's recorder and hindsight use it with rezolus's defaults.
