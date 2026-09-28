@@ -11,8 +11,9 @@
 //! - any other group is one row per tick, as a `WalGroupRow`;
 //! - [`Encoder`] turns each stream's WAL rows into its segment.
 //!
-//! Only V3 (acquisition-group) snapshots are ingested; V1/V2 per-sampler
-//! snapshots are a follow-up.
+//! A V1/V2 snapshot (from a producer older than acquisition groups) is
+//! written one table per `sampler` label, each metric with its own window,
+//! as `WalCell` rows.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -202,6 +203,7 @@ impl ArchiveWriter {
             long: Arc::clone(&self.long),
             config: Arc::clone(&self.config),
             groups: HashMap::new(),
+            samplers: HashMap::new(),
             accounts: HashMap::new(),
         })
     }
@@ -470,10 +472,22 @@ impl GroupState {
     }
 }
 
+/// A V1/V2 sampler table's ingest state.
+#[derive(Default)]
+struct SamplerState {
+    /// Dedup: the newest window end (or tick) of the last row written.
+    last_key: Option<u64>,
+    /// The metrics whose metadata this segment's WAL already carries.
+    described: HashSet<String>,
+}
+
 /// One source being recorded: its dendro writer handle and the state
 /// ingest keeps per group.
 pub struct SourceRecorder {
     writer: SourceWriter,
+    /// V1/V2 only: per sampler table, the last row's dedup key and the
+    /// metrics whose metadata this segment's WAL already carries.
+    samplers: HashMap<String, SamplerState>,
     source_key: String,
     long: LongStreams,
     config: Arc<WriterConfig>,
@@ -503,19 +517,165 @@ impl SourceRecorder {
         wall_offset: i64,
     ) -> Result<Staged, Error> {
         let mut rows = Vec::new();
-        if let Snapshot::V3(v3) = snapshot {
-            let mut done: HashSet<&str> = HashSet::new();
-            for g in &v3.groups {
-                if !done.insert(g.name.as_str()) {
-                    continue;
+        match snapshot {
+            Snapshot::V3(v3) => {
+                let mut done: HashSet<&str> = HashSet::new();
+                for g in &v3.groups {
+                    if !done.insert(g.name.as_str()) {
+                        continue;
+                    }
+                    self.stage_group(g, ts, wall_offset, &mut rows)?;
                 }
-                self.stage_group(g, ts, wall_offset, &mut rows)?;
             }
+            Snapshot::V1(s) => self.stage_flat(
+                &s.counters,
+                &s.gauges,
+                &s.histograms,
+                ts,
+                wall_offset,
+                &mut rows,
+            )?,
+            Snapshot::V2(s) => self.stage_flat(
+                &s.counters,
+                &s.gauges,
+                &s.histograms,
+                ts,
+                wall_offset,
+                &mut rows,
+            )?,
         }
         Ok(Staged {
             source_id: self.writer.source_id(),
             rows,
         })
+    }
+
+    /// A V1/V2 snapshot: one row per `sampler` label (`"unattributed"`
+    /// without one), skipped when the sampler's newest window has not
+    /// advanced, each metric's metadata carried on its first row in a
+    /// segment. The `.rez` v3 writer's rule, so the two tables match.
+    fn stage_flat(
+        &mut self,
+        counters: &[metriken_exposition::Counter],
+        gauges: &[metriken_exposition::Gauge],
+        histograms: &[metriken_exposition::Histogram],
+        ts: u64,
+        wall_offset: i64,
+        rows: &mut Vec<DWalRow>,
+    ) -> Result<(), Error> {
+        use metriken_segment::builder::{cells_approx_bytes, Cell, CellValue};
+        use metriken_segment::wal::{WalCell, WalValue};
+
+        struct Entry<'a> {
+            name: &'a str,
+            metadata: &'a HashMap<String, String>,
+            window: Option<(u64, u64)>,
+            value: CellValue<'a>,
+        }
+        let sampler_of = |m: &HashMap<String, String>| -> String {
+            m.get("sampler")
+                .cloned()
+                .unwrap_or_else(|| "unattributed".to_string())
+        };
+        let mut by_sampler: BTreeMap<String, Vec<Entry<'_>>> = BTreeMap::new();
+        for c in counters {
+            by_sampler
+                .entry(sampler_of(&c.metadata))
+                .or_default()
+                .push(Entry {
+                    name: &c.name,
+                    metadata: &c.metadata,
+                    window: c.window.map(|w| (w.begin_ns, w.end_ns)),
+                    value: CellValue::Counter(c.value),
+                });
+        }
+        for g in gauges {
+            by_sampler
+                .entry(sampler_of(&g.metadata))
+                .or_default()
+                .push(Entry {
+                    name: &g.name,
+                    metadata: &g.metadata,
+                    window: g.window.map(|w| (w.begin_ns, w.end_ns)),
+                    value: CellValue::Gauge(g.value),
+                });
+        }
+        for h in histograms {
+            by_sampler
+                .entry(sampler_of(&h.metadata))
+                .or_default()
+                .push(Entry {
+                    name: &h.name,
+                    metadata: &h.metadata,
+                    window: h.window.map(|w| (w.begin_ns, w.end_ns)),
+                    value: CellValue::Histogram(&h.value),
+                });
+        }
+
+        for (sampler, entries) in by_sampler {
+            // A `/` would make the table look like a group's to a reader.
+            if sampler.contains('/') {
+                tracing::warn!("sampler {sampler:?} contains '/'; its metrics are skipped");
+                continue;
+            }
+            let key = entries
+                .iter()
+                .filter_map(|e| e.window.map(|(_, end)| end))
+                .max()
+                .unwrap_or(ts);
+            let state = self.samplers.entry(sampler.clone()).or_default();
+            if state.last_key.is_some_and(|last| key <= last) {
+                continue;
+            }
+            state.last_key = Some(key);
+            let cells: Vec<WalCell> = entries
+                .iter()
+                .map(|e| WalCell {
+                    name: e.name.to_string(),
+                    metadata: state.described.insert(e.name.to_string()).then(|| {
+                        e.metadata
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    }),
+                    value: match e.value {
+                        CellValue::Counter(v) => WalValue::Counter(v),
+                        CellValue::Gauge(v) => WalValue::Gauge(v),
+                        CellValue::Histogram(h) => WalValue::Histogram(
+                            h.config().grouping_power(),
+                            h.config().max_value_power(),
+                            h.as_slice().to_vec(),
+                        ),
+                    },
+                    window: e.window,
+                })
+                .collect();
+            let bytes = cells_approx_bytes(
+                &entries
+                    .iter()
+                    .map(|e| Cell {
+                        name: e.name,
+                        metadata: e.metadata,
+                        window: e.window.map(|(begin_ns, end_ns)| {
+                            metriken_segment::window::Window { begin_ns, end_ns }
+                        }),
+                        value: match e.value {
+                            CellValue::Counter(v) => CellValue::Counter(v),
+                            CellValue::Gauge(v) => CellValue::Gauge(v),
+                            CellValue::Histogram(h) => CellValue::Histogram(h),
+                        },
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            rows.push(DWalRow {
+                stream: sampler.clone(),
+                ts: ts as i64,
+                wall_offset,
+                row: wal::encode_wal_row(&cells)?,
+            });
+            self.account(&sampler).add_row(bytes, ts as i64);
+        }
+        Ok(())
     }
 
     fn stage_group(
@@ -708,6 +868,9 @@ impl SourceRecorder {
         for stream in &batch {
             if let Some(state) = self.groups.get_mut(stream) {
                 state.anchored.clear();
+            }
+            if let Some(state) = self.samplers.get_mut(stream) {
+                state.described.clear();
             }
         }
         if batch.is_empty() {
