@@ -226,13 +226,19 @@ pub(crate) trait DataSource: Send + Sync {
     }
     /// Read one counter column by its schema position, every row group the
     /// range touches. `None` for a source without a parquet schema.
+    ///
+    /// `selective` says the query reads few series, so a long segment may
+    /// decode only the pages holding this one's rows. An all-series query
+    /// passes `false`, and each segment then decodes a row group once and
+    /// shares it through the pool across the series reading it.
     fn counter_column(
         &self,
         at: &ColumnPosition,
         start_ns: u64,
         end_ns: u64,
+        selective: bool,
     ) -> Option<types::ColumnChunk> {
-        let _ = (at, start_ns, end_ns);
+        let _ = (at, start_ns, end_ns, selective);
         None
     }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;

@@ -1168,6 +1168,10 @@ impl DataSource for SegmentedSource {
         }
         let table = self.counter_columns.get(name)?;
         let name: Arc<str> = Arc::from(name);
+        // Few series: a long segment may decode only each one's pages. Many:
+        // each segment decodes a row group once for all of them.
+        let selective = order.iter().filter(|l| l.matches(filter)).count()
+            <= crate::parquet::PRUNE_MAX_OCCUPANTS;
         let mut out = Vec::new();
         for (pos, labels) in order.iter().enumerate() {
             if !labels.matches(filter) {
@@ -1196,7 +1200,7 @@ impl DataSource for SegmentedSource {
                         }
                     };
                     let chunk = seg
-                        .counter_column(&l.position, start_ns, end_ns)?
+                        .counter_column(&l.position, start_ns, end_ns, selective)?
                         .labeled(table.labels[l.column_labels as usize].clone());
                     // A relabelled column carries every occupant's samples;
                     // this stream is one occupant's.

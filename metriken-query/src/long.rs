@@ -205,6 +205,16 @@ mod reader_tests {
     }
 
     fn write(fields: Vec<Field>, cols: Vec<ArrayRef>, kv: Vec<(&str, String)>) -> Vec<u8> {
+        write_paged(fields, cols, kv, None)
+    }
+
+    /// [`write`], with data pages of at most `page_rows` rows when given.
+    fn write_paged(
+        fields: Vec<Field>,
+        cols: Vec<ArrayRef>,
+        kv: Vec<(&str, String)>,
+        page_rows: Option<usize>,
+    ) -> Vec<u8> {
         let schema = Arc::new(Schema::new(fields));
         let mut kv: Vec<KeyValue> = kv
             .into_iter()
@@ -217,10 +227,15 @@ mod reader_tests {
             key: "sampling_interval_ms".to_string(),
             value: Some("1000".to_string()),
         });
-        let props = WriterProperties::builder()
+        let mut props = WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
-            .set_key_value_metadata(Some(kv))
-            .build();
+            .set_key_value_metadata(Some(kv));
+        if let Some(n) = page_rows {
+            props = props
+                .set_data_page_row_count_limit(n)
+                .set_write_batch_size(n);
+        }
+        let props = props.build();
         let mut buf = Vec::new();
         let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
         w.write(&RecordBatch::try_new(schema, cols).unwrap())
@@ -232,10 +247,14 @@ mod reader_tests {
     /// A long segment of `rows`, in the given order. `occupants` overrides
     /// the footer's occupant list.
     fn long(rows: &[Obs], occupants: Option<&str>) -> Vec<u8> {
+        long_paged(rows, occupants, None)
+    }
+
+    fn long_paged(rows: &[Obs], occupants: Option<&str>, page_rows: Option<usize>) -> Vec<u8> {
         let list_value = occupants
             .map(str::to_string)
             .unwrap_or_else(|| encode_occupant_ranges(rows.iter().map(|r| r.occ)));
-        write(
+        write_paged(
             vec![
                 Field::new("timestamp", DataType::UInt64, false),
                 Field::new(":window_begin", DataType::Int64, true),
@@ -262,6 +281,7 @@ mod reader_tests {
                 (LAYOUT_KEY, LAYOUT_LONG.to_string()),
                 (OCCUPANTS_KEY, list_value),
             ],
+            page_rows,
         )
     }
 
@@ -527,6 +547,80 @@ mod reader_tests {
         );
         let r = open(vec![seg]);
         assert_eq!(r.counter_labels("occupant").len(), 1);
+    }
+
+    /// A hundred occupants over ten ticks, every occupant at every tick:
+    /// more than a read prunes for (`PRUNE_MAX_OCCUPANTS`).
+    fn many() -> Vec<Obs> {
+        let mut rows = Vec::new();
+        for tick in 1..=10u64 {
+            for occ in 0..100u64 {
+                rows.push(Obs {
+                    ts: tick * 1_000_000_000,
+                    occ,
+                    cpu: Some(tick * (occ + 1)),
+                    depth: Some((tick + occ) as i64),
+                    lat: Some(buckets(tick)),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Sorted by occupant, eight rows to a page: an occupant's ten rows
+    /// span two or three of the 125 pages.
+    fn paged(rows: &[Obs]) -> Vec<u8> {
+        let mut rows = rows.to_vec();
+        rows.sort_by_key(|r| (r.occ, r.ts));
+        long_paged(&rows, None, Some(8))
+    }
+
+    #[test]
+    fn a_single_series_read_decodes_only_its_pages() {
+        let rows = many();
+        let whole = open(vec![wide(&rows)]);
+        let pool = BufferPool::new(64 << 20);
+        let long =
+            SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
+                .unwrap();
+        for q in [
+            "rate(cpu{__occupant__=\"17\"}[2s])",
+            "depth{__occupant__=\"17\"}",
+            "sum(rate(cpu{__occupant__=\"11\"}[2s]))",
+        ] {
+            let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            assert_eq!(canonical(&a), canonical(&b), "{q}");
+        }
+        // A pruned read decodes into its own arrays, not the pool's
+        // whole-column cache: nothing went through the pool.
+        let stats = pool.stats();
+        assert_eq!(
+            stats.misses, 0,
+            "pruned reads must not decode whole columns"
+        );
+        assert_eq!(stats.entries, 0);
+    }
+
+    #[test]
+    fn an_all_series_query_falls_back_to_one_shared_decode() {
+        let rows = many();
+        let whole = open(vec![wide(&rows)]);
+        let pool = BufferPool::new(64 << 20);
+        let long =
+            SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
+                .unwrap();
+        for q in ["sum(rate(cpu[2s]))", "rate(cpu[2s])", "max(depth)"] {
+            let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            assert_eq!(canonical(&a), canonical(&b), "{q}");
+        }
+        // A hundred streams read one row group: too many to prune for, so
+        // they share one decode of it through the pool.
+        assert!(
+            pool.stats().entries > 0,
+            "the fallback decode goes through the pool"
+        );
     }
 
     /// Occupant labels from outside the segment, as an archive supplies
