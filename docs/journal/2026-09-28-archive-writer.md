@@ -376,11 +376,16 @@ time in the encoder, over every seal.
 | busy host, 1 s | LZ4 | 157.4 MB | 5.56 s | 8.7 / 200 ms | 32 / 231 ms | 22.6 s |
 | | zstd-1 | 98.3 MB | 5.94 s | 9.3 / 202 ms | 34 / 228 ms | 22.6 s, 71 / 71 same |
 | | zstd-3 | 71.3 MB | 5.79 s | 9.0 / 206 ms | 31 / 232 ms | 22.6 s, 71 / 71 same |
-| heavy spike, 100 ms | LZ4 | 121.0 MB | 6.61 s | 11.2 / 157 ms | 30 / 162 ms | |
-| | zstd-1 | 77.1 MB | 7.10 s | 12.0 / 158 ms | 31 / 160 ms | |
-| | zstd-3 | 52.5 MB | 6.81 s | 11.5 / 161 ms | 27 / 166 ms | |
+| heavy spike, 100 ms | LZ4 | 121.0 MB | 6.61 s | 11.2 / 157 ms | 30 / 162 ms | 17.6 s |
+| | zstd-1 | 77.1 MB | 7.10 s | 12.0 / 158 ms | 31 / 160 ms | 17.3 s, 69 / 69 same |
+| | zstd-3 | 52.5 MB | 6.81 s | 11.5 / 161 ms | 27 / 166 ms | 17.5 s, 69 / 69 same |
+| quiet host, 1 s | LZ4 | 915.4 MB | 22.97 s | 9.2 / 108 ms | 35 / 123 ms | 32.8 s |
+| | zstd-1 | 521.8 MB | 24.35 s | 9.7 / 105 ms | 35 / 126 ms | 32.5 s, 72 / 72 same |
+| | zstd-3 | 389.5 MB | 23.62 s | 9.4 / 102 ms | 32 / 154 ms | 32.5 s, 72 / 72 same |
 
-zstd-3 is 55–57% smaller than LZ4 for about 4% more encode time; a seal's
+zstd-3 is 55–57% smaller than LZ4 on all three, for 3–4% more encode
+time; on the quiet host that makes the archive 2.9 times smaller than the
+`.rez` (1,126 MB); a seal's
 worst case is the WAL decode and table build, not the codec. Tick latency
 and query time do not move. So the writer seals with zstd-3
 (`WriterConfig::compression`, metriken#191). Readers already decode zstd
