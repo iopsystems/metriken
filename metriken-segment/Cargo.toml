@@ -1,0 +1,23 @@
+[package]
+name = "metriken-segment"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+]
+license = "MIT OR Apache-2.0"
+description = "The parquet segment format for metriken metrics: long layout and occupant streams"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
+
+[dependencies]
+arrow.workspace = true
+bytes = "1"
+parquet = { workspace = true, features = ["arrow"] }
+rmp-serde = "1.3"
+serde.workspace = true
+
+[features]
+default = ["lz4"]
+# Reading segments written with LZ4_RAW, the codec rezolus writes.
+lz4 = ["parquet/lz4"]

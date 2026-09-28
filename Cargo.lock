@@ -911,6 +911,7 @@ dependencies = [
  "histogram",
  "lru",
  "metriken-exposition",
+ "metriken-segment",
  "parquet",
  "promql-parser",
  "serde",
@@ -919,6 +920,17 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "metriken-segment"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "parquet",
+ "rmp-serde",
+ "serde",
 ]
 
 [[package]]

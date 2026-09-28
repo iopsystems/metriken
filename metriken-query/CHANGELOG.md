@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `long::OccupantLabels`: the `ColumnRelabel` that puts an occupant's
+  labels, read from its occupant stream (`metriken_segment::occupants`), on
+  a long table's series. It keeps `__occupant__`, so occupants with
+  identical labels stay separate, and it takes filters on occupant labels
+  off the segment filter so they apply after relabelling. Moved from
+  rezolus.
+
+### Changed
+
+- The long layout's format (markers, occupant-range codec) moved to the new
+  `metriken-segment` crate. `metriken_query::long` re-exports it, so
+  existing paths keep working.
+
 ## [0.31.0] - 2026-09-28
 
 ### Added
