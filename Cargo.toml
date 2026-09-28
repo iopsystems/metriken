@@ -7,6 +7,7 @@ members = [
     "metriken-derive",
     "metriken-exposition",
     "metriken-query",
+    "metriken-segment",
 ]
 
 [workspace.dependencies]

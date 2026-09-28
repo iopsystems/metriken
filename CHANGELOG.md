@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-segment 0.1.0
+
+- **Added:** the crate, the parquet segment format shared by writers and
+  `metriken-query`. It has the long layout's format (moved from
+  `metriken-query`) and the occupant stream (moved from rezolus).
+
+### metriken-query 0.32.0
+
+- **Added:** `long::OccupantLabels`, which puts occupant-stream labels on a
+  long table's series.
+- **Changed:** `long` re-exports `metriken_segment::long`.
+
 ### metriken-query 0.31.0
 
 - **Added:** long segments. A file marked `metriken.layout = "long"` holds

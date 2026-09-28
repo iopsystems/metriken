@@ -1,7 +1,7 @@
 # A high-cardinality metrics stack: what belongs in metriken, dendro and rezolus
 
-**Status:** OPEN — intent-first. Boundaries agreed 2026-09-28; nothing moved
-yet. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
+**Status:** OPEN. Boundaries agreed 2026-09-28. Phase 1a done (below):
+`metriken-segment` holds the long layout and the occupant stream. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
 then built on this stack rather than moved onto it afterwards (decided
 2026-09-28).
 
