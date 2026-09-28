@@ -95,6 +95,14 @@ moved:
    shape is written and read in one crate. The check is that rezolus's
    long-table and table-builder tests pass unchanged against the moved
    code.
+
+   Split in two:
+   - **1a, done:** the long layout moved from metriken-query and the
+     occupant stream's format moved from rezolus#1315. `OccupantLabels`,
+     the `ColumnRelabel` that applies an occupant's labels, went to
+     metriken-query instead, because it is read-side and uses
+     metriken-query's types.
+   - **1b, next:** the wide segment writer.
 2. **The wire form and stream protocol in `metriken-exposition`.** This
    covers `WalGroupRow` and the `/metrics/stream` endpoint (rezolus
    `src/agent/exposition/http/`). It comes before the writer because the
