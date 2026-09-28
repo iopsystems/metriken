@@ -384,9 +384,11 @@ zstd-3 is 55–57% smaller than LZ4 for about 4% more encode time; a seal's
 worst case is the WAL decode and table build, not the codec. Tick latency
 and query time do not move. So the writer seals with zstd-3
 (`WriterConfig::compression`, metriken#191). Readers already decode zstd
-(metriken-query enables it). A tail a reader rebuilds in memory keeps the
-default codec; it is never written anywhere, so no compression may be
-better there, which is not measured.
+(metriken-query enables it). A reader rebuilds a table's unsealed tail
+with zstd-3 too: `ArchiveReader` holds that segment in memory while it is
+open, so the smaller encoding is the smaller resident footprint, at about
+the same encode cost. (Leaving it uncompressed would save the encode and
+cost the most memory.)
 
 Not run: a replay paced at the recording's interval, which would separate
 the unpaced replay's backpressure from the writer's own cost at 100 ms.
