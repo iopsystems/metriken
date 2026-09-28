@@ -82,9 +82,9 @@ reading a few series and not one streaming every series, since each
 series would build its own reader. So the caller says which it is:
 `counter_streams` passes `selective` to `counter_column` when it streams
 at most 64 series, and a filtered `counters`/`gauges` read prunes when its
-filter leaves at most 64 occupants. Pruning is correct in any row order and
-selective when the segment is sorted by occupant. Histogram reads decode
-whole row groups; no rezolus group with slots holds histograms.
+filter leaves at most 64 occupants. Histogram streams prune the same way.
+Pruning is correct in any row order and selective when the segment is
+sorted by occupant.
 
 A first version decided by counting pruned reads per row group and falling
 back to a shared decode after eight. It was wrong: the count outlived the
@@ -94,9 +94,9 @@ pruned.
 ## Tests
 
 A second pair of tests writes a long segment sorted by occupant with eight
-rows to a page. A single-series read, a filtered gauge read and a filtered
-aggregate match the wide answers and leave the pool untouched, which shows
-they pruned. An all-series query over a hundred occupants matches too, and
+rows to a page. A single-series read, a filtered gauge read, a filtered
+aggregate and a histogram read match the wide answers and leave the pool
+untouched, which shows they pruned. An all-series query over a hundred occupants matches too, and
 goes through the pool.
 
 `long::reader_tests` builds the same observations as a wide table (a column
@@ -107,7 +107,8 @@ order. Histograms are compared for the occupant present at every tick only:
 a wide file decodes a null histogram cell as an empty snapshot and emits it
 as a row, while a long segment has no row for an absent observation, so an
 occupant absent from some ticks reads differently. The long reading is the
-one that matches what was observed.
+one that matches what was observed: a further test requires an occupant
+present at only some ticks to read as a file holding just those ticks.
 
 ## Measured
 

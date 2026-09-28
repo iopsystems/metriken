@@ -587,6 +587,7 @@ mod reader_tests {
             "rate(cpu{__occupant__=\"17\"}[2s])",
             "depth{__occupant__=\"17\"}",
             "sum(rate(cpu{__occupant__=\"11\"}[2s]))",
+            "histogram_mean(lat{__occupant__=\"17\"})",
         ] {
             let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
             let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
@@ -621,6 +622,28 @@ mod reader_tests {
             pool.stats().entries > 0,
             "the fallback decode goes through the pool"
         );
+    }
+
+    /// An occupant absent from some ticks has no rows there, so its
+    /// histogram reads as a series of only the ticks it was present at: the
+    /// same as a file holding just those ticks.
+    #[test]
+    fn a_histogram_with_gaps_reads_only_its_observations() {
+        let rows = observations();
+        let late: Vec<Obs> = rows.iter().filter(|r| r.occ == 2).cloned().collect();
+        let (a, b) = halves(&rows);
+        let long = open(vec![long(&a, None), long(&b, None)]);
+        let (la, lb) = halves(&late);
+        let only = open(vec![wide(&la), wide(&lb)]);
+        for q in [
+            "histogram_mean(lat{__occupant__=\"2\"})",
+            "histogram_count(lat{__occupant__=\"2\"})",
+            "histogram_sum(lat{__occupant__=\"2\"})",
+        ] {
+            let x = long.query_range(q, 1.0, 6.0, 1.0).unwrap();
+            let y = only.query_range(q, 1.0, 6.0, 1.0).unwrap();
+            assert_eq!(canonical(&x), canonical(&y), "{q}");
+        }
     }
 
     /// Occupant labels from outside the segment, as an archive supplies

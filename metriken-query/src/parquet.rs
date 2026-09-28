@@ -1991,12 +1991,14 @@ impl ParquetSource {
             })
             .collect();
 
+        let groups = plan_reads(self, &col_descs);
         let cursor = ParquetHistogramCursor {
             pf: Arc::clone(self),
             ts_col_idx,
             start_ns,
             end_ns,
-            groups: plan_reads(self, &col_descs),
+            wanted: wanted_occupants(&groups),
+            groups,
             rg_queue,
             pending: std::collections::VecDeque::new(),
         };
@@ -2813,22 +2815,6 @@ fn plan_reads(pf: &ParquetSource, cols: &[ColDesc]) -> Vec<ReadGroup> {
     groups
 }
 
-/// A row group's `occupant` column, when any group routes by occupant.
-fn read_occupants(
-    pf: &ParquetSource,
-    rg_idx: usize,
-    groups: &[ReadGroup],
-) -> Result<Option<Arc<Vec<Option<u64>>>>, Box<dyn Error>> {
-    match groups
-        .iter()
-        .find(|g| g.single.is_none())
-        .and_then(|g| g.occupant_col)
-    {
-        Some(c) => Ok(Some(read_counter_values_per_rg(pf, rg_idx, c)?)),
-        None => Ok(None),
-    }
-}
-
 fn read_counter_column(
     pf: &ParquetSource,
     at: &crate::ColumnPosition,
@@ -3195,6 +3181,8 @@ struct ParquetHistogramCursor {
     /// The columns to decode and the series their rows belong to, indexing
     /// the pre-filtered histogram columns for this metric (series order).
     groups: Vec<ReadGroup>,
+    /// In a long segment, the occupants this stream reads, for pruning.
+    wanted: Vec<u64>,
     /// Overlapping row group indices remaining to process.
     rg_queue: std::collections::VecDeque<usize>,
     /// Buffered rows from the current row group (sorted, ready to yield).
@@ -3206,12 +3194,23 @@ impl ParquetHistogramCursor {
     /// Returns false if no more row groups remain.
     fn fill_next_rg(&mut self) -> bool {
         while let Some(rg_idx) = self.rg_queue.pop_front() {
-            let Ok(timestamps) = read_timestamps(&self.pf, rg_idx, self.ts_col_idx) else {
+            // A long read of few occupants decodes only their pages.
+            let Ok(src) = RowSource::for_occupants(
+                &self.pf,
+                rg_idx,
+                &self.wanted,
+                group_columns(&self.groups)
+                    .into_iter()
+                    .chain([Some(self.ts_col_idx)]),
+            ) else {
+                continue;
+            };
+            let Ok(timestamps) = src.timestamps(&self.pf, rg_idx, self.ts_col_idx) else {
                 continue;
             };
 
             let mut rg_rows: Vec<HistogramRow> = Vec::new();
-            let Ok(occupants) = read_occupants(&self.pf, rg_idx, &self.groups) else {
+            let Ok(occupants) = src.occupants(&self.pf, rg_idx, &self.groups) else {
                 continue;
             };
 
@@ -3222,7 +3221,16 @@ impl ParquetHistogramCursor {
                     row_group_idx: rg_idx,
                 };
 
-                let snapshots: Arc<Vec<HistogramSnapshot>> = if let Some(pool) = &self.pf.pool {
+                let snapshots: Arc<Vec<HistogramSnapshot>> = if let RowSource::Selected(cols) = &src
+                {
+                    match cols
+                        .get(&g.col_idx)
+                        .and_then(|a| a.as_any().downcast_ref::<ListArray>())
+                    {
+                        Some(list) => Arc::new(snapshots_of(list)),
+                        None => continue,
+                    }
+                } else if let Some(pool) = &self.pf.pool {
                     if let Some(cached) = pool.get_histogram_snapshots(key) {
                         cached
                     } else {
@@ -3297,19 +3305,7 @@ impl ParquetHistogramCursor {
                     .as_any()
                     .downcast_ref::<ListArray>()
                     .expect("histogram column is not List");
-                for value in list.iter() {
-                    let snap = value
-                        .and_then(|lv| {
-                            lv.as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .map(raw_to_sparse_cumulative)
-                        })
-                        .unwrap_or_else(|| HistogramSnapshot {
-                            index: vec![],
-                            count: vec![],
-                        });
-                    out.push(snap);
-                }
+                out.extend(snapshots_of(list));
             }
             out
         });
@@ -3346,6 +3342,25 @@ impl Iterator for ParquetHistogramCursor {
 }
 
 // ─── Histogram snapshot helper ────────────────────────────────────────────────
+
+/// One snapshot per row of a histogram list column; a null cell is an empty
+/// snapshot.
+fn snapshots_of(list: &ListArray) -> Vec<HistogramSnapshot> {
+    list.iter()
+        .map(|value| {
+            value
+                .and_then(|lv| {
+                    lv.as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(raw_to_sparse_cumulative)
+                })
+                .unwrap_or_else(|| HistogramSnapshot {
+                    index: vec![],
+                    count: vec![],
+                })
+        })
+        .collect()
+}
 
 /// Convert a raw bucket array (individual counts per bucket) into a
 /// sparse cumulative prefix-sum snapshot. Only non-zero buckets are stored.
