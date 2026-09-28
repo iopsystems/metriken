@@ -35,21 +35,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// reader can refuse one it does not know.
 pub const ENCODER_VERSION: &str = "metriken-archive/1";
 
-pub use parquet::basic::{Compression, ZstdLevel};
-
-/// zstd at level 3, the writer's default codec.
-fn default_compression() -> Compression {
-    Compression::ZSTD(ZstdLevel::try_new(3).expect("3 is a valid zstd level"))
-}
-
-/// Parquet writer properties for sealed segments: the segment format's,
-/// with the writer's codec.
-fn sealed_props(compression: Compression) -> parquet::file::properties::WriterProperties {
-    metriken_segment::table::segment_writer_props()
-        .into_builder()
-        .set_compression(compression)
-        .build()
-}
+use crate::{default_compression, segment_props as sealed_props};
+pub use crate::{Compression, ZstdLevel};
 
 /// How a writer records.
 pub struct WriterConfig {

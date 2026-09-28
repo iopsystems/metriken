@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (re-exported `Compression`, `ZstdLevel`). On replayed recordings zstd-3
   was 55–57% smaller than LZ4 for about 4% more encode time, with the same
   tick latency and query time. `Encoder::for_streams` seals with it too.
-  Readers already decode zstd; a tail a reader rebuilds in memory keeps the
-  default codec.
+- `ArchiveReader` encodes the tail it rebuilds from unsealed rows with the
+  same codec. The tail is held in memory while the reader is open, so zstd's
+  smaller encoding is the smaller footprint; readers already decode zstd.
+  `default_compression` and the re-exported `Compression`, `ZstdLevel` are
+  at the crate root, outside the `write` feature.
 
 ## [0.2.4] - 2026-09-28
 

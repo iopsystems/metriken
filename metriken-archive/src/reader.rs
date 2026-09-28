@@ -28,7 +28,6 @@ use metriken_query::{
     BufferPool, CompositionSource, MetricsSource, ParquetReader, QueryError, QueryOptions,
     QueryResult, RateMode, SegmentedParquetReader, UnionChild, UnionError, UnionMetricsSource,
 };
-use metriken_segment::wal::materialize_wal_tail;
 
 use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
@@ -206,7 +205,9 @@ struct DbSegmentStore {
 
 /// A table's unsealed WAL rows as one segment. A table with an occupant
 /// stream is long, and its rows are `WalLongRow`s; they are kept in arrival
-/// order, which the long reader handles as well as a sorted segment.
+/// order, which the long reader handles as well as a sorted segment. Encoded
+/// with [`default_compression`](crate::default_compression): the segment is
+/// held in memory while the reader is open.
 fn live_tail(
     db: &dyn Catalog,
     recording_id: i64,
@@ -214,10 +215,11 @@ fn live_tail(
     long: bool,
 ) -> Result<Option<metriken_segment::wal::MaterializedTail>, Box<dyn std::error::Error>> {
     let rows = db.live_wal(recording_id, table)?;
+    let props = crate::segment_props(crate::default_compression());
     if long {
-        metriken_segment::wal::materialize_long_wal_tail(table, &rows, false)
+        metriken_segment::wal::materialize_long_wal_tail_with(table, &rows, false, props)
     } else {
-        materialize_wal_tail(table, &rows)
+        metriken_segment::wal::materialize_wal_tail_with(table, &rows, props)
     }
 }
 

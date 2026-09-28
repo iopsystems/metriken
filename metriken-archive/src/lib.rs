@@ -19,6 +19,27 @@ pub mod reader;
 pub mod writer;
 
 pub use catalog::{Catalog, DendroCatalog};
+pub use parquet::basic::{Compression, ZstdLevel};
+
+/// The codec for every segment this crate encodes: the writer's sealed
+/// segments, a copy's re-encoded tail, and the tail a reader rebuilds from
+/// unsealed rows and holds in memory while it is open. zstd level 3: on
+/// replayed recordings about half the bytes of LZ4 for about 4% more encode
+/// time, with no measurable decode cost. A reader's tail stays resident, so
+/// the smaller encoding is also the smaller footprint.
+pub fn default_compression() -> Compression {
+    Compression::ZSTD(ZstdLevel::try_new(3).expect("3 is a valid zstd level"))
+}
+
+/// The segment format's parquet writer properties with `compression`.
+pub(crate) fn segment_props(
+    compression: Compression,
+) -> parquet::file::properties::WriterProperties {
+    metriken_segment::table::segment_writer_props()
+        .into_builder()
+        .set_compression(compression)
+        .build()
+}
 pub use reader::{ArchiveReader, LabeledRecordings};
 #[cfg(feature = "write")]
 pub use writer::{ArchiveWriter, SourceRecorder, WriterConfig};
