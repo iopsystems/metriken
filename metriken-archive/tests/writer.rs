@@ -345,3 +345,142 @@ fn metadata_patched_during_a_recording_reads_back() {
     assert_eq!(done.metadata_get("events"), Some(events(2).1));
     assert_eq!(done.metadata_get("version").as_deref(), Some("1.0"));
 }
+
+/// A V2 snapshot (no acquisition groups) is written one table per sampler
+/// and reads back: values, labels, a metric that first appears mid-segment,
+/// and a tick whose window did not advance, which is skipped.
+#[test]
+fn a_v2_snapshot_is_written_one_table_per_sampler() {
+    use metriken_exposition::{Counter, Gauge, SnapshotV2};
+
+    let meta = |metric: &str, sampler: &str, extra: &[(&str, &str)]| {
+        let mut m: HashMap<String, String> = [("metric", metric), ("sampler", sampler)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for (k, v) in extra {
+            m.insert(k.to_string(), v.to_string());
+        }
+        m
+    };
+    let v2 = |t: u64, window_tick: u64| {
+        let ts = BASE + t * S;
+        let w = Some(metriken::Window::new(
+            BASE + window_tick * S - S / 2,
+            BASE + window_tick * S,
+        ));
+        let mut counters = vec![
+            Counter::new(
+                "0".into(),
+                window_tick * 10,
+                meta("ops", "fake", &[("op", "read")]),
+            )
+            .with_window(w),
+            Counter::new(
+                "1".into(),
+                window_tick * 20,
+                meta("ops", "fake", &[("op", "write")]),
+            )
+            .with_window(w),
+        ];
+        // First seen mid-segment, inside the first one: the reader routes a
+        // table by one segment's footer, so a metric first seen in a later
+        // segment is not found (the same for a `.rez`).
+        if window_tick >= 2 {
+            counters.push(
+                Counter::new("2".into(), window_tick, meta("late", "fake", &[])).with_window(w),
+            );
+        }
+        Snapshot::V2(SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::ZERO,
+            metadata: HashMap::new(),
+            counters,
+            gauges: vec![
+                Gauge::new("3".into(), window_tick as i64, meta("free", "mem", &[])).with_window(w),
+            ],
+            histograms: Vec::new(),
+        })
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2.dendro");
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 4,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(&path, config).unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    // Tick 7 repeats tick 6's window: the producer did not re-read, so the
+    // row is skipped rather than written twice.
+    let windows = [0, 1, 2, 3, 4, 5, 6, 6, 8, 9, 10, 11];
+    for (t, &w) in windows.iter().enumerate() {
+        let staged = source
+            .stage(&v2(t as u64, w), BASE + t as u64 * S, 0)
+            .unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+    }
+    source.finalize((BASE + 11 * S, 0)).unwrap();
+    writer.join().unwrap();
+
+    assert_eq!(
+        {
+            let mut s = streams(&path);
+            s.sort();
+            s
+        },
+        vec!["fake".to_string(), "mem".to_string()]
+    );
+    let reader = open(&path);
+    let rows = |q: &str| answer(&reader, q, 0).unwrap().0;
+    let by_op = rows("sum by (op) (rate(ops[2s]))");
+    assert_eq!(by_op.len(), 2, "{by_op:?}");
+    for (labels, values) in &by_op {
+        let want = if labels.contains(&("op".to_string(), "read".to_string())) {
+            10.0
+        } else {
+            20.0
+        };
+        assert!(!values.is_empty());
+        for (t, v) in values {
+            assert!(
+                (v.parse::<f64>().unwrap() - want).abs() < 1e-6,
+                "{labels:?} at {t}: {v}"
+            );
+        }
+    }
+    let late = rows("rate(late[2s])");
+    assert_eq!(late.len(), 1);
+    assert!(late[0]
+        .1
+        .iter()
+        .all(|(_, v)| (v.parse::<f64>().unwrap() - 1.0).abs() < 1e-6));
+    // The gauge reads back its last value, and the skipped tick did not add
+    // a row: twelve ticks, eleven distinct windows.
+    let free = rows("free");
+    assert_eq!(free.len(), 1);
+    assert_eq!(free[0].1.last().unwrap().1.parse::<f64>().unwrap(), 11.0);
+    use metriken_archive::Catalog;
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let id = catalog.sources().unwrap()[0].id;
+    let rows_in = |t: &str| -> u64 {
+        catalog
+            .segment_meta(id, t)
+            .unwrap()
+            .iter()
+            .map(|(_, m)| m.rows)
+            .sum()
+    };
+    assert_eq!(rows_in("mem"), 11);
+    assert!(
+        catalog.segment_meta(id, "fake").unwrap().len() > 1,
+        "the table sealed more than once, so a later segment had to carry its metadata again"
+    );
+}

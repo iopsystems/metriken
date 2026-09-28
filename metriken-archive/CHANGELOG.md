@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The writer ingests V1/V2 snapshots, from producers older than acquisition
+  groups: one table per `sampler` label (`unattributed` without one), each
+  metric with its own window, as `WalCell` rows. A sampler's row is skipped
+  when its newest window has not advanced, and a metric's metadata rides on
+  its first row in each segment, as rezolus's `.rez` writer does.
+
 ## [0.2.2] - 2026-09-28
 
 ### Changed

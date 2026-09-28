@@ -179,9 +179,18 @@ long layout's builder and WAL row in metriken-segment
   rebuilt all of it for every new schema, and a per-thread group sends one
   nearly every tick: on a replayed 1 s recording its stage time was 8.6 s
   against 5.2 s for the `.rez` writer, and 3.9 s after this change.
-- **Ingest is V3 only.** V1/V2 snapshots are ignored. Agents older than
-  acquisition groups are a follow-up, not needed by rezolus 6.0's own
-  agent.
+- **V1/V2 ingest** was first left out, and then needed as soon as rezolus's
+  recorder used the writer: `record` scrapes whatever the agent serves, and
+  an agent older than acquisition groups serves V2, which the V3-only
+  writer dropped without a word. It is now the `.rez` writer's rule: one
+  `WalCell` table per `sampler` label, dedup by the sampler's newest
+  window, metadata on a metric's first row in each segment.
+- **Reader routing is by one footer per table.** `ArchiveReader` learns a
+  table's metric names from one segment, so a metric that first appears
+  in a later segment of the same table cannot be queried. This is the
+  `.rez` reader's behaviour too. A sampler emits the same metric names
+  every tick, so it has not arisen; a producer whose metric set grows
+  mid-recording would need the probe to cover every segment's footer.
 - **Eviction lag** is two dendro passes: data streams at the cutoff, and
   occupant streams at the cutoff minus the restatement period. dendro's
   filter selects the streams to evict.
