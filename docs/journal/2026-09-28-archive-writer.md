@@ -367,6 +367,27 @@ timestamp and window columns and the repeat falls outside LZ4's 64 kB
 window. Sorting at compaction into long segments therefore needs zstd, or
 delta-encoded time columns, to pay off.
 
+**zstd at seal, measured.** The writer re-run in arrival order with each
+codec, on an otherwise idle machine; encode time is the writer thread's
+time in the encoder, over every seal.
+
+| recording | codec | size | encode total | mean / worst seal | tick p99 / max | query time, answers |
+|---|---|---|---|---|---|---|
+| busy host, 1 s | LZ4 | 157.4 MB | 5.56 s | 8.7 / 200 ms | 32 / 231 ms | 22.6 s |
+| | zstd-1 | 98.3 MB | 5.94 s | 9.3 / 202 ms | 34 / 228 ms | 22.6 s, 71 / 71 same |
+| | zstd-3 | 71.3 MB | 5.79 s | 9.0 / 206 ms | 31 / 232 ms | 22.6 s, 71 / 71 same |
+| heavy spike, 100 ms | LZ4 | 121.0 MB | 6.61 s | 11.2 / 157 ms | 30 / 162 ms | |
+| | zstd-1 | 77.1 MB | 7.10 s | 12.0 / 158 ms | 31 / 160 ms | |
+| | zstd-3 | 52.5 MB | 6.81 s | 11.5 / 161 ms | 27 / 166 ms | |
+
+zstd-3 is 55–57% smaller than LZ4 for about 4% more encode time; a seal's
+worst case is the WAL decode and table build, not the codec. Tick latency
+and query time do not move. So the writer seals with zstd-3
+(`WriterConfig::compression`, metriken#191). Readers already decode zstd
+(metriken-query enables it). A tail a reader rebuilds in memory keeps the
+default codec; it is never written anywhere, so no compression may be
+better there, which is not measured.
+
 Not run: a replay paced at the recording's interval, which would separate
 the unpaced replay's backpressure from the writer's own cost at 100 ms.
 
