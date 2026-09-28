@@ -286,9 +286,15 @@ pub fn segment_writer_props() -> WriterProperties {
 
 /// Serialize one table to parquet bytes.
 pub fn write_table_parquet(table: &Table) -> Result<Vec<u8>, Error> {
+    write_table_parquet_with(table, segment_writer_props())
+}
+
+/// [`write_table_parquet`] with the caller's writer properties, for a
+/// writer that seals with another codec than [`segment_writer_props`]'s.
+pub fn write_table_parquet_with(table: &Table, props: WriterProperties) -> Result<Vec<u8>, Error> {
     let (schema, batch) = table_to_batch(table)?;
     let mut buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(segment_writer_props()))?;
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(buf)

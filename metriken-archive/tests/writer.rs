@@ -2,7 +2,7 @@
 //! read back the same through `ArchiveReader`, apart from `__occupant__`.
 #![cfg(feature = "write")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -515,4 +515,68 @@ fn an_encoder_for_an_archives_streams_copies_a_live_long_table() {
         let (x, y) = (answer(&a, q, 0), answer(&b, q, 0));
         assert_eq!(x.as_ref().map(|r| &r.0), y.as_ref().map(|r| &r.0), "{q}");
     }
+}
+
+/// Sealed segments are written with the configured codec: zstd level 3 by
+/// default, and LZ4 when asked.
+#[test]
+fn sealed_segments_use_the_configured_codec() {
+    use metriken_archive::writer::Compression;
+    use metriken_archive::Catalog;
+
+    let codecs = |path: &Path| -> BTreeSet<String> {
+        let catalog = DendroCatalog::open(path).unwrap();
+        let id = catalog.sources().unwrap()[0].id;
+        let mut out = BTreeSet::new();
+        for table in catalog.tables(id).unwrap() {
+            for (seq, _) in catalog.segment_meta(id, &table).unwrap() {
+                let bytes = catalog.segment_bytes(id, &table, seq).unwrap().unwrap();
+                let meta =
+                    parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes))
+                        .map(|r| {
+                            use parquet::file::reader::FileReader;
+                            r.metadata().clone()
+                        })
+                        .unwrap();
+                for rg in meta.row_groups() {
+                    for c in rg.columns() {
+                        // The footer names the codec, not its level.
+                        let codec = format!("{:?}", c.compression());
+                        out.insert(codec.split('(').next().unwrap().to_string());
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let zstd = dir.path().join("zstd.dendro");
+    record(&zstd, true, true, None);
+    assert_eq!(
+        codecs(&zstd),
+        BTreeSet::from(["ZSTD".to_string()]),
+        "every column of every sealed segment, occupant streams included"
+    );
+
+    let lz4 = dir.path().join("lz4.dendro");
+    let mut writer = ArchiveWriter::create(
+        &lz4,
+        WriterConfig {
+            compression: Compression::LZ4_RAW,
+            ..WriterConfig::default()
+        },
+    )
+    .unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    for t in 0..4 {
+        let staged = source.stage(&snapshot(t), BASE + t * S, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+    }
+    source.finalize((BASE + 3 * S, 0)).unwrap();
+    writer.join().unwrap();
+    assert_eq!(codecs(&lz4), BTreeSet::from(["LZ4_RAW".to_string()]));
 }
