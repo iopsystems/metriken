@@ -1,7 +1,9 @@
 # The archive writer: dendro archives, long tables, occupant streams
 
-**Status:** OPEN. The writer is built (see "Built", below); the gate
-against the `.rez` writer has not been run. Phase 4 of
+**Status:** Gate run (see "Gate results", below): same answers, 3–9 times
+smaller, a tick tail about ten times shorter; the median tick at 100 ms is
+12–28% worse under an unpaced replay, accepted. Next is rezolus's adoption
+(6.0). Phase 4 of
 [the high-cardinality stack](2026-09-28-high-cardinality-stack.md), and step 3
 of rezolus 6.0 (iopsystems/rezolus#1224).
 
@@ -122,6 +124,10 @@ The case against:
 
 The gate below measures both, and arrival order is the fallback.
 
+*Decided by the gate:* arrival order is the default (`sort_long: false`).
+Sorting made the 100 ms archives 6–20% larger and did not improve the
+tick path; sorting is left to compaction.
+
 **Dedup, schema checks, seal policy.**
 - Dedup and schema checks carry over from the `.rez` writer: dedup per
   stream by window end, `GroupSnapshot::validate`, a small schema ring per
@@ -238,6 +244,63 @@ The writer replaces the `.rez` writer only if all of these hold:
    layout gate predicted.
 4. **Sorting at seal stays inside a tick.** If it doesn't at 100 ms, long
    segments are sealed in arrival order and sorted at compaction.
+
+## Gate results
+
+Measured 2026-09-28 with a scratch harness (not committed). It reads a
+`.rez` v3 recording's group tables, rebuilds each tick's V3 snapshot (a
+row's non-null cells are its members, the schema is sent when it changes),
+and replays the snapshots through the `.rez` v3 writer (`StreamRecorderV3`)
+and through `ArchiveWriter`, sorted and in arrival order. Tick cost is the
+caller's time in stage, commit and seal for one tick. The replay is not
+paced: ticks are fed as fast as the writer takes them, about 27 times real
+time at 100 ms. Answers are compared through rezolus's `RezReader`, which
+opens both containers: for every metric, `sum(rate(m[5s]))`,
+`count(rate(m[5s]))` and `sum by (id) (irate(m[5s]))` for counters,
+`sum` and `count` for gauges, `histogram_quantile(0.9, m)` for histograms,
+over the whole recording at its own step, relative tolerance 1e-9. Replay
+ran on an Apple M4 Max (16 cores, 128 GiB) on macOS 26.6.
+
+Inputs are the four synthetic thread and cgroup spike recordings from
+rezolus's `docs/journal/2026-09-25-dendro-archive-layout.md` (thread CPU
+0.5 ms "light" or 10 ms "heavy", each at 1 s and 100 ms). One segment of
+the 1 s heavy input (`cpu_usage/cpu_usage_task` #1) cannot be read, the
+wide layout's `TooManyTables` defect; both writers replay the same rows
+without it.
+
+| recording | ticks | answers same | size: `.rez` → sorted / arrival | tick p50: `.rez` / sorted / arrival | tick p99 | tick max |
+|---|---|---|---|---|---|---|
+| light, 1 s | 701 | 213 / 213 | 129.0 → 19.6 / 18.4 MB | 8.6 / 6.3 / 6.2 ms | 407 / 35 / 30 ms | 781 / 48 / 39 ms |
+| heavy, 1 s | 700 | 213 / 213 | 188.9 → 21.4 / 20.2 MB | 7.3 / 5.3 / 5.3 ms | 397 / 17 / 16 ms | 1067 / 149 / 140 ms |
+| light, 100 ms | 6,665 | 213 / 213 | 395.5 → 118.7 / 99.3 MB | 1.78 / 2.32 / 1.99 ms | 375 / 38 / 31 ms | 852 / 131 / 101 ms |
+| heavy, 100 ms | 6,665 | 213 / 213 | 561.5 → 127.9 / 121.0 MB | 2.59 / 3.31 / 2.95 ms | 406 / 36 / 29 ms | 917 / 170 / 184 ms |
+
+Against the four conditions:
+
+1. **Same answers:** met on all four, 213 of 213 queries.
+2. **No more tick cost:** met at 1 s. At 100 ms the tail is about ten
+   times shorter but the median is 12–28% worse: stage time is higher
+   (17.0 s against 15.5 s light, 22.8 s against 20.3 s heavy, sorted), and
+   commit carries the writer thread's backpressure from the unpaced replay
+   (5–6 s against 0.2 s at 1 s). Accepted without a paced replay
+   (decided 2026-09-28): a 0.3–0.7 ms median against a 400 ms tail.
+3. **Not larger:** met, 3.3–8.8 times smaller.
+4. **Sort within a tick:** the sorted writer's worst tick is no worse than
+   arrival order's, but sorting is larger and slower at the median, so
+   arrival order is the default.
+
+The `.rez` writer's tail is its commit: `wal_tick` waits for a synchronous
+commit on its writer thread (52–58 s of commit at 100 ms), where dendro's
+returns once the tick is queued.
+
+Query time, from the same comparison: every query slower than 2 s was faster
+on the dendro archive, most by a large margin; `sum by (id)
+(irate(cgroup_syscall[5s]))` at 100 ms took 165 s on the `.rez` output and
+2.4 s on the dendro one.
+
+Not run: the busy-host recording (in progress when this was written), and
+a replay paced at the recording's interval, which would separate the
+unpaced replay's backpressure from the writer's own cost at 100 ms.
 
 ## Not in this change
 

@@ -40,7 +40,10 @@ pub struct WriterConfig {
     pub seal: SealPolicy,
     /// Row time between restatements of a long table's live occupants.
     pub restate_every_ns: u64,
-    /// Sort a long segment by `(occupant, timestamp)` at seal.
+    /// Sort a long segment by `(occupant, timestamp)` at seal. Off by
+    /// default: on replayed recordings, arrival order was 6–20% smaller at
+    /// 100 ms and no slower on the tick path (see the writer's journal
+    /// entry). Sorting belongs at compaction.
     pub sort_long: bool,
     /// Write groups with slots long. Off writes every group one row per
     /// tick, which is only useful to compare the two.
@@ -52,7 +55,7 @@ impl Default for WriterConfig {
         Self {
             seal: SealPolicy::default(),
             restate_every_ns: 300_000_000_000,
-            sort_long: true,
+            sort_long: false,
             long_groups: true,
         }
     }
