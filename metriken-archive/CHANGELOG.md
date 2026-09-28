@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `writer` (feature `write`), phase 4 of
+  `docs/journal/2026-09-28-high-cardinality-stack.md`: `ArchiveWriter`
+  records V3 snapshots into a dendro archive. A group whose members carry a
+  slot `id` is written long, with its occupants numbered at ingest and
+  their labels in the table's occupant stream (restated every
+  `restate_every_ns`, 300 s by default). Other groups are one row per tick.
+  `SourceRecorder` holds one source's ingest state (dedup by window end,
+  a schema ring of three, schema anchoring per segment, seal accounts) and
+  evicts occupant streams one restatement period behind their data.
+  `Encoder` is the `SegmentEncoder`, versioned `metriken-archive/1`.
+
+### Changed
+
+- `ArchiveReader` materializes a long table's unsealed WAL tail as a long
+  segment. A table is long when it has an occupant stream.
+
 ## [0.1.0] - 2026-09-28
 
 ### Added

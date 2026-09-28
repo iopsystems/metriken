@@ -1,6 +1,7 @@
 # The archive writer: dendro archives, long tables, occupant streams
 
-**Status:** OPEN — intent-first, nothing built. Phase 4 of
+**Status:** OPEN. The writer is built (see "Built", below); the gate
+against the `.rez` writer has not been run. Phase 4 of
 [the high-cardinality stack](2026-09-28-high-cardinality-stack.md), and step 3
 of rezolus 6.0 (iopsystems/rezolus#1224).
 
@@ -138,6 +139,48 @@ The gate below measures both, and arrival order is the fallback.
 - Nothing is written to `caller_rows` for a long table. dendro's one gap,
   that caller rows cannot join a tick's transaction, therefore does not
   arise for new archives.
+
+## Built
+
+`metriken-archive/src/writer.rs`, behind the `write` feature, with the
+long layout's builder and WAL row in metriken-segment
+(`long_table.rs`, `wal.rs`). Decisions made while building it:
+
+- **Which labels are the occupant's.** Per slot (members sharing an `id`),
+  a label whose value differs between the slot's metrics belongs to the
+  metric column (`op=read`, `op=write`); a label constant across them
+  belongs to the occupant (`comm`, `pid`, `__uid__`, `id`). The storage
+  keys (`metric`, `metric_type`, `unit`, `grouping_power`,
+  `max_value_power`), `sampler` and `description` always stay on the
+  column. This is the converter's rule from the layout entry, applied per
+  schema rather than per stream, and it needs no key list. A column is one
+  fixed metadata set, named for its `metric`, with a `#N` suffix when a
+  group holds the metric more than once; readers match on metadata.
+- **Ingest is V3 only.** V1/V2 snapshots are ignored. Agents older than
+  acquisition groups are a follow-up, not needed by rezolus 6.0's own
+  agent.
+- **Eviction lag** is two dendro passes: data streams at the cutoff, and
+  occupant streams at the cutoff minus the restatement period. dendro's
+  filter selects the streams to evict.
+- **A segment's row count is the WAL rows it consumes.** dendro checks
+  `Segment::rows` against the WAL rows in its span, and a long segment has
+  one parquet row per occupant, so the encoder reports `rows.len()`.
+- **The encoder learns which streams are long from the recorders**, through
+  a set they share. A writer that resumes an existing archive would need
+  that set rebuilt before its first seal; resume is not built.
+- **The occupant stream's size charge** against its seal account is a flat
+  64 bytes per occupant row, not measured.
+- **The reader's tail** of a long table is materialized in arrival order,
+  not sorted.
+
+**Tests** (`metriken-archive/tests/writer.rs`) record the same snapshots
+twice, long and with `long_groups` off (every group one row per tick), and
+require the same answers through `ArchiveReader` for rates, sums by an
+occupant label and by a column label, selection by `__uid__`, a fixed
+group's gauge and a histogram quantile. `__occupant__` must appear on the
+long series and never on the wide. They run finalized, from the live WAL
+tail, and after eviction at a cutoff past the last restatement; that last
+test fails with the eviction lag removed.
 
 ## What stays in rezolus
 

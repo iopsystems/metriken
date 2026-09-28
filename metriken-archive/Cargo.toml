@@ -17,3 +17,14 @@ metriken-query = { version = "0.33.0", path = "../metriken-query", default-featu
 parquet = { version = "58.2.0", default-features = false, features = ["arrow", "lz4"] }
 metriken-segment = { version = "0.1.2", path = "../metriken-segment", default-features = false, features = ["lz4"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+metriken-exposition = { version = "0.21.1", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
+
+[features]
+# The archive writer. Off, this crate is a reader that builds for wasm32:
+# metriken-exposition depends on the registry, which does not.
+write = ["dendro/write", "dep:metriken-exposition"]
+
+[dev-dependencies]
+histogram = "1"
+metriken = { version = "0.11.0", path = "../metriken" }
+tempfile = "3"

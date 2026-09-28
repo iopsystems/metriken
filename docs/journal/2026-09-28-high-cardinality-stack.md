@@ -159,6 +159,8 @@ moved:
    step 3: a dendro-backed writer that writes groups with slots long, with
    their occupant stream, and materializes a long table's WAL tail as long.
    rezolus's recorder and hindsight use it with rezolus's defaults.
+
+   Built; the gate against the `.rez` writer (in the design entry) is next.
 5. **Members that come and go, in `metriken`.** Slot identity and `__uid__`
    minting move here for fixed-capacity groups. The dynamic registry gains
    registration ids and families (see below). It gets its own design entry.

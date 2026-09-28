@@ -13,11 +13,13 @@
 //! - [`wal`]: the write-ahead log's row format, and materializing a WAL
 //!   tail into a segment.
 //! - [`long`]: the long layout, one row per (timestamp, occupant).
+//! - [`long_table`]: building a long segment.
 //! - [`occupants`]: the stream that says which labels each occupant number
 //!   of a long table stands for.
 
 pub mod builder;
 pub mod long;
+pub mod long_table;
 pub mod occupants;
 pub mod schema;
 pub mod table;
