@@ -999,9 +999,13 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "dendro",
+ "histogram",
+ "metriken",
+ "metriken-exposition",
  "metriken-query",
  "metriken-segment",
  "parquet",
+ "tempfile",
  "tracing",
 ]
 
