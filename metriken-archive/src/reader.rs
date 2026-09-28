@@ -204,6 +204,23 @@ struct DbSegmentStore {
     tail: Option<bytes::Bytes>,
 }
 
+/// A table's unsealed WAL rows as one segment. A table with an occupant
+/// stream is long, and its rows are `WalLongRow`s; they are kept in arrival
+/// order, which the long reader handles as well as a sorted segment.
+fn live_tail(
+    db: &dyn Catalog,
+    recording_id: i64,
+    table: &str,
+    long: bool,
+) -> Result<Option<metriken_segment::wal::MaterializedTail>, Box<dyn std::error::Error>> {
+    let rows = db.live_wal(recording_id, table)?;
+    if long {
+        metriken_segment::wal::materialize_long_wal_tail(table, &rows, false)
+    } else {
+        materialize_wal_tail(table, &rows)
+    }
+}
+
 impl DbSegmentStore {
     fn build(
         db: DbHandle,
@@ -217,7 +234,10 @@ impl DbSegmentStore {
                     .into_iter()
                     .map(|(seq, _)| seq)
                     .collect();
-                let tail = materialize_wal_tail(sampler, &db.live_wal(recording_id, sampler)?)
+                let long = db
+                    .tables(recording_id)?
+                    .contains(&metriken_segment::occupants::stream_of(sampler));
+                let tail = live_tail(db, recording_id, sampler, long)
                     .map_err(|e| e.to_string())?
                     .map(|t| bytes::Bytes::from(t.bytes));
                 Ok((seqs, tail))
@@ -996,8 +1016,14 @@ impl ArchiveReader {
                 // `table_segments` splices the tail in.
                 let probe_bytes = match metas.first() {
                     Some((seq, _)) => db.segment_bytes(rec.id, &sampler, *seq)?,
-                    None => materialize_wal_tail(&sampler, &db.live_wal(rec.id, &sampler)?)?
-                        .map(|t| t.bytes),
+                    None => live_tail(
+                        &**db,
+                        rec.id,
+                        &sampler,
+                        occupant_streams
+                            .contains(&metriken_segment::occupants::stream_of(&sampler)),
+                    )?
+                    .map(|t| t.bytes),
                 };
                 // Nothing sealed and nothing live: the table has no rows at
                 // all, so there is nothing to open. Same skip as the eager path.

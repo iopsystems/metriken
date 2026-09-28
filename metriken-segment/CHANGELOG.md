@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The long layout's writer and WAL row, for phase 4 of
+  `docs/journal/2026-09-28-high-cardinality-stack.md`:
+  - `long_table::LongTableBuilder`: one row per tick and occupant, written
+    with the `metriken.layout=long` marker and the `metriken.occupants`
+    footer list, sorted by `(occupant, timestamp)` or kept in arrival order.
+  - `wal::WalLongRow` and `wal::LongOccupant`: a long table's values for one
+    tick, with each occupant's number, so a reader materializes a live tail
+    without the writer's state. Their msgpack codec,
+    `wal_long_row_approx_bytes`, and `materialize_long_wal_tail`.
+
 ## [0.1.2] - 2026-09-28
 
 ### Added

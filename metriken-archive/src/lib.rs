@@ -8,15 +8,20 @@
 //! - [`catalog`]: what the reader needs from a container, and dendro's
 //!   implementation of it.
 //! - [`reader`]: the reader, [`ArchiveReader`].
+//! - [`writer`] (feature `write`): the writer, [`ArchiveWriter`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod catalog;
 pub mod reader;
+#[cfg(feature = "write")]
+pub mod writer;
 
 pub use catalog::{Catalog, DendroCatalog};
 pub use reader::{ArchiveReader, LabeledRecordings};
+#[cfg(feature = "write")]
+pub use writer::{ArchiveWriter, SourceRecorder, WriterConfig};
 
 /// Opens an archive's catalog again, for a table first read after the
 /// reader's own handle is gone.

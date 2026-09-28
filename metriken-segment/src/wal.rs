@@ -437,3 +437,108 @@ pub fn wal_group_row_approx_bytes(row: &WalGroupRow) -> usize {
     }
     bytes
 }
+
+/// One long table's WAL payload for one tick: the occupants present, each
+/// with its values, and one shared window.
+///
+/// Occupant numbers are assigned when the row is written, so a reader
+/// materializing an unsealed tail needs nothing from the writer. `schema`
+/// holds the metric columns' fixed descriptors (no occupant labels, which
+/// live in the table's occupant stream) and, like [`WalGroupRow`]'s, is
+/// `Some` only on a row that anchors it for the current segment; every row
+/// carries `schema_hash`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WalLongRow {
+    pub schema_hash: (u64, u64),
+    pub schema: Option<crate::schema::GroupSchema>,
+    pub window: Option<(u64, u64)>,
+    pub occupants: Vec<LongOccupant>,
+}
+
+/// One occupant's values in a [`WalLongRow`], in its schema's order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LongOccupant {
+    pub occupant: u64,
+    pub counters: Vec<Option<u64>>,
+    pub gauges: Vec<Option<i64>>,
+    /// `(grouping_power, max_value_power, buckets)`.
+    pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
+}
+
+pub fn encode_wal_long_row(row: &WalLongRow) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec(row).map_err(|e| format!("failed to encode a WAL long row: {e}"))
+}
+
+pub fn decode_wal_long_row(bytes: &[u8]) -> Result<WalLongRow, String> {
+    rmp_serde::from_slice(bytes).map_err(|e| format!("failed to decode a WAL long row: {e}"))
+}
+
+/// A long row's cost against a writer's segment byte budget: one window
+/// slot, and per occupant an occupant slot plus its present values.
+pub fn wal_long_row_approx_bytes(row: &WalLongRow) -> usize {
+    let mut bytes = WINDOW_SLOT_BYTES;
+    for o in &row.occupants {
+        bytes += VALUE_SLOT_BYTES;
+        bytes += o.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
+        bytes += o.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
+        for (_, _, buckets) in o.histograms.iter().flatten() {
+            bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
+        }
+    }
+    bytes
+}
+
+/// A long table's live WAL rows as one long segment (`None` when there is no
+/// tail). A table is long when it has an occupant stream, which is how a
+/// reader chooses this over [`materialize_wal_tail`]. Rows with no matching
+/// schema anchor are skipped with a warning, as for a group table.
+pub fn materialize_long_wal_tail(
+    table_key: &str,
+    rows: &[impl WalRowSource],
+    sort: bool,
+) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
+    let mut builder = crate::long_table::LongTableBuilder::new();
+    let mut current: Option<((u64, u64), crate::schema::GroupSchema)> = None;
+    let mut warned = false;
+    let mut first_ts: Option<u64> = None;
+    for row in rows {
+        let decoded = decode_wal_long_row(row.row())?;
+        if let Some(s) = decoded.schema {
+            current = Some((decoded.schema_hash, s));
+        }
+        let schema = match &current {
+            Some((hash, s)) if *hash == decoded.schema_hash => s,
+            _ => {
+                if !warned {
+                    warn!(
+                        "long table {table_key} WAL row at ts={} has no matching schema anchor; \
+                         skipping until the next anchored row (warned once)",
+                        row.ts()
+                    );
+                    warned = true;
+                }
+                continue;
+            }
+        };
+        if decoded.occupants.is_empty() {
+            continue;
+        }
+        builder.push_tick(
+            row.ts(),
+            row.wall_offset(),
+            decoded.window.map(|(b, e)| Window::new(b, e)),
+            schema,
+            &decoded.occupants,
+        );
+        first_ts.get_or_insert(row.ts());
+    }
+    let rows = builder.rows() as u64;
+    if rows == 0 {
+        return Ok(None);
+    }
+    Ok(Some(MaterializedTail {
+        bytes: builder.finish(sort)?,
+        rows,
+        first_ts: first_ts.expect("a non-empty table has a first row"),
+    }))
+}
