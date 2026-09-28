@@ -14,7 +14,7 @@
 //! Only V3 (acquisition-group) snapshots are ingested; V1/V2 per-sampler
 //! snapshots are a follow-up.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -226,23 +226,39 @@ enum Layout {
     Long(Arc<LongLayout>),
 }
 
-/// How a slotted group's members map onto a long table.
+/// How one producer schema of a slotted group maps onto the group's long
+/// columns ([`LongColumns`]).
 struct LongLayout {
     /// The group's member counts (counters, gauges, histograms).
     arity: (usize, usize, usize),
-    /// The metric columns: fixed descriptors, no occupant labels.
-    schema: GroupSchema,
-    schema_hash: (u64, u64),
-    /// Per slot, in first-appearance order: its identity labels and, per
-    /// member kind, which (member index, column index) pairs it holds.
+    /// Per slot, in first-appearance order.
     slots: Vec<Slot>,
 }
 
 struct Slot {
-    labels: BTreeMap<String, String>,
+    /// The occupant's identity: `__uid__` when it has one, else its labels.
+    identity: String,
+    labels: Arc<BTreeMap<String, String>>,
+    /// The occupant's number, once looked up. A layout belongs to one group,
+    /// and a slot's labels are fixed within it, so this never changes.
+    number: std::sync::OnceLock<u64>,
+    /// Per member kind, (member index, column index) pairs.
     counters: Vec<(usize, usize)>,
     gauges: Vec<(usize, usize)>,
     histograms: Vec<(usize, usize)>,
+}
+
+/// A long group's metric columns. Append-only for the recording, so a
+/// column index in any cached [`LongLayout`] stays valid, and the columns
+/// change (and are re-anchored) only when a metric is new, not when
+/// membership does.
+#[derive(Default)]
+struct LongColumns {
+    schema: GroupSchema,
+    hash: (u64, u64),
+    /// Per member kind, column index by the column's fixed metadata.
+    index: [HashMap<String, usize>; 3],
+    names: HashSet<String>,
 }
 
 /// Keys that describe the metric, never an occupant.
@@ -264,102 +280,117 @@ impl Layout {
             Layout::Long(l) => l.arity,
         }
     }
+}
 
-    /// Whether a group with this schema is written long: any member
-    /// carries a slot `id`.
-    fn slotted(schema: &GroupSchema) -> bool {
-        schema
-            .counters
-            .iter()
-            .chain(&schema.gauges)
-            .chain(&schema.histograms)
-            .any(|d| d.metadata.contains_key("id"))
-    }
+/// Whether a group with this schema is written long: any member carries a
+/// slot `id`.
+fn slotted(schema: &metriken_exposition::GroupSchema) -> bool {
+    schema
+        .counters
+        .iter()
+        .chain(&schema.gauges)
+        .chain(&schema.histograms)
+        .any(|d| d.metadata.contains_key("id"))
+}
 
-    /// Lay a group out, long or one row per tick. A member without an `id`
-    /// in a long group is the occupant of slot `""`.
-    fn of(schema: Arc<GroupSchema>, long: bool) -> Self {
-        if !long {
-            return Layout::Wide(schema);
+impl LongLayout {
+    /// Lay a slotted group's schema out over its long columns, adding any
+    /// column it is the first to need. A member without an `id` is the
+    /// occupant of slot `""`.
+    fn of(schema: &metriken_exposition::GroupSchema, cols: &mut LongColumns) -> Self {
+        type Desc = metriken_exposition::MetricDesc;
+        let kinds: [&Vec<Desc>; 3] = [&schema.counters, &schema.gauges, &schema.histograms];
+        fn slot_of(d: &metriken_exposition::MetricDesc) -> &str {
+            d.metadata.get("id").map(String::as_str).unwrap_or("")
         }
-        let members = || {
-            schema
-                .counters
-                .iter()
-                .chain(&schema.gauges)
-                .chain(&schema.histograms)
-        };
+
         // A label is the occupant's when every metric of a slot agrees on
         // it (`comm`, `pid`, `id`, `__uid__`), and the metric column's when
         // it differs between a slot's metrics (`op` on a per-op table).
         // Storage keys are always the column's.
-        let mut by_slot: BTreeMap<&str, Vec<&MetricDesc>> = BTreeMap::new();
-        for d in members() {
-            let slot = d.metadata.get("id").map(String::as_str).unwrap_or("");
-            by_slot.entry(slot).or_default().push(d);
-        }
-        let mut per_metric: BTreeSet<String> = BTreeSet::new();
-        for members in by_slot.values() {
-            let keys: BTreeSet<&String> = members.iter().flat_map(|d| d.metadata.keys()).collect();
-            for k in keys {
-                let first = members[0].metadata.get(k);
-                if members.iter().any(|d| d.metadata.get(k) != first) {
-                    per_metric.insert(k.clone());
+        let mut first: HashMap<&str, &Desc> = HashMap::new();
+        let mut per_metric: HashSet<&str> = HashSet::new();
+        for d in kinds.iter().flat_map(|k| k.iter()) {
+            let f = *first.entry(slot_of(d)).or_insert(d);
+            if std::ptr::eq(f, d) {
+                continue;
+            }
+            for (k, v) in &d.metadata {
+                if f.metadata.get(k) != Some(v) {
+                    per_metric.insert(k);
+                }
+            }
+            for k in f.metadata.keys() {
+                if !d.metadata.contains_key(k) {
+                    per_metric.insert(k);
                 }
             }
         }
         let is_occupant_key = |k: &str| !STORAGE_KEYS.contains(&k) && !per_metric.contains(k);
-        let fixed = |d: &MetricDesc| -> BTreeMap<String, String> {
-            d.metadata
-                .iter()
-                .filter(|(k, _)| !is_occupant_key(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
-        let mut long = GroupSchema::default();
-        // A column is one fixed metadata set. It is named for its metric,
-        // with a suffix when a group holds that metric more than once
-        // (`op=read`, `op=write`); readers go by metadata, not name.
-        let mut columns: [HashMap<BTreeMap<String, String>, usize>; 3] = Default::default();
-        let mut names: HashSet<String> = HashSet::new();
+
+        let mut changed = false;
         let mut slots: Vec<Slot> = Vec::new();
-        let mut slot_index: HashMap<String, usize> = HashMap::new();
-        let kinds: [(&Vec<MetricDesc>, usize); 3] = [
-            (&schema.counters, 0),
-            (&schema.gauges, 1),
-            (&schema.histograms, 2),
-        ];
-        for (list, kind) in kinds {
+        let mut slot_index: HashMap<&str, usize> = HashMap::new();
+        let mut key = String::new();
+        for (kind, list) in kinds.into_iter().enumerate() {
             for (member, d) in list.iter().enumerate() {
-                let metadata = fixed(d);
-                let target = match kind {
-                    0 => &mut long.counters,
-                    1 => &mut long.gauges,
-                    _ => &mut long.histograms,
-                };
-                let col = *columns[kind].entry(metadata.clone()).or_insert_with(|| {
-                    let base = metadata
-                        .get("metric")
-                        .cloned()
-                        .unwrap_or_else(|| d.name.clone());
-                    let mut name = base.clone();
-                    let mut n = 1;
-                    while !names.insert(name.clone()) {
-                        name = format!("{base}#{n}");
-                        n += 1;
+                key.clear();
+                for (k, v) in &d.metadata {
+                    if !is_occupant_key(k) {
+                        key.push_str(k);
+                        key.push('\u{1f}');
+                        key.push_str(v);
+                        key.push('\u{1e}');
                     }
-                    target.push(MetricDesc { name, metadata });
-                    target.len() - 1
-                });
-                let slot_id = d.metadata.get("id").cloned().unwrap_or_default();
-                let si = *slot_index.entry(slot_id).or_insert_with(|| {
-                    slots.push(Slot {
-                        labels: d
+                }
+                let col = match cols.index[kind].get(key.as_str()) {
+                    Some(&c) => c,
+                    None => {
+                        let metadata: BTreeMap<String, String> = d
                             .metadata
                             .iter()
-                            .filter(|(k, _)| is_occupant_key(k))
+                            .filter(|(k, _)| !is_occupant_key(k))
                             .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
+                            .collect();
+                        // Named for its metric, with a suffix when a group
+                        // holds that metric more than once (`op=read`,
+                        // `op=write`); readers go by metadata, not name.
+                        let base = metadata
+                            .get("metric")
+                            .cloned()
+                            .unwrap_or_else(|| d.name.clone());
+                        let mut name = base.clone();
+                        let mut n = 1;
+                        while !cols.names.insert(name.clone()) {
+                            name = format!("{base}#{n}");
+                            n += 1;
+                        }
+                        let target = match kind {
+                            0 => &mut cols.schema.counters,
+                            1 => &mut cols.schema.gauges,
+                            _ => &mut cols.schema.histograms,
+                        };
+                        target.push(MetricDesc { name, metadata });
+                        cols.index[kind].insert(key.clone(), target.len() - 1);
+                        changed = true;
+                        target.len() - 1
+                    }
+                };
+                let si = *slot_index.entry(slot_of(d)).or_insert_with(|| {
+                    let labels: BTreeMap<String, String> = d
+                        .metadata
+                        .iter()
+                        .filter(|(k, _)| is_occupant_key(k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let identity = match labels.get("__uid__") {
+                        Some(uid) => format!("uid:{uid}"),
+                        None => format!("labels:{labels:?}"),
+                    };
+                    slots.push(Slot {
+                        identity,
+                        labels: Arc::new(labels),
+                        number: std::sync::OnceLock::new(),
                         counters: Vec::new(),
                         gauges: Vec::new(),
                         histograms: Vec::new(),
@@ -374,17 +405,17 @@ impl Layout {
                 pairs.push((member, col));
             }
         }
-        let schema_hash = long.hash();
-        Layout::Long(Arc::new(LongLayout {
+        if changed {
+            cols.hash = cols.schema.hash();
+        }
+        LongLayout {
             arity: (
                 schema.counters.len(),
                 schema.gauges.len(),
                 schema.histograms.len(),
             ),
-            schema: long,
-            schema_hash,
             slots,
-        }))
+        }
     }
 }
 
@@ -404,35 +435,35 @@ struct GroupState {
     /// Whether this segment's WAL already carries the schema of the given
     /// hash (wide: the group's; long: the metric columns').
     anchored: HashSet<(u64, u64)>,
+    /// Long only: the metric columns.
+    columns: LongColumns,
     /// Long only: occupant number by identity (`__uid__`, or the labels).
     occupants: HashMap<String, u64>,
     /// Long only: occupants seen since the last restatement, with labels.
-    seen: BTreeMap<u64, BTreeMap<String, String>>,
+    seen: BTreeMap<u64, Arc<BTreeMap<String, String>>>,
     last_restated: Option<u64>,
 }
 
 impl GroupState {
     fn layout(&mut self, g: &GroupSnapshot, long_groups: bool) -> Option<Arc<Layout>> {
-        if let Some(schema) = &g.schema {
-            if let Some((_, l)) = self.layouts.iter().find(|(h, _)| *h == g.schema_hash) {
-                return Some(Arc::clone(l));
-            }
-            let seg: GroupSchema = schema.as_ref().into();
-            let long = *self
-                .long
-                .get_or_insert_with(|| long_groups && Layout::slotted(&seg));
-            let layout = Arc::new(Layout::of(Arc::new(seg), long));
-            if self.layouts.len() == SCHEMA_RING_LEN {
-                self.layouts.pop_back();
-            }
-            self.layouts
-                .push_front((g.schema_hash, Arc::clone(&layout)));
-            return Some(layout);
+        if let Some((_, l)) = self.layouts.iter().find(|(h, _)| *h == g.schema_hash) {
+            return Some(Arc::clone(l));
+        }
+        let schema = g.schema.as_ref()?;
+        let long = *self
+            .long
+            .get_or_insert_with(|| long_groups && slotted(schema));
+        let layout = Arc::new(if long {
+            Layout::Long(Arc::new(LongLayout::of(schema, &mut self.columns)))
+        } else {
+            Layout::Wide(Arc::new(schema.as_ref().into()))
+        });
+        if self.layouts.len() == SCHEMA_RING_LEN {
+            self.layouts.pop_back();
         }
         self.layouts
-            .iter()
-            .find(|(h, _)| *h == g.schema_hash)
-            .map(|(_, l)| Arc::clone(l))
+            .push_front((g.schema_hash, Arc::clone(&layout)));
+        Some(layout)
     }
 }
 
@@ -544,21 +575,32 @@ impl SourceRecorder {
                     .insert(g.name.clone());
                 let mut present = Vec::new();
                 let mut first_seen = Vec::new();
+                let widths = (
+                    state.columns.schema.counters.len(),
+                    state.columns.schema.gauges.len(),
+                    state.columns.schema.histograms.len(),
+                );
                 for slot in &l.slots {
+                    let any = slot.counters.iter().any(|&(m, _)| g.counters[m].is_some())
+                        || slot.gauges.iter().any(|&(m, _)| g.gauges[m].is_some())
+                        || slot
+                            .histograms
+                            .iter()
+                            .any(|&(m, _)| g.histograms[m].is_some());
+                    if !any {
+                        continue;
+                    }
                     let mut occ = LongOccupant {
                         occupant: 0,
-                        counters: vec![None; l.schema.counters.len()],
-                        gauges: vec![None; l.schema.gauges.len()],
-                        histograms: vec![None; l.schema.histograms.len()],
+                        counters: vec![None; widths.0],
+                        gauges: vec![None; widths.1],
+                        histograms: vec![None; widths.2],
                     };
-                    let mut any = false;
                     for &(m, c) in &slot.counters {
                         occ.counters[c] = g.counters[m];
-                        any |= g.counters[m].is_some();
                     }
                     for &(m, c) in &slot.gauges {
                         occ.gauges[c] = g.gauges[m];
-                        any |= g.gauges[m].is_some();
                     }
                     for &(m, c) in &slot.histograms {
                         occ.histograms[c] = g.histograms[m].as_ref().map(|h| {
@@ -568,24 +610,22 @@ impl SourceRecorder {
                                 h.as_slice().to_vec(),
                             )
                         });
-                        any |= g.histograms[m].is_some();
                     }
-                    if !any {
-                        continue;
-                    }
-                    let identity = match slot.labels.get("__uid__") {
-                        Some(uid) => format!("uid:{uid}"),
-                        None => format!("labels:{:?}", slot.labels),
-                    };
-                    let next = state.occupants.len() as u64;
-                    let number = *state.occupants.entry(identity).or_insert(next);
-                    if number == next {
-                        first_seen.push(Occupant {
-                            occupant: number,
-                            labels: slot.labels.clone(),
-                        });
-                    }
-                    state.seen.insert(number, slot.labels.clone());
+                    let number = *slot.number.get_or_init(|| {
+                        let next = state.occupants.len() as u64;
+                        let number = *state.occupants.entry(slot.identity.clone()).or_insert(next);
+                        if number == next {
+                            first_seen.push(Occupant {
+                                occupant: number,
+                                labels: slot.labels.as_ref().clone(),
+                            });
+                        }
+                        number
+                    });
+                    state
+                        .seen
+                        .entry(number)
+                        .or_insert_with(|| Arc::clone(&slot.labels));
                     occ.occupant = number;
                     present.push(occ);
                 }
@@ -595,10 +635,11 @@ impl SourceRecorder {
                 if present.is_empty() {
                     return Ok(());
                 }
-                let anchor = state.anchored.insert(l.schema_hash);
+                let hash = state.columns.hash;
+                let anchor = state.anchored.insert(hash);
                 let row = WalLongRow {
-                    schema_hash: l.schema_hash,
-                    schema: anchor.then(|| l.schema.clone()),
+                    schema_hash: hash,
+                    schema: anchor.then(|| state.columns.schema.clone()),
                     window,
                     occupants: present,
                 };
@@ -626,7 +667,10 @@ impl SourceRecorder {
                         std::mem::take(&mut state.seen)
                             .into_iter()
                             .filter(|(n, _)| !fresh.contains(n))
-                            .map(|(occupant, labels)| Occupant { occupant, labels }),
+                            .map(|(occupant, labels)| Occupant {
+                                occupant,
+                                labels: labels.as_ref().clone(),
+                            }),
                     );
                 }
                 let stream = occupants::stream_of(&g.name);

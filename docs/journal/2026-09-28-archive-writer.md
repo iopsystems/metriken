@@ -165,6 +165,14 @@ long layout's builder and WAL row in metriken-segment
   nothing, and neither does a long row with no occupant present: such a
   row could land in a long stream before its occupant stream exists, and
   a reader tells a long table by that stream.
+- **A long group's columns are append-only.** Each group keeps its metric
+  columns for the recording, keyed by their fixed metadata, and a producer
+  schema is laid out over them. The columns (and their anchored schema)
+  change only when a metric is new, not when membership does; each slot's
+  occupant identity is worked out once per schema. The first version
+  rebuilt all of it for every new schema, and a per-thread group sends one
+  nearly every tick: on a replayed 1 s recording its stage time was 8.6 s
+  against 5.2 s for the `.rez` writer, and 3.9 s after this change.
 - **Ingest is V3 only.** V1/V2 snapshots are ignored. Agents older than
   acquisition groups are a follow-up, not needed by rezolus 6.0's own
   agent.
