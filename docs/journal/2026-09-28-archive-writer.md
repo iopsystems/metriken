@@ -212,6 +212,13 @@ test fails with the eviction lag removed.
 - The recorder's and hindsight's defaults: which endpoints, the intervals,
   the seal and retention settings.
 - The stream path's translation from identity frames into group schemas.
+- Events. rezolus keeps timeline events in a source's metadata under
+  `events`. The recorder adds `run_start`/`run_end` while it records
+  (rezolus#1323), which `SourceRecorder::update_metadata` carries on a
+  dendro archive. Events added after recording, by `recording annotate
+  --event` and the viewer's Save-as-Report, need a dendro arm through
+  dendro's `ArchiveMut::patch_source_metadata`. The viewer reads them
+  through `ArchiveReader`'s source metadata already, for either container.
 - Hindsight's `summarize`, `dump` and `copy_range`, which read the `.rez`
   catalog directly today and need dendro equivalents in 6.0.
 

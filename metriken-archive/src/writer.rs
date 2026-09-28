@@ -713,6 +713,19 @@ impl SourceRecorder {
         self.writer.seal(batch).map_err(boxed)
     }
 
+    /// Merge `patch` into this source's metadata while it records: a key in
+    /// `patch` replaces that key, and every other key is kept. Ordered with
+    /// the ticks around it, so a patch sent after a tick's commit lands after
+    /// that tick, and before [`finalize`](Self::finalize) when sent first.
+    ///
+    /// For facts learned during a recording, such as the events marking
+    /// where a wrapped command started and ended. Fire-and-forget: a patch
+    /// the writer cannot apply is logged and skipped, not an error here;
+    /// [`sync`](Self::sync) and read it back to know it landed.
+    pub fn update_metadata(&mut self, patch: BTreeMap<String, String>) -> Result<(), Error> {
+        self.writer.update_metadata(patch).map_err(boxed)
+    }
+
     /// Wait until everything this source sent has landed, so a reader sees
     /// its last tick.
     pub fn sync(&mut self) -> Result<(), Error> {
