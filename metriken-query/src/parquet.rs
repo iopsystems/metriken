@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
 };
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::RowGroupMetaData;
@@ -166,9 +167,10 @@ impl ParquetReader {
         at: &crate::ColumnPosition,
         start_ns: u64,
         end_ns: u64,
+        selective: bool,
     ) -> Option<crate::ColumnChunk> {
         match self.inner.files.as_slice() {
-            [(f, _)] => f.counter_column(at, start_ns, end_ns),
+            [(f, _)] => f.counter_column(at, start_ns, end_ns, selective),
             _ => None,
         }
     }
@@ -1312,7 +1314,29 @@ pub(crate) struct ParquetSource {
     /// table formatted 2,500 names a million times over one query — a third
     /// of its CPU, measured.
     fixed_cols: OnceLock<(Option<usize>, Option<usize>)>,
+    /// The `occupant` column, if this is a long segment; see
+    /// [`ParquetSource::occupant_col`].
+    occupant_col: OnceLock<Option<usize>>,
+    /// Per row group of a long segment, the rows each occupant has. Built
+    /// on first use; see [`ParquetSource::occupant_rows`].
+    occupant_rows: Mutex<HashMap<usize, Arc<OccupantRows>>>,
+    /// A long segment's metadata with its page index, loaded the first time
+    /// a read might prune; see [`ParquetSource::occupant_selection`].
+    page_meta: OnceLock<Option<ArrowReaderMetadata>>,
 }
+
+/// A pruned read is used only when the pages it keeps are at most this
+/// fraction (1/n) of the row group's rows.
+const PRUNE_MAX_FRACTION: usize = 4;
+
+/// A read of a long segment prunes only when it wants at most this many
+/// occupants. Beyond that the pages approach the whole group, and a query
+/// streaming that many series is better served by one decode of each row
+/// group, shared through the pool, than by a pruned read per series.
+pub(crate) const PRUNE_MAX_OCCUPANTS: usize = 64;
+
+/// Which rows of one row group belong to each occupant, ascending.
+type OccupantRows = HashMap<u64, Vec<u32>>;
 
 fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
     let mut file_metadata: HashMap<String, String> = HashMap::new();
@@ -1439,6 +1463,11 @@ impl DataSource for FileSource {
                 }
             }
         }
+        // A long segment has a row per occupant per tick; a sample is a tick.
+        if self.0.occupant_col().is_some() {
+            out.sort_unstable();
+            out.dedup();
+        }
         out
     }
 
@@ -1458,6 +1487,7 @@ impl DataSource for FileSource {
                     col_idx: c.col_idx as u32,
                     begin_col: c.begin_col.map(|i| i as u32),
                     width_col: c.width_col.map(|i| i as u32),
+                    occupant: c.occupant,
                 },
             })
             .collect()
@@ -1468,8 +1498,9 @@ impl DataSource for FileSource {
         at: &crate::ColumnPosition,
         start_ns: u64,
         end_ns: u64,
+        selective: bool,
     ) -> Option<crate::ColumnChunk> {
-        match read_counter_column(&self.0, at, start_ns, end_ns) {
+        match read_counter_column(&self.0, at, start_ns, end_ns, selective) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(
@@ -1496,6 +1527,176 @@ impl DataSource for FileSource {
 }
 
 impl ParquetSource {
+    /// The `occupant` column of a [long](crate::long) segment; `None` for
+    /// any other file, including one with a column of that name that is
+    /// not marked long.
+    fn occupant_col(&self) -> Option<usize> {
+        *self.occupant_col.get_or_init(|| {
+            if self
+                .read_file_metadata_value(crate::long::LAYOUT_KEY)
+                .as_deref()
+                != Some(crate::long::LAYOUT_LONG)
+            {
+                return None;
+            }
+            self.meta
+                .schema()
+                .index_of(crate::long::OCCUPANT_COLUMN)
+                .ok()
+        })
+    }
+
+    /// The rows each occupant has in row group `rg_idx` of a long segment.
+    ///
+    /// A single-series read of a long segment (`read_counter_column`, which
+    /// a stream calls once per series per segment) would otherwise scan
+    /// every row of the column for its occupant, and a query streaming every
+    /// series would cost rows times series. Built once per row group with
+    /// one pass over the `occupant` column, then shared; it lives as long as
+    /// the source, which the segment cache bounds.
+    fn occupant_rows(&self, rg_idx: usize) -> Result<Arc<OccupantRows>, Box<dyn Error>> {
+        let col = self.occupant_col().ok_or("not a long segment")?;
+        if let Some(rows) = self.occupant_rows.lock().unwrap().get(&rg_idx) {
+            return Ok(Arc::clone(rows));
+        }
+        let occupants = read_counter_values_per_rg(self, rg_idx, col)?;
+        let mut index: OccupantRows = HashMap::new();
+        for (row, occ) in occupants.iter().enumerate() {
+            if let Some(occ) = occ {
+                index.entry(*occ).or_default().push(row as u32);
+            }
+        }
+        let index = Arc::new(index);
+        self.occupant_rows
+            .lock()
+            .unwrap()
+            .insert(rg_idx, Arc::clone(&index));
+        Ok(index)
+    }
+
+    /// The rows of row group `rg_idx` that can hold any of `occupants`, from
+    /// the page index's bounds on the `occupant` column, when reading only
+    /// those is worth it; `None` means decode the whole group.
+    ///
+    /// Worth it means: this is a long segment written with a page index, the
+    /// read wants at most [`PRUNE_MAX_OCCUPANTS`], and the kept pages are at
+    /// most 1/[`PRUNE_MAX_FRACTION`] of the group. A pruned read bypasses the
+    /// pool's per-column cache, which suits a query reading a few series; a
+    /// query streaming every series says so (`selective: false` on
+    /// `counter_column`) and never gets here. Pruning on page bounds is
+    /// correct in any row order and selective when the segment is sorted by
+    /// occupant.
+    fn occupant_selection(&self, rg_idx: usize, occupants: &[u64]) -> Option<RowSelection> {
+        let col = self.occupant_col()?;
+        if occupants.is_empty() || occupants.len() > PRUNE_MAX_OCCUPANTS {
+            return None;
+        }
+        let meta = self.page_meta()?;
+        let md = meta.metadata();
+        let index = md.column_index()?.get(rg_idx)?.get(col)?;
+        let locations = md.offset_index()?.get(rg_idx)?.get(col)?.page_locations();
+        let parquet::file::page_index::column_index::ColumnIndexMetaData::INT64(bounds) = index
+        else {
+            return None;
+        };
+        let rows = md.row_group(rg_idx).num_rows() as usize;
+        let mut selectors = Vec::with_capacity(locations.len());
+        let mut kept = 0usize;
+        for (page, loc) in locations.iter().enumerate() {
+            let first = loc.first_row_index as usize;
+            let next = locations
+                .get(page + 1)
+                .map(|l| l.first_row_index as usize)
+                .unwrap_or(rows);
+            let keep = match (bounds.min_value(page), bounds.max_value(page)) {
+                (Some(lo), Some(hi)) => occupants
+                    .iter()
+                    .any(|o| (*lo as u64) <= *o && *o <= (*hi as u64)),
+                _ => true,
+            };
+            if keep {
+                kept += next - first;
+                selectors.push(RowSelector::select(next - first));
+            } else {
+                selectors.push(RowSelector::skip(next - first));
+            }
+        }
+        if kept * PRUNE_MAX_FRACTION > rows {
+            return None;
+        }
+        Some(RowSelection::from(selectors))
+    }
+
+    /// The metadata with the page index, for a long segment. Loaded once, and
+    /// only here: a wide file's page index is as wide as the file.
+    fn page_meta(&self) -> Option<&ArrowReaderMetadata> {
+        self.page_meta
+            .get_or_init(|| {
+                self.occupant_col()?;
+                let options = ArrowReaderOptions::new()
+                    .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
+                let loaded = match &self.backing {
+                    ParquetBacking::Bytes(b) => ArrowReaderMetadata::load(b, options),
+                    ParquetBacking::File(f) => ArrowReaderMetadata::load(f, options),
+                };
+                match loaded {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::warn!(source_id = self.id, error = %e, "loading a long segment's page index");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Decode `cols` of row group `rg_idx`, only the rows `selection` keeps.
+    fn read_selected(
+        &self,
+        rg_idx: usize,
+        cols: &[usize],
+        selection: RowSelection,
+    ) -> Result<HashMap<usize, arrow::array::ArrayRef>, Box<dyn Error>> {
+        let meta = self.page_meta().ok_or("no page index")?.clone();
+        let mut cols: Vec<usize> = cols.to_vec();
+        cols.sort_unstable();
+        cols.dedup();
+        let mask = ProjectionMask::roots(
+            meta.metadata().file_metadata().schema_descr(),
+            cols.iter().copied(),
+        );
+        let batches: Vec<arrow::record_batch::RecordBatch> = match &self.backing {
+            ParquetBacking::File(f) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(f.clone(), meta)
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(mask)
+                    .with_row_selection(selection)
+                    .build()?
+                    .collect::<Result<_, _>>()?
+            }
+            ParquetBacking::Bytes(b) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(b.clone(), meta)
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(mask)
+                    .with_row_selection(selection)
+                    .build()?
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        let mut out = HashMap::new();
+        for (i, col) in cols.iter().enumerate() {
+            let parts: Vec<&dyn arrow::array::Array> =
+                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            let joined = if parts.is_empty() {
+                arrow::array::new_empty_array(self.meta.schema().field(*col).data_type())
+            } else {
+                arrow::compute::concat(&parts)?
+            };
+            out.insert(*col, joined);
+        }
+        Ok(out)
+    }
+
     /// `(timestamp, duration)` column positions, resolved once per source.
     fn fixed_cols(&self) -> (Option<usize>, Option<usize>) {
         *self.fixed_cols.get_or_init(|| {
@@ -1573,6 +1774,9 @@ impl ParquetSource {
             pool: None,
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            occupant_rows: Mutex::new(HashMap::new()),
+            page_meta: OnceLock::new(),
         }))
     }
 
@@ -1587,6 +1791,9 @@ impl ParquetSource {
             pool: None,
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            occupant_rows: Mutex::new(HashMap::new()),
+            page_meta: OnceLock::new(),
         }))
     }
 
@@ -1601,6 +1808,9 @@ impl ParquetSource {
             pool: None,
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            occupant_rows: Mutex::new(HashMap::new()),
+            page_meta: OnceLock::new(),
         }))
     }
 
@@ -1616,6 +1826,9 @@ impl ParquetSource {
             pool: Some(pool),
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            occupant_rows: Mutex::new(HashMap::new()),
+            page_meta: OnceLock::new(),
         }))
     }
 
@@ -1633,6 +1846,9 @@ impl ParquetSource {
             pool: Some(pool),
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            occupant_rows: Mutex::new(HashMap::new()),
+            page_meta: OnceLock::new(),
         }))
     }
 
@@ -1647,6 +1863,9 @@ impl ParquetSource {
             pool: Some(pool),
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            occupant_rows: Mutex::new(HashMap::new()),
+            page_meta: OnceLock::new(),
         }))
     }
 
@@ -1772,12 +1991,14 @@ impl ParquetSource {
             })
             .collect();
 
+        let groups = plan_reads(self, &col_descs);
         let cursor = ParquetHistogramCursor {
             pf: Arc::clone(self),
             ts_col_idx,
             start_ns,
             end_ns,
-            col_descs,
+            wanted: wanted_occupants(&groups),
+            groups,
             rg_queue,
             pending: std::collections::VecDeque::new(),
         };
@@ -1857,6 +2078,9 @@ pub(crate) struct ColDesc {
     /// Column index of this metric's acquisition-window width (UInt64 ns),
     /// if present. Resolved as an atomic pair with `begin_col` — see there.
     width_col: Option<usize>,
+    /// In a [long](crate::long) segment, the occupant whose rows of
+    /// `col_idx` are this series. `None` when the column is the series.
+    occupant: Option<u64>,
 }
 
 /// Resolve one metric's acquisition-window sidecar columns as an ATOMIC
@@ -1889,6 +2113,7 @@ fn resolve_window_cols(
 
 fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
     let fields = pf.meta.schema().fields();
+    let occupant_col = pf.occupant_col();
     // Pass 1: window sidecar column indices, keyed by base column name.
     // A column named exactly `:window_begin` / `:window_width` (no base
     // name — `strip_suffix` yields "") is the table-level pair: one shared
@@ -1909,11 +2134,11 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
     let table_begin_col = win_begin.get("").copied();
     let table_width_col = win_width.get("").copied();
     // Pass 2: metric ColDescs, attaching window indices by column name.
-    fields
+    let descs = fields
         .iter()
         .enumerate()
         .filter_map(|(col_idx, field)| {
-            if col_idx == ts_col_idx {
+            if col_idx == ts_col_idx || Some(col_idx) == occupant_col {
                 return None;
             }
             let meta = field.metadata().clone();
@@ -1995,9 +2220,43 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 kind,
                 begin_col,
                 width_col,
+                occupant: None,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    match occupant_col {
+        None => descs,
+        Some(_) => expand_long(pf, descs),
+    }
+}
+
+/// A long segment's column descriptions: each metric column once per
+/// occupant the footer lists, labelled with [`crate::long::OCCUPANT_LABEL`].
+/// A malformed list leaves the segment with no series, reported once.
+fn expand_long(pf: &ParquetSource, descs: Vec<ColDesc>) -> Vec<ColDesc> {
+    let rows = pf.meta.metadata().file_metadata().num_rows().max(0) as u64;
+    let list = pf
+        .read_file_metadata_value(crate::long::OCCUPANTS_KEY)
+        .unwrap_or_default();
+    let occupants = match crate::long::decode_occupant_ranges(&list, rows) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(source_id = pf.id, error = %e, "long segment has a malformed occupant list; it presents no series");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(descs.len() * occupants.len());
+    for desc in descs {
+        for &occ in &occupants {
+            let mut d = desc.clone();
+            d.labels
+                .inner
+                .insert(crate::long::OCCUPANT_LABEL.to_string(), occ.to_string());
+            d.occupant = Some(occ);
+            out.push(d);
+        }
+    }
+    out
 }
 
 // ─── Timestamp reader ─────────────────────────────────────────────────────────
@@ -2381,11 +2640,187 @@ fn resolve_window(
 /// reconstructed windows [`read_counters`] produces for it, without the
 /// schema scan that finds it. For a reader that located the column at open
 /// and reads it back one segment at a time.
+/// Where a read gets one row group's columns: the whole group through the
+/// pool's per-column caches, or only the rows a page-index selection kept.
+enum RowSource {
+    Full,
+    Selected(HashMap<usize, arrow::array::ArrayRef>),
+}
+
+impl RowSource {
+    /// For a long read wanting `occupants`: the pruned rows of `cols` if
+    /// [`ParquetSource::occupant_selection`] says pruning is worth it.
+    fn for_occupants(
+        pf: &ParquetSource,
+        rg_idx: usize,
+        occupants: &[u64],
+        cols: impl IntoIterator<Item = Option<usize>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let Some(selection) = pf.occupant_selection(rg_idx, occupants) else {
+            return Ok(RowSource::Full);
+        };
+        let mut want: Vec<usize> = cols.into_iter().flatten().collect();
+        want.extend(pf.occupant_col());
+        Ok(RowSource::Selected(
+            pf.read_selected(rg_idx, &want, selection)?,
+        ))
+    }
+
+    fn timestamps(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_timestamps(pf, rg_idx, col),
+            RowSource::Selected(_) => self.u64s(pf, rg_idx, col),
+        }
+    }
+
+    fn u64s(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_counter_values_per_rg(pf, rg_idx, col),
+            RowSource::Selected(cols) => {
+                let a = cols.get(&col).ok_or("column not in the pruned read")?;
+                let a = a
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or("column is not UInt64")?;
+                Ok(Arc::new(a.iter().collect()))
+            }
+        }
+    }
+
+    fn i64s(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<i64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_gauge_values_per_rg(pf, rg_idx, col),
+            RowSource::Selected(cols) => {
+                let a = cols.get(&col).ok_or("column not in the pruned read")?;
+                let a = a
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("column is not Int64")?;
+                Ok(Arc::new(a.iter().collect()))
+            }
+        }
+    }
+
+    /// The row group's `occupant` column, when a group routes by occupant.
+    fn occupants(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        groups: &[ReadGroup],
+    ) -> Result<Option<Arc<Vec<Option<u64>>>>, Box<dyn Error>> {
+        match groups
+            .iter()
+            .find(|g| g.single.is_none())
+            .and_then(|g| g.occupant_col)
+        {
+            Some(c) => Ok(Some(self.u64s(pf, rg_idx, c)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// The occupants a long read wants, when every group routes by occupant.
+fn wanted_occupants(groups: &[ReadGroup]) -> Vec<u64> {
+    if groups.is_empty() || groups.iter().any(|g| g.single.is_some()) {
+        return Vec::new();
+    }
+    let mut v: Vec<u64> = groups
+        .iter()
+        .flat_map(|g| g.by_occupant.keys().copied())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Every column a grouped read touches, for a pruned decode.
+fn group_columns(groups: &[ReadGroup]) -> Vec<Option<usize>> {
+    groups
+        .iter()
+        .flat_map(|g| [Some(g.col_idx), g.begin_col, g.width_col])
+        .collect()
+}
+
+/// One physical column a read decodes, and which series its rows belong to.
+///
+/// In a wide file a column is one series. In a [long](crate::long) segment
+/// it is many, one per occupant, and a row belongs to the series of the
+/// occupant in the `occupant` column. Grouping by column is what keeps a
+/// long read linear in rows: the column is decoded once and each row is
+/// routed, rather than every series scanning every row.
+struct ReadGroup {
+    col_idx: usize,
+    begin_col: Option<usize>,
+    width_col: Option<usize>,
+    /// The series, when the column is one.
+    single: Option<usize>,
+    /// The series of each occupant, when the column is many.
+    by_occupant: HashMap<u64, usize>,
+    /// The long segment's `occupant` column.
+    occupant_col: Option<usize>,
+}
+
+impl ReadGroup {
+    /// The series row `row` belongs to, if any.
+    fn series(&self, occupants: Option<&[Option<u64>]>, row: usize) -> Option<usize> {
+        match self.single {
+            Some(i) => Some(i),
+            None => {
+                let occ = occupants?.get(row).copied().flatten()?;
+                self.by_occupant.get(&occ).copied()
+            }
+        }
+    }
+}
+
+/// Group `cols` (indices are series positions) by the column they read.
+fn plan_reads(pf: &ParquetSource, cols: &[ColDesc]) -> Vec<ReadGroup> {
+    let occupant_col = pf.occupant_col();
+    let mut groups: Vec<ReadGroup> = Vec::new();
+    let mut at: HashMap<usize, usize> = HashMap::new();
+    for (i, c) in cols.iter().enumerate() {
+        let g = *at.entry(c.col_idx).or_insert_with(|| {
+            groups.push(ReadGroup {
+                col_idx: c.col_idx,
+                begin_col: c.begin_col,
+                width_col: c.width_col,
+                single: None,
+                by_occupant: HashMap::new(),
+                occupant_col,
+            });
+            groups.len() - 1
+        });
+        match c.occupant {
+            None => groups[g].single = Some(i),
+            Some(occ) => {
+                groups[g].by_occupant.insert(occ, i);
+            }
+        }
+    }
+    groups
+}
+
 fn read_counter_column(
     pf: &ParquetSource,
     at: &crate::ColumnPosition,
     start_ns: u64,
     end_ns: u64,
+    selective: bool,
 ) -> Result<crate::ColumnChunk, Box<dyn Error>> {
     let (ts_col_idx, dur_col_idx) = pf.fixed_cols();
     let ts_col_idx = ts_col_idx.ok_or("missing timestamp")?;
@@ -2408,19 +2843,46 @@ fn read_counter_column(
             RgClass::Before | RgClass::After => continue,
             _ => {}
         }
-        let ts = read_timestamps(pf, rg_idx, ts_col_idx)?;
-        let vals = read_counter_values_per_rg(pf, rg_idx, col_idx)?;
-        let durations = dur_col_idx
-            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
-            .transpose()?;
-        let begins = begin_col
-            .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
-            .transpose()?;
-        let widths = width_col
-            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
-            .transpose()?;
-        for (row, (ts_opt, val_opt)) in ts.iter().zip(vals.iter()).enumerate() {
-            let (Some(base), Some(v)) = (ts_opt, val_opt) else {
+        // In a long segment the column holds many series. Read only the
+        // pages that can hold this one's rows when that is worth it, and
+        // visit only its rows either way.
+        let src = match at.occupant.filter(|_| selective) {
+            Some(occ) => RowSource::for_occupants(
+                pf,
+                rg_idx,
+                &[occ],
+                [
+                    Some(ts_col_idx),
+                    Some(col_idx),
+                    begin_col,
+                    width_col,
+                    dur_col_idx,
+                ],
+            )?,
+            None => RowSource::Full,
+        };
+        let ts = src.timestamps(pf, rg_idx, ts_col_idx)?;
+        let vals = src.u64s(pf, rg_idx, col_idx)?;
+        let rows: Box<dyn Iterator<Item = usize>> = match (&src, at.occupant) {
+            (RowSource::Selected(_), Some(occ)) => {
+                let col = pf.occupant_col().ok_or("not a long segment")?;
+                let occupants = src.u64s(pf, rg_idx, col)?;
+                let mine: Vec<usize> = (0..occupants.len())
+                    .filter(|r| occupants[*r] == Some(occ))
+                    .collect();
+                Box::new(mine.into_iter())
+            }
+            (RowSource::Full, Some(occ)) => match pf.occupant_rows(rg_idx)?.get(&occ) {
+                Some(rows) => Box::new(rows.clone().into_iter().map(|r| r as usize)),
+                None => continue,
+            },
+            (_, None) => Box::new(0..ts.len()),
+        };
+        let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        let begins = begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
+        let widths = width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        for row in rows {
+            let (Some(Some(base)), Some(Some(v))) = (ts.get(row), vals.get(row)) else {
                 continue;
             };
             let base = *base;
@@ -2480,6 +2942,8 @@ fn read_counters(
     if cols.is_empty() {
         return Ok(Counters { series: vec![] });
     }
+    let groups = plan_reads(pf, &cols);
+    let wanted = wanted_occupants(&groups);
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
@@ -2506,35 +2970,40 @@ fn read_counters(
             RgClass::Before | RgClass::After => continue,
             _ => {}
         }
-        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx)?;
+        let src = RowSource::for_occupants(
+            pf,
+            rg_idx,
+            &wanted,
+            group_columns(&groups)
+                .into_iter()
+                .chain([Some(ts_col_idx), dur_col_idx]),
+        )?;
+        let timestamps = src.timestamps(pf, rg_idx, ts_col_idx)?;
         // Window offsets were written by the recorder relative to the row's
         // own timestamp, which is what `read_timestamps` now returns — so the
         // column this reconstructs windows against and the column the point is
         // emitted at are the same one. They were not while the read path
         // snapped, which is why this used to decode the column a second time.
         // Per-snapshot collection duration for the fleet fallback window.
-        let durations = dur_col_idx
-            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
-            .transpose()?;
-        for (i, col) in cols.iter().enumerate() {
-            let values = read_counter_values_per_rg(pf, rg_idx, col.col_idx)?;
+        let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        let occupants = src.occupants(pf, rg_idx, &groups)?;
+        for g in &groups {
+            let values = src.u64s(pf, rg_idx, g.col_idx)?;
             debug_assert_eq!(
                 values.len(),
                 timestamps.len(),
                 "row count mismatch in row group"
             );
-            let begins = col
-                .begin_col
-                .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
-                .transpose()?;
-            let widths = col
-                .width_col
-                .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
-                .transpose()?;
+            let begins = g.begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
+            let widths = g.width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
             for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
                     let base = *ts;
                     if base >= start_ns && base <= end_ns {
+                        let Some(i) = g.series(occupants.as_ref().map(|o| o.as_slice()), row)
+                        else {
+                            continue;
+                        };
                         // One timestamp, both modes: the row's own. `raw`
                         // still selects point PLACEMENT in the streaming
                         // layer (see `Placement`), but there is no longer a
@@ -2604,6 +3073,8 @@ fn read_gauges(
     if cols.is_empty() {
         return Ok(Gauges { series: vec![] });
     }
+    let groups = plan_reads(pf, &cols);
+    let wanted = wanted_occupants(&groups);
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
     let mut val_acc: Vec<Vec<i64>> = vec![Vec::new(); cols.len()];
@@ -2628,31 +3099,36 @@ fn read_gauges(
             RgClass::Before | RgClass::After => continue,
             _ => {}
         }
-        let timestamps = read_timestamps(pf, rg_idx, ts_col_idx)?;
+        let src = RowSource::for_occupants(
+            pf,
+            rg_idx,
+            &wanted,
+            group_columns(&groups)
+                .into_iter()
+                .chain([Some(ts_col_idx), dur_col_idx]),
+        )?;
+        let timestamps = src.timestamps(pf, rg_idx, ts_col_idx)?;
         // See read_counters: the window anchor and the emitted point are the
         // same timestamp now that nothing rounds it.
-        let durations = dur_col_idx
-            .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
-            .transpose()?;
-        for (i, col) in cols.iter().enumerate() {
-            let values = read_gauge_values_per_rg(pf, rg_idx, col.col_idx)?;
+        let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        let occupants = src.occupants(pf, rg_idx, &groups)?;
+        for g in &groups {
+            let values = src.i64s(pf, rg_idx, g.col_idx)?;
             debug_assert_eq!(
                 values.len(),
                 timestamps.len(),
                 "row count mismatch in row group"
             );
-            let begins = col
-                .begin_col
-                .map(|c| read_gauge_values_per_rg(pf, rg_idx, c))
-                .transpose()?;
-            let widths = col
-                .width_col
-                .map(|c| read_counter_values_per_rg(pf, rg_idx, c))
-                .transpose()?;
+            let begins = g.begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
+            let widths = g.width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
             for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
                 if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
                     let base = *ts;
                     if base >= start_ns && base <= end_ns {
+                        let Some(i) = g.series(occupants.as_ref().map(|o| o.as_slice()), row)
+                        else {
+                            continue;
+                        };
                         // One timestamp, both modes: the row's own. `raw`
                         // still selects point PLACEMENT in the streaming
                         // layer (see `Placement`), but there is no longer a
@@ -2702,8 +3178,11 @@ struct ParquetHistogramCursor {
     ts_col_idx: usize,
     start_ns: u64,
     end_ns: u64,
-    /// Pre-filtered histogram columns for this metric, in series-index order.
-    col_descs: Vec<ColDesc>,
+    /// The columns to decode and the series their rows belong to, indexing
+    /// the pre-filtered histogram columns for this metric (series order).
+    groups: Vec<ReadGroup>,
+    /// In a long segment, the occupants this stream reads, for pruning.
+    wanted: Vec<u64>,
     /// Overlapping row group indices remaining to process.
     rg_queue: std::collections::VecDeque<usize>,
     /// Buffered rows from the current row group (sorted, ready to yield).
@@ -2715,42 +3194,64 @@ impl ParquetHistogramCursor {
     /// Returns false if no more row groups remain.
     fn fill_next_rg(&mut self) -> bool {
         while let Some(rg_idx) = self.rg_queue.pop_front() {
-            let Ok(timestamps) = read_timestamps(&self.pf, rg_idx, self.ts_col_idx) else {
+            // A long read of few occupants decodes only their pages.
+            let Ok(src) = RowSource::for_occupants(
+                &self.pf,
+                rg_idx,
+                &self.wanted,
+                group_columns(&self.groups)
+                    .into_iter()
+                    .chain([Some(self.ts_col_idx)]),
+            ) else {
+                continue;
+            };
+            let Ok(timestamps) = src.timestamps(&self.pf, rg_idx, self.ts_col_idx) else {
                 continue;
             };
 
             let mut rg_rows: Vec<HistogramRow> = Vec::new();
+            let Ok(occupants) = src.occupants(&self.pf, rg_idx, &self.groups) else {
+                continue;
+            };
 
-            for (si, col) in self.col_descs.iter().enumerate() {
-                let ColKind::Histogram { .. } = col.kind else {
-                    continue;
-                };
-
+            for g in &self.groups {
                 let key = CacheKey {
                     source_id: self.pf.id,
-                    column_idx: col.col_idx,
+                    column_idx: g.col_idx,
                     row_group_idx: rg_idx,
                 };
 
-                let snapshots: Arc<Vec<HistogramSnapshot>> = if let Some(pool) = &self.pf.pool {
+                let snapshots: Arc<Vec<HistogramSnapshot>> = if let RowSource::Selected(cols) = &src
+                {
+                    match cols
+                        .get(&g.col_idx)
+                        .and_then(|a| a.as_any().downcast_ref::<ListArray>())
+                    {
+                        Some(list) => Arc::new(snapshots_of(list)),
+                        None => continue,
+                    }
+                } else if let Some(pool) = &self.pf.pool {
                     if let Some(cached) = pool.get_histogram_snapshots(key) {
                         cached
                     } else {
-                        let decoded = Arc::new(self.decode_histogram_column(rg_idx, col.col_idx));
+                        let decoded = Arc::new(self.decode_histogram_column(rg_idx, g.col_idx));
                         pool.put_histogram_snapshots(key, Arc::clone(&decoded));
                         decoded
                     }
                 } else {
-                    Arc::new(self.decode_histogram_column(rg_idx, col.col_idx))
+                    Arc::new(self.decode_histogram_column(rg_idx, g.col_idx))
                 };
 
-                for (ts_opt, snap) in timestamps.iter().zip(snapshots.iter()) {
+                for (row, (ts_opt, snap)) in timestamps.iter().zip(snapshots.iter()).enumerate() {
                     let Some(ts) = ts_opt else {
                         continue;
                     };
                     if *ts < self.start_ns || *ts > self.end_ns {
                         continue;
                     }
+                    let Some(si) = g.series(occupants.as_ref().map(|o| o.as_slice()), row) else {
+                        continue;
+                    };
                     rg_rows.push(HistogramRow {
                         series_idx: si,
                         timestamp: *ts,
@@ -2804,19 +3305,7 @@ impl ParquetHistogramCursor {
                     .as_any()
                     .downcast_ref::<ListArray>()
                     .expect("histogram column is not List");
-                for value in list.iter() {
-                    let snap = value
-                        .and_then(|lv| {
-                            lv.as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .map(raw_to_sparse_cumulative)
-                        })
-                        .unwrap_or_else(|| HistogramSnapshot {
-                            index: vec![],
-                            count: vec![],
-                        });
-                    out.push(snap);
-                }
+                out.extend(snapshots_of(list));
             }
             out
         });
@@ -2853,6 +3342,25 @@ impl Iterator for ParquetHistogramCursor {
 }
 
 // ─── Histogram snapshot helper ────────────────────────────────────────────────
+
+/// One snapshot per row of a histogram list column; a null cell is an empty
+/// snapshot.
+fn snapshots_of(list: &ListArray) -> Vec<HistogramSnapshot> {
+    list.iter()
+        .map(|value| {
+            value
+                .and_then(|lv| {
+                    lv.as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(raw_to_sparse_cumulative)
+                })
+                .unwrap_or_else(|| HistogramSnapshot {
+                    index: vec![],
+                    count: vec![],
+                })
+        })
+        .collect()
+}
 
 /// Convert a raw bucket array (individual counts per bucket) into a
 /// sparse cumulative prefix-sum snapshot. Only non-zero buckets are stored.

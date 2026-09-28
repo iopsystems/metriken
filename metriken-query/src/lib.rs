@@ -40,6 +40,7 @@ pub mod display;
 pub(crate) mod histogram_stream;
 pub(crate) mod labels;
 pub(crate) mod lazy;
+pub mod long;
 pub(crate) mod memory;
 pub(crate) mod memory_store;
 pub mod parquet;
@@ -87,6 +88,9 @@ pub struct ColumnPosition {
     pub col_idx: u32,
     pub begin_col: Option<u32>,
     pub width_col: Option<u32>,
+    /// In a [long](crate::long) segment, the occupant whose rows are this
+    /// series; `None` for a column that is one series.
+    pub occupant: Option<u64>,
 }
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
@@ -222,13 +226,19 @@ pub(crate) trait DataSource: Send + Sync {
     }
     /// Read one counter column by its schema position, every row group the
     /// range touches. `None` for a source without a parquet schema.
+    ///
+    /// `selective` says the query reads few series, so a long segment may
+    /// decode only the pages holding this one's rows. An all-series query
+    /// passes `false`, and each segment then decodes a row group once and
+    /// shares it through the pool across the series reading it.
     fn counter_column(
         &self,
         at: &ColumnPosition,
         start_ns: u64,
         end_ns: u64,
+        selective: bool,
     ) -> Option<types::ColumnChunk> {
-        let _ = (at, start_ns, end_ns);
+        let _ = (at, start_ns, end_ns, selective);
         None
     }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
