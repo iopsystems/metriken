@@ -10,6 +10,8 @@
 //! - [`builder`]: growing a wide table row by row.
 //! - [`schema`] and [`window`]: a group's membership and a reading's
 //!   acquisition window, as segments store them.
+//! - [`wal`]: the write-ahead log's row format, and materializing a WAL
+//!   tail into a segment.
 //! - [`long`]: the long layout, one row per (timestamp, occupant).
 //! - [`occupants`]: the stream that says which labels each occupant number
 //!   of a long table stands for.
@@ -19,4 +21,5 @@ pub mod long;
 pub mod occupants;
 pub mod schema;
 pub mod table;
+pub mod wal;
 pub mod window;

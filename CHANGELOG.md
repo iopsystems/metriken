@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-segment 0.1.2
+
+- **Added:** `wal`, the write-ahead log's row format (`WalGroupRow`,
+  `WalCell`, `WalValue`, their msgpack codec), materializing a WAL tail into
+  a segment (`materialize_wal_tail`, over any row type implementing
+  `WalRowSource`), and `wal_group_row_approx_bytes`. Moved from rezolus.
+
+### metriken-exposition 0.21.1
+
+- **Added:** `wal_group_row` (a `GroupSnapshot` as a WAL row) and
+  `group_approx_bytes`, moved from rezolus, with the test pinning
+  `group_approx_bytes` to `wal_group_row_approx_bytes`.
+
 ### metriken-query 0.33.0
 
 - **Changed:** depends on metriken-exposition 0.21.0.
