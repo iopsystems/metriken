@@ -1,9 +1,10 @@
 # The archive writer: dendro archives, long tables, occupant streams
 
-**Status:** Gate run (see "Gate results", below): same answers, 3–9 times
-smaller, a tick tail about ten times shorter; the median tick at 100 ms is
-12–28% worse under an unpaced replay, accepted. Next is rezolus's adoption
-(6.0). Phase 4 of
+**Status:** Gate run on four synthetic recordings and two real hosts (see
+"Gate results", below): same answers, 1.5–9 times smaller, a tick tail
+three to ten times shorter; the median tick at 100 ms is 12–28% worse
+under an unpaced replay, accepted. rezolus's adoption is under way
+(rezolus `docs/journal/2026-09-28-dendro-writer-adoption.md`). Phase 4 of
 [the high-cardinality stack](2026-09-28-high-cardinality-stack.md), and step 3
 of rezolus 6.0 (iopsystems/rezolus#1224).
 
@@ -307,9 +308,95 @@ on the dendro archive, most by a large margin; `sum by (id)
 (irate(cgroup_syscall[5s]))` at 100 ms took 165 s on the `.rez` output and
 2.4 s on the dendro one.
 
-Not run: the busy-host recording (in progress when this was written), and
-a replay paced at the recording's interval, which would separate the
-unpaced replay's backpressure from the writer's own cost at 100 ms.
+### Two real hosts
+
+The same harness on two production recordings, both at 1 s, described as
+in rezolus's layout entry: the **busy host** (agent 5.22.0, 2.3 h, 8,180
+ticks, many short-lived threads) and the **quiet host** (agent 5.18–5.20,
+9.6 h, 34,678 ticks, about 2,530 long-lived threads reporting every tick).
+Every segment of both inputs decoded; neither had unsealed WAL rows.
+
+| host | answers same | size: `.rez` → sorted / arrival | tick p50: `.rez` / sorted / arrival | tick p99 | tick max |
+|---|---|---|---|---|---|
+| busy | 216 / 219 | 545 → 147 / 157 MB | 1.35 / 1.36 / 1.35 ms | 79 / 40 / 36 ms | 2,405 / 256 / 259 ms |
+| quiet | 210 / 210 | 1,126 → 763 / 915 MB | 0.10 / 0.33 / 0.35 ms | 106 / 36 / 33 ms | 728 / 104 / 123 ms |
+
+The timings were taken while other builds ran on the same machine, so they
+are noisier than the synthetic set.
+
+- **The three busy-host differences are the `.rez` writer's.** Its output
+  for the per-task table (`sum`, `count` and `sum by (id)` over
+  `task_cpu_usage`) cannot be read: re-sealed at that writer's own
+  boundaries, a segment crossed arrow-rs's `TooManyTables` limit, and the
+  reader reports the table as evicted. The input recording reads, and its
+  `sum(rate(task_cpu_usage[5s]))` matches the dendro archive's line for
+  line. So on real data the `.rez` writer loses the per-task table and this
+  writer does not.
+- **The quiet host is where long saves least.** Its per-task table is 98%
+  dense: every thread reports every tick. Long arrival is 507 MB and long
+  sorted 345 MB against 663 MB for the `.rez`, the same as rezolus's layout
+  gate measured on that recording (505.4 and 348.7 MB). The value column
+  is 87% of a segment, at 5.9 bytes per value in arrival order and 4.0
+  sorted (PLAIN, LZ4). Cgroup tables still shrink 3–4 times.
+- **Sorting helps on both hosts:** 6% smaller on the busy host and 32% on
+  the quiet one, against 6–20% larger on the synthetic spikes. Arrival
+  order stays the default anyway, to keep the cost at seal low (decided
+  2026-09-28); sorting is left to compaction.
+
+What the per-task table's size is made of, measured on three quiet-host
+segments of about 263,000 rows (value column only, per segment):
+
+| encoding | size |
+|---|---|
+| PLAIN + LZ4 (the writer) | 1,050 kB |
+| PLAIN + zstd | 553 kB |
+| DELTA_BINARY_PACKED + LZ4 | 811 kB |
+| DELTA_BINARY_PACKED + zstd | 798 kB |
+
+A thread's CPU time grows by a median 0.88–0.94 ms per tick (p90
+1.9–2.7 ms), about 20 bits of nanoseconds that delta encoding does not
+remove; 36–44% of readings did not change. zstd halves the column; its
+encode cost at seal is not measured.
+
+**Segment length does not change it.** Re-encoding 1, 4, 16 and 64
+consecutive quiet-host segments as one (104 to 6,656 ticks) moved the value
+column from 4.35 to 4.21 bytes per row under LZ4 and from 2.34 to 2.21
+under zstd. Sorted by occupant, a longer segment is *larger* overall under
+LZ4 (4.69 to 8.63 bytes per row), because each occupant's run restarts the
+timestamp and window columns and the repeat falls outside LZ4's 64 kB
+window. Sorting at compaction into long segments therefore needs zstd, or
+delta-encoded time columns, to pay off.
+
+**zstd at seal, measured.** The writer re-run in arrival order with each
+codec, on an otherwise idle machine; encode time is the writer thread's
+time in the encoder, over every seal.
+
+| recording | codec | size | encode total | mean / worst seal | tick p99 / max | query time, answers |
+|---|---|---|---|---|---|---|
+| busy host, 1 s | LZ4 | 157.4 MB | 5.56 s | 8.7 / 200 ms | 32 / 231 ms | 22.6 s |
+| | zstd-1 | 98.3 MB | 5.94 s | 9.3 / 202 ms | 34 / 228 ms | 22.6 s, 71 / 71 same |
+| | zstd-3 | 71.3 MB | 5.79 s | 9.0 / 206 ms | 31 / 232 ms | 22.6 s, 71 / 71 same |
+| heavy spike, 100 ms | LZ4 | 121.0 MB | 6.61 s | 11.2 / 157 ms | 30 / 162 ms | 17.6 s |
+| | zstd-1 | 77.1 MB | 7.10 s | 12.0 / 158 ms | 31 / 160 ms | 17.3 s, 69 / 69 same |
+| | zstd-3 | 52.5 MB | 6.81 s | 11.5 / 161 ms | 27 / 166 ms | 17.5 s, 69 / 69 same |
+| quiet host, 1 s | LZ4 | 915.4 MB | 22.97 s | 9.2 / 108 ms | 35 / 123 ms | 32.8 s |
+| | zstd-1 | 521.8 MB | 24.35 s | 9.7 / 105 ms | 35 / 126 ms | 32.5 s, 72 / 72 same |
+| | zstd-3 | 389.5 MB | 23.62 s | 9.4 / 102 ms | 32 / 154 ms | 32.5 s, 72 / 72 same |
+
+zstd-3 is 55–57% smaller than LZ4 on all three, for 3–4% more encode
+time; on the quiet host that makes the archive 2.9 times smaller than the
+`.rez` (1,126 MB); a seal's
+worst case is the WAL decode and table build, not the codec. Tick latency
+and query time do not move. So the writer seals with zstd-3
+(`WriterConfig::compression`, metriken#191). Readers already decode zstd
+(metriken-query enables it). A reader rebuilds a table's unsealed tail
+with zstd-3 too: `ArchiveReader` holds that segment in memory while it is
+open, so the smaller encoding is the smaller resident footprint, at about
+the same encode cost. (Leaving it uncompressed would save the encode and
+cost the most memory.)
+
+Not run: a replay paced at the recording's interval, which would separate
+the unpaced replay's backpressure from the writer's own cost at 100 ms.
 
 ## Not in this change
 
