@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Long segments: one row per observation, keyed by occupant.** A parquet
+  file whose key-value metadata has `metriken.layout = "long"` holds a
+  `UInt64` `occupant` column and one column per metric, and lists its
+  occupants in its footer (`metriken.occupants`, ascending ranges). Each
+  metric column and occupant reads as one series labelled `__occupant__`,
+  so the segmented reader, unions and PromQL see ordinary series; a
+  `ColumnRelabel` supplies the occupant's labels. Open stays footer-only.
+  The `long` module has the key names and `encode_occupant_ranges` for
+  writers. Measured on a per-thread table of 396,117 threads over 2.3 h:
+  `sum(rate(...))` took 2.8 s over long segments against 55 s over the same
+  data one column per thread. See `docs/journal/2026-09-28-long-segments.md`.
+
+### Changed
+
+- `ColumnPosition` has an `occupant` field (`None` for a column that is one
+  series).
+
 ## [0.30.0] - 2026-09-23
 
 ### Added

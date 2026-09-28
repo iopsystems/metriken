@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.31.0
+
+- **Added:** long segments. A file marked `metriken.layout = "long"` holds
+  one row per (timestamp, occupant) and one column per metric; each metric
+  column and occupant reads as one series labelled `__occupant__`.
+- **Changed:** `ColumnPosition` has an `occupant` field.
+
 ### metriken-query 0.30.0
 
 - **Added:** `CompositionSource::lazy` and `CompositionCatalog`: a

@@ -40,6 +40,7 @@ pub mod display;
 pub(crate) mod histogram_stream;
 pub(crate) mod labels;
 pub(crate) mod lazy;
+pub mod long;
 pub(crate) mod memory;
 pub(crate) mod memory_store;
 pub mod parquet;
@@ -87,6 +88,9 @@ pub struct ColumnPosition {
     pub col_idx: u32,
     pub begin_col: Option<u32>,
     pub width_col: Option<u32>,
+    /// In a [long](crate::long) segment, the occupant whose rows are this
+    /// series; `None` for a column that is one series.
+    pub occupant: Option<u64>,
 }
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 
