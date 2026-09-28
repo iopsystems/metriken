@@ -78,7 +78,7 @@ pub(crate) enum Block {
     Timestamps(Arc<Vec<Option<u64>>>),
     CounterValues(Arc<Vec<Option<u64>>>),
     GaugeValues(Arc<Vec<Option<i64>>>),
-    HistogramSnapshots(Arc<Vec<HistogramSnapshot>>),
+    HistogramSnapshots(Arc<Vec<Option<HistogramSnapshot>>>),
 }
 
 impl BufferPool {
@@ -202,7 +202,7 @@ impl BufferPool {
     pub(crate) fn get_histogram_snapshots(
         &self,
         key: CacheKey,
-    ) -> Option<Arc<Vec<HistogramSnapshot>>> {
+    ) -> Option<Arc<Vec<Option<HistogramSnapshot>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
             if let Block::HistogramSnapshots(v) = &entry.data {
@@ -219,9 +219,14 @@ impl BufferPool {
         result
     }
 
-    pub(crate) fn put_histogram_snapshots(&self, key: CacheKey, data: Arc<Vec<HistogramSnapshot>>) {
+    pub(crate) fn put_histogram_snapshots(
+        &self,
+        key: CacheKey,
+        data: Arc<Vec<Option<HistogramSnapshot>>>,
+    ) {
         let size: usize = data
             .iter()
+            .flatten()
             .map(|s| {
                 s.index.len() * std::mem::size_of::<u32>()
                     + s.count.len() * std::mem::size_of::<u64>()

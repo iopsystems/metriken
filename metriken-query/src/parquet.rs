@@ -3221,29 +3221,29 @@ impl ParquetHistogramCursor {
                     row_group_idx: rg_idx,
                 };
 
-                let snapshots: Arc<Vec<HistogramSnapshot>> = if let RowSource::Selected(cols) = &src
-                {
-                    match cols
-                        .get(&g.col_idx)
-                        .and_then(|a| a.as_any().downcast_ref::<ListArray>())
-                    {
-                        Some(list) => Arc::new(snapshots_of(list)),
-                        None => continue,
-                    }
-                } else if let Some(pool) = &self.pf.pool {
-                    if let Some(cached) = pool.get_histogram_snapshots(key) {
-                        cached
+                let snapshots: Arc<Vec<Option<HistogramSnapshot>>> =
+                    if let RowSource::Selected(cols) = &src {
+                        match cols
+                            .get(&g.col_idx)
+                            .and_then(|a| a.as_any().downcast_ref::<ListArray>())
+                        {
+                            Some(list) => Arc::new(snapshots_of(list)),
+                            None => continue,
+                        }
+                    } else if let Some(pool) = &self.pf.pool {
+                        if let Some(cached) = pool.get_histogram_snapshots(key) {
+                            cached
+                        } else {
+                            let decoded = Arc::new(self.decode_histogram_column(rg_idx, g.col_idx));
+                            pool.put_histogram_snapshots(key, Arc::clone(&decoded));
+                            decoded
+                        }
                     } else {
-                        let decoded = Arc::new(self.decode_histogram_column(rg_idx, g.col_idx));
-                        pool.put_histogram_snapshots(key, Arc::clone(&decoded));
-                        decoded
-                    }
-                } else {
-                    Arc::new(self.decode_histogram_column(rg_idx, g.col_idx))
-                };
+                        Arc::new(self.decode_histogram_column(rg_idx, g.col_idx))
+                    };
 
                 for (row, (ts_opt, snap)) in timestamps.iter().zip(snapshots.iter()).enumerate() {
-                    let Some(ts) = ts_opt else {
+                    let (Some(ts), Some(snap)) = (ts_opt, snap) else {
                         continue;
                     };
                     if *ts < self.start_ns || *ts > self.end_ns {
@@ -3272,7 +3272,11 @@ impl ParquetHistogramCursor {
     /// Decode all rows for one histogram column in one row group.
     /// Returns an empty Vec on panic or read error (the streaming operator
     /// will then see no data for that column in that row group).
-    fn decode_histogram_column(&self, rg_idx: usize, col_idx: usize) -> Vec<HistogramSnapshot> {
+    fn decode_histogram_column(
+        &self,
+        rg_idx: usize,
+        col_idx: usize,
+    ) -> Vec<Option<HistogramSnapshot>> {
         let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
         let Ok(reader) = self
             .pf
@@ -3343,21 +3347,21 @@ impl Iterator for ParquetHistogramCursor {
 
 // ─── Histogram snapshot helper ────────────────────────────────────────────────
 
-/// One snapshot per row of a histogram list column; a null cell is an empty
-/// snapshot.
-fn snapshots_of(list: &ListArray) -> Vec<HistogramSnapshot> {
+/// One snapshot per row of a histogram list column; `None` for a null cell.
+///
+/// A null cell is a row where the series has no value (a wide table's column
+/// for a member absent that tick), not a histogram of zeros. Reading it as
+/// zeros made the series' next value count as an increase from zero, so a
+/// member's first reading was counted in full or not at all depending on
+/// whether an earlier row of the same segment held a null for it.
+fn snapshots_of(list: &ListArray) -> Vec<Option<HistogramSnapshot>> {
     list.iter()
         .map(|value| {
-            value
-                .and_then(|lv| {
-                    lv.as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .map(raw_to_sparse_cumulative)
-                })
-                .unwrap_or_else(|| HistogramSnapshot {
-                    index: vec![],
-                    count: vec![],
-                })
+            value.and_then(|lv| {
+                lv.as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .map(raw_to_sparse_cumulative)
+            })
         })
         .collect()
 }

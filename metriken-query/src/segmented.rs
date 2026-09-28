@@ -1709,7 +1709,22 @@ mod tests {
         labels: &[(&str, &str)],
         rows: &[(u64, Vec<u64>)],
     ) -> Vec<u8> {
+        let rows: Vec<(u64, Option<Vec<u64>>)> =
+            rows.iter().map(|(t, b)| (*t, Some(b.clone()))).collect();
+        segment_histogram_nullable(name, grouping_power, max_value_power, labels, &rows)
+    }
+
+    /// [`segment_histogram_labeled`] where a row's cell may be null: a
+    /// member absent that tick, as a wide table stores it.
+    fn segment_histogram_nullable(
+        name: &str,
+        grouping_power: u8,
+        max_value_power: u8,
+        labels: &[(&str, &str)],
+        rows: &[(u64, Option<Vec<u64>>)],
+    ) -> Vec<u8> {
         use arrow::array::ListArray;
+        use arrow::buffer::NullBuffer;
         use arrow::buffer::OffsetBuffer;
 
         let mut meta = HashMap::new();
@@ -1748,14 +1763,15 @@ mod tests {
         let mut offsets: Vec<i32> = vec![0];
         let mut flat: Vec<u64> = Vec::new();
         for (_, buckets) in rows {
-            flat.extend(buckets);
+            flat.extend(buckets.iter().flatten());
             offsets.push(flat.len() as i32);
         }
+        let valid = NullBuffer::from_iter(rows.iter().map(|(_, b)| b.is_some()));
         let list = ListArray::new(
             item,
             OffsetBuffer::new(offsets.into()),
             Arc::new(UInt64Array::from(flat)),
-            None,
+            Some(valid),
         );
         let batch = RecordBatch::try_new(
             schema,
@@ -2665,6 +2681,44 @@ mod tests {
         };
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].values, vec![(3.0, 35.0), (4.0, 50.0)]);
+    }
+
+    #[test]
+    fn a_null_histogram_cell_is_no_sample() {
+        // A member that is absent for the first two rows of a segment, then
+        // reads 5, 6 and 8. Its first reading has nothing before it, so the
+        // answer is the same as when the segment starts at that reading.
+        let n = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let cell = |count: u64| {
+            let mut buckets = vec![0u64; n];
+            buckets[5] = count;
+            Some(buckets)
+        };
+        let deltas = |rows: &[(u64, Option<Vec<u64>>)]| {
+            let seg = segment_histogram_nullable("latency", 2, 8, &[], rows);
+            let pool = BufferPool::new(64 * 1024 * 1024);
+            let r = SegmentedParquetReader::open_bytes_with_pool(vec![seg], pool).unwrap();
+            let QueryResult::Matrix { result } = r
+                .query_range("histogram_irate(latency)", 1.0, 5.0, 1.0)
+                .unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            result[0].values.clone()
+        };
+        let with_nulls = deltas(&[
+            (1_000_000_000, None),
+            (2_000_000_000, None),
+            (3_000_000_000, cell(5)),
+            (4_000_000_000, cell(6)),
+            (5_000_000_000, cell(8)),
+        ]);
+        let without = deltas(&[
+            (3_000_000_000, cell(5)),
+            (4_000_000_000, cell(6)),
+            (5_000_000_000, cell(8)),
+        ]);
+        assert_eq!(with_nulls, without);
     }
 
     #[test]
