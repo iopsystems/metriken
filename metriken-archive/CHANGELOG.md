@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `SourceRecorder::update_metadata`: merge a patch into a source's metadata
+  while it records, ordered with the ticks around it. For facts learned
+  during a recording, such as the events marking where a wrapped command
+  started and ended (dendro's `SourceWriter::update_metadata`).
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

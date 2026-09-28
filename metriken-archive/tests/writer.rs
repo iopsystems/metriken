@@ -296,3 +296,52 @@ fn long_and_wide_answer_the_same_from_the_live_tail() {
 fn long_and_wide_answer_the_same_after_eviction() {
     compare(true, Some(19));
 }
+
+/// Metadata patched during a recording reads back with the source, merged
+/// into what it started with: live after a sync, and after finalize.
+#[test]
+fn metadata_patched_during_a_recording_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.dendro");
+    let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let metadata = [("version".to_string(), "1.0".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, metadata, BASE).unwrap();
+    let events = |n: usize| {
+        (
+            "events".to_string(),
+            format!(
+                r#"{{"events":[{}]}}"#,
+                vec![r#"{"kind":"run_start"}"#; n].join(",")
+            ),
+        )
+    };
+    for t in 0..4 {
+        let staged = source.stage(&snapshot(t), BASE + t * S, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        if t == 1 {
+            source
+                .update_metadata([events(1)].into_iter().collect())
+                .unwrap();
+        }
+        source.maybe_seal().unwrap();
+    }
+    source.sync().unwrap();
+    let live = open(&path);
+    assert_eq!(live.metadata_get("events"), Some(events(1).1));
+    assert_eq!(live.metadata_get("version").as_deref(), Some("1.0"));
+
+    // The last patch before finalize replaces the key, and is kept.
+    source
+        .update_metadata([events(2)].into_iter().collect())
+        .unwrap();
+    source.finalize((BASE + 3 * S, 0)).unwrap();
+    writer.join().unwrap();
+    let done = open(&path);
+    assert_eq!(done.metadata_get("events"), Some(events(2).1));
+    assert_eq!(done.metadata_get("version").as_deref(), Some("1.0"));
+}
