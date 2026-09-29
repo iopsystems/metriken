@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken (unreleased)
+### metriken 0.11.2
 
 - **Added:** `epoch`, the process's producer epoch (a v4 UUID minted once per
   process) and the clock anchor its timestamps are relative to, moved from
