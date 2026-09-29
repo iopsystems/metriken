@@ -448,9 +448,9 @@ dependencies = [
 
 [[package]]
 name = "dendro"
-version = "0.3.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d36bb8f4a447e9b333db42ed36ccb9b8d2364315058982eb928ace21a065b431"
+checksum = "c3419fe24f3f8320b68db8642bab7a6b9c9a86d99ce34539712338509f63796d"
 dependencies = [
  "arrow",
  "bytes",
@@ -997,6 +997,7 @@ dependencies = [
 name = "metriken-archive"
 version = "0.2.5"
 dependencies = [
+ "arrow",
  "bytes",
  "dendro",
  "histogram",

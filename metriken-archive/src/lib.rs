@@ -14,11 +14,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod catalog;
+pub mod filter;
 pub mod reader;
 #[cfg(feature = "write")]
 pub mod writer;
 
 pub use catalog::{Catalog, DendroCatalog};
+pub use filter::KeepMetrics;
 pub use parquet::basic::{Compression, ZstdLevel};
 
 /// The codec for every segment this crate encodes: the writer's sealed
@@ -31,10 +33,10 @@ pub fn default_compression() -> Compression {
     Compression::ZSTD(ZstdLevel::try_new(3).expect("3 is a valid zstd level"))
 }
 
-/// The segment format's parquet writer properties with `compression`.
-pub(crate) fn segment_props(
-    compression: Compression,
-) -> parquet::file::properties::WriterProperties {
+/// The segment format's parquet writer properties with `compression`: what
+/// a caller re-encoding a segment (a column projection) passes so the result
+/// matches a sealed one.
+pub fn segment_props(compression: Compression) -> parquet::file::properties::WriterProperties {
     metriken_segment::table::segment_writer_props()
         .into_builder()
         .set_compression(compression)
