@@ -14,12 +14,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod catalog;
+pub mod encoder;
 pub mod filter;
 pub mod reader;
 #[cfg(feature = "write")]
 pub mod writer;
 
 pub use catalog::{Catalog, DendroCatalog};
+pub use encoder::Encoder;
 pub use filter::KeepMetrics;
 pub use parquet::basic::{Compression, ZstdLevel};
 
