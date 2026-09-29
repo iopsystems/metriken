@@ -580,3 +580,81 @@ fn sealed_segments_use_the_configured_codec() {
     writer.join().unwrap();
     assert_eq!(codecs(&lz4), BTreeSet::from(["LZ4_RAW".to_string()]));
 }
+
+/// A copy trimmed to some metrics keeps a long table long: its `occupant`
+/// column, its layout markers, and its occupant stream whole. The kept
+/// metric answers the same; the others are gone. A table left with no kept
+/// metric is dropped by the copy, and its occupant stream is not.
+#[test]
+fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
+    use dendro::archive::{Archive, ArchiveMut};
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    use metriken_archive::writer::Encoder;
+    use metriken_archive::{default_compression, segment_props, KeepMetrics};
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    record(&src_path, true, true, None);
+    let src = Archive::open(&src_path).unwrap();
+    let mut names = Vec::new();
+    for s in src.read_sources().unwrap() {
+        names.extend(src.all_streams(s.id).unwrap());
+    }
+    let copy = |metrics: &[&str], dest: &Path| {
+        let metrics: BTreeSet<String> = metrics.iter().map(|m| m.to_string()).collect();
+        let keep = KeepMetrics::new(&metrics);
+        let spec = CopySpec {
+            keep_columns: Some(&keep),
+            writer_props: Some(segment_props(default_compression())),
+            ..CopySpec::everything()
+        };
+        let encoder = Encoder::for_streams(names.iter().map(String::as_str));
+        let mut dst = ArchiveMut::create(dest).unwrap();
+        dst.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
+            .unwrap();
+    };
+
+    let cpu = dir.path().join("cpu.dendro");
+    copy(&["cpu_time"], &cpu);
+    let mut kept = streams(&cpu);
+    kept.sort();
+    assert_eq!(
+        kept,
+        vec![
+            "threads/tasks".to_string(),
+            "threads/tasks/occupants".to_string()
+        ]
+    );
+    let (a, b) = (open(&src_path), open(&cpu));
+    for q in [
+        "rate(cpu_time[3s])",
+        "sum by (comm) (rate(cpu_time[3s]))",
+        "irate(cpu_time{__uid__=\"c0\"}[3s])",
+    ] {
+        let (x, y) = (answer(&a, q, 0).unwrap(), answer(&b, q, 0).unwrap());
+        assert_eq!(x.0, y.0, "{q}");
+        if !q.starts_with("sum") {
+            assert!(
+                y.1,
+                "{q}: still a long table, its series carry __occupant__"
+            );
+        }
+    }
+    assert!(
+        answer(&b, "rate(syscalls[3s])", 0).is_err(),
+        "syscalls is gone"
+    );
+
+    let mem = dir.path().join("mem.dendro");
+    copy(&["mem_free"], &mem);
+    let mut kept = streams(&mem);
+    kept.sort();
+    assert_eq!(
+        kept,
+        vec![
+            "memory/meminfo".to_string(),
+            "threads/tasks/occupants".to_string()
+        ],
+        "the long table had no kept metric; its occupant stream is the caller's to remove"
+    );
+}

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `KeepMetrics`, a dendro `ColumnFilter` for a copy trimmed to some
+  metrics (`CopySpec::keep_columns`). It keeps every column a segment
+  needs to place its rows (timestamps, windows, a long table's `occupant`),
+  a value column by its name, its base before `:`, or its `metric`
+  metadata, and a per-metric window with its metric; occupant streams are
+  copied whole (`projects`). Needs dendro 0.3.3, whose projection keeps a
+  long segment's layout markers.
+- `segment_props` is public: the writer properties a re-encoding caller
+  passes so a projected segment matches a sealed one.
+
+### Changed
+
+- dendro 0.3.3.
+
 ## [0.2.5] - 2026-09-28
 
 ### Changed
