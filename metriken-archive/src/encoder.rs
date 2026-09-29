@@ -140,12 +140,14 @@ impl SegmentEncoder for Encoder {
         .map_err(boxed)?;
         // dendro counts the WAL rows a segment consumes; a long segment has
         // one parquet row per occupant, so `t.rows` is not that count.
+        // The names fingerprint, so a reader probes one footer per distinct
+        // set of metric names rather than only the table's first.
         Ok(tail.map(|t| Segment {
+            index: crate::names::index_of(&t.bytes),
             bytes: t.bytes,
             rows: rows.len() as u64,
             first_ts: rows[0].ts,
             last_ts,
-            index: None,
         }))
     }
 

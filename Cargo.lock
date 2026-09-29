@@ -1077,6 +1077,7 @@ dependencies = [
  "histogram",
  "metriken",
  "parquet",
+ "rmp",
  "rmp-serde",
  "serde",
  "tracing",

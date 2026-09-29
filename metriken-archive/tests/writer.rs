@@ -729,3 +729,120 @@ fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
     .expect("an unknown encoder is refused");
     assert!(err.to_string().contains("\"metriken-archive/2\""), "{err}");
 }
+
+/// A tick of two groups whose metric sets grow: `memory/meminfo` (wide)
+/// gains `swap_free` at tick 7, `threads/tasks` (long) gains `ctx_switches`
+/// at tick 12, and `memory/meminfo` gains `dirty` at tick 21, after the
+/// last seal of a live recording.
+fn growing(t: u64) -> Snapshot {
+    let ts = BASE + t * S;
+    let window = Some(metriken::Window::new(ts - S / 2, ts));
+    let gauge = |name: &str, metric: &str| MetricDesc {
+        name: name.to_string(),
+        metadata: [("metric", metric), ("sampler", "memory")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let mut mem = GroupSchema::default();
+    let mut gauges = vec![Some(1_000 - t as i64)];
+    mem.gauges.push(gauge("9", "mem_free"));
+    if t >= 7 {
+        mem.gauges.push(gauge("10", "swap_free"));
+        gauges.push(Some(500 + t as i64));
+    }
+    if t >= 21 {
+        mem.gauges.push(gauge("11", "dirty"));
+        gauges.push(Some(t as i64));
+    }
+    let mut tasks = GroupSchema::default();
+    let mut counters = Vec::new();
+    for occ @ (slot, _, pid, _) in occupants(t) {
+        tasks
+            .counters
+            .push(desc(format!("0x{slot}"), "cpu_time", &[], occ));
+        counters.push(Some(t * 1000 + pid));
+        if t >= 12 {
+            tasks
+                .counters
+                .push(desc(format!("4x{slot}"), "ctx_switches", &[], occ));
+            counters.push(Some(t * 7 + pid));
+        }
+    }
+    let group = |name: &str, schema: GroupSchema, counters, gauges| GroupSnapshot {
+        name: name.to_string(),
+        schema_hash: schema.hash(),
+        schema: Some(Arc::new(schema)),
+        window,
+        counters,
+        gauges,
+        histograms: Vec::new(),
+    };
+    Snapshot::V3(SnapshotV3 {
+        systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+        duration: Duration::from_millis(1),
+        metadata: HashMap::new(),
+        groups: vec![
+            group("threads/tasks", tasks, counters, Vec::new()),
+            group("memory/meminfo", mem, Vec::new(), gauges),
+        ],
+    })
+}
+
+/// A metric that first appears in a later segment of a table, or only in its
+/// live tail, is found: the reader routes a query by every segment's names,
+/// not the first segment's.
+#[test]
+fn a_metric_that_first_appears_in_a_later_segment_is_found() {
+    for finalize in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow.dendro");
+        let config = WriterConfig {
+            seal: SealPolicy {
+                max_rows: 5,
+                ..SealPolicy::default()
+            },
+            ..WriterConfig::default()
+        };
+        let mut writer = ArchiveWriter::create(&path, config).unwrap();
+        let labels = [("source".to_string(), "test".to_string())]
+            .into_iter()
+            .collect();
+        let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+        for t in 0..TICKS {
+            let staged = source.stage(&growing(t), BASE + t * S, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+            source.maybe_seal().unwrap();
+        }
+        if finalize {
+            source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+        } else {
+            source.sync().unwrap();
+            std::mem::forget(source);
+        }
+        writer.join().unwrap();
+
+        let reader = open(&path);
+        let points = |q: &str| -> usize {
+            let (a, _) = answer(&reader, q, 0).unwrap();
+            a.iter().map(|(_, v)| v.len()).sum()
+        };
+        assert!(
+            points("sum(swap_free)") > 0,
+            "finalize={finalize}: swap_free"
+        );
+        assert!(
+            points("sum(rate(ctx_switches[3s]))") > 0,
+            "finalize={finalize}: ctx_switches"
+        );
+        assert!(points("sum(dirty)") > 0, "finalize={finalize}: dirty");
+        assert!(points("sum(mem_free)") > 0);
+        let mut names = reader.gauge_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["dirty", "mem_free", "swap_free"],
+            "finalize={finalize}"
+        );
+    }
+}

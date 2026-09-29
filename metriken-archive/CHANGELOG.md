@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A metric that first appears in a later segment of a table, or only in
+  its live tail, can be queried. The reader learned a table's metric names
+  from its first segment alone. The encoder now stores a names fingerprint
+  in each sealed segment's dendro `caller_index`, and the reader probes one
+  footer per distinct fingerprint, plus the tail's schema-carrying rows. A
+  segment without a fingerprint is assumed to hold the first segment's
+  names, as before.
+
 ### Added
 
 - `READABLE_ENCODERS`, the encoder versions the reader decodes (today
@@ -15,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than misreading its WAL rows. A source without the key is not
   checked. `ENCODER_VERSION` is now also re-exported at the crate root.
 - Sealed segments carry metriken-segment's format version (`metriken.format`).
+- `Catalog::segment_indexes`, each sealed segment's caller index without
+  its payload. It defaults to empty, for a container that keeps none.
 
 ## [0.2.7] - 2026-09-29
 

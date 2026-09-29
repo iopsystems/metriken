@@ -58,6 +58,9 @@ impl WalRowSource for WalRow {
     }
 }
 
+/// A sealed segment's sequence number and its caller index, if it has one.
+pub type SegmentIndex = (u64, Option<Vec<u8>>);
+
 /// The read side of an archive's container.
 ///
 /// `Send` so a catalog can sit behind the `Mutex` a byte-backed archive's
@@ -82,6 +85,14 @@ pub trait Catalog: Send {
 
     /// A table's WAL rows newer than its last sealed segment.
     fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String>;
+
+    /// Each sealed segment's caller index, by sequence number, without the
+    /// payload: `None` where a segment has none. A container that keeps no
+    /// index answers empty, which the reader treats as every segment having
+    /// none.
+    fn segment_indexes(&self, _source_id: i64, _table: &str) -> Result<Vec<SegmentIndex>, String> {
+        Ok(Vec::new())
+    }
 
     /// A table's sealed segment count and span, from the catalog.
     fn segment_span(&self, source_id: i64, table: &str) -> Result<(u64, Span), String>;
@@ -220,6 +231,10 @@ impl Catalog for DendroCatalog {
         self.0
             .read_segment_bytes(source_id, table, seq)
             .map_err(err)
+    }
+
+    fn segment_indexes(&self, source_id: i64, table: &str) -> Result<Vec<SegmentIndex>, String> {
+        self.0.read_segment_indexes(source_id, table).map_err(err)
     }
 
     fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String> {

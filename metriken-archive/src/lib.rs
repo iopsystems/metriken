@@ -16,11 +16,12 @@ use std::sync::Arc;
 pub mod catalog;
 pub mod encoder;
 pub mod filter;
+mod names;
 pub mod reader;
 #[cfg(feature = "write")]
 pub mod writer;
 
-pub use catalog::{Catalog, DendroCatalog};
+pub use catalog::{Catalog, DendroCatalog, SegmentIndex};
 pub use encoder::{Encoder, ENCODER_VERSION, READABLE_ENCODERS};
 pub use filter::KeepMetrics;
 pub use parquet::basic::{Compression, ZstdLevel};

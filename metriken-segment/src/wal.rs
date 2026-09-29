@@ -34,6 +34,20 @@ pub trait WalRowSource {
     fn row(&self) -> &[u8];
 }
 
+impl<T: WalRowSource + ?Sized> WalRowSource for &T {
+    fn ts(&self) -> u64 {
+        (**self).ts()
+    }
+
+    fn wall_offset(&self) -> i64 {
+        (**self).wall_offset()
+    }
+
+    fn row(&self) -> &[u8] {
+        (**self).row()
+    }
+}
+
 /// One metric's contribution to a WAL row: exactly what
 /// `TableBuilder::push_row` needs to place the value in its column, and nothing
 /// else. The recorder's own `Snapshot` entry carries a good deal more, and
@@ -258,6 +272,59 @@ pub struct MaterializedTail {
 /// above is the release-build backstop if that is ever violated anyway.
 pub fn is_group_table_key(table_key: &str) -> bool {
     table_key.contains('/')
+}
+
+/// The rows of a live tail that name every column it holds: for a group or
+/// long table, each row that anchors a schema; for a table of cells, each
+/// row whose cell names differ from the row before. Materialized alone, they
+/// make a segment with the tail's columns and a few of its rows, which is
+/// what a reader needs to learn the tail's metric names without building the
+/// whole tail.
+///
+/// A group or long row is read only as far as its schema: the values that
+/// follow are never decoded.
+pub fn schema_rows<'a, R: WalRowSource>(
+    table_key: &str,
+    long: bool,
+    rows: &'a [R],
+) -> Result<Vec<&'a R>, String> {
+    let mut out = Vec::new();
+    if long || is_group_table_key(table_key) {
+        for row in rows {
+            if anchors_schema(row.row())? {
+                out.push(row);
+            }
+        }
+    } else {
+        let mut last: Option<Vec<String>> = None;
+        for row in rows {
+            let names: Vec<String> = decode_wal_row(row.row())?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            if last.as_ref() != Some(&names) {
+                out.push(row);
+                last = Some(names);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an encoded [`WalGroupRow`] or [`WalLongRow`] carries its schema.
+/// Both are msgpack arrays that begin `[schema_hash, schema, ...]`, and
+/// `schema` is nil unless the row anchors it.
+fn anchors_schema(mut bytes: &[u8]) -> Result<bool, String> {
+    let err = |e: &dyn std::fmt::Display| format!("failed to read a WAL row's schema: {e}");
+    rmp::decode::read_array_len(&mut bytes).map_err(|e| err(&e))?;
+    let n = rmp::decode::read_array_len(&mut bytes).map_err(|e| err(&e))?;
+    for _ in 0..n {
+        rmp::decode::read_int::<u64, _>(&mut bytes).map_err(|e| err(&e))?;
+    }
+    match bytes.first() {
+        Some(&b) => Ok(b != rmp::Marker::Null.to_u8()),
+        None => Err(err(&"the row ends before its schema")),
+    }
 }
 
 /// Encode a `.rez` table's live WAL rows as one parquet segment — dispatches
@@ -566,4 +633,119 @@ pub fn materialize_long_wal_tail_with(
         rows,
         first_ts: first_ts.expect("a non-empty table has a first row"),
     }))
+}
+
+#[cfg(test)]
+mod schema_rows_tests {
+    use super::*;
+    use crate::schema::{GroupSchema, MetricDesc};
+
+    struct Row(u64, Vec<u8>);
+    impl WalRowSource for Row {
+        fn ts(&self) -> u64 {
+            self.0
+        }
+        fn wall_offset(&self) -> i64 {
+            0
+        }
+        fn row(&self) -> &[u8] {
+            &self.1
+        }
+    }
+
+    fn schema(names: &[&str]) -> GroupSchema {
+        GroupSchema {
+            counters: names
+                .iter()
+                .map(|n| MetricDesc {
+                    name: n.to_string(),
+                    metadata: [("metric".to_string(), n.to_string())].into(),
+                })
+                .collect(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        }
+    }
+
+    fn group(ts: u64, s: Option<GroupSchema>, n: usize) -> Row {
+        let hash = (u64::MAX, ts);
+        let row = WalGroupRow {
+            schema_hash: hash,
+            schema: s,
+            window: Some((ts, ts + 1)),
+            counters: vec![Some(u64::MAX); n],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        };
+        Row(ts, encode_wal_group_row(&row).unwrap())
+    }
+
+    /// Only the rows that carry a schema are kept, in a group table and a
+    /// long one; a large hash and values decode as ints of any width.
+    #[test]
+    fn group_and_long_rows_are_kept_when_they_anchor_a_schema() {
+        let rows = vec![
+            group(1, Some(schema(&["a"])), 1),
+            group(2, None, 1),
+            group(3, Some(schema(&["a", "b"])), 2),
+            group(4, None, 2),
+        ];
+        let kept: Vec<u64> = schema_rows("s/g", false, &rows)
+            .unwrap()
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(kept, vec![1, 3]);
+
+        let long = |ts: u64, s: Option<GroupSchema>| {
+            let row = WalLongRow {
+                schema_hash: (7, 300),
+                schema: s,
+                window: None,
+                occupants: vec![LongOccupant {
+                    occupant: 0,
+                    counters: vec![Some(1)],
+                    gauges: Vec::new(),
+                    histograms: Vec::new(),
+                }],
+            };
+            Row(ts, encode_wal_long_row(&row).unwrap())
+        };
+        let rows = vec![long(1, Some(schema(&["a"]))), long(2, None)];
+        let kept: Vec<u64> = schema_rows("s", true, &rows)
+            .unwrap()
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(kept, vec![1]);
+    }
+
+    /// A table of cells keeps each row whose names differ from the row
+    /// before: the first, and every change.
+    #[test]
+    fn cell_rows_are_kept_when_their_names_change() {
+        let cell = |name: &str| WalCell {
+            name: name.to_string(),
+            metadata: None,
+            value: WalValue::Counter(1),
+            window: None,
+        };
+        let row = |ts: u64, names: &[&str]| {
+            let cells: Vec<WalCell> = names.iter().map(|n| cell(n)).collect();
+            Row(ts, encode_wal_row(&cells).unwrap())
+        };
+        let rows = vec![
+            row(1, &["a"]),
+            row(2, &["a"]),
+            row(3, &["a", "b"]),
+            row(4, &["a", "b"]),
+            row(5, &["a"]),
+        ];
+        let kept: Vec<u64> = schema_rows("sampler", false, &rows)
+            .unwrap()
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(kept, vec![1, 3, 5]);
+    }
 }

@@ -94,24 +94,73 @@ fn probe_tables(pending: &[PendingProbe]) -> Vec<Result<ProbedTable, String>> {
     pending.iter().map(|p| probe_one(p, &pool)).collect()
 }
 
-/// One table's footer: the metric names it holds and its row cadence.
+/// One table's footers: the metric names they hold between them, and the
+/// row cadence of the first.
 fn probe_one(
-    (sampler, bytes, span): &PendingProbe,
+    (sampler, probes, span): &PendingProbe,
     pool: &Arc<BufferPool>,
 ) -> Result<ProbedTable, String> {
-    let probe = ParquetReader::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
-        .map_err(|e| format!("probing table {sampler}: {e}"))?;
-    let names = TableNames {
-        counters: probe.counter_names().into_iter().collect(),
-        gauges: probe.gauge_names().into_iter().collect(),
-        histograms: probe.histogram_names().into_iter().collect(),
-    };
-    Ok((sampler.clone(), names, probe.interval(), *span))
+    let mut names = TableNames::default();
+    let mut interval = None;
+    for bytes in probes {
+        let probe = ParquetReader::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
+            .map_err(|e| format!("probing table {sampler}: {e}"))?;
+        names.counters.extend(probe.counter_names());
+        names.gauges.extend(probe.gauge_names());
+        names.histograms.extend(probe.histogram_names());
+        interval.get_or_insert(probe.interval());
+    }
+    Ok((sampler.clone(), names, interval.unwrap_or(1.0), *span))
 }
 
-/// One table awaiting its footer probe: its key, the segment bytes to parse,
-/// and the span the catalog already answered.
-type PendingProbe = (String, Vec<u8>, Option<(u64, u64)>);
+/// One table awaiting its footer probes: its key, the segments to parse
+/// (see `table_probes`), and the span the catalog already answered.
+type PendingProbe = (String, Vec<Vec<u8>>, Option<(u64, u64)>);
+
+/// The segments whose footers name every metric a table holds:
+///
+/// - its first sealed segment, and each later one whose names fingerprint
+///   (`crate::names`) no earlier probe has. A segment without a fingerprint
+///   (a `.rez`, or one sealed before fingerprints) is assumed to hold the
+///   first segment's names, which is what the reader assumed of every segment
+///   before;
+/// - the rows of its live tail that name its columns
+///   (`metriken_segment::wal::schema_rows`), materialized alone.
+fn table_probes(
+    db: &dyn Catalog,
+    recording_id: i64,
+    table: &str,
+    sealed: &[(u64, crate::catalog::SegmentMeta)],
+    long: bool,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut probes = Vec::new();
+    if let Some((first, _)) = sealed.first() {
+        let fingerprints: HashMap<u64, u64> = db
+            .segment_indexes(recording_id, table)?
+            .into_iter()
+            .filter_map(|(seq, index)| Some((seq, crate::names::fingerprint(index.as_deref())?)))
+            .collect();
+        let mut seen: HashSet<u64> = fingerprints.get(first).copied().into_iter().collect();
+        probes.extend(db.segment_bytes(recording_id, table, *first)?);
+        for (seq, _) in &sealed[1..] {
+            if let Some(fp) = fingerprints.get(seq) {
+                if seen.insert(*fp) {
+                    probes.extend(db.segment_bytes(recording_id, table, *seq)?);
+                }
+            }
+        }
+    }
+    let rows = db.live_wal(recording_id, table)?;
+    let naming = metriken_segment::wal::schema_rows(table, long, &rows)?;
+    let props = crate::segment_props(crate::default_compression());
+    let tail = if long {
+        metriken_segment::wal::materialize_long_wal_tail_with(table, &naming, false, props)?
+    } else {
+        metriken_segment::wal::materialize_wal_tail_with(table, &naming, props)?
+    };
+    probes.extend(tail.map(|t| t.bytes));
+    Ok(probes)
+}
 
 /// What a probe yields: the table's key, its metric names, its row spacing and
 /// its span.
@@ -1021,28 +1070,24 @@ impl ArchiveReader {
             for sampler in samplers {
                 let metas = db.segment_meta(rec.id, &sampler)?;
 
-                // The probe segment is the first SEALED one — or, when a table
-                // has none, its materialized WAL tail. A quiet sampler in a
-                // live hindsight buffer is exactly that: rows in the WAL, no
-                // seal yet. Skipping it here would make it invisible to the
-                // reader, which the eager path never did because
-                // `table_segments` splices the tail in.
-                let probe_bytes = match metas.first() {
-                    Some((seq, _)) => db.segment_bytes(rec.id, &sampler, *seq)?,
-                    None => live_tail(
-                        &**db,
-                        rec.id,
-                        &sampler,
-                        occupant_streams
-                            .contains(&metriken_segment::occupants::stream_of(&sampler)),
-                    )?
-                    .map(|t| t.bytes),
-                };
+                // The footers that name every metric the table holds: sealed
+                // segments by names fingerprint, and the live tail's rows that
+                // carry a schema. A quiet sampler in a live hindsight buffer
+                // has only the latter: rows in the WAL, no seal yet. Skipping
+                // it would make it invisible to the reader, which the eager
+                // path never did because `table_segments` splices the tail in.
+                let probes = table_probes(
+                    &**db,
+                    rec.id,
+                    &sampler,
+                    &metas,
+                    occupant_streams.contains(&metriken_segment::occupants::stream_of(&sampler)),
+                )?;
                 // Nothing sealed and nothing live: the table has no rows at
                 // all, so there is nothing to open. Same skip as the eager path.
-                let Some(bytes) = probe_bytes else {
+                if probes.is_empty() {
                     continue;
-                };
+                }
 
                 // Span from the catalog, widened by the live WAL: a hindsight
                 // buffer's newest rows are unsealed, and a span that stopped at
@@ -1077,7 +1122,7 @@ impl ArchiveReader {
                 });
                 measured_intervals.insert(sampler.clone(), measured);
 
-                pending.push((sampler, bytes, span));
+                pending.push((sampler, probes, span));
             }
 
             // Phase two: parse the footers. One probe per table, independent.

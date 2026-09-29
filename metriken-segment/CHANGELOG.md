@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format 1, as is every segment written before it.
   `table::read_table_parquet` and `occupants::decode_segment` make the
   check.
+- `wal::schema_rows`, the rows of a live tail that name every column it
+  holds: a group or long row that anchors a schema (read no further than
+  its schema), or a cell row whose names differ from the row before.
+  Materialized alone they give a reader the tail's metric names without
+  building the whole tail.
+- `WalRowSource` is implemented for `&T`, so a subset of rows can be
+  materialized without copying them.
 
 ## [0.1.4] - 2026-09-28
 
