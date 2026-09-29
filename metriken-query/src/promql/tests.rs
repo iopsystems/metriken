@@ -91,6 +91,29 @@ fn test_query_engine_creation() {
     }
 }
 
+/// A bare selector naming a counter says to use rate(), rather than
+/// reporting a metric the source holds as missing.
+#[test]
+fn a_bare_counter_selector_names_the_fix() {
+    let engine = QueryEngine::new(Arc::new(create_rate_source()));
+    match engine.query_range("test_counter", 1000.0, 1004.0, 1.0) {
+        Err(QueryError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("is a counter") && msg.contains("rate("),
+                "{msg}"
+            )
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    assert!(engine
+        .query_range("rate(test_counter[2s])", 1000.0, 1004.0, 1.0)
+        .is_ok());
+    match engine.query_range("absent_metric", 1000.0, 1004.0, 1.0) {
+        Err(QueryError::MetricNotFound(_)) => {}
+        other => panic!("expected MetricNotFound, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_simple_rate_query_parsing() {
     let source = Arc::new(create_empty_source());

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A bare selector naming a counter (`cpu_usage` rather than
+  `rate(cpu_usage[1m])`) fails with `QueryError::Unsupported`, saying the
+  metric is a counter to read through `rate()` or `irate()`. It failed with
+  `MetricNotFound`, which reported a metric the source holds as missing. A
+  bare selector still reads gauges only.
+
 ## [0.33.2] - 2026-09-29
 
 ### Changed

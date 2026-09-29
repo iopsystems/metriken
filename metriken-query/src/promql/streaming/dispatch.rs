@@ -605,10 +605,21 @@ where
     let staleness_ns = ctx.step_ns.max(ctx.interval_ns);
     let data_start = ctx.start_ns.saturating_sub(staleness_ns);
 
-    let gauges = ctx
+    let Some(gauges) = ctx
         .source
         .gauges(metric_name, &filter, data_start, ctx.end_ns)
-        .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+    else {
+        // A bare selector reads gauges. A counter is read through rate() or
+        // irate(), and saying so beats reporting a metric the source holds as
+        // missing. Asked only on this path, so a found gauge costs nothing.
+        if ctx.source.counter_names().iter().any(|n| n == metric_name) {
+            return Err(QueryError::Unsupported(format!(
+                "{metric_name} is a counter: read it through rate() or irate(), \
+                 e.g. rate({metric_name}[1m])"
+            )));
+        }
+        return Err(QueryError::MetricNotFound(metric_name.to_string()));
+    };
 
     let series: SeriesSet<'a> = gauges
         .series
