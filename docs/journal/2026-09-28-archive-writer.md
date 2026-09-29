@@ -134,7 +134,8 @@ tick path; sorting is left to compaction.
   stream by window end, `GroupSnapshot::validate`, a small schema ring per
   group, and an arity check.
 - Seal policy is dendro's `SealPolicy`, with rezolus's defaults (8 MiB,
-  900 rows, 300 s, staggered).
+  900 rows, 300 s, staggered). Kept after measuring seven alternatives
+  (see "Seal policy, measured").
 - A long row's size charge is its values plus one occupant slot per
   member.
 
@@ -394,6 +395,65 @@ with zstd-3 too: `ArchiveReader` holds that segment in memory while it is
 open, so the smaller encoding is the smaller resident footprint, at about
 the same encode cost. (Leaving it uncompressed would save the encode and
 cost the most memory.)
+
+**Seal policy, measured.** Seven policies on the busy host, the quiet host
+and the heavy 100 ms spike, zstd-3, arrival order. The replay is unpaced,
+so dendro's wall-clock `max_age` never fires in it; a measurement-only
+row-time bound stood in for it (a stream seals once its open segment spans
+N of row time, the first segment shortened by the stream's stagger
+bucket), which is what the 300 s age does at a real 1 s cadence. The byte
+cap is the writer's size estimate, about ten times the encoded segment.
+
+| policy | busy: size, segments, worst seal, tick p99 / max | quiet: size, segments, worst seal, tick p99 / max |
+|---|---|---|
+| 1. 8 MiB + 900 rows + 5 min (rezolus's today) | 77.2 MB, 1,868, 96 ms, 22 / 99 ms | 414.4 MB, 7,390, 41 ms, 31 / 718 ms |
+| 2. 5 min span only | 76.5 MB, 1,810, 97 ms, 24 / 109 ms | 410.5 MB, 7,060, 92 ms, 36 / 375 ms |
+| 3. 15 min span only | 70.8 MB, 710, 334 ms, 44 / 478 ms | 384.7 MB, 2,590, 261 ms, 48 / 385 ms |
+| 4. 60 min span only | 68.2 MB, 240, 627 ms, 20 / 782 ms | 374.4 MB, 768, 257 ms, 18 / 443 ms |
+| 5. 15 min aligned (dendro `align`) | 71.0 MB, 771, 271 ms, 4 / 1,769 ms | 386.4 MB, 2,912, 281 ms, 4 / 1,974 ms |
+| 6. 8 MiB estimate only | 69.4 MB, 325, 202 ms, 34 / 243 ms | 381.2 MB, 1,233, 324 ms, 38 / 686 ms |
+| 7. 900 rows only | 69.9 MB, 524, 298 ms, 47 / 359 ms | 381.9 MB, 1,901, 265 ms, 46 / 326 ms |
+
+On the heavy spike at 100 ms, policy 1 was 52.9 MB with a tick p99 of 28 ms
+and max 152 ms; the 5 min span alone was 50.0 MB, p99 58 ms and max
+413 ms, because at 100 ms it makes segments three times the 900-row cap's;
+15 and 60 min spans were 49.3 MB; aligned sealing reached a 4.2 s tick.
+Every policy gave every query the same answer on all three recordings.
+
+- Longer segments are 7–12% smaller and read up to 10% faster (72
+  quiet-host queries: 31.8 s under policy 1, 28.5 s under a 60 min span).
+- They cost seal time, which the tick pays: the worst seal grows from
+  41–96 ms to 260–630 ms.
+- Aligning every stream on one boundary puts every seal on one tick: 1.8
+  and 2.0 s at 1 s, 4.2 s at 100 ms. The stagger exists for this.
+- A byte or row cap alone never seals a slow stream: under policies 6 and
+  7 some segment spans the whole recording (2.3 h and 9.6 h), so a reader
+  of the live archive rebuilds it all and retention has nothing whole to
+  evict. A time bound is required.
+
+**Decided (2026-09-28):** keep the combination (policy 1). At 1 s its
+5 min bound already makes it time-based (policies 1 and 2 nearly match);
+at 100 ms the row cap keeps seals small. Open: taking the 5 min bound in
+row time rather than wall time, so a paused producer or an offline
+conversion seals as a live recording does; the measurement-only bound
+above is the prototype.
+
+**Sealing only at the end** (every cap off; the busy host):
+
+| | never sealed until finalize | policy 1 |
+|---|---|---|
+| file while recording | 771 MB + 10 MB `-wal` | 77 MB at the end |
+| open of the live archive | 5.3 s (every table rebuilt from WAL rows) | ~0.01 s |
+| finalize | 21 s, every stream sealed at once | milliseconds |
+| file after finalize | 671 MB (freed WAL pages stay in the file) | 77 MB |
+| peak RSS of the run | 7.9 GB | |
+| tick p99 / max | 3.4 / 23 ms | 22 / 99 ms |
+
+WAL rows are msgpack, about ten times the sealed zstd segments; every open
+of a live archive (viewer, `/status`, a hindsight dump) rebuilds the whole
+recording in memory; the final seal is one long pause that a kill at the
+end leaves to whichever reader opens the file next. Only the tick tail
+improves. Rejected.
 
 Not run: a replay paced at the recording's interval, which would separate
 the unpaced replay's backpressure from the writer's own cost at 100 ms.
