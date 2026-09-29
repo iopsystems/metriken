@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a live slot is assigned the labels it has; `release` clears the slot;
   `retain` releases the slots a producer's own liveness check reports gone.
   `group::SlotMetadata` is the trait it writes through, implemented for
-  metriken's group types. Phase 5a of
+  metriken's group types. `SlotIdentity::grouped` takes the groups as a list
+  of lists, for a producer that shares per-group metric lists between
+  statics. Phase 5a of
   `docs/journal/2026-09-29-members-that-come-and-go.md`.
 - **Added:** `CounterFamily` and `GaugeFamily`, one registered metric whose
   members are created at runtime (`member(labels)`) and removed when their
