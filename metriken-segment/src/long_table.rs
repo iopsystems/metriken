@@ -255,10 +255,12 @@ impl LongTableBuilder {
                 encode_occupant_ranges(self.occupants.iter().copied()),
             ),
         ];
-        let props = props
-            .into_builder()
-            .set_key_value_metadata(Some(kv))
-            .build();
+        let props = crate::format::stamped(
+            props
+                .into_builder()
+                .set_key_value_metadata(Some(kv))
+                .build(),
+        );
         let mut buf = Vec::new();
         let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
         w.write(&batch)?;

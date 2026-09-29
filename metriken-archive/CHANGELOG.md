@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `READABLE_ENCODERS`, the encoder versions the reader decodes (today
+  `ENCODER_VERSION` alone). `ArchiveReader::from_catalog` refuses a source
+  whose `encoder` key, which dendro writes at `add_source`, names another,
+  rather than misreading its WAL rows. A source without the key is not
+  checked. `ENCODER_VERSION` is now also re-exported at the crate root.
+- Sealed segments carry metriken-segment's format version (`metriken.format`).
+
 ## [0.2.7] - 2026-09-29
 
 ### Changed

@@ -1765,6 +1765,7 @@ impl ParquetSource {
     fn open(path: &Path) -> Result<Arc<Self>, Box<dyn Error>> {
         let file = File::open(path)?;
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1782,6 +1783,7 @@ impl ParquetSource {
 
     fn open_bytes(bytes: Bytes) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1799,6 +1801,7 @@ impl ParquetSource {
 
     fn open_file(file: File) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1817,6 +1820,7 @@ impl ParquetSource {
     fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
         let file = File::open(path)?;
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1837,6 +1841,7 @@ impl ParquetSource {
         pool: Arc<BufferPool>,
     ) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1854,6 +1859,7 @@ impl ParquetSource {
 
     fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -3413,6 +3419,47 @@ mod tests {
         );
         // 3. Neither → degenerate point window.
         assert_eq!(resolve_window(1_000, None, None, None), (1_000, 1_000));
+    }
+
+    /// A segment from a newer format, or with a layout this reader does not
+    /// know, is refused at open rather than read as a wide table.
+    #[test]
+    fn a_newer_segment_format_or_unknown_layout_is_refused() {
+        let file = |kv: Vec<(&str, &str)>| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "timestamp",
+                DataType::UInt64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(UInt64Array::from(vec![1u64, 2])) as ArrayRef],
+            )
+            .unwrap();
+            let kv = kv
+                .into_iter()
+                .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                .collect();
+            let props = WriterProperties::builder()
+                .set_key_value_metadata(Some(kv))
+                .build();
+            let mut buf = Vec::new();
+            let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            buf
+        };
+        use metriken_segment::format::FORMAT_KEY;
+        use metriken_segment::long::LAYOUT_KEY;
+        assert!(ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "1")])).is_ok());
+        let err = ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "2")]))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("segment format 2"), "{err}");
+        let err = ParquetReader::open_bytes(file(vec![(LAYOUT_KEY, "long2")]))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("\"long2\""), "{err}");
     }
 
     /// Minimal parquet writer for timestamp-jitter tests: a `timestamp`
