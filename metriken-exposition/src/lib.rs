@@ -5,6 +5,8 @@
 
 #[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
 mod convert;
+#[cfg(feature = "msgpack")]
+pub mod group_builder;
 #[cfg(feature = "parquet")]
 mod parquet;
 mod prometheus;
