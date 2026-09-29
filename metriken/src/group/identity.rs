@@ -121,14 +121,41 @@ type Occupants = BTreeMap<usize, (BTreeMap<String, String>, String)>;
 /// indexes its CPU time, its run-queue wait and its context switches, and
 /// every one of them must agree on which occupant the slot holds.
 pub struct SlotIdentity {
-    groups: &'static [&'static dyn SlotMetadata],
+    groups: Groups,
     live: Mutex<Occupants>,
 }
 
+/// The groups a [`SlotIdentity`] writes to, as the producer declared them.
+enum Groups {
+    Flat(&'static [&'static dyn SlotMetadata]),
+    Grouped(&'static [&'static [&'static dyn SlotMetadata]]),
+}
+
+impl Groups {
+    fn each(&self, mut f: impl FnMut(&dyn SlotMetadata)) {
+        match self {
+            Groups::Flat(groups) => groups.iter().for_each(|g| f(*g)),
+            Groups::Grouped(lists) => lists.iter().flat_map(|l| l.iter()).for_each(|g| f(*g)),
+        }
+    }
+}
+
 impl SlotIdentity {
+    /// A slot space over these groups.
     pub const fn new(groups: &'static [&'static dyn SlotMetadata]) -> Self {
         Self {
-            groups,
+            groups: Groups::Flat(groups),
+            live: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// A slot space over several lists of groups, for a producer that
+    /// declares its metrics per acquisition group and shares those lists
+    /// between statics: `&[TASK_METRICS, &[&CGROUP_CPU]]`. A `const` context
+    /// cannot concatenate the lists, so they are kept as given.
+    pub const fn grouped(lists: &'static [&'static [&'static dyn SlotMetadata]]) -> Self {
+        Self {
+            groups: Groups::Grouped(lists),
             live: Mutex::new(BTreeMap::new()),
         }
     }
@@ -158,9 +185,8 @@ impl SlotIdentity {
         };
         let mut metadata: HashMap<String, String> = labels.into_iter().collect();
         metadata.insert(UID_LABEL.to_string(), uid.clone());
-        for group in self.groups {
-            group.set_metadata(slot, metadata.clone());
-        }
+        self.groups
+            .each(|group| group.set_metadata(slot, metadata.clone()));
         uid
     }
 
@@ -172,9 +198,7 @@ impl SlotIdentity {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&slot);
-        for group in self.groups {
-            group.clear_metadata(slot);
-        }
+        self.groups.each(|group| group.clear_metadata(slot));
     }
 
     /// Release every live slot `keep` returns false for, and return how many
@@ -278,6 +302,26 @@ mod tests {
         assert_eq!(BOTH.uid(3), None);
         let second = BOTH.assign(3, labels("nginx"));
         assert_ne!(first, second);
+    }
+
+    /// A grouped identity writes every metric of every list.
+    #[test]
+    fn a_grouped_identity_writes_every_list() {
+        static C: CounterGroup = CounterGroup::new(4);
+        static D: GaugeGroup = GaugeGroup::new(4);
+        static E: CounterGroup = CounterGroup::new(4);
+        static FIRST: &[&dyn SlotMetadata] = &[&C, &D];
+        static LISTS: SlotIdentity = SlotIdentity::grouped(&[FIRST, &[&E]]);
+        let uid = LISTS.assign(1, labels("x"));
+        for m in [C.load_metadata(1), D.load_metadata(1), E.load_metadata(1)] {
+            assert_eq!(m.unwrap()[UID_LABEL], uid);
+        }
+        LISTS.release(1);
+        assert!(
+            C.load_metadata(1).is_none()
+                && D.load_metadata(1).is_none()
+                && E.load_metadata(1).is_none()
+        );
     }
 
     /// `retain` releases the slots its check reports gone, in every group.
