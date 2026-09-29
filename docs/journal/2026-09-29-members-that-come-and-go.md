@@ -218,6 +218,34 @@ tenant appears and dropped when it leaves. What that needs:
   table instead of one registry entry per member; that is the design
   alternative, and the measurement chooses.
 
+**Measured (2026-09-29).** One counter per member, registered through
+`MetricBuilder` with two metadata keys, on one thread of an Apple-silicon
+laptop (macOS); the snapshot is metriken-exposition's `Snapshotter` (V1):
+
+| members | register | drop | memory | registry walk | V1 snapshot | snapshot msgpack | register, worst, during snapshots |
+|---|---|---|---|---|---|---|---|
+| 1k | 392 ns | 110 ns | ~1 KB | 0.03 ms | 0.35 ms | 0.0 MB | 0.4 ms |
+| 10k | 207 ns | 98 ns | 488 B | 0.15 ms | 1.7 ms | 0.5 MB | 1.3 ms |
+| 100k | 188 ns | 144 ns | 642 B | 1.9 ms | 17.7 ms | 5.3 MB | 11.7 ms |
+| 1M | 201 ns | 150 ns | 651 B | 21 ms | 178 ms | 57 MB | 121 ms |
+
+Register and drop are per member; memory is the resident-set growth per
+member. The median register during snapshots stayed at 0.2 µs; the worst
+equals one snapshot, because a snapshot holds the registry's global read
+guard for its whole walk and a registration waits for it. The walk itself is
+an eighth of the snapshot: the rest is building each member's name and
+metadata map.
+
+So a registry entry per member meets the bar at 100k (an 18 ms snapshot)
+and does not at 1M (178 ms, and a 121 ms stall for a member created
+mid-snapshot). **Decision: a family keeps its own member table** instead of
+one registry entry per member. It holds registration ids, never reused, each
+member's labels once, and the values in a slab, under the family's own lock.
+The family is one registry entry. Its snapshot reuses a cached schema while
+membership is unchanged and copies values, so neither the global guard nor a
+per-member map is on the snapshot path. The measurement is repeated against
+the family table as its GO.
+
 rezolus does not use 5c: its members are BPF map entries read in bulk, and a
 registration per thread would add an allocation and a lock to every thread
 start. 5c is for services.
@@ -250,11 +278,11 @@ start. 5c is for services.
   (rezolus `docs/principles.md`, principle 16).
 - **5b:** as 5a, plus the stream tests; per-refresh cost of the moved
   builder no worse than `create_v3`'s.
-- **5c:** the measurements above exist. GO if a snapshot of 100k members
-  builds within one 1 s interval's budget on one core with room to spare,
-  and register or drop is not serialized behind a snapshot for longer than a
-  snapshot takes. The thresholds are proposals, to be settled against the
-  first numbers.
+- **5c:** the family table, measured as above at 1k to 1M members. GO if
+  a family of 1M members snapshots in under 50 ms on one core, a register
+  or drop during a snapshot waits no longer than copying that family's
+  values, and memory per member is below the registry's 650 B. Measured
+  against the registry-per-member numbers above.
 
 ## Not in this phase
 
