@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-archive"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "arrow",
  "bytes",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.33.1"
+version = "0.33.2"
 dependencies = [
  "arrow",
  "bytes",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-segment"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arrow",
  "bytes",

@@ -1,6 +1,6 @@
 [package]
 name = "metriken-archive"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -14,9 +14,9 @@ repository = "https://github.com/iopsystems/metriken"
 arrow.workspace = true
 bytes = "1"
 dendro = { version = "0.3.3", default-features = false }
-metriken-query = { version = "0.33.1", path = "../metriken-query", default-features = false, features = ["lz4"] }
+metriken-query = { version = "0.33.2", path = "../metriken-query", default-features = false, features = ["lz4"] }
 parquet = { version = "58.2.0", default-features = false, features = ["arrow", "lz4", "zstd"] }
-metriken-segment = { version = "0.1.4", path = "../metriken-segment", default-features = false, features = ["lz4"] }
+metriken-segment = { version = "0.1.5", path = "../metriken-segment", default-features = false, features = ["lz4"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 metriken-exposition = { version = "0.21.1", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
 
