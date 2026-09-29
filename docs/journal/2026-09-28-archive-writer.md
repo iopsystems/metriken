@@ -187,12 +187,25 @@ long layout's builder and WAL row in metriken-segment
   writer dropped without a word. It is now the `.rez` writer's rule: one
   `WalCell` table per `sampler` label, dedup by the sampler's newest
   window, metadata on a metric's first row in each segment.
-- **Reader routing is by one footer per table.** `ArchiveReader` learns a
-  table's metric names from one segment, so a metric that first appears
-  in a later segment of the same table cannot be queried. This is the
-  `.rez` reader's behaviour too. A sampler emits the same metric names
-  every tick, so it has not arisen; a producer whose metric set grows
-  mid-recording would need the probe to cover every segment's footer.
+- **Reader routing covers every segment (fixed 2026-09-29).** `ArchiveReader`
+  learned a table's metric names from one segment, so a metric that first
+  appeared in a later segment, or only in the live tail, could not be
+  queried. Now:
+  - the encoder stores a names fingerprint in each sealed segment's dendro
+    `caller_index` (metric name and data type per column, `MNS1` + FNV-1a);
+  - the reader probes the first segment and one more per fingerprint it
+    has not seen, reading the fingerprints from the catalog without
+    payloads;
+  - it probes the live tail from only the rows that carry a schema
+    (`metriken_segment::wal::schema_rows`, which reads a group or long row
+    no further than its schema).
+
+  A segment without a fingerprint (a `.rez`, a conversion, or one sealed
+  before this) is assumed to hold the first segment's names, as before.
+  Measured on the quiet host's recording: a finalized archive opens in 7
+  ms against 5.4, and a live one (1,500 ticks, every table's tail in the
+  WAL) in 27 ms against 7, the difference being the tails' rows read
+  from SQLite.
 - **Eviction lag** is two dendro passes: data streams at the cutoff, and
   occupant streams at the cutoff minus the restatement period. dendro's
   filter selects the streams to evict.
