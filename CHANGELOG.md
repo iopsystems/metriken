@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `group::SlotMetadata` is the trait it writes through, implemented for
   metriken's group types. Phase 5a of
   `docs/journal/2026-09-29-members-that-come-and-go.md`.
+- **Added:** `CounterFamily` and `GaugeFamily`, one registered metric whose
+  members are created at runtime (`member(labels)`) and removed when their
+  handle drops. A family answers as a counter or gauge group: a member is a
+  slot, its labels are the slot's metadata, and each member carries a
+  `__uid__` minted at creation, so a freed slot's next member is a new
+  occupant. A family keeps its own member table rather than a registry
+  entry per member: at 1M members, 401 B per member against 651 B, a
+  per-tick value read of 2.2 ms, and a member created during reads waits at
+  most 1.4 ms where a registry entry waited 121 ms behind a snapshot. Phase
+  5c.
 
 ### metriken-archive 0.1.0
 

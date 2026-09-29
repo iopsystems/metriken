@@ -1,7 +1,7 @@
 mod counter;
 mod gauge;
 mod histogram;
-mod identity;
+pub(crate) mod identity;
 pub(crate) mod metadata;
 pub(crate) mod windows;
 
