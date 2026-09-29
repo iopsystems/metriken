@@ -70,6 +70,7 @@
 //! [`linkme`]: https://docs.rs/linkme
 
 mod counter;
+pub mod epoch;
 mod gauge;
 pub mod group;
 pub mod histogram;

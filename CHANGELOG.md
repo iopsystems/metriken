@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken (unreleased)
+
+- **Added:** `epoch`, the process's producer epoch (a v4 UUID minted once per
+  process) and the clock anchor its timestamps are relative to, moved from
+  rezolus's agent. The key name and semantics follow dendro's
+  `keys::PRODUCER_EPOCH`.
+- **Added:** `group::SlotIdentity`, the occupants of a slot space shared by
+  one or more groups, moved from rezolus without its change broadcast.
+  `assign` writes an occupant's labels and a minted `__uid__`
+  (`group::UID_LABEL`) to every group's slot metadata, and keeps the uid when
+  a live slot is assigned the labels it has; `release` clears the slot;
+  `retain` releases the slots a producer's own liveness check reports gone.
+  `group::SlotMetadata` is the trait it writes through, implemented for
+  metriken's group types. Phase 5a of
+  `docs/journal/2026-09-29-members-that-come-and-go.md`.
+
 ### metriken-archive 0.1.0
 
 - **Added:** the crate, `ArchiveReader` and the `Catalog` trait with dendro's
