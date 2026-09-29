@@ -246,6 +246,27 @@ membership is unchanged and copies values, so neither the global guard nor a
 per-member map is on the snapshot path. The measurement is repeated against
 the family table as its GO.
 
+**Built and measured (2026-09-29): GO.** `CounterFamily` and `GaugeFamily`
+(`metriken/src/family.rs`), same machine and members:
+
+| members | create | drop | memory | value read | label read | worst create during reads | V1 snapshot |
+|---|---|---|---|---|---|---|---|
+| 1k | 506 ns | 82 ns | 655 B | 0.00 ms | 0.01 ms | 0.8 ms | 0.65 ms |
+| 10k | 198 ns | 66 ns | 313 B | 0.01 ms | 0.05 ms | 0.05 ms | 2.8 ms |
+| 100k | 190 ns | 83 ns | 378 B | 0.09 ms | 0.48 ms | 0.3 ms | 30 ms |
+| 1M | 194 ns | 86 ns | 401 B | 2.2 ms | 5.5 ms | 1.4 ms | 298 ms |
+
+The value read is what a group builder with a cached schema takes every
+tick; the label read is what it takes when membership changed. Against the
+criteria: 2.2 ms (plus 5.5 ms on a membership change) is under 50 ms at 1M;
+a create waits at most 1.4 ms, less than the 5.5 ms label copy, where a
+registry entry waited 121 ms; 401 B per member is under 650 B.
+
+metriken-exposition's V1 `Snapshotter` is slower on a family than on
+registry entries (298 ms against 178 ms at 1M), because it builds a name
+and clones the metadata of every member every snapshot. It is not the path
+families are for; 5b's group builder, with its schema cache, is.
+
 rezolus does not use 5c: its members are BPF map entries read in bulk, and a
 registration per thread would add an allocation and a lock to every thread
 start. 5c is for services.

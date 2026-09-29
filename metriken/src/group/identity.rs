@@ -90,6 +90,13 @@ fn mint_uid(generation: u64) -> String {
     format!("{h:016x}")
 }
 
+/// A uid for a new occupant: the next assignment's number, minted. Shared by
+/// [`SlotIdentity`] and the families (`crate::family`), so a uid is unique
+/// across both.
+pub(crate) fn next_uid() -> String {
+    mint_uid(GENERATION.fetch_add(1, Ordering::AcqRel) + 1)
+}
+
 /// Per live slot: the labels it was assigned (without the uid) and its uid.
 type Occupants = BTreeMap<usize, (BTreeMap<String, String>, String)>;
 
@@ -145,7 +152,7 @@ impl SlotIdentity {
                     return uid.clone();
                 }
             }
-            let uid = mint_uid(GENERATION.fetch_add(1, Ordering::AcqRel) + 1);
+            let uid = next_uid();
             live.insert(slot, (labels.clone(), uid.clone()));
             uid
         };

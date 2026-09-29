@@ -71,6 +71,7 @@
 
 mod counter;
 pub mod epoch;
+mod family;
 mod gauge;
 pub mod group;
 pub mod histogram;
@@ -92,6 +93,7 @@ pub use metriken_derive::metric;
 pub use crate::counter::Counter;
 #[doc(inline)]
 pub use crate::dynmetrics::{DynBoxedMetric, DynPinnedMetric, MetricBuilder};
+pub use crate::family::{CounterFamily, CounterMember, GaugeFamily, GaugeMember};
 pub use crate::gauge::Gauge;
 pub use crate::group::{CounterGroup, GaugeGroup, HistogramGroup};
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};
