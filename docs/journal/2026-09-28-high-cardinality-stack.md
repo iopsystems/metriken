@@ -168,7 +168,10 @@ moved:
    `docs/journal/2026-09-28-dendro-writer-adoption.md`).
 5. **Members that come and go, in `metriken`.** Slot identity and `__uid__`
    minting move here for fixed-capacity groups. The dynamic registry gains
-   registration ids and families (see below). It gets its own design entry.
+   registration ids and families (see below). Design:
+   [members that come and go](2026-09-29-members-that-come-and-go.md),
+   in three parts landing in order (5a slot identity, 5b the group builder
+   and stream frame producer, 5c families), all before rezolus 6.0.0.
    Phases 1–4 don't depend on it: they take occupants from any source.
 6. **rezolus 6.0** builds on the result: the agent uses metriken's groups
    and identity and its stream endpoint, and the recorder, hindsight and
