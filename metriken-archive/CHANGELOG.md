@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `Encoder` and `ENCODER_VERSION` move to a new `encoder` module outside
+  the `write` feature (`metriken_archive::Encoder`), since they use only
+  metriken-segment. A reader build, the browser viewer's included, can now
+  copy an archive with dendro's `copy_sources_into`, which encodes each
+  stream's live tail. `writer::Encoder` and `writer::ENCODER_VERSION` still
+  name them.
+
 ## [0.2.6] - 2026-09-29
 
 ### Added
