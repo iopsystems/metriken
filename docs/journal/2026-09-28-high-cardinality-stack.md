@@ -170,8 +170,8 @@ moved:
    minting move here for fixed-capacity groups. The dynamic registry gains
    registration ids and families (see below). Design:
    [members that come and go](2026-09-29-members-that-come-and-go.md),
-   in three parts (5a slot identity, 5b the group builder and stream frame
-   producer, 5c families), with two decisions open.
+   in three parts landing in order (5a slot identity, 5b the group builder
+   and stream frame producer, 5c families), all before rezolus 6.0.0.
    Phases 1–4 don't depend on it: they take occupants from any source.
 6. **rezolus 6.0** builds on the result: the agent uses metriken's groups
    and identity and its stream endpoint, and the recorder, hindsight and

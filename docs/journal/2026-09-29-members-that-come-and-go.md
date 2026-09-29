@@ -1,8 +1,10 @@
 # Members that come and go: slot identity, the group builder and families in metriken
 
 **Status:** OPEN — design, nothing built. Phase 5 of
-[the high-cardinality stack](2026-09-28-high-cardinality-stack.md). Two
-decisions below are the maintainer's ("Decisions needed").
+[the high-cardinality stack](2026-09-28-high-cardinality-stack.md). Both
+decisions below were made on 2026-09-29: `.rez` stops being a `--stream`
+target in rezolus 6.0, and all three parts land before rezolus 6.0.0, in
+the order 5a, 5b, 5c.
 
 ## Goal
 
@@ -150,8 +152,8 @@ TASKS.release(pid);          // the occupant left
 - **`producer_epoch` moves too.** The uid needs it, and so do snapshot
   metadata and the stream handshake. metriken mints it once per process,
   and the name and semantics stay dendro's `keys::PRODUCER_EPOCH`.
-- **No change broadcast** unless the identity index survives (decision 1).
-  The occupant stream is built from `__uid__` in the schema; nothing else
+- **No change broadcast.** The identity index is gone (decision 1); the
+  occupant stream is built from `__uid__` in the schema, and nothing else
   consumes a change feed.
 - **A liveness hook**, since both known phantom cases are a missed release:
   `retain(|slot, labels| bool)` walks the live assignments at the caller's
@@ -220,17 +222,24 @@ rezolus does not use 5c: its members are BPF map entries read in bulk, and a
 registration per thread would add an allocation and a lock to every thread
 start. 5c is for services.
 
-## Decisions needed
+## Decisions (2026-09-29)
 
-1. **Does `.rez` stay a `--stream` target in 6.0?** If not, the identity
-   index, its broadcast, `Demand`, and the recorder's `index_state` check go
-   (a row's `schema_hash` and in-band schema are what a `.dendro` recording
-   uses). 5.x keeps `.rez --stream` on `release/5.x`. Recommendation: drop it
-   in 6.0; `record --stream` then writes `.dendro` only.
-2. **Does 5c gate rezolus 6.0.0?** The high-cardinality plan put every phase
-   before 6.0. 5c changes no storage format and rezolus does not use it; 5a
-   and 5b are what rezolus 6.0 builds on. Recommendation: 5a and 5b before
-   6.0.0, 5c after.
+1. **`.rez` is no longer a `--stream` target in rezolus 6.0.**
+   `record --stream` writes `.dendro` only, which takes identity from
+   `__uid__` in the rows' schemas. What existed only for `.rez --stream`
+   goes:
+   - the identity index (`IndexEntry`, `SourceIndex`, `Frame::Index`);
+   - its broadcast and the `Demand` refcount;
+   - the recorder's `index_state` check.
+
+   5.x keeps `.rez --stream` on `release/5.x`. A 5.x `record --stream`
+   against a 6.0 agent receives no index frames, which is accepted at a
+   major version; `--stream` has been opt-in since it arrived in 5.21.
+2. **All three parts land before rezolus 6.0.0**, 5c included, though
+   rezolus does not use it: families are the reason the stack moved into
+   metriken, and settling their registry before 6.0 keeps the producer API
+   from changing again after it. The order is 5a, 5b, 5c, since a family's
+   uid is 5a's and its snapshot as a group is 5b's.
 
 ## GO / NO-GO
 
