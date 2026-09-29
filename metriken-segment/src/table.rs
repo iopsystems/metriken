@@ -294,7 +294,7 @@ pub fn write_table_parquet(table: &Table) -> Result<Vec<u8>, Error> {
 pub fn write_table_parquet_with(table: &Table, props: WriterProperties) -> Result<Vec<u8>, Error> {
     let (schema, batch) = table_to_batch(table)?;
     let mut buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(crate::format::stamped(props)))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(buf)
@@ -315,7 +315,9 @@ fn u64_col(a: &ArrayRef) -> &UInt64Array {
 /// the identity index is split by occupant before the query engine sees it,
 /// and that split needs every row in hand rather than a footer.
 pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Error> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))?.build()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))?;
+    crate::format::check(builder.metadata().file_metadata().key_value_metadata())?;
+    let reader = builder.build()?;
 
     let mut timestamps: Vec<u64> = Vec::new();
     let mut wall_offsets: Vec<i64> = Vec::new();

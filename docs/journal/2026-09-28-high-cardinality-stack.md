@@ -1,8 +1,10 @@
 # A high-cardinality metrics stack: what belongs in metriken, dendro and rezolus
 
-**Status:** OPEN. Boundaries agreed 2026-09-28. Phases 1–3 done (below):
+**Status:** OPEN. Boundaries agreed 2026-09-28. Phases 1–4 done (below):
 `metriken-segment` holds the wide layout, the long layout, the occupant
-stream and the WAL row format; `metriken-archive` holds the reader. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
+stream and the WAL row format; `metriken-archive` holds the reader and the
+writer, which rezolus's `record` and `hindsight` use by default from 6.0.
+Phase 5 is next. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
 then built on this stack rather than moved onto it afterwards (decided
 2026-09-28).
 
@@ -160,7 +162,10 @@ moved:
    their occupant stream, and materializes a long table's WAL tail as long.
    rezolus's recorder and hindsight use it with rezolus's defaults.
 
-   Built; the gate against the `.rez` writer (in the design entry) is next.
+   Done. The writer passed its gate against the `.rez` writer (in the
+   design entry), and rezolus adopted it in stages ending with dendro as
+   the default for `record` and `hindsight` (rezolus
+   `docs/journal/2026-09-28-dendro-writer-adoption.md`).
 5. **Members that come and go, in `metriken`.** Slot identity and `__uid__`
    minting move here for fixed-capacity groups. The dynamic registry gains
    registration ids and families (see below). It gets its own design entry.
@@ -222,9 +227,20 @@ number is for a dynamic member, and the per-member cost at scale.
 ## Open questions
 
 - Names: `metriken-segment` and `metriken-archive` are working names.
-- Versioning: the WAL row and the segment format become public wire
-  formats with more than one producer. Each needs a version that a reader
-  checks.
+- ~~Versioning~~ — settled 2026-09-29, before rezolus 6.0 writes archives
+  in the field:
+  - **Segments** carry `metriken.format` (metriken-segment `format`, version
+    1). A reader refuses a newer format, or a `metriken.layout` it does not
+    know, instead of reading an unknown layout as a wide table. A segment
+    without the key is format 1, which covers every segment written before it
+    and every copied `.rez` segment. Bump the version when a reader of the old
+    one would misread the new writer's segments; a column or key old readers
+    ignore does not need it.
+  - **WAL rows** are versioned per source by dendro's `encoder` key
+    (`metriken-archive/1`). dendro already refuses a mismatch when it seals,
+    copies or materializes, and metriken-archive's reader now refuses a source
+    whose encoder is not in `READABLE_ENCODERS`. A reader keeps older versions
+    in that list for as long as it can decode them.
 - Whether `metriken-archive` depends on dendro unconditionally, or behind
   a feature.
 

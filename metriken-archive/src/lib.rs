@@ -21,7 +21,7 @@ pub mod reader;
 pub mod writer;
 
 pub use catalog::{Catalog, DendroCatalog};
-pub use encoder::Encoder;
+pub use encoder::{Encoder, ENCODER_VERSION, READABLE_ENCODERS};
 pub use filter::KeepMetrics;
 pub use parquet::basic::{Compression, ZstdLevel};
 

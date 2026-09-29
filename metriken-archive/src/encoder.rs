@@ -17,6 +17,13 @@ use crate::{default_compression, segment_props as sealed_props};
 /// reader can refuse one it does not know.
 pub const ENCODER_VERSION: &str = "metriken-archive/1";
 
+/// The encoder versions this crate's reader decodes: a source's WAL rows
+/// are in one of these encodings. [`ArchiveReader`](crate::ArchiveReader)
+/// refuses a source whose `encoder` key names any other, rather than
+/// misreading its live tail. A source without the key (a `.rez`, or an
+/// archive written before the key) is not checked.
+pub const READABLE_ENCODERS: &[&str] = &[ENCODER_VERSION];
+
 /// The streams written long, shared between the recorders (which decide)
 /// and the encoder (which seals them on dendro's writer thread).
 pub(crate) type LongStreams = Arc<Mutex<HashSet<String>>>;

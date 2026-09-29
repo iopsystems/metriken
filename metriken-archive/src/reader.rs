@@ -981,6 +981,17 @@ impl ArchiveReader {
         let mut out = Vec::new();
 
         for (recording, rec) in db.sources()?.into_iter().enumerate() {
+            if let Some(wrote) = rec.metadata.get(dendro::keys::ENCODER) {
+                if !crate::encoder::READABLE_ENCODERS.contains(&wrote.as_str()) {
+                    return Err(format!(
+                        "recording {} was written by encoder {wrote:?}, which this reader \
+                         does not decode (it reads {}); read it with a newer release",
+                        crate::source_name(&rec.labels),
+                        crate::encoder::READABLE_ENCODERS.join(", ")
+                    )
+                    .into());
+                }
+            }
             if !rec.complete {
                 tracing::warn!(
                     "recording {} was not cleanly finalized; it was recovered up to its \

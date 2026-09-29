@@ -658,3 +658,74 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
         "the long table had no kept metric; its occupant stream is the caller's to remove"
     );
 }
+
+/// Every sealed segment carries the segment format version, and a source
+/// written by an encoder this reader does not decode is refused at open
+/// rather than misread.
+#[test]
+fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
+    use metriken_archive::Catalog;
+    use metriken_segment::format::{FORMAT_KEY, FORMAT_VERSION};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rec.dendro");
+    record(&path, true, true, None);
+
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let source = catalog.sources().unwrap().remove(0);
+    assert_eq!(
+        source
+            .metadata
+            .get(dendro::keys::ENCODER)
+            .map(String::as_str),
+        Some(metriken_archive::ENCODER_VERSION)
+    );
+    let mut segments = 0;
+    for table in catalog.tables(source.id).unwrap() {
+        for (seq, _) in catalog.segment_meta(source.id, &table).unwrap() {
+            let bytes = catalog
+                .segment_bytes(source.id, &table, seq)
+                .unwrap()
+                .unwrap();
+            let reader =
+                parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes))
+                    .unwrap();
+            use parquet::file::reader::FileReader;
+            let kv = reader
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .cloned();
+            let version = kv
+                .unwrap_or_default()
+                .into_iter()
+                .find(|e| e.key == FORMAT_KEY)
+                .and_then(|e| e.value);
+            assert_eq!(version, Some(FORMAT_VERSION.to_string()), "{table} #{seq}");
+            segments += 1;
+        }
+    }
+    assert!(segments > 0);
+    drop(catalog);
+    let _ = open(&path);
+
+    {
+        let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        let mut md = db.read_sources().unwrap()[0].meta.metadata.clone();
+        md.insert(
+            dendro::keys::ENCODER.to_string(),
+            "metriken-archive/2".to_string(),
+        );
+        db.update_source_metadata(id, &md).unwrap();
+    }
+    let err = ArchiveReader::from_catalog(
+        Box::new(DendroCatalog::open(&path).unwrap()),
+        None,
+        BufferPool::new(64 * 1024 * 1024),
+        None,
+    )
+    .err()
+    .expect("an unknown encoder is refused");
+    assert!(err.to_string().contains("\"metriken-archive/2\""), "{err}");
+}

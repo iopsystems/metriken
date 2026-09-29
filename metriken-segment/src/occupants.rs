@@ -151,8 +151,9 @@ pub fn encode_segment(
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, Some(props))
-        .map_err(|e| e.to_string())?;
+    let mut w =
+        parquet::arrow::ArrowWriter::try_new(&mut buf, schema, Some(crate::format::stamped(props)))
+            .map_err(|e| e.to_string())?;
     w.write(&batch).map_err(|e| e.to_string())?;
     w.close().map_err(|e| e.to_string())?;
     Ok(buf)
@@ -160,12 +161,12 @@ pub fn encode_segment(
 
 /// Every row of an occupant stream segment, as `(timestamp, occupant)`.
 pub fn decode_segment(bytes: &[u8]) -> Result<Vec<(u64, Occupant)>, String> {
-    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
         bytes::Bytes::copy_from_slice(bytes),
     )
-    .map_err(|e| e.to_string())?
-    .build()
     .map_err(|e| e.to_string())?;
+    crate::format::check(builder.metadata().file_metadata().key_value_metadata())?;
+    let reader = builder.build().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch.map_err(|e| e.to_string())?;
