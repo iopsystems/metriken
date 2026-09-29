@@ -246,12 +246,16 @@ mod tests {
     /// the groups are not rewritten.
     #[test]
     fn a_re_announcement_keeps_its_uid() {
-        let uid = BOTH.assign(2, labels("sshd"));
-        let version = A.metadata_version();
-        assert_eq!(BOTH.assign(2, labels("sshd")), uid);
-        assert_eq!(A.metadata_version(), version, "nothing was written");
+        // Its own group: the version counts every write to a group, and the
+        // other tests write to theirs concurrently.
+        static G: CounterGroup = CounterGroup::new(8);
+        static ONE: SlotIdentity = SlotIdentity::new(&[&G]);
+        let uid = ONE.assign(2, labels("sshd"));
+        let version = G.metadata_version();
+        assert_eq!(ONE.assign(2, labels("sshd")), uid);
+        assert_eq!(G.metadata_version(), version, "nothing was written");
         assert_ne!(
-            BOTH.assign(2, labels("cron")),
+            ONE.assign(2, labels("cron")),
             uid,
             "a relabel is a new occupant"
         );
