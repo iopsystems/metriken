@@ -81,9 +81,10 @@ pub trait StreamRow {
 /// on a 2,500-task registry was 95% of the cost of encoding a pass for the
 /// stream. Keep one per producer, across passes.
 ///
-/// One entry per group name, holding the latest hash; a group that stops
-/// appearing keeps its entry, so the cache holds at most one schema per group
-/// name the producer has had.
+/// One entry per group name, holding the latest hash. A group that stops
+/// appearing keeps its entry until [`retain`](Self::retain) drops it, so a
+/// producer whose group names are unbounded (one per container, say) calls
+/// `retain` with the names it still has.
 #[derive(Debug, Default)]
 pub struct SchemaCache {
     by_stream: HashMap<String, ((u64, u64), Arc<GroupSchema>)>,
@@ -107,6 +108,22 @@ impl SchemaCache {
         self.by_stream
             .insert(g.name.clone(), (g.schema_hash, Arc::clone(&schema)));
         Some(schema)
+    }
+
+    /// Keep only the groups whose names `keep` accepts. A group dropped here
+    /// is converted again if it reappears.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.by_stream.retain(|name, _| keep(name));
+    }
+
+    /// How many groups the cache holds.
+    pub fn len(&self) -> usize {
+        self.by_stream.len()
+    }
+
+    /// Whether the cache holds no groups.
+    pub fn is_empty(&self) -> bool {
+        self.by_stream.is_empty()
     }
 }
 
@@ -433,6 +450,26 @@ mod tests {
         let mut bare = group(STREAM, 4);
         bare.schema = None;
         assert!(cache.schema(&bare).is_none());
+    }
+
+    /// `retain` drops the groups it rejects and keeps the rest; a dropped
+    /// group is converted again when it reappears.
+    #[test]
+    fn retain_drops_the_groups_it_rejects() {
+        let mut cache = SchemaCache::new();
+        let kept = cache.schema(&group(STREAM, 3)).unwrap();
+        let gone = cache.schema(&group("cgroup/one", 2)).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        cache.retain(|name| name == STREAM);
+        assert_eq!(cache.len(), 1);
+        assert!(Arc::ptr_eq(
+            &kept,
+            &cache.schema(&group(STREAM, 3)).unwrap()
+        ));
+        let again = cache.schema(&group("cgroup/one", 2)).unwrap();
+        assert!(!Arc::ptr_eq(&gone, &again), "converted again");
+        assert_eq!(*gone, *again);
     }
 
     /// The first row of a stream carries its schema inside the payload, or

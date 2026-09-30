@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-archive 0.3.1
+
+- **Added:** `SchemaCache::retain`, `len` and `is_empty`. A producer whose
+  group names are unbounded drops the groups it no longer has; the cache
+  otherwise keeps one entry per group name it has seen.
+
 ### metriken-archive 0.3.0
 
 - **Added:** `stream::SchemaCache`, which converts each group's schema to the
