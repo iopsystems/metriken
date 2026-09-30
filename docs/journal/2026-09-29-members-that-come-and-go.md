@@ -1,6 +1,7 @@
 # Members that come and go: slot identity, the group builder and families in metriken
 
-**Status:** OPEN — design, nothing built. Phase 5 of
+**Status:** DONE in metriken — 5a, 5b and 5c built; 5b measured GO against rezolus
+(2026-09-29, "5b: measured" below). Phase 5 of
 [the high-cardinality stack](2026-09-28-high-cardinality-stack.md). Both
 decisions below were made on 2026-09-29: `.rez` stops being a `--stream`
 target in rezolus 6.0, and all three parts land before rezolus 6.0.0, in
@@ -311,3 +312,224 @@ start. 5c is for services.
 - Per-counter generation and width (rezolus #1224, ride-alongs).
 - Changes-only rows: measured NO-GO (rezolus
   `docs/journal/2026-09-28-changes-only-stream.md`).
+
+## 5b: built (2026-09-29)
+
+### The group builder
+
+`metriken-exposition::group_builder`, behind `msgpack` (the schema hash
+needs it). The producer-specific half is a `Router`:
+
+```rust
+pub trait Router {
+    type Guard: ReadGuard;
+    fn route<'a>(&'a self, metric: &'a MetricEntry) -> Option<Route<'a>>;
+    fn acquire(&self, group: GroupId<'_>) -> Acquisition<Self::Guard>; // default Windowless
+    fn window(&self, group: GroupId<'_>) -> Option<Window>;             // default None
+    fn annotate(&self, metric: &MetricEntry, metadata: &mut BTreeMap<String, String>); // default no-op
+}
+pub struct Route<'a> { pub group: GroupId<'a>, pub membership: Membership<'a> }
+pub enum Membership<'a> { Present, All, Prefix(usize), Set(&'a [usize]), Slots }
+pub enum Acquisition<G> { Windowless, Stamped(Option<Window>), Reader(G) }
+pub trait ReadGuard { fn mark_end(&mut self) {} fn finish(self) -> Option<Window>; }
+```
+
+- `route` returning `None` leaves a metric out (rezolus's `log_` filter).
+  `GroupId` is two borrowed parts, so routing allocates nothing; the wire
+  name is `"{namespace}/{name}"`.
+- `Acquisition::Stamped` is read at a group's first touch and again through
+  `window` after its values, and the builder emits the union
+  (`resolve_walk_window`). `Acquisition::Reader` is rezolus's reader-stamped
+  bracket: the guard opens at first touch, `mark_end` runs after each group
+  metric's values are read, `finish` runs at emit, and a group that produced
+  nothing drops its guard unfinished. The builder knows nothing about how a
+  guard stamps.
+- `GroupBuilder::new(router)` owns the router and the skeleton cache.
+  `build_groups(extra)` returns the groups; `snapshot(stamp, duration,
+  extra, metadata)` wraps them in a `SnapshotV3` with `producer_epoch`,
+  `clock_anchor_wall_ns`, `ts` and `wall_offset`, and `systemtime =
+  ts + wall_offset`. `Stamp::now()` is `metriken::epoch::anchored_now()`.
+- `ExtraGroup` is a caller's group of ready-made members, always built
+  fresh. rezolus's `external/main` becomes one.
+- Names come from `MemberNames`: `Positional` (`{metric_id}`,
+  `{metric_id}x{idx}`, the default and what archives carry) or `ByName`
+  (`{name}`, `{name}#{idx}`, stable across registration order, unique only
+  when names are).
+- Member metadata, the identity fold with `metadata_version` folded before
+  members, the miss path storing the walk's own identity, the hit-path
+  arity check that evicts and skips, and the empty-group skip are
+  `create_v3`'s, with their comments rewritten without rezolus's types.
+  `acq_group` (`GROUP_METADATA_KEY`) is stripped from every member.
+- `is_family(metric)` tells a router a metric is a `CounterFamily` or
+  `GaugeFamily`, whose membership is `Slots`. `DefaultRouter` routes by
+  `acq_group` into one namespace, for a producer without a group registry.
+
+### How rezolus implements it
+
+```rust
+struct RezolusRouter {
+    sampler_mods: Vec<(&'static str, &'static str)>, // samplers::sampler_modules()
+    groups: &'static HashMap<(&'static str, &'static str), &'static AcquisitionGroup>,
+}
+impl Router for RezolusRouter {
+    type Guard = ReaderGuard; // AcquisitionGuard<'static> + &'static AcquisitionGroup
+    fn route<'a>(&'a self, m: &'a MetricEntry) -> Option<Route<'a>> {
+        if m.name().starts_with("log_") { return None; }
+        let sampler = attribute_sampler(m.module(), &self.sampler_mods);
+        match m.metadata().get("acq_group").map(|g| self.groups.get(&(sampler, g))) {
+            Some(Some(ag)) => Some(Route {
+                group: GroupId::new(ag.sampler, ag.name),
+                membership: if ag.is_reader_stamped() { Membership::Slots }
+                    else if let Some(s) = ag.member_set() { Membership::Set(s) }
+                    else if let Some(n) = ag.member_bound() { Membership::Prefix(n) }
+                    else { Membership::All },
+            }),
+            // Some(None) is the unregistered-acq_group debug_assert.
+            _ => Some(Route { group: GroupId::new(sampler, "main"), membership: Membership::Present }),
+        }
+    }
+    fn acquire(&self, g: GroupId<'_>) -> Acquisition<ReaderGuard> {
+        match self.groups.get(&(g.namespace, g.name)) {
+            Some(ag) if ag.is_reader_stamped() => Acquisition::Reader(ReaderGuard::new(ag)),
+            Some(ag) => Acquisition::Stamped(ag.window()),
+            None => Acquisition::Windowless,
+        }
+    }
+    fn window(&self, g: GroupId<'_>) -> Option<Window> {
+        self.groups.get(&(g.namespace, g.name)).and_then(|ag| ag.window())
+    }
+    fn annotate(&self, m: &MetricEntry, md: &mut BTreeMap<String, String>) {
+        md.insert("sampler".into(), attribute_sampler(m.module(), &self.sampler_mods).into());
+    }
+}
+// ReaderGuard::finish: guard.finish(); ag.window()
+```
+
+`SnapshotBuilder` holds a `GroupBuilder<RezolusRouter>` in place of its
+`SkeletonCache`, passes `external/main` as an `ExtraGroup` (still sorted and
+named by its labels hash in rezolus), and passes `source` and `version` as
+snapshot metadata. `create_v3`, `fold_group_identities`, `GroupBuilder`,
+`members`, `resolve_walk_window` and their tests are deleted.
+
+### The frame producer
+
+`metriken-archive::stream`, behind a new `stream` feature
+(`dep:metriken-exposition`, `dep:metriken`) rather than `write`: a producer
+serving a stream needs neither the archive writer nor dendro's writer.
+`FrameProducer::new(labels, metadata)` takes the source uuid and anchor from
+`metriken::epoch` and adds dendro's `PRODUCER_EPOCH` key;
+`FrameProducer::for_source` names them explicitly. `opening()` is the
+preamble plus handshake; `interval(rows, ts, wall_offset, seq)` is one
+interval's `Frame::Rows`; `empty_interval(seq)` is the empty one.
+
+`interval` takes any `StreamRow` (stream, schema hash, schema, payload), so
+rezolus can pass its `AgentRow`s, which also serve `/metrics/rows`, without
+converting. `EncodedGroup::encode(&GroupSnapshot)` is metriken's row type.
+rezolus's `keep` closure became filtering the iterator before `interval`,
+which keeps the rule that a filtered row never marks a schema as sent.
+
+What stays in rezolus: the axum route, the content type, the per-connection
+timer and interval index, the TTL-shared pass, and the per-subscriber
+filters (a repeated reading, a group whose window did not advance).
+
+### Differences from `create_v3`
+
+For `Positional` names there is no difference in groups, schemas, hashes or
+windows. What changed:
+
+- Both passes read one `metriken::metrics()` guard, where `create_v3` took
+  one per pass, so both see the same dynamic metrics. Registering a dynamic
+  metric waits for the two walks instead of one at a time.
+- `mark_end` is called after every counter-group and gauge-group metric of a
+  guarded group, not only in the `Slots` arms. In rezolus a guarded group's
+  metrics are all `Slots`, so this is the same calls.
+- The two `debug!` lines on a hit-path eviction are gone
+  (metriken-exposition has no logging dependency); the eviction is not.
+
+### Tests
+
+metriken-exposition: 28 integration tests (`tests/group_builder.rs`) and 8
+unit tests. Ported from `create_v3`'s: declared and default groups, schema
+hash stability, unique names, slot order and slot meaning, metadata changed
+at a stable index, hit allocations constant from 8 to 512 members, slot
+churn hits and misses, absent and unhandled-value groups, registered versus
+value-derived membership, a zero-crossing default member, bounds and
+clamping, reader-stamped windows, concurrent builders, a 4.2M-slot group
+with 2 members, stamped and discarded sweeps, the anchored stamp, and the
+`members`/`resolve_walk_window` unit tests. New: a router that declines a
+metric, a router splitting metrics into two groups with per-group cache
+counts, `ByName`, extra groups alone and joined to a routed group, and
+counter and gauge families as groups whose members come and go with the
+schema reused while membership is unchanged.
+
+metriken-archive: 11 unit tests in `stream` (ported: schema inside the
+payload, not resent, resent on change, the pass's stamp, `NO_INDEX_STATE`,
+the empty interval, one timeline per process, the handshake, a tick into an
+archive through dendro's subscriber; new: per-subscription schema state,
+a round trip through dendro's frame encode and decode), and one integration
+test (`tests/stream.rs`): a registry with a counter and a counter family
+through `GroupBuilder`, `FrameProducer`, dendro's wire and `Subscriber`,
+read back by `ArchiveReader` with each tenant's labels and `__uid__`.
+
+Not ported: V2 (`create`) tests, the external-metrics store, TTL and body
+caching, `/metrics/rows`, sampler attribution, `set_member_set`'s own test
+(it tests `AcquisitionGroup`), and the recorder's `StreamSubscriber`.
+
+## 5b: measured (2026-09-29): GO
+
+rezolus's adoption (a `RezolusRouter` over this builder, and this frame
+producer behind its `/metrics/stream`) was checked three ways.
+
+**Equivalence.** Before deleting `create_v3`, one test built each tick with
+both builders from the same registry and compared every group's name,
+schema, `schema_hash`, values, windows and the snapshot metadata, and the
+rebuild count, over nine ticks: cold start, cache hits, slot assign and
+release, metadata replaced at a stable index, a restamped window, histograms
+loading, external metrics growing, a default member leaving. No
+difference; a deliberately changed label made it fail. The expectations
+stay in rezolus as `v3_snapshot_contract`.
+
+**Builder cost, isolated.** A 797-entry registry (a 4096-slot per-task
+group with 2,500 live slots, a 512-slot cgroup group, three per-CPU groups
+of 64, 200 scalars), 300 warm-up, 3,000 cache-hit and 2,000
+membership-change ticks.
+
+- First measured on an Apple-silicon laptop: membership-change ticks were
+  3–4.5% slower than `create_v3`, from cloning a member's base metadata
+  before, not inside, the slot-metadata callback and formatting the name
+  first. Fixed (`member_metadata`); after it, 18 runs gave ratios of
+  0.993–1.024 on membership-change ticks and 0.986–1.031 on cache-hit
+  ticks, with one run where the new builder alone sat 14% slower on
+  cache-hit ticks for the whole process. That run never reproduced under a
+  profiler, and its cause is not known.
+- On Linux (a systemslab VM, Debian 13, one pinned CPU), each builder run
+  alone under `perf record`: 163.18 G cycles for `create_v3`, 163.57 G for
+  this builder (+0.24%), with the same profile (the builder 16.8% against
+  17.5%, `GroupSchema::hash` 5.7% both, `malloc`/`free` 16.5% against
+  15.6%). 24 runs of both builders alternating spread 1.4% in total CPU,
+  with no slow run.
+
+**End to end.** The same VM, each build's own agent and recorder (rezolus
+upstream `7dd615c8` against the adoption branch), the shipped agent config
+with per-task series on, under process churn, 180 s per arm, pairs
+alternating which build ran first. Sampler health was identical in every
+arm (30 healthy). CPU seconds and peak RSS:
+
+| arm | agent, old → new | recorder, old → new | agent peak | archive |
+|---|---|---|---|---|
+| 1 Hz scrape | 3.74 → 3.78 | 1.67 → 1.66 | 152 MB | 1.2 MB |
+| 1 Hz `--stream` | 4.02 → 4.07 | 0.48 → 0.48 | 157 MB | 1.2 MB |
+| 10 Hz scrape | 35.86 → 35.71 | 18.71 → 18.32 | 152 MB | 6.5 MB |
+| 10 Hz `--stream` | 37.96 → 37.95 | 6.31 → 6.31 | 157 MB | 6.5 MB |
+
+Every archive was finalized, with 181–182 rows of 180 at 1 Hz and 1,802 of
+1,800 at 10 Hz at the measured cadence, a per-task table with 56–79
+occupants, 24 occupant streams, and queries returning data. A real agent's
+V3 build under churn took 0.70 ms at the median and 0.87 ms at p99.
+
+Two harness mistakes on the way, recorded so the next run avoids them: a
+filter that matched `RESULT` only at the start of a line lost the first
+Linux run's per-tick numbers (libtest prints the test name first), and not
+waiting for an agent to exit let the next agent's PMU budget probe find the
+counters still held (1 per CPU free instead of 6), which disabled three
+samplers in every other arm of the first end-to-end run.

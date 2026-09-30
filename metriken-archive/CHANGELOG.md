@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `stream` (feature `stream`): a producer's groups as dendro replication
+  frames, moved from rezolus's agent (`frames.rs`). `FrameProducer` makes
+  one subscription's frames: dendro's preamble and a `Frame::Handshake`
+  whose uuid is the process's producer epoch and whose anchor is its clock
+  anchor, then per interval a `Frame::Rows` of encoded `WalGroupRow`s, with
+  a group's schema inside the payload on its first row and whenever its hash
+  changes for that subscriber, and an empty `Frame::Rows` for an interval
+  with nothing new. Every rows frame names dendro's `NO_INDEX_STATE`.
+  `EncodedGroup` encodes a pass's `GroupSnapshot`s once for every
+  subscriber; `StreamRow` lets a producer pass rows of its own type. The
+  transport stays with the caller. A separate feature from `write`, since a
+  producer serving a stream needs neither the archive writer nor dendro's.
+
 ## [0.2.8] - 2026-09-29
 
 ### Fixed

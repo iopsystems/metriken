@@ -9,6 +9,8 @@
 //!   implementation of it.
 //! - [`reader`]: the reader, [`ArchiveReader`].
 //! - [`writer`] (feature `write`): the writer, [`ArchiveWriter`].
+//! - [`stream`] (feature `stream`): a producer's groups as dendro
+//!   replication frames, [`FrameProducer`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,6 +20,8 @@ pub mod encoder;
 pub mod filter;
 mod names;
 pub mod reader;
+#[cfg(feature = "stream")]
+pub mod stream;
 #[cfg(feature = "write")]
 pub mod writer;
 
@@ -46,6 +50,8 @@ pub fn segment_props(compression: Compression) -> parquet::file::properties::Wri
         .build()
 }
 pub use reader::{ArchiveReader, LabeledRecordings};
+#[cfg(feature = "stream")]
+pub use stream::FrameProducer;
 #[cfg(feature = "write")]
 pub use writer::{ArchiveWriter, SourceRecorder, WriterConfig};
 

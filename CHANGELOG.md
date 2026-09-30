@@ -35,6 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   most 1.4 ms where a registry entry waited 121 ms behind a snapshot. Phase
   5c.
 
+### metriken-exposition (unreleased)
+
+- **Added:** `group_builder`, which walks the registry into `SnapshotV3`
+  groups, moved from rezolus's agent (`create_v3`). A caller-supplied
+  `Router` says which group each metric belongs to (`GroupId`), how its
+  members are chosen (`Membership`: value-derived, all slots, a prefix, an
+  explicit set, or the slots that carry metadata), where each group's window
+  comes from (`Acquisition`, with a `ReadGuard` for a group whose read is the
+  acquisition), and which keys to add to member metadata. `GroupBuilder`
+  builds the member descriptors, names (`{metric_id}` / `{metric_id}x{idx}`
+  by default, `ByName` as an alternative), schema and hash, keeps rezolus's
+  two-pass skeleton cache, appends caller groups (`ExtraGroup`), and stamps
+  the snapshot with `producer_epoch`, `clock_anchor_wall_ns`, `ts` and
+  `wall_offset` from `metriken::epoch`. Families snapshot as one group of
+  their live members. `DefaultRouter` routes by `acq_group` metadata for a
+  producer with no group registry. Behind `msgpack`, which the schema hash
+  needs. Phase 5b of `docs/journal/2026-09-29-members-that-come-and-go.md`.
+
 ### metriken-archive 0.1.0
 
 - **Added:** the crate, `ArchiveReader` and the `Catalog` trait with dendro's
