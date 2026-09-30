@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   most 1.4 ms where a registry entry waited 121 ms behind a snapshot. Phase
   5c.
 
-### metriken-exposition (unreleased)
+### metriken-exposition 0.21.2
 
 - **Added:** `group_builder`, which walks the registry into `SnapshotV3`
   groups, moved from rezolus's agent (`create_v3`). A caller-supplied
