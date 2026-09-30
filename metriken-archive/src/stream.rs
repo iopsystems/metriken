@@ -75,11 +75,8 @@ pub trait StreamRow {
 /// Each group's schema in the segment format, converted once per schema
 /// hash and shared between passes.
 ///
-/// A snapshot carries every group's schema on every pass, and a subscriber
-/// is sent one only when its hash changes. Converting every schema on every
-/// pass allocated each member's name and labels again and freed them, which
-/// on a 2,500-task registry was 95% of the cost of encoding a pass for the
-/// stream. Keep one per producer, across passes.
+/// A snapshot carries every group's schema on every pass; this converts one
+/// only when its hash changes. Keep one per producer, across passes.
 ///
 /// One entry per group name, holding the latest hash; a group that stops
 /// appearing keeps its entry, so the cache holds at most one schema per group
@@ -321,8 +318,8 @@ impl FrameProducer {
 /// it is.
 ///
 /// Spliced into the encoded row rather than built again from the snapshot:
-/// the values are already encoded, and deriving them twice is a second chance
-/// to disagree. A payload that does not decode is returned unchanged; the
+/// the values are already encoded, and deriving them twice could produce
+/// different values. A payload that does not decode is returned unchanged; the
 /// subscriber skips a row it cannot read, and losing one row is better than
 /// ending the subscription.
 fn with_schema(payload: &[u8], schema: &GroupSchema) -> Vec<u8> {

@@ -581,5 +581,8 @@ two copies of each payload (`payload().to_vec()` and `encode_frame`) are
 inside the 19 µs the frame takes. Removing the copies would change dendro's
 `WalRow`.
 
-Not yet measured end to end: the agent's CPU streamed against scraped with
-this change.
+Measured end to end afterwards (rezolus #1383, 2026-09-30) on `delta`, a
+32-core bare-metal host, with per-thread series on and process churn, two
+180 s windows per arm: the streamed agent's CPU fell from 3.08–3.19 s to
+2.11–2.19 s at 1 Hz and from 29.91–31.44 s to 18.84–19.09 s at 10 Hz, to
+within 0–4% (1 Hz) and 8–16% (10 Hz) of the same build scraped.
