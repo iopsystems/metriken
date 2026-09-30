@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.33.4
+
+- **Changed:** a segment the segmented reader opens is cached under an id
+  derived from its bytes (XXH3-64, `twox-hash`), not a fresh id per open.
+  A reader reopened over the same segments on the same `BufferPool` finds
+  the blocks the previous reader decoded; identical bytes decode to
+  identical blocks, so sharing them is correct. A live archive is reopened
+  to see new rows, and before this every reopen left the sealed segments'
+  decoded blocks unreachable.
+
 ### metriken-archive 0.3.0
 
 - **Added:** `stream::SchemaCache`, which converts each group's schema to the

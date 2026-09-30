@@ -204,7 +204,10 @@ impl SegmentedParquetReader {
                 catalog.push(SegmentCatalog::GONE);
                 continue;
             };
-            let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
+            let seg = ParquetReader::builder()
+                .pool(Arc::clone(&pool))
+                .content_keyed_bytes(bytes)
+                .build()?;
             check_histogram_configs(idx, &seg)?;
             // Each column contributes every label set it can present as —
             // one, unless a relabelling says otherwise.
@@ -803,10 +806,12 @@ impl SegmentedSource {
         let Some(bytes) = self.store.bytes(idx).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let seg = Arc::new(ParquetReader::open_bytes_with_pool(
-            bytes,
-            Arc::clone(&self.pool),
-        )?);
+        let seg = Arc::new(
+            ParquetReader::builder()
+                .pool(Arc::clone(&self.pool))
+                .content_keyed_bytes(bytes)
+                .build()?,
+        );
         let size = seg.resident_estimate();
         self.cache
             .lock()
@@ -2055,6 +2060,65 @@ mod tests {
         let pool2 = BufferPool::new(64 * 1024 * 1024);
         let r2 = SegmentedParquetReader::open_bytes_with_pool(vec![c, d], pool2).unwrap();
         assert_eq!(r2.counter_labels("cpu_cycles").len(), 2);
+    }
+
+    /// A reader reopened over the same segments, on the same pool, reads the
+    /// blocks the first one decoded: the blocks are keyed by the segment's
+    /// bytes, not by which open read them. Segments with different bytes
+    /// share nothing.
+    #[test]
+    fn a_reopened_reader_reuses_the_pools_decoded_blocks() {
+        use crate::MetricsSource;
+        let segs = || {
+            vec![
+                segment(
+                    "cpu_cycles",
+                    &[],
+                    &[(1_000_000_000, 10), (2_000_000_000, 20)],
+                ),
+                segment(
+                    "cpu_cycles",
+                    &[],
+                    &[(3_000_000_000, 35), (4_000_000_000, 50)],
+                ),
+            ]
+        };
+        let query = |r: &SegmentedParquetReader| {
+            r.query_range("rate(cpu_cycles[2s])", 1.0, 4.0, 1.0)
+                .unwrap();
+        };
+        let pool = BufferPool::new(64 * 1024 * 1024);
+
+        let first =
+            SegmentedParquetReader::open_bytes_with_pool(segs(), Arc::clone(&pool)).unwrap();
+        query(&first);
+        let after_first = pool.stats();
+        assert!(after_first.misses > 0, "the first reader decodes");
+
+        let second =
+            SegmentedParquetReader::open_bytes_with_pool(segs(), Arc::clone(&pool)).unwrap();
+        query(&second);
+        let after_second = pool.stats();
+        assert_eq!(
+            after_second.misses, after_first.misses,
+            "the reopened reader decodes nothing new"
+        );
+        assert!(after_second.hits > after_first.hits);
+
+        let other = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment(
+                "cpu_cycles",
+                &[],
+                &[(1_000_000_000, 11), (2_000_000_000, 21)],
+            )],
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        query(&other);
+        assert!(
+            pool.stats().misses > after_second.misses,
+            "different bytes are decoded, not served from the first segments' blocks"
+        );
     }
 
     #[test]
