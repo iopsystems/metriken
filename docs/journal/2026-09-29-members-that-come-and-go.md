@@ -1,6 +1,7 @@
 # Members that come and go: slot identity, the group builder and families in metriken
 
-**Status:** OPEN — 5a, 5b and 5c built in metriken; rezolus adoption pending. Phase 5 of
+**Status:** DONE in metriken — 5a, 5b and 5c built; 5b measured GO against rezolus
+(2026-09-29, "5b: measured" below). Phase 5 of
 [the high-cardinality stack](2026-09-28-high-cardinality-stack.md). Both
 decisions below were made on 2026-09-29: `.rez` stops being a `--stream`
 target in rezolus 6.0, and all three parts land before rezolus 6.0.0, in
@@ -474,6 +475,61 @@ Not ported: V2 (`create`) tests, the external-metrics store, TTL and body
 caching, `/metrics/rows`, sampler attribution, `set_member_set`'s own test
 (it tests `AcquisitionGroup`), and the recorder's `StreamSubscriber`.
 
-GO for 5b still needs rezolus: its snapshot and stream tests against the
-moved code, and the per-refresh cost from the agent's `sampling latency`
-line.
+## 5b: measured (2026-09-29): GO
+
+rezolus's adoption (a `RezolusRouter` over this builder, and this frame
+producer behind its `/metrics/stream`) was checked three ways.
+
+**Equivalence.** Before deleting `create_v3`, one test built each tick with
+both builders from the same registry and compared every group's name,
+schema, `schema_hash`, values, windows and the snapshot metadata, and the
+rebuild count, over nine ticks: cold start, cache hits, slot assign and
+release, metadata replaced at a stable index, a restamped window, histograms
+loading, external metrics growing, a default member leaving. No
+difference; a deliberately changed label made it fail. The expectations
+stay in rezolus as `v3_snapshot_contract`.
+
+**Builder cost, isolated.** A 797-entry registry (a 4096-slot per-task
+group with 2,500 live slots, a 512-slot cgroup group, three per-CPU groups
+of 64, 200 scalars), 300 warm-up, 3,000 cache-hit and 2,000
+membership-change ticks.
+
+- First measured on an Apple-silicon laptop: membership-change ticks were
+  3–4.5% slower than `create_v3`, from cloning a member's base metadata
+  before, not inside, the slot-metadata callback and formatting the name
+  first. Fixed (`member_metadata`); after it, 18 runs gave ratios of
+  0.993–1.024 on membership-change ticks and 0.986–1.031 on cache-hit
+  ticks, with one run where the new builder alone sat 14% slower on
+  cache-hit ticks for the whole process. That run never reproduced under a
+  profiler, and its cause is not known.
+- On Linux (a systemslab VM, Debian 13, one pinned CPU), each builder run
+  alone under `perf record`: 163.18 G cycles for `create_v3`, 163.57 G for
+  this builder (+0.24%), with the same profile (the builder 16.8% against
+  17.5%, `GroupSchema::hash` 5.7% both, `malloc`/`free` 16.5% against
+  15.6%). 24 runs of both builders alternating spread 1.4% in total CPU,
+  with no slow run.
+
+**End to end.** The same VM, each build's own agent and recorder (rezolus
+upstream `7dd615c8` against the adoption branch), the shipped agent config
+with per-task series on, under process churn, 180 s per arm, pairs
+alternating which build ran first. Sampler health was identical in every
+arm (30 healthy). CPU seconds and peak RSS:
+
+| arm | agent, old → new | recorder, old → new | agent peak | archive |
+|---|---|---|---|---|
+| 1 Hz scrape | 3.74 → 3.78 | 1.67 → 1.66 | 152 MB | 1.2 MB |
+| 1 Hz `--stream` | 4.02 → 4.07 | 0.48 → 0.48 | 157 MB | 1.2 MB |
+| 10 Hz scrape | 35.86 → 35.71 | 18.71 → 18.32 | 152 MB | 6.5 MB |
+| 10 Hz `--stream` | 37.96 → 37.95 | 6.31 → 6.31 | 157 MB | 6.5 MB |
+
+Every archive was finalized, with 181–182 rows of 180 at 1 Hz and 1,802 of
+1,800 at 10 Hz at the measured cadence, a per-task table with 56–79
+occupants, 24 occupant streams, and queries returning data. A real agent's
+V3 build under churn took 0.70 ms at the median and 0.87 ms at p99.
+
+Two harness mistakes on the way, recorded so the next run avoids them: a
+filter that matched `RESULT` only at the start of a line lost the first
+Linux run's per-tick numbers (libtest prints the test name first), and not
+waiting for an agent to exit let the next agent's PMU budget probe find the
+counters still held (1 per CPU free instead of 6), which disabled three
+samplers in every other arm of the first end-to-end run.
