@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-09-30
+
+### Added
+
+- `wal::encode_wal_group_row_with_schema`, which puts a schema into an
+  encoded `WalGroupRow` whose `schema` is `None` without decoding its values
+  or cloning the schema. The output is byte for byte what
+  `encode_wal_group_row` gives for the anchored row; a payload laid out any
+  other way is decoded and re-encoded.
+
 ## [0.1.5] - 2026-09-29
 
 ### Added

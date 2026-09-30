@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-30
+
+### Added
+
+- `stream::SchemaCache`, which converts each group's schema to the segment
+  format once per schema hash and hands out an `Arc` on later passes.
+  Converting every group's schema on every pass, then freeing it, was about
+  95% of the cost of encoding a pass for the stream: on rezolus's
+  `v3_build_cost` registry (a 2,500-task group), 20.4 ms per unchanged pass
+  before, 0.29 ms after.
+
+### Changed
+
+- **Breaking:** `EncodedGroup::schema` is `Option<Arc<GroupSchema>>`, and
+  `EncodedGroup::encode` and `encode_groups` take a `&mut SchemaCache`.
+- `FrameProducer` puts a changed schema into an already-encoded row with
+  metriken-segment's `encode_wal_group_row_with_schema` instead of cloning
+  the schema and decoding and re-encoding the row: 3.3 ms to 0.86 ms per
+  frame on the same registry when the task group's membership changed.
+
 ## [0.2.9] - 2026-09-29
 
 ### Added
