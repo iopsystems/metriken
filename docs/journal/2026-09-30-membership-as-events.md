@@ -125,6 +125,29 @@ The ~24% spent on schemas is roughly what criterion 3 asks for, and it
 removes only what the long form removes. So criterion 3 stays at a third,
 and the double decode becomes a separate, earlier fix in rezolus.
 
+## Progress (2026-09-30)
+
+- **Step 1b** (rezolus #1384): the recorder decodes each streamed row once.
+  Over four 180 s windows at 100 ms under the churn above, the recorder used
+  24–27% less CPU: 25.9–37.4 s before, 19.6–27.5 s after.
+- **Step 7** (rezolus #1385): hindsight subscribes to the stream. Checked
+  against a real agent on `delta`: it buffered from the stream, a dump opened
+  in `recording metadata`, and the dump and the live buffer both answered
+  `irate(cpu_usage)`.
+- **Step 8** (rezolus #1386): the live viewer records the stream into a
+  temporary archive. An open `ArchiveReader`'s view turned out to be fixed:
+  its tables, spans and WAL tail are read once, and its time range does not
+  grow (metriken-archive `reader.rs`: "a live archive is re-opened").
+  rezolus's `rez::live::LiveReader` therefore reopens after each interval.
+  The same fact means `rezolus view` on a running hindsight buffer shows it
+  as it was when opened; that is not fixed yet.
+- **For metriken-archive:** the reader warns that a source which is not
+  finalized "was recovered up to its last checkpoint". That wording is right
+  for a crashed recording and wrong for one that is still being written. A
+  reader that reopens every second repeated it every second, so rezolus
+  reopens with logging off. A reader option saying the archive is live, or
+  wording that covers both cases, would let a caller keep the warning.
+
 ## Design
 
 ### The stream carries the long form
@@ -236,7 +259,7 @@ In order, each its own PR and release:
 1. **Measure the recorder's split.** Done, above: ~24% schemas, ~12%
    value decode (done twice per row), ~12% the writer thread.
 1b. **rezolus: decode each streamed row once.** Independent of the long
-   form.
+   form. Open as rezolus #1384.
 2. **metriken-segment:** nothing new if `WalLongRow`, `LongOccupant` and
    `Occupant` carry the producer key as `occupant`; the writer rewrites it.
    Confirm that the WAL format needs no version bump when the writer (not
