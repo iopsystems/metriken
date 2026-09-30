@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-exposition (unreleased)
+### metriken-exposition 0.21.3
 
 - **Changed:** `GroupBuilder`'s maps hash with foldhash instead of SipHash,
   and a cache hit takes its value-vector sizes from the first pass's decision
