@@ -4,7 +4,9 @@
 `metriken-segment` holds the wide layout, the long layout, the occupant
 stream and the WAL row format; `metriken-archive` holds the reader and the
 writer, which rezolus's `record` and `hindsight` use by default from 6.0.
-Phase 5 is next. Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
+Phase 5 (slot identity, the group builder, families) is done. Phase 5d,
+sending a slot group's membership on the stream as occupant events rather
+than as a full schema, is open ([membership as events](2026-09-30-membership-as-events.md)). Every phase lands before rezolus 6.0 (iopsystems/rezolus#1224), which is
 then built on this stack rather than moved onto it afterwards (decided
 2026-09-28).
 
@@ -173,6 +175,10 @@ moved:
    in three parts landing in order (5a slot identity, 5b the group builder
    and stream frame producer, 5c families), all before rezolus 6.0.0.
    Phases 1–4 don't depend on it: they take occupants from any source.
+   5d, [membership as events](2026-09-30-membership-as-events.md): under
+   churn, a changed task group resends its whole schema every tick (81% of
+   the stream's bytes on a busy host); the stream should carry the long
+   form the archive stores, with occupants as events. Open.
 6. **rezolus 6.0** builds on the result: the agent uses metriken's groups
    and identity and its stream endpoint, and the recorder, hindsight and
    viewer use `metriken-archive`.

@@ -1,0 +1,226 @@
+# Membership as events: slot groups on the stream in the archive's long form
+
+**Status:** OPEN — design, nothing built. Phase 5d of
+[the high-cardinality stack](2026-09-28-high-cardinality-stack.md), after
+[members that come and go](2026-09-29-members-that-come-and-go.md).
+
+## Goal
+
+When an occupant joins or leaves a group with slots, the replication stream
+should carry that change, not the group's whole schema. The storage end
+already works this way: the archive writes such a group long, keyed by
+occupant, with each occupant's labels in a `<table>/occupants` stream. The
+producer end already works this way too: `SlotIdentity::assign` and
+`release` are the events. Every stage in between discards the event and
+rebuilds the full member list.
+
+## Why
+
+### Measured: the schema is most of the stream under churn
+
+A throwaway probe subscribed to a rezolus agent's `/metrics/stream` on
+`delta` (32 cores, Debian 13, kernel 6.12) and tallied each group's rows.
+The agent had per-thread series on (`task_attribution = true`) and ran under
+process churn (16 short `awk` loops at a time, repeatedly). The agent was
+rezolus #1383, with metriken-archive 0.3.0. 120 s per interval:
+
+| interval | stream bytes | schema bytes | task group: schema resent | task group: schema share |
+|---|---|---|---|---|
+| 1 s | 29.5 MB (245 KB/s) | 23.9 MB (81.2%) | 120 of 121 rows | 97.8% |
+| 100 ms | 309.5 MB (2.58 MB/s) | 250.9 MB (81.1%) | 1,191 of 1,201 rows | 97.7% |
+
+At 1 s each task-group resend carried about 845 members, of which about 16
+had been added and 12 removed since the previous one (1,941 added and 1,479
+removed over 120 resends), at about 212 bytes of schema per member. So the
+stream sent about 180 KB of schema per tick to say that roughly 28 members
+changed. The cgroup groups (`syscall_counts_cgroup`, `cpu_tlb_flush_cgroup`,
+`cpu_usage_cgroup_*`, `scheduler_runqueue_cgroup_*`) were resent 5–15 times
+in 120 s at 1 s, and schema was 47–91% of their bytes.
+
+### How it got this way
+
+`record --stream` briefly had an event form: the identity index
+(`Frame::Index` entries against `caller_rows`). rezolus's stream journal
+(`docs/journal/2026-09-22-recorder-stream-ingest.md`) found identity held
+twice, once in the schema and once in the index. Phase 5's decision 1
+(2026-09-29) removed the index and kept identity in the schema, since the
+long writer could build its occupant stream from `__uid__` in the schema and
+nothing else read a change feed. That decision did not measure what
+restating the whole schema on every change costs. The numbers above are that
+cost.
+
+### Measured: what each stage pays per change
+
+A group's values are a positional vector, and its schema lists every member
+with its full labels under one hash. So a single assign or release changes
+the hash, and every stage treats the result as a new schema:
+
+| stage | work on a changed group | measured |
+|---|---|---|
+| builder (`GroupBuilder`) | rebuilds every member's descriptor, hashes the schema | membership-change tick 7.0–8.4 ms vs 1.4–1.6 ms cache hit (rezolus `v3_build_cost`, 2,500-task group) |
+| stream encode | converts the changed schema once (`SchemaCache`) | 3.4 ms on the same registry |
+| frame | splices the schema into the row | 0.86 ms |
+| wire | the full schema, per subscriber | 81% of bytes (above) |
+| recorder (rezolus `StreamSchemas::snapshot`) | decodes the schema, converts it back to metriken-exposition's type, builds a `GroupSnapshot` | not isolated |
+| writer (`LongLayout::of`, `metriken-archive/src/writer.rs`) | walks every member to separate occupant labels from column metadata, keys each slot by `__uid__` | not isolated |
+
+End to end on `delta` under the same churn, with rezolus #1383, over 180 s
+windows, the recorder used 2.79 s streaming at 1 Hz and 33.53 s at 10 Hz;
+the agent it was streaming from used 2.19 s and 18.84 s. So a streaming
+recorder at 10 Hz used 1.8 times the CPU of the agent it recorded. How much of that goes to schemas has not been isolated.
+
+The archive does not need any of this. `LongLayout` exists to recover, from
+a full member list, the occupants the producer already knew about as
+events.
+
+## Design
+
+### The stream carries the long form
+
+For a group the writer would write long (any member carries a slot `id`:
+`slotted()` in `metriken-archive/src/writer.rs`), the subscriber asks for
+the long form and each interval carries two rows:
+
+- **`<group>`: a long row.** A `WalLongRow` whose schema is the group's
+  metric columns only: each metric's fixed descriptor, with no occupant
+  labels. Its hash changes only when the set of metrics changes, never when
+  membership does. Each present occupant has one `LongOccupant` with its
+  values, keyed by the producer's occupant key.
+- **`<group>/occupants`: occupant rows.** An `Occupant` (key plus labels)
+  for each occupant this subscriber has not been told about yet. That means
+  new assignments, plus every live occupant on the connection's first
+  interval.
+
+A departure is not sent. The archive represents a departed occupant by its
+absence from later rows, and so does this form. `SlotIdentity::release`
+means the slot has no values from then on.
+
+Groups without slots (host-wide, per-sampler scalars, groups whose
+membership follows values) keep the current `WalGroupRow` form, where a
+schema change is rare.
+
+### The producer's occupant key, and the writer's numbers
+
+The archive numbers occupants densely per stream, and the writer assigns
+those numbers (`GroupState::occupants`). That stays with the writer. The
+writer serves several sources and outlives a producer's connection, so a
+number minted by the producer could collide after a reconnect.
+
+The producer sends a `u64` key that identifies an occupant for the life of
+the process:
+
+- for a `SlotIdentity` space, the assignment's generation, the same one
+  `mint_uid` hashes into `__uid__` (`metriken/src/group/identity.rs`);
+- for a bounded group with fixed slots (per-CPU, per-device), the slot
+  index, since each slot's occupant does not change.
+
+The writer maps key to archive number per stream: one hash lookup per
+present occupant per tick, instead of a layout rebuild per change. A
+producer restart is a new producer epoch, and therefore a new dendro source
+(the handshake uuid is the epoch), so keys never need to survive a restart.
+
+### The builder
+
+For a `Membership::Slots` group, `GroupBuilder` builds the metric columns
+once per set of metrics. Each tick it emits the live slots' values keyed by
+occupant key, and it takes new occupants' labels from `SlotIdentity` rather
+than rebuilding every member's descriptor.
+
+The wide `GroupSnapshot` is still needed for `/metrics/binary`. That body is
+self-contained by contract: `record --format raw`, the exporter and the
+viewer decode each one alone. So the wide schema is built only when a
+scraper asks for it. An agent that is only streamed never builds it.
+
+### Subscribing
+
+The long form is opt-in per subscription: `/metrics/stream?layout=long`.
+Without the parameter the stream is today's.
+- A 5.x `record --stream` keeps working against a 6.0 agent. It records
+  rows without an identity index, as decision 1 already accepted.
+- The 6.0 recorder asks for `long` and refuses an agent that ignores it.
+  The response names the layout it serves, the way it names the frame
+  interval (`x-rezolus-frame-interval` today).
+
+On a reconnect the subscriber receives every live occupant again on the
+first interval. The writer dedups them by key, like the restatements it
+already writes every `restate_every_ns`.
+
+### The writer
+
+`ArchiveWriter` gains a staging entry for a group that arrives long: a
+`WalLongRow` with producer keys, plus the new occupants. It maps the keys to
+archive numbers, writes the long row, and writes first-seen occupants to the
+occupant stream. The restatement is unchanged. `LongLayout::of` remains for
+a snapshot that arrives wide: a scrape, or a stream without `layout=long`.
+
+## GO / NO-GO
+
+Measured on `delta` under the churn above, per-thread series on, 1 Hz and
+10 Hz, against rezolus #1383 as the baseline. Proposed thresholds, to be
+settled before building:
+
+1. **Same answers.** An archive recorded over the long stream and one
+   recorded over the wide stream of the same agent, over the same ticks,
+   give the same answer to every query in the writer gate's set (metriken
+   `2026-09-28-archive-writer.md`, 213 queries). Occupant labels match
+   series for series.
+2. **Wire.** Stream bytes per second fall by at least 3x at 1 s and at
+   100 ms. Schema is 81% of the bytes today; this criterion checks that the
+   occupant rows do not add back what the schema removed.
+3. **Recorder CPU** falls, at 10 Hz by at least a third, from 33.53 s per
+   180 s.
+4. **Agent CPU** streaming is no higher than the baseline's (2.19 s at 1 Hz,
+   18.84 s at 10 Hz), and a membership-change tick on `v3_build_cost`
+   costs no more than twice a cache-hit tick when only the long form is
+   requested (today 5–6 times).
+
+NO-GO if (1) fails in a way that needs the wide schema to repair, or if (2)
+and (3) together are under 2x and a third.
+
+## Plan
+
+In order, each its own PR and release:
+
+1. **Measure the recorder's split.** Profile the 10 Hz streaming recorder
+   on `delta` to find how much of its 33.5 s is schema decode, conversion
+   and `LongLayout::of`. If it is small, criterion (3) is the wrong target
+   and gets restated here before building.
+2. **metriken-segment:** nothing new if `WalLongRow`, `LongOccupant` and
+   `Occupant` carry the producer key as `occupant`; the writer rewrites it.
+   Confirm that the WAL format needs no version bump when the writer (not
+   the wire) assigns the stored number.
+3. **metriken:** expose an occupant's generation from `SlotIdentity` next
+   to its uid.
+4. **metriken-exposition:** `GroupBuilder` emits a slot group's long form
+   (metric columns, occupant keys, new occupants since the last call per
+   consumer), and builds the wide schema only on request.
+5. **metriken-archive:** `FrameProducer` serves the long form per
+   subscription; `ArchiveWriter` stages a long group with producer keys.
+6. **rezolus:** `/metrics/stream?layout=long`, the recorder asking for it,
+   and the gate above.
+
+## Open questions
+
+- **Hindsight scrapes `/metrics/binary`** (rezolus
+  `src/hindsight/config/general.rs:91`). That is the recorder that runs on
+  every host, and it pays for the full schema on every tick, plus a
+  `LongLayout` rebuild whenever the hash changes. It should read the long
+  form too, either over the stream or, per rezolus #1224 part 3, in-agent.
+  Which one decides whether hindsight is part of this phase.
+- **Families (5c)** have registration ids, which would serve as occupant
+  keys. A family could produce the long form directly and never have a wide
+  schema at all. Not checked against the 5c code.
+- **Whether per-CPU and per-device groups need the long form on the wire.**
+  Their membership does not churn, so the wide form costs them nothing
+  after the first row. Sending every slotted group the same way keeps the
+  writer to one path; sending only `Membership::Slots` groups long keeps the
+  change smaller.
+- **Histogram groups with slots** (rezolus backlog, after 6.0) would travel
+  in this form with no further wire change.
+
+## Not in this phase
+
+- `/metrics/binary` and V3 snapshots keep full schemas.
+- Changes-only values (measured NO-GO, rezolus
+  `docs/journal/2026-09-28-changes-only-stream.md`). This design changes
+  how membership travels, not values.
