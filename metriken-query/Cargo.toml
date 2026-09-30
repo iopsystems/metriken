@@ -1,6 +1,6 @@
 [package]
 name = "metriken-query"
-version = "0.33.2"
+version = "0.33.3"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
