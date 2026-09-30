@@ -73,6 +73,27 @@ The archive does not need any of this. `LongLayout` exists to recover, from
 a full member list, the occupants the producer already knew about as
 events.
 
+## Decisions (2026-09-30)
+
+- **Every rezolus consumer of a live agent is a stream consumer.** The
+  recorder already is. Hindsight and the live viewer move from
+  `/metrics/binary` to `/metrics/stream?layout=long`. They share one
+  consumer: a subscription feeding an `ArchiveWriter`.
+  - **Recorder:** the writer with no retention.
+  - **Hindsight:** the same writer with retention (it already evicts
+    through `ArchiveWriter::evict_before`).
+  - **Live viewer:** writes into a temporary archive and queries it through
+    `ArchiveReader` while it is still being written, as it already reads a
+    live hindsight buffer. Today the viewer polls `/metrics/binary`
+    (rezolus `src/viewer/actions.rs` `ingest_loop`), ingests each snapshot
+    into a `MemoryStore`, and keeps every raw body in an unbounded
+    `VecDeque` for save-as-parquet and reports (`state.snapshots`). With an
+    archive, saving copies the archive, as a dendro source's Save-as-Report
+    already does (`report_save::build_dendro_report`).
+- **Who still reads `/metrics/binary`:** the exporter, and `record` to
+  `.rez`, parquet or raw. Those need self-contained snapshots, so that
+  endpoint keeps full schemas.
+
 ## Design
 
 ### The stream carries the long form
@@ -196,17 +217,32 @@ In order, each its own PR and release:
    consumer), and builds the wide schema only on request.
 5. **metriken-archive:** `FrameProducer` serves the long form per
    subscription; `ArchiveWriter` stages a long group with producer keys.
-6. **rezolus:** `/metrics/stream?layout=long`, the recorder asking for it,
-   and the gate above.
+6. **rezolus:** `/metrics/stream?layout=long`, and the recorder asking for
+   it, with the gate above.
+7. **rezolus hindsight:** a stream consumer. It subscribes as the recorder
+   does, keeps its retention, `/status`, `/dump` and SIGHUP capture, and its
+   config names an agent instead of a `/metrics/binary` URL. Gate: its
+   `hindsight_dump` tests pass, and a dump answers the same as one from
+   today's scraping buffer over the same window.
+8. **rezolus live viewer:** a stream consumer writing a temporary archive,
+   read live through `ArchiveReader`. `state.snapshots` and the
+   `MemoryStore` ingest path go away, and save and report copy the archive.
+   Gate: `viewer_smoke` in live mode, the same dashboards and queries as
+   today, and flat memory over a long session.
+
+Steps 7 and 8 need only the stream, not the long form. Either can land
+before steps 2–6, and then gain the long form when step 6 lands.
 
 ## Open questions
 
-- **Hindsight scrapes `/metrics/binary`** (rezolus
-  `src/hindsight/config/general.rs:91`). That is the recorder that runs on
-  every host, and it pays for the full schema on every tick, plus a
-  `LongLayout` rebuild whenever the hash changes. It should read the long
-  form too, either over the stream or, per rezolus #1224 part 3, in-agent.
-  Which one decides whether hindsight is part of this phase.
+- **Hindsight in-agent** (rezolus #1224 part 3) would skip the transport
+  as well. That remains a separate step. Moving hindsight to the stream
+  first leaves a smaller change for later: swapping the subscription for an
+  in-process channel.
+- **The live viewer's temporary archive:** where it lives (a temp file, or
+  memory if dendro can hold a SQLite archive in memory), and what bounds it
+  for a viewer left open for days. Hindsight's retention is the likely
+  answer. Not decided.
 - **Families (5c)** have registration ids, which would serve as occupant
   keys. A family could produce the long form directly and never have a wide
   schema at all. Not checked against the 5c code.
