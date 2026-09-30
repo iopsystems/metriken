@@ -94,6 +94,37 @@ events.
   `.rez`, parquet or raw. Those need self-contained snapshots, so that
   endpoint keeps full schemas.
 
+## Step 1: where the streaming recorder's CPU goes (2026-09-30)
+
+The recorder under `perf record --call-graph dwarf` on `delta` (the rezolus
+#1383 build) was streaming at 100 ms from an agent with per-thread series
+on, under the churn above. 40 s were sampled at 199 Hz. The DWARF unwind
+left many frames unresolved, so these are shares of all samples, with
+overlaps, and should be read as approximate:
+
+| where | share of samples | what it is |
+|---|---|---|
+| schema handling | ~24% | `GroupSchema::hash` 3.7%, `LongLayout::of` 3.6%, dropping schemas (`Arc<GroupSchema>::drop_slow`) 5.0%, cloning label maps 2.5%, converting `MetricDesc` lists 2.2%, decoding strings and label maps ~7% |
+| decoding values | ~12% | `decode_wal_group_row` 12.2%, 9.7% of it histograms |
+| the writer thread | ~12% | sealing (`Encoder::encode` 6.8%, parquet 2.3%), SQLite commit and WAL writes (~5%) |
+
+Two costs are fixable without the long form:
+
+- **Each row's payload is decoded twice.** `AgentRow::from_payload` decodes
+  it to compute arity and `approx_bytes`, and to lift the schema out.
+  `StreamSchemas::snapshot` then decodes it again to build a
+  `GroupSnapshot` (both in rezolus: `crates/rez/src/wire.rs` and
+  `src/recorder/stream.rs`). Decoding once would save up to half of the
+  ~12%.
+- **The recorder turns the rows back into a snapshot,** and the writer
+  encodes them into WAL rows again. The long form removes the schema half of
+  that. The value half is covered by the writer's staging entry for rows
+  that are already encoded (plan step 5).
+
+The ~24% spent on schemas is roughly what criterion 3 asks for, and it
+removes only what the long form removes. So criterion 3 stays at a third,
+and the double decode becomes a separate, earlier fix in rezolus.
+
 ## Design
 
 ### The stream carries the long form
@@ -202,10 +233,10 @@ and (3) together are under 2x and a third.
 
 In order, each its own PR and release:
 
-1. **Measure the recorder's split.** Profile the 10 Hz streaming recorder
-   on `delta` to find how much of its 33.5 s is schema decode, conversion
-   and `LongLayout::of`. If it is small, criterion (3) is the wrong target
-   and gets restated here before building.
+1. **Measure the recorder's split.** Done, above: ~24% schemas, ~12%
+   value decode (done twice per row), ~12% the writer thread.
+1b. **rezolus: decode each streamed row once.** Independent of the long
+   form.
 2. **metriken-segment:** nothing new if `WalLongRow`, `LongOccupant` and
    `Occupant` carry the producer key as `occupant`; the writer rewrites it.
    Confirm that the WAL format needs no version bump when the writer (not
