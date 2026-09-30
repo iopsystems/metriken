@@ -9,7 +9,7 @@ use dendro::replicate::wire::{self, FrameReader};
 use dendro::replicate::{Frame, Subscriber};
 use dendro::writer::Writer;
 use metriken::{metric, MetricEntry};
-use metriken_archive::stream::{encode_groups, FrameProducer};
+use metriken_archive::stream::{encode_groups, FrameProducer, SchemaCache};
 use metriken_archive::{ArchiveReader, DendroCatalog, Encoder};
 use metriken_exposition::group_builder::{
     is_family, Acquisition, GroupBuilder, GroupId, Membership, NoGuard, Route, Router, Stamp,
@@ -61,6 +61,7 @@ fn a_registry_streams_into_an_archive_that_reads_back() {
     let mut builder = GroupBuilder::new(StreamRouter {
         window: std::sync::Mutex::new(None),
     });
+    let mut schema_cache = SchemaCache::new();
     let mut producer = FrameProducer::new(
         [("source".to_string(), "svc".to_string())].into(),
         BTreeMap::new(),
@@ -96,7 +97,7 @@ fn a_registry_streams_into_an_archive_that_reads_back() {
             Default::default(),
         );
         assert_eq!(snapshot.groups.len(), 2);
-        let rows = encode_groups(&snapshot.groups).unwrap();
+        let rows = encode_groups(&snapshot.groups, &mut schema_cache).unwrap();
         let frame = producer.interval(&rows, stamp.ts, stamp.wall_offset, tick as u64);
         wire::encode_frame(&frame, &mut bytes).unwrap();
         sent.push(frame);

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-archive 0.3.0
+
+- **Added:** `stream::SchemaCache`, which converts each group's schema to the
+  segment format once per schema hash and hands out an `Arc` on later passes.
+  A snapshot carries every group's schema on every pass, and converting all of
+  them each pass (then freeing them) was about 95% of the cost of encoding a
+  pass for the stream: on rezolus's `v3_build_cost` registry (a 2,500-task
+  group), 20.4 ms per unchanged pass before, 0.29 ms after.
+- **Changed (breaking):** `EncodedGroup::schema` is `Option<Arc<GroupSchema>>`,
+  and `EncodedGroup::encode` and `encode_groups` take a `&mut SchemaCache`.
+- **Changed:** `FrameProducer` puts a changed schema into an already-encoded
+  row with `encode_wal_group_row_with_schema` instead of cloning the schema
+  and decoding and re-encoding the row: 3.3 ms → 0.86 ms per frame on the same
+  registry when the task group's membership changed.
+
+### metriken-segment 0.1.6
+
+- **Added:** `wal::encode_wal_group_row_with_schema`, which puts a schema into
+  an encoded `WalGroupRow` whose `schema` is `None` without decoding its values
+  or cloning the schema. The output is byte for byte what
+  `encode_wal_group_row` gives for the anchored row; a payload laid out any
+  other way is decoded and re-encoded.
+
 ### metriken-exposition 0.21.3
 
 - **Changed:** `GroupBuilder`'s maps hash with foldhash instead of SipHash,
