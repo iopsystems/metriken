@@ -39,7 +39,8 @@
 //! [`WalGroupRow::schema`], on the first row of a stream and whenever the
 //! schema's hash changes, and is left out otherwise.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use dendro::archive::WalRow;
 use dendro::replicate::{Frame, NO_INDEX_STATE};
@@ -47,7 +48,7 @@ use metriken_exposition::GroupSnapshot;
 use metriken_segment::schema::GroupSchema;
 #[cfg(doc)]
 use metriken_segment::wal::WalGroupRow;
-use metriken_segment::wal::{decode_wal_group_row, encode_wal_group_row};
+use metriken_segment::wal::{encode_wal_group_row, encode_wal_group_row_with_schema};
 
 /// The ordinal a producer's own source takes. A producer is one source, so
 /// it is always this; the field exists because a connection may carry
@@ -71,6 +72,44 @@ pub trait StreamRow {
     fn payload(&self) -> &[u8];
 }
 
+/// Each group's schema in the segment format, converted once per schema
+/// hash and shared between passes.
+///
+/// A snapshot carries every group's schema on every pass, and a subscriber
+/// is sent one only when its hash changes. Converting every schema on every
+/// pass allocated each member's name and labels again and freed them, which
+/// on a 2,500-task registry was 95% of the cost of encoding a pass for the
+/// stream. Keep one per producer, across passes.
+///
+/// One entry per group name, holding the latest hash; a group that stops
+/// appearing keeps its entry, so the cache holds at most one schema per group
+/// name the producer has had.
+#[derive(Debug, Default)]
+pub struct SchemaCache {
+    by_stream: HashMap<String, ((u64, u64), Arc<GroupSchema>)>,
+}
+
+impl SchemaCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `g`'s schema, converted if its hash is not the one cached for its
+    /// name. `None` when the snapshot carries no schema.
+    pub fn schema(&mut self, g: &GroupSnapshot) -> Option<Arc<GroupSchema>> {
+        let source = g.schema.as_ref()?;
+        if let Some((hash, schema)) = self.by_stream.get(&g.name) {
+            if *hash == g.schema_hash {
+                return Some(Arc::clone(schema));
+            }
+        }
+        let schema = Arc::new(GroupSchema::from(source.as_ref()));
+        self.by_stream
+            .insert(g.name.clone(), (g.schema_hash, Arc::clone(&schema)));
+        Some(schema)
+    }
+}
+
 /// A [`GroupSnapshot`] encoded once per pass, shared by every subscriber.
 ///
 /// Encoding is per pass rather than per subscriber: what differs between
@@ -81,18 +120,18 @@ pub struct EncodedGroup {
     /// The group's acquisition window, `(begin_ns, end_ns)`.
     pub window: Option<(u64, u64)>,
     pub schema_hash: (u64, u64),
-    pub schema: Option<GroupSchema>,
+    pub schema: Option<Arc<GroupSchema>>,
     /// The encoded [`WalGroupRow`] with `schema: None`.
     pub row: Vec<u8>,
 }
 
 impl EncodedGroup {
-    pub fn encode(g: &GroupSnapshot) -> Result<Self, String> {
+    pub fn encode(g: &GroupSnapshot, schemas: &mut SchemaCache) -> Result<Self, String> {
         Ok(Self {
             stream: g.name.clone(),
             window: g.window.map(|w| (w.begin_ns, w.end_ns)),
             schema_hash: g.schema_hash,
-            schema: g.schema.as_ref().map(|s| s.as_ref().into()),
+            schema: schemas.schema(g),
             row: encode_wal_group_row(&metriken_exposition::wal_group_row(g, None))?,
         })
     }
@@ -101,8 +140,12 @@ impl EncodedGroup {
 /// Every group of a pass, encoded.
 pub fn encode_groups<'a>(
     groups: impl IntoIterator<Item = &'a GroupSnapshot>,
+    schemas: &mut SchemaCache,
 ) -> Result<Vec<EncodedGroup>, String> {
-    groups.into_iter().map(EncodedGroup::encode).collect()
+    groups
+        .into_iter()
+        .map(|g| EncodedGroup::encode(g, schemas))
+        .collect()
 }
 
 impl StreamRow for EncodedGroup {
@@ -115,7 +158,7 @@ impl StreamRow for EncodedGroup {
     }
 
     fn schema(&self) -> Option<&GroupSchema> {
-        self.schema.as_ref()
+        self.schema.as_deref()
     }
 
     fn payload(&self) -> &[u8] {
@@ -236,7 +279,7 @@ impl FrameProducer {
                         self.sent_schemas
                             .insert(row.stream().to_string(), row.schema_hash());
                         match row.schema() {
-                            Some(schema) => with_schema(row.payload(), schema.clone()),
+                            Some(schema) => with_schema(row.payload(), schema),
                             // Nothing to anchor with: sent as is, and a
                             // subscriber without the schema skips it, as it
                             // does any row whose hash it cannot resolve.
@@ -277,24 +320,20 @@ impl FrameProducer {
 /// Put `schema` into an encoded [`WalGroupRow`], leaving everything else as
 /// it is.
 ///
-/// Decoded and re-encoded rather than built again from the snapshot: the
-/// values are already encoded, and deriving them twice is a second chance to
-/// disagree. A payload that does not decode is returned unchanged; the
+/// Spliced into the encoded row rather than built again from the snapshot:
+/// the values are already encoded, and deriving them twice is a second chance
+/// to disagree. A payload that does not decode is returned unchanged; the
 /// subscriber skips a row it cannot read, and losing one row is better than
 /// ending the subscription.
-fn with_schema(payload: &[u8], schema: GroupSchema) -> Vec<u8> {
-    let Ok(mut row) = decode_wal_group_row(payload) else {
-        return payload.to_vec();
-    };
-    row.schema = Some(schema);
-    encode_wal_group_row(&row).unwrap_or_else(|_| payload.to_vec())
+fn with_schema(payload: &[u8], schema: &GroupSchema) -> Vec<u8> {
+    encode_wal_group_row_with_schema(payload, schema).unwrap_or_else(|_| payload.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use metriken_segment::schema::MetricDesc;
-    use metriken_segment::wal::WalGroupRow;
+    use metriken_segment::wal::{decode_wal_group_row, WalGroupRow};
 
     const STREAM: &str = "cpu_usage/cpu_usage_task";
     const UUID: &str = "11111111-2222-4333-8444-555555555555";
@@ -317,7 +356,7 @@ mod tests {
             stream: STREAM.to_string(),
             window: Some((1_000, 2_000)),
             schema_hash: schema(n).hash(),
-            schema: Some(schema(n)),
+            schema: Some(Arc::new(schema(n))),
             row: encode_wal_group_row(&WalGroupRow {
                 schema_hash: schema(n).hash(),
                 schema: None,
@@ -344,6 +383,56 @@ mod tests {
             panic!("a rows frame")
         };
         rows
+    }
+
+    fn group(name: &str, n: usize) -> GroupSnapshot {
+        let desc = |i: usize| metriken_exposition::MetricDesc {
+            name: format!("{i}"),
+            metadata: [("metric".to_string(), "cpu_usage_user".to_string())].into(),
+        };
+        let schema = metriken_exposition::GroupSchema {
+            counters: (0..n).map(desc).collect(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        };
+        GroupSnapshot {
+            name: name.to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(Arc::new(schema)),
+            window: None,
+            counters: vec![Some(1); n],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        }
+    }
+
+    /// A pass whose group kept its hash reuses the converted schema; a new
+    /// hash converts again, and other groups keep theirs.
+    #[test]
+    fn a_schema_is_converted_once_per_hash() {
+        let mut cache = SchemaCache::new();
+        let first = cache.schema(&group(STREAM, 3)).unwrap();
+        let other = cache
+            .schema(&group("cpu_usage/cpu_usage_cgroup", 2))
+            .unwrap();
+        let again = cache.schema(&group(STREAM, 3)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "same hash, same conversion");
+        assert_eq!(
+            *first,
+            GroupSchema::from(group(STREAM, 3).schema.unwrap().as_ref())
+        );
+
+        let changed = cache.schema(&group(STREAM, 4)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.counters.len(), 4);
+        let other_again = cache
+            .schema(&group("cpu_usage/cpu_usage_cgroup", 2))
+            .unwrap();
+        assert!(Arc::ptr_eq(&other, &other_again));
+
+        let mut bare = group(STREAM, 4);
+        bare.schema = None;
+        assert!(cache.schema(&bare).is_none());
     }
 
     /// The first row of a stream carries its schema inside the payload, or

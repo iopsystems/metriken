@@ -533,3 +533,53 @@ Linux run's per-tick numbers (libtest prints the test name first), and not
 waiting for an agent to exit let the next agent's PMU budget probe find the
 counters still held (1 per CPU free instead of 6), which disabled three
 samplers in every other arm of the first end-to-end run.
+
+## After 5b: why streaming cost the agent more (2026-09-30)
+
+The end-to-end table above has the agent using more CPU when streamed than
+when scraped: 4.07 s against 3.78 s at 1 Hz and 37.95 s against 35.71 s at
+10 Hz, about 1.2–1.6 ms per pass. Both transports take one sampling pass per
+interval, so the difference is in encoding.
+
+The stream path converted every group's schema from metriken-exposition's
+type to metriken-segment's on every pass (`EncodedGroup::encode`, and
+rezolus's `wire::encode_group`), allocating each member's name and labels
+and freeing them after the frame. A subscriber is sent a schema only when its
+hash changes, so on a pass with no change every conversion was discarded.
+When a hash did change, `FrameProducer` cloned the converted schema, decoded
+the encoded row and encoded it again with the schema.
+
+Measured on rezolus's `v3_build_cost` registry (795 entries, a 2,500-task
+group; a scrape body of 7.7 MB, about 14 times a real host's), release build
+on an Apple-silicon laptop, median per pass:
+
+| step | before | after |
+|---|---|---|
+| scrape: encode the snapshot | 9.5 ms | 9.7 ms |
+| stream, no schema changed: encode, frame, free | 20.4 ms | 0.29 ms |
+| stream, task group changed: encode, frame, free | 24.0 ms | 4.2 ms |
+| of which the frame, task group changed | 3.3 ms | 0.86 ms |
+
+Before, converting schemas and freeing them was about 95% of the stream's
+encode cost; encoding the values alone is 0.24 ms. The fix:
+
+- `stream::SchemaCache` converts a group's schema once per hash and hands out
+  an `Arc`; `EncodedGroup::schema` is an `Arc`.
+- `metriken_segment::wal::encode_wal_group_row_with_schema` puts the schema
+  into the encoded row in place of its `nil`, without decoding the values or
+  cloning the schema, byte for byte what encoding the anchored row gives.
+
+What is left on a pass where a group changed is converting that group's
+schema once (3.4 ms for the 2,500-task group here). The two schema types
+encode to the same bytes (pinned by metriken-exposition's `segment` tests),
+so a producer could encode metriken-exposition's schema into the row
+directly and never convert; not done.
+
+Two smaller costs were measured and left: `group_approx_bytes`, which only
+rezolus's `/metrics/rows` uses, is 27 µs per pass on this registry, and the
+two copies of each payload (`payload().to_vec()` and `encode_frame`) are
+inside the 19 µs the frame takes. Removing the copies would change dendro's
+`WalRow`.
+
+Not yet measured end to end: the agent's CPU streamed against scraped with
+this change.
