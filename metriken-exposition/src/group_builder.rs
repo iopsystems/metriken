@@ -44,6 +44,11 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+/// The builder's own maps, keyed by group and looked up once or twice per
+/// registry entry per build. foldhash rather than SipHash: the keys are the
+/// builder's own strings, not attacker-chosen.
+type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
 use std::time::{Duration, SystemTime};
 
 use metriken::{MetricEntry, Value, Window};
@@ -322,7 +327,7 @@ impl Stamp {
 pub struct GroupBuilder<R: Router, N: MemberNames = Positional> {
     router: R,
     names: N,
-    cache: HashMap<String, GroupSkeleton>,
+    cache: FastMap<String, GroupSkeleton>,
     rebuilds: u64,
 }
 
@@ -339,7 +344,7 @@ impl<R: Router> GroupBuilder<R, Positional> {
         Self {
             router,
             names: Positional,
-            cache: HashMap::new(),
+            cache: FastMap::default(),
             rebuilds: 0,
         }
     }
@@ -352,7 +357,7 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
         GroupBuilder {
             router: self.router,
             names,
-            cache: HashMap::new(),
+            cache: FastMap::default(),
             rebuilds: 0,
         }
     }
@@ -442,7 +447,7 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
 
         let decisions = fold_group_identities(cache, router, &metrics, &extra_keys);
 
-        let mut groups: HashMap<GroupId<'_>, Group<R::Guard>> = HashMap::new();
+        let mut groups: FastMap<GroupId<'_>, Group<R::Guard>> = FastMap::default();
         // Reused by every `Slots` walk, cleared per metric: one buffer for
         // the whole build rather than one per group.
         let mut idx_scratch: Vec<usize> = Vec::new();
@@ -472,19 +477,18 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
                         Acquisition::Stamped(first) => WindowState::Stamped(first),
                         Acquisition::Reader(guard) => WindowState::Reader(guard),
                     };
-                    let needs_schema = decisions.get(e.key()).copied().unwrap_or(true);
-                    let mut group = Group::new(window, needs_schema);
+                    let decision = decisions.get(e.key()).copied().unwrap_or_default();
+                    let mut group = Group::new(window, decision.needs_schema);
 
                     // A hit: size this build's value vectors from the cached
-                    // schema so pushing values never reallocates. At most
-                    // three allocations per hit group, none per member.
-                    if !needs_schema {
-                        if let Some(cached) = cache.get(&e.key().wire_name()) {
-                            group.counter_values = Vec::with_capacity(cached.schema.counters.len());
-                            group.gauge_values = Vec::with_capacity(cached.schema.gauges.len());
-                            group.histogram_values =
-                                Vec::with_capacity(cached.schema.histograms.len());
-                        }
+                    // schema (its sizes carried by the decision, so the cache
+                    // is not looked up again) and pushing values never
+                    // reallocates. At most three allocations per hit group,
+                    // none per member.
+                    if let Some((counters, gauges, histograms)) = decision.sizes {
+                        group.counter_values = Vec::with_capacity(counters);
+                        group.gauge_values = Vec::with_capacity(gauges);
+                        group.histogram_values = Vec::with_capacity(histograms);
                     }
                     e.insert(group)
                 }
@@ -1049,12 +1053,12 @@ impl GroupIdentityAccum {
 /// members exactly as this pass does; for [`Membership::Present`] the two
 /// read values separately, which [`GroupBuilder`]'s docs cover.
 fn fold_group_identities<'a, R: Router>(
-    cache: &HashMap<String, GroupSkeleton>,
+    cache: &FastMap<String, GroupSkeleton>,
     router: &'a R,
     metrics: &'a metriken::Metrics,
     extra: &HashSet<GroupId<'_>>,
-) -> HashMap<GroupId<'a>, bool> {
-    let mut accums: HashMap<GroupId<'a>, GroupIdentityAccum> = HashMap::new();
+) -> FastMap<GroupId<'a>, Decision> {
+    let mut accums: FastMap<GroupId<'a>, GroupIdentityAccum> = FastMap::default();
     let mut idx_scratch: Vec<usize> = Vec::new();
 
     for (metric_id, metric) in metrics.iter().enumerate() {
@@ -1113,14 +1117,47 @@ fn fold_group_identities<'a, R: Router>(
     accums
         .into_iter()
         .map(|(key, accum)| {
-            let needs_schema = extra.contains(&key)
-                || match cache.get(&key.wire_name()) {
-                    Some(cached) => cached.identity != accum.finish(),
-                    None => true,
-                };
-            (key, needs_schema)
+            let hit = if extra.contains(&key) {
+                None
+            } else {
+                cache
+                    .get(&key.wire_name())
+                    .filter(|cached| cached.identity == accum.finish())
+            };
+            let decision = match hit {
+                Some(cached) => Decision {
+                    needs_schema: false,
+                    sizes: Some((
+                        cached.schema.counters.len(),
+                        cached.schema.gauges.len(),
+                        cached.schema.histograms.len(),
+                    )),
+                },
+                None => Decision::default(),
+            };
+            (key, decision)
         })
         .collect()
+}
+
+/// What the first pass decided for one group.
+#[derive(Clone, Copy, Debug)]
+struct Decision {
+    /// The group's membership changed (or it has no cached schema, or it is
+    /// an extra group): the walk builds its schema.
+    needs_schema: bool,
+    /// On a hit, the cached schema's counter, gauge and histogram counts, to
+    /// size the walk's value vectors.
+    sizes: Option<(usize, usize, usize)>,
+}
+
+impl Default for Decision {
+    fn default() -> Self {
+        Self {
+            needs_schema: true,
+            sizes: None,
+        }
+    }
 }
 
 /// Whether `metric` is a [`metriken::CounterFamily`] or

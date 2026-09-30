@@ -14,6 +14,7 @@ repository = "https://github.com/iopsystems/metriken"
 [dependencies]
 arrow = { workspace = true, optional = true }
 chrono = "0.4.44"
+foldhash = { version = "0.2.0", optional = true }
 histogram.workspace = true
 metriken = { version = "0.11.2", path = "../metriken" }
 metriken-segment = { version = "0.1.2", path = "../metriken-segment", default-features = false, optional = true }
@@ -31,6 +32,6 @@ default = ["parquet-conversion", "segment"]
 segment = ["dep:metriken-segment", "serde"]
 serde = ["dep:serde", "chrono/serde", "histogram/serde", "metriken/serde"]
 json = ["serde", "dep:serde_json"]
-msgpack = ["serde", "dep:rmp-serde"]
+msgpack = ["serde", "dep:rmp-serde", "dep:foldhash"]
 parquet = ["dep:arrow", "dep:parquet"]
 parquet-conversion = ["serde", "msgpack", "parquet"]

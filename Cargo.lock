@@ -1039,6 +1039,7 @@ version = "0.21.2"
 dependencies = [
  "arrow",
  "chrono",
+ "foldhash 0.2.0",
  "histogram",
  "metriken",
  "metriken-segment",
