@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition (unreleased)
+
+- **Changed:** `GroupBuilder`'s maps hash with foldhash instead of SipHash,
+  and a cache hit takes its value-vector sizes from the first pass's decision
+  instead of formatting the group's wire name to look the cache up again.
+  Measured on rezolus's `v3_build_cost` registry (795 entries, a 4096-slot
+  per-task group), with rezolus's route cache: cache-hit ticks 1,499–1,588 µs
+  → 1,323–1,479 µs at the median, membership-change ticks 7,193–7,405 µs →
+  6,511–6,770 µs.
+
 ### metriken 0.11.2
 
 - **Added:** `epoch`, the process's producer epoch (a v4 UUID minted once per
