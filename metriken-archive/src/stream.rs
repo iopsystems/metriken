@@ -334,8 +334,8 @@ impl FrameProducer {
 /// it is.
 ///
 /// Spliced into the encoded row rather than built again from the snapshot:
-/// the values are already encoded, and deriving them twice is a second chance
-/// to disagree. A payload that does not decode is returned unchanged; the
+/// the values are already encoded, and deriving them twice could produce
+/// different values. A payload that does not decode is returned unchanged; the
 /// subscriber skips a row it cannot read, and losing one row is better than
 /// ending the subscription.
 fn with_schema(payload: &[u8], schema: &GroupSchema) -> Vec<u8> {
