@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.33.6
+
+- **Fixed:** the histogram functions read from a range's start with no
+  lookback, so a sample at the start could be left out by the same `f64`
+  round trip 0.33.5 fixed at the end. They now read from 1 µs before the
+  start. The slack constant is `RANGE_SLACK_NS`; a grid point up to 1 µs past
+  `end` can be emitted when `end` falls just before a step boundary.
+
 ### metriken-query 0.33.5
 
 - **Fixed:** a query range's end, given in `f64` seconds, could convert to a

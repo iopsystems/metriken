@@ -2094,10 +2094,47 @@ mod tests {
             panic!("a range query gives a matrix");
         };
         let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
+        assert!(
+            times.contains(&1_790_832_064.0),
+            "the point at 064.0 is emitted: {times:?}"
+        );
+    }
+
+    /// A histogram query whose range starts at the first sample's time, given
+    /// in `f64` seconds, still reads that sample. `1790832062.002000539`
+    /// seconds converts back to 101 ns after the sample; without the read
+    /// slack the sample was left out.
+    #[test]
+    fn a_histogram_range_starting_at_the_first_sample_includes_it() {
+        use crate::MetricsSource;
+        let first: u64 = 1_790_832_062_002_000_539;
+        assert!(
+            ((first as f64 / 1e9) * 1e9).round() as u64 > first,
+            "the fixture reproduces the rounding"
+        );
+        let rows: Vec<(u64, Vec<u64>)> = (0..3u64)
+            .map(|k| (first + k * 1_000_000_000, vec![(k + 1) * 10; 16]))
+            .collect();
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment_histogram("latency", 2, 4, &rows)],
+            pool,
+        )
+        .unwrap();
+        let query = |start: u64| {
+            r.query_range(
+                "histogram_irate(latency)",
+                start as f64 / 1e9,
+                (first + 2_000_000_000) as f64 / 1e9,
+                1.0,
+            )
+            .map(|res| format!("{res:?}"))
+            .map_err(|e| e.to_string())
+        };
         assert_eq!(
-            times,
-            vec![1_790_832_064.0],
-            "the point at 064.0 is emitted"
+            query(first),
+            query(first - 500_000_000),
+            "a range starting at the first sample reads it, as one starting earlier does"
         );
     }
 
