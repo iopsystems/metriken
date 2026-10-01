@@ -11,12 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Changed:** a segment the segmented reader opens to read rows is cached
   under an id derived from its bytes (XXH3-128 with a per-process seed,
-  `twox-hash`), not a fresh id per open.
-  A reader reopened over the same segments on the same `BufferPool` finds
-  the blocks the previous reader decoded; identical bytes decode to
-  identical blocks, so sharing them is correct. A live archive is reopened
-  to see new rows, and before this every reopen left the sealed segments'
-  decoded blocks unreachable.
+  `twox-hash`), not a fresh id per open. A reader reopened over the same
+  segments on the same `BufferPool` finds the blocks the previous reader
+  decoded; identical bytes decode to identical blocks, so sharing them is
+  correct. rezolus's live viewer reopens its archive every interval; on a
+  60-minute live recording, heavier queries' medians fell 9–27%.
+
+### metriken-archive 0.3.1
+
+- **Added:** `SchemaCache::retain`, `len` and `is_empty`. A producer whose
+  group names are unbounded drops the groups it no longer has; the cache
+  otherwise keeps one entry per group name it has seen.
 
 ### metriken-archive 0.3.0
 
