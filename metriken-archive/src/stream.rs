@@ -75,16 +75,12 @@ pub trait StreamRow {
 /// Each group's schema in the segment format, converted once per schema
 /// hash and shared between passes.
 ///
-/// A snapshot carries every group's schema on every pass, and a subscriber
-/// is sent one only when its hash changes. Converting every schema on every
-/// pass allocated each member's name and labels again and freed them, which
-/// on a 2,500-task registry was 95% of the cost of encoding a pass for the
-/// stream. Keep one per producer, across passes.
+/// A snapshot carries every group's schema on every pass; this converts one
+/// only when its hash changes. Keep one per producer, across passes.
 ///
-/// One entry per group name, holding the latest hash. A group that stops
-/// appearing keeps its entry until [`retain`](Self::retain) drops it, so a
-/// producer whose group names are unbounded (one per container, say) calls
-/// `retain` with the names it still has.
+/// One entry per group name, holding the latest hash. An entry stays until
+/// [`retain`](Self::retain) drops it; a producer whose group names are
+/// unbounded calls `retain` with the names it still has.
 #[derive(Debug, Default)]
 pub struct SchemaCache {
     by_stream: HashMap<String, ((u64, u64), Arc<GroupSchema>)>,
