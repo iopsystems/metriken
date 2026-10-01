@@ -92,6 +92,28 @@ fn test_query_engine_creation() {
 }
 
 /// A bare selector naming a counter says to use rate(), rather than
+/// A metric the source holds gives an empty matrix where nothing matches;
+/// only a name the source does not hold is `MetricNotFound`.
+#[test]
+fn a_held_metric_with_nothing_in_range_is_empty_not_missing() {
+    let engine = QueryEngine::new(Arc::new(create_rate_source()));
+    let empty = |q: &str, start: f64, end: f64| match engine.query_range(q, start, end, 1.0) {
+        Ok(QueryResult::Matrix { result }) => assert!(result.is_empty(), "{q}: {result:?}"),
+        other => panic!("{q}: expected an empty matrix, got {other:?}"),
+    };
+    empty("rate(test_counter[2s])", 2000.0, 2004.0);
+    empty("sum(rate(test_counter[2s]))", 2000.0, 2004.0);
+    empty(
+        "rate(test_counter{no_such_label=\"x\"}[2s])",
+        1000.0,
+        1004.0,
+    );
+    match engine.query_range("rate(absent_metric[2s])", 1000.0, 1004.0, 1.0) {
+        Err(QueryError::MetricNotFound(name)) => assert_eq!(name, "absent_metric"),
+        other => panic!("expected MetricNotFound, got {other:?}"),
+    }
+}
+
 /// reporting a metric the source holds as missing.
 #[test]
 fn a_bare_counter_selector_names_the_fix() {
@@ -1610,8 +1632,8 @@ fn test_histogram_irate_first_step_is_null() {
 
     let result = engine.query_range("histogram_irate(req_latency)", 1000.0, 1002.0, 1.0);
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        other => panic!("expected MetricNotFound (single delta → null), got {other:?}"),
+        Ok(QueryResult::Matrix { result }) if result.is_empty() => {}
+        other => panic!("expected an empty matrix (single delta → null), got {other:?}"),
     }
 }
 

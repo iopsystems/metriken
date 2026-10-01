@@ -649,10 +649,7 @@ impl QueryEngine {
             .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
         let result = stream.quantiles(&quantiles, start_ns, end_ns, stride_ns, &metric_name);
         if result.is_empty() {
-            return Err(QueryError::MetricNotFound(format!(
-                "No histogram data found for {}",
-                metric_name
-            )));
+            return Err(QueryError::MetricNotFound(metric_name));
         }
         Ok(QueryResult::Matrix { result })
     }
@@ -676,9 +673,7 @@ impl QueryEngine {
         let result = stream.heatmap(start_ns, end_ns, stride_ns);
         match result {
             Some(result) => Ok(QueryResult::HistogramHeatmap { result }),
-            None => Err(QueryError::MetricNotFound(format!(
-                "No histogram data found for {metric_name}"
-            ))),
+            None => Err(QueryError::MetricNotFound(metric_name)),
         }
     }
 
@@ -705,9 +700,7 @@ impl QueryEngine {
             .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
         let result = stream.irate(group_by.as_ref(), start_ns, end_ns, &metric_name);
         if result.is_empty() {
-            return Err(QueryError::MetricNotFound(format!(
-                "No histogram data found for {metric_name}"
-            )));
+            return Err(QueryError::MetricNotFound(metric_name));
         }
         Ok(QueryResult::Matrix { result })
     }
@@ -736,9 +729,7 @@ impl QueryEngine {
             _ => stream.count(group, start_ns, end_ns, stride_ns, &metric_name),
         };
         if result.is_empty() {
-            return Err(QueryError::MetricNotFound(format!(
-                "No histogram data found for {metric_name}"
-            )));
+            return Err(QueryError::MetricNotFound(metric_name));
         }
         Ok(QueryResult::Matrix { result })
     }
@@ -753,7 +744,37 @@ impl QueryEngine {
         self.query_range_opts(query_str, start, end, step, &QueryOptions::default())
     }
 
+    /// Evaluates `query_str` over `[start, end]`.
+    ///
+    /// A selector naming a metric the source holds, but with no samples in
+    /// the range or none matching its labels, gives an empty matrix.
+    /// `QueryError::MetricNotFound` means the source holds no metric of
+    /// that name.
     pub fn query_range_opts(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+        step: f64,
+        opts: &QueryOptions,
+    ) -> Result<QueryResult, QueryError> {
+        match self.evaluate_range(query_str, start, end, step, opts) {
+            Err(QueryError::MetricNotFound(name)) if self.holds_metric(&name) => {
+                Ok(QueryResult::Matrix { result: vec![] })
+            }
+            result => result,
+        }
+    }
+
+    /// Whether the source has a counter, gauge or histogram named `name`.
+    fn holds_metric(&self, name: &str) -> bool {
+        let named = |names: Vec<String>| names.iter().any(|n| n == name);
+        named(self.source.counter_names())
+            || named(self.source.gauge_names())
+            || named(self.source.histogram_names())
+    }
+
+    fn evaluate_range(
         &self,
         query_str: &str,
         start: f64,

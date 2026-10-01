@@ -354,7 +354,7 @@ mod tests {
             for _ in 0..2 {
                 let result = reader.query_range("rate(cpu_usage[2s])", 1.0, 4.0, 1.0);
                 assert!(
-                    matches!(result, Err(QueryError::MetricNotFound(_))),
+                    matches!(&result, Ok(crate::QueryResult::Matrix { result }) if result.is_empty()),
                     "evicted={evicted}: {result:?}"
                 );
             }

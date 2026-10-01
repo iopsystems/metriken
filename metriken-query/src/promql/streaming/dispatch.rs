@@ -585,7 +585,7 @@ where
     let result = stream.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
     Ok(Built::Materialized {
         result,
-        name: format!("No histogram data found for {metric_name}"),
+        name: metric_name.to_string(),
     })
 }
 
