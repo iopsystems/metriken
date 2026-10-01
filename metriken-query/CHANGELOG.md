@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A query range's end, given in `f64` seconds, could convert to a few hundred
+  nanoseconds before a sample at that time, leaving it out; with grid rates
+  that dropped the last grid point. The end is now rounded and widened by
+  1 µs; the start is rounded.
+
+## [Unreleased]
+
 ### Changed
 
 - A segment the segmented reader opens to read rows is cached under an id

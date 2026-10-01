@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.33.5
+
+- **Fixed:** a query range's end, given in `f64` seconds, could convert to a
+  few hundred nanoseconds before a sample at that time, which was then left
+  out. With grid rates that dropped the last grid point, and on a short
+  recording `rate()` returned nothing and reported the metric as not found.
+  The end is now rounded and widened by 1 µs (`RANGE_END_SLACK_NS`); the start
+  is rounded.
+
 ### metriken-query 0.33.4
 
 - **Changed:** a segment the segmented reader opens to read rows is cached

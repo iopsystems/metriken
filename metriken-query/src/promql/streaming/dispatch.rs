@@ -48,7 +48,7 @@ pub fn try_streaming(
 ) -> Result<QueryResult, QueryError> {
     let rate_mode = opts.rate_mode;
     let step_ns = (step * 1e9) as u64;
-    let raw_start_ns = (start * 1e9) as u64;
+    let raw_start_ns = crate::promql::range_start_ns(start);
     // Grid mode fixes the evaluation-grid phase to the step boundary so two
     // recordings on the same step share a grid (A/B alignment) and gauge/rate
     // labels land on round step multiples. Raw keeps the caller's start. Snap
@@ -60,7 +60,7 @@ pub fn try_streaming(
     let ctx = Ctx {
         source,
         start_ns,
-        end_ns: (end * 1e9) as u64,
+        end_ns: crate::promql::range_end_ns(end),
         step_ns,
         interval_ns: (source.interval() * 1e9) as u64,
         rate_mode,
