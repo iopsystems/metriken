@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A segment the segmented reader opens to read rows is cached under an id
+  derived from its bytes (XXH3-128 with a per-process seed), not a fresh id
+  per open, so a reader reopened over the
+  same segments on the same `BufferPool` finds the blocks the previous reader
+  decoded.
+
 ## [0.33.3] - 2026-09-29
 
 ### Changed

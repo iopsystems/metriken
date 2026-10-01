@@ -20,7 +20,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
-use crate::buffer_pool::{next_source_id, BufferPool, CacheKey};
+use crate::buffer_pool::{content_source_id, next_source_id, BufferPool, CacheKey};
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
@@ -586,6 +586,9 @@ impl From<&crate::MemoryStore> for CompositionSource {
 enum BuilderEntry {
     Path(std::path::PathBuf, Labels),
     Bytes(Bytes, Labels),
+    /// Bytes whose cache id is derived from their content; see
+    /// [`content_source_id`].
+    ContentKeyedBytes(Bytes),
     OwnedFile(File, Labels),
     Source(Arc<dyn DataSource>, Labels),
 }
@@ -618,6 +621,15 @@ impl ParquetBuilder {
     /// by passing the same `Arc`.
     pub fn pool(mut self, pool: Arc<BufferPool>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Add in-memory bytes whose cached blocks are keyed by their content,
+    /// so another source opened from the same bytes on the same pool shares
+    /// them.
+    pub(crate) fn content_keyed_bytes(mut self, bytes: impl Into<Bytes>) -> Self {
+        self.entries
+            .push(BuilderEntry::ContentKeyedBytes(bytes.into()));
         self
     }
 
@@ -764,6 +776,19 @@ impl ParquetBuilder {
                         None => ParquetSource::open_bytes(bytes)?,
                     };
                     Ok((Arc::new(FileSource(src)) as Arc<dyn DataSource>, labels))
+                }
+                BuilderEntry::ContentKeyedBytes(bytes) => {
+                    let src = match &pool {
+                        Some(p) => {
+                            let id = content_source_id(&bytes);
+                            ParquetSource::open_bytes_with_pool_id(bytes, Arc::clone(p), id)?
+                        }
+                        None => ParquetSource::open_bytes(bytes)?,
+                    };
+                    Ok((
+                        Arc::new(FileSource(src)) as Arc<dyn DataSource>,
+                        Labels::default(),
+                    ))
                 }
                 BuilderEntry::OwnedFile(file, labels) => {
                     let src = match &pool {
@@ -1840,11 +1865,21 @@ impl ParquetSource {
         bytes: Bytes,
         pool: Arc<BufferPool>,
     ) -> Result<Arc<Self>, Box<dyn Error>> {
+        Self::open_bytes_with_pool_id(bytes, pool, next_source_id())
+    }
+
+    /// [`open_bytes_with_pool`](Self::open_bytes_with_pool) with the cache id
+    /// given rather than drawn from the counter.
+    fn open_bytes_with_pool_id(
+        bytes: Bytes,
+        pool: Arc<BufferPool>,
+        id: u64,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
         metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
-            id: next_source_id(),
+            id,
             backing: ParquetBacking::Bytes(bytes),
             meta,
             sampling_interval_ms,

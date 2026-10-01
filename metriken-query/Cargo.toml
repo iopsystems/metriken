@@ -25,6 +25,7 @@ serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror = "2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -26,6 +26,28 @@ pub(crate) fn next_source_id() -> u64 {
     NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A source id derived from a file's bytes, with the top bit set so it cannot
+/// equal an id from [`next_source_id`], which counts up from 1.
+///
+/// Two sources opened from the same bytes share their cached blocks, which
+/// is correct because identical bytes decode to identical blocks. The
+/// segmented reader opens segments this way, so a reader reopened over an
+/// archive (a live archive is reopened to see new rows) finds the sealed
+/// segments' blocks the previous reader decoded.
+///
+/// The hash is XXH3-128 with a seed drawn once per process, folded to 64
+/// bits. XXH3 is not collision-resistant against chosen inputs; the seed
+/// keeps a file crafted elsewhere from colliding with a known segment's id
+/// in this process.
+pub(crate) fn content_source_id(bytes: &[u8]) -> u64 {
+    static SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new().hash_one(0u8)
+    });
+    let h = twox_hash::XxHash3_128::oneshot_with_seed(*SEED, bytes);
+    ((h as u64) ^ ((h >> 64) as u64)) | (1 << 63)
+}
+
 /// A bounded LRU cache of decoded parquet row groups.
 ///
 /// Construct one per process (or per logical workload), share across many
