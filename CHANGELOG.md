@@ -35,8 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Added:** `GroupBuilder::build_stream`, which emits each group whose
   metrics are all counter groups or gauge groups in the long form
-  (`LongGroupSnapshot`): the metrics as columns, one `LongMember` per slot
-  with a value, with the slot's labels and an occupant key. Keys are
+  (`LongGroupSnapshot`): the metrics as columns, one `LongMember` per
+  member slot, with the slot's labels and an occupant key. Keys are
   assigned per group from 0 as occupants appear, so they encode in a few
   bytes. A slot gets a new key when its occupant changes (a new `__uid__`,
   or new labels on a slot without one) and, in a group of
