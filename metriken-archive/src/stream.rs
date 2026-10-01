@@ -4,16 +4,18 @@
 //! A producer is one dendro *source*: one clock domain, one identity, one
 //! sequence of observations. A subscription is dendro's preamble, a
 //! [`Frame::Handshake`] once, then one [`Frame::Rows`] per interval whose
-//! rows are encoded [`WalGroupRow`]s. Moved from rezolus's agent
+//! rows are encoded [`WalGroupRow`]s, [`WalLongRow`]s, and [`Occupant`] rows
+//! on `<group>/occupants`. Moved from rezolus's agent
 //! (`frames.rs`); the transport (an HTTP route, its timer, which groups a
 //! subscriber asked for) stays with the caller. Phase 5b of
 //! `docs/journal/2026-09-29-members-that-come-and-go.md`.
 //!
 //! # No identity index
 //!
-//! No [`Frame::Index`] is sent. What a slot means travels in the group's
-//! schema (each member's labels, `__uid__` included), which the payload
-//! carries whenever it changes. Every rows frame names dendro's
+//! No [`Frame::Index`] is sent. For a group sent wide, what a slot means
+//! travels in the group's schema (each member's labels, `__uid__` included),
+//! which the payload carries whenever it changes. For a group sent long, it
+//! travels on `<group>/occupants` (see below). Every rows frame names dendro's
 //! [`NO_INDEX_STATE`], which a subscriber always resolves.
 //!
 //! # Time is the producer's
@@ -39,7 +41,7 @@
 //! [`WalGroupRow::schema`], on the first row of a stream and whenever the
 //! schema's hash changes, and is left out otherwise.
 //!
-//! # Slot groups travel long
+//! # Groups of counter groups and gauge groups are sent long
 //!
 //! A [`LongGroupSnapshot`] is sent as a [`WalLongRow`] on the group's stream,
 //! keyed by the producer's occupant keys, whose schema is the group's metric
@@ -47,7 +49,10 @@
 //! `<group>/occupants`, the subscription is sent an [`Occupant`] (key and
 //! labels) for each occupant that was not in the group's previous row: new
 //! occupants, and every occupant on the subscription's first row. A
-//! departure is not sent; the occupant is absent from later rows.
+//! departure is not sent; the occupant is absent from later rows. A group
+//! can change form between rows; the subscriber reads the form from each
+//! row, and a change of form sends the row's schema and, for a long row,
+//! every occupant again.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -441,7 +446,10 @@ impl FrameProducer {
     /// Filter `rows` to what this subscriber should receive before passing
     /// them: a schema is recorded as sent when a row carrying it is built,
     /// so a row filtered out afterwards would leave its group referencing a
-    /// schema this subscriber never received.
+    /// schema this subscriber never received. Likewise an occupant is
+    /// recorded as sent when its occupants row is built, so a long row
+    /// filtered out afterwards leaves its new occupants without labels for
+    /// as long as they stay present.
     pub fn interval<'r, R: StreamRow + 'r>(
         &mut self,
         rows: impl IntoIterator<Item = &'r R>,
@@ -452,9 +460,19 @@ impl FrameProducer {
         let mut out = Vec::new();
         for row in rows {
             let long = row.occupants();
+            // A change of form anchors the row's schema again, since a hash
+            // sent for one form says nothing to a reader of the other, and a
+            // group that turns long again describes its occupants afresh.
+            let was_long = self.sent_occupants.contains_key(row.stream());
+            if was_long != long.is_some() {
+                self.sent_schemas.remove(row.stream());
+            }
+            if long.is_none() {
+                self.sent_occupants.remove(row.stream());
+            }
             if let Some(present) = long {
-                // The occupants this subscriber has not been told about go
-                // first, so their labels are known when the row is read.
+                // The occupants not yet sent to this subscriber go first, so
+                // their labels are known when the row is read.
                 let sent = self
                     .sent_occupants
                     .entry(row.stream().to_string())
@@ -759,6 +777,13 @@ mod tests {
         assert_eq!(
             described(&p.interval([&long(&[1, 3])], 4, 0, 4)),
             (vec![1], false)
+        );
+        // A row sent wide in between makes the next long row describe
+        // everything again.
+        p.interval([&row(1)], 5, 0, 5);
+        assert_eq!(
+            described(&p.interval([&long(&[1, 3])], 6, 0, 6)),
+            (vec![1, 3], true)
         );
         // Another subscription is told everything.
         let mut q = producer();

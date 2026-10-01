@@ -33,13 +33,17 @@ static TASKS: SlotIdentity = SlotIdentity::new(&[&TASK_CPU, &TASK_CTX, &TASK_RSS
 #[metric(name = "long_cpus_busy", metadata = { acq_group = "cpus" })]
 static CPU_BUSY: metriken::CounterGroup = metriken::CounterGroup::new(4);
 
+/// Membership follows values: slot 0 reads zero on one tick.
+#[metric(name = "long_flick_ops", metadata = { acq_group = "flick" })]
+static FLICK: metriken::CounterGroup = metriken::CounterGroup::new(2);
+
 #[metric(name = "long_main_requests", metadata = { acq_group = "main" })]
 static REQUESTS: metriken::Counter = metriken::Counter::new();
 #[metric(name = "long_main_queues", metadata = { acq_group = "main" })]
 static QUEUES: metriken::CounterGroup = metriken::CounterGroup::new(2);
 
 /// `tasks` by slot metadata with a stamped window, `cpus` every slot,
-/// `main` (a counter beside a counter group) by value.
+/// `flick` and `main` (a counter beside a counter group) by value.
 struct TestRouter {
     window: Mutex<Option<Window>>,
 }
@@ -77,7 +81,8 @@ impl Router for TestRouter {
 
 const S: u64 = 1_000_000_000;
 const TICKS: u64 = 30;
-/// Where the long recording's subscription is replaced, as a reconnect.
+/// Where the long recording's subscription and builder are replaced, as a
+/// restarted producer would be: keys start from 0 again.
 const RECONNECT: u64 = 15;
 
 fn base() -> u64 {
@@ -132,6 +137,8 @@ fn advance(tick: u64) {
     }
     REQUESTS.add(7);
     QUEUES.add(1, 3);
+    FLICK.set(0, if tick == 7 { 0 } else { 100 + tick * 5 });
+    FLICK.set(1, 1 + tick);
 }
 
 /// Records both archives from the same ticks; returns, per tick, how many
@@ -173,6 +180,8 @@ fn record(wide: &Path, long: &Path, finalize: bool) -> Vec<usize> {
 
         if tick == RECONNECT {
             (producer, decoder) = (subscribe(), StreamDecoder::new());
+            long_builder = GroupBuilder::new(router());
+            *long_builder.router().window.lock().unwrap() = window;
         }
         let groups: Vec<EncodedStreamGroup> = long_builder
             .build_stream(Vec::new())
@@ -267,6 +276,8 @@ const QUERIES: &[&str] = &[
     "rate(long_cpus_busy[3s])",
     "rate(long_main_requests[3s])",
     "rate(long_main_queues[3s])",
+    "irate(long_flick_ops[3s])",
+    "sum(irate(long_flick_ops[3s]))",
 ];
 
 /// One test, since the two recordings share the registry's statics.
@@ -305,4 +316,83 @@ fn the_long_stream_records_what_wide_snapshots_record() {
             .collect();
         assert_eq!(uids.len(), cpu.len(), "one series per occupant");
     }
+}
+
+/// A group that changes form between rows decodes as each row's form: the
+/// decoder reads the form from the row, not from what the stream sent before.
+#[test]
+fn the_decoder_follows_a_group_that_changes_form() {
+    use dendro::archive::WalRow;
+    use metriken_archive::StreamedGroup;
+    use metriken_segment::occupants::{self, Occupant};
+    use metriken_segment::schema::{GroupSchema, MetricDesc};
+    use metriken_segment::wal::{self, LongOccupant, WalGroupRow, WalLongRow};
+
+    const STREAM: &str = "t/switch";
+    let schema = GroupSchema {
+        counters: vec![MetricDesc {
+            name: "0".to_string(),
+            metadata: [("metric".to_string(), "ops".to_string())].into(),
+        }],
+        gauges: Vec::new(),
+        histograms: Vec::new(),
+    };
+    let row = |stream: &str, row: Vec<u8>| WalRow {
+        stream: stream.to_string(),
+        ts: 1,
+        wall_offset: 0,
+        row,
+    };
+    let long = wal::encode_wal_long_row(&WalLongRow {
+        schema_hash: schema.hash(),
+        schema: Some(schema.clone()),
+        window: None,
+        occupants: vec![LongOccupant {
+            occupant: 0,
+            counters: vec![Some(1)],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        }],
+    })
+    .unwrap();
+    let described = occupants::encode_wal_row(&[Occupant {
+        occupant: 0,
+        labels: [("id".to_string(), "0".to_string())].into(),
+    }]);
+    let wide = wal::encode_wal_group_row(&WalGroupRow {
+        schema_hash: schema.hash(),
+        schema: Some(schema.clone()),
+        window: None,
+        counters: vec![Some(2)],
+        gauges: Vec::new(),
+        histograms: Vec::new(),
+    })
+    .unwrap();
+
+    let mut decoder = StreamDecoder::new();
+    let kinds = |groups: Vec<StreamedGroup>| -> Vec<&'static str> {
+        groups
+            .iter()
+            .map(|g| match g {
+                StreamedGroup::Wide(_) => "wide",
+                StreamedGroup::Long { .. } => "long",
+                StreamedGroup::Occupants { .. } => "occupants",
+            })
+            .collect()
+    };
+    let first = decoder
+        .decode([
+            row(&occupants::stream_of(STREAM), described),
+            row(STREAM, long.clone()),
+        ])
+        .unwrap();
+    assert_eq!(kinds(first), ["occupants", "long"]);
+    assert_eq!(
+        kinds(decoder.decode([row(STREAM, wide)]).unwrap()),
+        ["wide"]
+    );
+    assert_eq!(
+        kinds(decoder.decode([row(STREAM, long)]).unwrap()),
+        ["long"]
+    );
 }

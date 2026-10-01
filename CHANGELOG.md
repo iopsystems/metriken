@@ -11,20 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Added:** the long form on the replication stream. `EncodedLongGroup`
   (and `EncodedStreamGroup` over `GroupBuilder::build_stream`'s groups)
-  carries a slot group as a `WalLongRow` keyed by the producer's occupant
-  keys, whose schema is the group's columns. `FrameProducer::interval`
-  sends, before each long row, an `Occupant` row on `<group>/occupants` for
-  every occupant the subscription was not sent in that group's previous
-  row. `StreamRow::occupants` (defaulted to `None`) is what marks a row as
-  long.
+  carries a group of counter groups and gauge groups as a `WalLongRow`
+  keyed by the producer's occupant keys, whose schema is the group's
+  columns. `FrameProducer::interval` sends, before each long row, an
+  `Occupant` row on `<group>/occupants` for every occupant the subscription
+  was not sent in that group's previous row. `StreamRow::occupants`
+  (defaulted to `None`) is what marks a row as long. A group can change
+  form between rows: the change sends the row's schema, and for a long row
+  every occupant, again.
 - **Added:** `StreamDecoder` turns a stream's rows back into
-  `StreamedGroup`s, and `SourceRecorder::stage_streamed` writes them: a
-  long row's columns are mapped onto the group's long columns once per
-  columns hash, and each producer key gets an occupant number the first
-  time it is present, with the labels its occupant row gave it. A reconnect
-  that describes live occupants again does not number them again. Recorded
-  over the long stream, an archive answers queries as one recorded from
-  wide snapshots of the same ticks (`tests/stream_long.rs`).
+  `StreamedGroup`s, reading each row's form from the row, and
+  `SourceRecorder::stage_streamed` writes them. A long row's columns are
+  mapped onto the group's long columns once per columns hash. Each
+  described key is mapped to an occupant number by the occupant's identity
+  (its `__uid__`, or else its labels), as the wide path numbers occupants,
+  so a reconnect, a restarted producer whose keys start again from 0, and a
+  group that changes form all keep each occupant's series. Recorded over
+  the long stream, with a value-derived group and a restarted producer
+  among the cases, an archive answers queries as one recorded from wide
+  snapshots of the same ticks (`tests/stream_long.rs`).
 
 ### metriken-exposition 0.21.4
 
@@ -33,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`LongGroupSnapshot`): the metrics as columns, one `LongMember` per slot
   with a value, with the slot's labels and an occupant key. Keys are
   assigned per group from 0 as occupants appear, so they encode in a few
-  bytes; a slot gets a new key when its occupant changes (a new `__uid__`,
-  or new labels on a slot without one). Any other group is a `GroupSnapshot`, as `build_groups` builds it
+  bytes. A slot gets a new key when its occupant changes (a new `__uid__`,
+  or new labels on a slot without one) and, in a group of
+  `Membership::Slots` metrics, when it returns after a build without a
+  value. Any other group is a `GroupSnapshot`, as `build_groups` builds it
   (`StreamGroup`). A long group's columns are rebuilt when its metrics
   change, and a slot's labels when its occupant changes. With 2,500
   occupants over five metrics and 16 leaving and 16 arriving, a change tick

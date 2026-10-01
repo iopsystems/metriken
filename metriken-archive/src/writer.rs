@@ -13,9 +13,9 @@
 //!
 //! A pass taken off a replication stream ([`crate::stream`]) is staged with
 //! [`SourceRecorder::stage_streamed`], its rows decoded by a
-//! [`StreamDecoder`]. A slot group arrives long, keyed by the producer's
-//! occupant keys, and is written long with those keys mapped to occupant
-//! numbers; no full member list is laid out.
+//! [`StreamDecoder`]. A group sent long arrives keyed by the producer's
+//! occupant keys and is written long, each key mapped to an occupant number
+//! by the occupant's identity, as the wide path numbers occupants.
 //!
 //! A V1/V2 snapshot (from a producer older than acquisition groups) is
 //! written one table per `sampler` label, each metric with its own window,
@@ -100,8 +100,8 @@ pub enum StreamedGroup {
     /// occupant keys. Its schema is the group's columns, present on the row
     /// that anchors them.
     Long { name: String, row: WalLongRow },
-    /// The occupants first described on `<table>/occupants`: each key's
-    /// labels, for the long rows of `table` that follow.
+    /// The occupants sent on `<table>/occupants`: each key's labels, for
+    /// the long rows of `table` that follow.
     Occupants {
         table: String,
         occupants: Vec<Occupant>,
@@ -113,17 +113,16 @@ pub enum StreamedGroup {
 /// connection: the schemas it holds are the ones this connection was sent.
 ///
 /// A row on `<table>/occupants` is an [`Occupants`](StreamedGroup::Occupants)
-/// row, and marks `table` as long: the first row of a long group always
-/// describes its occupants. Any other row of a long table is a
-/// [`WalLongRow`]. Any other row is a [`WalGroupRow`], whose schema this
-/// holds from the row that carried it; a row whose schema this connection
-/// was never sent is skipped and counted in [`unresolved`](Self::unresolved).
+/// row. Any other row is a [`WalLongRow`] or a [`WalGroupRow`], told apart
+/// by the length of the msgpack array it is encoded as, so a
+/// group can change form between rows. A group row's schema is held from
+/// the row that carried it; a group row whose schema this connection was
+/// never sent is skipped and counted in [`unresolved`](Self::unresolved).
 ///
 /// [`WalGroupRow`]: metriken_segment::wal::WalGroupRow
 #[derive(Default)]
 pub struct StreamDecoder {
     schemas: HashMap<String, ((u64, u64), Arc<metriken_exposition::GroupSchema>)>,
-    long: HashSet<String>,
     /// Group rows skipped because their schema was never sent.
     pub unresolved: u64,
 }
@@ -143,7 +142,6 @@ impl StreamDecoder {
         for row in rows {
             let stream = row.stream;
             if let Some(table) = occupants::table_of(&stream) {
-                self.long.insert(table.to_string());
                 out.push(StreamedGroup::Occupants {
                     table: table.to_string(),
                     occupants: occupants::decode_wal_row(&row.row)
@@ -151,7 +149,7 @@ impl StreamDecoder {
                 });
                 continue;
             }
-            if self.long.contains(&stream) {
+            if row_form(&row.row) == Some(RowForm::Long) {
                 let decoded = wal::decode_wal_long_row(&row.row)
                     .map_err(|e| format!("stream {stream}: {e}"))?;
                 out.push(StreamedGroup::Long {
@@ -201,6 +199,34 @@ impl StreamDecoder {
         Ok(out)
     }
 }
+
+/// Which row type an encoded stream payload is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowForm {
+    /// A [`WalGroupRow`](metriken_segment::wal::WalGroupRow): six fields.
+    Group,
+    /// A [`WalLongRow`]: four fields.
+    Long,
+}
+
+/// The form of an encoded row, from the length of the msgpack array its
+/// struct is encoded as. `None` for a payload that is not such an array.
+fn row_form(payload: &[u8]) -> Option<RowForm> {
+    let len = match *payload.first()? {
+        b @ 0x90..=0x9f => usize::from(b & 0x0f),
+        0xdc => usize::from(u16::from_be_bytes(payload.get(1..3)?.try_into().ok()?)),
+        0xdd => u32::from_be_bytes(payload.get(1..5)?.try_into().ok()?) as usize,
+        _ => return None,
+    };
+    match len {
+        GROUP_ROW_FIELDS => Some(RowForm::Group),
+        LONG_ROW_FIELDS => Some(RowForm::Long),
+        _ => None,
+    }
+}
+
+const GROUP_ROW_FIELDS: usize = 6;
+const LONG_ROW_FIELDS: usize = 4;
 
 /// A segment-format schema as metriken-exposition's, which a
 /// [`GroupSnapshot`] carries.
@@ -485,10 +511,7 @@ impl LongLayout {
                         .filter(|(k, _)| is_occupant_key(k))
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    let identity = match labels.get("__uid__") {
-                        Some(uid) => format!("uid:{uid}"),
-                        None => format!("labels:{labels:?}"),
-                    };
+                    let identity = occupant_identity(&labels);
                     slots.push(Slot {
                         identity,
                         labels: Arc::new(labels),
@@ -547,13 +570,44 @@ struct GroupState {
     /// Streamed long rows only: the columns the producer last anchored,
     /// by hash, mapped onto `columns`.
     wire: Option<((u64, u64), Arc<WireColumns>)>,
-    /// Streamed long rows only: occupant number by the producer's key.
-    keys: HashMap<u64, u64>,
-    /// Streamed long rows only: labels sent for keys with no number yet.
-    pending: HashMap<u64, Arc<BTreeMap<String, String>>>,
-    /// Streamed long rows only: whether a row with no anchor, or an
-    /// occupant with no labels, has been warned about.
-    warned: bool,
+    /// Streamed long rows only: each producer key the producer has
+    /// described and that was present in the last row written, with its
+    /// occupant number and labels.
+    keys: HashMap<u64, (u64, Arc<BTreeMap<String, String>>)>,
+    /// Long only: the occupant numbers whose labels the occupant stream
+    /// already holds.
+    described: HashSet<u64>,
+    /// Streamed long rows only: which of the `WARN_*` warnings have been
+    /// logged for this group.
+    warned: u8,
+}
+
+/// A long row arrived for a group recorded wide.
+const WARN_WIDE: u8 = 1;
+/// A long row arrived before its columns were anchored.
+const WARN_ANCHOR: u8 = 2;
+/// An occupant's values do not match its row's columns.
+const WARN_WIDTH: u8 = 4;
+/// An occupant arrived with a key no occupants row described.
+const WARN_LABELS: u8 = 8;
+
+impl GroupState {
+    /// Whether warning `flag` is to be logged: true the first time only.
+    fn first_warning(&mut self, flag: u8) -> bool {
+        let first = self.warned & flag == 0;
+        self.warned |= flag;
+        first
+    }
+}
+
+/// What makes two occupants of a group the same occupant: its `__uid__`
+/// when it has one, otherwise its labels. The wide and streamed paths both
+/// number occupants by it, so a group that changes form keeps its series.
+fn occupant_identity(labels: &BTreeMap<String, String>) -> String {
+    match labels.get("__uid__") {
+        Some(uid) => format!("uid:{uid}"),
+        None => format!("labels:{labels:?}"),
+    }
 }
 
 /// A streamed long row's columns, mapped onto the group's [`LongColumns`]:
@@ -667,13 +721,17 @@ impl SourceRecorder {
 
     /// One pass off a replication stream, in the order its rows arrived.
     ///
-    /// A long row is written long, its occupant keys mapped to this archive's
-    /// occupant numbers. A key gets a number the first time it is present in
-    /// a long row, with the labels an [`Occupants`](StreamedGroup::Occupants)
-    /// row gave it, and keeps that number for the recording, so labels sent
-    /// again (on a reconnect) are not a new occupant. An occupant whose labels
-    /// were never sent, or a row whose columns were never anchored, is
-    /// skipped with one warning per group.
+    /// A long row is written long. Each key an
+    /// [`Occupants`](StreamedGroup::Occupants) row describes is mapped to an
+    /// occupant number by the occupant's identity, its `__uid__` or else its
+    /// labels, as the wide path numbers occupants: labels sent again for a
+    /// live occupant (a reconnect) keep its number, a key described with
+    /// other labels (a restarted producer reusing keys) gets the other
+    /// occupant's, and a group that changes form keeps its series. A key is
+    /// forgotten when a written row does not contain it; the producer
+    /// describes it again if it returns. An occupant whose key was never
+    /// described, or a row whose columns were never anchored, is skipped
+    /// with one warning per group and cause.
     pub fn stage_streamed(
         &mut self,
         groups: Vec<StreamedGroup>,
@@ -695,11 +753,19 @@ impl SourceRecorder {
                     }
                 }
                 StreamedGroup::Occupants { table, occupants } => {
+                    // Numbered by identity, as the wide path numbers them: a
+                    // key described again with the same labels keeps its
+                    // number, and one described with other labels (a
+                    // restarted producer reusing keys) gets the other
+                    // occupant's.
                     let state = self.groups.entry(table).or_default();
                     for o in occupants {
-                        if !state.keys.contains_key(&o.occupant) {
-                            state.pending.insert(o.occupant, Arc::new(o.labels));
-                        }
+                        let next = state.occupants.len() as u64;
+                        let number = *state
+                            .occupants
+                            .entry(occupant_identity(&o.labels))
+                            .or_insert(next);
+                        state.keys.insert(o.occupant, (number, Arc::new(o.labels)));
                     }
                 }
             }
@@ -724,9 +790,8 @@ impl SourceRecorder {
             return Ok(());
         }
         if state.long == Some(false) {
-            if !state.warned {
+            if state.first_warning(WARN_WIDE) {
                 tracing::warn!("group {name} is recorded wide and arrived long; skipped");
-                state.warned = true;
             }
             return Ok(());
         }
@@ -756,11 +821,10 @@ impl SourceRecorder {
         let wire = match &state.wire {
             Some((hash, wire)) if *hash == row.schema_hash => Arc::clone(wire),
             _ => {
-                if !state.warned {
+                if state.first_warning(WARN_ANCHOR) {
                     tracing::warn!(
                         "group {name}: a long row arrived before its columns; skipped (warned once)"
                     );
-                    state.warned = true;
                 }
                 return Ok(());
             }
@@ -774,47 +838,37 @@ impl SourceRecorder {
         );
         let mut present = Vec::with_capacity(row.occupants.len());
         let mut first_seen = Vec::new();
+        let mut present_keys = HashSet::with_capacity(row.occupants.len());
         for o in row.occupants {
             if o.counters.len() != wire.counters.len()
                 || o.gauges.len() != wire.gauges.len()
                 || o.histograms.len() != wire.histograms.len()
             {
-                if !state.warned {
+                if state.first_warning(WARN_WIDTH) {
                     tracing::warn!(
                         "group {name}: an occupant does not match its columns; skipped (warned once)"
                     );
-                    state.warned = true;
                 }
                 continue;
             }
-            let number = match state.keys.get(&o.occupant) {
-                Some(&n) => n,
-                None => {
-                    let Some(labels) = state.pending.remove(&o.occupant) else {
-                        if !state.warned {
-                            tracing::warn!(
-                                "group {name}: occupant {} arrived without labels; skipped \
-                                 (warned once)",
-                                o.occupant
-                            );
-                            state.warned = true;
-                        }
-                        continue;
-                    };
-                    let n = (state.occupants.len() + state.keys.len()) as u64;
-                    state.keys.insert(o.occupant, n);
-                    first_seen.push(Occupant {
-                        occupant: n,
-                        labels: labels.as_ref().clone(),
-                    });
-                    state.seen.insert(n, labels);
-                    n
+            let Some((number, labels)) = state.keys.get(&o.occupant).cloned() else {
+                if state.first_warning(WARN_LABELS) {
+                    tracing::warn!(
+                        "group {name}: occupant key {} arrived without labels; skipped \
+                         (warned once)",
+                        o.occupant
+                    );
                 }
+                continue;
             };
-            if let Some(labels) = state.pending.remove(&o.occupant) {
-                // Sent again for a key already numbered: a reconnect.
-                state.seen.entry(number).or_insert(labels);
+            if state.described.insert(number) {
+                first_seen.push(Occupant {
+                    occupant: number,
+                    labels: labels.as_ref().clone(),
+                });
             }
+            state.seen.entry(number).or_insert(labels);
+            present_keys.insert(o.occupant);
             let mut occ = LongOccupant {
                 occupant: number,
                 counters: vec![None; widths.0],
@@ -832,6 +886,9 @@ impl SourceRecorder {
             }
             present.push(occ);
         }
+        // The producer describes a key again whenever it returns after a row
+        // without it, so a key absent from this row need not be kept.
+        state.keys.retain(|k, _| present_keys.contains(k));
         self.write_long(name, row.window, present, first_seen, ts, wall_offset, rows)
     }
 
@@ -1056,9 +1113,9 @@ impl SourceRecorder {
                         });
                     }
                     let number = *slot.number.get_or_init(|| {
-                        let next = (state.occupants.len() + state.keys.len()) as u64;
+                        let next = state.occupants.len() as u64;
                         let number = *state.occupants.entry(slot.identity.clone()).or_insert(next);
-                        if number == next {
+                        if state.described.insert(number) {
                             first_seen.push(Occupant {
                                 occupant: number,
                                 labels: slot.labels.as_ref().clone(),
@@ -1234,5 +1291,38 @@ impl SourceRecorder {
             self.writer.seal(batch).map_err(boxed)?;
         }
         self.writer.finalize((last.0 as i64, last.1)).map_err(boxed)
+    }
+}
+
+#[cfg(test)]
+mod row_form_tests {
+    use super::*;
+    use metriken_segment::wal::WalGroupRow;
+
+    /// The decoder tells the two row types apart by their field counts, so
+    /// those must differ and match what the encoders write.
+    #[test]
+    fn group_and_long_rows_encode_as_arrays_of_different_lengths() {
+        assert_ne!(GROUP_ROW_FIELDS, LONG_ROW_FIELDS);
+        let group = wal::encode_wal_group_row(&WalGroupRow {
+            schema_hash: (1, 2),
+            schema: None,
+            window: None,
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        })
+        .unwrap();
+        let long = wal::encode_wal_long_row(&WalLongRow {
+            schema_hash: (1, 2),
+            schema: None,
+            window: None,
+            occupants: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(row_form(&group), Some(RowForm::Group));
+        assert_eq!(row_form(&long), Some(RowForm::Long));
+        assert_eq!(row_form(&[]), None);
+        assert_eq!(row_form(&[0x93]), None);
     }
 }
