@@ -40,6 +40,15 @@
 //!   group's metadata store (O(live slots), not O(capacity)). This is what a
 //!   slot space managed by [`metriken::group::SlotIdentity`] is, and what a
 //!   family ([`metriken::CounterFamily`], [`metriken::GaugeFamily`]) is.
+//!
+//! # The long form
+//!
+//! [`GroupBuilder::build_stream`] emits a group whose metrics are all counter
+//! groups or gauge groups as a [`LongGroupSnapshot`]: the metrics as columns,
+//! and one [`LongMember`] per slot with a value, carrying the slot's labels
+//! and a key that identifies its occupant. Its columns change when the
+//! group's metrics do, and a slot's labels when its occupant does, so a
+//! change of occupant does not rebuild the group's schema.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -328,6 +337,9 @@ pub struct GroupBuilder<R: Router, N: MemberNames = Positional> {
     router: R,
     names: N,
     cache: FastMap<String, GroupSkeleton>,
+    /// Per long group of [`build_stream`](Self::build_stream): its columns
+    /// and its slots' occupants.
+    long: FastMap<String, LongState>,
     rebuilds: u64,
 }
 
@@ -345,19 +357,21 @@ impl<R: Router> GroupBuilder<R, Positional> {
             router,
             names: Positional,
             cache: FastMap::default(),
+            long: FastMap::default(),
             rebuilds: 0,
         }
     }
 }
 
 impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
-    /// The same builder naming members with `names`. The cache is emptied,
+    /// The same builder naming members with `names`. The caches are emptied,
     /// since cached schemas carry the old names.
     pub fn with_names<M: MemberNames>(self, names: M) -> GroupBuilder<R, M> {
         GroupBuilder {
             router: self.router,
             names,
             cache: FastMap::default(),
+            long: FastMap::default(),
             rebuilds: 0,
         }
     }
@@ -422,388 +436,862 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
     /// whose only metrics have a value kind the builder does not expose
     /// (`Value::HistogramGroup`, `Value::Other`).
     pub fn build_groups(&mut self, extra: Vec<ExtraGroup>) -> Vec<GroupSnapshot> {
+        // One registry guard for both passes, so both see the same dynamic
+        // metrics. Registering or dropping a dynamic metric waits for it.
+        let metrics = metriken::metrics();
         let Self {
             router,
             names,
             cache,
             rebuilds,
+            ..
         } = self;
-        let router: &R = router;
+        build_wide(
+            &*router,
+            &*names,
+            cache,
+            rebuilds,
+            &metrics,
+            extra,
+            &HashSet::new(),
+        )
+    }
+}
 
-        // One registry guard for both passes, so both see the same dynamic
-        // metrics. Registering or dropping a dynamic metric waits for it.
-        let metrics = metriken::metrics();
+/// The groups of [`GroupBuilder::build_groups`] except those in `skip`, from
+/// one registry guard.
+fn build_wide<R: Router, N: MemberNames>(
+    router: &R,
+    names: &N,
+    cache: &mut FastMap<String, GroupSkeleton>,
+    rebuilds: &mut u64,
+    metrics: &metriken::Metrics,
+    extra: Vec<ExtraGroup>,
+    skip: &HashSet<GroupId<'_>>,
+) -> Vec<GroupSnapshot> {
+    let mut extra_ids: Vec<(String, String, Option<Window>)> = Vec::with_capacity(extra.len());
+    let mut extra_members = Vec::with_capacity(extra.len());
+    for g in extra {
+        extra_ids.push((g.namespace, g.name, g.window));
+        extra_members.push((g.counters, g.gauges, g.histograms));
+    }
+    let extra_keys: HashSet<GroupId<'_>> = extra_ids
+        .iter()
+        .map(|(ns, name, _)| GroupId::new(ns, name))
+        .collect();
 
-        let mut extra_ids: Vec<(String, String, Option<Window>)> = Vec::with_capacity(extra.len());
-        let mut extra_members = Vec::with_capacity(extra.len());
-        for g in extra {
-            extra_ids.push((g.namespace, g.name, g.window));
-            extra_members.push((g.counters, g.gauges, g.histograms));
+    let decisions = fold_group_identities(cache, router, metrics, &extra_keys, skip);
+
+    let mut groups: FastMap<GroupId<'_>, Group<R::Guard>> = FastMap::default();
+    // Reused by every `Slots` walk, cleared per metric: one buffer for
+    // the whole build rather than one per group.
+    let mut idx_scratch: Vec<usize> = Vec::new();
+
+    for (metric_id, metric) in metrics.iter().enumerate() {
+        let Some(value) = metric.value() else {
+            continue;
+        };
+        let Some(route) = router.route(metric) else {
+            continue;
+        };
+        if skip.contains(&route.group) {
+            continue;
         }
-        let extra_keys: HashSet<GroupId<'_>> = extra_ids
-            .iter()
-            .map(|(ns, name, _)| GroupId::new(ns, name))
-            .collect();
+        let registered = route.membership.registered();
 
-        let decisions = fold_group_identities(cache, router, &metrics, &extra_keys);
+        let group = match groups.entry(route.group) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                // First touch of this group in this build. A stamped
+                // window is read here, before any of the group's values:
+                // a window can only lag its values, never lead them,
+                // which is the safe direction. Reading it only after the
+                // walk could pair a window from a writer's next cycle
+                // with values read before it, claiming the data is newer
+                // than it is. A reader guard opens here and is finished
+                // at emit.
+                let window = match router.acquire(*e.key()) {
+                    Acquisition::Windowless => WindowState::Windowless,
+                    Acquisition::Stamped(first) => WindowState::Stamped(first),
+                    Acquisition::Reader(guard) => WindowState::Reader(guard),
+                };
+                let decision = decisions.get(e.key()).copied().unwrap_or_default();
+                let mut group = Group::new(window, decision.needs_schema);
 
-        let mut groups: FastMap<GroupId<'_>, Group<R::Guard>> = FastMap::default();
-        // Reused by every `Slots` walk, cleared per metric: one buffer for
-        // the whole build rather than one per group.
-        let mut idx_scratch: Vec<usize> = Vec::new();
-
-        for (metric_id, metric) in metrics.iter().enumerate() {
-            let Some(value) = metric.value() else {
-                continue;
-            };
-            let Some(route) = router.route(metric) else {
-                continue;
-            };
-            let registered = route.membership.registered();
-
-            let group = match groups.entry(route.group) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => {
-                    // First touch of this group in this build. A stamped
-                    // window is read here, before any of the group's values:
-                    // a window can only lag its values, never lead them,
-                    // which is the safe direction. Reading it only after the
-                    // walk could pair a window from a writer's next cycle
-                    // with values read before it, claiming the data is newer
-                    // than it is. A reader guard opens here and is finished
-                    // at emit.
-                    let window = match router.acquire(*e.key()) {
-                        Acquisition::Windowless => WindowState::Windowless,
-                        Acquisition::Stamped(first) => WindowState::Stamped(first),
-                        Acquisition::Reader(guard) => WindowState::Reader(guard),
-                    };
-                    let decision = decisions.get(e.key()).copied().unwrap_or_default();
-                    let mut group = Group::new(window, decision.needs_schema);
-
-                    // A hit: size this build's value vectors from the cached
-                    // schema (its sizes carried by the decision, so the cache
-                    // is not looked up again) and pushing values never
-                    // reallocates. At most three allocations per hit group,
-                    // none per member.
-                    if let Some((counters, gauges, histograms)) = decision.sizes {
-                        group.counter_values = Vec::with_capacity(counters);
-                        group.gauge_values = Vec::with_capacity(gauges);
-                        group.histogram_values = Vec::with_capacity(histograms);
-                    }
-                    e.insert(group)
+                // A hit: size this build's value vectors from the cached
+                // schema (its sizes carried by the decision, so the cache
+                // is not looked up again) and pushing values never
+                // reallocates. At most three allocations per hit group,
+                // none per member.
+                if let Some((counters, gauges, histograms)) = decision.sizes {
+                    group.counter_values = Vec::with_capacity(counters);
+                    group.gauge_values = Vec::with_capacity(gauges);
+                    group.histogram_values = Vec::with_capacity(histograms);
                 }
-            };
+                e.insert(group)
+            }
+        };
 
-            if group.needs_schema {
-                // MISS: build the descriptors. The member walks below must
-                // choose members exactly as `fold_group_identities` does, or
-                // the two passes disagree on membership.
-                let mut metadata: BTreeMap<String, String> =
-                    [("metric".to_string(), metric.name().to_string())].into();
-                for (k, v) in metric.metadata().iter() {
-                    metadata.insert(k.to_string(), v.to_string());
+        if group.needs_schema {
+            // MISS: build the descriptors. The member walks below must
+            // choose members exactly as `fold_group_identities` does, or
+            // the two passes disagree on membership.
+            let mut metadata: BTreeMap<String, String> =
+                [("metric".to_string(), metric.name().to_string())].into();
+            for (k, v) in metric.metadata().iter() {
+                metadata.insert(k.to_string(), v.to_string());
+            }
+            router.annotate(metric, &mut metadata);
+            metadata.remove(GROUP_METADATA_KEY);
+
+            let metric_id_u64 = metric_id as u64;
+
+            match value {
+                Value::Counter(v) => {
+                    group.walk_identity.counters =
+                        identity_fold(group.walk_identity.counters, &metric_id_u64.to_le_bytes());
+                    group.counter_descs.push(MetricDesc {
+                        name: names.metric(metric_id, metric),
+                        metadata,
+                    });
+                    group.counter_values.push(Some(v));
                 }
-                router.annotate(metric, &mut metadata);
-                metadata.remove(GROUP_METADATA_KEY);
-
-                let metric_id_u64 = metric_id as u64;
-
-                match value {
-                    Value::Counter(v) => {
+                Value::Gauge(v) => {
+                    group.walk_identity.gauges =
+                        identity_fold(group.walk_identity.gauges, &metric_id_u64.to_le_bytes());
+                    group.gauge_descs.push(MetricDesc {
+                        name: names.metric(metric_id, metric),
+                        metadata,
+                    });
+                    group.gauge_values.push(Some(v));
+                }
+                Value::CounterGroup(g) => {
+                    // The version first, then the members: see
+                    // `fold_group_version`.
+                    group.walk_identity.counters = fold_group_version(
+                        group.walk_identity.counters,
+                        metric_id_u64,
+                        g.metadata_version(),
+                    );
+                    let members =
+                        walk_members(route.membership, &mut idx_scratch, g.entries(), &mut |f| {
+                            g.for_each_metadata(f)
+                        });
+                    for idx in members {
+                        // The value and the metadata are two reads with no
+                        // lock in common. A slot whose occupant changes
+                        // between them pairs one occupant's value with the
+                        // other's labels for this build. A producer that
+                        // relabels a slot should do it in one
+                        // `set_metadata` call, and between builds.
+                        let v = g.counter_value(idx);
+                        if !registered && !matches!(v, Some(v) if v != 0) {
+                            continue;
+                        }
+                        // Fold what THIS walk observed, in the same order
+                        // as the first pass, so a later build can
+                        // reproduce it on a real hit. Membership only:
+                        // the labels are covered by the version above.
                         group.walk_identity.counters = identity_fold(
                             group.walk_identity.counters,
+                            &(idx as u64).to_le_bytes(),
+                        );
+                        // The metadata before the name: allocating them
+                        // in this order measured faster on a rebuild (see
+                        // `member_metadata`).
+                        let member_md =
+                            member_metadata(&metadata, idx, &mut |f| g.with_metadata(idx, f));
+                        group.counter_descs.push(MetricDesc {
+                            name: names.member(metric_id, metric, idx),
+                            metadata: member_md,
+                        });
+                        group.counter_values.push(v);
+                    }
+                    group.mark_end();
+                }
+                Value::GaugeGroup(g) => {
+                    group.walk_identity.gauges = fold_group_version(
+                        group.walk_identity.gauges,
+                        metric_id_u64,
+                        g.metadata_version(),
+                    );
+                    let members =
+                        walk_members(route.membership, &mut idx_scratch, g.entries(), &mut |f| {
+                            g.for_each_metadata(f)
+                        });
+                    for idx in members {
+                        // `gauge_value` maps the group's unwritten
+                        // sentinel to `None`, so `None` is the whole
+                        // value-derived test for a gauge.
+                        let v = g.gauge_value(idx);
+                        if !registered && v.is_none() {
+                            continue;
+                        }
+                        group.walk_identity.gauges =
+                            identity_fold(group.walk_identity.gauges, &(idx as u64).to_le_bytes());
+                        // The metadata before the name: allocating them
+                        // in this order measured faster on a rebuild (see
+                        // `member_metadata`).
+                        let member_md =
+                            member_metadata(&metadata, idx, &mut |f| g.with_metadata(idx, f));
+                        group.gauge_descs.push(MetricDesc {
+                            name: names.member(metric_id, metric, idx),
+                            metadata: member_md,
+                        });
+                        group.gauge_values.push(v);
+                    }
+                    group.mark_end();
+                }
+                Value::Histogram(h) => {
+                    // `config()` needs no loaded value.
+                    let mut metadata = metadata;
+                    metadata.insert(
+                        "grouping_power".to_string(),
+                        h.config().grouping_power().to_string(),
+                    );
+                    metadata.insert(
+                        "max_value_power".to_string(),
+                        h.config().max_value_power().to_string(),
+                    );
+                    let hv = h.load();
+                    // Registered: the metric is the member, and `None`
+                    // means no reading yet. Omitting it would make
+                    // membership follow values and change the schema on
+                    // exactly the event (a histogram not yet loaded)
+                    // registered membership exists to ignore.
+                    if registered || hv.is_some() {
+                        group.walk_identity.histograms = identity_fold(
+                            group.walk_identity.histograms,
                             &metric_id_u64.to_le_bytes(),
                         );
-                        group.counter_descs.push(MetricDesc {
+                        group.histogram_descs.push(MetricDesc {
                             name: names.metric(metric_id, metric),
                             metadata,
                         });
-                        group.counter_values.push(Some(v));
+                        group.histogram_values.push(hv);
                     }
-                    Value::Gauge(v) => {
-                        group.walk_identity.gauges =
-                            identity_fold(group.walk_identity.gauges, &metric_id_u64.to_le_bytes());
-                        group.gauge_descs.push(MetricDesc {
-                            name: names.metric(metric_id, metric),
-                            metadata,
+                }
+                _ => {}
+            }
+        } else {
+            // HIT: identity unchanged since the cached build. Read values
+            // in the same order and under the same membership rules as
+            // the arms above, and build no descriptor.
+            match value {
+                Value::Counter(v) => group.counter_values.push(Some(v)),
+                Value::Gauge(v) => group.gauge_values.push(Some(v)),
+                Value::CounterGroup(g) => {
+                    let members =
+                        walk_members(route.membership, &mut idx_scratch, g.entries(), &mut |f| {
+                            g.for_each_metadata(f)
                         });
-                        group.gauge_values.push(Some(v));
-                    }
-                    Value::CounterGroup(g) => {
-                        // The version first, then the members: see
-                        // `fold_group_version`.
-                        group.walk_identity.counters = fold_group_version(
-                            group.walk_identity.counters,
-                            metric_id_u64,
-                            g.metadata_version(),
-                        );
-                        let members = walk_members(
-                            route.membership,
-                            &mut idx_scratch,
-                            g.entries(),
-                            &mut |f| g.for_each_metadata(f),
-                        );
-                        for idx in members {
-                            // The value and the metadata are two reads with no
-                            // lock in common. A slot whose occupant changes
-                            // between them pairs one occupant's value with the
-                            // other's labels for this build. A producer that
-                            // relabels a slot should do it in one
-                            // `set_metadata` call, and between builds.
-                            let v = g.counter_value(idx);
-                            if !registered && !matches!(v, Some(v) if v != 0) {
-                                continue;
-                            }
-                            // Fold what THIS walk observed, in the same order
-                            // as the first pass, so a later build can
-                            // reproduce it on a real hit. Membership only:
-                            // the labels are covered by the version above.
-                            group.walk_identity.counters = identity_fold(
-                                group.walk_identity.counters,
-                                &(idx as u64).to_le_bytes(),
-                            );
-                            // The metadata before the name: allocating them
-                            // in this order measured faster on a rebuild (see
-                            // `member_metadata`).
-                            let member_md =
-                                member_metadata(&metadata, idx, &mut |f| g.with_metadata(idx, f));
-                            group.counter_descs.push(MetricDesc {
-                                name: names.member(metric_id, metric, idx),
-                                metadata: member_md,
-                            });
-                            group.counter_values.push(v);
+                    for idx in members {
+                        let v = g.counter_value(idx);
+                        if !registered && !matches!(v, Some(v) if v != 0) {
+                            continue;
                         }
-                        group.mark_end();
+                        group.counter_values.push(v);
                     }
-                    Value::GaugeGroup(g) => {
-                        group.walk_identity.gauges = fold_group_version(
-                            group.walk_identity.gauges,
-                            metric_id_u64,
-                            g.metadata_version(),
-                        );
-                        let members = walk_members(
-                            route.membership,
-                            &mut idx_scratch,
-                            g.entries(),
-                            &mut |f| g.for_each_metadata(f),
-                        );
-                        for idx in members {
-                            // `gauge_value` maps the group's unwritten
-                            // sentinel to `None`, so `None` is the whole
-                            // value-derived test for a gauge.
-                            let v = g.gauge_value(idx);
-                            if !registered && v.is_none() {
-                                continue;
-                            }
-                            group.walk_identity.gauges = identity_fold(
-                                group.walk_identity.gauges,
-                                &(idx as u64).to_le_bytes(),
-                            );
-                            // The metadata before the name: allocating them
-                            // in this order measured faster on a rebuild (see
-                            // `member_metadata`).
-                            let member_md =
-                                member_metadata(&metadata, idx, &mut |f| g.with_metadata(idx, f));
-                            group.gauge_descs.push(MetricDesc {
-                                name: names.member(metric_id, metric, idx),
-                                metadata: member_md,
-                            });
-                            group.gauge_values.push(v);
-                        }
-                        group.mark_end();
-                    }
-                    Value::Histogram(h) => {
-                        // `config()` needs no loaded value.
-                        let mut metadata = metadata;
-                        metadata.insert(
-                            "grouping_power".to_string(),
-                            h.config().grouping_power().to_string(),
-                        );
-                        metadata.insert(
-                            "max_value_power".to_string(),
-                            h.config().max_value_power().to_string(),
-                        );
-                        let hv = h.load();
-                        // Registered: the metric is the member, and `None`
-                        // means no reading yet. Omitting it would make
-                        // membership follow values and change the schema on
-                        // exactly the event (a histogram not yet loaded)
-                        // registered membership exists to ignore.
-                        if registered || hv.is_some() {
-                            group.walk_identity.histograms = identity_fold(
-                                group.walk_identity.histograms,
-                                &metric_id_u64.to_le_bytes(),
-                            );
-                            group.histogram_descs.push(MetricDesc {
-                                name: names.metric(metric_id, metric),
-                                metadata,
-                            });
-                            group.histogram_values.push(hv);
-                        }
-                    }
-                    _ => {}
+                    group.mark_end();
                 }
-            } else {
-                // HIT: identity unchanged since the cached build. Read values
-                // in the same order and under the same membership rules as
-                // the arms above, and build no descriptor.
-                match value {
-                    Value::Counter(v) => group.counter_values.push(Some(v)),
-                    Value::Gauge(v) => group.gauge_values.push(Some(v)),
-                    Value::CounterGroup(g) => {
-                        let members = walk_members(
-                            route.membership,
-                            &mut idx_scratch,
-                            g.entries(),
-                            &mut |f| g.for_each_metadata(f),
-                        );
-                        for idx in members {
-                            let v = g.counter_value(idx);
-                            if !registered && !matches!(v, Some(v) if v != 0) {
-                                continue;
-                            }
-                            group.counter_values.push(v);
+                Value::GaugeGroup(g) => {
+                    let members =
+                        walk_members(route.membership, &mut idx_scratch, g.entries(), &mut |f| {
+                            g.for_each_metadata(f)
+                        });
+                    for idx in members {
+                        let v = g.gauge_value(idx);
+                        if !registered && v.is_none() {
+                            continue;
                         }
-                        group.mark_end();
+                        group.gauge_values.push(v);
                     }
-                    Value::GaugeGroup(g) => {
-                        let members = walk_members(
-                            route.membership,
-                            &mut idx_scratch,
-                            g.entries(),
-                            &mut |f| g.for_each_metadata(f),
-                        );
-                        for idx in members {
-                            let v = g.gauge_value(idx);
-                            if !registered && v.is_none() {
-                                continue;
-                            }
-                            group.gauge_values.push(v);
-                        }
-                        group.mark_end();
-                    }
-                    Value::Histogram(h) => {
-                        let hv = h.load();
-                        if registered || hv.is_some() {
-                            group.histogram_values.push(hv);
-                        }
-                    }
-                    _ => {}
+                    group.mark_end();
                 }
+                Value::Histogram(h) => {
+                    let hv = h.load();
+                    if registered || hv.is_some() {
+                        group.histogram_values.push(hv);
+                    }
+                }
+                _ => {}
             }
         }
+    }
 
-        // Caller-supplied groups: always built, appended after any registry
-        // members of the same group.
-        for ((namespace, name, window), (counters, gauges, histograms)) in
-            extra_ids.iter().zip(extra_members)
+    // Caller-supplied groups: always built, appended after any registry
+    // members of the same group.
+    for ((namespace, name, window), (counters, gauges, histograms)) in
+        extra_ids.iter().zip(extra_members)
+    {
+        let group = groups
+            .entry(GroupId::new(namespace, name))
+            .or_insert_with(|| Group::new(WindowState::Fixed(*window), true));
+        debug_assert!(
+            group.needs_schema,
+            "group `{namespace}/{name}` has extra members but was not marked for a rebuild",
+        );
+        for (desc, v) in counters {
+            group.counter_descs.push(desc);
+            group.counter_values.push(v);
+        }
+        for (desc, v) in gauges {
+            group.gauge_descs.push(desc);
+            group.gauge_values.push(v);
+        }
+        for (desc, v) in histograms {
+            group.histogram_descs.push(desc);
+            group.histogram_values.push(v);
+        }
+    }
+
+    let mut snapshots: Vec<GroupSnapshot> = Vec::with_capacity(groups.len());
+
+    for (key, group) in groups {
+        // A metric routes (and so creates its group) before its value kind
+        // is matched, so a group whose only metrics are of a kind not
+        // exposed here has nothing in it. Left out rather than emitted
+        // empty. Checked on values, not descriptors, which are always
+        // empty on a hit. A reader guard is dropped unfinished: nothing
+        // was read, so there is nothing to publish.
+        if group.counter_values.is_empty()
+            && group.gauge_values.is_empty()
+            && group.histogram_values.is_empty()
         {
-            let group = groups
-                .entry(GroupId::new(namespace, name))
-                .or_insert_with(|| Group::new(WindowState::Fixed(*window), true));
-            debug_assert!(
-                group.needs_schema,
-                "group `{namespace}/{name}` has extra members but was not marked for a rebuild",
-            );
-            for (desc, v) in counters {
-                group.counter_descs.push(desc);
-                group.counter_values.push(v);
-            }
-            for (desc, v) in gauges {
-                group.gauge_descs.push(desc);
-                group.gauge_values.push(v);
-            }
-            for (desc, v) in histograms {
-                group.histogram_descs.push(desc);
-                group.histogram_values.push(v);
-            }
+            continue;
         }
 
-        let mut snapshots: Vec<GroupSnapshot> = Vec::with_capacity(groups.len());
+        let group_name = key.wire_name();
 
-        for (key, group) in groups {
-            // A metric routes (and so creates its group) before its value kind
-            // is matched, so a group whose only metrics are of a kind not
-            // exposed here has nothing in it. Left out rather than emitted
-            // empty. Checked on values, not descriptors, which are always
-            // empty on a hit. A reader guard is dropped unfinished: nothing
-            // was read, so there is nothing to publish.
-            if group.counter_values.is_empty()
-                && group.gauge_values.is_empty()
-                && group.histogram_values.is_empty()
-            {
-                continue;
-            }
+        let window = match group.window {
+            WindowState::Windowless => None,
+            WindowState::Fixed(w) => w,
+            WindowState::Stamped(first) => resolve_walk_window(first, router.window(key)),
+            // The width was set by the last `mark_end`; finishing here
+            // only decides when the window is published.
+            WindowState::Reader(guard) => guard.finish(),
+        };
 
-            let group_name = key.wire_name();
-
-            let window = match group.window {
-                WindowState::Windowless => None,
-                WindowState::Fixed(w) => w,
-                WindowState::Stamped(first) => resolve_walk_window(first, router.window(key)),
-                // The width was set by the last `mark_end`; finishing here
-                // only decides when the window is published.
-                WindowState::Reader(guard) => guard.finish(),
+        let (schema, hash) = if group.needs_schema {
+            let schema = GroupSchema {
+                counters: group.counter_descs,
+                gauges: group.gauge_descs,
+                histograms: group.histogram_descs,
             };
+            let hash = schema.hash();
+            let schema = Arc::new(schema);
+            // The walk's own identity, not the first pass's: see the
+            // type's docs.
+            cache.insert(
+                group_name.clone(),
+                GroupSkeleton {
+                    identity: group.walk_identity.finish(),
+                    schema: schema.clone(),
+                    hash,
+                },
+            );
+            *rebuilds += 1;
+            (schema, hash)
+        } else {
+            match cache.get(&group_name) {
+                Some(cached)
+                    if cached.schema.counters.len() == group.counter_values.len()
+                        && cached.schema.gauges.len() == group.gauge_values.len()
+                        && cached.schema.histograms.len() == group.histogram_values.len() =>
+                {
+                    (cached.schema.clone(), cached.hash)
+                }
+                // The first pass called a hit and this walk collected a
+                // different membership: evict and leave the group out of
+                // this build. A reader-guarded group has already
+                // published its window above; its membership is
+                // registered, so both passes agree and this is not
+                // reached for one.
+                Some(_) => {
+                    cache.remove(&group_name);
+                    continue;
+                }
+                // Not reached: a hit implies a cache entry.
+                None => continue,
+            }
+        };
 
-            let (schema, hash) = if group.needs_schema {
-                let schema = GroupSchema {
-                    counters: group.counter_descs,
-                    gauges: group.gauge_descs,
-                    histograms: group.histogram_descs,
-                };
-                let hash = schema.hash();
-                let schema = Arc::new(schema);
-                // The walk's own identity, not the first pass's: see the
-                // type's docs.
-                cache.insert(
-                    group_name.clone(),
-                    GroupSkeleton {
-                        identity: group.walk_identity.finish(),
-                        schema: schema.clone(),
-                        hash,
-                    },
-                );
-                *rebuilds += 1;
-                (schema, hash)
-            } else {
-                match cache.get(&group_name) {
-                    Some(cached)
-                        if cached.schema.counters.len() == group.counter_values.len()
-                            && cached.schema.gauges.len() == group.gauge_values.len()
-                            && cached.schema.histograms.len() == group.histogram_values.len() =>
-                    {
-                        (cached.schema.clone(), cached.hash)
-                    }
-                    // The first pass called a hit and this walk collected a
-                    // different membership: evict and leave the group out of
-                    // this build. A reader-guarded group has already
-                    // published its window above; its membership is
-                    // registered, so both passes agree and this is not
-                    // reached for one.
-                    Some(_) => {
-                        cache.remove(&group_name);
+        snapshots.push(GroupSnapshot {
+            name: group_name,
+            schema_hash: hash,
+            schema: Some(schema),
+            window,
+            counters: group.counter_values,
+            gauges: group.gauge_values,
+            histograms: group.histogram_values,
+        });
+    }
+
+    snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+    snapshots
+}
+
+impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
+    /// Every routed group plus `extra`, sorted by name, with each slotted
+    /// group in the long form.
+    ///
+    /// A group is long when every metric routed to it is a counter group or
+    /// a gauge group and `extra` does not name it. Each slot that has a value
+    /// is an occupant ([`LongMember`]) holding one value per metric. Any
+    /// other group is a [`GroupSnapshot`], built as
+    /// [`build_groups`](Self::build_groups) builds it.
+    ///
+    /// A long group's columns ([`LongGroupSnapshot::columns`]) are built
+    /// when its set of metrics changes. An occupant's labels are built when
+    /// its slot gets a new occupant. A change of occupant costs that slot's
+    /// labels, not the group's schema.
+    pub fn build_stream(&mut self, extra: Vec<ExtraGroup>) -> Vec<StreamGroup> {
+        let metrics = metriken::metrics();
+        let extra_keys: HashSet<(String, String)> = extra
+            .iter()
+            .map(|g| (g.namespace.clone(), g.name.clone()))
+            .collect();
+        let Self {
+            router,
+            names,
+            cache,
+            long: states,
+            rebuilds,
+        } = self;
+        let router: &R = router;
+        let long_keys = long_groups(router, &metrics, &extra_keys);
+        let wide = build_wide(
+            router, &*names, cache, rebuilds, &metrics, extra, &long_keys,
+        );
+        let long = build_long(router, &*names, states, rebuilds, &metrics, &long_keys);
+        let mut groups: Vec<StreamGroup> = wide
+            .into_iter()
+            .map(StreamGroup::Wide)
+            .chain(long.into_iter().map(StreamGroup::Long))
+            .collect();
+        groups.sort_by(|a, b| a.name().cmp(b.name()));
+        groups
+    }
+}
+
+fn build_long<R: Router, N: MemberNames>(
+    router: &R,
+    names: &N,
+    states: &mut FastMap<String, LongState>,
+    rebuilds: &mut u64,
+    metrics: &metriken::Metrics,
+    long_keys: &HashSet<GroupId<'_>>,
+) -> Vec<LongGroupSnapshot> {
+    if long_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups: FastMap<GroupId<'_>, LongAcc<'_, R::Guard>> = FastMap::default();
+    let mut idx_scratch: Vec<usize> = Vec::new();
+
+    for (metric_id, metric) in metrics.iter().enumerate() {
+        let Some(value) = metric.value() else {
+            continue;
+        };
+        let Some(route) = router.route(metric) else {
+            continue;
+        };
+        if !long_keys.contains(&route.group) {
+            continue;
+        }
+        let registered = route.membership.registered();
+        let acc = groups.entry(route.group).or_insert_with_key(|key| {
+            let name = key.wire_name();
+            let state = states.remove(&name).unwrap_or_default();
+            LongAcc {
+                window: match router.acquire(*key) {
+                    Acquisition::Windowless => WindowState::Windowless,
+                    Acquisition::Stamped(first) => WindowState::Stamped(first),
+                    Acquisition::Reader(guard) => WindowState::Reader(guard),
+                },
+                name,
+                state,
+                identity: IDENTITY_FNV_OFFSET,
+                counter_metrics: Vec::new(),
+                gauge_metrics: Vec::new(),
+                versions: Vec::new(),
+                slots: Vec::new(),
+                position: FastMap::default(),
+                occupants: Vec::new(),
+            }
+        });
+
+        match value {
+            Value::CounterGroup(g) => {
+                let column = acc.counter_metrics.len();
+                acc.counter_metrics.push((metric_id, metric));
+                acc.identity = identity_fold(acc.identity, b"c");
+                acc.identity = identity_fold(acc.identity, &(metric_id as u64).to_le_bytes());
+                // Read before the members, as `fold_group_version`
+                // explains: a change landing mid-walk shows next build.
+                let version = g.metadata_version();
+                let unchanged = acc.state.versions.get(&metric_id) == Some(&version);
+                acc.versions.push((metric_id, version));
+                let members =
+                    walk_members(route.membership, &mut idx_scratch, g.entries(), &mut |f| {
+                        g.for_each_metadata(f)
+                    });
+                for idx in members {
+                    let v = g.counter_value(idx);
+                    if !registered && !matches!(v, Some(v) if v != 0) {
                         continue;
                     }
-                    // Not reached: a hit implies a cache entry.
-                    None => continue,
+                    let pos = acc.occupant(idx, unchanged, &mut |f| g.with_metadata(idx, f));
+                    let counters = &mut acc.occupants[pos].counters;
+                    if counters.len() <= column {
+                        counters.resize(column + 1, None);
+                    }
+                    counters[column] = v;
                 }
-            };
-
-            snapshots.push(GroupSnapshot {
-                name: group_name,
-                schema_hash: hash,
-                schema: Some(schema),
-                window,
-                counters: group.counter_values,
-                gauges: group.gauge_values,
-                histograms: group.histogram_values,
-            });
+                acc.mark_end();
+            }
+            Value::GaugeGroup(g) => {
+                let column = acc.gauge_metrics.len();
+                acc.gauge_metrics.push((metric_id, metric));
+                acc.identity = identity_fold(acc.identity, b"g");
+                acc.identity = identity_fold(acc.identity, &(metric_id as u64).to_le_bytes());
+                let version = g.metadata_version();
+                let unchanged = acc.state.versions.get(&metric_id) == Some(&version);
+                acc.versions.push((metric_id, version));
+                let members =
+                    walk_members(route.membership, &mut idx_scratch, g.entries(), &mut |f| {
+                        g.for_each_metadata(f)
+                    });
+                for idx in members {
+                    let v = g.gauge_value(idx);
+                    if !registered && v.is_none() {
+                        continue;
+                    }
+                    let pos = acc.occupant(idx, unchanged, &mut |f| g.with_metadata(idx, f));
+                    let gauges = &mut acc.occupants[pos].gauges;
+                    if gauges.len() <= column {
+                        gauges.resize(column + 1, None);
+                    }
+                    gauges[column] = v;
+                }
+                acc.mark_end();
+            }
+            // `long_groups` admits only the two kinds above.
+            _ => {}
         }
-
-        snapshots.sort_by(|a, b| a.name.cmp(&b.name));
-        snapshots
     }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for (key, mut acc) in groups {
+        let identity = ((acc.identity >> 64) as u64, acc.identity as u64);
+        if acc.state.identity != Some(identity) {
+            let columns = Arc::new(GroupSchema {
+                counters: acc
+                    .counter_metrics
+                    .iter()
+                    .map(|(id, m)| column_desc(router, names, *id, m))
+                    .collect(),
+                gauges: acc
+                    .gauge_metrics
+                    .iter()
+                    .map(|(id, m)| column_desc(router, names, *id, m))
+                    .collect(),
+                histograms: Vec::new(),
+            });
+            acc.state.hash = columns.hash();
+            acc.state.columns = columns;
+            acc.state.identity = Some(identity);
+            *rebuilds += 1;
+        }
+        acc.state.versions = acc.versions.into_iter().collect();
+        // Slots that held no value this build are forgotten; one that
+        // comes back reads its metadata again.
+        let present: HashSet<usize> = acc.slots.iter().copied().collect();
+        acc.state.slots.retain(|idx, _| present.contains(idx));
+
+        if acc.occupants.is_empty() {
+            // Nothing read: the window is not published, as for a wide
+            // group with no values.
+            states.insert(acc.name, acc.state);
+            continue;
+        }
+        let window = match acc.window {
+            WindowState::Windowless => None,
+            WindowState::Fixed(w) => w,
+            WindowState::Stamped(first) => resolve_walk_window(first, router.window(key)),
+            WindowState::Reader(guard) => guard.finish(),
+        };
+        let widths = (acc.counter_metrics.len(), acc.gauge_metrics.len());
+        let mut order: Vec<usize> = (0..acc.occupants.len()).collect();
+        order.sort_unstable_by_key(|&i| acc.slots[i]);
+        let mut occupants: Vec<Option<LongMember>> = acc.occupants.into_iter().map(Some).collect();
+        let occupants: Vec<LongMember> = order
+            .into_iter()
+            .map(|i| {
+                let mut o = occupants[i].take().expect("each position is taken once");
+                o.counters.resize(widths.0, None);
+                o.gauges.resize(widths.1, None);
+                o
+            })
+            .collect();
+        out.push(LongGroupSnapshot {
+            name: acc.name.clone(),
+            window,
+            columns_hash: acc.state.hash,
+            columns: Arc::clone(&acc.state.columns),
+            occupants,
+        });
+        states.insert(acc.name, acc.state);
+    }
+    out
+}
+
+/// The groups [`GroupBuilder::build_stream`] writes long: every metric routed
+/// to them is a counter group or a gauge group, and `extra` does not name
+/// them.
+fn long_groups<'a, R: Router>(
+    router: &'a R,
+    metrics: &'a metriken::Metrics,
+    extra: &HashSet<(String, String)>,
+) -> HashSet<GroupId<'a>> {
+    let mut eligible: FastMap<GroupId<'a>, bool> = FastMap::default();
+    for metric in metrics.iter() {
+        let Some(value) = metric.value() else {
+            continue;
+        };
+        let Some(route) = router.route(metric) else {
+            continue;
+        };
+        let slotted = matches!(value, Value::CounterGroup(_) | Value::GaugeGroup(_));
+        let ok = eligible.entry(route.group).or_insert(true);
+        *ok &= slotted;
+    }
+    eligible
+        .into_iter()
+        .filter(|(key, ok)| {
+            *ok && !extra.contains(&(key.namespace.to_string(), key.name.to_string()))
+        })
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// A long group's column for one group metric: the metric's metadata, as a
+/// wide member carries it, without `id` or the slot's labels.
+fn column_desc<R: Router, N: MemberNames>(
+    router: &R,
+    names: &N,
+    metric_id: usize,
+    metric: &MetricEntry,
+) -> MetricDesc {
+    let mut metadata: BTreeMap<String, String> =
+        [("metric".to_string(), metric.name().to_string())].into();
+    for (k, v) in metric.metadata().iter() {
+        metadata.insert(k.to_string(), v.to_string());
+    }
+    router.annotate(metric, &mut metadata);
+    metadata.remove(GROUP_METADATA_KEY);
+    MetricDesc {
+        name: names.metric(metric_id, metric),
+        metadata,
+    }
+}
+
+/// One group of [`GroupBuilder::build_stream`].
+#[derive(Clone, Debug)]
+pub enum StreamGroup {
+    Wide(GroupSnapshot),
+    Long(LongGroupSnapshot),
+}
+
+impl StreamGroup {
+    /// The group's wire name.
+    pub fn name(&self) -> &str {
+        match self {
+            StreamGroup::Wide(g) => &g.name,
+            StreamGroup::Long(g) => &g.name,
+        }
+    }
+}
+
+/// A slotted group in the long form: one entry per occupant present, with
+/// the group's metrics as columns.
+#[derive(Clone, Debug)]
+pub struct LongGroupSnapshot {
+    /// `"{namespace}/{name}"`, as [`GroupSnapshot::name`].
+    pub name: String,
+    pub window: Option<Window>,
+    /// [`GroupSchema::hash`] of `columns`.
+    pub columns_hash: (u64, u64),
+    /// One descriptor per counter-group and gauge-group metric, in registry
+    /// order: the metric's metadata, with no `id` and no slot labels. It has
+    /// no histograms.
+    pub columns: Arc<GroupSchema>,
+    /// The occupants that had a value, in slot order.
+    pub occupants: Vec<LongMember>,
+}
+
+/// One occupant of a [`LongGroupSnapshot`] and its values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LongMember {
+    /// Identifies the occupant within its group for the life of the
+    /// process. For a slot with a [`UID_LABEL`] it is the uid's sixteen hex
+    /// digits read as a number; otherwise a hash of its labels.
+    ///
+    /// [`UID_LABEL`]: metriken::group::UID_LABEL
+    pub key: u64,
+    /// `id` (the slot) and the slot's metadata: the labels a wide member
+    /// carries beyond its metric's.
+    pub labels: Arc<BTreeMap<String, String>>,
+    /// One per counter column, `None` where the metric has no value.
+    pub counters: Vec<Option<u64>>,
+    /// One per gauge column.
+    pub gauges: Vec<Option<i64>>,
+}
+
+/// What [`GroupBuilder::build_stream`] keeps per long group between builds.
+#[derive(Default)]
+struct LongState {
+    /// The metrics `columns` was built from.
+    identity: Option<(u64, u64)>,
+    columns: Arc<GroupSchema>,
+    hash: (u64, u64),
+    /// Each group metric's metadata version at the last build, by registry
+    /// position.
+    versions: FastMap<usize, u64>,
+    /// The occupant each slot held at the last build.
+    slots: FastMap<usize, SlotOccupant>,
+}
+
+#[derive(Clone)]
+struct SlotOccupant {
+    key: u64,
+    labels: Arc<BTreeMap<String, String>>,
+}
+
+/// One long group during a build.
+struct LongAcc<'m, G> {
+    name: String,
+    window: WindowState<G>,
+    state: LongState,
+    /// Folded from each metric's kind and registry position.
+    identity: u128,
+    counter_metrics: Vec<(usize, &'m MetricEntry)>,
+    gauge_metrics: Vec<(usize, &'m MetricEntry)>,
+    /// This build's metadata version of each group metric.
+    versions: Vec<(usize, u64)>,
+    /// Per position in `occupants`, its slot.
+    slots: Vec<usize>,
+    position: FastMap<usize, usize>,
+    occupants: Vec<LongMember>,
+}
+
+impl<G: ReadGuard> LongAcc<'_, G> {
+    fn mark_end(&mut self) {
+        if let WindowState::Reader(guard) = &mut self.window {
+            guard.mark_end();
+        }
+    }
+
+    /// The position of slot `idx`'s occupant in this build, added on its
+    /// first value. Its labels are those of the last build when this metric's
+    /// metadata is `unchanged`, or when the slot's metadata still names the
+    /// same occupant; otherwise they are built from the metadata.
+    fn occupant(
+        &mut self,
+        idx: usize,
+        unchanged: bool,
+        with_metadata: &mut WithMetadata<'_>,
+    ) -> usize {
+        if let Some(&pos) = self.position.get(&idx) {
+            return pos;
+        }
+        let cached = self.state.slots.get(&idx);
+        let occupant = match cached {
+            Some(c) if unchanged => c.clone(),
+            _ => {
+                let mut resolved = None;
+                with_metadata(&mut |m| resolved = Some(slot_occupant(idx, m, cached)));
+                resolved.unwrap_or_else(|| slot_occupant(idx, None, cached))
+            }
+        };
+        self.state.slots.insert(idx, occupant.clone());
+        let pos = self.occupants.len();
+        self.position.insert(idx, pos);
+        self.slots.push(idx);
+        // Sized from the last build's columns, so a group whose metrics did
+        // not change fills each occupant without reallocating.
+        self.occupants.push(LongMember {
+            key: occupant.key,
+            labels: occupant.labels,
+            counters: Vec::with_capacity(self.state.columns.counters.len()),
+            gauges: Vec::with_capacity(self.state.columns.gauges.len()),
+        });
+        pos
+    }
+}
+
+/// Slot `idx`'s occupant from its metadata `m`: `cached` when `m` describes
+/// the same occupant, otherwise one built from `m`.
+fn slot_occupant(
+    idx: usize,
+    m: Option<&HashMap<String, String>>,
+    cached: Option<&SlotOccupant>,
+) -> SlotOccupant {
+    // A uid names one assignment, so equal uids are the same occupant.
+    let uid = m.and_then(|m| m.get(metriken::group::UID_LABEL));
+    if let (Some(uid), Some(c)) = (uid, cached) {
+        if c.labels.get(metriken::group::UID_LABEL) == Some(uid) {
+            return c.clone();
+        }
+    }
+    let id = idx.to_string();
+    let same = uid.is_none()
+        && cached.is_some_and(|c| {
+            let extra = m.map_or(0, |m| usize::from(!m.contains_key("id")));
+            c.labels.get("id") == Some(&id)
+                && c.labels.len() == m.map_or(0, HashMap::len) + extra
+                && m.is_none_or(|m| {
+                    m.iter()
+                        .all(|(k, v)| k == "id" || c.labels.get(k) == Some(v))
+                })
+        });
+    if let (true, Some(c)) = (same, cached) {
+        return c.clone();
+    }
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    labels.insert("id".to_string(), id);
+    if let Some(m) = m {
+        for (k, v) in m {
+            labels.insert(k.clone(), v.clone());
+        }
+    }
+    let key = labels
+        .get(metriken::group::UID_LABEL)
+        .filter(|uid| uid.len() == 16)
+        .and_then(|uid| u64::from_str_radix(uid, 16).ok())
+        .unwrap_or_else(|| labels_key(&labels));
+    SlotOccupant {
+        key,
+        labels: Arc::new(labels),
+    }
+}
+
+/// FNV-1a-64 over each label's key and value, with separators.
+fn labels_key(labels: &BTreeMap<String, String>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fold = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (k, v) in labels {
+        fold(k.as_bytes());
+        fold(&[0x1f]);
+        fold(v.as_bytes());
+        fold(&[0x1e]);
+    }
+    h
 }
 
 enum WindowState<G> {
@@ -1057,6 +1545,7 @@ fn fold_group_identities<'a, R: Router>(
     router: &'a R,
     metrics: &'a metriken::Metrics,
     extra: &HashSet<GroupId<'_>>,
+    skip: &HashSet<GroupId<'_>>,
 ) -> FastMap<GroupId<'a>, Decision> {
     let mut accums: FastMap<GroupId<'a>, GroupIdentityAccum> = FastMap::default();
     let mut idx_scratch: Vec<usize> = Vec::new();
@@ -1068,6 +1557,9 @@ fn fold_group_identities<'a, R: Router>(
         let Some(route) = router.route(metric) else {
             continue;
         };
+        if skip.contains(&route.group) {
+            continue;
+        }
         let registered = route.membership.registered();
 
         let accum = accums.entry(route.group).or_default();

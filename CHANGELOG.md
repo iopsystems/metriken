@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.21.4
+
+- **Added:** `GroupBuilder::build_stream`, which emits each group whose
+  metrics are all counter groups or gauge groups in the long form
+  (`LongGroupSnapshot`): the metrics as columns, one `LongMember` per slot
+  with a value, with the slot's labels and an occupant key. The key is the
+  slot's `__uid__` read as a number, or a hash of its labels when it has no
+  uid. Any other group is a `GroupSnapshot`, as `build_groups` builds it
+  (`StreamGroup`). A long group's columns are rebuilt when its metrics
+  change, and a slot's labels when its occupant changes. With 2,500
+  occupants over five metrics and 16 leaving and 16 arriving, a change tick
+  took 0.57-0.70 ms against 0.36-0.39 ms for an unchanged one; the wide
+  build's change tick took 8.7-32 ms (`tests/stream_cost.rs`, release, an
+  Apple M-series laptop).
+
 ### metriken-query 0.33.6
 
 - **Fixed:** the histogram functions read from a range's start with no
