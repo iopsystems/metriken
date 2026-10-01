@@ -14,8 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`LongGroupSnapshot`): the metrics as columns, one `LongMember` per slot
   with a value, with the slot's labels and an occupant key. Keys are
   assigned per group from 0 as occupants appear, so they encode in a few
-  bytes; a slot gets a new key when its occupant changes (a new `__uid__`,
-  or new labels on a slot without one). Any other group is a `GroupSnapshot`, as `build_groups` builds it
+  bytes. A slot gets a new key when its occupant changes (a new `__uid__`,
+  or new labels on a slot without one) and, in a group of
+  `Membership::Slots` metrics, when it returns after a build without a
+  value. Any other group is a `GroupSnapshot`, as `build_groups` builds it
   (`StreamGroup`). A long group's columns are rebuilt when its metrics
   change, and a slot's labels when its occupant changes. With 2,500
   occupants over five metrics and 16 leaving and 16 arriving, a change tick

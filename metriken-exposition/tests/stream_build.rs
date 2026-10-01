@@ -283,6 +283,31 @@ fn a_zero_counter_is_not_an_occupant_when_membership_follows_values() {
     );
 }
 
+#[metric(name = "stream_flicker_slots")]
+static FLICKER: metriken::CounterGroup = metriken::CounterGroup::new(4);
+
+/// A slot that reads zero for one build, under value-derived membership,
+/// keeps its key when it returns: it is the same occupant.
+#[test]
+fn a_slot_that_reads_zero_for_a_build_keeps_its_key() {
+    let _one = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let key = |groups: &[StreamGroup]| {
+        long(groups, "main")
+            .occupants
+            .iter()
+            .find(|o| o.counters.iter().flatten().any(|v| *v == 41 || *v == 42))
+            .map(|o| o.key)
+    };
+    let mut b = GroupBuilder::new(TestRouter);
+    FLICKER.set(2, 41);
+    let before = key(&stream(&mut b)).expect("present");
+    FLICKER.set(2, 0);
+    stream(&mut b);
+    FLICKER.set(2, 42);
+    assert_eq!(key(&stream(&mut b)), Some(before));
+    FLICKER.set(2, 0);
+}
+
 // --- what a change of occupant costs ---------------------------------------------
 
 #[metric(name = "stream_churn_cpu", metadata = { acq_group = "slots_churn" })]

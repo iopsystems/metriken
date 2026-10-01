@@ -843,8 +843,10 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
     ///
     /// A long group's columns ([`LongGroupSnapshot::columns`]) are built
     /// when its set of metrics changes. An occupant's labels are built when
-    /// its slot gets a new occupant. A change of occupant costs that slot's
-    /// labels, not the group's schema.
+    /// its slot gets a new occupant, or, in a group of
+    /// [`Membership::Slots`] metrics, when a slot returns after a build in
+    /// which it had no value. A change of occupant costs that slot's labels,
+    /// not the group's schema.
     pub fn build_stream(&mut self, extra: Vec<ExtraGroup>) -> Vec<StreamGroup> {
         let metrics = metriken::metrics();
         let extra_keys: HashSet<(String, String)> = extra
@@ -900,6 +902,7 @@ fn build_long<R: Router, N: MemberNames>(
             continue;
         }
         let registered = route.membership.registered();
+        let slot_membership = matches!(route.membership, Membership::Slots);
         let acc = groups.entry(route.group).or_insert_with_key(|key| {
             let name = key.wire_name();
             let state = states.remove(&name).unwrap_or_default();
@@ -916,10 +919,13 @@ fn build_long<R: Router, N: MemberNames>(
                 gauge_metrics: Vec::new(),
                 versions: Vec::new(),
                 slots: Vec::new(),
+                slot_membership: false,
                 position: FastMap::default(),
                 occupants: Vec::new(),
             }
         });
+
+        acc.slot_membership |= slot_membership;
 
         match value {
             Value::CounterGroup(g) => {
@@ -1004,10 +1010,15 @@ fn build_long<R: Router, N: MemberNames>(
             *rebuilds += 1;
         }
         acc.state.versions = acc.versions.into_iter().collect();
-        // Slots that held no value this build are forgotten; one that
-        // comes back reads its metadata again.
-        let present: HashSet<usize> = acc.slots.iter().copied().collect();
-        acc.state.slots.retain(|idx, _| present.contains(idx));
+        // A slot of a slot-metadata group that held no value this build is
+        // forgotten: its next occupant has a new uid, and keeping every slot
+        // ever seen would grow with every PID. Any other group keeps it, so
+        // a slot that reads nothing for a build (a counter at zero under
+        // value-derived membership) keeps its key when it returns.
+        if acc.slot_membership {
+            let position = &acc.position;
+            acc.state.slots.retain(|idx, _| position.contains_key(idx));
+        }
 
         if acc.occupants.is_empty() {
             // Nothing read: the window is not published, as for a wide
@@ -1113,8 +1124,8 @@ impl StreamGroup {
     }
 }
 
-/// A slotted group in the long form: one entry per occupant present, with
-/// the group's metrics as columns.
+/// A group of counter groups and gauge groups in the long form: one entry
+/// per occupant present, with the group's metrics as columns.
 #[derive(Clone, Debug)]
 pub struct LongGroupSnapshot {
     /// `"{namespace}/{name}"`, as [`GroupSnapshot::name`].
@@ -1136,13 +1147,17 @@ pub struct LongMember {
     /// Identifies the occupant within its group for the life of the
     /// builder. Keys are assigned from 0 in the order occupants first
     /// appear, and a slot gets a new one when its occupant changes: a new
-    /// [`UID_LABEL`], or new labels on a slot without one. Small numbers keep
-    /// a long row short on the wire.
+    /// [`UID_LABEL`], new labels on a slot without one, or, in a group of
+    /// [`Membership::Slots`] metrics, a return after a build in which the
+    /// slot had no value. Small numbers keep a long row short on the wire.
     ///
     /// [`UID_LABEL`]: metriken::group::UID_LABEL
     pub key: u64,
     /// `id` (the slot) and the slot's metadata: the labels a wide member
-    /// carries beyond its metric's.
+    /// carries beyond its metric's. Taken from the first of the group's
+    /// metrics, in registry order, that has a value for the slot; a group
+    /// whose metrics carry different metadata for one slot shows only that
+    /// metric's.
     pub labels: Arc<BTreeMap<String, String>>,
     /// One per counter column, `None` where the metric has no value.
     pub counters: Vec<Option<u64>>,
@@ -1185,6 +1200,9 @@ struct LongAcc<'m, G> {
     versions: Vec<(usize, u64)>,
     /// Per position in `occupants`, its slot.
     slots: Vec<usize>,
+    /// Whether any of the group's metrics takes its members from slot
+    /// metadata ([`Membership::Slots`]).
+    slot_membership: bool,
     position: FastMap<usize, usize>,
     occupants: Vec<LongMember>,
 }
