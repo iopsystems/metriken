@@ -123,7 +123,9 @@ pub enum StreamedGroup {
 #[derive(Default)]
 pub struct StreamDecoder {
     schemas: HashMap<String, ((u64, u64), Arc<metriken_exposition::GroupSchema>)>,
-    /// Group rows skipped because their schema was never sent.
+    /// Group rows skipped because their schema was never sent. Long rows
+    /// are checked by the writer ([`SourceRecorder::stage_streamed`]), not
+    /// counted here.
     pub unresolved: u64,
 }
 
@@ -210,7 +212,8 @@ enum RowForm {
 }
 
 /// The form of an encoded row, from the length of the msgpack array its
-/// struct is encoded as. `None` for a payload that is not such an array.
+/// struct is encoded as. `None` for a payload that is not an array of 6 or 4
+/// elements.
 fn row_form(payload: &[u8]) -> Option<RowForm> {
     let len = match *payload.first()? {
         b @ 0x90..=0x9f => usize::from(b & 0x0f),
@@ -570,10 +573,13 @@ struct GroupState {
     /// Streamed long rows only: the columns the producer last anchored,
     /// by hash, mapped onto `columns`.
     wire: Option<((u64, u64), Arc<WireColumns>)>,
-    /// Streamed long rows only: each producer key the producer has
-    /// described and that was present in the last row written, with its
-    /// occupant number and labels.
+    /// Streamed long rows only: each producer key resolved to an occupant
+    /// number and its labels, kept while the key is present in the rows
+    /// written.
     keys: HashMap<u64, (u64, Arc<BTreeMap<String, String>>)>,
+    /// Streamed long rows only: labels an occupants row sent for a key not
+    /// yet resolved, resolved by the long row that contains the key.
+    announced: HashMap<u64, BTreeMap<String, String>>,
     /// Long only: the occupant numbers whose labels the occupant stream
     /// already holds.
     described: HashSet<u64>,
@@ -600,9 +606,33 @@ impl GroupState {
     }
 }
 
+/// The keys every column of `schema` carries with one value, storage keys
+/// excepted: what [`LongLayout::of`] counts as the occupant's when a slot's
+/// metrics agree on them.
+fn shared_keys(schema: &GroupSchema) -> BTreeMap<String, String> {
+    let mut all = schema
+        .counters
+        .iter()
+        .chain(&schema.gauges)
+        .chain(&schema.histograms);
+    let Some(first) = all.next() else {
+        return BTreeMap::new();
+    };
+    let mut shared: BTreeMap<String, String> = first
+        .metadata
+        .iter()
+        .filter(|(k, _)| !STORAGE_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for d in all {
+        shared.retain(|k, v| d.metadata.get(k) == Some(v));
+    }
+    shared
+}
+
 /// What makes two occupants of a group the same occupant: its `__uid__`
 /// when it has one, otherwise its labels. The wide and streamed paths both
-/// number occupants by it, so a group that changes form keeps its series.
+/// number occupants by it.
 fn occupant_identity(labels: &BTreeMap<String, String>) -> String {
     match labels.get("__uid__") {
         Some(uid) => format!("uid:{uid}"),
@@ -616,6 +646,12 @@ struct WireColumns {
     counters: Vec<usize>,
     gauges: Vec<usize>,
     histograms: Vec<usize>,
+    /// Keys every column of the row carries with one value that are not
+    /// storage keys. The wide path counts these as the occupant's
+    /// ([`LongLayout::of`]), so the streamed path adds them to each
+    /// occupant's labels before numbering it, and leaves them off the
+    /// columns.
+    shared: BTreeMap<String, String>,
 }
 
 impl GroupState {
@@ -753,19 +789,16 @@ impl SourceRecorder {
                     }
                 }
                 StreamedGroup::Occupants { table, occupants } => {
-                    // Numbered by identity, as the wide path numbers them: a
-                    // key described again with the same labels keeps its
-                    // number, and one described with other labels (a
-                    // restarted producer reusing keys) gets the other
-                    // occupant's.
                     let state = self.groups.entry(table).or_default();
+                    if state.long == Some(false) {
+                        continue;
+                    }
+                    // A key described again is resolved again: its labels
+                    // may now name another occupant (a restarted producer
+                    // reusing keys).
                     for o in occupants {
-                        let next = state.occupants.len() as u64;
-                        let number = *state
-                            .occupants
-                            .entry(occupant_identity(&o.labels))
-                            .or_insert(next);
-                        state.keys.insert(o.occupant, (number, Arc::new(o.labels)));
+                        state.keys.remove(&o.occupant);
+                        state.announced.insert(o.occupant, o.labels);
                     }
                 }
             }
@@ -785,23 +818,32 @@ impl SourceRecorder {
         rows: &mut Vec<DWalRow>,
     ) -> Result<(), Error> {
         let state = self.groups.entry(name.to_string()).or_default();
-        let key = row.window.map(|(_, end)| end).unwrap_or(ts);
-        if state.last_key == Some(key) {
-            return Ok(());
-        }
         if state.long == Some(false) {
             if state.first_warning(WARN_WIDE) {
                 tracing::warn!("group {name} is recorded wide and arrived long; skipped");
             }
             return Ok(());
         }
+        // The columns are taken before the dedup below: the producer sends
+        // them once, and a row skipped as a repeat would otherwise lose them
+        // for the rest of the connection.
         if let Some(schema) = &row.schema {
             if state.wire.as_ref().map(|(h, _)| *h) != Some(row.schema_hash) {
+                let shared = shared_keys(schema);
                 let mut changed = false;
                 let mut map = |kind: usize, list: &[MetricDesc]| -> Vec<usize> {
                     list.iter()
                         .map(|d| {
-                            let (c, added) = state.columns.wire_column(kind, d);
+                            let column = MetricDesc {
+                                name: d.name.clone(),
+                                metadata: d
+                                    .metadata
+                                    .iter()
+                                    .filter(|(k, _)| !shared.contains_key(*k))
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            };
+                            let (c, added) = state.columns.wire_column(kind, &column);
                             changed |= added;
                             c
                         })
@@ -811,12 +853,17 @@ impl SourceRecorder {
                     counters: map(0, &schema.counters),
                     gauges: map(1, &schema.gauges),
                     histograms: map(2, &schema.histograms),
+                    shared,
                 };
                 if changed {
                     state.columns.hash = state.columns.schema.hash();
                 }
                 state.wire = Some((row.schema_hash, Arc::new(wire)));
             }
+        }
+        let key = row.window.map(|(_, end)| end).unwrap_or(ts);
+        if state.last_key == Some(key) {
+            return Ok(());
         }
         let wire = match &state.wire {
             Some((hash, wire)) if *hash == row.schema_hash => Arc::clone(wire),
@@ -840,6 +887,7 @@ impl SourceRecorder {
         let mut first_seen = Vec::new();
         let mut present_keys = HashSet::with_capacity(row.occupants.len());
         for o in row.occupants {
+            present_keys.insert(o.occupant);
             if o.counters.len() != wire.counters.len()
                 || o.gauges.len() != wire.gauges.len()
                 || o.histograms.len() != wire.histograms.len()
@@ -851,7 +899,23 @@ impl SourceRecorder {
                 }
                 continue;
             }
-            let Some((number, labels)) = state.keys.get(&o.occupant).cloned() else {
+            let resolved = match state.keys.get(&o.occupant) {
+                Some(found) => Some(found.clone()),
+                None => state.announced.remove(&o.occupant).map(|mut labels| {
+                    for (k, v) in &wire.shared {
+                        labels.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    let next = state.occupants.len() as u64;
+                    let number = *state
+                        .occupants
+                        .entry(occupant_identity(&labels))
+                        .or_insert(next);
+                    let found = (number, Arc::new(labels));
+                    state.keys.insert(o.occupant, found.clone());
+                    found
+                }),
+            };
+            let Some((number, labels)) = resolved else {
                 if state.first_warning(WARN_LABELS) {
                     tracing::warn!(
                         "group {name}: occupant key {} arrived without labels; skipped \
@@ -868,7 +932,6 @@ impl SourceRecorder {
                 });
             }
             state.seen.entry(number).or_insert(labels);
-            present_keys.insert(o.occupant);
             let mut occ = LongOccupant {
                 occupant: number,
                 counters: vec![None; widths.0],
@@ -889,6 +952,7 @@ impl SourceRecorder {
         // The producer describes a key again whenever it returns after a row
         // without it, so a key absent from this row need not be kept.
         state.keys.retain(|k, _| present_keys.contains(k));
+        state.announced.retain(|k, _| present_keys.contains(k));
         self.write_long(name, row.window, present, first_seen, ts, wall_offset, rows)
     }
 
@@ -1034,16 +1098,19 @@ impl SourceRecorder {
         let long_groups = self.config.long_groups;
         let state = self.groups.entry(g.name.clone()).or_default();
         let key = g.window.map(|w| w.end_ns).unwrap_or(ts);
-        if state.last_key == Some(key) {
-            return Ok(());
-        }
         // A group with no members has no values to record, and its schema
         // must not decide whether the group is long.
         if g.counters.is_empty() && g.gauges.is_empty() && g.histograms.is_empty() {
             state.last_key = Some(key);
             return Ok(());
         }
-        let Some(layout) = state.layout(g, long_groups) else {
+        // The layout is taken before the dedup: a streamed schema arrives
+        // once, and a row skipped as a repeat would otherwise lose it.
+        let layout = state.layout(g, long_groups);
+        if state.last_key == Some(key) {
+            return Ok(());
+        }
+        let Some(layout) = layout else {
             tracing::warn!(
                 "group {} arrived without a schema it has sent before; skipped",
                 g.name
@@ -1322,6 +1389,14 @@ mod row_form_tests {
         .unwrap();
         assert_eq!(row_form(&group), Some(RowForm::Group));
         assert_eq!(row_form(&long), Some(RowForm::Long));
+        // With a schema inside, as the producer splices it on an anchor row.
+        let schema = GroupSchema::default();
+        let anchored_group = wal::encode_wal_group_row_with_schema(&group, &schema).unwrap();
+        let mut anchored = wal::decode_wal_long_row(&long).unwrap();
+        anchored.schema = Some(schema);
+        let anchored_long = wal::encode_wal_long_row(&anchored).unwrap();
+        assert_eq!(row_form(&anchored_group), Some(RowForm::Group));
+        assert_eq!(row_form(&anchored_long), Some(RowForm::Long));
         assert_eq!(row_form(&[]), None);
         assert_eq!(row_form(&[0x93]), None);
     }

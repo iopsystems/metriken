@@ -150,7 +150,7 @@ and the double decode becomes a separate, earlier fix in rezolus.
 
 ## Built (2026-10-01)
 
-Steps 2-6 shipped as metriken #223 (exposition), #224 (archive) and the
+Steps 2-6 are built in metriken #223 (exposition), #224 (archive) and the
 rezolus change that serves and asks for `/metrics/stream?layout=long`. What
 differs from the design below:
 
@@ -172,9 +172,19 @@ differs from the design below:
   this rule closes.
 - **A row's form is read from the row.** A `WalGroupRow` and a `WalLongRow`
   encode as msgpack arrays of 6 and 4 fields, so `StreamDecoder` needs no
-  per-stream state and a group can change form (a scalar registered into a
-  group of counter groups) between rows. A change of form re-sends the
-  row's schema and, for a long row, every occupant.
+  per-stream state to tell the forms apart, and a group can change form (a
+  scalar registered into a group of counter groups) between rows. A change
+  of form re-sends the row's schema and, for a long row, every occupant.
+- **The writer gives the occupant the keys the wide path would.** A key
+  that is not a storage key and has one value across all of a long row's
+  columns (`op` on a one-metric group) is moved from the columns to each
+  occupant's labels before the occupant is numbered, which is how
+  `LongLayout::of` splits a wide schema. Without it a group that changed
+  form kept the same values under two numbers. A second review found this,
+  and that columns sent on a row the writer skips as a repeat were lost
+  (both paths now take a row's schema before the dedup), and that an
+  occupant skipped once for a width mismatch lost its key;
+  `metriken-archive/tests/stream_edges.rs` covers all three.
 - **Every slotted group travels long**, per the owner's decision
   (2026-10-01): any group whose metrics are all counter groups or gauge
   groups, per-CPU and per-device included. Measured cost: those groups are

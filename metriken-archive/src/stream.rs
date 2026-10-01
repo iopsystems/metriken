@@ -7,8 +7,7 @@
 //! rows are encoded [`WalGroupRow`]s, [`WalLongRow`]s, and [`Occupant`] rows
 //! on `<group>/occupants`. Moved from rezolus's agent
 //! (`frames.rs`); the transport (an HTTP route, its timer, which groups a
-//! subscriber asked for) stays with the caller. Phase 5b of
-//! `docs/journal/2026-09-29-members-that-come-and-go.md`.
+//! subscriber asked for) stays with the caller.
 //!
 //! # No identity index
 //!
@@ -47,7 +46,8 @@
 //! keyed by the producer's occupant keys, whose schema is the group's metric
 //! columns and changes only when its metrics do. Before it, on
 //! `<group>/occupants`, the subscription is sent an [`Occupant`] (key and
-//! labels) for each occupant that was not in the group's previous row: new
+//! labels) for each occupant that was not in the previous row of this group
+//! sent to this subscription: new
 //! occupants, and every occupant on the subscription's first row. A
 //! departure is not sent; the occupant is absent from later rows. A group
 //! can change form between rows; the subscriber reads the form from each
