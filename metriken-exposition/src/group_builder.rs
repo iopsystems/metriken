@@ -1134,8 +1134,10 @@ pub struct LongGroupSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LongMember {
     /// Identifies the occupant within its group for the life of the
-    /// process. For a slot with a [`UID_LABEL`] it is the uid's sixteen hex
-    /// digits read as a number; otherwise a hash of its labels.
+    /// builder. Keys are assigned from 0 in the order occupants first
+    /// appear, and a slot gets a new one when its occupant changes: a new
+    /// [`UID_LABEL`], or new labels on a slot without one. Small numbers keep
+    /// a long row short on the wire.
     ///
     /// [`UID_LABEL`]: metriken::group::UID_LABEL
     pub key: u64,
@@ -1160,6 +1162,8 @@ struct LongState {
     versions: FastMap<usize, u64>,
     /// The occupant each slot held at the last build.
     slots: FastMap<usize, SlotOccupant>,
+    /// The key the group's next new occupant gets.
+    next_key: u64,
 }
 
 #[derive(Clone)]
@@ -1205,13 +1209,16 @@ impl<G: ReadGuard> LongAcc<'_, G> {
         if let Some(&pos) = self.position.get(&idx) {
             return pos;
         }
-        let cached = self.state.slots.get(&idx);
+        let LongState {
+            slots, next_key, ..
+        } = &mut self.state;
+        let cached = slots.get(&idx);
         let occupant = match cached {
             Some(c) if unchanged => c.clone(),
             _ => {
                 let mut resolved = None;
-                with_metadata(&mut |m| resolved = Some(slot_occupant(idx, m, cached)));
-                resolved.unwrap_or_else(|| slot_occupant(idx, None, cached))
+                with_metadata(&mut |m| resolved = Some(slot_occupant(idx, m, cached, next_key)));
+                resolved.unwrap_or_else(|| slot_occupant(idx, None, cached, next_key))
             }
         };
         self.state.slots.insert(idx, occupant.clone());
@@ -1231,11 +1238,13 @@ impl<G: ReadGuard> LongAcc<'_, G> {
 }
 
 /// Slot `idx`'s occupant from its metadata `m`: `cached` when `m` describes
-/// the same occupant, otherwise one built from `m`.
+/// the same occupant, otherwise one built from `m` with the key `next_key`,
+/// which is then advanced.
 fn slot_occupant(
     idx: usize,
     m: Option<&HashMap<String, String>>,
     cached: Option<&SlotOccupant>,
+    next_key: &mut u64,
 ) -> SlotOccupant {
     // A uid names one assignment, so equal uids are the same occupant.
     let uid = m.and_then(|m| m.get(metriken::group::UID_LABEL));
@@ -1265,33 +1274,12 @@ fn slot_occupant(
             labels.insert(k.clone(), v.clone());
         }
     }
-    let key = labels
-        .get(metriken::group::UID_LABEL)
-        .filter(|uid| uid.len() == 16)
-        .and_then(|uid| u64::from_str_radix(uid, 16).ok())
-        .unwrap_or_else(|| labels_key(&labels));
+    let key = *next_key;
+    *next_key += 1;
     SlotOccupant {
         key,
         labels: Arc::new(labels),
     }
-}
-
-/// FNV-1a-64 over each label's key and value, with separators.
-fn labels_key(labels: &BTreeMap<String, String>) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut fold = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    for (k, v) in labels {
-        fold(k.as_bytes());
-        fold(&[0x1f]);
-        fold(v.as_bytes());
-        fold(&[0x1e]);
-    }
-    h
 }
 
 enum WindowState<G> {

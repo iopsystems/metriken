@@ -289,10 +289,10 @@ fn a_zero_counter_is_not_an_occupant_when_membership_follows_values() {
 static CHURN_CPU: metriken::CounterGroup = metriken::CounterGroup::new(16);
 static CHURN: SlotIdentity = SlotIdentity::new(&[&CHURN_CPU]);
 
-/// An occupant's key is its uid read as a number. A departure and an
-/// arrival keep the group's columns and the other occupants' labels as they
-/// were, and give the new occupant a new key, even in a reused slot with the
-/// same labels.
+/// Keys are assigned from 0 in the order occupants appear. A departure and
+/// an arrival keep the group's columns and the other occupants' labels and
+/// keys as they were, and give the new occupant the next key, even in a
+/// reused slot with the same labels.
 #[test]
 fn a_change_of_occupant_keeps_the_columns_and_the_other_occupants() {
     let _one = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -305,10 +305,10 @@ fn a_change_of_occupant_keeps_the_columns_and_the_other_occupants() {
     let before = stream(&mut b);
     let g0 = long(&before, "slots_churn").clone();
     let rebuilds = b.rebuilds();
-    let key = |uid: &str| u64::from_str_radix(uid, 16).unwrap();
-    assert_eq!(g0.occupants[0].key, key(&stay));
-    assert_eq!(g0.occupants[1].key, key(&go));
+    assert_eq!(g0.occupants[0].key, 0);
+    assert_eq!(g0.occupants[1].key, 1);
     assert_eq!(g0.occupants[0].labels[UID_LABEL], stay);
+    assert_eq!(g0.occupants[1].labels[UID_LABEL], go);
 
     CHURN.release(2);
     let back = CHURN.assign(2, labels(&[("comm", "go")]));
@@ -325,7 +325,8 @@ fn a_change_of_occupant_keeps_the_columns_and_the_other_occupants() {
     );
     assert_eq!(g1.occupants[0].key, g0.occupants[0].key);
     assert_ne!(back, go);
-    assert_eq!(g1.occupants[1].key, key(&back), "a new occupant, a new key");
+    assert_eq!(g1.occupants[1].key, 2, "a new occupant, the next key");
+    assert_eq!(g1.occupants[1].labels[UID_LABEL], back);
     assert_eq!(g1.occupants[1].counters, vec![Some(3)]);
 
     CHURN.release(1);
