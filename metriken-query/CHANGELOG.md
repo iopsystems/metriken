@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- A segment the segmented reader opens is cached under an id derived from
-  its bytes (XXH3-64), not a fresh id per open, so a reader reopened over the
+- A segment the segmented reader opens to read rows is cached under an id
+  derived from its bytes (XXH3-128 with a per-process seed), not a fresh id
+  per open, so a reader reopened over the
   same segments on the same `BufferPool` finds the blocks the previous reader
   decoded.
 

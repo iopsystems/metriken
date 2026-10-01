@@ -204,10 +204,9 @@ impl SegmentedParquetReader {
                 catalog.push(SegmentCatalog::GONE);
                 continue;
             };
-            let seg = ParquetReader::builder()
-                .pool(Arc::clone(&pool))
-                .content_keyed_bytes(bytes)
-                .build()?;
+            // Footer only: nothing is decoded into the pool here, so the
+            // segment needs no content-derived id.
+            let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
             check_histogram_configs(idx, &seg)?;
             // Each column contributes every label set it can present as —
             // one, unless a relabelling says otherwise.
