@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A query range's end, given in `f64` seconds, could convert to a few hundred
+  nanoseconds before a sample at that time, leaving it out; with grid rates
+  that dropped the last grid point. The end is now rounded and widened by
+  1 µs; the start is rounded.
+
 ## [0.33.4] - 2026-09-30
 
 ### Changed

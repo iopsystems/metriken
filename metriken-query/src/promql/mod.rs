@@ -163,6 +163,26 @@ pub enum QueryResult {
     HistogramHeatmap { result: HistogramHeatmapResult },
 }
 
+/// How far past a query range's end samples are still read, in nanoseconds.
+///
+/// Ranges arrive as `f64` seconds. Near the current epoch (about 1.8e9 s) an
+/// `f64` resolves about 240 ns, so an end computed from a sample's own time
+/// can convert to a few hundred nanoseconds before that sample and leave it
+/// out. 1 µs covers that error until the 2100s.
+pub(crate) const RANGE_END_SLACK_NS: u64 = 1_000;
+
+/// A query range's start in nanoseconds, rounded to the nearest. No slack:
+/// a start on a step boundary must stay on it.
+pub(crate) fn range_start_ns(start: f64) -> u64 {
+    (start * 1e9).round() as u64
+}
+
+/// A query range's end in nanoseconds, rounded and then widened by
+/// [`RANGE_END_SLACK_NS`] so a sample at the end is read.
+pub(crate) fn range_end_ns(end: f64) -> u64 {
+    ((end * 1e9).round() as u64).saturating_add(RANGE_END_SLACK_NS)
+}
+
 /// The PromQL query engine, backed by any `DataSource`.
 pub(crate) struct QueryEngine {
     source: Arc<dyn DataSource>,
@@ -611,8 +631,8 @@ impl QueryEngine {
         let (metric_selector, stride_ns) = parse_optional_stride(remaining)?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let start_ns = (start * 1e9) as u64;
-        let end_ns = (end * 1e9) as u64;
+        let start_ns = range_start_ns(start);
+        let end_ns = range_end_ns(end);
         let stream = self
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
@@ -637,8 +657,8 @@ impl QueryEngine {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let start_ns = (start * 1e9) as u64;
-        let end_ns = (end * 1e9) as u64;
+        let start_ns = range_start_ns(start);
+        let end_ns = range_end_ns(end);
         let stream = self
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
@@ -667,8 +687,8 @@ impl QueryEngine {
         }
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let start_ns = (start * 1e9) as u64;
-        let end_ns = (end * 1e9) as u64;
+        let start_ns = range_start_ns(start);
+        let end_ns = range_end_ns(end);
         let stream = self
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)
@@ -693,8 +713,8 @@ impl QueryEngine {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
-        let start_ns = (start * 1e9) as u64;
-        let end_ns = (end * 1e9) as u64;
+        let start_ns = range_start_ns(start);
+        let end_ns = range_end_ns(end);
         let stream = self
             .source
             .histogram_stream(&metric_name, &labels, start_ns, end_ns)

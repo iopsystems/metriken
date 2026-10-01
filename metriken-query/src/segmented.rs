@@ -2061,6 +2061,46 @@ mod tests {
         assert_eq!(r2.counter_labels("cpu_cycles").len(), 2);
     }
 
+    /// A query whose range ends at the last sample's time, given in `f64`
+    /// seconds, still sees that sample. The timestamps are a real recording's:
+    /// `1790832064.022395` seconds converts back to 120 ns before the last
+    /// sample, which dropped it, and with it the grid point at 064.0 that it
+    /// brackets; `rate()` then returned nothing at a 1 s step.
+    #[test]
+    fn a_range_ending_at_the_last_sample_includes_it() {
+        use crate::MetricsSource;
+        let first: u64 = 1_790_832_062_063_539_000;
+        let last: u64 = 1_790_832_064_022_395_000;
+        let mut rows: Vec<(u64, u64)> =
+            (0..19).map(|k| (first + k * 103_000_000, 10 * k)).collect();
+        rows.push((last, 190));
+        let round_trip = ((last as f64 / 1e9) * 1e9) as u64;
+        assert!(round_trip < last, "the fixture reproduces the rounding");
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_cycles", &[], &rows)],
+            pool,
+        )
+        .unwrap();
+        let result = r
+            .query_range(
+                "rate(cpu_cycles[1s])",
+                first as f64 / 1e9,
+                last as f64 / 1e9,
+                1.0,
+            )
+            .unwrap();
+        let crate::QueryResult::Matrix { result } = result else {
+            panic!("a range query gives a matrix");
+        };
+        let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            times,
+            vec![1_790_832_064.0],
+            "the point at 064.0 is emitted"
+        );
+    }
+
     /// A reader reopened over the same segments, on the same pool, reads the
     /// blocks the first one decoded: the blocks are keyed by the segment's
     /// bytes, not by which open read them. Segments with different bytes
