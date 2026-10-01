@@ -45,8 +45,8 @@
 //!
 //! [`GroupBuilder::build_stream`] emits a group whose metrics are all counter
 //! groups or gauge groups as a [`LongGroupSnapshot`]: the metrics as columns,
-//! and one [`LongMember`] per slot with a value, carrying the slot's labels
-//! and a key that identifies its occupant. Its columns change when the
+//! and one [`LongMember`] per member slot, carrying the slot's labels and a
+//! key that names its occupant. Its columns change when the
 //! group's metrics do, and a slot's labels when its occupant does, so a
 //! change of occupant does not rebuild the group's schema.
 
@@ -836,16 +836,18 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
     /// group in the long form.
     ///
     /// A group is long when every metric routed to it is a counter group or
-    /// a gauge group and `extra` does not name it. Each slot that has a value
-    /// is an occupant ([`LongMember`]) holding one value per metric. Any
+    /// a gauge group and `extra` does not name it. Each member slot is an
+    /// occupant ([`LongMember`]) holding one value per metric: every walked
+    /// slot under registered membership, a slot with a value under
+    /// [`Membership::Present`]. Any
     /// other group is a [`GroupSnapshot`], built as
     /// [`build_groups`](Self::build_groups) builds it.
     ///
     /// A long group's columns ([`LongGroupSnapshot::columns`]) are built
     /// when its set of metrics changes. An occupant's labels are built when
-    /// its slot gets a new occupant, or, in a group of
-    /// [`Membership::Slots`] metrics, when a slot returns after a build in
-    /// which it had no value. A change of occupant costs that slot's labels,
+    /// its slot gets a new occupant, or, in a group with a
+    /// [`Membership::Slots`] metric, when a slot returns after a build in
+    /// which it carried no slot metadata. A change of occupant costs that slot's labels,
     /// not the group's schema.
     pub fn build_stream(&mut self, extra: Vec<ExtraGroup>) -> Vec<StreamGroup> {
         let metrics = metriken::metrics();
@@ -1010,8 +1012,8 @@ fn build_long<R: Router, N: MemberNames>(
             *rebuilds += 1;
         }
         acc.state.versions = acc.versions.into_iter().collect();
-        // A slot of a slot-metadata group that held no value this build is
-        // forgotten: its next occupant has a new uid, and keeping every slot
+        // A slot of a group with a slot-metadata metric that was not walked
+        // this build is forgotten: its next occupant has a new uid, and keeping every slot
         // ever seen would grow with every PID. Any other group keeps it, so
         // a slot that reads nothing for a build (a counter at zero under
         // value-derived membership) keeps its key when it returns.
@@ -1137,27 +1139,29 @@ pub struct LongGroupSnapshot {
     /// order: the metric's metadata, with no `id` and no slot labels. It has
     /// no histograms.
     pub columns: Arc<GroupSchema>,
-    /// The occupants that had a value, in slot order.
+    /// The member slots' occupants, in slot order.
     pub occupants: Vec<LongMember>,
 }
 
 /// One occupant of a [`LongGroupSnapshot`] and its values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LongMember {
-    /// Identifies the occupant within its group for the life of the
-    /// builder. Keys are assigned from 0 in the order occupants first
-    /// appear, and a slot gets a new one when its occupant changes: a new
-    /// [`UID_LABEL`], new labels on a slot without one, or, in a group of
-    /// [`Membership::Slots`] metrics, a return after a build in which the
-    /// slot had no value. Small numbers keep a long row short on the wire.
+    /// Names one occupant within its group for the life of the builder; an
+    /// occupant can receive more than one key. Keys are assigned from 0 in
+    /// the order occupants first appear, and a slot gets a new one when its
+    /// occupant changes: a new [`UID_LABEL`], new labels on a slot without
+    /// one, or, in a group with a [`Membership::Slots`] metric, a return
+    /// after a build in which the slot carried no slot metadata. Small
+    /// numbers keep a long row short on the wire.
     ///
     /// [`UID_LABEL`]: metriken::group::UID_LABEL
     pub key: u64,
     /// `id` (the slot) and the slot's metadata: the labels a wide member
     /// carries beyond its metric's. Taken from the first of the group's
-    /// metrics, in registry order, that has a value for the slot; a group
-    /// whose metrics carry different metadata for one slot shows only that
-    /// metric's.
+    /// metrics, in registry order, that walks the slot this build, or the
+    /// labels cached from the last build when that metric's metadata
+    /// version is unchanged; a group whose metrics carry different metadata
+    /// for one slot shows only one metric's.
     pub labels: Arc<BTreeMap<String, String>>,
     /// One per counter column, `None` where the metric has no value.
     pub counters: Vec<Option<u64>>,
