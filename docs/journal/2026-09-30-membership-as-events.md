@@ -1,6 +1,6 @@
 # Membership as events: slot groups on the stream in the archive's long form
 
-**Status:** OPEN — design, nothing built. Phase 5d of
+**Status:** BUILT, GO (2026-10-01) — awaiting release. Phase 5d of
 [the high-cardinality stack](2026-09-28-high-cardinality-stack.md), after
 [members that come and go](2026-09-29-members-that-come-and-go.md).
 
@@ -147,6 +147,89 @@ and the double decode becomes a separate, earlier fix in rezolus.
   reader that reopens every second repeated it every second, so rezolus
   reopens with logging off. A reader option saying the archive is live, or
   wording that covers both cases, would let a caller keep the warning.
+
+## Built (2026-10-01)
+
+Steps 2-6 shipped as metriken #223 (exposition), #224 (archive) and the
+rezolus change that serves and asks for `/metrics/stream?layout=long`. What
+differs from the design below:
+
+- **Producer keys are dense per group, not the assignment's generation.**
+  `GroupBuilder` numbers occupants from 0 per group as they appear; a slot
+  gets the next number when its occupant changes. The first build used the
+  `__uid__` read as a number, or a label hash for slots without one: nine
+  bytes of msgpack per occupant per row, about 7.6 KB per tick for the
+  per-task group on `delta`. Step 3 (expose a generation from
+  `SlotIdentity`) was therefore not needed; metriken and metriken-core are
+  unchanged.
+- **Keys live for one builder, so the writer numbers occupants by
+  identity.** An occupants row maps its key to an archive number through
+  the occupant's identity (`__uid__`, else its labels), the same identity
+  the wide path numbers by (`LongLayout::of`). A reconnect, a restarted
+  producer whose keys start again from 0, and a group that changes form
+  keep each occupant's series. A review found the first version gave a
+  restarted producer's new occupants the old ones' labels; that is the case
+  this rule closes.
+- **A row's form is read from the row.** A `WalGroupRow` and a `WalLongRow`
+  encode as msgpack arrays of 6 and 4 fields, so `StreamDecoder` needs no
+  per-stream state and a group can change form (a scalar registered into a
+  group of counter groups) between rows. A change of form re-sends the
+  row's schema and, for a long row, every occupant.
+- **Every slotted group travels long**, per the owner's decision
+  (2026-10-01): any group whose metrics are all counter groups or gauge
+  groups, per-CPU and per-device included. Measured cost: those groups are
+  10-20% larger long than wide (softirq time 9.3 KB/s wide, 10.7 KB/s long,
+  at 100 ms), small next to the per-task group's saving.
+- **The recorder accepts an agent that serves only the wide layout**
+  instead of refusing it. The decoder reads both, and the recorder logs that
+  the agent serves only the wide layout.
+- **A value-derived slot keeps its occupant across a build without a
+  value.** Only groups of `Membership::Slots` metrics forget an absent slot.
+- **The agent builds the wide snapshot only when something reads it.** A
+  pass's wide snapshot and its long stream rows are each built on first
+  request, so an agent that is only streamed long never builds the wide
+  schema.
+
+### GO / NO-GO, measured on `delta`
+
+32 cores, Debian 13, kernel 6.12, per-thread series on, 16 short `awk` loops
+at a time throughout. Base is rezolus main (wide stream, step 1b included);
+"long" is this phase. One agent per recorder, interleaved windows of 180 s.
+
+1. **Same answers: GO.** `metriken-archive/tests/stream_long.rs` records one
+   registry both ways over 30 ticks: a `SlotIdentity` group with a stamped
+   window, a fixed per-CPU group, a value-derived group with a slot reading
+   zero for a tick, a mixed group, and a producer restarted at tick 15 with
+   keys starting from 0. Ten queries answer identically, finalized and from
+   the live tail. The writer gate's 213-query set was not rerun.
+2. **Wire: GO.** Stream bytes per second, both layouts subscribed to one
+   agent at once under churn:
+
+   | interval | wide | long | ratio | per-task group, wide → long |
+   |---|---|---|---|---|
+   | 1 s | 263 KB/s | 61.3 KB/s | 4.3x | 166 KB/s → 11.2 KB/s |
+   | 100 ms | 1.90 MB/s | 555 KB/s | 3.4x | 1.40 MB/s → 86 KB/s |
+
+   What remains of the long stream is mostly histogram groups
+   (`syscall_latency` 106 KB/s at 100 ms), which are the same in both
+   layouts. An earlier probe at 100 ms read 1.15x; its script waited on the
+   churn loop before starting the 100 ms pass, so that pass ran without
+   churn, and it predates dense keys.
+3. **Recorder CPU: GO.** At 10 Hz, 15.3 s and 15.8 s (base) against 9.4 s
+   and 8.1 s (long), 39-49% less; at 1 Hz 1.8 s against 0.9-1.0 s. The
+   first run of windows (before dense keys) gave the same split: 15.5 and
+   18.0 s against 8.2 and 8.6 s.
+4. **Agent CPU: GO.** At 10 Hz 10.9 s and 11.6 s (base) against 7.1 s and
+   6.9 s (long), 35-40% less; at 1 Hz 1.53 s against 1.00 s. A
+   membership-change tick of `build_stream` is 1.5-1.9x an unchanged one
+   (2,500 occupants, 16 in and 16 out; `metriken-exposition/tests/stream_cost.rs`),
+   against 25-80x for the wide build.
+
+One window of the second run is unexplained: the long recorder exited 1 in
+its first 1 Hz window and its log was overwritten by the next window. Five
+repetitions of that window's conditions (a fresh agent, recording 10 s after
+start, under churn) all exited 0. Reopen if a recorder exits 1 against a
+6.0 agent without a refusal in its log.
 
 ## Design
 
