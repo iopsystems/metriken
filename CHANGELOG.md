@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-archive 0.3.2
+
+- **Added:** the long form on the replication stream. `EncodedLongGroup`
+  (and `EncodedStreamGroup` over `GroupBuilder::build_stream`'s groups)
+  carries a slot group as a `WalLongRow` keyed by the producer's occupant
+  keys, whose schema is the group's columns. `FrameProducer::interval`
+  sends, before each long row, an `Occupant` row on `<group>/occupants` for
+  every occupant the subscription was not sent in that group's previous
+  row. `StreamRow::occupants` (defaulted to `None`) is what marks a row as
+  long.
+- **Added:** `StreamDecoder` turns a stream's rows back into
+  `StreamedGroup`s, and `SourceRecorder::stage_streamed` writes them: a
+  long row's columns are mapped onto the group's long columns once per
+  columns hash, and each producer key gets an occupant number the first
+  time it is present, with the labels its occupant row gave it. A reconnect
+  that describes live occupants again does not number them again. Recorded
+  over the long stream, an archive answers queries as one recorded from
+  wide snapshots of the same ticks (`tests/stream_long.rs`).
+
 ### metriken-exposition 0.21.4
 
 - **Added:** `GroupBuilder::build_stream`, which emits each group whose

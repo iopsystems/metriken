@@ -11,6 +11,12 @@
 //! - any other group is one row per tick, as a `WalGroupRow`;
 //! - [`Encoder`] turns each stream's WAL rows into its segment.
 //!
+//! A pass taken off a replication stream ([`crate::stream`]) is staged with
+//! [`SourceRecorder::stage_streamed`], its rows decoded by a
+//! [`StreamDecoder`]. A slot group arrives long, keyed by the producer's
+//! occupant keys, and is written long with those keys mapped to occupant
+//! numbers; no full member list is laid out.
+//!
 //! A V1/V2 snapshot (from a producer older than acquisition groups) is
 //! written one table per `sampler` label, each metric with its own window,
 //! as `WalCell` rows.
@@ -82,6 +88,136 @@ pub struct ArchiveWriter {
 pub struct Staged {
     source_id: i64,
     rows: Vec<DWalRow>,
+}
+
+/// One row of a pass taken off a replication stream (see
+/// [`crate::stream`]), for [`SourceRecorder::stage_streamed`].
+pub enum StreamedGroup {
+    /// A group row, as a snapshot's group: staged as
+    /// [`SourceRecorder::stage`] stages it.
+    Wide(GroupSnapshot),
+    /// A long row of the stream named `name`, keyed by the producer's
+    /// occupant keys. Its schema is the group's columns, present on the row
+    /// that anchors them.
+    Long { name: String, row: WalLongRow },
+    /// The occupants first described on `<table>/occupants`: each key's
+    /// labels, for the long rows of `table` that follow.
+    Occupants {
+        table: String,
+        occupants: Vec<Occupant>,
+    },
+}
+
+/// Turns the rows of a replication stream's frames back into
+/// [`StreamedGroup`]s, for [`SourceRecorder::stage_streamed`]. One per
+/// connection: the schemas it holds are the ones this connection was sent.
+///
+/// A row on `<table>/occupants` is an [`Occupants`](StreamedGroup::Occupants)
+/// row, and marks `table` as long: the first row of a long group always
+/// describes its occupants. Any other row of a long table is a
+/// [`WalLongRow`]. Any other row is a [`WalGroupRow`], whose schema this
+/// holds from the row that carried it; a row whose schema this connection
+/// was never sent is skipped and counted in [`unresolved`](Self::unresolved).
+///
+/// [`WalGroupRow`]: metriken_segment::wal::WalGroupRow
+#[derive(Default)]
+pub struct StreamDecoder {
+    schemas: HashMap<String, ((u64, u64), Arc<metriken_exposition::GroupSchema>)>,
+    long: HashSet<String>,
+    /// Group rows skipped because their schema was never sent.
+    pub unresolved: u64,
+}
+
+impl StreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One pass's rows, in the order they arrived. A payload that does not
+    /// decode is an error naming its stream.
+    pub fn decode(
+        &mut self,
+        rows: impl IntoIterator<Item = DWalRow>,
+    ) -> Result<Vec<StreamedGroup>, String> {
+        let mut out = Vec::new();
+        for row in rows {
+            let stream = row.stream;
+            if let Some(table) = occupants::table_of(&stream) {
+                self.long.insert(table.to_string());
+                out.push(StreamedGroup::Occupants {
+                    table: table.to_string(),
+                    occupants: occupants::decode_wal_row(&row.row)
+                        .map_err(|e| format!("stream {stream}: {e}"))?,
+                });
+                continue;
+            }
+            if self.long.contains(&stream) {
+                let decoded = wal::decode_wal_long_row(&row.row)
+                    .map_err(|e| format!("stream {stream}: {e}"))?;
+                out.push(StreamedGroup::Long {
+                    name: stream,
+                    row: decoded,
+                });
+                continue;
+            }
+            let decoded =
+                wal::decode_wal_group_row(&row.row).map_err(|e| format!("stream {stream}: {e}"))?;
+            let arrived = decoded
+                .schema
+                .as_ref()
+                .map(|s| Arc::new(exposition_schema(s)));
+            if let Some(schema) = &arrived {
+                self.schemas
+                    .insert(stream.clone(), (decoded.schema_hash, Arc::clone(schema)));
+            }
+            match self.schemas.get(&stream) {
+                Some((hash, _)) if *hash == decoded.schema_hash => {}
+                _ => {
+                    self.unresolved += 1;
+                    continue;
+                }
+            }
+            let histograms = decoded
+                .histograms
+                .into_iter()
+                .map(|h| {
+                    h.map(|(gp, mvp, buckets)| {
+                        histogram::Histogram::from_buckets(gp, mvp, buckets)
+                            .map_err(|e| format!("stream {stream}: histogram: {e}"))
+                    })
+                    .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            out.push(StreamedGroup::Wide(GroupSnapshot {
+                name: stream,
+                schema_hash: decoded.schema_hash,
+                schema: arrived,
+                window: decoded.window.map(|(b, e)| metriken::Window::new(b, e)),
+                counters: decoded.counters,
+                gauges: decoded.gauges,
+                histograms,
+            }));
+        }
+        Ok(out)
+    }
+}
+
+/// A segment-format schema as metriken-exposition's, which a
+/// [`GroupSnapshot`] carries.
+fn exposition_schema(s: &GroupSchema) -> metriken_exposition::GroupSchema {
+    let convert = |list: &[MetricDesc]| {
+        list.iter()
+            .map(|d| metriken_exposition::MetricDesc {
+                name: d.name.clone(),
+                metadata: d.metadata.clone(),
+            })
+            .collect()
+    };
+    metriken_exposition::GroupSchema {
+        counters: convert(&s.counters),
+        gauges: convert(&s.gauges),
+        histograms: convert(&s.histograms),
+    }
 }
 
 impl ArchiveWriter {
@@ -184,6 +320,47 @@ struct LongColumns {
     /// Per member kind, column index by the column's fixed metadata.
     index: [HashMap<String, usize>; 3],
     names: HashSet<String>,
+}
+
+impl LongColumns {
+    /// The column for a streamed long row's column `d` of member `kind`
+    /// (0 counters, 1 gauges, 2 histograms), added if new. Every key of a
+    /// streamed column describes the metric; the occupant's labels arrive
+    /// separately. Returns the index and whether it was added.
+    fn wire_column(&mut self, kind: usize, d: &MetricDesc) -> (usize, bool) {
+        let mut key = String::new();
+        for (k, v) in &d.metadata {
+            key.push_str(k);
+            key.push('\u{1f}');
+            key.push_str(v);
+            key.push('\u{1e}');
+        }
+        if let Some(&c) = self.index[kind].get(&key) {
+            return (c, false);
+        }
+        let base = d
+            .metadata
+            .get("metric")
+            .cloned()
+            .unwrap_or_else(|| d.name.clone());
+        let mut name = base.clone();
+        let mut n = 1;
+        while !self.names.insert(name.clone()) {
+            name = format!("{base}#{n}");
+            n += 1;
+        }
+        let target = match kind {
+            0 => &mut self.schema.counters,
+            1 => &mut self.schema.gauges,
+            _ => &mut self.schema.histograms,
+        };
+        target.push(MetricDesc {
+            name,
+            metadata: d.metadata.clone(),
+        });
+        self.index[kind].insert(key, target.len() - 1);
+        (target.len() - 1, true)
+    }
 }
 
 /// Keys that describe the metric, never an occupant.
@@ -367,6 +544,24 @@ struct GroupState {
     /// Long only: occupants seen since the last restatement, with labels.
     seen: BTreeMap<u64, Arc<BTreeMap<String, String>>>,
     last_restated: Option<u64>,
+    /// Streamed long rows only: the columns the producer last anchored,
+    /// by hash, mapped onto `columns`.
+    wire: Option<((u64, u64), Arc<WireColumns>)>,
+    /// Streamed long rows only: occupant number by the producer's key.
+    keys: HashMap<u64, u64>,
+    /// Streamed long rows only: labels sent for keys with no number yet.
+    pending: HashMap<u64, Arc<BTreeMap<String, String>>>,
+    /// Streamed long rows only: whether a row with no anchor, or an
+    /// occupant with no labels, has been warned about.
+    warned: bool,
+}
+
+/// A streamed long row's columns, mapped onto the group's [`LongColumns`]:
+/// per member kind, the writer's column for each of the row's.
+struct WireColumns {
+    counters: Vec<usize>,
+    gauges: Vec<usize>,
+    histograms: Vec<usize>,
 }
 
 impl GroupState {
@@ -468,6 +663,176 @@ impl SourceRecorder {
             source_id: self.writer.source_id(),
             rows,
         })
+    }
+
+    /// One pass off a replication stream, in the order its rows arrived.
+    ///
+    /// A long row is written long, its occupant keys mapped to this archive's
+    /// occupant numbers. A key gets a number the first time it is present in
+    /// a long row, with the labels an [`Occupants`](StreamedGroup::Occupants)
+    /// row gave it, and keeps that number for the recording, so labels sent
+    /// again (on a reconnect) are not a new occupant. An occupant whose labels
+    /// were never sent, or a row whose columns were never anchored, is
+    /// skipped with one warning per group.
+    pub fn stage_streamed(
+        &mut self,
+        groups: Vec<StreamedGroup>,
+        ts: u64,
+        wall_offset: i64,
+    ) -> Result<Staged, Error> {
+        let mut rows = Vec::new();
+        let mut done: HashSet<String> = HashSet::new();
+        for g in groups {
+            match g {
+                StreamedGroup::Wide(g) => {
+                    if done.insert(g.name.clone()) {
+                        self.stage_group(&g, ts, wall_offset, &mut rows)?;
+                    }
+                }
+                StreamedGroup::Long { name, row } => {
+                    if done.insert(name.clone()) {
+                        self.stage_long_row(&name, row, ts, wall_offset, &mut rows)?;
+                    }
+                }
+                StreamedGroup::Occupants { table, occupants } => {
+                    let state = self.groups.entry(table).or_default();
+                    for o in occupants {
+                        if !state.keys.contains_key(&o.occupant) {
+                            state.pending.insert(o.occupant, Arc::new(o.labels));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Staged {
+            source_id: self.writer.source_id(),
+            rows,
+        })
+    }
+
+    fn stage_long_row(
+        &mut self,
+        name: &str,
+        row: WalLongRow,
+        ts: u64,
+        wall_offset: i64,
+        rows: &mut Vec<DWalRow>,
+    ) -> Result<(), Error> {
+        let state = self.groups.entry(name.to_string()).or_default();
+        let key = row.window.map(|(_, end)| end).unwrap_or(ts);
+        if state.last_key == Some(key) {
+            return Ok(());
+        }
+        if state.long == Some(false) {
+            if !state.warned {
+                tracing::warn!("group {name} is recorded wide and arrived long; skipped");
+                state.warned = true;
+            }
+            return Ok(());
+        }
+        if let Some(schema) = &row.schema {
+            if state.wire.as_ref().map(|(h, _)| *h) != Some(row.schema_hash) {
+                let mut changed = false;
+                let mut map = |kind: usize, list: &[MetricDesc]| -> Vec<usize> {
+                    list.iter()
+                        .map(|d| {
+                            let (c, added) = state.columns.wire_column(kind, d);
+                            changed |= added;
+                            c
+                        })
+                        .collect()
+                };
+                let wire = WireColumns {
+                    counters: map(0, &schema.counters),
+                    gauges: map(1, &schema.gauges),
+                    histograms: map(2, &schema.histograms),
+                };
+                if changed {
+                    state.columns.hash = state.columns.schema.hash();
+                }
+                state.wire = Some((row.schema_hash, Arc::new(wire)));
+            }
+        }
+        let wire = match &state.wire {
+            Some((hash, wire)) if *hash == row.schema_hash => Arc::clone(wire),
+            _ => {
+                if !state.warned {
+                    tracing::warn!(
+                        "group {name}: a long row arrived before its columns; skipped (warned once)"
+                    );
+                    state.warned = true;
+                }
+                return Ok(());
+            }
+        };
+        state.long = Some(true);
+        state.last_key = Some(key);
+        let widths = (
+            state.columns.schema.counters.len(),
+            state.columns.schema.gauges.len(),
+            state.columns.schema.histograms.len(),
+        );
+        let mut present = Vec::with_capacity(row.occupants.len());
+        let mut first_seen = Vec::new();
+        for o in row.occupants {
+            if o.counters.len() != wire.counters.len()
+                || o.gauges.len() != wire.gauges.len()
+                || o.histograms.len() != wire.histograms.len()
+            {
+                if !state.warned {
+                    tracing::warn!(
+                        "group {name}: an occupant does not match its columns; skipped (warned once)"
+                    );
+                    state.warned = true;
+                }
+                continue;
+            }
+            let number = match state.keys.get(&o.occupant) {
+                Some(&n) => n,
+                None => {
+                    let Some(labels) = state.pending.remove(&o.occupant) else {
+                        if !state.warned {
+                            tracing::warn!(
+                                "group {name}: occupant {} arrived without labels; skipped \
+                                 (warned once)",
+                                o.occupant
+                            );
+                            state.warned = true;
+                        }
+                        continue;
+                    };
+                    let n = (state.occupants.len() + state.keys.len()) as u64;
+                    state.keys.insert(o.occupant, n);
+                    first_seen.push(Occupant {
+                        occupant: n,
+                        labels: labels.as_ref().clone(),
+                    });
+                    state.seen.insert(n, labels);
+                    n
+                }
+            };
+            if let Some(labels) = state.pending.remove(&o.occupant) {
+                // Sent again for a key already numbered: a reconnect.
+                state.seen.entry(number).or_insert(labels);
+            }
+            let mut occ = LongOccupant {
+                occupant: number,
+                counters: vec![None; widths.0],
+                gauges: vec![None; widths.1],
+                histograms: vec![None; widths.2],
+            };
+            for (i, v) in o.counters.into_iter().enumerate() {
+                occ.counters[wire.counters[i]] = v;
+            }
+            for (i, v) in o.gauges.into_iter().enumerate() {
+                occ.gauges[wire.gauges[i]] = v;
+            }
+            for (i, v) in o.histograms.into_iter().enumerate() {
+                occ.histograms[wire.histograms[i]] = v;
+            }
+            present.push(occ);
+        }
+        self.write_long(name, row.window, present, first_seen, ts, wall_offset, rows)
     }
 
     /// A V1/V2 snapshot: one row per `sampler` label (`"unattributed"`
@@ -652,10 +1017,6 @@ impl SourceRecorder {
                 self.account(&g.name).add_row(bytes, ts as i64);
             }
             Layout::Long(l) => {
-                self.long
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(g.name.clone());
                 let mut present = Vec::new();
                 let mut first_seen = Vec::new();
                 let widths = (
@@ -695,7 +1056,7 @@ impl SourceRecorder {
                         });
                     }
                     let number = *slot.number.get_or_init(|| {
-                        let next = state.occupants.len() as u64;
+                        let next = (state.occupants.len() + state.keys.len()) as u64;
                         let number = *state.occupants.entry(slot.identity.clone()).or_insert(next);
                         if number == next {
                             first_seen.push(Occupant {
@@ -712,64 +1073,91 @@ impl SourceRecorder {
                     occ.occupant = number;
                     present.push(occ);
                 }
-                // A tick with no occupant present has nothing to record, and
-                // writing it could put rows in a long stream before its
-                // occupant stream exists.
-                if present.is_empty() {
-                    return Ok(());
-                }
-                let hash = state.columns.hash;
-                let anchor = state.anchored.insert(hash);
-                let row = WalLongRow {
-                    schema_hash: hash,
-                    schema: anchor.then(|| state.columns.schema.clone()),
-                    window,
-                    occupants: present,
-                };
-                let bytes = wal::wal_long_row_approx_bytes(&row);
-                rows.push(DWalRow {
-                    stream: g.name.clone(),
-                    ts: ts as i64,
-                    wall_offset,
-                    row: wal::encode_wal_long_row(&row)?,
-                });
-                // Restate every occupant seen since the last restatement,
-                // so a live occupant's labels stay inside retention.
-                let due = match state.last_restated {
-                    None => {
-                        state.last_restated = Some(ts);
-                        false
-                    }
-                    Some(t) => ts.saturating_sub(t) >= self.config.restate_every_ns,
-                };
-                let mut labels_rows = first_seen;
-                if due {
-                    state.last_restated = Some(ts);
-                    let fresh: HashSet<u64> = labels_rows.iter().map(|o| o.occupant).collect();
-                    labels_rows.extend(
-                        std::mem::take(&mut state.seen)
-                            .into_iter()
-                            .filter(|(n, _)| !fresh.contains(n))
-                            .map(|(occupant, labels)| Occupant {
-                                occupant,
-                                labels: labels.as_ref().clone(),
-                            }),
-                    );
-                }
-                let stream = occupants::stream_of(&g.name);
-                if !labels_rows.is_empty() {
-                    let n = labels_rows.len();
-                    rows.push(DWalRow {
-                        stream: stream.clone(),
-                        ts: ts as i64,
-                        wall_offset,
-                        row: occupants::encode_wal_row(&labels_rows),
-                    });
-                    self.account(&stream).add_row(n * 64, ts as i64);
-                }
-                self.account(&g.name).add_row(bytes, ts as i64);
+                self.write_long(&g.name, window, present, first_seen, ts, wall_offset, rows)?;
             }
         }
+        Ok(())
+    }
+
+    /// Write one tick of a long group: `present` already numbered, and
+    /// `first_seen` the occupants numbered this tick. Anchors the columns on
+    /// the segment's first row, and restates the occupants seen since the
+    /// last restatement when one is due.
+    #[allow(clippy::too_many_arguments)]
+    fn write_long(
+        &mut self,
+        name: &str,
+        window: Option<(u64, u64)>,
+        present: Vec<LongOccupant>,
+        first_seen: Vec<Occupant>,
+        ts: u64,
+        wall_offset: i64,
+        rows: &mut Vec<DWalRow>,
+    ) -> Result<(), Error> {
+        self.long
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+        let state = self
+            .groups
+            .get_mut(name)
+            .expect("the caller made the group's state");
+        // A tick with no occupant present has nothing to record, and
+        // writing it could put rows in a long stream before its
+        // occupant stream exists.
+        if present.is_empty() {
+            return Ok(());
+        }
+        let hash = state.columns.hash;
+        let anchor = state.anchored.insert(hash);
+        let row = WalLongRow {
+            schema_hash: hash,
+            schema: anchor.then(|| state.columns.schema.clone()),
+            window,
+            occupants: present,
+        };
+        let bytes = wal::wal_long_row_approx_bytes(&row);
+        rows.push(DWalRow {
+            stream: name.to_string(),
+            ts: ts as i64,
+            wall_offset,
+            row: wal::encode_wal_long_row(&row)?,
+        });
+        // Restate every occupant seen since the last restatement,
+        // so a live occupant's labels stay inside retention.
+        let due = match state.last_restated {
+            None => {
+                state.last_restated = Some(ts);
+                false
+            }
+            Some(t) => ts.saturating_sub(t) >= self.config.restate_every_ns,
+        };
+        let mut labels_rows = first_seen;
+        if due {
+            state.last_restated = Some(ts);
+            let fresh: HashSet<u64> = labels_rows.iter().map(|o| o.occupant).collect();
+            labels_rows.extend(
+                std::mem::take(&mut state.seen)
+                    .into_iter()
+                    .filter(|(n, _)| !fresh.contains(n))
+                    .map(|(occupant, labels)| Occupant {
+                        occupant,
+                        labels: labels.as_ref().clone(),
+                    }),
+            );
+        }
+        let stream = occupants::stream_of(name);
+        if !labels_rows.is_empty() {
+            let n = labels_rows.len();
+            rows.push(DWalRow {
+                stream: stream.clone(),
+                ts: ts as i64,
+                wall_offset,
+                row: occupants::encode_wal_row(&labels_rows),
+            });
+            self.account(&stream).add_row(n * 64, ts as i64);
+        }
+        self.account(name).add_row(bytes, ts as i64);
         Ok(())
     }
 

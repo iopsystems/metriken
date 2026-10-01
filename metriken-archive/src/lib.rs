@@ -53,7 +53,7 @@ pub use reader::{ArchiveReader, LabeledRecordings};
 #[cfg(feature = "stream")]
 pub use stream::FrameProducer;
 #[cfg(feature = "write")]
-pub use writer::{ArchiveWriter, SourceRecorder, WriterConfig};
+pub use writer::{ArchiveWriter, SourceRecorder, StreamDecoder, StreamedGroup, WriterConfig};
 
 /// Opens an archive's catalog again, for a table first read after the
 /// reader's own handle is gone.
