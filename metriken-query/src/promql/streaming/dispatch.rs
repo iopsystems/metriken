@@ -32,7 +32,7 @@ use crate::promql::streaming::{
     AtPoints, BinOp, CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv,
     GaugeIdelta, GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
-use crate::promql::{MatrixSample, QueryError, QueryResult};
+use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
 use crate::{DataSource, QueryOptions, RateMode};
 
 /// Evaluate `expr` via the streaming pipeline. Returns
@@ -77,16 +77,14 @@ pub fn try_streaming(
             let collected = collect_to_matrix(series, metric_name);
             if collected.is_empty() {
                 if let Some(name) = metric_name_for_error {
-                    return Err(QueryError::MetricNotFound(name));
+                    held_somewhere(source, &name)?;
                 }
-                QueryResult::Matrix { result: vec![] }
-            } else {
-                QueryResult::Matrix { result: collected }
             }
+            QueryResult::Matrix { result: collected }
         }
         Built::Materialized { result, name } => {
             if result.is_empty() {
-                return Err(QueryError::MetricNotFound(name));
+                held_somewhere(source, &name)?;
             }
             QueryResult::Matrix { result }
         }
@@ -120,6 +118,20 @@ impl<'a> Ctx<'a> {
             Some(points) => producer.at_points(points.clone()),
             None => producer,
         }
+    }
+}
+
+/// `MetricNotFound` for a name the source holds as no kind at all. A
+/// source whose read of a name it does not hold returns an empty set rather
+/// than `None` reaches here with an empty result.
+fn held_somewhere(source: &dyn DataSource, name: &str) -> Result<(), QueryError> {
+    let held = source.counter_names().iter().any(|n| n == name)
+        || source.gauge_names().iter().any(|n| n == name)
+        || source.histogram_names().iter().any(|n| n == name);
+    if held {
+        Ok(())
+    } else {
+        Err(QueryError::MetricNotFound(name.to_string()))
     }
 }
 
@@ -382,10 +394,17 @@ where
                 RateMode::Raw => range_ns,
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
-            let streams = ctx
-                .source
-                .counter_streams(metric_name, &filter, data_start, ctx.end_ns)
-                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let Some(streams) =
+                ctx.source
+                    .counter_streams(metric_name, &filter, data_start, ctx.end_ns)
+            else {
+                nothing_read(ctx.source, metric_name, MetricKind::Counter)?;
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
+            };
             // Each series is its producer over its own sample stream, pulled
             // by whatever consumes it: an aggregate holds one buffered point
             // per series and each producer one interval's worth of samples,
@@ -432,10 +451,17 @@ where
             })
         }
         "avg_over_time" => {
-            let gauges = ctx
+            let Some(gauges) = ctx
                 .source
                 .gauges(metric_name, &filter, data_start, ctx.end_ns)
-                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            else {
+                nothing_read(ctx.source, metric_name, MetricKind::Gauge)?;
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
+            };
             let series: SeriesSet<'a> = gauges
                 .series
                 .into_iter()
@@ -459,10 +485,17 @@ where
             })
         }
         "idelta" => {
-            let gauges = ctx
+            let Some(gauges) = ctx
                 .source
                 .gauges(metric_name, &filter, data_start, ctx.end_ns)
-                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            else {
+                nothing_read(ctx.source, metric_name, MetricKind::Gauge)?;
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
+            };
             let series: SeriesSet<'a> = gauges
                 .series
                 .into_iter()
@@ -513,10 +546,17 @@ where
                     metric_name_for_error: Some(metric_name.to_string()),
                 });
             }
-            let counters = ctx
-                .source
-                .counters(metric_name, &filter, deriv_data_start, ctx.end_ns)
-                .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+            let Some(counters) =
+                ctx.source
+                    .counters(metric_name, &filter, deriv_data_start, ctx.end_ns)
+            else {
+                nothing_read(ctx.source, metric_name, MetricKind::Counter)?;
+                return Ok(Built::Series {
+                    series: Vec::new(),
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: None,
+                });
+            };
             let series: SeriesSet<'a> = counters
                 .series
                 .into_iter()
@@ -578,10 +618,16 @@ where
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
-    let stream = ctx
+    let Some(stream) = ctx
         .source
         .histogram_stream(metric_name, &filter, ctx.start_ns, ctx.end_ns)
-        .ok_or_else(|| QueryError::MetricNotFound(metric_name.to_string()))?;
+    else {
+        nothing_read(ctx.source, metric_name, MetricKind::Histogram)?;
+        return Ok(Built::Materialized {
+            result: Vec::new(),
+            name: metric_name.to_string(),
+        });
+    };
     let result = stream.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
     Ok(Built::Materialized {
         result,
@@ -612,13 +658,12 @@ where
         // A bare selector reads gauges. A counter is read through rate() or
         // irate(), and saying so beats reporting a metric the source holds as
         // missing. Asked only on this path, so a found gauge costs nothing.
-        if ctx.source.counter_names().iter().any(|n| n == metric_name) {
-            return Err(QueryError::Unsupported(format!(
-                "{metric_name} is a counter: read it through rate() or irate(), \
-                 e.g. rate({metric_name}[1m])"
-            )));
-        }
-        return Err(QueryError::MetricNotFound(metric_name.to_string()));
+        nothing_read(ctx.source, metric_name, MetricKind::Gauge)?;
+        return Ok(Built::Series {
+            series: Vec::new(),
+            metric_name: Some(metric_name),
+            metric_name_for_error: None,
+        });
     };
 
     let series: SeriesSet<'a> = gauges

@@ -27,8 +27,72 @@ pub enum QueryError {
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
 
+    /// The source holds no counter, gauge or histogram of this name. The
+    /// payload is the bare name.
     #[error("Metric not found: {0}")]
     MetricNotFound(String),
+}
+
+/// The kind of series a query function reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+impl MetricKind {
+    fn noun(self) -> &'static str {
+        match self {
+            MetricKind::Counter => "counter",
+            MetricKind::Gauge => "gauge",
+            MetricKind::Histogram => "histogram",
+        }
+    }
+}
+
+/// What a read of `name` as `kind` that found no series means: `Ok` when
+/// the source holds `name` as `kind` (nothing matched the range or the
+/// labels, so the answer is empty), [`QueryError::Unsupported`] when it
+/// holds `name` only as another kind, and [`QueryError::MetricNotFound`]
+/// when it holds no metric of that name. Asked only on that path.
+pub(crate) fn nothing_read(
+    source: &dyn DataSource,
+    name: &str,
+    kind: MetricKind,
+) -> Result<(), QueryError> {
+    let holds = |k: MetricKind| {
+        let names = match k {
+            MetricKind::Counter => source.counter_names(),
+            MetricKind::Gauge => source.gauge_names(),
+            MetricKind::Histogram => source.histogram_names(),
+        };
+        names.iter().any(|n| n == name)
+    };
+    if holds(kind) {
+        return Ok(());
+    }
+    let held = [
+        MetricKind::Counter,
+        MetricKind::Gauge,
+        MetricKind::Histogram,
+    ]
+    .into_iter()
+    .find(|k| *k != kind && holds(*k));
+    match held {
+        Some(MetricKind::Counter) if kind == MetricKind::Gauge => {
+            Err(QueryError::Unsupported(format!(
+                "{name} is a counter: read it through rate() or irate(), \
+                 e.g. rate({name}[1m])"
+            )))
+        }
+        Some(held) => Err(QueryError::Unsupported(format!(
+            "{name} is a {}, and this function reads a {}",
+            held.noun(),
+            kind.noun()
+        ))),
+        None => Err(QueryError::MetricNotFound(name.to_string())),
+    }
 }
 
 /// A single sample in the result.
@@ -645,11 +709,14 @@ impl QueryEngine {
         let end_ns = range_end_ns(end);
         let stream = self
             .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
-            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let Some(stream) = stream else {
+            nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
+            return Ok(QueryResult::Matrix { result: vec![] });
+        };
         let result = stream.quantiles(&quantiles, start_ns, end_ns, stride_ns, &metric_name);
         if result.is_empty() {
-            return Err(QueryError::MetricNotFound(metric_name));
+            return Ok(QueryResult::Matrix { result: vec![] });
         }
         Ok(QueryResult::Matrix { result })
     }
@@ -668,12 +735,15 @@ impl QueryEngine {
         let end_ns = range_end_ns(end);
         let stream = self
             .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
-            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let Some(stream) = stream else {
+            nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
+            return Ok(QueryResult::Matrix { result: vec![] });
+        };
         let result = stream.heatmap(start_ns, end_ns, stride_ns);
         match result {
             Some(result) => Ok(QueryResult::HistogramHeatmap { result }),
-            None => Err(QueryError::MetricNotFound(metric_name)),
+            None => Ok(QueryResult::Matrix { result: vec![] }),
         }
     }
 
@@ -696,11 +766,14 @@ impl QueryEngine {
         let end_ns = range_end_ns(end);
         let stream = self
             .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
-            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let Some(stream) = stream else {
+            nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
+            return Ok(QueryResult::Matrix { result: vec![] });
+        };
         let result = stream.irate(group_by.as_ref(), start_ns, end_ns, &metric_name);
         if result.is_empty() {
-            return Err(QueryError::MetricNotFound(metric_name));
+            return Ok(QueryResult::Matrix { result: vec![] });
         }
         Ok(QueryResult::Matrix { result })
     }
@@ -720,8 +793,11 @@ impl QueryEngine {
         let end_ns = range_end_ns(end);
         let stream = self
             .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns)
-            .ok_or_else(|| QueryError::MetricNotFound(metric_name.clone()))?;
+            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let Some(stream) = stream else {
+            nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
+            return Ok(QueryResult::Matrix { result: vec![] });
+        };
         let group = group_by.as_ref();
         let result = match func {
             "histogram_mean" => stream.mean(group, start_ns, end_ns, stride_ns, &metric_name),
@@ -729,7 +805,7 @@ impl QueryEngine {
             _ => stream.count(group, start_ns, end_ns, stride_ns, &metric_name),
         };
         if result.is_empty() {
-            return Err(QueryError::MetricNotFound(metric_name));
+            return Ok(QueryResult::Matrix { result: vec![] });
         }
         Ok(QueryResult::Matrix { result })
     }
@@ -746,10 +822,12 @@ impl QueryEngine {
 
     /// Evaluates `query_str` over `[start, end]`.
     ///
-    /// A selector naming a metric the source holds, but with no samples in
-    /// the range or none matching its labels, gives an empty matrix.
-    /// `QueryError::MetricNotFound` means the source holds no metric of
-    /// that name.
+    /// A selector naming a metric of the kind its function reads, with no
+    /// samples in the range or none matching its labels, gives an empty
+    /// matrix; `query` gives an empty vector, and `histogram_heatmap` an
+    /// empty matrix rather than a heatmap. A name the source holds only as
+    /// another kind is [`QueryError::Unsupported`]. [`QueryError::MetricNotFound`]
+    /// means the source holds no metric of that name.
     pub fn query_range_opts(
         &self,
         query_str: &str,
@@ -758,20 +836,7 @@ impl QueryEngine {
         step: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        match self.evaluate_range(query_str, start, end, step, opts) {
-            Err(QueryError::MetricNotFound(name)) if self.holds_metric(&name) => {
-                Ok(QueryResult::Matrix { result: vec![] })
-            }
-            result => result,
-        }
-    }
-
-    /// Whether the source has a counter, gauge or histogram named `name`.
-    fn holds_metric(&self, name: &str) -> bool {
-        let named = |names: Vec<String>| names.iter().any(|n| n == name);
-        named(self.source.counter_names())
-            || named(self.source.gauge_names())
-            || named(self.source.histogram_names())
+        self.evaluate_range(query_str, start, end, step, opts)
     }
 
     fn evaluate_range(

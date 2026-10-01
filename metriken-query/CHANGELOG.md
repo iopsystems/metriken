@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- A selector naming a metric the source holds, with no samples in the range
-  or none matching its labels, gives an empty matrix instead of
-  `QueryError::MetricNotFound`. That error now means the source holds no
+- A selector naming a metric of the kind its function reads, with no
+  samples in the range or none matching its labels, gives an empty result
+  instead of `QueryError::MetricNotFound`. A name held only as another kind
+  is `QueryError::Unsupported`. `MetricNotFound` means the source holds no
   metric of that name, and carries the bare name.
 
 ## [0.33.6] - 2026-10-01

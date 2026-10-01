@@ -9,13 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-query 0.34.0
 
-- **Changed:** a query whose selector names a metric the source holds, but
-  which has no samples in the range or none matching its labels, returns an
-  empty matrix. `QueryError::MetricNotFound` now means the source holds no
-  metric of that name, and its payload is always the bare name (the histogram
-  functions used to wrap it as "No histogram data found for ..."). Callers
-  that matched `MetricNotFound` to detect an empty result must check for an
-  empty matrix instead.
+- **Changed:** a query whose selector names a metric of the kind its
+  function reads, with no samples in the range or none matching its labels,
+  returns an empty matrix (an empty vector from `query`; `histogram_heatmap`
+  returns an empty matrix, not a heatmap). A name the source holds only as
+  another kind is `QueryError::Unsupported`, naming the kind it is: `rate()`
+  of a gauge, `histogram_mean()` of a counter, a bare histogram.
+  `QueryError::MetricNotFound` now means the source holds no metric of that
+  name, and its payload is always the bare name. A misspelled name is
+  reported from either operand of a binary expression. Callers that matched
+  `MetricNotFound` to detect an empty result must check for an empty result
+  instead.
 
 ### metriken-query 0.33.6
 
