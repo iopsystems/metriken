@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.33.5"
+version = "0.33.6"
 dependencies = [
  "arrow",
  "bytes",
