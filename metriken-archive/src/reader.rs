@@ -1096,8 +1096,8 @@ impl ArchiveReader {
     /// and `SegmentedParquetReader::handover`), the new one reads only the
     /// segments sealed since, the live tail, and the occupant-stream
     /// segments not yet decoded, and takes over the segments `previous` had
-    /// open. A table whose relabel's identities are not fixed reuses only
-    /// the decoded occupant-stream segments. Once retention evicts a segment
+    /// open when both readers use the same pool. A table whose relabel's
+    /// identities are not fixed reuses nothing. Once retention evicts a segment
     /// `previous` read, only the decoded occupant-stream segments are
     /// reused. Tables are matched by recording id and name. A table already
     /// built here is left as it is, and so is a table of a tar archive,

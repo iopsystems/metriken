@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newer reader of the same file the state the older reader saved for it.
   That table then reads only the segments sealed since, the live tail, and
   the occupant-stream segments not yet decoded, and takes over the older
-  reader's open segments. Segments are matched by sequence number, row
+  reader's open segments when both use the same pool. Segments are matched by sequence number, row
   count and time span. Once retention evicts a segment the older reader
   read, only the decoded occupant-stream segments are reused. On a
   30-minute recording of a per-task group, the first query after a reopen

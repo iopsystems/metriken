@@ -1117,9 +1117,9 @@ fn state_passes_through_a_reader_that_was_not_queried() {
     // and no occupant segment.
     let (_unqueried, probe_count) = open_counting(&path, &pool);
     assert_eq!(second_count.get(), probe_count.get());
-    let (third, fresh) = (third_count.get(), fresh_count.get());
+    let (third, fresh, probe) = (third_count.get(), fresh_count.get(), probe_count.get());
     assert!(
-        third.0 < fresh.0 && third.1 == 0 && fresh.1 > 0,
+        third.0 > probe.0 && third.0 < fresh.0 && third.1 == 0 && fresh.1 > 0,
         "{third:?} {fresh:?}"
     );
 
