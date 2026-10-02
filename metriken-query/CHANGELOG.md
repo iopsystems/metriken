@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `SegmentedParquetReader::open_after` and `handover`. A reader opened
+  with `open_after` saves its open state, and `handover` returns it as a
+  `Handover`. `open_after` given the `Handover` of an earlier reader of the
+  same table does not read the leading segments whose `SegmentStore::key`
+  matches, and takes over the earlier reader's open segments when both use
+  the same pool. Reuse needs both readers to have no relabel, or both to
+  have one whose identities are fixed. A table with a column naming an
+  occupant the relabel does not describe saves no state.
+  `Handover::without_segments` drops the open segments.
+- `SegmentStore::key`, an id for a segment that differs whenever its bytes
+  do. Default `None`.
+- `ColumnRelabel::identities_are_fixed`: whether each column presents as
+  one label set for all its samples, the same for every instance over the
+  same table. Default `false`; `true` for `long::OccupantLabels`.
+
+### Changed
+
+- A read of one occupant of a long column is not relabelled again when the
+  relabel's identities are fixed, and the maps keyed by label sets hash
+  with foldhash.
+
 ## [0.34.0] - 2026-10-02
 
 ### Changed

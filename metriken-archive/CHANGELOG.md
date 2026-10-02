@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ArchiveReader::keep_handover` and `reuse_from`. A table built after
+  `keep_handover` saves its open state. `reuse_from` gives each table of a
+  newer reader of the same file the state the older reader saved for it.
+  That table then reads only the segments sealed since, the live tail, and
+  the occupant-stream segments not yet decoded, and takes over the older
+  reader's open segments when both use the same pool. Segments are matched by sequence number, row
+  count and time span. Once retention evicts a segment the older reader
+  read, only the decoded occupant-stream segments are reused. On a
+  30-minute recording of a per-task group, the first query after a reopen
+  took 2.7x a warm query, and takes 1.3x after a reopen that reuses the
+  previous reader (one host, load average about 9).
+
+### Changed
+
+- Requires metriken-query 0.34.1.
+
+## [0.3.2] - 2026-10-01
+
+### Added
+
+- Slot groups travel long on the replication stream. `FrameProducer` sends
+  a long group as a `WalLongRow` keyed by per-group occupant keys, preceded
+  by a `<group>/occupants` row for each key the subscription has not been
+  sent. `StreamDecoder` reads each row's form from the row, and
+  `SourceRecorder::stage_streamed` writes a long row with its keys mapped
+  to occupant numbers by occupant identity.
+
 ## [0.3.1] - 2026-09-30
 
 ### Added

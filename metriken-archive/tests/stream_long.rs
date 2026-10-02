@@ -142,8 +142,9 @@ fn advance(tick: u64) {
 }
 
 /// Records both archives from the same ticks; returns, per tick, how many
-/// occupants the long stream described.
-fn record(wide: &Path, long: &Path, finalize: bool) -> Vec<usize> {
+/// occupants the long stream described. `on_tick` runs after each tick, once
+/// the long archive holds it.
+fn record(wide: &Path, long: &Path, finalize: bool, on_tick: &mut dyn FnMut(u64)) -> Vec<usize> {
     let router = || TestRouter {
         window: Mutex::new(None),
     };
@@ -205,6 +206,8 @@ fn record(wide: &Path, long: &Path, finalize: bool) -> Vec<usize> {
         let staged = long_source.stage_streamed(streamed, ts, 0).unwrap();
         long_writer.commit(vec![staged]).unwrap();
         long_source.maybe_seal().unwrap();
+        long_source.sync().unwrap();
+        on_tick(tick);
     }
     assert_eq!(decoder.unresolved, 0);
 
@@ -290,7 +293,29 @@ fn the_long_stream_records_what_wide_snapshots_record() {
             dir.path().join("wide.dendro"),
             dir.path().join("long.dendro"),
         );
-        let described = record(&wide, &long, finalize);
+        // While it is written, a reader reopened over the long archive and
+        // reusing the one before answers as a fresh open does.
+        let mut previous: Option<ArchiveReader> = None;
+        let mut reused = 0;
+        let mut check = |tick: u64| {
+            if tick % 3 != 2 {
+                return;
+            }
+            let (fresh, after) = (open(&long), open(&long));
+            match &previous {
+                Some(previous) => {
+                    after.reuse_from(previous);
+                    reused += 1;
+                }
+                None => after.keep_handover(),
+            }
+            for q in QUERIES {
+                assert_eq!(answer(&after, q), answer(&fresh, q), "{q} at tick {tick}");
+            }
+            previous = Some(after);
+        };
+        let described = record(&wide, &long, finalize, &mut check);
+        assert!(reused >= 8);
 
         // Every live occupant at the start and again at the reconnect, then
         // only the occupant that changed hands.

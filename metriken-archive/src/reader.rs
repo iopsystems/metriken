@@ -32,6 +32,21 @@ use metriken_query::{
 use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
 
+use metriken_segment::occupants::Occupant;
+
+/// An occupant stream's sealed segments, decoded, by [`segment_key`].
+type OccupantSegments = BTreeMap<u64, Arc<Vec<Occupant>>>;
+
+/// The saved state of one reader's table, for the same table in the reader
+/// that replaces it. It holds no catalog connection.
+#[derive(Clone, Default)]
+struct Carried {
+    /// The built table's state; `None` when it saved none.
+    handover: Option<metriken_query::Handover>,
+    /// The occupant-stream segments it decoded.
+    occupant_segments: OccupantSegments,
+}
+
 enum TableReader {
     /// A table read from its segments on demand — one segment or many; the
     /// segmented reader fetches only what a query touches either way. A
@@ -249,7 +264,22 @@ struct DbSegmentStore {
     recording_id: i64,
     sampler: String,
     seqs: Vec<u64>,
+    /// Each sealed segment's [`segment_key`], in `seqs` order.
+    keys: Vec<u64>,
     tail: Option<bytes::Bytes>,
+}
+
+/// An id for a sealed segment: its sequence number with its row count and
+/// time span. Compaction can give a merged segment the sequence number of
+/// the first segment it replaced, and numbering restarts for a stream whose
+/// segments were all evicted; the count and span tell those apart. dendro
+/// changes a sealed segment's bytes only by compaction, which changes its
+/// row count and span.
+fn segment_key(seq: u64, meta: &crate::catalog::SegmentMeta) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    (seq, meta.rows, meta.first_ts, meta.last_ts).hash(&mut h);
+    h.finish()
 }
 
 /// A table's unsealed WAL rows as one segment. A table with an occupant
@@ -278,20 +308,20 @@ impl DbSegmentStore {
         recording_id: i64,
         sampler: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (seqs, tail) = db
+        let (seqs, keys, tail) = db
             .with(|db| {
-                let seqs: Vec<u64> = db
+                let (seqs, keys): (Vec<u64>, Vec<u64>) = db
                     .segment_meta(recording_id, sampler)?
                     .into_iter()
-                    .map(|(seq, _)| seq)
-                    .collect();
+                    .map(|(seq, meta)| (seq, segment_key(seq, &meta)))
+                    .unzip();
                 let long = db
                     .tables(recording_id)?
                     .contains(&metriken_segment::occupants::stream_of(sampler));
                 let tail = live_tail(db, recording_id, sampler, long)
                     .map_err(|e| e.to_string())?
                     .map(|t| bytes::Bytes::from(t.bytes));
-                Ok((seqs, tail))
+                Ok((seqs, keys, tail))
             })
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -299,6 +329,7 @@ impl DbSegmentStore {
             recording_id,
             sampler: sampler.to_string(),
             seqs,
+            keys,
             tail,
         })
     }
@@ -307,6 +338,11 @@ impl DbSegmentStore {
 impl metriken_query::SegmentStore for DbSegmentStore {
     fn len(&self) -> usize {
         self.seqs.len() + usize::from(self.tail.is_some())
+    }
+
+    /// A sealed segment's [`segment_key`]; the live tail has none.
+    fn key(&self, idx: usize) -> Option<u64> {
+        self.keys.get(idx).copied()
     }
 
     fn bytes(&self, idx: usize) -> metriken_query::SegmentBytes {
@@ -325,6 +361,16 @@ impl metriken_query::SegmentStore for DbSegmentStore {
 }
 
 impl SegmentSource {
+    /// The catalog id of the recording this table belongs to; `None` for
+    /// a tar archive's in-memory table.
+    fn source_id(&self) -> Option<i64> {
+        match self {
+            SegmentSource::Bytes(_) => None,
+            SegmentSource::Db { recording_id, .. }
+            | SegmentSource::SharedDb { recording_id, .. } => Some(*recording_id),
+        }
+    }
+
     /// This table as a store the segmented reader fetches from on demand.
     /// `None` when the table has no segments and no tail any more — evicted
     /// between the probe and the query.
@@ -361,35 +407,44 @@ impl SegmentSource {
     /// Every row of an occupant stream, sealed segments first and then the
     /// live WAL: the labels of every occupant the table's rows can name.
     /// Empty for a tar archive, which has no long tables.
+    ///
+    /// `known` holds sealed segments of the stream already decoded, by
+    /// [`segment_key`]; they are not read again. Returned with the rows are
+    /// the decoded sealed segments the rows came from.
     fn occupants(
         &self,
         stream: &str,
-    ) -> Result<Vec<metriken_segment::occupants::Occupant>, Box<dyn std::error::Error>> {
-        fn read(
-            db: &dyn Catalog,
-            recording_id: i64,
-            stream: &str,
-        ) -> Result<Vec<metriken_segment::occupants::Occupant>, Box<dyn std::error::Error>>
-        {
+        known: &OccupantSegments,
+    ) -> Result<(Vec<Occupant>, OccupantSegments), Box<dyn std::error::Error>> {
+        let read = |db: &dyn Catalog, recording_id: i64| {
             let mut out = Vec::new();
-            for (seq, _) in db.segment_meta(recording_id, stream)? {
-                // A segment retention took since the catalog read is gone,
-                // and so are the rows that named its occupants.
-                if let Some(bytes) = db.segment_bytes(recording_id, stream, seq)? {
-                    out.extend(
-                        metriken_segment::occupants::decode_segment(&bytes)?
-                            .into_iter()
-                            .map(|(_, o)| o),
-                    );
-                }
+            let mut decoded = OccupantSegments::new();
+            for (seq, meta) in db.segment_meta(recording_id, stream)? {
+                let key = segment_key(seq, &meta);
+                let rows = match known.get(&key) {
+                    Some(rows) => Arc::clone(rows),
+                    // A segment retention took since the catalog read is
+                    // gone, and so are the rows that named its occupants.
+                    None => match db.segment_bytes(recording_id, stream, seq)? {
+                        Some(bytes) => Arc::new(
+                            metriken_segment::occupants::decode_segment(&bytes)?
+                                .into_iter()
+                                .map(|(_, o)| o)
+                                .collect(),
+                        ),
+                        None => continue,
+                    },
+                };
+                out.extend(rows.iter().cloned());
+                decoded.insert(key, rows);
             }
             for row in db.live_wal(recording_id, stream)? {
                 out.extend(metriken_segment::occupants::decode_wal_row(&row.row)?);
             }
-            Ok(out)
-        }
-        self.with_catalog(|db, recording_id, _| read(db, recording_id, stream))
-            .unwrap_or_else(|| Ok(Vec::new()))
+            Ok((out, decoded))
+        };
+        self.with_catalog(|db, recording_id, _| read(db, recording_id))
+            .unwrap_or_else(|| Ok((Vec::new(), OccupantSegments::new())))
     }
 
     /// Run `f` against this table's catalog, with its source id and table
@@ -530,6 +585,16 @@ struct SamplerReader {
     pool: Arc<BufferPool>,
     /// Built on first access, never at open.
     reader: std::sync::OnceLock<Option<TableReader>>,
+    /// The state saved by the same table in a reader this one replaced (see
+    /// [`ArchiveReader::reuse_from`]), taken when this table's reader is
+    /// built.
+    previous: std::sync::Mutex<Option<Carried>>,
+    /// Whether this table's reader saves state for a later reader (see
+    /// [`ArchiveReader::keep_handover`]).
+    keep: std::sync::atomic::AtomicBool,
+    /// The occupant stream's sealed segments this table's reader was built
+    /// from, decoded, for a reader that replaces this one.
+    occupant_segments: std::sync::Mutex<OccupantSegments>,
     /// Row timestamps, read once.
     ///
     /// Reading them means decoding a whole column, and the cross-cadence
@@ -622,6 +687,13 @@ impl SamplerReader {
     fn reader(&self) -> Option<&TableReader> {
         self.reader
             .get_or_init(|| {
+                // Taken before anything can fail, so a table whose build
+                // fails holds no predecessor.
+                let previous = self
+                    .previous
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
                 let pool = Arc::clone(&self.pool);
                 // The store fetches segments as queries touch them; nothing
                 // is read here beyond the catalog and the live WAL tail.
@@ -639,12 +711,24 @@ impl SamplerReader {
                         return None;
                     }
                 };
-                let opened = match self.relabel() {
-                    Some(Ok(relabel)) => {
-                        SegmentedParquetReader::open_relabeled_with_pool(store, pool, relabel)
-                    }
+                let relabel = match self.relabel(previous.as_ref()) {
+                    Some(Ok(relabel)) => Some(relabel),
                     Some(Err(())) => return None,
-                    None => SegmentedParquetReader::open_with_pool(store, pool),
+                    None => None,
+                };
+                let opened = match self.keep.load(std::sync::atomic::Ordering::Relaxed) {
+                    true => SegmentedParquetReader::open_after(
+                        store,
+                        pool,
+                        relabel,
+                        previous.as_ref().and_then(|p| p.handover.as_ref()),
+                    ),
+                    false => match relabel {
+                        Some(relabel) => {
+                            SegmentedParquetReader::open_relabeled_with_pool(store, pool, relabel)
+                        }
+                        None => SegmentedParquetReader::open_with_pool(store, pool),
+                    },
                 };
                 opened
                     .map(TableReader::Segmented)
@@ -671,10 +755,25 @@ impl SamplerReader {
     /// a segment that would not parse is — never a silent fall-through to
     /// the plain path, which would file every reused slot's rows under its
     /// first occupant.
-    fn relabel(&self) -> Option<Result<Arc<dyn metriken_query::ColumnRelabel>, ()>> {
+    ///
+    /// The occupant-stream segments `previous` decoded are not decoded again.
+    fn relabel(
+        &self,
+        previous: Option<&Carried>,
+    ) -> Option<Result<Arc<dyn metriken_query::ColumnRelabel>, ()>> {
         if let Some(stream) = &self.occupants {
-            return Some(match self.segments.occupants(stream) {
-                Ok(rows) => Ok(Arc::new(metriken_query::long::OccupantLabels::new(rows))),
+            let empty = OccupantSegments::new();
+            let known = previous.map_or(&empty, |p| &p.occupant_segments);
+            return Some(match self.segments.occupants(stream, known) {
+                Ok((rows, decoded)) => {
+                    if self.keep.load(std::sync::atomic::Ordering::Relaxed) {
+                        *self
+                            .occupant_segments
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = decoded;
+                    }
+                    Ok(Arc::new(metriken_query::long::OccupantLabels::new(rows)))
+                }
                 Err(e) => {
                     tracing::warn!("reading the occupant stream {stream}: {e}");
                     Err(())
@@ -975,6 +1074,88 @@ impl ArchiveReader {
         self.complete
     }
 
+    /// Makes each table built after this call save the state a later
+    /// reader of the same archive can start from (see
+    /// [`reuse_from`](Self::reuse_from)). A table whose reader is already
+    /// built saves none. A caller that reopens the archive calls this on
+    /// its first reader, before querying it.
+    pub fn keep_handover(&self) {
+        for table in &self.tables {
+            table.keep.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Lets each table of this reader start from the state `previous` saved
+    /// for the same table, for a reader opened over the same archive file
+    /// after `previous` was: a live archive reopened to see new rows. It
+    /// also calls [`keep_handover`](Self::keep_handover) on this reader.
+    /// Call it before querying this reader.
+    ///
+    /// A table's reader is still built on first query. When the matching
+    /// table of `previous` saved state (see [`keep_handover`](Self::keep_handover)
+    /// and `SegmentedParquetReader::handover`), the new one reads only the
+    /// segments sealed since, the live tail, and the occupant-stream
+    /// segments not yet decoded, and takes over the segments `previous` had
+    /// open when both readers use the same pool. A table whose relabel's
+    /// identities are not fixed reuses nothing. Once retention evicts a segment
+    /// `previous` read, only the decoded occupant-stream segments are
+    /// reused. Tables are matched by recording id and name. A table already
+    /// built here is left as it is, and so is a table of a tar archive,
+    /// which has no keyed segments.
+    ///
+    /// `previous` must read the same archive file. A segment is matched by
+    /// its sequence number, row count and time span, and a filtered copy of
+    /// an archive keeps those for every segment, so a reader of such a copy
+    /// gives wrong answers without an error.
+    ///
+    /// Until its reader is built, a table of this reader holds the state
+    /// `previous` saved for it, the segments `previous` had open among
+    /// those it reuses, and the decoded occupant-stream segments. A table
+    /// of `previous` that was never queried passes on the state and the
+    /// occupant-stream segments it was given, without the open segments.
+    /// None of it holds a connection to the archive.
+    pub fn reuse_from(&self, previous: &ArchiveReader) {
+        self.keep_handover();
+        for table in &self.tables {
+            // A built table ignores `previous`, and a tar table has no keyed
+            // segments.
+            if table.reader.get().is_some() || table.segments.source_id().is_none() {
+                continue;
+            }
+            let Some(old) = previous.tables.iter().find(|t| {
+                t.segments.source_id() == table.segments.source_id() && t.sampler == table.sampler
+            }) else {
+                continue;
+            };
+            if Arc::ptr_eq(old, table) {
+                continue;
+            }
+            // A built table gives its saved state. A table that was not
+            // queried, or whose build failed, gives the state it was given,
+            // without the open segments, which nothing will read.
+            let carried = match old.reader.get() {
+                Some(Some(TableReader::Segmented(r))) => Some(Carried {
+                    handover: r.handover(),
+                    occupant_segments: old
+                        .occupant_segments
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                }),
+                _ => old
+                    .previous
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|c| Carried {
+                        handover: c.handover.as_ref().map(|h| h.without_segments()),
+                        occupant_segments: c.occupant_segments.clone(),
+                    }),
+            };
+            *table.previous.lock().unwrap_or_else(|e| e.into_inner()) = carried;
+        }
+    }
+
     /// Several readers' tables as one reader: the single-source view of a
     /// multi-source archive. Its metadata is the first reader's, and it is
     /// complete when every reader is.
@@ -1162,6 +1343,9 @@ impl ArchiveReader {
                     },
                     pool: Arc::clone(&pool),
                     reader: std::sync::OnceLock::new(),
+                    previous: std::sync::Mutex::new(None),
+                    occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
+                    keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
                 }));
             }
@@ -1263,6 +1447,9 @@ impl ArchiveReader {
                     segments: SegmentSource::Bytes(segments),
                     pool: Arc::clone(&pool),
                     reader: std::sync::OnceLock::new(),
+                    previous: std::sync::Mutex::new(None),
+                    occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
+                    keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
                 }));
             }

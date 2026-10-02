@@ -12,6 +12,7 @@ homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
+foldhash = "0.2.0"
 arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
