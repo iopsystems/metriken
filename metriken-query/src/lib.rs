@@ -63,7 +63,8 @@ pub use promql::{
     referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
 };
 pub use segmented::{
-    ColumnRelabel, InMemorySegments, Run, SegmentBytes, SegmentStore, SegmentedParquetReader,
+    ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore,
+    SegmentedParquetReader,
 };
 pub use types::{ColumnChunk, CounterSample, CounterStream, HistogramSnapshot};
 

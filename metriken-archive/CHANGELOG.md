@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes over the segments the other had open. Segments are matched by
   sequence number, row count and time span. Nothing is reused for a table
   once retention evicts a segment the other read. On a 30-minute recording
-  of a per-task group, a query after a reopen took 485 ms against 180 ms
-  warm; after a reopen that reuses the previous reader it takes 230-240 ms.
+  of a per-task group, the first query after a reopen took 2.7x a warm
+  query, and takes 1.3x after a reopen that reuses the previous reader
+  (one host, load average about 9).
 
 ## [0.3.2] - 2026-10-01
 

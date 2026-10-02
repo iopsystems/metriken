@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `SegmentedParquetReader::open_after` opens a table over the reader that
-  preceded it: the leading segments whose `SegmentStore::key` matches are
-  not read again, and the segments it had open on the same pool are taken
-  over. It applies when both readers have no relabel, or both have one
-  whose identities are fixed.
+- `SegmentedParquetReader::handover` and `open_after`: a reader opened over
+  a table after another starts from the `Handover` the other gave. The
+  leading segments whose `SegmentStore::key` matches are not read again,
+  and the segments the other had open on the same pool are taken over. It
+  applies when both readers have no relabel, or both have one whose
+  identities are fixed, and no column named an occupant the relabel did
+  not describe. A `Handover` holds no `SegmentStore`.
 - `SegmentStore::key`, an id for a segment that differs whenever its bytes
   do. Default `None`.
 - `ColumnRelabel::identities_are_fixed`, whether every instance of a

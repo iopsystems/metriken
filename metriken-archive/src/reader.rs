@@ -37,6 +37,16 @@ use metriken_segment::occupants::Occupant;
 /// An occupant stream's sealed segments, decoded, by [`segment_key`].
 type OccupantSegments = BTreeMap<u64, Arc<Vec<Occupant>>>;
 
+/// What one reader's table hands the same table in the reader that
+/// replaces it. It holds no catalog connection.
+#[derive(Clone, Default)]
+struct Carried {
+    /// The built table's state; `None` when it saved none.
+    handover: Option<metriken_query::Handover>,
+    /// The occupant-stream segments it decoded.
+    occupant_segments: OccupantSegments,
+}
+
 enum TableReader {
     /// A table read from its segments on demand — one segment or many; the
     /// segmented reader fetches only what a query touches either way. A
@@ -262,7 +272,9 @@ struct DbSegmentStore {
 /// An id for a sealed segment: its sequence number with its row count and
 /// time span. Compaction can give a merged segment the sequence number of
 /// the first segment it replaced, and numbering restarts for a stream whose
-/// segments were all evicted; the count and span tell those apart.
+/// segments were all evicted; the count and span tell those apart. dendro
+/// changes a sealed segment's bytes only by compaction, which changes its
+/// row count and span.
 fn segment_key(seq: u64, meta: &crate::catalog::SegmentMeta) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
@@ -573,11 +585,10 @@ struct SamplerReader {
     pool: Arc<BufferPool>,
     /// Built on first access, never at open.
     reader: std::sync::OnceLock<Option<TableReader>>,
-    /// The same table in a reader this one replaced (see
+    /// What the same table in a reader this one replaced handed on (see
     /// [`ArchiveReader::reuse_from`]), taken when this table's reader is
-    /// built. It is a table whose reader was built, so it holds no
-    /// predecessor of its own.
-    previous: std::sync::Mutex<Option<Arc<SamplerReader>>>,
+    /// built.
+    previous: std::sync::Mutex<Option<Carried>>,
     /// The occupant stream's sealed segments this table's reader was built
     /// from, decoded, for a reader that replaces this one.
     occupant_segments: std::sync::Mutex<OccupantSegments>,
@@ -697,14 +708,14 @@ impl SamplerReader {
                         return None;
                     }
                 };
-                let relabel = match self.relabel(previous.as_deref()) {
+                let relabel = match self.relabel(previous.as_ref()) {
                     Some(Ok(relabel)) => Some(relabel),
                     Some(Err(())) => return None,
                     None => None,
                 };
-                let opened = match previous.as_ref().and_then(|p| p.reader.get()) {
-                    Some(Some(TableReader::Segmented(previous))) => {
-                        SegmentedParquetReader::open_after(store, pool, relabel, previous)
+                let opened = match previous.as_ref().and_then(|p| p.handover.as_ref()) {
+                    Some(handover) => {
+                        SegmentedParquetReader::open_after(store, pool, relabel, handover)
                     }
                     _ => match relabel {
                         Some(relabel) => {
@@ -742,18 +753,12 @@ impl SamplerReader {
     /// The occupant-stream segments `previous` decoded are not decoded again.
     fn relabel(
         &self,
-        previous: Option<&SamplerReader>,
+        previous: Option<&Carried>,
     ) -> Option<Result<Arc<dyn metriken_query::ColumnRelabel>, ()>> {
         if let Some(stream) = &self.occupants {
-            let known = previous
-                .map(|p| {
-                    p.occupant_segments
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .unwrap_or_default();
-            return Some(match self.segments.occupants(stream, &known) {
+            let empty = OccupantSegments::new();
+            let known = previous.map_or(&empty, |p| &p.occupant_segments);
+            return Some(match self.segments.occupants(stream, known) {
                 Ok((rows, decoded)) => {
                     *self
                         .occupant_segments
@@ -1071,37 +1076,45 @@ impl ArchiveReader {
     /// not yet decoded, and takes over the segments `previous` had open;
     /// otherwise it opens as it would without this call. Nothing is reused
     /// for a table once retention has evicted a segment `previous` read.
-    /// Tables are matched by recording id and name, and a table already
-    /// built here is left as it is.
+    /// Tables are matched by recording id and name. A table already built
+    /// here is left as it is, and so is a table of a tar archive, which
+    /// has nothing to reuse. Call this before querying this reader.
     ///
     /// `previous` should be a reader of the same archive. A segment is
     /// matched by its sequence number, row count and time span, so a
     /// reader of another archive is reused from only where those agree.
     ///
-    /// A table of this reader holds the matching table of `previous` until
-    /// its own reader is built, and a table never queried passes it on to
-    /// the reader that reuses this one.
+    /// Until its reader is built, a table of this reader holds the state
+    /// `previous` saved for it, the segments `previous` had open among
+    /// those it reuses, and the decoded occupant-stream segments; a table
+    /// never queried passes them on to the reader that reuses this one.
+    /// None of it holds a connection to the archive.
     pub fn reuse_from(&self, previous: &ArchiveReader) {
         for table in &self.tables {
             // A table already built has no use for a predecessor.
-            if table.reader.get().is_some() {
+            if table.reader.get().is_some() || table.segments.source_id().is_none() {
                 continue;
             }
             let Some(old) = previous.tables.iter().find(|t| {
-                t.segments.source_id() == table.segments.source_id()
-                    && (t.segments.source_id().is_some() || t.recording == table.recording)
-                    && t.sampler == table.sampler
+                t.segments.source_id() == table.segments.source_id() && t.sampler == table.sampler
             }) else {
                 continue;
             };
             if Arc::ptr_eq(old, table) {
                 continue;
             }
-            // A table whose reader was built is carried; one that was not
-            // queried, or whose build failed, passes on its own
-            // predecessor, so the chain stays one reader deep.
+            // A table whose reader was built hands on its state; one that
+            // was not queried, or whose build failed, passes on what it
+            // was handed.
             let carried = match old.reader.get() {
-                Some(Some(TableReader::Segmented(_))) => Some(Arc::clone(old)),
+                Some(Some(TableReader::Segmented(r))) => Some(Carried {
+                    handover: r.handover(),
+                    occupant_segments: old
+                        .occupant_segments
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                }),
                 _ => old
                     .previous
                     .lock()
