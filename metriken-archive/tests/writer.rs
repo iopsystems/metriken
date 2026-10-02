@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use dendro::seal::SealPolicy;
-use metriken_archive::{ArchiveReader, ArchiveWriter, DendroCatalog, WriterConfig};
+use metriken_archive::{
+    ArchiveReader, ArchiveWriter, Catalog, DendroCatalog, SourceRecorder, WriterConfig,
+};
 use metriken_exposition::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
 use metriken_query::{BufferPool, MetricsSource, QueryResult};
 
@@ -148,6 +150,17 @@ fn snapshot(t: u64) -> Snapshot {
 /// Record `TICKS` snapshots; finalize when `finalize`, else leave the tail
 /// in the WAL. With `evict`, drop everything before that tick at the end.
 fn record(path: &Path, long_groups: bool, finalize: bool, evict: Option<u64>) {
+    record_with(path, long_groups, finalize, evict, &mut |_, _| {});
+}
+
+/// [`record`], running `on_tick` after each tick has landed.
+fn record_with(
+    path: &Path,
+    long_groups: bool,
+    finalize: bool,
+    evict: Option<u64>,
+    on_tick: &mut dyn FnMut(&mut SourceRecorder, u64),
+) {
     let config = WriterConfig {
         seal: SealPolicy {
             max_rows: 5,
@@ -167,6 +180,8 @@ fn record(path: &Path, long_groups: bool, finalize: bool, evict: Option<u64>) {
         let staged = source.stage(&snap, BASE + t * S, 0).unwrap();
         writer.commit(vec![staged]).unwrap();
         source.maybe_seal().unwrap();
+        source.sync().unwrap();
+        on_tick(&mut source, t);
     }
     if let Some(t) = evict {
         source.evict_before(BASE + t * S).unwrap();
@@ -243,7 +258,6 @@ const QUERIES: &[&str] = &[
 ];
 
 fn streams(path: &Path) -> Vec<String> {
-    use metriken_archive::Catalog;
     let catalog = DendroCatalog::open(path).unwrap();
     let id = catalog.sources().unwrap()[0].id;
     catalog.tables(id).unwrap()
@@ -848,4 +862,203 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
             "finalize={finalize}"
         );
     }
+}
+
+/// A catalog counting the sealed segments read through it.
+struct Counting {
+    inner: DendroCatalog,
+    fetched: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Catalog for Counting {
+    fn sources(&self) -> Result<Vec<metriken_archive::catalog::Source>, String> {
+        self.inner.sources()
+    }
+    fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {
+        self.inner.tables(source_id)
+    }
+    fn segment_meta(
+        &self,
+        source_id: i64,
+        table: &str,
+    ) -> Result<Vec<(u64, metriken_archive::catalog::SegmentMeta)>, String> {
+        self.inner.segment_meta(source_id, table)
+    }
+    fn segment_bytes(
+        &self,
+        source_id: i64,
+        table: &str,
+        seq: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.fetched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.segment_bytes(source_id, table, seq)
+    }
+    fn live_wal(
+        &self,
+        source_id: i64,
+        table: &str,
+    ) -> Result<Vec<metriken_archive::catalog::WalRow>, String> {
+        self.inner.live_wal(source_id, table)
+    }
+    fn segment_indexes(
+        &self,
+        source_id: i64,
+        table: &str,
+    ) -> Result<Vec<metriken_archive::SegmentIndex>, String> {
+        self.inner.segment_indexes(source_id, table)
+    }
+    fn segment_span(
+        &self,
+        source_id: i64,
+        table: &str,
+    ) -> Result<(u64, metriken_archive::catalog::Span), String> {
+        self.inner.segment_span(source_id, table)
+    }
+    fn live_wal_span(
+        &self,
+        source_id: i64,
+        table: &str,
+    ) -> Result<metriken_archive::catalog::Span, String> {
+        self.inner.live_wal_span(source_id, table)
+    }
+    fn caller_row_streams(&self, source_id: i64) -> Result<Vec<String>, String> {
+        self.inner.caller_row_streams(source_id)
+    }
+    fn caller_rows(
+        &self,
+        source_id: i64,
+        stream: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.inner.caller_rows(source_id, stream, from, to)
+    }
+    fn last_caller_row_at_or_before(
+        &self,
+        source_id: i64,
+        stream: &str,
+        upto: u64,
+        pred: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<Option<u64>, String> {
+        self.inner
+            .last_caller_row_at_or_before(source_id, stream, upto, pred)
+    }
+}
+
+/// Opens `path` on `pool` through a [`Counting`] catalog; returns the reader
+/// and its fetch count.
+fn open_counting(
+    path: &Path,
+    pool: &Arc<BufferPool>,
+) -> (ArchiveReader, Arc<std::sync::atomic::AtomicUsize>) {
+    let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let catalog = Counting {
+        inner: DendroCatalog::open(path).unwrap(),
+        fetched: Arc::clone(&fetched),
+    };
+    let mut recordings =
+        ArchiveReader::from_catalog(Box::new(catalog), None, Arc::clone(pool), None).unwrap();
+    (recordings.remove(0).1, fetched)
+}
+
+fn answers(reader: &ArchiveReader, from: u64) -> Vec<Result<Answer, String>> {
+    QUERIES
+        .iter()
+        .map(|q| answer(reader, q, from).map(|a| a.0))
+        .collect()
+}
+
+/// While an archive is written, and through an eviction, a reader reopened
+/// with `reuse_from` answers as a fresh open does, and reads fewer
+/// segments doing it.
+fn follow(long_groups: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("follow.dendro");
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let mut previous: Option<ArchiveReader> = None;
+    let (mut reused_fetches, mut fresh_fetches) = (0, 0);
+    let mut from = 0;
+    record_with(&path, long_groups, false, None, &mut |source, t| {
+        if t == 17 {
+            from = 12;
+            source.evict_before(BASE + from * S).unwrap();
+            source.sync().unwrap();
+        }
+        if t % 2 == 0 && t != 18 {
+            return;
+        }
+        let (fresh, fresh_count) = open_counting(&path, &pool);
+        let (after, after_count) = open_counting(&path, &pool);
+        if let Some(previous) = &previous {
+            after.reuse_from(previous);
+        }
+        assert_eq!(answers(&after, from), answers(&fresh, from), "tick {t}");
+        if previous.is_some() {
+            use std::sync::atomic::Ordering::Relaxed;
+            reused_fetches += after_count.load(Relaxed);
+            fresh_fetches += fresh_count.load(Relaxed);
+        }
+        previous = Some(after);
+    });
+    assert!(
+        reused_fetches * 2 < fresh_fetches,
+        "reuse read {reused_fetches} segments, fresh opens {fresh_fetches}"
+    );
+}
+
+#[test]
+fn a_reused_long_reader_answers_as_a_fresh_open() {
+    follow(true);
+}
+
+#[test]
+fn a_reused_wide_reader_answers_as_a_fresh_open() {
+    follow(false);
+}
+
+/// Compaction gives a merged segment the sequence number of the first
+/// segment it replaced. A reader that saw that first segment alone is not
+/// reused for the merged one.
+#[test]
+fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact.dendro");
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let mut early: Option<ArchiveReader> = None;
+    record_with(&path, true, true, None, &mut |_, t| {
+        // One segment of five rows sealed, the rest in the tail. Read from
+        // a copy, since compaction needs the archive to itself; the copy's
+        // sequence numbers are the original's.
+        if t == 6 {
+            let copy = dir.path().join("early.dendro");
+            for suffix in ["", "-wal"] {
+                let from = format!("{}{suffix}", path.display());
+                if std::path::Path::new(&from).exists() {
+                    std::fs::copy(&from, format!("{}{suffix}", copy.display())).unwrap();
+                }
+            }
+            let (reader, _) = open_counting(&copy, &pool);
+            answers(&reader, 0);
+            early = Some(reader);
+        }
+    });
+    {
+        let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
+        let tables = streams(&path);
+        let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+        for stream in tables {
+            dendro::rewrite::compact_stream(
+                &mut db,
+                id,
+                &stream,
+                &dendro::rewrite::CompactSpec::to_rows(10),
+            )
+            .unwrap();
+        }
+    }
+    let (fresh, _) = open_counting(&path, &pool);
+    let (after, _) = open_counting(&path, &pool);
+    after.reuse_from(early.as_ref().unwrap());
+    assert_eq!(answers(&after, 0), answers(&fresh, 0));
 }

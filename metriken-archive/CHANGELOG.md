@@ -10,11 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `ArchiveReader::reuse_from`: a reader opened over a live archive after
-  another starts each table from the work the other did for it. Sealed
-  segments and occupant-stream segments already read are not read again,
-  and the segments the other reader had open are taken over. A query after
-  a reopen that cost 4-5x a warm query on a 30-minute recording of a
-  per-task group costs 1-1.7x.
+  another reads, for each table the other had queried, only the segments
+  sealed since and the occupant-stream segments it had not decoded, and
+  takes over the segments the other had open. Segments are matched by
+  sequence number, row count and time span. Nothing is reused for a table
+  once retention evicts a segment the other read. On a 30-minute recording
+  of a per-task group, a query after a reopen took 485 ms against 180 ms
+  warm; after a reopen that reuses the previous reader it takes 230-240 ms.
 
 ## [0.3.2] - 2026-10-01
 

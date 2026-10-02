@@ -43,9 +43,9 @@ pub trait SegmentStore: Send + Sync {
     /// it. `Err` is a read failure and is reported.
     fn bytes(&self, idx: usize) -> SegmentBytes;
 
-    /// An id for segment `idx` that stays the same for as long as the
-    /// segment's bytes do, unique among this table's segments: a sealed
-    /// segment's. `None` (the default) for a segment that can change, such
+    /// An id for segment `idx` that differs whenever the segment's bytes do,
+    /// among this table's segments as the store presents them over time.
+    /// `None` (the default) for a segment that can change under one id, such
     /// as one built from a live tail. A reader reopened with
     /// [`SegmentedParquetReader::open_after`] reuses its predecessor's work
     /// for the leading segments whose ids match.
@@ -95,11 +95,11 @@ pub trait ColumnRelabel: Send + Sync {
     /// What one sample of the column presents as. `None` leaves it as it is.
     fn at(&self, name: &str, labels: &Labels, timestamp: u64) -> Option<Labels>;
 
-    /// Whether [`identities`](Self::identities) for a column can only grow
-    /// with segments that carry it: true when a column's label sets are
-    /// fixed once written, as a long table's occupant labels are. A reader
-    /// reopened with [`SegmentedParquetReader::open_after`] reuses its
-    /// predecessor's indexes only then. Default: false.
+    /// Whether every instance of this relabel built over the same table
+    /// returns the same [`identities`](Self::identities) for a column of a
+    /// segment with a [`SegmentStore::key`], so that a reader reopened with
+    /// [`SegmentedParquetReader::open_after`] can keep the identities its
+    /// predecessor computed for those segments. Default: false.
     fn identities_are_fixed(&self) -> bool {
         false
     }
@@ -206,10 +206,12 @@ impl SegmentedParquetReader {
     /// The leading segments the store names by [`SegmentStore::key`] that
     /// match the ones `previous` was opened with are not read again: the new
     /// reader starts from the identity indexes and catalog `previous` had
-    /// after them, and takes over the segments it had open. The rest are
-    /// read as [`open_with_pool`](Self::open_with_pool) reads them. Reuse
-    /// needs a relabel whose identities do not change
-    /// ([`ColumnRelabel::identities_are_fixed`]), or none.
+    /// after them, and takes over the segments it had open when both use
+    /// the same `pool`. The rest are read as
+    /// [`open_with_pool`](Self::open_with_pool) reads them. Reuse needs a
+    /// relabel whose identities are fixed
+    /// ([`ColumnRelabel::identities_are_fixed`]) or none, and `previous`
+    /// opened with a relabel exactly when this open has one.
     pub fn open_after(
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
@@ -229,19 +231,26 @@ impl SegmentedParquetReader {
             return Err("SegmentedParquetReader requires at least one segment".into());
         }
 
-        // The leading segments the store can name: sealed ones, which never
-        // change. The state after them is what a later reopen can reuse.
+        // The leading segments the store can name, whose bytes do not
+        // change while their keys stay the same. The state after them is
+        // what a later reopen can reuse.
         let keys: Vec<u64> = (0..store.len()).map_while(|i| store.key(i)).collect();
+        let relabeled = relabel.is_some();
         let reusable = relabel.as_ref().is_none_or(|r| r.identities_are_fixed());
         let reused = previous
             .filter(|_| reusable)
-            .and_then(|p| p.source.sealed_prefix(&keys));
-        let (mut state, start, mut sealed) = match &reused {
-            Some((prev, len)) => {
-                let sealed = (*len == keys.len()).then(|| Arc::clone(prev));
-                ((**prev).clone(), *len, sealed)
+            .and_then(|p| p.source.sealed_prefix(&keys, relabeled));
+        let (mut state, start) = match &reused {
+            Some((prev, len)) => ((**prev).clone(), *len),
+            None => (OpenState::default(), 0),
+        };
+        // Taken at the boundary between the keyed segments and the rest,
+        // when there is a rest; otherwise the full state serves as both.
+        let mut sealed = match &reused {
+            Some((prev, len)) if *len == keys.len() && keys.len() < store.len() => {
+                Some(Arc::clone(prev))
             }
-            None => (OpenState::default(), 0, None),
+            _ => None,
         };
 
         for idx in start..store.len() {
@@ -259,52 +268,42 @@ impl SegmentedParquetReader {
             let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
             state.fold(idx, &seg, relabel.as_ref())?;
         }
-        if keys.len() == store.len() && sealed.is_none() && reusable {
-            sealed = Some(Arc::new(state.clone()));
-        }
         if state.opened == 0 {
             return Err("every segment of the table was gone by the time it was opened".into());
         }
         state.histogram_runs.report();
+        let state = Arc::new(state);
+        if !keys.is_empty() && keys.len() == store.len() {
+            sealed = Some(Arc::clone(&state));
+        }
 
         // The previous reader's opened segments for the shared ones, so a
-        // query after a reopen does not fetch and parse them again.
+        // query after a reopen does not fetch and parse them again. Only on
+        // the same pool, whose budget they are decoded into.
         let mut cache = SegmentCache::new(pool.max_bytes());
         if let (Some(prev), Some((_, len))) = (previous, &reused) {
-            let prev_cache = prev.source.cache.lock().unwrap_or_else(|e| e.into_inner());
-            // Least recently used first, so the new cache keeps the order.
-            for (idx, (seg, size)) in prev_cache.entries.iter().rev() {
-                if idx < len {
-                    cache.insert(*idx, Arc::clone(seg), *size);
+            if Arc::ptr_eq(&prev.source.pool, &pool) {
+                let prev_cache = prev.source.cache.lock().unwrap_or_else(|e| e.into_inner());
+                // Least recently used first, so the new cache keeps the order.
+                for (idx, (seg, size)) in prev_cache.entries.iter().rev() {
+                    if idx < len {
+                        cache.insert(*idx, Arc::clone(seg), *size);
+                    }
                 }
             }
         }
 
-        let OpenState {
-            catalog,
-            counter_identity,
-            gauge_identity,
-            histogram_identity,
-            histogram_runs,
-            file_metadata,
-            column_map,
-            counter_columns,
-            ..
-        } = state;
         let source = Arc::new(SegmentedSource {
             store,
-            catalog,
             cache: Mutex::new(cache),
             pool,
             relabel,
-            counter_identity,
-            gauge_identity,
-            histogram_identity,
-            histogram_runs,
-            file_metadata,
-            column_map,
-            counter_columns,
-            sealed: sealed.filter(|_| reusable).map(|state| (keys, state)),
+            state,
+            sealed: sealed.filter(|_| reusable).map(|state| Sealed {
+                keys,
+                relabeled,
+                state,
+            }),
         });
         let engine = QueryEngine::new(Arc::clone(&source) as Arc<dyn DataSource>);
         Ok(Self { source, engine })
@@ -312,7 +311,7 @@ impl SegmentedParquetReader {
 
     /// Number of segments backing this reader, gone ones included.
     pub fn segment_count(&self) -> usize {
-        self.source.catalog.len()
+        self.source.state.catalog.len()
     }
 
     /// The reader's spliced [`DataSource`] (the same [`SegmentedSource`]
@@ -417,13 +416,23 @@ impl SegmentedParquetReader {
 /// after the segments both share.
 #[derive(Clone, Default)]
 struct OpenState {
+    /// One entry per segment, in store order.
     catalog: Vec<SegmentCatalog>,
+    /// Open-time identity indexes (see [`SeriesIdentity`]) used to splice
+    /// counters/gauges/histograms in O(1) per sample instead of scanning
+    /// the already-spliced accumulator.
     counter_identity: SeriesIdentity,
     gauge_identity: SeriesIdentity,
     histogram_identity: SeriesIdentity,
+    /// Cross-segment histogram config-conflict resolution (see
+    /// [`HistogramRunIndex`]).
     histogram_runs: HistogramRunIndex,
+    /// Merged across segments at open, last wins.
     file_metadata: HashMap<String, String>,
+    /// Built at open from every segment's columns; see `column_map`.
     column_map: HashMap<String, HashMap<Labels, String>>,
+    /// name -> per series position, the `(segment, column)` pairs its
+    /// samples come from, in segment order. What `counter_streams` reads.
     counter_columns: CounterColumns,
     /// Segments folded in that were present (not gone).
     opened: usize,
@@ -659,6 +668,11 @@ fn check_histogram_configs(idx: usize, segment: &ParquetReader) -> Result<(), Bo
     Ok(())
 }
 
+/// The hasher for maps keyed by a series' labels, which the reader builds at
+/// open and probes per column: foldhash rather than SipHash, since the keys
+/// come from the archive's own catalog.
+type LabelsHash = foldhash::fast::RandomState;
+
 /// `(name, labels) -> position` for one metric kind (counter, gauge, or raw
 /// per-column histogram identity), built ONCE at open from footer-only
 /// column lists (see [`ParquetReader::counter_columns`] and its gauge/
@@ -684,11 +698,6 @@ fn check_histogram_configs(idx: usize, segment: &ParquetReader) -> Result<(), Bo
 /// regression test). Built from RAW schema order
 /// (`counter_columns`/`gauge_columns`/`histogram_columns`), not the sorted
 /// order `counter_labels`/etc. return for display.
-/// The hasher for maps keyed by a series' labels, which the reader builds at
-/// open and probes per column: foldhash rather than SipHash, since the keys
-/// come from the archive's own catalog.
-type LabelsHash = foldhash::fast::RandomState;
-
 #[derive(Clone, Default)]
 struct SeriesIdentity {
     /// name -> distinct label sets, index == position.
@@ -845,33 +854,26 @@ impl HistogramRunIndex {
 struct SegmentedSource {
     /// Where segment bytes come from when a query needs them.
     store: Arc<dyn SegmentStore>,
-    /// One entry per segment, in store order.
-    catalog: Vec<SegmentCatalog>,
     /// Segments opened by queries, bounded by bytes.
     cache: Mutex<SegmentCache>,
     /// Decode cache every opened segment is wired to.
     pool: Arc<BufferPool>,
     /// Time-varying identity for the columns, if the archive has one.
     relabel: Option<Arc<dyn ColumnRelabel>>,
-    /// Open-time identity indexes (see [`SeriesIdentity`]) used to splice
-    /// counters/gauges/histograms in O(1) per sample instead of scanning
-    /// the already-spliced accumulator.
-    counter_identity: SeriesIdentity,
-    gauge_identity: SeriesIdentity,
-    histogram_identity: SeriesIdentity,
-    /// Cross-segment histogram config-conflict resolution (see
-    /// [`HistogramRunIndex`]).
-    histogram_runs: HistogramRunIndex,
-    /// Merged across segments at open, last wins.
-    file_metadata: HashMap<String, String>,
-    /// Built at open from every segment's columns; see `column_map`.
-    column_map: HashMap<String, HashMap<Labels, String>>,
-    /// name -> per series position, the `(segment, column)` pairs its
-    /// samples come from, in segment order. What `counter_streams` reads.
-    counter_columns: CounterColumns,
-    /// The keys of the leading sealed segments and the open state after
-    /// them, for a reader reopened over the same table.
-    sealed: Option<(Vec<u64>, Arc<OpenState>)>,
+    /// What open built from every segment.
+    state: Arc<OpenState>,
+    /// What open built from the leading keyed segments, for a reader
+    /// reopened over the same table.
+    sealed: Option<Sealed>,
+}
+
+/// The open state after a table's leading keyed segments.
+struct Sealed {
+    /// The keys of those segments, in store order.
+    keys: Vec<u64>,
+    /// Whether the state was built with a relabel.
+    relabeled: bool,
+    state: Arc<OpenState>,
 }
 
 /// name -> where each series' samples are.
@@ -897,12 +899,15 @@ struct Location {
 }
 
 impl SegmentedSource {
-    /// The state after this reader's sealed segments, and how many there
-    /// are, when they are the first of `keys`.
-    fn sealed_prefix(&self, keys: &[u64]) -> Option<(Arc<OpenState>, usize)> {
-        let (sealed, state) = self.sealed.as_ref()?;
-        (keys.len() >= sealed.len() && keys[..sealed.len()] == sealed[..])
-            .then(|| (Arc::clone(state), sealed.len()))
+    /// The state after this reader's keyed segments, and how many there
+    /// are, when they are the first of `keys` and were read with a relabel
+    /// exactly when `relabeled` says so.
+    /// A reader with a relabel and one without never share state.
+    fn sealed_prefix(&self, keys: &[u64], relabeled: bool) -> Option<(Arc<OpenState>, usize)> {
+        let sealed = self.sealed.as_ref()?;
+        let n = sealed.keys.len();
+        (sealed.relabeled == relabeled && keys.len() >= n && keys[..n] == sealed.keys[..])
+            .then(|| (Arc::clone(&sealed.state), n))
     }
 
     /// The filter a segment is asked with: the query's own, unless a
@@ -963,7 +968,8 @@ impl SegmentedSource {
         start_ns: u64,
         end_ns: u64,
     ) -> impl Iterator<Item = (usize, Arc<ParquetReader>)> + '_ {
-        self.catalog
+        self.state
+            .catalog
             .iter()
             .enumerate()
             .filter(move |(_, entry)| entry.touches(start_ns, end_ns))
@@ -1239,7 +1245,7 @@ impl DataSource for SegmentedSource {
         // used to do (see `SeriesIdentity`). A label-filtered query simply
         // leaves the non-matching slots `None`, dropped by `flatten()`
         // below — same outcome as before, just not by linear search.
-        let order = self.counter_identity.order(name);
+        let order = self.state.counter_identity.order(name);
         if order.is_empty() {
             return None;
         }
@@ -1257,7 +1263,7 @@ impl DataSource for SegmentedSource {
                 .into_iter()
                 .flat_map(|c| relabel_counter(self.relabel.as_deref(), name, filter, c))
             {
-                match self.counter_identity.position(name, &c.labels) {
+                match self.state.counter_identity.position(name, &c.labels) {
                     Some(pos) => match &mut slots[pos] {
                         Some(a) => merge_counter(a, c),
                         slot => *slot = Some(c),
@@ -1292,11 +1298,11 @@ impl DataSource for SegmentedSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<Vec<crate::CounterStream<'s>>> {
-        let order = self.counter_identity.order(name);
+        let order = self.state.counter_identity.order(name);
         if order.is_empty() {
             return None;
         }
-        let table = self.counter_columns.get(name)?;
+        let table = self.state.counter_columns.get(name)?;
         let name: Arc<str> = Arc::from(name);
         // Few series: a long segment may decode only each one's pages. Many:
         // each segment decodes a row group once for all of them.
@@ -1318,7 +1324,7 @@ impl DataSource for SegmentedSource {
             let name = Arc::clone(&name);
             let samples = locations
                 .iter()
-                .filter(move |l| self.catalog[l.segment as usize].touches(start_ns, end_ns))
+                .filter(move |l| self.state.catalog[l.segment as usize].touches(start_ns, end_ns))
                 .filter_map(move |l| {
                     let idx = l.segment as usize;
                     let seg = match self.segment(idx) {
@@ -1332,8 +1338,14 @@ impl DataSource for SegmentedSource {
                     let chunk = seg.counter_column(&l.position, start_ns, end_ns, selective)?;
                     // A read of one occupant of a long column holds only that
                     // occupant's samples, which present as this series' labels
-                    // throughout, so relabelling it would only rebuild them.
-                    if l.position.occupant.is_some() {
+                    // throughout when the relabel's identities are fixed, so
+                    // relabelling it would only rebuild them.
+                    if l.position.occupant.is_some()
+                        && self
+                            .relabel
+                            .as_deref()
+                            .is_none_or(|r| r.identities_are_fixed())
+                    {
                         return Some(vec![chunk.labeled(series_labels.clone())]);
                     }
                     let chunk = chunk.labeled(table.labels[l.column_labels as usize].clone());
@@ -1363,7 +1375,7 @@ impl DataSource for SegmentedSource {
     }
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
-        let order = self.gauge_identity.order(name);
+        let order = self.state.gauge_identity.order(name);
         if order.is_empty() {
             return None;
         }
@@ -1381,7 +1393,7 @@ impl DataSource for SegmentedSource {
                 .into_iter()
                 .flat_map(|g| relabel_gauge(self.relabel.as_deref(), name, filter, g))
             {
-                match self.gauge_identity.position(name, &g.labels) {
+                match self.state.gauge_identity.position(name, &g.labels) {
                     Some(pos) => match &mut slots[pos] {
                         Some(a) => merge_gauge(a, g),
                         slot => *slot = Some(g),
@@ -1411,7 +1423,7 @@ impl DataSource for SegmentedSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        if self.histogram_runs.run_count(name) <= 1 {
+        if self.state.histogram_runs.run_count(name) <= 1 {
             // No conflict, so the segments' own labels carry no `__run__` and
             // `Labels::matches` would fail closed on one. A dashboard can
             // legitimately pin `__run__="0"` to keep one query working across
@@ -1432,7 +1444,7 @@ impl DataSource for SegmentedSource {
                 })
                 .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &effective, s))
                 .collect();
-            return splice_histogram_streams(name, &self.histogram_identity, streams);
+            return splice_histogram_streams(name, &self.state.histogram_identity, streams);
         }
 
         // Cross-segment histogram config conflict: `name` carries more than
@@ -1454,7 +1466,7 @@ impl DataSource for SegmentedSource {
         let seg_filter = self.segment_filter(name, &inner_filter);
         let streams: Vec<HistogramStream> = self
             .touched(start_ns, end_ns)
-            .filter(|(idx, _)| self.histogram_runs.segment_run(name, *idx) == Some(want_run))
+            .filter(|(idx, _)| self.state.histogram_runs.segment_run(name, *idx) == Some(want_run))
             .filter_map(|(_, seg)| {
                 seg.data_source()
                     .histogram_stream(name, &seg_filter, start_ns, end_ns)
@@ -1462,12 +1474,13 @@ impl DataSource for SegmentedSource {
             .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &inner_filter, s))
             .collect();
 
-        let spliced = splice_histogram_streams(name, &self.histogram_identity, streams)?;
+        let spliced = splice_histogram_streams(name, &self.state.histogram_identity, streams)?;
         Some(relabel_with_run(spliced, want_run))
     }
 
     fn interval(&self) -> f64 {
-        self.catalog
+        self.state
+            .catalog
             .iter()
             .filter(|c| c.present)
             .map(|c| c.interval)
@@ -1475,7 +1488,8 @@ impl DataSource for SegmentedSource {
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {
-        self.catalog
+        self.state
+            .catalog
             .iter()
             .filter_map(|c| c.span)
             .fold(None, |acc, (lo, hi)| match acc {
@@ -1485,28 +1499,28 @@ impl DataSource for SegmentedSource {
     }
 
     fn counter_names(&self) -> Vec<String> {
-        self.counter_identity.names()
+        self.state.counter_identity.names()
     }
 
     fn gauge_names(&self) -> Vec<String> {
-        self.gauge_identity.names()
+        self.state.gauge_identity.names()
     }
 
     fn histogram_names(&self) -> Vec<String> {
-        self.histogram_identity.names()
+        self.state.histogram_identity.names()
     }
 
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.counter_identity.labels(name)
+        self.state.counter_identity.labels(name)
     }
 
     fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.gauge_identity.labels(name)
+        self.state.gauge_identity.labels(name)
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        if self.histogram_runs.run_count(name) <= 1 {
-            return self.histogram_identity.labels(name);
+        if self.state.histogram_runs.run_count(name) <= 1 {
+            return self.state.histogram_identity.labels(name);
         }
         // Conflict: surface each run's label sets tagged with `__run__` so
         // the split is addressable (`histogram_mean(latency{__run__="1"})`).
@@ -1515,6 +1529,7 @@ impl DataSource for SegmentedSource {
         // overwritten below.
         let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
         for (run, labels) in self
+            .state
             .histogram_runs
             .run_labels
             .get(name)
@@ -1536,15 +1551,15 @@ impl DataSource for SegmentedSource {
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {
-        self.file_metadata.clone()
+        self.state.file_metadata.clone()
     }
 
     fn metadata_get(&self, key: &str) -> Option<String> {
-        self.file_metadata.get(key).cloned()
+        self.state.file_metadata.get(key).cloned()
     }
 
     fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
-        self.column_map.clone()
+        self.state.column_map.clone()
     }
 
     fn sample_timestamps(&self) -> Vec<u64> {
@@ -4084,12 +4099,23 @@ mod tests {
             .collect()
     }
 
+    /// The answer to a fixed query, with each series' labels sorted.
     fn answer(r: &SegmentedParquetReader) -> String {
-        format!(
-            "{:?}",
-            r.query_range("rate(cpu_cycles[2s])", 1.0, 20.0, 1.0)
-                .unwrap()
-        )
+        let QueryResult::Matrix { result } = r
+            .query_range("rate(cpu_cycles[2s])", 1.0, 20.0, 1.0)
+            .unwrap()
+        else {
+            panic!("not a matrix");
+        };
+        let mut out: Vec<String> = result
+            .into_iter()
+            .map(|m| {
+                let labels: BTreeMap<_, _> = m.metric.into_iter().collect();
+                format!("{labels:?} {:?}", m.values)
+            })
+            .collect();
+        out.sort();
+        out.join("\n")
     }
 
     /// A reader opened after another over the same table reads only the
@@ -4201,5 +4227,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.fetched(), vec![0, 1]);
+    }
+
+    /// Presents every `slot` column as `who="a"` throughout, and says its
+    /// identities are fixed.
+    struct AllA;
+
+    impl ColumnRelabel for AllA {
+        fn identities(&self, _name: &str, labels: &Labels) -> Option<Vec<Labels>> {
+            labels
+                .inner
+                .contains_key("slot")
+                .then(|| vec![HandOver::with(labels, "a")])
+        }
+
+        fn split(&self, _name: &str, labels: &Labels, timestamps: &[u64]) -> Option<Vec<Run>> {
+            labels
+                .inner
+                .contains_key("slot")
+                .then(|| vec![(HandOver::with(labels, "a"), 0..timestamps.len())])
+        }
+
+        fn at(&self, _name: &str, labels: &Labels, _timestamp: u64) -> Option<Labels> {
+            labels
+                .inner
+                .contains_key("slot")
+                .then(|| HandOver::with(labels, "a"))
+        }
+
+        fn segment_filter(&self, _name: &str, filter: &Labels) -> Labels {
+            let mut f = filter.clone();
+            f.inner.remove("who");
+            f
+        }
+
+        fn identities_are_fixed(&self) -> bool {
+            true
+        }
+    }
+
+    /// A reader opened without a relabel is not reused by an open with one,
+    /// whose identities for the same columns differ.
+    #[test]
+    fn open_after_a_reader_without_a_relabel_reads_everything() {
+        let seg = |from| segment("cpu_cycles", &[("slot", "0")], &rows(from, 4));
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let segments = || vec![(Some(1), seg(1)), (Some(2), seg(5)), (None, seg(9))];
+        let first = SegmentedParquetReader::open_with_pool(
+            KeyedSegments::new(segments()),
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        answer(&first);
+        let store = KeyedSegments::new(segments());
+        let after = SegmentedParquetReader::open_after(
+            Arc::clone(&store) as Arc<dyn SegmentStore>,
+            Arc::clone(&pool),
+            Some(Arc::new(AllA)),
+            &first,
+        )
+        .unwrap();
+        assert_eq!(store.fetched(), vec![0, 1, 2]);
+        let fresh = SegmentedParquetReader::open_relabeled_with_pool(
+            KeyedSegments::new(segments()),
+            Arc::clone(&pool),
+            Arc::new(AllA),
+        )
+        .unwrap();
+        assert_eq!(
+            after.counter_labels("cpu_cycles"),
+            fresh.counter_labels("cpu_cycles")
+        );
+        assert_eq!(answer(&after), answer(&fresh));
     }
 }

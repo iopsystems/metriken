@@ -60,8 +60,11 @@ impl OccupantLabels {
 }
 
 impl ColumnRelabel for OccupantLabels {
-    /// An occupant number's labels never change once written, so a long
-    /// column presents as the same label set in every segment.
+    /// True for a table written by metriken-archive's writer, which commits
+    /// an occupant's labels with the first row naming it and keeps them one
+    /// restatement period longer than the rows. An occupant the stream does
+    /// not describe presents bare, and keeps presenting bare to a reader
+    /// that reuses a predecessor's identities after it is described.
     fn identities_are_fixed(&self) -> bool {
         true
     }

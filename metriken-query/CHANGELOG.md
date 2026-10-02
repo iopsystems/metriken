@@ -11,17 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `SegmentedParquetReader::open_after` opens a table over the reader that
   preceded it: the leading segments whose `SegmentStore::key` matches are
-  not read again, and their opened segments are taken over.
-- `SegmentStore::key`, an id for a segment whose bytes do not change.
-  Default `None`.
-- `ColumnRelabel::identities_are_fixed`, whether a column's label sets only
-  grow with the segments that carry it. Default `false`; `true` for
-  `long::OccupantLabels`.
+  not read again, and the segments it had open on the same pool are taken
+  over. It applies when both readers have no relabel, or both have one
+  whose identities are fixed.
+- `SegmentStore::key`, an id for a segment that differs whenever its bytes
+  do. Default `None`.
+- `ColumnRelabel::identities_are_fixed`, whether every instance of a
+  relabel over the same table returns the same identities for a keyed
+  segment's columns. Default `false`; `true` for `long::OccupantLabels`.
 
 ### Changed
 
-- A read of one occupant of a long column is not relabelled again, and the
-  maps keyed by label sets hash with foldhash.
+- A read of one occupant of a long column is not relabelled again when the
+  relabel's identities are fixed, and the maps keyed by label sets hash
+  with foldhash.
 
 ## [0.34.0] - 2026-10-02
 
