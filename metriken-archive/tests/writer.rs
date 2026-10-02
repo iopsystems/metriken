@@ -266,7 +266,10 @@ fn compare(finalize: bool, evict: Option<u64>) {
         assert_eq!(l.as_ref().map(|a| &a.0), w.as_ref().map(|a| &a.0), "{q}");
         // `cron` is gone by tick 15, so after eviction it has no series.
         if evict.is_some() && q.contains("cron") {
-            assert!(w.is_err(), "{q}: an evicted occupant still answers");
+            assert!(
+                w.as_ref().is_ok_and(|(a, _)| a.is_empty()),
+                "{q}: an evicted occupant still answers: {w:?}"
+            );
             continue;
         }
         let ((w, wide_occupants), (_, long_occupants)) = (w.unwrap(), l.unwrap());
