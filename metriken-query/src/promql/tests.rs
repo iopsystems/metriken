@@ -95,11 +95,11 @@ fn test_query_engine_creation() {
 /// another, says so rather than answering empty or reporting it missing.
 #[test]
 fn a_name_held_as_another_kind_is_unsupported() {
-    let unsupported = |engine: &QueryEngine, q: &str, kind: &str| {
-        match engine.query_range(q, 1000.0, 1004.0, 1.0) {
-            Err(QueryError::Unsupported(msg)) => assert!(msg.contains(kind), "{q}: {msg}"),
-            other => panic!("{q}: expected Unsupported, got {other:?}"),
-        }
+    let unsupported = |engine: &QueryEngine, q: &str, kind: &str| match engine
+        .query_range(q, 1000.0, 1004.0, 1.0)
+    {
+        Err(QueryError::Unsupported(msg)) => assert!(msg.contains(kind), "{q}: {msg}"),
+        other => panic!("{q}: expected Unsupported, got {other:?}"),
     };
     let gauges = QueryEngine::new(Arc::new(create_gauge_source()));
     unsupported(&gauges, "rate(test_gauge[2s])", "gauge");
