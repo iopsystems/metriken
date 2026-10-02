@@ -1056,6 +1056,7 @@ version = "0.34.0"
 dependencies = [
  "arrow",
  "bytes",
+ "foldhash 0.2.0",
  "histogram",
  "lru",
  "metriken-exposition",

@@ -574,12 +574,17 @@ fn check_histogram_configs(idx: usize, segment: &ParquetReader) -> Result<(), Bo
 /// regression test). Built from RAW schema order
 /// (`counter_columns`/`gauge_columns`/`histogram_columns`), not the sorted
 /// order `counter_labels`/etc. return for display.
+/// The hasher for maps keyed by a series' labels, which the reader builds at
+/// open and probes per column: foldhash rather than SipHash, since the keys
+/// come from the archive's own catalog.
+type LabelsHash = foldhash::fast::RandomState;
+
 #[derive(Default)]
 struct SeriesIdentity {
     /// name -> distinct label sets, index == position.
     order: HashMap<String, Vec<Labels>>,
     /// name -> (labels -> position), mirrors `order`.
-    pos: HashMap<String, HashMap<Labels, usize>>,
+    pos: HashMap<String, HashMap<Labels, usize, LabelsHash>>,
 }
 
 impl SeriesIdentity {
@@ -764,7 +769,7 @@ type CounterColumns = HashMap<String, ColumnTable>;
 #[derive(Default)]
 struct ColumnTable {
     labels: Vec<Labels>,
-    labels_index: HashMap<Labels, usize>,
+    labels_index: HashMap<Labels, usize, LabelsHash>,
     by_series: Vec<Vec<Location>>,
 }
 
@@ -991,7 +996,7 @@ fn relabel_histogram_stream(
     // identity each column can present as, in column order, and rows map
     // into it.
     let mut series: Vec<Labels> = Vec::new();
-    let mut position: HashMap<Labels, usize> = HashMap::new();
+    let mut position: HashMap<Labels, usize, LabelsHash> = HashMap::default();
     for labels in &base {
         let sets = relabel
             .identities(&name, labels)
@@ -1203,9 +1208,14 @@ impl DataSource for SegmentedSource {
                             return None;
                         }
                     };
-                    let chunk = seg
-                        .counter_column(&l.position, start_ns, end_ns, selective)?
-                        .labeled(table.labels[l.column_labels as usize].clone());
+                    let chunk = seg.counter_column(&l.position, start_ns, end_ns, selective)?;
+                    // A read of one occupant of a long column holds only that
+                    // occupant's samples, which present as this series' labels
+                    // throughout, so relabelling it would only rebuild them.
+                    if l.position.occupant.is_some() {
+                        return Some(vec![chunk.labeled(series_labels.clone())]);
+                    }
+                    let chunk = chunk.labeled(table.labels[l.column_labels as usize].clone());
                     // A relabelled column carries every occupant's samples;
                     // this stream is one occupant's.
                     let pieces =
