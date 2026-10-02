@@ -91,6 +91,65 @@ fn test_query_engine_creation() {
     }
 }
 
+/// A function that reads one kind, given a name the source holds only as
+/// another, says so rather than answering empty or reporting it missing.
+#[test]
+fn a_name_held_as_another_kind_is_unsupported() {
+    let unsupported = |engine: &QueryEngine, q: &str, kind: &str| match engine
+        .query_range(q, 1000.0, 1004.0, 1.0)
+    {
+        Err(QueryError::Unsupported(msg)) => assert!(msg.contains(kind), "{q}: {msg}"),
+        other => panic!("{q}: expected Unsupported, got {other:?}"),
+    };
+    let gauges = QueryEngine::new(Arc::new(create_gauge_source()));
+    unsupported(&gauges, "rate(test_gauge[2s])", "gauge");
+    unsupported(&gauges, "histogram_mean(test_gauge)", "gauge");
+    let counters = QueryEngine::new(Arc::new(create_rate_source()));
+    unsupported(&counters, "avg_over_time(test_counter[2s])", "counter");
+    unsupported(&counters, "histogram_heatmap(test_counter)", "counter");
+    let histograms = QueryEngine::new(Arc::new(create_hist_source(&[0, 5, 10])));
+    unsupported(&histograms, "req_latency", "histogram");
+    unsupported(&histograms, "rate(req_latency[2s])", "histogram");
+}
+
+/// A missing name is reported whichever operand it is, even beside an
+/// operand that matched nothing.
+#[test]
+fn a_missing_name_is_reported_from_either_operand() {
+    let engine = QueryEngine::new(Arc::new(create_rate_source()));
+    for q in [
+        "rate(test_counter{x=\"y\"}[2s]) / rate(typo_counter[2s])",
+        "rate(typo_counter[2s]) + rate(test_counter{x=\"y\"}[2s])",
+    ] {
+        match engine.query_range(q, 1000.0, 1004.0, 1.0) {
+            Err(QueryError::MetricNotFound(name)) => assert_eq!(name, "typo_counter", "{q}"),
+            other => panic!("{q}: expected MetricNotFound, got {other:?}"),
+        }
+    }
+}
+
+/// A metric the source holds gives an empty matrix where nothing matches;
+/// only a name the source does not hold is `MetricNotFound`.
+#[test]
+fn a_held_metric_with_nothing_in_range_is_empty_not_missing() {
+    let engine = QueryEngine::new(Arc::new(create_rate_source()));
+    let empty = |q: &str, start: f64, end: f64| match engine.query_range(q, start, end, 1.0) {
+        Ok(QueryResult::Matrix { result }) => assert!(result.is_empty(), "{q}: {result:?}"),
+        other => panic!("{q}: expected an empty matrix, got {other:?}"),
+    };
+    empty("rate(test_counter[2s])", 2000.0, 2004.0);
+    empty("sum(rate(test_counter[2s]))", 2000.0, 2004.0);
+    empty(
+        "rate(test_counter{no_such_label=\"x\"}[2s])",
+        1000.0,
+        1004.0,
+    );
+    match engine.query_range("rate(absent_metric[2s])", 1000.0, 1004.0, 1.0) {
+        Err(QueryError::MetricNotFound(name)) => assert_eq!(name, "absent_metric"),
+        other => panic!("expected MetricNotFound, got {other:?}"),
+    }
+}
+
 /// A bare selector naming a counter says to use rate(), rather than
 /// reporting a metric the source holds as missing.
 #[test]
@@ -1610,8 +1669,8 @@ fn test_histogram_irate_first_step_is_null() {
 
     let result = engine.query_range("histogram_irate(req_latency)", 1000.0, 1002.0, 1.0);
     match result {
-        Err(QueryError::MetricNotFound(_)) => {}
-        other => panic!("expected MetricNotFound (single delta → null), got {other:?}"),
+        Ok(QueryResult::Matrix { result }) if result.is_empty() => {}
+        other => panic!("expected an empty matrix (single delta → null), got {other:?}"),
     }
 }
 
