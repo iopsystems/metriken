@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-archive 0.3.2
+
+- **Added:** the long form on the replication stream. `EncodedLongGroup`
+  (and `EncodedStreamGroup` over `GroupBuilder::build_stream`'s groups)
+  carries a group of counter groups and gauge groups as a `WalLongRow`
+  keyed by the producer's occupant keys, whose schema is the group's
+  columns. `FrameProducer::interval` sends, before each long row, an
+  `Occupant` row on `<group>/occupants` for every occupant the subscription
+  was not sent in that group's previous row. `StreamRow::occupants`
+  (defaulted to `None`) is what marks a row as long. A group can change
+  form between rows: the change sends the row's schema, and for a long row
+  every occupant, again.
+- **Added:** `StreamDecoder` turns a stream's rows back into
+  `StreamedGroup`s, reading each row's form from the row, and
+  `SourceRecorder::stage_streamed` writes them. A long row's columns are
+  mapped onto the group's long columns once per columns hash. Each
+  described key is mapped to an occupant number by the occupant's identity
+  (its `__uid__`, or else its labels), as the wide path numbers occupants,
+  so a reconnect, a restarted producer whose keys start again from 0, and a
+  group that changes form all keep each occupant's series. Recorded over
+  the long stream, with a value-derived group and a restarted producer
+  among the cases, an archive answers queries as one recorded from wide
+  snapshots of the same ticks (`tests/stream_long.rs`).
+
 ### metriken-exposition 0.21.4
 
 - **Added:** `GroupBuilder::build_stream`, which emits each group whose

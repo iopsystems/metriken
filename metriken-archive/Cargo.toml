@@ -20,17 +20,17 @@ metriken-segment = { version = "0.1.6", path = "../metriken-segment", default-fe
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 metriken-exposition = { version = "0.21.2", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
 metriken = { version = "0.11.2", path = "../metriken", optional = true }
+histogram = { workspace = true, optional = true }
 
 [features]
 # The archive writer. Off, this crate is a reader that builds for wasm32:
 # metriken-exposition depends on the registry, which does not.
-write = ["dendro/write", "dep:metriken-exposition"]
+write = ["dendro/write", "dep:metriken-exposition", "dep:metriken", "dep:histogram"]
 # A producer's groups as dendro replication frames (`stream::FrameProducer`).
 # Separate from `write`: a producer serving a stream needs neither the
 # archive writer nor dendro's.
 stream = ["dep:metriken-exposition", "dep:metriken"]
 
 [dev-dependencies]
-histogram = "1"
 metriken = { version = "0.11.0", path = "../metriken" }
 tempfile = "3"
