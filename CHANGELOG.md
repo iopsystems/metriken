@@ -39,15 +39,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member slot, with the slot's labels and an occupant key. Keys are
   assigned per group from 0 as occupants appear, so they encode in a few
   bytes. A slot gets a new key when its occupant changes (a new `__uid__`,
-  or new labels on a slot without one) and, in a group of
-  `Membership::Slots` metrics, when it returns after a build without a
-  value. Any other group is a `GroupSnapshot`, as `build_groups` builds it
+  or new labels on a slot without one) and, in a group with a
+  `Membership::Slots` metric, when it returns after a build in which it
+  carried no slot metadata. Any other group is a `GroupSnapshot`, as `build_groups` builds it
   (`StreamGroup`). A long group's columns are rebuilt when its metrics
   change, and a slot's labels when its occupant changes. With 2,500
   occupants over five metrics and 16 leaving and 16 arriving, a change tick
   took 0.57-0.70 ms against 0.36-0.39 ms for an unchanged one; the wide
   build's change tick took 8.7-32 ms (`tests/stream_cost.rs`, release, an
   Apple M-series laptop).
+
+### metriken-query 0.34.0
+
+- **Changed:** a query whose selector names a metric of the kind its
+  function reads, with no samples in the range or none matching its labels,
+  returns an empty matrix (an empty vector from `query`; `histogram_heatmap`
+  returns an empty matrix, not a heatmap). A name the source holds only as
+  another kind is `QueryError::Unsupported`, naming the kind it is: `rate()`
+  of a gauge, `histogram_mean()` of a counter, a bare histogram.
+  `QueryError::MetricNotFound` now means the source holds no metric of that
+  name, and its payload is always the bare name. A misspelled name is
+  reported from either operand of a binary expression. Callers that matched
+  `MetricNotFound` to detect an empty result must check for an empty result
+  instead.
 
 ### metriken-query 0.33.6
 

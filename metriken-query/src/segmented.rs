@@ -3176,9 +3176,10 @@ mod tests {
             .columns("histogram_mean(latency{__run__=\"1\"})")
             .unwrap()
             .is_empty());
-        assert!(r
-            .query_range("histogram_mean(latency{__run__=\"1\"})", 1.0, 4.0, 1.0)
-            .is_err());
+        assert!(matches!(
+            r.query_range("histogram_mean(latency{__run__=\"1\"})", 1.0, 4.0, 1.0),
+            Ok(crate::QueryResult::Matrix { result }) if result.is_empty()
+        ));
     }
 
     #[test]
