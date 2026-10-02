@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `SegmentedParquetReader::open_after` opens a table over the reader that
+  preceded it: the leading segments whose `SegmentStore::key` matches are
+  not read again, and their opened segments are taken over.
+- `SegmentStore::key`, an id for a segment whose bytes do not change.
+  Default `None`.
+- `ColumnRelabel::identities_are_fixed`, whether a column's label sets only
+  grow with the segments that carry it. Default `false`; `true` for
+  `long::OccupantLabels`.
+
+### Changed
+
+- A read of one occupant of a long column is not relabelled again, and the
+  maps keyed by label sets hash with foldhash.
+
 ## [0.34.0] - 2026-10-02
 
 ### Changed

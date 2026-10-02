@@ -60,6 +60,12 @@ impl OccupantLabels {
 }
 
 impl ColumnRelabel for OccupantLabels {
+    /// An occupant number's labels never change once written, so a long
+    /// column presents as the same label set in every segment.
+    fn identities_are_fixed(&self) -> bool {
+        true
+    }
+
     fn identities(&self, _name: &str, labels: &Labels) -> Option<Vec<Labels>> {
         self.with(labels).map(|l| vec![l])
     }

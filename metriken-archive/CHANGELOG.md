@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ArchiveReader::reuse_from`: a reader opened over a live archive after
+  another starts each table from the work the other did for it. Sealed
+  segments and occupant-stream segments already read are not read again,
+  and the segments the other reader had open are taken over. A query after
+  a reopen that cost 4-5x a warm query on a 30-minute recording of a
+  per-task group costs 1-1.7x.
+
+## [0.3.2] - 2026-10-01
+
+### Added
+
+- Slot groups travel long on the replication stream. `FrameProducer` sends
+  a long group as a `WalLongRow` keyed by per-group occupant keys, preceded
+  by a `<group>/occupants` row for each key the subscription has not been
+  sent. `StreamDecoder` reads each row's form from the row, and
+  `SourceRecorder::stage_streamed` writes a long row with its keys mapped
+  to occupant numbers by occupant identity.
+
 ## [0.3.1] - 2026-09-30
 
 ### Added
