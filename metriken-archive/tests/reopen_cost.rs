@@ -35,6 +35,7 @@ fn reopen_cost() {
         .unwrap_or_else(|_| "sum(irate(task_cpu_usage[5s]))".to_string());
     let pool = BufferPool::new(256 << 20);
     let reader = open(&path, &pool);
+    reader.keep_handover();
     let (lo, hi) = reader.time_range().unwrap();
     let t = Instant::now();
     reader.query_range(&query, lo, hi, 5.0).unwrap();

@@ -9,18 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `SegmentedParquetReader::handover` and `open_after`: a reader opened over
-  a table after another starts from the `Handover` the other gave. The
-  leading segments whose `SegmentStore::key` matches are not read again,
-  and the segments the other had open on the same pool are taken over. It
-  applies when both readers have no relabel, or both have one whose
-  identities are fixed, and no column named an occupant the relabel did
-  not describe. A `Handover` holds no `SegmentStore`.
+- `SegmentedParquetReader::open_after` and `handover`. A reader opened
+  with `open_after` saves its open state, and `handover` returns it as a
+  `Handover`. `open_after` given the `Handover` of an earlier reader of the
+  same table does not read the leading segments whose `SegmentStore::key`
+  matches, and takes over the earlier reader's open segments when both use
+  the same pool. Reuse needs both readers to have no relabel, or both to
+  have one whose identities are fixed. A table with a column naming an
+  occupant the relabel does not describe saves no state.
+  `Handover::without_segments` drops the open segments.
 - `SegmentStore::key`, an id for a segment that differs whenever its bytes
   do. Default `None`.
-- `ColumnRelabel::identities_are_fixed`, whether every instance of a
-  relabel over the same table returns the same identities for a keyed
-  segment's columns. Default `false`; `true` for `long::OccupantLabels`.
+- `ColumnRelabel::identities_are_fixed`: whether each column presents as
+  one label set for all its samples, the same for every instance over the
+  same table. Default `false`; `true` for `long::OccupantLabels`.
 
 ### Changed
 

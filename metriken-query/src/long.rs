@@ -60,11 +60,10 @@ impl OccupantLabels {
 }
 
 impl ColumnRelabel for OccupantLabels {
-    /// True for a table written by metriken-archive's writer, which commits
-    /// an occupant's labels with the first row naming it and keeps them one
-    /// restatement period longer than the rows. An occupant the stream does
-    /// not describe presents bare, and keeps presenting bare to a reader
-    /// that reuses a predecessor's identities after it is described.
+    /// Returns true: an occupant's labels do not change, and each occupant
+    /// column presents as one label set for all its samples. A segment
+    /// naming an occupant the stream does not describe saves no state
+    /// (see [`SegmentedParquetReader::handover`](crate::SegmentedParquetReader::handover)).
     fn identities_are_fixed(&self) -> bool {
         true
     }
@@ -718,5 +717,101 @@ mod reader_tests {
         // At 5 s only occupant 2 is alive: cpu = tick * 3 * 10 + 2, so its
         // rate is 30/s.
         assert!((result[0].value.1 - 30.0).abs() < 1e-9, "{result:?}");
+    }
+
+    /// Occupant 0 is `early` before 3.5 s and `late` after, so its column
+    /// presents as two label sets: its identities are not fixed.
+    struct Shift;
+
+    impl Shift {
+        fn with(labels: &Labels, comm: &str) -> Labels {
+            let mut l = labels.clone();
+            l.inner.insert("comm".to_string(), comm.to_string());
+            l
+        }
+
+        fn ours(labels: &Labels) -> bool {
+            labels.inner.get(OCCUPANT_LABEL).map(String::as_str) == Some("0")
+        }
+    }
+
+    impl ColumnRelabel for Shift {
+        fn identities(&self, _name: &str, labels: &Labels) -> Option<Vec<Labels>> {
+            Self::ours(labels)
+                .then(|| vec![Self::with(labels, "early"), Self::with(labels, "late")])
+        }
+
+        fn split(&self, _name: &str, labels: &Labels, timestamps: &[u64]) -> Option<Vec<Run>> {
+            if !Self::ours(labels) {
+                return None;
+            }
+            let cut = timestamps.partition_point(|ts| *ts < 3_500_000_000);
+            Some(vec![
+                (Self::with(labels, "early"), 0..cut),
+                (Self::with(labels, "late"), cut..timestamps.len()),
+            ])
+        }
+
+        fn at(&self, _name: &str, labels: &Labels, timestamp: u64) -> Option<Labels> {
+            Self::ours(labels).then(|| {
+                Self::with(
+                    labels,
+                    if timestamp < 3_500_000_000 {
+                        "early"
+                    } else {
+                        "late"
+                    },
+                )
+            })
+        }
+
+        fn segment_filter(&self, _name: &str, filter: &Labels) -> Labels {
+            let mut f = filter.clone();
+            f.inner.remove("comm");
+            f
+        }
+    }
+
+    /// A one-occupant read under a relabel whose identities are not fixed is
+    /// still cut by occupant: each label set gets only its own samples.
+    #[test]
+    fn a_relabel_that_is_not_fixed_cuts_a_one_occupant_read() {
+        let rows = observations();
+        let (a, b) = halves(&rows);
+        let r = SegmentedParquetReader::open_relabeled_with_pool(
+            Arc::new(InMemorySegments::new(vec![long(&a, None), long(&b, None)])),
+            BufferPool::new(64 << 20),
+            Arc::new(Shift),
+        )
+        .unwrap();
+        // When each `comm` has points, over the six ticks.
+        let times = |comm: &str| {
+            let q = r
+                .query_range(
+                    &format!("rate(cpu{{comm=\"{comm}\"}}[1500ms])"),
+                    1.0,
+                    6.0,
+                    1.0,
+                )
+                .unwrap();
+            let crate::QueryResult::Matrix { result } = q else {
+                panic!("expected a matrix, got {q:?}");
+            };
+            assert_eq!(result.len(), 1, "{comm}: {result:?}");
+            result[0]
+                .values
+                .iter()
+                .map(|(t, _)| *t)
+                .collect::<Vec<f64>>()
+        };
+        let (early, late) = (times("early"), times("late"));
+        assert!(
+            !early.is_empty() && early.iter().all(|t| *t < 3.5),
+            "{early:?}"
+        );
+        assert!(
+            !late.is_empty() && late.iter().all(|t| *t > 3.5),
+            "{late:?}"
+        );
     }
 }

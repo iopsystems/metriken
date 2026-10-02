@@ -48,7 +48,8 @@ pub trait SegmentStore: Send + Sync {
     /// `None` (the default) for a segment that can change under one id, such
     /// as one built from a live tail. A reader reopened with
     /// [`SegmentedParquetReader::open_after`] reuses its predecessor's work
-    /// for the leading segments whose ids match.
+    /// for the leading segments whose ids match; only the segments before
+    /// the first `None` are reused.
     fn key(&self, idx: usize) -> Option<u64> {
         let _ = idx;
         None
@@ -95,11 +96,13 @@ pub trait ColumnRelabel: Send + Sync {
     /// What one sample of the column presents as. `None` leaves it as it is.
     fn at(&self, name: &str, labels: &Labels, timestamp: u64) -> Option<Labels>;
 
-    /// Whether every instance of this relabel built over the same table
-    /// returns the same [`identities`](Self::identities) for a column of a
-    /// segment with a [`SegmentStore::key`], so that a reader reopened with
-    /// [`SegmentedParquetReader::open_after`] can keep the identities its
-    /// predecessor computed for those segments. Default: false.
+    /// Whether each column presents as exactly one label set for every one
+    /// of its samples, and every instance built over the same table returns
+    /// that same set for the columns of a segment with a
+    /// [`SegmentStore::key`]. A reader then reads one occupant of a long
+    /// column without relabelling it, and a reader reopened with
+    /// [`SegmentedParquetReader::open_after`] keeps its predecessor's
+    /// identities. Default: false.
     fn identities_are_fixed(&self) -> bool {
         false
     }
@@ -184,7 +187,7 @@ impl SegmentedParquetReader {
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open(store, pool, None, None)
+        Self::open(store, pool, None, None, false)
     }
 
     /// [`open_with_pool`](Self::open_with_pool) with a [`ColumnRelabel`]:
@@ -195,39 +198,43 @@ impl SegmentedParquetReader {
         pool: Arc<BufferPool>,
         relabel: Arc<dyn ColumnRelabel>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open(store, pool, Some(relabel), None)
+        Self::open(store, pool, Some(relabel), None, false)
     }
 
     /// [`open_with_pool`](Self::open_with_pool) or, with a relabel,
     /// [`open_relabeled_with_pool`](Self::open_relabeled_with_pool), for a
-    /// table a reader was opened over earlier, which gave `previous`
-    /// ([`handover`](Self::handover)): a live archive reopened to see new
-    /// rows.
+    /// table that is reopened as new rows arrive. The reader saves the state
+    /// a later reader of the table can start from (see
+    /// [`handover`](Self::handover)), and starts from `previous`, the
+    /// handover of an earlier reader of the table, when there is one.
     ///
-    /// The leading segments the store names by [`SegmentStore::key`] that
-    /// match the ones the earlier reader was opened with are not read
-    /// again: the new reader starts from the identity indexes and catalog
-    /// the earlier one had after them, and takes over the segments it had
-    /// open when both use the same `pool`. The rest are read as
-    /// [`open_with_pool`](Self::open_with_pool) reads them. Reuse needs a
-    /// relabel whose identities are fixed
+    /// The leading segments whose [`SegmentStore::key`] matches the earlier
+    /// reader's are not read again: the new reader starts from the identity
+    /// indexes and catalog the earlier one had after them, and takes over
+    /// the segments it had open when both use the same `pool`. The rest are
+    /// read as [`open_with_pool`](Self::open_with_pool) reads them. Reuse
+    /// needs a relabel whose identities are fixed
     /// ([`ColumnRelabel::identities_are_fixed`]) or none, and the earlier
     /// reader opened with a relabel exactly when this open has one.
+    ///
+    /// A handover from another table, or a store whose keys repeat for
+    /// different bytes, gives wrong answers without an error.
     pub fn open_after(
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
         relabel: Option<Arc<dyn ColumnRelabel>>,
-        previous: &Handover,
+        previous: Option<&Handover>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open(store, pool, relabel, Some(previous))
+        Self::open(store, pool, relabel, previous, true)
     }
 
     /// What a reader opened after this one over the same table can start
     /// from, with [`open_after`](Self::open_after): the open state after
     /// the leading keyed segments, and the segments among them this reader
-    /// has open. `None` when this reader saved no such state: its store
-    /// keys no segment, its relabel's identities are not fixed, or a column
-    /// named an occupant the relabel did not describe. A handover holds no
+    /// has open. `None` when this reader saved no such state: it was not
+    /// opened with [`open_after`](Self::open_after), its store keys no
+    /// segment, its relabel's identities are not fixed, or a column named an
+    /// occupant the relabel did not describe. A handover holds no
     /// [`SegmentStore`].
     pub fn handover(&self) -> Option<Handover> {
         let sealed = self.source.sealed.clone()?;
@@ -252,6 +259,7 @@ impl SegmentedParquetReader {
         pool: Arc<BufferPool>,
         relabel: Option<Arc<dyn ColumnRelabel>>,
         previous: Option<&Handover>,
+        keep: bool,
     ) -> Result<Self, Box<dyn Error>> {
         if store.is_empty() {
             return Err("SegmentedParquetReader requires at least one segment".into());
@@ -262,7 +270,8 @@ impl SegmentedParquetReader {
         // what a later reopen can reuse.
         let keys: Vec<u64> = (0..store.len()).map_while(|i| store.key(i)).collect();
         let relabeled = relabel.is_some();
-        let reusable = relabel.as_ref().is_none_or(|r| r.identities_are_fixed());
+        // Only a reader opened with `open_after` saves state or starts from it.
+        let reusable = keep && relabel.as_ref().is_none_or(|r| r.identities_are_fixed());
         let reused = previous
             .filter(|_| reusable)
             .and_then(|p| p.sealed_prefix(&keys, relabeled));
@@ -712,8 +721,8 @@ fn check_histogram_configs(idx: usize, segment: &ParquetReader) -> Result<(), Bo
 }
 
 /// The hasher for maps keyed by a series' labels, which the reader builds at
-/// open and probes per column: foldhash rather than SipHash, since the keys
-/// come from the archive's own catalog.
+/// open and probes per column: foldhash rather than SipHash, being faster on
+/// these keys and still seeded per process.
 type LabelsHash = foldhash::fast::RandomState;
 
 /// `(name, labels) -> position` for one metric kind (counter, gauge, or raw
@@ -954,7 +963,26 @@ pub struct Handover {
     segments: Vec<(usize, Arc<ParquetReader>, usize)>,
 }
 
+impl std::fmt::Debug for Handover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handover")
+            .field("keyed_segments", &self.sealed.keys.len())
+            .field("open_segments", &self.segments.len())
+            .finish()
+    }
+}
+
 impl Handover {
+    /// This handover without the opened segments: the state alone, for a
+    /// handover that is kept while no reader of the table is open.
+    pub fn without_segments(&self) -> Handover {
+        Handover {
+            sealed: self.sealed.clone(),
+            pool: Arc::clone(&self.pool),
+            segments: Vec::new(),
+        }
+    }
+
     /// The state after the handing reader's keyed segments, and how many
     /// there are, when they are the first of `keys` and were read with a
     /// relabel exactly when `relabeled` says so. A reader with a relabel
@@ -4182,9 +4210,11 @@ mod tests {
     fn open_after_reads_only_segments_sealed_since() {
         let seg = |from| segment("cpu_cycles", &[], &rows(from, 4));
         let pool = BufferPool::new(64 * 1024 * 1024);
-        let first = SegmentedParquetReader::open_with_pool(
+        let first = SegmentedParquetReader::open_after(
             KeyedSegments::new(vec![(Some(1), seg(1)), (Some(2), seg(5)), (None, seg(9))]),
             Arc::clone(&pool),
+            None,
+            None,
         )
         .unwrap();
         answer(&first);
@@ -4202,7 +4232,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SegmentStore>,
             Arc::clone(&pool),
             None,
-            &first.handover().unwrap(),
+            Some(&first.handover().unwrap()),
         )
         .unwrap();
         assert_eq!(
@@ -4227,7 +4257,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SegmentStore>,
             Arc::clone(&pool),
             None,
-            &after.handover().unwrap(),
+            Some(&after.handover().unwrap()),
         )
         .unwrap();
         assert_eq!(store.fetched(), vec![3]);
@@ -4240,9 +4270,11 @@ mod tests {
     fn open_after_with_a_different_prefix_reads_everything() {
         let seg = |from| segment("cpu_cycles", &[], &rows(from, 4));
         let pool = BufferPool::new(64 * 1024 * 1024);
-        let first = SegmentedParquetReader::open_with_pool(
+        let first = SegmentedParquetReader::open_after(
             KeyedSegments::new(vec![(Some(1), seg(1)), (Some(2), seg(5))]),
             Arc::clone(&pool),
+            None,
+            None,
         )
         .unwrap();
         answer(&first);
@@ -4251,7 +4283,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SegmentStore>,
             Arc::clone(&pool),
             None,
-            &first.handover().unwrap(),
+            Some(&first.handover().unwrap()),
         )
         .unwrap();
         assert_eq!(store.fetched(), vec![0, 1]);
@@ -4269,7 +4301,7 @@ mod tests {
         let seg = |from| segment("cpu_cycles", &[("slot", "0")], &rows(from, 4));
         let pool = BufferPool::new(64 * 1024 * 1024);
         let relabel = || Some(Arc::new(HandOver { cut: 6_000_000_000 }) as Arc<dyn ColumnRelabel>);
-        let first = SegmentedParquetReader::open(
+        let first = SegmentedParquetReader::open_after(
             KeyedSegments::new(vec![(Some(1), seg(1)), (Some(2), seg(5))]),
             Arc::clone(&pool),
             relabel(),
@@ -4323,9 +4355,11 @@ mod tests {
         let seg = |from| segment("cpu_cycles", &[("slot", "0")], &rows(from, 4));
         let pool = BufferPool::new(64 * 1024 * 1024);
         let segments = || vec![(Some(1), seg(1)), (Some(2), seg(5)), (None, seg(9))];
-        let first = SegmentedParquetReader::open_with_pool(
+        let first = SegmentedParquetReader::open_after(
             KeyedSegments::new(segments()),
             Arc::clone(&pool),
+            None,
+            None,
         )
         .unwrap();
         answer(&first);
@@ -4334,7 +4368,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SegmentStore>,
             Arc::clone(&pool),
             Some(Arc::new(AllA)),
-            &first.handover().unwrap(),
+            Some(&first.handover().unwrap()),
         )
         .unwrap();
         assert_eq!(store.fetched(), vec![0, 1, 2]);
@@ -4352,7 +4386,7 @@ mod tests {
     }
 
     /// A column naming an occupant the relabel does not describe leaves a
-    /// reader with nothing to hand on; once described, it hands on.
+    /// reader with no handover; once described, it has one.
     #[test]
     fn an_undescribed_occupant_hands_nothing_on() {
         use crate::long::{OccupantLabels, OCCUPANT_LABEL};
@@ -4361,10 +4395,11 @@ mod tests {
         let pool = BufferPool::new(64 * 1024 * 1024);
         let segments = || vec![(Some(1), seg(1)), (Some(2), seg(5)), (None, seg(9))];
         let open = |rows: Vec<Occupant>| {
-            SegmentedParquetReader::open_relabeled_with_pool(
+            SegmentedParquetReader::open_after(
                 KeyedSegments::new(segments()),
                 Arc::clone(&pool),
-                Arc::new(OccupantLabels::new(rows)),
+                Some(Arc::new(OccupantLabels::new(rows))),
+                None,
             )
             .unwrap()
         };

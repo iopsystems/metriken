@@ -302,9 +302,12 @@ fn the_long_stream_records_what_wide_snapshots_record() {
                 return;
             }
             let (fresh, after) = (open(&long), open(&long));
-            if let Some(previous) = &previous {
-                after.reuse_from(previous);
-                reused += 1;
+            match &previous {
+                Some(previous) => {
+                    after.reuse_from(previous);
+                    reused += 1;
+                }
+                None => after.keep_handover(),
             }
             for q in QUERIES {
                 assert_eq!(answer(&after, q), answer(&fresh, q), "{q} at tick {tick}");

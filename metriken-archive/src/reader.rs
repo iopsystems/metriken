@@ -37,8 +37,8 @@ use metriken_segment::occupants::Occupant;
 /// An occupant stream's sealed segments, decoded, by [`segment_key`].
 type OccupantSegments = BTreeMap<u64, Arc<Vec<Occupant>>>;
 
-/// What one reader's table hands the same table in the reader that
-/// replaces it. It holds no catalog connection.
+/// The saved state of one reader's table, for the same table in the reader
+/// that replaces it. It holds no catalog connection.
 #[derive(Clone, Default)]
 struct Carried {
     /// The built table's state; `None` when it saved none.
@@ -585,10 +585,13 @@ struct SamplerReader {
     pool: Arc<BufferPool>,
     /// Built on first access, never at open.
     reader: std::sync::OnceLock<Option<TableReader>>,
-    /// What the same table in a reader this one replaced handed on (see
+    /// The state saved by the same table in a reader this one replaced (see
     /// [`ArchiveReader::reuse_from`]), taken when this table's reader is
     /// built.
     previous: std::sync::Mutex<Option<Carried>>,
+    /// Whether this table's reader saves state for a later reader (see
+    /// [`ArchiveReader::keep_handover`]).
+    keep: std::sync::atomic::AtomicBool,
     /// The occupant stream's sealed segments this table's reader was built
     /// from, decoded, for a reader that replaces this one.
     occupant_segments: std::sync::Mutex<OccupantSegments>,
@@ -713,11 +716,14 @@ impl SamplerReader {
                     Some(Err(())) => return None,
                     None => None,
                 };
-                let opened = match previous.as_ref().and_then(|p| p.handover.as_ref()) {
-                    Some(handover) => {
-                        SegmentedParquetReader::open_after(store, pool, relabel, handover)
-                    }
-                    _ => match relabel {
+                let opened = match self.keep.load(std::sync::atomic::Ordering::Relaxed) {
+                    true => SegmentedParquetReader::open_after(
+                        store,
+                        pool,
+                        relabel,
+                        previous.as_ref().and_then(|p| p.handover.as_ref()),
+                    ),
+                    false => match relabel {
                         Some(relabel) => {
                             SegmentedParquetReader::open_relabeled_with_pool(store, pool, relabel)
                         }
@@ -760,10 +766,12 @@ impl SamplerReader {
             let known = previous.map_or(&empty, |p| &p.occupant_segments);
             return Some(match self.segments.occupants(stream, known) {
                 Ok((rows, decoded)) => {
-                    *self
-                        .occupant_segments
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = decoded;
+                    if self.keep.load(std::sync::atomic::Ordering::Relaxed) {
+                        *self
+                            .occupant_segments
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = decoded;
+                    }
                     Ok(Arc::new(metriken_query::long::OccupantLabels::new(rows)))
                 }
                 Err(e) => {
@@ -1066,33 +1074,51 @@ impl ArchiveReader {
         self.complete
     }
 
-    /// Lets each table of this reader start from the work `previous` did
-    /// for the same table, for a reader opened over the same archive after
-    /// `previous` was: a live archive reopened to see new rows.
+    /// Makes each table built after this call save the state a later
+    /// reader of the same archive can start from (see
+    /// [`reuse_from`](Self::reuse_from)). A table whose reader is already
+    /// built saves none. A caller that reopens the archive calls this on
+    /// its first reader, before querying it.
+    pub fn keep_handover(&self) {
+        for table in &self.tables {
+            table.keep.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Lets each table of this reader start from the state `previous` saved
+    /// for the same table, for a reader opened over the same archive file
+    /// after `previous` was: a live archive reopened to see new rows. It
+    /// also calls [`keep_handover`](Self::keep_handover) on this reader.
+    /// Call it before querying this reader.
     ///
     /// A table's reader is still built on first query. When the matching
-    /// table in `previous` was built, the new one reads only the segments
-    /// sealed since then, the live tail, and the occupant-stream segments
-    /// not yet decoded, and takes over the segments `previous` had open;
-    /// otherwise it opens as it would without this call. Nothing is reused
-    /// for a table once retention has evicted a segment `previous` read.
-    /// Tables are matched by recording id and name. A table already built
-    /// here is left as it is, and so is a table of a tar archive, which
-    /// has nothing to reuse. Call this before querying this reader.
+    /// table of `previous` saved state (see [`keep_handover`](Self::keep_handover)
+    /// and `SegmentedParquetReader::handover`), the new one reads only the
+    /// segments sealed since, the live tail, and the occupant-stream
+    /// segments not yet decoded, and takes over the segments `previous` had
+    /// open. A table whose relabel's identities are not fixed reuses only
+    /// the decoded occupant-stream segments. Once retention evicts a segment
+    /// `previous` read, only the decoded occupant-stream segments are
+    /// reused. Tables are matched by recording id and name. A table already
+    /// built here is left as it is, and so is a table of a tar archive,
+    /// which has no keyed segments.
     ///
-    /// `previous` should be a reader of the same archive. A segment is
-    /// matched by its sequence number, row count and time span, so a
-    /// reader of another archive is reused from only where those agree.
+    /// `previous` must read the same archive file. A segment is matched by
+    /// its sequence number, row count and time span, and a filtered copy of
+    /// an archive keeps those for every segment, so a reader of such a copy
+    /// gives wrong answers without an error.
     ///
     /// Until its reader is built, a table of this reader holds the state
     /// `previous` saved for it, the segments `previous` had open among
-    /// those it reuses, and the decoded occupant-stream segments; a table
-    /// never queried passes them on to the reader that reuses this one.
+    /// those it reuses, and the decoded occupant-stream segments. A table
+    /// of `previous` that was never queried passes on the state and the
+    /// occupant-stream segments it was given, without the open segments.
     /// None of it holds a connection to the archive.
     pub fn reuse_from(&self, previous: &ArchiveReader) {
+        self.keep_handover();
         for table in &self.tables {
-            // A table already built has no use for a predecessor, and a tar
-            // table has nothing to reuse.
+            // A built table ignores `previous`, and a tar table has no keyed
+            // segments.
             if table.reader.get().is_some() || table.segments.source_id().is_none() {
                 continue;
             }
@@ -1104,9 +1130,9 @@ impl ArchiveReader {
             if Arc::ptr_eq(old, table) {
                 continue;
             }
-            // A table whose reader was built hands on its state; one that
-            // was not queried, or whose build failed, passes on what it
-            // was handed.
+            // A built table gives its saved state. A table that was not
+            // queried, or whose build failed, gives the state it was given,
+            // without the open segments, which nothing will read.
             let carried = match old.reader.get() {
                 Some(Some(TableReader::Segmented(r))) => Some(Carried {
                     handover: r.handover(),
@@ -1120,7 +1146,11 @@ impl ArchiveReader {
                     .previous
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
+                    .as_ref()
+                    .map(|c| Carried {
+                        handover: c.handover.as_ref().map(|h| h.without_segments()),
+                        occupant_segments: c.occupant_segments.clone(),
+                    }),
             };
             *table.previous.lock().unwrap_or_else(|e| e.into_inner()) = carried;
         }
@@ -1315,6 +1345,7 @@ impl ArchiveReader {
                     reader: std::sync::OnceLock::new(),
                     previous: std::sync::Mutex::new(None),
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
+                    keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
                 }));
             }
@@ -1418,6 +1449,7 @@ impl ArchiveReader {
                     reader: std::sync::OnceLock::new(),
                     previous: std::sync::Mutex::new(None),
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
+                    keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
                 }));
             }

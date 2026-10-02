@@ -867,7 +867,21 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
 /// A catalog counting the sealed segments read through it.
 struct Counting {
     inner: DendroCatalog,
-    fetched: Arc<std::sync::atomic::AtomicUsize>,
+    fetched: Arc<Fetched>,
+}
+
+/// Sealed segments read: of data tables, and of occupant streams.
+#[derive(Default)]
+struct Fetched {
+    tables: std::sync::atomic::AtomicUsize,
+    occupants: std::sync::atomic::AtomicUsize,
+}
+
+impl Fetched {
+    fn get(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.tables.load(Relaxed), self.occupants.load(Relaxed))
+    }
 }
 
 impl Catalog for Counting {
@@ -890,8 +904,12 @@ impl Catalog for Counting {
         table: &str,
         seq: u64,
     ) -> Result<Option<Vec<u8>>, String> {
-        self.fetched
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counter = if table.ends_with("/occupants") {
+            &self.fetched.occupants
+        } else {
+            &self.fetched.tables
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.segment_bytes(source_id, table, seq)
     }
     fn live_wal(
@@ -947,12 +965,9 @@ impl Catalog for Counting {
 }
 
 /// Opens `path` on `pool` through a [`Counting`] catalog; returns the reader
-/// and its fetch count.
-fn open_counting(
-    path: &Path,
-    pool: &Arc<BufferPool>,
-) -> (ArchiveReader, Arc<std::sync::atomic::AtomicUsize>) {
-    let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+/// and its fetch counts.
+fn open_counting(path: &Path, pool: &Arc<BufferPool>) -> (ArchiveReader, Arc<Fetched>) {
+    let fetched = Arc::new(Fetched::default());
     let catalog = Counting {
         inner: DendroCatalog::open(path).unwrap(),
         fetched: Arc::clone(&fetched),
@@ -977,7 +992,7 @@ fn follow(long_groups: bool) {
     let path = dir.path().join("follow.dendro");
     let pool = BufferPool::new(64 * 1024 * 1024);
     let mut previous: Option<ArchiveReader> = None;
-    let (mut reused_fetches, mut fresh_fetches) = (0, 0);
+    let (mut reused, mut fresh_total) = ((0, 0), (0, 0));
     let mut from = 0;
     record_with(&path, long_groups, false, None, &mut |source, t| {
         if t == 17 {
@@ -990,21 +1005,32 @@ fn follow(long_groups: bool) {
         }
         let (fresh, fresh_count) = open_counting(&path, &pool);
         let (after, after_count) = open_counting(&path, &pool);
-        if let Some(previous) = &previous {
-            after.reuse_from(previous);
+        match &previous {
+            Some(previous) => after.reuse_from(previous),
+            None => after.keep_handover(),
         }
         assert_eq!(answers(&after, from), answers(&fresh, from), "tick {t}");
         if previous.is_some() {
-            use std::sync::atomic::Ordering::Relaxed;
-            reused_fetches += after_count.load(Relaxed);
-            fresh_fetches += fresh_count.load(Relaxed);
+            let (a, f) = (after_count.get(), fresh_count.get());
+            reused = (reused.0 + a.0, reused.1 + a.1);
+            fresh_total = (fresh_total.0 + f.0, fresh_total.1 + f.1);
         }
         previous = Some(after);
     });
     assert!(
-        reused_fetches * 2 < fresh_fetches,
-        "reuse read {reused_fetches} segments, fresh opens {fresh_fetches}"
+        reused.0 * 2 < fresh_total.0,
+        "reuse read {} table segments, fresh opens {}",
+        reused.0,
+        fresh_total.0
     );
+    if long_groups {
+        assert!(
+            reused.1 * 2 < fresh_total.1,
+            "reuse read {} occupant segments, fresh opens {}",
+            reused.1,
+            fresh_total.1
+        );
+    }
 }
 
 #[test]
@@ -1039,6 +1065,7 @@ fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
                 }
             }
             let (reader, _) = open_counting(&copy, &pool);
+            reader.keep_handover();
             answers(&reader, 0);
             early = Some(reader);
         }
@@ -1061,4 +1088,45 @@ fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
     let (after, _) = open_counting(&path, &pool);
     after.reuse_from(early.as_ref().unwrap());
     assert_eq!(answers(&after, 0), answers(&fresh, 0));
+}
+
+/// A reader whose tables were not queried passes on the state it was given,
+/// and a first reader without `keep_handover` saves none.
+#[test]
+fn state_passes_through_a_reader_that_was_not_queried() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pass.dendro");
+    record(&path, true, true, None);
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let (fresh, fresh_count) = open_counting(&path, &pool);
+    let expected = answers(&fresh, 0);
+
+    let (first, _) = open_counting(&path, &pool);
+    first.keep_handover();
+    answers(&first, 0);
+    let (second, second_count) = open_counting(&path, &pool);
+    second.reuse_from(&first);
+    drop(first);
+    let (third, third_count) = open_counting(&path, &pool);
+    third.reuse_from(&second);
+    drop(second);
+    assert_eq!(answers(&third, 0), expected);
+    // The second reader read only what opening reads. The third read the
+    // segments its query decodes, since open segments are not passed on
+    // past a reader that was not queried, but no footer to build its state
+    // and no occupant segment.
+    let (_unqueried, probe_count) = open_counting(&path, &pool);
+    assert_eq!(second_count.get(), probe_count.get());
+    let (third, fresh) = (third_count.get(), fresh_count.get());
+    assert!(
+        third.0 < fresh.0 && third.1 == 0 && fresh.1 > 0,
+        "{third:?} {fresh:?}"
+    );
+
+    let (plain, _) = open_counting(&path, &pool);
+    answers(&plain, 0);
+    let (after, after_count) = open_counting(&path, &pool);
+    after.reuse_from(&plain);
+    assert_eq!(answers(&after, 0), expected);
+    assert_eq!(after_count.get(), fresh_count.get());
 }
