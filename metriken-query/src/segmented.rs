@@ -571,9 +571,7 @@ impl OpenState {
             let entry = self.column_map.entry(metric.clone()).or_default();
             for (labels, col) in cols {
                 let sets = match relabel {
-                    Some(r) => r
-                        .identities(&metric, &labels)
-                        .unwrap_or_else(|| vec![labels]),
+                    Some(r) => identities(r, &metric, &labels).unwrap_or_else(|| vec![labels]),
                     None => vec![labels],
                 };
                 for mut labels in sets {

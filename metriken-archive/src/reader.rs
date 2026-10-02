@@ -1091,7 +1091,8 @@ impl ArchiveReader {
     /// None of it holds a connection to the archive.
     pub fn reuse_from(&self, previous: &ArchiveReader) {
         for table in &self.tables {
-            // A table already built has no use for a predecessor.
+            // A table already built has no use for a predecessor, and a tar
+            // table has nothing to reuse.
             if table.reader.get().is_some() || table.segments.source_id().is_none() {
                 continue;
             }
