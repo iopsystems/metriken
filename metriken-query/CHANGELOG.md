@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- An aggregation with several groups (`sum by (comm) (...)`) advances its
+  groups together: reading one group's next point computes every group's
+  points up to that timestamp and buffers those not yet read. A consumer
+  that reads one group to its end, as building a matrix does, buffers the
+  other groups' points meanwhile, 88 bytes each plus the buffers' spare
+  capacity. Reading the groups one after another fetched and opened each
+  segment again for every group that reached it, since the segment cache
+  could not hold the table across groups. On a 9.6-hour recording of a
+  per-task group with a 256 MB pool, `sum by (comm)
+  (irate(task_cpu_usage[5s]))` made 22,679 segment fetches on the table
+  stored wide and took 192 s, or 423-603 s stored long; it makes 306 and
+  takes 13-15 s on either.
+
 ## [0.34.1] - 2026-10-02
 
 ### Added
