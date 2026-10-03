@@ -175,21 +175,6 @@ impl ParquetReader {
         }
     }
 
-    /// The rows of the `wanted` occupants of a long counter column of a
-    /// single-file reader, by occupant, each row group decoded once.
-    pub(crate) fn counter_column_split(
-        &self,
-        at: &crate::ColumnPosition,
-        start_ns: u64,
-        end_ns: u64,
-        wanted: &std::collections::HashSet<u64>,
-    ) -> Option<HashMap<u64, crate::ColumnChunk>> {
-        match self.inner.files.as_slice() {
-            [(f, _)] => f.counter_column_split(at, start_ns, end_ns, wanted),
-            _ => None,
-        }
-    }
-
     /// What this reader holds in memory while open, estimated: its bytes if
     /// it was opened from bytes, plus a per-column charge for the parsed
     /// footer and column descriptors.
@@ -1548,27 +1533,6 @@ impl DataSource for FileSource {
                     col_idx = at.col_idx,
                     error = %e,
                     "reading a counter column"
-                );
-                None
-            }
-        }
-    }
-
-    fn counter_column_split(
-        &self,
-        at: &crate::ColumnPosition,
-        start_ns: u64,
-        end_ns: u64,
-        wanted: &std::collections::HashSet<u64>,
-    ) -> Option<HashMap<u64, crate::ColumnChunk>> {
-        match read_counter_column_split(&self.0, at, start_ns, end_ns, wanted) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(
-                    source_id = self.0.id,
-                    col_idx = at.col_idx,
-                    error = %e,
-                    "reading a long counter column"
                 );
                 None
             }
@@ -2984,129 +2948,6 @@ fn read_counter_column(
         values,
         windows,
     })
-}
-
-/// The rows of the `wanted` occupants of a long counter column, by
-/// occupant: each row group the range touches is decoded once, in one
-/// projection of the columns the rows need, however many occupants are
-/// wanted. The decode does not go through the pool, since the rows are
-/// taken by the streams that wanted them. `at.occupant` is not used.
-fn read_counter_column_split(
-    pf: &ParquetSource,
-    at: &crate::ColumnPosition,
-    start_ns: u64,
-    end_ns: u64,
-    wanted: &std::collections::HashSet<u64>,
-) -> Result<HashMap<u64, crate::ColumnChunk>, Box<dyn Error>> {
-    let (ts_col_idx, dur_col_idx) = pf.fixed_cols();
-    let ts_col_idx = ts_col_idx.ok_or("missing timestamp")?;
-    let occupant_col = pf.occupant_col().ok_or("not a long segment")?;
-    let col_idx = at.col_idx as usize;
-    let begin_col = at.begin_col.map(|i| i as usize);
-    let width_col = at.width_col.map(|i| i as usize);
-    let windowed = (begin_col.is_some() && width_col.is_some()) || dur_col_idx.is_some();
-
-    // A projection's batch holds its columns in schema order.
-    let mut cols: Vec<usize> = [
-        Some(ts_col_idx),
-        Some(col_idx),
-        Some(occupant_col),
-        begin_col,
-        width_col,
-        dur_col_idx,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    cols.sort_unstable();
-    cols.dedup();
-    let at_of = |c: usize| cols.binary_search(&c).ok();
-    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
-
-    let mut out: HashMap<u64, crate::ColumnChunk> = HashMap::new();
-    for rg_idx in 0..pf.meta.metadata().num_row_groups() {
-        match rg_classify(
-            pf.meta.metadata().row_group(rg_idx),
-            ts_col_idx,
-            start_ns,
-            end_ns,
-        ) {
-            RgClass::Before | RgClass::After => continue,
-            _ => {}
-        }
-        let reader = pf.build_batch_reader(
-            rg_idx,
-            ProjectionMask::roots(&parquet_schema, cols.iter().copied()),
-        )?;
-        let decoded: Result<Result<(), Box<dyn Error>>, String> = catch_decode_panic(|| {
-            use arrow::array::Array;
-            for batch in reader {
-                let batch = batch?;
-                let u64s = |c: usize| -> Result<&UInt64Array, Box<dyn Error>> {
-                    let i = at_of(c).ok_or("column not projected")?;
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| format!("column {c} is not UInt64").into())
-                };
-                let ts = u64s(ts_col_idx)?;
-                let vals = u64s(col_idx)?;
-                let occupants = u64s(occupant_col)?;
-                let durations = dur_col_idx.map(u64s).transpose()?;
-                let widths = width_col.map(u64s).transpose()?;
-                let begins = begin_col
-                    .map(|c| -> Result<&Int64Array, Box<dyn Error>> {
-                        let i = at_of(c).ok_or("column not projected")?;
-                        batch
-                            .column(i)
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .ok_or_else(|| format!("column {c} is not Int64").into())
-                    })
-                    .transpose()?;
-                let get_u = |a: &UInt64Array, r: usize| (!a.is_null(r)).then(|| a.value(r));
-                for row in 0..batch.num_rows() {
-                    let Some(occupant) = get_u(occupants, row) else {
-                        continue;
-                    };
-                    if !wanted.contains(&occupant) {
-                        continue;
-                    }
-                    let (Some(base), Some(v)) = (get_u(ts, row), get_u(vals, row)) else {
-                        continue;
-                    };
-                    if base < start_ns || base > end_ns {
-                        continue;
-                    }
-                    let chunk = out.entry(occupant).or_insert_with(|| crate::ColumnChunk {
-                        timestamps: Vec::new(),
-                        values: Vec::new(),
-                        windows: windowed.then(Vec::new),
-                    });
-                    chunk.timestamps.push(base);
-                    chunk.values.push(v);
-                    if let Some(w) = chunk.windows.as_mut() {
-                        let bo = begins.and_then(|b| (!b.is_null(row)).then(|| b.value(row)));
-                        let wd = widths.and_then(|x| get_u(x, row));
-                        let dur = durations.and_then(|d| get_u(d, row));
-                        w.push(resolve_window(base, bo, wd, dur));
-                    }
-                }
-            }
-            Ok(())
-        });
-        match decoded {
-            Ok(r) => r?,
-            Err(panic) => {
-                return Err(format!(
-                    "parquet decode panic reading a long counter column (rg={rg_idx}): {panic}"
-                )
-                .into())
-            }
-        }
-    }
-    Ok(out)
 }
 
 fn read_counters(

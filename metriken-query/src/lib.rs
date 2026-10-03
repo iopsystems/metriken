@@ -242,19 +242,6 @@ pub(crate) trait DataSource: Send + Sync {
         let _ = (at, start_ns, end_ns, selective);
         None
     }
-    /// Read a long counter column once for many occupants: the rows of each
-    /// of `wanted`, by occupant. `None` for a source that is not a long
-    /// parquet segment.
-    fn counter_column_split(
-        &self,
-        at: &ColumnPosition,
-        start_ns: u64,
-        end_ns: u64,
-        wanted: &std::collections::HashSet<u64>,
-    ) -> Option<std::collections::HashMap<u64, types::ColumnChunk>> {
-        let _ = (at, start_ns, end_ns, wanted);
-        None
-    }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;
     fn histogram_stream(
         &self,

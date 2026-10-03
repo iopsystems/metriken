@@ -67,6 +67,15 @@ fn reopen_cost() {
     let reader = open(&path, &pool);
     reader.keep_handover();
     let (lo, hi) = reader.time_range().unwrap();
+    // `REOPEN_COST_FRAC=a,b` queries that fraction of the recording.
+    let (lo, hi) = match std::env::var("REOPEN_COST_FRAC") {
+        Ok(f) => {
+            let (a, b) = f.split_once(',').unwrap();
+            let at = |x: &str| lo + (hi - lo) * x.parse::<f64>().unwrap();
+            (at(a), at(b))
+        }
+        Err(_) => (lo, hi),
+    };
     let t = Instant::now();
     reader.query_range(&query, lo, hi, 5.0).unwrap();
     println!(

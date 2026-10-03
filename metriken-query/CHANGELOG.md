@@ -9,21 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- A query reading many occupants of a long table reads each segment's
-  column once for all of them, in one projection outside the buffer pool,
-  and hands each series its own rows. It used to decode the row group
-  through the pool once per series, and decoded it again whenever the
-  pool had evicted it, which a pool smaller than the table did for nearly
-  every series. On a 9.6-hour recording of a per-task group (291 segments,
-  3,383 occupants), `sum(irate(task_cpu_usage[5s]))` took 20-25 s and now
-  takes 14-18 s, as the same table stored wide does.
-- An aggregation with several groups advances them together through time:
-  reading one group's next point emits every group's points up to that
-  timestamp, buffering the ones not yet read. Reading the groups one after
-  another pulled every series through the table once per group. On the
-  same recording `sum by (comm) (irate(task_cpu_usage[5s]))` took 192 s on
-  the wide table and 423-603 s on the long one, and takes 14-28 s on
-  either.
+- An aggregation with several groups (`sum by (comm) (...)`) advances its
+  groups together: reading one group's next point computes every group's
+  points up to that timestamp and buffers those not yet read. A consumer
+  that reads one group to its end, as building a matrix does, buffers the
+  other groups' points meanwhile, 88 bytes each. Reading the groups one
+  after another read every segment of the table once per group. On a
+  9.6-hour recording of a per-task group with a 256 MB pool,
+  `sum by (comm) (irate(task_cpu_usage[5s]))` took 192 s on the table
+  stored wide and 423-603 s stored long, and takes about 13 s on either.
 
 ## [0.34.1] - 2026-10-02
 

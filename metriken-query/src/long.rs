@@ -612,18 +612,17 @@ mod reader_tests {
         let long =
             SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
                 .unwrap();
-        for q in ["sum(rate(cpu[2s]))", "rate(cpu[2s])"] {
+        for q in ["sum(rate(cpu[2s]))", "rate(cpu[2s])", "max(depth)"] {
             let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
             let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
             assert_eq!(canonical(&a), canonical(&b), "{q}");
         }
-        // A hundred counter streams read one row group: too many to prune
-        // for, so it is decoded once for all of them, outside the pool, and
-        // each stream takes its own rows.
-        assert_eq!(pool.stats().misses, 0, "the shared read bypasses the pool");
-        let a = whole.query_range("max(depth)", 1.0, 10.0, 1.0).unwrap();
-        let b = long.query_range("max(depth)", 1.0, 10.0, 1.0).unwrap();
-        assert_eq!(canonical(&a), canonical(&b), "max(depth)");
+        // A hundred streams read one row group: too many to prune for, so
+        // they share one decode of it through the pool.
+        assert!(
+            pool.stats().entries > 0,
+            "the fallback decode goes through the pool"
+        );
     }
 
     /// An occupant absent from some ticks has no rows there, so its
@@ -816,8 +815,8 @@ mod reader_tests {
         );
     }
 
-    /// Two hundred occupants over sixty ticks in twelve segments, each living
-    /// a different span, some with one tick in a segment.
+    /// Two hundred occupants over sixty ticks, each living a different span.
+    /// Split five ticks to a segment, some have one tick in a segment.
     fn churn() -> Vec<Obs> {
         let mut rows = Vec::new();
         for tick in 1..=60u64 {
@@ -838,8 +837,9 @@ mod reader_tests {
         rows
     }
 
-    /// An all-series read of a long table answers as the wide table does,
-    /// whatever the pool holds.
+    /// An all-series read of a long table spread over segments answers as
+    /// the wide table does, with a 64 MiB pool and with a 4 KiB pool, which
+    /// holds less than one row group.
     #[test]
     fn an_all_series_read_across_segments_matches_the_wide_table() {
         let rows = churn();

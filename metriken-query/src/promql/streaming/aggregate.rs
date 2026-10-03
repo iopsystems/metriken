@@ -18,10 +18,11 @@
 //! degenerate to a straight-line reduce.
 //!
 //! Several groups advance together ([`Lockstep`]): reading any group's
-//! next point emits every group's points up to that timestamp, buffering
-//! the ones not yet read. A consumer that reads one group to its end before
-//! the next still pulls every child through time in order, which is what
-//! lets a source read each of its segments once for all of them.
+//! next point computes every group's points up to that timestamp and
+//! buffers those not yet read. A consumer that reads one group to its end
+//! before the next still pulls every child in timestamp order, and buffers
+//! every other live group's points meanwhile, 88 bytes each. A group whose
+//! reader is dropped is no longer advanced.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -84,6 +85,9 @@ pub fn aggregate<'a>(input: SeriesSet<'a>, op: AggOp, group_by: GroupBy<'_>) -> 
         .unzip();
     let shared = Rc::new(RefCell::new(Lockstep {
         buffers: merges.iter().map(|_| VecDeque::new()).collect(),
+        heads: vec![None; merges.len()],
+        live: vec![true; merges.len()],
+        started: false,
         merges,
     }));
     labels
@@ -104,19 +108,37 @@ pub fn aggregate<'a>(input: SeriesSet<'a>, op: AggOp, group_by: GroupBy<'_>) -> 
 /// Several groups' merges, advanced together through time.
 struct Lockstep<'a> {
     merges: Vec<MergeReduce<'a>>,
-    /// Points emitted and not yet read, by group.
+    /// Points computed and not yet read, by group.
     buffers: Vec<VecDeque<Point>>,
+    /// Each merge's next timestamp; `None` once it is exhausted.
+    heads: Vec<Option<u64>>,
+    /// Whether the group's reader still exists.
+    live: Vec<bool>,
+    /// Whether `heads` has been filled.
+    started: bool,
 }
 
 impl Lockstep<'_> {
-    /// The next point of group `index`, advancing every group whose next
-    /// timestamp is the smallest until that group has one.
+    /// The next point of group `index`, advancing every live group whose
+    /// next timestamp is the smallest until that group has one.
     fn next(&mut self, index: usize) -> Option<Point> {
+        if !self.started {
+            for (head, merge) in self.heads.iter_mut().zip(&mut self.merges) {
+                *head = merge.next_ts();
+            }
+            self.started = true;
+        }
         while self.buffers[index].is_empty() {
-            let t = self.merges.iter_mut().filter_map(|m| m.next_ts()).min()?;
-            for (merge, buffer) in self.merges.iter_mut().zip(&mut self.buffers) {
-                if merge.next_ts() == Some(t) {
-                    buffer.extend(merge.next());
+            let t = self
+                .heads
+                .iter()
+                .zip(&self.live)
+                .filter_map(|(h, live)| h.filter(|_| *live))
+                .min()?;
+            for g in 0..self.merges.len() {
+                if self.live[g] && self.heads[g] == Some(t) {
+                    self.buffers[g].extend(self.merges[g].next());
+                    self.heads[g] = self.merges[g].next_ts();
                 }
             }
         }
@@ -135,6 +157,14 @@ impl Iterator for LockstepGroup<'_> {
 
     fn next(&mut self) -> Option<Point> {
         self.shared.borrow_mut().next(self.index)
+    }
+}
+
+impl Drop for LockstepGroup<'_> {
+    fn drop(&mut self) {
+        let mut shared = self.shared.borrow_mut();
+        shared.live[self.index] = false;
+        shared.buffers[self.index] = VecDeque::new();
     }
 }
 
@@ -460,5 +490,23 @@ mod lockstep_tests {
         let pulls = log.borrow();
         let at = |p: (&str, u64)| pulls.iter().position(|x| *x == p).unwrap();
         assert!(at(("c", 1)) < at(("a", 3)), "{pulls:?}");
+    }
+
+    /// A group whose reader is dropped is no longer advanced: its child is
+    /// pulled no further than the first point a merge peeks at.
+    #[test]
+    fn a_dropped_group_is_not_advanced() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let input = vec![recorded("a", "x", &log), recorded("c", "y", &log)];
+        let by = ["group".to_string()];
+        let mut groups = aggregate(input, AggOp::Sum, GroupBy::Include(&by));
+        groups.sort_by(|a, b| a.labels.inner.cmp(&b.labels.inner));
+        let y = groups.pop().unwrap();
+        drop(y);
+        let x = groups.pop().unwrap();
+        assert_eq!(x.iter.count(), 3);
+        let pulls = log.borrow();
+        let c = pulls.iter().filter(|(id, _)| *id == "c").count();
+        assert!(c <= 1, "{pulls:?}");
     }
 }
