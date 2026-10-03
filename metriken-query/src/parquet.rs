@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
@@ -1342,11 +1342,6 @@ pub(crate) struct ParquetSource {
     /// The `occupant` column, if this is a long segment; see
     /// [`ParquetSource::occupant_col`].
     occupant_col: OnceLock<Option<usize>>,
-    /// Without a pool: per row group of a long segment, the rows each
-    /// occupant has, built on first use and kept for the life of the source.
-    /// With a pool the index is a pool entry; see
-    /// [`ParquetSource::occupant_rows`].
-    occupant_rows: Mutex<HashMap<usize, Arc<OccupantRows>>>,
     /// A long segment's metadata with its page index, loaded the first time
     /// a read might prune; see [`ParquetSource::occupant_selection`].
     page_meta: OnceLock<Option<ArrowReaderMetadata>>,
@@ -1628,12 +1623,10 @@ impl ParquetSource {
     /// an index no column reaches: counted against the budget, evicted in LRU
     /// order like a column, and rebuilt from the occupant column after
     /// eviction. An index larger than the whole pool is not cached. Without
-    /// a pool it is kept in `occupant_rows` for the life of the source.
+    /// a pool it is built on every call; every reader of long segments has
+    /// one.
     fn occupant_rows(&self, rg_idx: usize) -> Result<Arc<OccupantRows>, Box<dyn Error>> {
         let col = self.occupant_col().ok_or("not a long segment")?;
-        if let Some(rows) = self.occupant_rows.lock().unwrap().get(&rg_idx) {
-            return Ok(Arc::clone(rows));
-        }
         // A pool entry under a column index no column reaches.
         let key = CacheKey {
             source_id: self.id,
@@ -1649,12 +1642,7 @@ impl ParquetSource {
         let index = Arc::new(OccupantRows::build(&occupants));
         if let Some(pool) = &self.pool {
             pool.put_derived(key, Arc::clone(&index), index.bytes());
-            return Ok(index);
         }
-        self.occupant_rows
-            .lock()
-            .unwrap()
-            .insert(rg_idx, Arc::clone(&index));
         Ok(index)
     }
 
@@ -1860,7 +1848,6 @@ impl ParquetSource {
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
-            occupant_rows: Mutex::new(HashMap::new()),
             page_meta: OnceLock::new(),
         }))
     }
@@ -1878,7 +1865,6 @@ impl ParquetSource {
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
-            occupant_rows: Mutex::new(HashMap::new()),
             page_meta: OnceLock::new(),
         }))
     }
@@ -1896,7 +1882,6 @@ impl ParquetSource {
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
-            occupant_rows: Mutex::new(HashMap::new()),
             page_meta: OnceLock::new(),
         }))
     }
@@ -1915,7 +1900,6 @@ impl ParquetSource {
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
-            occupant_rows: Mutex::new(HashMap::new()),
             page_meta: OnceLock::new(),
         }))
     }
@@ -1946,7 +1930,6 @@ impl ParquetSource {
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
-            occupant_rows: Mutex::new(HashMap::new()),
             page_meta: OnceLock::new(),
         }))
     }
@@ -1964,7 +1947,6 @@ impl ParquetSource {
             columns: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
-            occupant_rows: Mutex::new(HashMap::new()),
             page_meta: OnceLock::new(),
         }))
     }
@@ -2501,12 +2483,16 @@ fn read_timestamps(
     Ok(result)
 }
 
+/// The most rows [`reserve_rows`] reserves up front.
+const RESERVE_ROWS_MAX: usize = 1 << 22;
+
 /// Reserve room for a row group's rows from the footer's count. The count
-/// is a hint: a negative or unallocatable one reserves nothing, and the
-/// vector grows as rows are decoded.
+/// is a hint: a negative one reserves nothing, a larger one than
+/// [`RESERVE_ROWS_MAX`] reserves that many, an unallocatable one reserves
+/// nothing, and the vector grows past the reservation as rows are decoded.
 fn reserve_rows<T>(out: &mut Vec<T>, rows: i64) {
     if let Ok(rows) = usize::try_from(rows) {
-        let _ = out.try_reserve_exact(rows);
+        let _ = out.try_reserve_exact(rows.min(RESERVE_ROWS_MAX));
     }
 }
 
@@ -4189,10 +4175,10 @@ mod occupant_rows_tests {
         assert_eq!(index.rows.len(), 6);
     }
 
-    /// Without a pool, a long segment's index is built once per row group
-    /// and kept on the source.
+    /// Without a pool, a long segment's index is built from its occupant
+    /// column.
     #[test]
-    fn without_a_pool_the_index_is_kept_on_the_source() {
+    fn without_a_pool_the_index_is_built() {
         use arrow::array::{ArrayRef, UInt64Array};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -4223,21 +4209,19 @@ mod occupant_rows_tests {
         w.close().unwrap();
         let src = ParquetSource::open_bytes(buf.into()).unwrap();
         assert!(src.pool.is_none());
-        let a = src.occupant_rows(0).unwrap();
-        let b = src.occupant_rows(0).unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "built once");
-        assert_eq!(a.get(&5), Some(&[0u32, 2][..]));
-        assert_eq!(a.get(&6), Some(&[1u32, 3][..]));
+        let index = src.occupant_rows(0).unwrap();
+        assert_eq!(index.get(&5), Some(&[0u32, 2][..]));
+        assert_eq!(index.get(&6), Some(&[1u32, 3][..]));
     }
 
-    /// A footer's row count that is negative or cannot be allocated reserves
-    /// nothing rather than failing.
+    /// A footer's row count that is negative or huge reserves at most
+    /// `RESERVE_ROWS_MAX` rather than failing.
     #[test]
     fn a_corrupt_row_count_reserves_nothing() {
         for rows in [-1i64, i64::MAX, 1 << 60] {
             let mut v: Vec<Option<u64>> = Vec::new();
             reserve_rows(&mut v, rows);
-            assert_eq!(v.capacity(), 0, "{rows}");
+            assert!(v.capacity() <= RESERVE_ROWS_MAX, "{rows}: {}", v.capacity());
         }
     }
 
