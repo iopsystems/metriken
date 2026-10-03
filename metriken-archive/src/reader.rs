@@ -426,12 +426,20 @@ impl SegmentSource {
                     // A segment retention took since the catalog read is
                     // gone, and so are the rows that named its occupants.
                     None => match db.segment_bytes(recording_id, stream, seq)? {
-                        Some(bytes) => Arc::new(
-                            metriken_segment::occupants::decode_segment(&bytes)?
-                                .into_iter()
-                                .map(|(_, o)| o)
-                                .collect(),
-                        ),
+                        // An occupant is restated with the labels it was first
+                        // described with, and the relabel keeps an occupant's
+                        // first labels, so a segment's first row for each
+                        // occupant is all it contributes.
+                        Some(bytes) => {
+                            let mut seen = std::collections::HashSet::new();
+                            Arc::new(
+                                metriken_segment::occupants::decode_segment(&bytes)?
+                                    .into_iter()
+                                    .map(|(_, o)| o)
+                                    .filter(|o| seen.insert(o.occupant))
+                                    .collect(),
+                            )
+                        }
                         None => continue,
                     },
                 };
