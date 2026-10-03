@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A query reading many occupants of a long table reads each segment's
+  column once for all of them, in one projection outside the buffer pool,
+  and hands each series its own rows. It used to decode the row group
+  through the pool once per series, and decoded it again whenever the
+  pool had evicted it, which a pool smaller than the table did for nearly
+  every series. On a 9.6-hour recording of a per-task group (291 segments,
+  3,383 occupants), `sum(irate(task_cpu_usage[5s]))` took 20-25 s and now
+  takes 14-18 s, as the same table stored wide does.
+- An aggregation with several groups advances them together through time:
+  reading one group's next point emits every group's points up to that
+  timestamp, buffering the ones not yet read. Reading the groups one after
+  another pulled every series through the table once per group. On the
+  same recording `sum by (comm) (irate(task_cpu_usage[5s]))` took 192 s on
+  the wide table and 423-603 s on the long one, and takes 14-28 s on
+  either.
+
 ## [0.34.1] - 2026-10-02
 
 ### Added

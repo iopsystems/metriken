@@ -995,6 +995,132 @@ impl Handover {
     }
 }
 
+/// One query's reads of long counter columns for many occupants: a
+/// `(segment, column)` is read for all of them the first time any of their
+/// streams reaches it, and each stream then takes its own occupant's rows.
+/// An entry is dropped once every occupant the query reads there has asked.
+///
+/// Every stream first asks for its earliest segment, and then for each of
+/// its segments in turn. So a read keeps the rows of each occupant that will
+/// ask for this segment next: one whose earliest segment it is, or one that
+/// has asked for the segment before it. The rows held are also bounded by
+/// the pool's budget: over it, the entry furthest ahead in time is dropped,
+/// to be read again when it is reached.
+struct LongSplit<'s> {
+    source: &'s SegmentedSource,
+    start_ns: u64,
+    end_ns: u64,
+    /// The occupants the query reads, by `(segment, column)`, each with the
+    /// `(segment, column)` its stream reads before this one.
+    wanted: HashMap<SplitKey, HashMap<u64, Option<SplitKey>>>,
+    state: Mutex<SplitState>,
+}
+
+#[derive(Default)]
+struct SplitState {
+    /// Rows read and not yet taken, by `(segment, column)`.
+    read: BTreeMap<(u32, u32), SplitRead>,
+    /// The occupants that have asked, by `(segment, column)`.
+    asked: HashMap<(u32, u32), std::collections::HashSet<u64>>,
+    /// Bytes of the rows in `read`.
+    bytes: usize,
+}
+
+/// A long column of one segment: `(segment, column)`.
+type SplitKey = (u32, u32);
+
+/// One `(segment, column)`'s rows read and not yet taken, by occupant, and
+/// the occupants the reads covered: one outside it has to be read for.
+#[derive(Default)]
+struct SplitRead {
+    chunks: HashMap<u64, crate::ColumnChunk>,
+    covered: std::collections::HashSet<u64>,
+}
+
+impl SplitRead {
+    fn bytes(&self) -> usize {
+        self.chunks.values().map(chunk_bytes).sum()
+    }
+}
+
+fn chunk_bytes(c: &crate::ColumnChunk) -> usize {
+    c.timestamps.len() * 16 + c.windows.as_ref().map_or(0, |w| w.len() * 16)
+}
+
+impl LongSplit<'_> {
+    /// `occupant`'s rows of the column at `position` in `segment`; `None`
+    /// when it has none in the range or the segment could not be read.
+    fn take(
+        &self,
+        segment: u32,
+        position: &crate::ColumnPosition,
+        occupant: u64,
+    ) -> Option<crate::ColumnChunk> {
+        let key = (segment, position.col_idx);
+        let wanted = self.wanted.get(&key)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *state;
+        let asked = state.asked.entry(key).or_default();
+        asked.insert(occupant);
+        let done = asked.len() >= wanted.len();
+        let covered = state
+            .read
+            .get(&key)
+            .is_some_and(|r| r.covered.contains(&occupant));
+        let mine = if covered {
+            let entry = state.read.get_mut(&key)?;
+            let mine = entry.chunks.remove(&occupant);
+            state.bytes -= mine.as_ref().map_or(0, chunk_bytes);
+            mine
+        } else {
+            // Read for this occupant and every other that will ask next and
+            // has not been read for.
+            let asked = &state.asked;
+            let already = state.read.get(&key).map(|r| &r.covered);
+            let pending: std::collections::HashSet<u64> = wanted
+                .iter()
+                .filter(|(o, previous)| {
+                    **o == occupant
+                        || (!asked.get(&key).is_some_and(|a| a.contains(o))
+                            && !already.is_some_and(|c| c.contains(o))
+                            && previous
+                                .is_none_or(|p| asked.get(&p).is_some_and(|a| a.contains(o))))
+                })
+                .map(|(o, _)| *o)
+                .collect();
+            let seg = match self.source.segment(segment as usize) {
+                Ok(Some(seg)) => seg,
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!(segment, "fetching a segment: {e}");
+                    return None;
+                }
+            };
+            let mut chunks =
+                seg.counter_column_split(position, self.start_ns, self.end_ns, &pending)?;
+            let mine = chunks.remove(&occupant);
+            let entry = state.read.entry(key).or_default();
+            state.bytes += chunks.values().map(chunk_bytes).sum::<usize>();
+            entry.chunks.extend(chunks);
+            entry.covered.extend(pending);
+            mine
+        };
+        if done || state.read.get(&key).is_some_and(|r| r.chunks.is_empty()) {
+            if let Some(rest) = state.read.remove(&key) {
+                state.bytes -= rest.bytes();
+            }
+        }
+        let budget = self.source.pool.max_bytes();
+        while state.bytes > budget && state.read.len() > 1 {
+            let Some((_, far)) = state.read.pop_last() else {
+                break;
+            };
+            state.bytes -= far.bytes();
+        }
+        mine
+    }
+}
+
 impl SegmentedSource {
     /// The filter a segment is asked with: the query's own, unless a
     /// relabelling has keys the columns do not carry — see
@@ -1391,9 +1517,41 @@ impl DataSource for SegmentedSource {
         let table = self.state.counter_columns.get(name)?;
         let name: Arc<str> = Arc::from(name);
         // Few series: a long segment may decode only each one's pages. Many:
-        // each segment decodes a row group once for all of them.
+        // each long segment is read once for all of them (`LongSplit`).
         let selective = order.iter().filter(|l| l.matches(filter)).count()
             <= crate::parquet::PRUNE_MAX_OCCUPANTS;
+        // A read of one occupant of a long column holds only that occupant's
+        // samples, which present as its series' labels throughout when the
+        // relabel's identities are fixed, so it needs no relabelling.
+        let occupant_reads = self
+            .relabel
+            .as_deref()
+            .is_none_or(|r| r.identities_are_fixed());
+        let split = (!selective && occupant_reads).then(|| {
+            let mut wanted: HashMap<SplitKey, HashMap<u64, Option<SplitKey>>> = HashMap::new();
+            for (pos, labels) in order.iter().enumerate() {
+                if !labels.matches(filter) {
+                    continue;
+                }
+                let mut previous = None;
+                for l in table.by_series.get(pos).into_iter().flatten() {
+                    if let Some(occupant) = l.position.occupant {
+                        if self.state.catalog[l.segment as usize].touches(start_ns, end_ns) {
+                            let key = (l.segment, l.position.col_idx);
+                            wanted.entry(key).or_default().insert(occupant, previous);
+                            previous = Some(key);
+                        }
+                    }
+                }
+            }
+            Arc::new(LongSplit {
+                source: self,
+                start_ns,
+                end_ns,
+                wanted,
+                state: Mutex::new(SplitState::default()),
+            })
+        });
         let mut out = Vec::new();
         for (pos, labels) in order.iter().enumerate() {
             if !labels.matches(filter) {
@@ -1408,10 +1566,17 @@ impl DataSource for SegmentedSource {
             let labels = labels.clone();
             let series_labels = labels.clone();
             let name = Arc::clone(&name);
+            let split = split.clone();
             let samples = locations
                 .iter()
                 .filter(move |l| self.state.catalog[l.segment as usize].touches(start_ns, end_ns))
                 .filter_map(move |l| {
+                    if let (Some(occupant), Some(split)) = (l.position.occupant, &split) {
+                        // The chunk's labels are not read: the stream is
+                        // this series'.
+                        let chunk = split.take(l.segment, &l.position, occupant)?;
+                        return Some(vec![chunk.labeled(Labels::default())]);
+                    }
                     let idx = l.segment as usize;
                     let seg = match self.segment(idx) {
                         Ok(Some(seg)) => seg,
@@ -1422,17 +1587,8 @@ impl DataSource for SegmentedSource {
                         }
                     };
                     let chunk = seg.counter_column(&l.position, start_ns, end_ns, selective)?;
-                    // A read of one occupant of a long column holds only that
-                    // occupant's samples, which present as this series' labels
-                    // throughout when the relabel's identities are fixed, so
-                    // relabelling it would only rebuild them.
-                    if l.position.occupant.is_some()
-                        && self
-                            .relabel
-                            .as_deref()
-                            .is_none_or(|r| r.identities_are_fixed())
-                    {
-                        return Some(vec![chunk.labeled(series_labels.clone())]);
+                    if l.position.occupant.is_some() && occupant_reads {
+                        return Some(vec![chunk.labeled(Labels::default())]);
                     }
                     let chunk = chunk.labeled(table.labels[l.column_labels as usize].clone());
                     // A relabelled column carries every occupant's samples;

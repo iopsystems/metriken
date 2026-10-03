@@ -16,8 +16,16 @@
 //! holding that exact timestamp contribute to the reduction. Children
 //! with aligned grids (the common case for step-aligned PromQL queries)
 //! degenerate to a straight-line reduce.
+//!
+//! Several groups advance together ([`Lockstep`]): reading any group's
+//! next point emits every group's points up to that timestamp, buffering
+//! the ones not yet read. A consumer that reads one group to its end before
+//! the next still pulls every child through time in order, which is what
+//! lets a source read each of its segments once for all of them.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 use crate::labels::{is_internal_label, Labels};
 
@@ -64,10 +72,70 @@ pub fn aggregate<'a>(input: SeriesSet<'a>, op: AggOp, group_by: GroupBy<'_>) -> 
         groups.entry(group_labels).or_default().push(ls.iter);
     }
 
-    groups
+    if groups.len() < 2 {
+        return groups
+            .into_iter()
+            .map(|(labels, children)| LabeledSeries::new(labels, MergeReduce::new(children, op)))
+            .collect();
+    }
+    let (labels, merges): (Vec<Labels>, Vec<MergeReduce<'a>>) = groups
         .into_iter()
-        .map(|(labels, children)| LabeledSeries::new(labels, MergeReduce::new(children, op)))
+        .map(|(labels, children)| (labels, MergeReduce::new(children, op)))
+        .unzip();
+    let shared = Rc::new(RefCell::new(Lockstep {
+        buffers: merges.iter().map(|_| VecDeque::new()).collect(),
+        merges,
+    }));
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, labels)| {
+            LabeledSeries::new(
+                labels,
+                LockstepGroup {
+                    shared: Rc::clone(&shared),
+                    index,
+                },
+            )
+        })
         .collect()
+}
+
+/// Several groups' merges, advanced together through time.
+struct Lockstep<'a> {
+    merges: Vec<MergeReduce<'a>>,
+    /// Points emitted and not yet read, by group.
+    buffers: Vec<VecDeque<Point>>,
+}
+
+impl Lockstep<'_> {
+    /// The next point of group `index`, advancing every group whose next
+    /// timestamp is the smallest until that group has one.
+    fn next(&mut self, index: usize) -> Option<Point> {
+        while self.buffers[index].is_empty() {
+            let t = self.merges.iter_mut().filter_map(|m| m.next_ts()).min()?;
+            for (merge, buffer) in self.merges.iter_mut().zip(&mut self.buffers) {
+                if merge.next_ts() == Some(t) {
+                    buffer.extend(merge.next());
+                }
+            }
+        }
+        self.buffers[index].pop_front()
+    }
+}
+
+/// One group of a [`Lockstep`].
+struct LockstepGroup<'a> {
+    shared: Rc<RefCell<Lockstep<'a>>>,
+    index: usize,
+}
+
+impl Iterator for LockstepGroup<'_> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        self.shared.borrow_mut().next(self.index)
+    }
 }
 
 pub(crate) fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Labels {
@@ -113,6 +181,14 @@ impl<'a> MergeReduce<'a> {
             children: children.into_iter().map(Iterator::peekable).collect(),
             op,
         }
+    }
+
+    /// The timestamp of the next point, without emitting it.
+    fn next_ts(&mut self) -> Option<u64> {
+        self.children
+            .iter_mut()
+            .filter_map(|c| c.peek().map(|p| p.t))
+            .min()
     }
 }
 
@@ -328,5 +404,61 @@ mod interval_tests {
         let p = mr.next().unwrap();
         assert_eq!(p.v, 30.0);
         assert!(p.bounds.is_none());
+    }
+}
+
+#[cfg(test)]
+mod lockstep_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A series at timestamps 1..=3 that records `(series, t)` as it is
+    /// pulled.
+    fn recorded<'a>(
+        id: &'static str,
+        group: &'static str,
+        log: &Rc<RefCell<Vec<(&'static str, u64)>>>,
+    ) -> LabeledSeries<'a> {
+        let log = Rc::clone(log);
+        LabeledSeries::new(
+            Labels::from([("id", id), ("group", group)]),
+            (1..=3u64).map(move |t| {
+                log.borrow_mut().push((id, t));
+                Point {
+                    t,
+                    v: 1.0,
+                    bounds: None,
+                    edges: None,
+                    interpolated: false,
+                }
+            }),
+        )
+    }
+
+    /// Reading one group to its end pulls every group's children through
+    /// time together, and each group still gets all of its points.
+    #[test]
+    fn groups_advance_together() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let input = vec![
+            recorded("a", "x", &log),
+            recorded("b", "x", &log),
+            recorded("c", "y", &log),
+        ];
+        let by = ["group".to_string()];
+        let mut groups = aggregate(input, AggOp::Sum, GroupBy::Include(&by));
+        groups.sort_by(|a, b| a.labels.inner.cmp(&b.labels.inner));
+        let mut drained = Vec::new();
+        for g in groups {
+            drained.push(g.iter.map(|p| (p.t, p.v)).collect::<Vec<_>>());
+        }
+        assert_eq!(drained[0], vec![(1, 2.0), (2, 2.0), (3, 2.0)]);
+        assert_eq!(drained[1], vec![(1, 1.0), (2, 1.0), (3, 1.0)]);
+        // The second group's child is pulled at t=1 before the first group's
+        // reach t=3, though the first group was read to its end first.
+        let pulls = log.borrow();
+        let at = |p: (&str, u64)| pulls.iter().position(|x| *x == p).unwrap();
+        assert!(at(("c", 1)) < at(("a", 3)), "{pulls:?}");
     }
 }

@@ -612,17 +612,18 @@ mod reader_tests {
         let long =
             SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
                 .unwrap();
-        for q in ["sum(rate(cpu[2s]))", "rate(cpu[2s])", "max(depth)"] {
+        for q in ["sum(rate(cpu[2s]))", "rate(cpu[2s])"] {
             let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
             let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
             assert_eq!(canonical(&a), canonical(&b), "{q}");
         }
-        // A hundred streams read one row group: too many to prune for, so
-        // they share one decode of it through the pool.
-        assert!(
-            pool.stats().entries > 0,
-            "the fallback decode goes through the pool"
-        );
+        // A hundred counter streams read one row group: too many to prune
+        // for, so it is decoded once for all of them, outside the pool, and
+        // each stream takes its own rows.
+        assert_eq!(pool.stats().misses, 0, "the shared read bypasses the pool");
+        let a = whole.query_range("max(depth)", 1.0, 10.0, 1.0).unwrap();
+        let b = long.query_range("max(depth)", 1.0, 10.0, 1.0).unwrap();
+        assert_eq!(canonical(&a), canonical(&b), "max(depth)");
     }
 
     /// An occupant absent from some ticks has no rows there, so its
@@ -813,5 +814,62 @@ mod reader_tests {
             !late.is_empty() && late.iter().all(|t| *t > 3.5),
             "{late:?}"
         );
+    }
+
+    /// Two hundred occupants over sixty ticks in twelve segments, each living
+    /// a different span, some with one tick in a segment.
+    fn churn() -> Vec<Obs> {
+        let mut rows = Vec::new();
+        for tick in 1..=60u64 {
+            for occ in 0..200u64 {
+                let (born, dies) = (occ % 50, occ % 50 + 3 + (occ * 7) % 40);
+                if tick < born || tick > dies {
+                    continue;
+                }
+                rows.push(Obs {
+                    ts: tick * 1_000_000_000,
+                    occ,
+                    cpu: Some(tick * (occ + 1) * 3),
+                    depth: Some((tick + occ) as i64),
+                    lat: Some(buckets(tick)),
+                });
+            }
+        }
+        rows
+    }
+
+    /// An all-series read of a long table answers as the wide table does,
+    /// whatever the pool holds.
+    #[test]
+    fn an_all_series_read_across_segments_matches_the_wide_table() {
+        let rows = churn();
+        let by_segment = |tick_span: u64| -> Vec<Vec<Obs>> {
+            let mut segs: Vec<Vec<Obs>> = Vec::new();
+            for r in &rows {
+                let i = ((r.ts / 1_000_000_000 - 1) / tick_span) as usize;
+                if segs.len() <= i {
+                    segs.resize_with(i + 1, Vec::new);
+                }
+                segs[i].push(r.clone());
+            }
+            segs
+        };
+        let wide_segs: Vec<Vec<u8>> = by_segment(5).iter().map(|s| wide(s)).collect();
+        let long_segs: Vec<Vec<u8>> = by_segment(5).iter().map(|s| long(s, None)).collect();
+        let whole =
+            SegmentedParquetReader::open_bytes_with_pool(wide_segs, BufferPool::new(64 << 20))
+                .unwrap();
+        for pool in [64 << 20, 4 << 10] {
+            let longr = SegmentedParquetReader::open_bytes_with_pool(
+                long_segs.clone(),
+                BufferPool::new(pool),
+            )
+            .unwrap();
+            for q in ["sum(rate(cpu[3s]))", "rate(cpu[3s])", "sum(irate(cpu[3s]))"] {
+                let a = whole.query_range(q, 1.0, 60.0, 1.0).unwrap();
+                let b = longr.query_range(q, 1.0, 60.0, 1.0).unwrap();
+                assert_eq!(canonical(&a), canonical(&b), "{q}, pool {pool}");
+            }
+        }
     }
 }
