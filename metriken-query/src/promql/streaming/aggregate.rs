@@ -21,8 +21,10 @@
 //! next point computes every group's points up to that timestamp and
 //! buffers those not yet read. A consumer that reads one group to its end
 //! before the next still pulls every child in timestamp order, and buffers
-//! every other live group's points meanwhile, 88 bytes each. A group whose
-//! reader is dropped is no longer advanced.
+//! every other live group's points meanwhile: 88 bytes each, plus the
+//! buffers' spare capacity. A group whose reader is dropped is no longer
+//! advanced, and an exhausted group's reader gets `None` without advancing
+//! the others.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -123,10 +125,15 @@ impl Lockstep<'_> {
     /// next timestamp is the smallest until that group has one.
     fn next(&mut self, index: usize) -> Option<Point> {
         if !self.started {
-            for (head, merge) in self.heads.iter_mut().zip(&mut self.merges) {
-                *head = merge.next_ts();
+            for g in 0..self.merges.len() {
+                if self.live[g] {
+                    self.heads[g] = self.merges[g].next_ts();
+                }
             }
             self.started = true;
+        }
+        if self.buffers[index].is_empty() && self.heads[index].is_none() {
+            return None;
         }
         while self.buffers[index].is_empty() {
             let t = self
@@ -162,9 +169,14 @@ impl Iterator for LockstepGroup<'_> {
 
 impl Drop for LockstepGroup<'_> {
     fn drop(&mut self) {
-        let mut shared = self.shared.borrow_mut();
+        let Ok(mut shared) = self.shared.try_borrow_mut() else {
+            return;
+        };
         shared.live[self.index] = false;
         shared.buffers[self.index] = VecDeque::new();
+        // Its children are never read again.
+        shared.merges[self.index].children.clear();
+        shared.heads[self.index] = None;
     }
 }
 
@@ -508,5 +520,52 @@ mod lockstep_tests {
         let pulls = log.borrow();
         let c = pulls.iter().filter(|(id, _)| *id == "c").count();
         assert!(c <= 1, "{pulls:?}");
+    }
+
+    /// Asking an exhausted group for its next point does not run the other
+    /// groups to their ends.
+    #[test]
+    fn an_exhausted_group_does_not_advance_the_others() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let short = {
+            let log = Rc::clone(&log);
+            LabeledSeries::new(
+                Labels::from([("id", "a"), ("group", "x")]),
+                (1..=2u64).map(move |t| {
+                    log.borrow_mut().push(("a", t));
+                    Point {
+                        t,
+                        v: 1.0,
+                        bounds: None,
+                        edges: None,
+                        interpolated: false,
+                    }
+                }),
+            )
+        };
+        let long = {
+            let log = Rc::clone(&log);
+            LabeledSeries::new(
+                Labels::from([("id", "b"), ("group", "y")]),
+                (1..=1000u64).map(move |t| {
+                    log.borrow_mut().push(("b", t));
+                    Point {
+                        t,
+                        v: 1.0,
+                        bounds: None,
+                        edges: None,
+                        interpolated: false,
+                    }
+                }),
+            )
+        };
+        let by = ["group".to_string()];
+        let mut groups = aggregate(vec![short, long], AggOp::Sum, GroupBy::Include(&by));
+        groups.sort_by(|a, b| a.labels.inner.cmp(&b.labels.inner));
+        let mut x = groups.remove(0).iter;
+        assert_eq!(x.by_ref().count(), 2);
+        assert!(x.next().is_none());
+        let b = log.borrow().iter().filter(|(id, _)| *id == "b").count();
+        assert!(b <= 4, "b pulled {b} times");
     }
 }

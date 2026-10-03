@@ -1,8 +1,15 @@
 //! What a query costs on a freshly reopened reader, as a live viewer reopens
 //! one every interval. Ignored; needs a recording:
 //! `REOPEN_COST_ARCHIVE=path.dendro cargo test --release -p metriken-archive
-//! --test reopen_cost -- --ignored --nocapture`. `REOPEN_COST_QUERY` picks
-//! the query (default `sum(irate(task_cpu_usage[5s]))`).
+//! --test reopen_cost -- --ignored --nocapture`. Optional settings:
+//!
+//! - `REOPEN_COST_QUERY`: the query (default `sum(irate(task_cpu_usage[5s]))`).
+//! - `REOPEN_COST_POOL_MB`: the buffer pool's size (default 256).
+//! - `REOPEN_COST_FRAC=a,b`: query that fraction of the recording.
+//! - `REOPEN_COST_COLD_ONLY`: stop after the cold query.
+//! - `REOPEN_COST_SAVE=file`: write the answer, canonicalized.
+//! - `REOPEN_COST_COMPARE=other.dendro`: fail unless the other archive gives
+//!   the same answer; `REOPEN_COST_DUMP=dir` says where the two go when not.
 
 use std::time::{Duration, Instant};
 

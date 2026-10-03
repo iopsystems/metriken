@@ -13,11 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   groups together: reading one group's next point computes every group's
   points up to that timestamp and buffers those not yet read. A consumer
   that reads one group to its end, as building a matrix does, buffers the
-  other groups' points meanwhile, 88 bytes each. Reading the groups one
-  after another read every segment of the table once per group. On a
-  9.6-hour recording of a per-task group with a 256 MB pool,
-  `sum by (comm) (irate(task_cpu_usage[5s]))` took 192 s on the table
-  stored wide and 423-603 s stored long, and takes about 13 s on either.
+  other groups' points meanwhile, 88 bytes each plus the buffers' spare
+  capacity. Reading the groups one after another fetched and opened each
+  segment again for every group that reached it, since the segment cache
+  could not hold the table across groups. On a 9.6-hour recording of a
+  per-task group with a 256 MB pool, `sum by (comm)
+  (irate(task_cpu_usage[5s]))` made 22,679 segment fetches on the table
+  stored wide and took 192 s, or 423-603 s stored long; it makes 306 and
+  takes 13-15 s on either.
 
 ## [0.34.1] - 2026-10-02
 
