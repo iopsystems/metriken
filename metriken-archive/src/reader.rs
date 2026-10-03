@@ -34,6 +34,14 @@ use crate::{InMemorySource, IndexRelabel, Reopen};
 
 use metriken_segment::occupants::Occupant;
 
+/// Each occupant's first row, in the order the rows came.
+fn first_per_occupant(rows: impl IntoIterator<Item = Occupant>) -> Vec<Occupant> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|o| seen.insert(o.occupant))
+        .collect()
+}
+
 /// An occupant stream's sealed segments, decoded, by [`segment_key`].
 type OccupantSegments = BTreeMap<u64, Arc<Vec<Occupant>>>;
 
@@ -404,8 +412,10 @@ impl SegmentSource {
         Ok((!store.is_empty()).then_some(store))
     }
 
-    /// Every row of an occupant stream, sealed segments first and then the
-    /// live WAL: the labels of every occupant the table's rows can name.
+    /// The rows of an occupant stream: from each sealed segment, its first
+    /// row for each occupant; from the live WAL, every row. Sealed segments
+    /// come first, in sequence order. These are the labels of every occupant
+    /// the table's rows can name.
     /// Empty for a tar archive, which has no long tables.
     ///
     /// `known` holds sealed segments of the stream already decoded, by
@@ -426,20 +436,18 @@ impl SegmentSource {
                     // A segment retention took since the catalog read is
                     // gone, and so are the rows that named its occupants.
                     None => match db.segment_bytes(recording_id, stream, seq)? {
-                        // An occupant is restated with the labels it was first
-                        // described with, and the relabel keeps an occupant's
-                        // first labels, so a segment's first row for each
-                        // occupant is all it contributes.
-                        Some(bytes) => {
-                            let mut seen = std::collections::HashSet::new();
-                            Arc::new(
-                                metriken_segment::occupants::decode_segment(&bytes)?
-                                    .into_iter()
-                                    .map(|(_, o)| o)
-                                    .filter(|o| seen.insert(o.occupant))
-                                    .collect(),
-                            )
-                        }
+                        // `OccupantLabels::new` keeps the first labels it sees
+                        // for an occupant, and segments are read in order, so
+                        // a later row for the same occupant in this segment
+                        // cannot change any series' labels. The relabel's key
+                        // set can lose a key that appears only on such a row;
+                        // no series carries that key, so a filter on it
+                        // matches the same series either way.
+                        Some(bytes) => Arc::new(first_per_occupant(
+                            metriken_segment::occupants::decode_segment(&bytes)?
+                                .into_iter()
+                                .map(|(_, o)| o),
+                        )),
                         None => continue,
                     },
                 };
@@ -1933,6 +1941,22 @@ fn union_sorted(iters: impl Iterator<Item = Vec<String>>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A later row for an occupant, even with other labels, is dropped; the
+    /// first rows keep their order.
+    #[test]
+    fn first_per_occupant_keeps_each_first_row_in_order() {
+        let occ = |n: u64, comm: &str| Occupant {
+            occupant: n,
+            labels: [("comm".to_string(), comm.to_string())].into(),
+        };
+        let kept = first_per_occupant([occ(5, "a"), occ(3, "b"), occ(5, "c"), occ(3, "b")]);
+        let got: Vec<(u64, &str)> = kept
+            .iter()
+            .map(|o| (o.occupant, o.labels["comm"].as_str()))
+            .collect();
+        assert_eq!(got, vec![(5, "a"), (3, "b")]);
+    }
 
     /// The typical gap is the MEDIAN, so one long hole (a restart, a missed
     /// poll) does not masquerade as the table's cadence. Moved from rezolus.

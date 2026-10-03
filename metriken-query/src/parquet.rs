@@ -1342,8 +1342,10 @@ pub(crate) struct ParquetSource {
     /// The `occupant` column, if this is a long segment; see
     /// [`ParquetSource::occupant_col`].
     occupant_col: OnceLock<Option<usize>>,
-    /// Per row group of a long segment, the rows each occupant has. Built
-    /// on first use; see [`ParquetSource::occupant_rows`].
+    /// Without a pool: per row group of a long segment, the rows each
+    /// occupant has, built on first use and kept for the life of the source.
+    /// With a pool the index is a pool entry; see
+    /// [`ParquetSource::occupant_rows`].
     occupant_rows: Mutex<HashMap<usize, Arc<OccupantRows>>>,
     /// A long segment's metadata with its page index, loaded the first time
     /// a read might prune; see [`ParquetSource::occupant_selection`].
@@ -1360,25 +1362,27 @@ const PRUNE_MAX_FRACTION: usize = 4;
 /// group, shared through the pool, than by a pruned read per series.
 pub(crate) const PRUNE_MAX_OCCUPANTS: usize = 64;
 
-/// Which rows of one row group belong to each occupant, ascending: every
-/// row number in one vector, grouped by occupant, and each occupant's range
-/// of it. One allocation per row group rather than one per occupant.
+/// Which rows of one row group belong to each occupant: `rows` holds every
+/// row number, grouped by occupant and ascending within each, and `ranges`
+/// maps an occupant to its slice of `rows`.
 #[derive(Default)]
 struct OccupantRows {
-    ranges: HashMap<u64, (u32, u32)>,
+    ranges: HashMap<u64, (u32, u32), foldhash::fast::RandomState>,
     rows: Vec<u32>,
 }
 
 impl OccupantRows {
     fn build(occupants: &[Option<u64>]) -> Self {
-        let mut counts: HashMap<u64, u32> = HashMap::new();
+        // First the count of each occupant's rows, held as its end; then
+        // each row is placed at its occupant's cursor.
+        let mut ranges: HashMap<u64, (u32, u32), foldhash::fast::RandomState> = HashMap::default();
         for occ in occupants.iter().flatten() {
-            *counts.entry(*occ).or_default() += 1;
+            ranges.entry(*occ).or_default().1 += 1;
         }
-        let mut ranges: HashMap<u64, (u32, u32)> = HashMap::with_capacity(counts.len());
         let mut start = 0u32;
-        for (occ, n) in counts {
-            ranges.insert(occ, (start, start));
+        for range in ranges.values_mut() {
+            let n = range.1;
+            *range = (start, start);
             start += n;
         }
         let mut rows = vec![0u32; start as usize];
@@ -1392,11 +1396,14 @@ impl OccupantRows {
         Self { ranges, rows }
     }
 
-    /// Heap bytes, as the pool counts them.
+    /// Estimated heap size for the pool's budget: 4 bytes per row, plus 24
+    /// bytes per map slot (a 16-byte entry, its control byte, and load-factor
+    /// slack).
     fn bytes(&self) -> usize {
         self.rows.capacity() * 4 + self.ranges.capacity() * 24
     }
 
+    #[cfg(test)]
     fn get(&self, occupant: &u64) -> Option<&[u32]> {
         let (start, end) = *self.ranges.get(occupant)?;
         Some(&self.rows[start as usize..end as usize])
@@ -1616,18 +1623,18 @@ impl ParquetSource {
     /// A single-series read of a long segment (`read_counter_column`, which
     /// a stream calls once per series per segment) would otherwise scan
     /// every row of the column for its occupant, and a query streaming every
-    /// series would cost rows times series. Built once per row group with
-    /// one pass over the `occupant` column, then shared. With a pool it is
-    /// held there beside the columns it indexes, counted against the pool's
-    /// budget and evicted as they are; without one it lives as long as the
-    /// source.
+    /// series would cost rows times series. Built from the `occupant` column
+    /// and shared. With a pool it is a pool entry under `usize::MAX - col`,
+    /// an index no column reaches: counted against the budget, evicted in LRU
+    /// order like a column, and rebuilt from the occupant column after
+    /// eviction. An index larger than the whole pool is not cached. Without
+    /// a pool it is kept in `occupant_rows` for the life of the source.
     fn occupant_rows(&self, rg_idx: usize) -> Result<Arc<OccupantRows>, Box<dyn Error>> {
         let col = self.occupant_col().ok_or("not a long segment")?;
         if let Some(rows) = self.occupant_rows.lock().unwrap().get(&rg_idx) {
             return Ok(Arc::clone(rows));
         }
-        // Kept in the pool beside the columns it indexes, under a key no
-        // column has, so it is counted and evicted as they are.
+        // A pool entry under a column index no column reaches.
         let key = CacheKey {
             source_id: self.id,
             column_idx: usize::MAX - col,
@@ -2437,10 +2444,8 @@ fn read_timestamps(
         pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [ts_col_idx]))?;
     let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
         catch_decode_panic(|| {
-            // Sized to the row group, so the vector holds no spare capacity:
-            // the pool accounts for what it holds by length.
-            let mut out =
-                Vec::with_capacity(pf.meta.metadata().row_group(rg_idx).num_rows() as usize);
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
             for batch_result in reader {
                 let batch = match batch_result {
                     Ok(b) => b,
@@ -2484,6 +2489,9 @@ fn read_timestamps(
             .into());
         }
     };
+    let mut out = out;
+    // Capacity equal to length, which is what the pool counts.
+    out.shrink_to_fit();
     let result = Arc::new(out);
 
     if let Some(pool) = &pf.pool {
@@ -2491,6 +2499,15 @@ fn read_timestamps(
     }
 
     Ok(result)
+}
+
+/// Reserve room for a row group's rows from the footer's count. The count
+/// is a hint: a negative or unallocatable one reserves nothing, and the
+/// vector grows as rows are decoded.
+fn reserve_rows<T>(out: &mut Vec<T>, rows: i64) {
+    if let Ok(rows) = usize::try_from(rows) {
+        let _ = out.try_reserve_exact(rows);
+    }
 }
 
 /// Read UInt64 values from `col_idx` in a single row group, in row order,
@@ -2574,10 +2591,8 @@ fn read_counter_values_per_rg(
         pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
     let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
         catch_decode_panic(|| {
-            // Sized to the row group, so the vector holds no spare capacity:
-            // the pool accounts for what it holds by length.
-            let mut out =
-                Vec::with_capacity(pf.meta.metadata().row_group(rg_idx).num_rows() as usize);
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
             for batch_result in reader {
                 let batch = match batch_result {
                     Ok(b) => b,
@@ -2619,6 +2634,9 @@ fn read_counter_values_per_rg(
             .into());
         }
     };
+    let mut out = out;
+    // Capacity equal to length, which is what the pool counts.
+    out.shrink_to_fit();
     let result = Arc::new(out);
 
     if let Some(pool) = &pf.pool {
@@ -2650,10 +2668,8 @@ fn read_gauge_values_per_rg(
         pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
     let decode_result: Result<Result<Vec<Option<i64>>, Box<dyn Error>>, String> =
         catch_decode_panic(|| {
-            // Sized to the row group, so the vector holds no spare capacity:
-            // the pool accounts for what it holds by length.
-            let mut out =
-                Vec::with_capacity(pf.meta.metadata().row_group(rg_idx).num_rows() as usize);
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
             for batch_result in reader {
                 let batch = match batch_result {
                     Ok(b) => b,
@@ -2695,6 +2711,9 @@ fn read_gauge_values_per_rg(
             .into());
         }
     };
+    let mut out = out;
+    // Capacity equal to length, which is what the pool counts.
+    out.shrink_to_fit();
     let result = Arc::new(out);
 
     if let Some(pool) = &pf.pool {
@@ -2973,15 +2992,10 @@ fn read_counter_column(
             }
             (RowSource::Full, Some(occ)) => {
                 let index = pf.occupant_rows(rg_idx)?;
-                match index.get(&occ) {
-                    Some(rows) => Box::new(
-                        rows.iter()
-                            .map(|r| *r as usize)
-                            .collect::<Vec<_>>()
-                            .into_iter(),
-                    ),
-                    None => continue,
-                }
+                let Some(&(start, end)) = index.ranges.get(&occ) else {
+                    continue;
+                };
+                Box::new((start as usize..end as usize).map(move |i| index.rows[i] as usize))
             }
             (_, None) => Box::new(0..ts.len()),
         };
@@ -3396,10 +3410,11 @@ impl ParquetHistogramCursor {
         let col_idx_captured = col_idx;
         let source_id_captured = self.pf.id;
         let decode_result = catch_decode_panic(|| {
-            // Sized to the row group, so the vector holds no spare capacity:
-            // the pool accounts for what it holds by length.
-            let mut out =
-                Vec::with_capacity(self.pf.meta.metadata().row_group(rg_idx).num_rows() as usize);
+            let mut out = Vec::new();
+            reserve_rows(
+                &mut out,
+                self.pf.meta.metadata().row_group(rg_idx).num_rows(),
+            );
             for batch_result in reader {
                 let batch = match batch_result {
                     Ok(b) => b,
@@ -3425,7 +3440,10 @@ impl ParquetHistogramCursor {
         });
 
         match decode_result {
-            Ok(out) => out,
+            Ok(mut out) => {
+                out.shrink_to_fit();
+                out
+            }
             Err(panic_msg) => {
                 tracing::error!(
                     rg_idx,
@@ -4169,6 +4187,58 @@ mod occupant_rows_tests {
         assert_eq!(index.get(&9), Some(&[5u32][..]));
         assert_eq!(index.get(&1), None);
         assert_eq!(index.rows.len(), 6);
+    }
+
+    /// Without a pool, a long segment's index is built once per row group
+    /// and kept on the source.
+    #[test]
+    fn without_a_pool_the_index_is_kept_on_the_source() {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new(crate::long::OCCUPANT_COLUMN, DataType::UInt64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 1, 2, 2])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![5u64, 6, 5, 6])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                crate::long::LAYOUT_KEY.to_string(),
+                crate::long::LAYOUT_LONG.to_string(),
+            )]))
+            .build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let src = ParquetSource::open_bytes(buf.into()).unwrap();
+        assert!(src.pool.is_none());
+        let a = src.occupant_rows(0).unwrap();
+        let b = src.occupant_rows(0).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "built once");
+        assert_eq!(a.get(&5), Some(&[0u32, 2][..]));
+        assert_eq!(a.get(&6), Some(&[1u32, 3][..]));
+    }
+
+    /// A footer's row count that is negative or cannot be allocated reserves
+    /// nothing rather than failing.
+    #[test]
+    fn a_corrupt_row_count_reserves_nothing() {
+        for rows in [-1i64, i64::MAX, 1 << 60] {
+            let mut v: Vec<Option<u64>> = Vec::new();
+            reserve_rows(&mut v, rows);
+            assert_eq!(v.capacity(), 0, "{rows}");
+        }
     }
 
     /// A column decoded for the pool has no spare capacity, whatever the
