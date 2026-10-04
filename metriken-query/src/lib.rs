@@ -35,6 +35,7 @@
 //!     .unwrap();
 //! ```
 
+pub(crate) mod batch_rate;
 pub(crate) mod buffer_pool;
 pub mod display;
 pub(crate) mod histogram_stream;
@@ -167,6 +168,12 @@ pub struct QueryOptions {
     /// timestamp — so the uniform grid is just the special case where those
     /// gaps are all equal.
     pub eval_timestamps: Option<std::sync::Arc<[u64]>>,
+    /// Compute `rate`/`irate` from one sample stream per series rather than
+    /// in one pass over a segmented reader's columns. For samples in
+    /// increasing time order the two give the same series and timestamps; an
+    /// aggregate's values and bands can differ in the last bits, from
+    /// summation order. For comparing the two and for diagnosis.
+    pub per_series_rates: bool,
 }
 
 impl QueryOptions {
@@ -176,7 +183,15 @@ impl QueryOptions {
             rate_mode,
             rate_span_ns: None,
             eval_timestamps: None,
+            per_series_rates: false,
         }
+    }
+
+    /// Compute rates from one stream per series. See
+    /// [`QueryOptions::per_series_rates`].
+    pub fn with_per_series_rates(mut self, per_series: bool) -> Self {
+        self.per_series_rates = per_series;
+        self
     }
 
     /// Evaluate at an explicit timestamp list. See
@@ -240,6 +255,32 @@ pub(crate) trait DataSource: Send + Sync {
         selective: bool,
     ) -> Option<types::ColumnChunk> {
         let _ = (at, start_ns, end_ns, selective);
+        None
+    }
+    /// Columns `cols` (schema indices) of every row group `[start_ns,
+    /// end_ns]` touches, decoded once, for a read of many series at a time.
+    /// `None` for a source that is not a single parquet file, or when the
+    /// read fails (logged).
+    fn batch_columns(
+        &self,
+        cols: &[usize],
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<parquet::BatchColumns> {
+        let _ = (cols, start_ns, end_ns);
+        None
+    }
+    /// `rate`/`irate` of counter `name` on the evaluation grid, computed by
+    /// the source in one pass over its data, optionally aggregated; see
+    /// `batch_rate`. `None` when the source does not compute it; the
+    /// dispatcher then uses the per-series path.
+    fn counter_grid_rates(
+        &self,
+        name: &str,
+        filter: &Labels,
+        request: &batch_rate::GridRateRequest<'_>,
+    ) -> Option<Vec<promql::streaming::LabeledPoints>> {
+        let _ = (name, filter, request);
         None
     }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;

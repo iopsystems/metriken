@@ -52,7 +52,7 @@ pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
 pub(crate) use binary::{interval_binop, matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
 pub(crate) use deriv::StreamingDeriv;
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
-pub(crate) use rate::{CounterGridRate, CounterPairwiseRate};
+pub(crate) use rate::{CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
 
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;
@@ -149,6 +149,10 @@ impl<'a> LabeledSeries<'a> {
 
 /// Output of a streaming evaluation stage.
 pub type SeriesSet<'a> = Vec<LabeledSeries<'a>>;
+
+/// A series' labels and its points, computed in one pass by a source; see
+/// [`crate::batch_rate`].
+pub(crate) type LabeledPoints = (crate::labels::Labels, Vec<Point>);
 
 /// Boundary collector: drain a streaming result into the same
 /// `MatrixSample` shape the eager engine returns.

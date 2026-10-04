@@ -996,6 +996,304 @@ impl Handover {
 }
 
 impl SegmentedSource {
+    /// See [`DataSource::counter_grid_rates`]. `None` when the relabel's
+    /// identities are not fixed, when a series has two locations in one
+    /// segment, when nothing matches, or when a segment's columns cannot be
+    /// read; the dispatcher then uses the per-series path.
+    fn grid_rates(
+        &self,
+        name: &str,
+        filter: &Labels,
+        request: &crate::batch_rate::GridRateRequest<'_>,
+    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
+        use crate::batch_rate::{Grid, Grouped, PerSeries, Sample, SeriesRate, Sink};
+        if !self
+            .relabel
+            .as_deref()
+            .is_none_or(|r| r.identities_are_fixed())
+        {
+            return None;
+        }
+        let order = self.state.counter_identity.order(name);
+        let table = self.state.counter_columns.get(name)?;
+        let (start, end) = (request.data_start, request.end_ns);
+
+        // The series read, and per segment which column (and occupant, in a
+        // long column) each is.
+        struct ColPlan {
+            begin: Option<u32>,
+            width: Option<u32>,
+            wide: Option<usize>,
+            long: HashMap<u64, usize>,
+        }
+        let mut labels: Vec<Labels> = Vec::new();
+        let mut rates: Vec<SeriesRate> = Vec::new();
+        let mut plans: BTreeMap<u32, HashMap<u32, ColPlan>> = BTreeMap::new();
+        for (pos, l) in order.iter().enumerate() {
+            if !l.matches(filter) {
+                continue;
+            }
+            let Some(locations) = table.by_series.get(pos) else {
+                continue;
+            };
+            let series = labels.len();
+            let windowed = locations
+                .first()
+                .is_some_and(|l| l.position.begin_col.is_some() && l.position.width_col.is_some());
+            let mut segments = std::collections::HashSet::new();
+            for l in locations {
+                if !self.state.catalog[l.segment as usize].touches(start, end) {
+                    continue;
+                }
+                if !segments.insert(l.segment) {
+                    return None;
+                }
+                let plan = plans
+                    .entry(l.segment)
+                    .or_default()
+                    .entry(l.position.col_idx)
+                    .or_insert_with(|| ColPlan {
+                        begin: l.position.begin_col,
+                        width: l.position.width_col,
+                        wide: None,
+                        long: HashMap::new(),
+                    });
+                let duplicate = match l.position.occupant {
+                    Some(o) => plan.long.insert(o, series).is_some(),
+                    None => plan.wide.replace(series).is_some(),
+                };
+                if duplicate {
+                    return None;
+                }
+            }
+            labels.push(l.clone());
+            rates.push(SeriesRate::new(windowed, request.start_ns));
+        }
+        if labels.is_empty() {
+            return None;
+        }
+
+        let grid = Grid::from_request(request);
+        let n = labels.len();
+
+        // Series are split across partitions, each run by one thread with
+        // its own sink. Without aggregation, by series. With it, by group,
+        // largest first to the partition with the fewest series, so a
+        // group's accumulators exist in one partition; except that a group
+        // with more than twice a partition's share of the series is spread
+        // across all partitions by series, each holding its accumulators,
+        // merged at the end. Fewer than half the partition count of groups
+        // can be that large.
+        let parts = batch_threads().min(n).max(1);
+        let groups = request
+            .group
+            .map(|(op, by)| (op, crate::batch_rate::groups(by, &labels)));
+        let partition: Vec<usize> = match &groups {
+            Some((_, (glabels, group_of))) => {
+                let mut size = vec![0usize; glabels.len()];
+                for g in group_of {
+                    size[*g] += 1;
+                }
+                let spread = |g: usize| size[g] > 2 * n / parts;
+                let mut load = vec![0usize; parts];
+                for g in (0..glabels.len()).filter(|g| spread(*g)) {
+                    for l in load.iter_mut() {
+                        *l += size[g] / parts;
+                    }
+                }
+                let mut by_size: Vec<usize> = (0..glabels.len()).filter(|g| !spread(*g)).collect();
+                by_size.sort_unstable_by_key(|g| std::cmp::Reverse(size[*g]));
+                let mut part_of = vec![0usize; glabels.len()];
+                for g in by_size {
+                    let p = (0..parts).min_by_key(|p| load[*p]).unwrap_or(0);
+                    part_of[g] = p;
+                    load[p] += size[g];
+                }
+                group_of
+                    .iter()
+                    .enumerate()
+                    .map(|(s, g)| if spread(*g) { s % parts } else { part_of[*g] })
+                    .collect()
+            }
+            None => (0..n).map(|s| s % parts).collect(),
+        };
+        let mut local = vec![0u32; n];
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); parts];
+        for (s, p) in partition.iter().enumerate() {
+            local[s] = members[*p].len() as u32;
+            members[*p].push(s);
+        }
+        let mut part_rates: Vec<Vec<SeriesRate>> = (0..parts).map(|_| Vec::new()).collect();
+        for (s, rate) in rates.into_iter().enumerate() {
+            part_rates[partition[s]].push(rate);
+        }
+        enum PartSink {
+            Series(PerSeries),
+            Groups(Grouped),
+        }
+        impl PartSink {
+            fn sink(&mut self) -> &mut dyn Sink {
+                match self {
+                    PartSink::Series(s) => s,
+                    PartSink::Groups(g) => g,
+                }
+            }
+        }
+        let mut sinks: Vec<PartSink> = members
+            .iter()
+            .map(|m| match &groups {
+                Some((op, (glabels, group_of))) => PartSink::Groups(Grouped::new(
+                    *op,
+                    glabels.clone(),
+                    m.iter().map(|s| group_of[*s]).collect(),
+                    &grid,
+                )),
+                None => PartSink::Series(PerSeries {
+                    points: vec![Vec::new(); m.len()],
+                }),
+            })
+            .collect();
+
+        // A segment's samples, in row order, bucketed by partition and named
+        // by their series' index within it.
+        let segments: Vec<u32> = plans.keys().copied().collect();
+        // `Ok(None)` for a segment that is gone, as the per-series path
+        // skips it; `Err` for one that cannot be read, which ends the batch
+        // read.
+        type Buckets = Vec<Vec<(u32, Sample)>>;
+        type Read = Result<Option<Buckets>, ()>;
+        let read = |seg: u32| -> Read {
+            let reader = match self.segment(seg as usize) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!(segment = seg, "fetching a segment: {e}");
+                    return Err(());
+                }
+            };
+            let plan = &plans[&seg];
+            let mut cols: Vec<usize> = Vec::new();
+            for (col, p) in plan {
+                cols.push(*col as usize);
+                cols.extend(p.begin.map(|c| c as usize));
+                cols.extend(p.width.map(|c| c as usize));
+            }
+            let Some(columns) = reader.batch_columns(&cols, start, end) else {
+                return Err(());
+            };
+            let mut buckets: Vec<Vec<(u32, Sample)>> = vec![Vec::new(); parts];
+            let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
+                a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
+            };
+            for batch in &columns.batches {
+                let Some(ts) = columns.u64s(batch, columns.ts) else {
+                    continue;
+                };
+                let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
+                let occupant = columns.occupant.and_then(|c| columns.u64s(batch, c));
+                for (col, p) in plan {
+                    let Some(values) = columns.u64s(batch, *col as usize) else {
+                        continue;
+                    };
+                    let begin = p.begin.and_then(|c| columns.i64s(batch, c as usize));
+                    let width = p.width.and_then(|c| columns.u64s(batch, c as usize));
+                    let windowed = (begin.is_some() && width.is_some()) || duration.is_some();
+                    for r in 0..batch.num_rows() {
+                        let series = match (p.wide, occupant) {
+                            (Some(s), _) if p.long.is_empty() => s,
+                            (_, Some(occ)) => {
+                                match get(Some(occ), r).and_then(|o| p.long.get(&o)) {
+                                    Some(s) => *s,
+                                    None => continue,
+                                }
+                            }
+                            _ => continue,
+                        };
+                        let (Some(base), Some(value)) = (get(Some(ts), r), get(Some(values), r))
+                        else {
+                            continue;
+                        };
+                        if base < start || base > end {
+                            continue;
+                        }
+                        let window = windowed.then(|| {
+                            let bo = begin.and_then(|b| {
+                                (!arrow::array::Array::is_null(b, r)).then(|| b.value(r))
+                            });
+                            crate::parquet::resolve_window(
+                                base,
+                                bo,
+                                get(width, r),
+                                get(duration, r),
+                            )
+                        });
+                        buckets[partition[series]].push((
+                            local[series],
+                            Sample {
+                                ts: base,
+                                value,
+                                window,
+                            },
+                        ));
+                    }
+                }
+            }
+            Ok(Some(buckets))
+        };
+        for chunk in segments.chunks(batch_threads()) {
+            let read_chunk: Vec<Option<Buckets>> = read_all(chunk, &read)
+                .into_iter()
+                .collect::<Result<_, ()>>()
+                .ok()?;
+            let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, p: usize| {
+                for buckets in read_chunk.iter().flatten() {
+                    for (s, sample) in &buckets[p] {
+                        rates[*s as usize].push(*sample, &grid, *s as usize, sink.sink());
+                    }
+                }
+            };
+            run_partitions(&mut part_rates, &mut sinks, &run);
+        }
+        let finish = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, _p: usize| {
+            for (s, rate) in rates.iter_mut().enumerate() {
+                rate.finish(&grid, s, sink.sink());
+            }
+        };
+        run_partitions(&mut part_rates, &mut sinks, &finish);
+
+        Some(match groups {
+            Some(_) => {
+                let mut sinks = sinks.into_iter().map(|s| match s {
+                    PartSink::Groups(g) => g,
+                    PartSink::Series(_) => unreachable!("grouped sinks"),
+                });
+                let mut all = sinks.next()?;
+                for g in sinks {
+                    all.merge(g);
+                }
+                all.finish(&grid)
+            }
+            None => {
+                let mut points: Vec<Vec<Vec<crate::promql::streaming::Point>>> = sinks
+                    .into_iter()
+                    .map(|s| match s {
+                        PartSink::Series(p) => p.points,
+                        PartSink::Groups(_) => unreachable!("per-series sinks"),
+                    })
+                    .collect();
+                labels
+                    .into_iter()
+                    .enumerate()
+                    .map(|(s, l)| {
+                        let mut p = std::mem::take(&mut points[partition[s]][local[s] as usize]);
+                        p.shrink_to_fit();
+                        (l, p)
+                    })
+                    .collect()
+            }
+        })
+    }
+
     /// The filter a segment is asked with: the query's own, unless a
     /// relabelling has keys the columns do not carry — see
     /// [`ColumnRelabel::segment_filter`].
@@ -1319,6 +1617,15 @@ fn splice_histogram_streams(
 }
 
 impl DataSource for SegmentedSource {
+    fn counter_grid_rates(
+        &self,
+        name: &str,
+        filter: &Labels,
+        request: &crate::batch_rate::GridRateRequest<'_>,
+    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
+        self.grid_rates(name, filter, request)
+    }
+
     fn counters(
         &self,
         name: &str,
@@ -1740,6 +2047,78 @@ impl MetricsSource for SegmentedParquetReader {
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.histogram_labels(name)
+    }
+}
+
+/// Threads a batch read uses: segments decoded at once, and the most
+/// partitions. At most 8.
+fn batch_threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
+    }
+}
+
+/// Read `segments`, in parallel where threads exist, in their order. A
+/// panic in a read is raised again here.
+fn read_all<T, F>(segments: &[u32], read: &F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(u32) -> T + Sync,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        segments.iter().map(|s| read(*s)).collect()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if segments.len() < 2 {
+            return segments.iter().map(|s| read(*s)).collect();
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = segments
+                .iter()
+                .map(|s| scope.spawn(move || read(*s)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        })
+    }
+}
+
+/// Run `f` over each partition's series and sink, one thread per partition
+/// where threads exist.
+fn run_partitions<R, S, F>(rates: &mut [R], sinks: &mut [S], f: &F)
+where
+    R: Send,
+    S: Send,
+    F: Fn(&mut R, &mut S, usize) + Sync,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+            f(r, s, p);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if rates.len() < 2 {
+            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+                f(r, s, p);
+            }
+            return;
+        }
+        std::thread::scope(|scope| {
+            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+                scope.spawn(move || f(r, s, p));
+            }
+        });
     }
 }
 
@@ -2391,8 +2770,10 @@ mod tests {
                 ),
             ]
         };
+        // The per-series path reads through the pool; a batch read does not.
+        let opts = crate::QueryOptions::default().with_per_series_rates(true);
         let query = |r: &SegmentedParquetReader| {
-            r.query_range("rate(cpu_cycles[2s])", 1.0, 4.0, 1.0)
+            r.query_range_opts("rate(cpu_cycles[2s])", 1.0, 4.0, 1.0, &opts)
                 .unwrap();
         };
         let pool = BufferPool::new(64 * 1024 * 1024);
@@ -2472,14 +2853,16 @@ mod tests {
         let r =
             SegmentedParquetReader::open_bytes_with_pool(segs(), Arc::clone(&narrow_pool)).unwrap();
         // Grid mode looks back one step, so 9..10s reaches no further than 8s —
-        // still clear of the 1s/2s segments.
-        let _ = r.query_range("rate(cpu_cycles[1s])", 9.0, 10.0, 1.0);
+        // still clear of the 1s/2s segments. Pool entries count decodes on the
+        // per-series path, which is the one read through the pool.
+        let opts = crate::QueryOptions::default().with_per_series_rates(true);
+        let _ = r.query_range_opts("rate(cpu_cycles[1s])", 9.0, 10.0, 1.0, &opts);
         let narrow = narrow_pool.stats();
 
         let wide_pool = BufferPool::new(64 * 1024 * 1024);
         let r =
             SegmentedParquetReader::open_bytes_with_pool(segs(), Arc::clone(&wide_pool)).unwrap();
-        let _ = r.query_range("rate(cpu_cycles[1s])", 1.0, 10.0, 1.0);
+        let _ = r.query_range_opts("rate(cpu_cycles[1s])", 1.0, 10.0, 1.0, &opts);
         let wide = wide_pool.stats();
 
         assert!(
@@ -4409,5 +4792,260 @@ mod tests {
             labels: [("comm".to_string(), "w".to_string())].into(),
         };
         assert!(open(vec![described]).handover().is_some());
+    }
+
+    /// A batch read fetches only the segments its range touches.
+    #[test]
+    fn a_batch_read_fetches_only_the_segments_it_touches() {
+        let store = KeyedSegments::new(vec![
+            (Some(1), segment("cpu_cycles", &[], &[(1_000_000_000, 10)])),
+            (Some(2), segment("cpu_cycles", &[], &[(2_000_000_000, 20)])),
+            (
+                Some(3),
+                segment(
+                    "cpu_cycles",
+                    &[],
+                    &[(9_000_000_000, 90), (10_000_000_000, 100)],
+                ),
+            ),
+        ]);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(
+            Arc::clone(&store) as Arc<dyn SegmentStore>,
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        let opened = store.fetched();
+        store.fetched.lock().unwrap().clear();
+        let result = r
+            .query_range("sum(rate(cpu_cycles[1s]))", 9.0, 10.0, 1.0)
+            .unwrap();
+        assert_eq!(pool.stats().misses, 0, "the batch path ran");
+        assert_eq!(store.fetched(), vec![2], "opened {opened:?}");
+        let QueryResult::Matrix { result } = result else {
+            panic!("a matrix");
+        };
+        assert_eq!(result[0].values, vec![(10.0, 10.0)]);
+    }
+
+    /// One counter with a `duration` column and no window columns: rows
+    /// `(timestamp, value, duration)`.
+    fn segment_with_duration(rows: &[(u64, u64, u64)]) -> Vec<u8> {
+        let mut metadata = HashMap::new();
+        metadata.insert("metric".to_string(), "cpu_cycles".to_string());
+        metadata.insert("metric_type".to_string(), "counter".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("duration", DataType::UInt64, true),
+            Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(metadata),
+        ]));
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        let col = |f: fn(&(u64, u64, u64)) -> u64| {
+            Arc::new(UInt64Array::from(rows.iter().map(f).collect::<Vec<_>>())) as ArrayRef
+        };
+        let batch =
+            RecordBatch::try_new(schema, vec![col(|r| r.0), col(|r| r.2), col(|r| r.1)]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// With windows from a `duration` column, a hole and a reset, the batch
+    /// path gives what the per-series path gives.
+    #[test]
+    fn a_batch_read_with_a_duration_column_matches_the_per_series_path() {
+        let s = 1_000_000_000u64;
+        let segs = vec![
+            segment_with_duration(&[(s, 10, 300), (2 * s, 20, 310), (3 * s, 35, 290)]),
+            segment_with_duration(&[(8 * s, 90, 305), (9 * s, 4, 300), (10 * s, 30, 300)]),
+        ];
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        for q in ["rate(cpu_cycles[1s])", "sum(irate(cpu_cycles[1s]))"] {
+            for step in [1.0, 0.5] {
+                let pool = BufferPool::new(64 * 1024 * 1024);
+                let r =
+                    SegmentedParquetReader::open_bytes_with_pool(segs.clone(), Arc::clone(&pool))
+                        .unwrap();
+                let batch = r.query_range(q, 1.0, 10.0, step).unwrap();
+                assert_eq!(pool.stats().misses, 0, "{q}: the batch path ran");
+                let streams = r.query_range_opts(q, 1.0, 10.0, step, &per_series).unwrap();
+                assert_eq!(
+                    format!("{batch:?}"),
+                    format!("{streams:?}"),
+                    "{q} step {step}"
+                );
+            }
+        }
+    }
+
+    /// A row of [`segment_with_windows`]: timestamp, value, duration,
+    /// window begin offset and width.
+    type WindowRow = (u64, u64, u64, Option<i64>, Option<u64>);
+
+    /// A counter with `duration` and, when `windowed`, nullable
+    /// `:window_begin`/`:window_width` columns: rows `(timestamp, value,
+    /// duration, begin, width)`.
+    fn segment_with_windows(rows: &[WindowRow], windowed: bool) -> Vec<u8> {
+        let mut metadata = HashMap::new();
+        metadata.insert("metric".to_string(), "cpu_cycles".to_string());
+        metadata.insert("metric_type".to_string(), "counter".to_string());
+        let mut fields = vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("duration", DataType::UInt64, true),
+        ];
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+            )),
+        ];
+        if windowed {
+            fields.push(Field::new(":window_begin", DataType::Int64, true));
+            fields.push(Field::new(":window_width", DataType::UInt64, true));
+            cols.push(Arc::new(arrow::array::Int64Array::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )));
+            cols.push(Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+            )));
+        }
+        fields.push(Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(metadata));
+        cols.push(Arc::new(UInt64Array::from(
+            rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+        )));
+        let schema = Arc::new(Schema::new(fields));
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, cols).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// Where a row's window columns are null, and in a later segment with
+    /// only a duration column, the window comes from the duration on both
+    /// paths, and the bands agree.
+    #[test]
+    fn a_batch_read_with_mixed_windows_matches_the_per_series_path() {
+        let s = 1_000_000_000u64;
+        let segs = vec![
+            segment_with_windows(
+                &[
+                    (s, 10, 300_000, Some(-5), Some(100)),
+                    (2 * s, 20, 310_000, None, None),
+                    (3 * s, 35, 290_000, Some(-7), Some(120)),
+                    (4 * s, 50, 300_000, Some(-3), Some(90)),
+                ],
+                true,
+            ),
+            segment_with_windows(
+                &[
+                    (5 * s, 60, 305_000, None, None),
+                    (6 * s, 75, 300_000, None, None),
+                    (7 * s, 90, 300_000, None, None),
+                ],
+                false,
+            ),
+        ];
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        for q in ["rate(cpu_cycles[1s])", "sum(irate(cpu_cycles[1s]))"] {
+            for step in [1.0, 0.5] {
+                let pool = BufferPool::new(64 * 1024 * 1024);
+                let r =
+                    SegmentedParquetReader::open_bytes_with_pool(segs.clone(), Arc::clone(&pool))
+                        .unwrap();
+                let batch = r.query_range(q, 1.0, 7.0, step).unwrap();
+                assert_eq!(pool.stats().misses, 0, "{q}: the batch path ran");
+                let streams = r.query_range_opts(q, 1.0, 7.0, step, &per_series).unwrap();
+                assert_eq!(
+                    format!("{batch:?}"),
+                    format!("{streams:?}"),
+                    "{q} step {step}"
+                );
+            }
+        }
+    }
+
+    /// Samples outside the range a query reads do not make edges outside
+    /// it observed: with samples half a second off the grid, a query over
+    /// 10-15 s has points at 11-14 s on both paths.
+    #[test]
+    fn a_batch_read_keeps_to_the_range() {
+        let rows: Vec<(u64, u64)> = (0..30u64)
+            .map(|k| (k * 1_000_000_000 + 500_000_000, k * 10))
+            .collect();
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_cycles", &[], &rows)],
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        let batch = r
+            .query_range("rate(cpu_cycles[1s])", 10.0, 15.0, 1.0)
+            .unwrap();
+        let streams = r
+            .query_range_opts("rate(cpu_cycles[1s])", 10.0, 15.0, 1.0, &per_series)
+            .unwrap();
+        assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
+        let QueryResult::Matrix { result } = batch else {
+            panic!("a matrix");
+        };
+        let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0]);
+    }
+
+    /// A store whose segments become unreadable after open.
+    struct Failing {
+        segments: Vec<Bytes>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl SegmentStore for Failing {
+        fn len(&self) -> usize {
+            self.segments.len()
+        }
+
+        fn bytes(&self, idx: usize) -> SegmentBytes {
+            if idx == 1 && self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("unreadable".into());
+            }
+            Ok(self.segments.get(idx).cloned())
+        }
+    }
+
+    /// A segment that cannot be read ends the batch read: the query takes
+    /// the per-series path and answers as it does, rather than losing that
+    /// segment's rows to the batch path alone.
+    #[test]
+    fn an_unreadable_segment_falls_back_to_the_per_series_path() {
+        let s = 1_000_000_000u64;
+        let store = Arc::new(Failing {
+            segments: vec![
+                Bytes::from(segment("cpu_cycles", &[], &[(s, 10), (2 * s, 20)])),
+                Bytes::from(segment("cpu_cycles", &[], &[(3 * s, 35), (4 * s, 50)])),
+                Bytes::from(segment("cpu_cycles", &[], &[(5 * s, 70), (6 * s, 80)])),
+            ],
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(
+            Arc::clone(&store) as Arc<dyn SegmentStore>,
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let batch = r
+            .query_range("sum(rate(cpu_cycles[1s]))", 1.0, 6.0, 1.0)
+            .unwrap();
+        assert!(pool.stats().misses > 0, "the per-series path ran");
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        let streams = r
+            .query_range_opts("sum(rate(cpu_cycles[1s]))", 1.0, 6.0, 1.0, &per_series)
+            .unwrap();
+        assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
     }
 }

@@ -414,6 +414,50 @@ mod reader_tests {
         serde_json::to_value(r).unwrap()
     }
 
+    /// `a` and `b` are the same result, with numbers equal to a relative
+    /// 1e-12: the batch path sums in another order than the per-series one.
+    fn assert_close(a: &crate::QueryResult, b: &crate::QueryResult, what: &str) {
+        fn walk(a: &serde_json::Value, b: &serde_json::Value, at: &str, what: &str) {
+            use serde_json::Value::*;
+            match (a, b) {
+                (Number(x), Number(y)) => {
+                    let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                    assert!(
+                        (x - y).abs() <= 1e-12 * x.abs().max(y.abs()).max(1.0),
+                        "{what}: {at}: {x} != {y}"
+                    );
+                }
+                (Array(x), Array(y)) => {
+                    assert_eq!(x.len(), y.len(), "{what}: {at}: lengths");
+                    for (i, (x, y)) in x.iter().zip(y).enumerate() {
+                        walk(x, y, &format!("{at}[{i}]"), what);
+                    }
+                }
+                (Object(x), Object(y)) => {
+                    assert_eq!(
+                        x.keys().collect::<Vec<_>>(),
+                        y.keys().collect::<Vec<_>>(),
+                        "{what}: {at}: keys"
+                    );
+                    for (k, x) in x {
+                        walk(x, &y[k], &format!("{at}.{k}"), what);
+                    }
+                }
+                _ => assert_eq!(a, b, "{what}: {at}"),
+            }
+        }
+        // Series in label order: the per-series path's aggregate keeps its
+        // groups in a hash map.
+        let sorted = |r: &crate::QueryResult| {
+            let mut v = canonical(r);
+            if let Some(serde_json::Value::Array(series)) = v.get_mut("result") {
+                series.sort_by_key(|s| s.get("metric").map(|m| m.to_string()).unwrap_or_default());
+            }
+            v
+        };
+        walk(&sorted(a), &sorted(b), "", what);
+    }
+
     fn assert_same(a: &SegmentedParquetReader, b: &SegmentedParquetReader) {
         for q in QUERIES {
             let ra = a.query_range(q, 1.0, 6.0, 1.0).unwrap();
@@ -584,14 +628,16 @@ mod reader_tests {
         let long =
             SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
                 .unwrap();
+        // Pruning is the per-series path's: a batch read does not prune.
+        let opts = crate::QueryOptions::default().with_per_series_rates(true);
         for q in [
             "rate(cpu{__occupant__=\"17\"}[2s])",
             "depth{__occupant__=\"17\"}",
             "sum(rate(cpu{__occupant__=\"11\"}[2s]))",
             "histogram_mean(lat{__occupant__=\"17\"})",
         ] {
-            let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
-            let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            let a = whole.query_range_opts(q, 1.0, 10.0, 1.0, &opts).unwrap();
+            let b = long.query_range_opts(q, 1.0, 10.0, 1.0, &opts).unwrap();
             assert_eq!(canonical(&a), canonical(&b), "{q}");
         }
         // A pruned read decodes into its own arrays, not the pool's
@@ -612,9 +658,11 @@ mod reader_tests {
         let long =
             SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
                 .unwrap();
+        // The per-series path: a batch read does not go through the pool.
+        let opts = crate::QueryOptions::default().with_per_series_rates(true);
         for q in ["sum(rate(cpu[2s]))", "rate(cpu[2s])", "max(depth)"] {
-            let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
-            let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            let a = whole.query_range_opts(q, 1.0, 10.0, 1.0, &opts).unwrap();
+            let b = long.query_range_opts(q, 1.0, 10.0, 1.0, &opts).unwrap();
             assert_eq!(canonical(&a), canonical(&b), "{q}");
         }
         // A hundred streams read one row group: too many to prune for, so
@@ -868,7 +916,76 @@ mod reader_tests {
             for q in ["sum(rate(cpu[3s]))", "rate(cpu[3s])", "sum(irate(cpu[3s]))"] {
                 let a = whole.query_range(q, 1.0, 60.0, 1.0).unwrap();
                 let b = longr.query_range(q, 1.0, 60.0, 1.0).unwrap();
-                assert_eq!(canonical(&a), canonical(&b), "{q}, pool {pool}");
+                assert_close(&a, &b, &format!("{q}, pool {pool}"));
+            }
+        }
+    }
+
+    /// The batch path (`DataSource::counter_grid_rates`) gives what the
+    /// per-series path gives, on long and wide segments, for rate and irate,
+    /// alone and under each aggregation, with `by`, on a cut range, on a step
+    /// between samples, and with a wider span, over regular samples with
+    /// table-level windows. `batch_rate`'s tests cover holes, resets and
+    /// duplicates; `segmented`'s, a duration column.
+    #[test]
+    fn the_batch_path_matches_the_per_series_path() {
+        let rows = churn();
+        let mut segs: Vec<Vec<Obs>> = Vec::new();
+        for r in &rows {
+            let i = ((r.ts / 1_000_000_000 - 1) / 5) as usize;
+            if segs.len() <= i {
+                segs.resize_with(i + 1, Vec::new);
+            }
+            segs[i].push(r.clone());
+        }
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        let span = crate::QueryOptions::default().with_rate_span_ns(Some(3_000_000_000));
+        let span_per_series = span.clone().with_per_series_rates(true);
+        let queries = [
+            "rate(cpu[3s])",
+            "irate(cpu[3s])",
+            "sum(rate(cpu[3s]))",
+            "avg(irate(cpu[3s]))",
+            "min(rate(cpu[3s]))",
+            "max(rate(cpu[3s]))",
+            "count(rate(cpu[3s]))",
+            "sum by (__occupant__) (rate(cpu[3s]))",
+            "sum without (__occupant__) (rate(cpu[3s]))",
+            "sum(rate(cpu{__occupant__=\"7\"}[3s]))",
+        ];
+        for (layout, bytes) in [
+            (
+                "long",
+                segs.iter().map(|s| long(s, None)).collect::<Vec<_>>(),
+            ),
+            ("wide", segs.iter().map(|s| wide(s)).collect::<Vec<_>>()),
+        ] {
+            for q in queries {
+                for (start, end, step) in [(1.0, 60.0, 1.0), (13.5, 41.0, 1.0), (1.0, 60.0, 2.5)] {
+                    let pool = BufferPool::new(64 << 20);
+                    let r = SegmentedParquetReader::open_bytes_with_pool(
+                        bytes.clone(),
+                        Arc::clone(&pool),
+                    )
+                    .unwrap();
+                    let batch = r.query_range(q, start, end, step).unwrap();
+                    assert_eq!(pool.stats().misses, 0, "{layout} {q}: the batch path ran");
+                    let streams = r
+                        .query_range_opts(q, start, end, step, &per_series)
+                        .unwrap();
+                    let what = format!("{layout} {q} [{start}, {end}] step {step}");
+                    assert_close(&batch, &streams, &what);
+                }
+                let r = SegmentedParquetReader::open_bytes_with_pool(
+                    bytes.clone(),
+                    BufferPool::new(64 << 20),
+                )
+                .unwrap();
+                let batch = r.query_range_opts(q, 1.0, 60.0, 1.0, &span).unwrap();
+                let streams = r
+                    .query_range_opts(q, 1.0, 60.0, 1.0, &span_per_series)
+                    .unwrap();
+                assert_close(&batch, &streams, &format!("{layout} {q} span 3s"));
             }
         }
     }

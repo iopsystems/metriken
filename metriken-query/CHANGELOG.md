@@ -7,8 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rate`/`irate` of a counter in grid mode, alone or under `sum`, `avg`,
+  `min`, `max` or `count` with or without `by`/`without`, is computed by a
+  segmented reader in one pass over decoded columns: segments are decoded
+  in parallel (up to 8 threads), each series' grid rate is computed from its
+  samples with the per-series path's arithmetic, and an aggregate is
+  reduced into accumulators per group and grid point. Other expressions,
+  raw mode, explicit evaluation timestamps, `offset`/`@`, sources other than
+  a segmented reader, relabels whose identities are not fixed, a series
+  with two columns in one segment, and a segment that cannot be read take
+  the per-series path as before. On a 9.6-hour recording of a per-task
+  group (6,644 series, 76 M rows) at a 1 s step, a warm `sum(irate(...))`
+  took 9.7 s on the table stored long and 14 s stored wide, and takes
+  0.89 s and 1.18 s; `sum by (comm)` took 10-11 s and 15 s, and takes
+  1.07 s and 1.38 s.
+- `QueryOptions::per_series_rates` (`with_per_series_rates`) computes rates
+  one series at a time, for comparison and diagnosis.
+
 ### Changed
 
+- An aggregate over rates can differ from earlier releases in the last bits
+  of its values and bands, from summation order. Series, timestamps and
+  the interpolated flag are the same, for samples in increasing time order.
+- A one-pass read does not go through the buffer pool: a warm query decodes
+  its segments again rather than finding them in the pool. A grouped
+  aggregate holds 88 bytes per group per grid point outside the pool,
+  allocated in blocks of 1,024 points where the group has points, and once
+  per partition (up to 8) for a group spread across partitions.
 - A column decoded into the buffer pool reserves its row group's row count,
   taken from the footer as a hint, and is shrunk to its length after
   decoding. Timestamp, counter and gauge columns used to grow batch by batch
