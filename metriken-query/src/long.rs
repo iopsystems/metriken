@@ -20,7 +20,7 @@ use crate::segmented::{ColumnRelabel, Run};
 /// by the `__` rule, so listings and legends hide it.
 pub struct OccupantLabels {
     labels: HashMap<u64, BTreeMap<String, String>>,
-    /// Every key an occupant supplies. A query filter on one of these cannot
+    /// Every key in the rows this was built from. A query filter on one of these cannot
     /// be answered by the columns, so it is taken off the segment filter and
     /// applied to the relabelled series.
     keys: BTreeSet<String>,

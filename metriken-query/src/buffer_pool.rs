@@ -101,6 +101,9 @@ pub(crate) enum Block {
     CounterValues(Arc<Vec<Option<u64>>>),
     GaugeValues(Arc<Vec<Option<i64>>>),
     HistogramSnapshots(Arc<Vec<Option<HistogramSnapshot>>>),
+    /// Anything else derived from one column of one row group, such as a
+    /// long segment's row index by occupant.
+    Derived(Arc<dyn std::any::Any + Send + Sync>),
 }
 
 impl BufferPool {
@@ -193,6 +196,33 @@ impl BufferPool {
     pub(crate) fn put_counter_values(&self, key: CacheKey, data: Arc<Vec<Option<u64>>>) {
         let size = data.len() * std::mem::size_of::<Option<u64>>();
         self.put(key, Block::CounterValues(data), size);
+    }
+
+    /// A value derived from a row group, cached and counted like a column.
+    pub(crate) fn get_derived<T: std::any::Any + Send + Sync>(
+        &self,
+        key: CacheKey,
+    ) -> Option<Arc<T>> {
+        let mut inner = self.inner.lock().unwrap();
+        let result = inner.cache.get(&key).and_then(|entry| match &entry.data {
+            Block::Derived(v) => Arc::clone(v).downcast::<T>().ok(),
+            _ => None,
+        });
+        if result.is_some() {
+            inner.hits += 1;
+        } else {
+            inner.misses += 1;
+        }
+        result
+    }
+
+    pub(crate) fn put_derived<T: std::any::Any + Send + Sync>(
+        &self,
+        key: CacheKey,
+        data: Arc<T>,
+        size: usize,
+    ) {
+        self.put(key, Block::Derived(data), size);
     }
 
     // ─── Gauge value column ──────────────────────────────────────────────────

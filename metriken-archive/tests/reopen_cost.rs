@@ -72,7 +72,9 @@ fn reopen_cost() {
         .unwrap_or(256);
     let pool = BufferPool::new(pool_mb << 20);
     let reader = open(&path, &pool);
-    reader.keep_handover();
+    if std::env::var("REOPEN_COST_NO_HANDOVER").is_err() {
+        reader.keep_handover();
+    }
     let (lo, hi) = reader.time_range().unwrap();
     // `REOPEN_COST_FRAC=a,b` queries that fraction of the recording.
     let (lo, hi) = match std::env::var("REOPEN_COST_FRAC") {

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A column decoded into the buffer pool reserves its row group's row count,
+  taken from the footer as a hint, and is shrunk to its length after
+  decoding. Timestamp, counter and gauge columns used to grow batch by batch
+  to up to twice their length while the pool counted their length, so the
+  pool held up to twice its budget.
+- A long segment's index of rows by occupant is one vector per row group
+  instead of one per occupant. It is a buffer pool entry, counted against
+  the pool's budget, evicted in LRU order like a column, and rebuilt from
+  the occupant column after eviction. It used to be kept per source for as
+  long as the source stayed in the segment cache.
+
 ## [0.34.2] - 2026-10-03
 
 ### Changed
