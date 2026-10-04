@@ -5048,4 +5048,48 @@ mod tests {
             .unwrap();
         assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
     }
+
+    /// An expression reading two tables through a union takes the batch path
+    /// on each, and answers as the per-series path does.
+    #[test]
+    fn a_union_of_two_tables_takes_the_batch_path() {
+        let s = 1_000_000_000u64;
+        let rows_a = [(s, 10), (2 * s, 20), (3 * s, 35), (4 * s, 50)];
+        let rows_b = [(s, 1), (2 * s, 3), (3 * s, 4), (4 * s, 9)];
+        let pool_a = BufferPool::new(64 * 1024 * 1024);
+        let pool_b = BufferPool::new(64 * 1024 * 1024);
+        let a = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_cycles", &[], &rows_a)],
+            Arc::clone(&pool_a),
+        )
+        .unwrap();
+        let b = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_instructions", &[], &rows_b)],
+            Arc::clone(&pool_b),
+        )
+        .unwrap();
+        let union = crate::UnionMetricsSource::try_new(vec![
+            crate::UnionChild::from(&a),
+            crate::UnionChild::from(&b),
+        ])
+        .unwrap();
+        let q = "sum(irate(cpu_cycles[1s])) / sum(irate(cpu_instructions[1s]))";
+        let batch = union.query_range(q, 2.0, 4.0, 1.0).unwrap();
+        assert_eq!(pool_a.stats().misses, 0, "cpu_cycles took the batch path");
+        assert_eq!(
+            pool_b.stats().misses,
+            0,
+            "cpu_instructions took the batch path"
+        );
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        let streams = union
+            .query_range_opts(q, 2.0, 4.0, 1.0, &per_series)
+            .unwrap();
+        assert!(pool_a.stats().misses > 0, "the per-series path ran");
+        assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
+        let QueryResult::Matrix { result } = batch else {
+            panic!("a matrix");
+        };
+        assert_eq!(result[0].values, vec![(2.0, 5.0), (3.0, 15.0), (4.0, 3.0)]);
+    }
 }

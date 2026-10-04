@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A `UnionMetricsSource` passes a batched `rate`/`irate` to the child that
+  holds the counter, so an expression reading several segmented tables
+  takes the one-pass path for each counter instead of the per-series path.
+  On a 9.6-hour recording, `sum(irate(task_cpu_usage[5s])) / cpu_cores`
+  (a per-task group stored wide, 6,644 series, divided by a second table)
+  took 23-44 s end to end in `rezolus mcp query` and takes 10.8-13.7 s,
+  on a loaded machine.
+
 ## [0.34.3] - 2026-10-04
 
 ### Added
