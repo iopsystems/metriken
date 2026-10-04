@@ -628,14 +628,16 @@ mod reader_tests {
         let long =
             SegmentedParquetReader::open_bytes_with_pool(vec![paged(&rows)], Arc::clone(&pool))
                 .unwrap();
+        // Pruning is the per-series path's: a batch read does not prune.
+        let opts = crate::QueryOptions::default().with_per_series_rates(true);
         for q in [
             "rate(cpu{__occupant__=\"17\"}[2s])",
             "depth{__occupant__=\"17\"}",
             "sum(rate(cpu{__occupant__=\"11\"}[2s]))",
             "histogram_mean(lat{__occupant__=\"17\"})",
         ] {
-            let a = whole.query_range(q, 1.0, 10.0, 1.0).unwrap();
-            let b = long.query_range(q, 1.0, 10.0, 1.0).unwrap();
+            let a = whole.query_range_opts(q, 1.0, 10.0, 1.0, &opts).unwrap();
+            let b = long.query_range_opts(q, 1.0, 10.0, 1.0, &opts).unwrap();
             assert_eq!(canonical(&a), canonical(&b), "{q}");
         }
         // A pruned read decodes into its own arrays, not the pool's
@@ -920,10 +922,11 @@ mod reader_tests {
     }
 
     /// The batch path (`DataSource::counter_grid_rates`) gives what the
-    /// per-series path gives, on long and wide segments, for every shape it
-    /// takes: rate and irate, alone and under each aggregation, with `by`, on
-    /// a cut range, on a step the samples do not fall on, and with a wider
-    /// span.
+    /// per-series path gives, on long and wide segments, for rate and irate,
+    /// alone and under each aggregation, with `by`, on a cut range, on a step
+    /// between samples, and with a wider span, over regular samples with
+    /// table-level windows. `batch_rate`'s tests cover holes, resets and
+    /// duplicates; `segmented`'s, a duration column.
     #[test]
     fn the_batch_path_matches_the_per_series_path() {
         let rows = churn();

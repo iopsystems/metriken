@@ -131,7 +131,7 @@ impl<'a> Ctx<'a> {
 /// path.
 fn batch_rates<'a>(
     ctx: &'a Ctx<'a>,
-    expr: &Expr,
+    call: &parser::Call,
     group: Option<(AggOp, GroupBy<'_>)>,
 ) -> Option<(SeriesSet<'a>, String)> {
     if ctx.per_series_rates
@@ -141,13 +141,6 @@ fn batch_rates<'a>(
     {
         return None;
     }
-    let mut expr = expr;
-    while let Expr::Paren(p) = expr {
-        expr = &p.expr;
-    }
-    let Expr::Call(call) = expr else {
-        return None;
-    };
     if !matches!(call.func.name, "rate" | "irate") || call.args.args.len() != 1 {
         return None;
     }
@@ -258,7 +251,15 @@ where
         Some(parser::LabelModifier::Exclude(ls)) => GroupBy::Exclude(ls.labels.as_slice()),
     };
 
-    if let Some((series, name)) = batch_rates(ctx, &agg.expr, Some((op, group_by))) {
+    let mut inner: &Expr = &agg.expr;
+    while let Expr::Paren(p) = inner {
+        inner = &p.expr;
+    }
+    let batched = match inner {
+        Expr::Call(call) => batch_rates(ctx, call, Some((op, group_by))),
+        _ => None,
+    };
+    if let Some((series, name)) = batched {
         return Ok(Built::Series {
             series,
             metric_name: None,
@@ -450,7 +451,7 @@ where
         // `[range]` window is inert, and the value is the per-step rate. The
         // mode only chooses point placement (see `RateMode`).
         "rate" | "irate" => {
-            if let Some((series, _)) = batch_rates(ctx, &Expr::Call(call.clone()), None) {
+            if let Some((series, _)) = batch_rates(ctx, call, None) {
                 return Ok(Built::Series {
                     series,
                     metric_name: Some(metric_name),

@@ -3077,8 +3077,8 @@ impl BatchColumns {
 
 /// Decode `cols` of every row group of `pf` that `[start_ns, end_ns]`
 /// touches, with the timestamp, duration and occupant columns. A batch that
-/// will not decode ends its row group with the rows read so far, as the
-/// single-column readers do.
+/// will not decode is an error: every projected column would lose its rows
+/// from there, where a single-column read loses only that column's.
 fn read_batch_columns(
     pf: &ParquetSource,
     cols: &[usize],
@@ -3103,24 +3103,23 @@ fn read_batch_columns(
             pf.build_batch_reader(rg_idx, ProjectionMask::roots(&schema, all.iter().copied()))?;
         let decoded = catch_decode_panic(|| {
             let mut out = Vec::new();
+            let mut failed = None;
             for batch in reader {
                 match batch {
                     Ok(b) => out.push(b),
                     Err(e) => {
-                        tracing::warn!(
-                            rg_idx,
-                            source_id = pf.id,
-                            error = %e,
-                            "aborting batch read on parquet error",
-                        );
+                        failed = Some(e.to_string());
                         break;
                     }
                 }
             }
-            out
+            (out, failed)
         });
         match decoded {
-            Ok(out) => batches.extend(out),
+            Ok((_, Some(e))) => {
+                return Err(format!("parquet error in a batch read (rg={rg_idx}): {e}").into())
+            }
+            Ok((out, None)) => batches.extend(out),
             Err(panic) => {
                 return Err(
                     format!("parquet decode panic in a batch read (rg={rg_idx}): {panic}").into(),

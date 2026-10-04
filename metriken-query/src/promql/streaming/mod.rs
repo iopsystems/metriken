@@ -52,7 +52,7 @@ pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
 pub(crate) use binary::{interval_binop, matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
 pub(crate) use deriv::StreamingDeriv;
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
-pub(crate) use rate::{CounterGridRate, CounterPairwiseRate};
+pub(crate) use rate::{CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
 
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;

@@ -166,7 +166,7 @@ pub struct CounterGridRate<'a> {
 }
 
 /// How many leading samples the typical spacing is taken from.
-const SPACING_PROBE: usize = 9;
+pub(crate) const SPACING_PROBE: usize = 9;
 
 impl<'a> CounterGridRate<'a> {
     /// From whole vectors; see [`from_stream`](Self::from_stream).

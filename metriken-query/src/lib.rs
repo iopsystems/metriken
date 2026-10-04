@@ -168,11 +168,11 @@ pub struct QueryOptions {
     /// timestamp — so the uniform grid is just the special case where those
     /// gaps are all equal.
     pub eval_timestamps: Option<std::sync::Arc<[u64]>>,
-    /// Compute `rate`/`irate` from one sample stream per series, never in
-    /// one pass by the source (`DataSource::counter_grid_rates`). The two
-    /// give the same series and points; an aggregate's value can differ in
-    /// the last bits of a float, from summation order. For comparing the two
-    /// and for diagnosis.
+    /// Compute `rate`/`irate` from one sample stream per series rather than
+    /// in one pass over a segmented reader's columns. For samples in
+    /// increasing time order the two give the same series and timestamps; an
+    /// aggregate's values and bands can differ in the last bits, from
+    /// summation order. For comparing the two and for diagnosis.
     pub per_series_rates: bool,
 }
 
@@ -272,8 +272,8 @@ pub(crate) trait DataSource: Send + Sync {
     }
     /// `rate`/`irate` of counter `name` on the evaluation grid, computed by
     /// the source in one pass over its data, optionally aggregated; see
-    /// `batch_rate`. `None` when the source does not compute it, which sends
-    /// the query down the per-series path.
+    /// `batch_rate`. `None` when the source does not compute it; the
+    /// dispatcher then uses the per-series path.
     fn counter_grid_rates(
         &self,
         name: &str,

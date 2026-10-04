@@ -996,10 +996,10 @@ impl Handover {
 }
 
 impl SegmentedSource {
-    /// See [`DataSource::counter_grid_rates`]. `None`, sending the query to
-    /// the per-series path, when the relabel's identities are not fixed,
-    /// when a series has two locations in one segment, or when nothing
-    /// matches.
+    /// See [`DataSource::counter_grid_rates`]. `None` when the relabel's
+    /// identities are not fixed, when a series has two locations in one
+    /// segment, when nothing matches, or when a segment's columns cannot be
+    /// read; the dispatcher then uses the per-series path.
     fn grid_rates(
         &self,
         name: &str,
@@ -1077,35 +1077,34 @@ impl SegmentedSource {
         let n = labels.len();
 
         // Series are split across partitions, each run by one thread with
-        // its own sink. Few groups: by series, each partition holding its
-        // own accumulators for them, merged at the end. Many: by group, so
-        // a group's accumulators exist in one partition, except that a group
+        // its own sink. Without aggregation, by series. With it, by group,
+        // largest first to the partition with the fewest series, so a
+        // group's accumulators exist in one partition; except that a group
         // with more than twice a partition's share of the series is spread
-        // by series like the few-groups case; at most half the partitions'
-        // count of groups can be that large.
+        // across all partitions by series, each holding its accumulators,
+        // merged at the end. Fewer than half the partition count of groups
+        // can be that large.
         let parts = batch_threads().min(n).max(1);
         let groups = request
             .group
             .map(|(op, by)| (op, crate::batch_rate::groups(by, &labels)));
         let partition: Vec<usize> = match &groups {
-            Some((_, (glabels, group_of))) if glabels.len() >= parts * 4 => {
-                // Largest groups first, each to the partition with the
-                // fewest series so far.
+            Some((_, (glabels, group_of))) => {
                 let mut size = vec![0usize; glabels.len()];
                 for g in group_of {
                     size[*g] += 1;
                 }
-                let mut by_size: Vec<usize> = (0..glabels.len()).collect();
-                by_size.sort_unstable_by_key(|g| std::cmp::Reverse(size[*g]));
                 let spread = |g: usize| size[g] > 2 * n / parts;
                 let mut load = vec![0usize; parts];
-                for g in by_size.iter().filter(|g| spread(**g)) {
+                for g in (0..glabels.len()).filter(|g| spread(*g)) {
                     for l in load.iter_mut() {
-                        *l += size[*g] / parts;
+                        *l += size[g] / parts;
                     }
                 }
+                let mut by_size: Vec<usize> = (0..glabels.len()).filter(|g| !spread(*g)).collect();
+                by_size.sort_unstable_by_key(|g| std::cmp::Reverse(size[*g]));
                 let mut part_of = vec![0usize; glabels.len()];
-                for g in by_size.into_iter().filter(|g| !spread(*g)) {
+                for g in by_size {
                     let p = (0..parts).min_by_key(|p| load[*p]).unwrap_or(0);
                     part_of[g] = p;
                     load[p] += size[g];
@@ -1116,7 +1115,7 @@ impl SegmentedSource {
                     .map(|(s, g)| if spread(*g) { s % parts } else { part_of[*g] })
                     .collect()
             }
-            _ => (0..n).map(|s| s % parts).collect(),
+            None => (0..n).map(|s| s % parts).collect(),
         };
         let mut local = vec![0u32; n];
         let mut members: Vec<Vec<usize>> = vec![Vec::new(); parts];
@@ -1158,13 +1157,18 @@ impl SegmentedSource {
         // A segment's samples, in row order, bucketed by partition and named
         // by their series' index within it.
         let segments: Vec<u32> = plans.keys().copied().collect();
-        let read = |seg: u32| -> Option<Vec<Vec<(u32, Sample)>>> {
+        // `Ok(None)` for a segment that is gone, as the per-series path
+        // skips it; `Err` for one that cannot be read, which ends the batch
+        // read.
+        type Buckets = Vec<Vec<(u32, Sample)>>;
+        type Read = Result<Option<Buckets>, ()>;
+        let read = |seg: u32| -> Read {
             let reader = match self.segment(seg as usize) {
                 Ok(Some(r)) => r,
-                Ok(None) => return None,
+                Ok(None) => return Ok(None),
                 Err(e) => {
                     tracing::warn!(segment = seg, "fetching a segment: {e}");
-                    return None;
+                    return Err(());
                 }
             };
             let plan = &plans[&seg];
@@ -1174,7 +1178,9 @@ impl SegmentedSource {
                 cols.extend(p.begin.map(|c| c as usize));
                 cols.extend(p.width.map(|c| c as usize));
             }
-            let columns = reader.batch_columns(&cols, start, end)?;
+            let Some(columns) = reader.batch_columns(&cols, start, end) else {
+                return Err(());
+            };
             let mut buckets: Vec<Vec<(u32, Sample)>> = vec![Vec::new(); parts];
             let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
                 a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
@@ -1232,10 +1238,13 @@ impl SegmentedSource {
                     }
                 }
             }
-            Some(buckets)
+            Ok(Some(buckets))
         };
         for chunk in segments.chunks(batch_threads()) {
-            let read_chunk = read_all(chunk, &read);
+            let read_chunk: Vec<Option<Buckets>> = read_all(chunk, &read)
+                .into_iter()
+                .collect::<Result<_, ()>>()
+                .ok()?;
             let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, p: usize| {
                 for buckets in read_chunk.iter().flatten() {
                     for (s, sample) in &buckets[p] {
@@ -2041,7 +2050,8 @@ impl MetricsSource for SegmentedParquetReader {
     }
 }
 
-/// How many segments a batch read decodes at once.
+/// Threads a batch read uses: segments decoded at once, and the most
+/// partitions. At most 8, so concurrent queries share the machine.
 fn batch_threads() -> usize {
     #[cfg(target_arch = "wasm32")]
     {
@@ -2049,15 +2059,16 @@ fn batch_threads() -> usize {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::thread::available_parallelism().map_or(4, |n| n.get())
+        std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
     }
 }
 
-/// Read `segments`, in parallel where threads exist, in their order.
-fn read_all<T, F>(segments: &[u32], read: &F) -> Vec<Option<T>>
+/// Read `segments`, in parallel where threads exist, in their order. A
+/// panic in a read is raised again here.
+fn read_all<T, F>(segments: &[u32], read: &F) -> Vec<T>
 where
     T: Send,
-    F: Fn(u32) -> Option<T> + Sync,
+    F: Fn(u32) -> T + Sync,
 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -2075,7 +2086,7 @@ where
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or(None))
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         })
     }
@@ -4815,5 +4826,56 @@ mod tests {
             panic!("a matrix");
         };
         assert_eq!(result[0].values, vec![(10.0, 10.0)]);
+    }
+
+    /// One counter with a `duration` column and no window columns: rows
+    /// `(timestamp, value, duration)`.
+    fn segment_with_duration(rows: &[(u64, u64, u64)]) -> Vec<u8> {
+        let mut metadata = HashMap::new();
+        metadata.insert("metric".to_string(), "cpu_cycles".to_string());
+        metadata.insert("metric_type".to_string(), "counter".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("duration", DataType::UInt64, true),
+            Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(metadata),
+        ]));
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        let col = |f: fn(&(u64, u64, u64)) -> u64| {
+            Arc::new(UInt64Array::from(rows.iter().map(f).collect::<Vec<_>>())) as ArrayRef
+        };
+        let batch =
+            RecordBatch::try_new(schema, vec![col(|r| r.0), col(|r| r.2), col(|r| r.1)]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// With windows from a `duration` column, a hole and a reset, the batch
+    /// path gives what the per-series path gives.
+    #[test]
+    fn a_batch_read_with_a_duration_column_matches_the_per_series_path() {
+        let s = 1_000_000_000u64;
+        let segs = vec![
+            segment_with_duration(&[(s, 10, 300), (2 * s, 20, 310), (3 * s, 35, 290)]),
+            segment_with_duration(&[(8 * s, 90, 305), (9 * s, 4, 300), (10 * s, 30, 300)]),
+        ];
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        for q in ["rate(cpu_cycles[1s])", "sum(irate(cpu_cycles[1s]))"] {
+            for step in [1.0, 0.5] {
+                let pool = BufferPool::new(64 * 1024 * 1024);
+                let r =
+                    SegmentedParquetReader::open_bytes_with_pool(segs.clone(), Arc::clone(&pool))
+                        .unwrap();
+                let batch = r.query_range(q, 1.0, 10.0, step).unwrap();
+                assert_eq!(pool.stats().misses, 0, "{q}: the batch path ran");
+                let streams = r.query_range_opts(q, 1.0, 10.0, step, &per_series).unwrap();
+                assert_eq!(
+                    format!("{batch:?}"),
+                    format!("{streams:?}"),
+                    "{q} step {step}"
+                );
+            }
+        }
     }
 }

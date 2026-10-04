@@ -12,25 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rate`/`irate` of a counter in grid mode, alone or under `sum`, `avg`,
   `min`, `max` or `count` with or without `by`/`without`, is computed by a
   segmented reader in one pass over decoded columns: segments are decoded
-  in parallel, each series' grid rate is computed from its samples as
-  `CounterGridRate` computes it, and an aggregate is reduced into one
-  accumulator per group and grid point. Other expressions, raw mode,
-  explicit evaluation timestamps, and relabels whose identities are not
-  fixed take the per-series path as before. On a 9.6-hour recording of a
-  per-task group (6,644 series, 76 M rows) at a 1 s step, a warm
-  `sum(irate(...))` took 9.7-14.5 s and takes 0.63-0.94 s; `sum by (comm)`
-  took 11-14 s and takes 0.7-1.0 s; long and wide tables alike.
+  in parallel (up to 8 threads), each series' grid rate is computed from its
+  samples with the per-series path's arithmetic, and an aggregate is
+  reduced into accumulators per group and grid point. Other expressions,
+  raw mode, explicit evaluation timestamps, `offset`/`@`, sources other than
+  a segmented reader, relabels whose identities are not fixed, a series
+  with two columns in one segment, and a segment that cannot be read take
+  the per-series path as before. On a 9.6-hour recording of a per-task
+  group (6,644 series, 76 M rows) at a 1 s step, a warm `sum(irate(...))`
+  took 9.7-14.5 s and takes 0.63-0.94 s; `sum by (comm)` took 11-14 s and
+  takes 0.7-1.0 s; long and wide tables alike.
 - `QueryOptions::per_series_rates` (`with_per_series_rates`) computes rates
   one series at a time, for comparison and diagnosis.
 
 ### Changed
 
 - An aggregate over rates can differ from earlier releases in the last bits
-  of a float, from summation order. Series, timestamps, bands and the
-  interpolated flag are the same.
+  of its values and bands, from summation order. Series, timestamps and
+  the interpolated flag are the same, for samples in increasing time order.
 - A one-pass read does not go through the buffer pool: a warm query decodes
-  its segments again rather than finding them in the pool.
-
+  its segments again rather than finding them in the pool. A grouped
+  aggregate holds 88 bytes per group per grid point outside the pool, for
+  the stretches of the grid where the group has points.
 - A column decoded into the buffer pool reserves its row group's row count,
   taken from the footer as a hint, and is shrunk to its length after
   decoding. Timestamp, counter and gauge columns used to grow batch by batch
