@@ -66,6 +66,7 @@ pub fn try_streaming(
         rate_mode,
         rate_span_ns: opts.rate_span_ns,
         eval_timestamps: opts.eval_timestamps.clone(),
+        per_series_rates: opts.per_series_rates,
     };
 
     let result = match build(&ctx, expr)? {
@@ -103,6 +104,8 @@ struct Ctx<'a> {
     rate_span_ns: Option<u64>,
     /// Explicit evaluation timestamps; see [`QueryOptions::eval_timestamps`].
     eval_timestamps: Option<std::sync::Arc<[u64]>>,
+    /// See [`QueryOptions::per_series_rates`].
+    per_series_rates: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -119,6 +122,58 @@ impl<'a> Ctx<'a> {
             None => producer,
         }
     }
+}
+
+/// `rate`/`irate` of a matrix selector on the grid, computed by the source in
+/// one pass when it can (see [`crate::batch_rate`]). `None` for any other
+/// expression, for raw mode or explicit evaluation timestamps, and for a
+/// source that does not compute it: the caller then builds the per-series
+/// path.
+fn batch_rates<'a>(
+    ctx: &'a Ctx<'a>,
+    expr: &Expr,
+    group: Option<(AggOp, GroupBy<'_>)>,
+) -> Option<(SeriesSet<'a>, String)> {
+    if ctx.per_series_rates
+        || ctx.eval_timestamps.is_some()
+        || !matches!(ctx.rate_mode, RateMode::Grid)
+        || ctx.step_ns == 0
+    {
+        return None;
+    }
+    let mut expr = expr;
+    while let Expr::Paren(p) = expr {
+        expr = &p.expr;
+    }
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    if !matches!(call.func.name, "rate" | "irate") || call.args.args.len() != 1 {
+        return None;
+    }
+    let Expr::MatrixSelector(sel) = &*call.args.args[0] else {
+        return None;
+    };
+    if sel.vs.offset.is_some() || sel.vs.at.is_some() {
+        return None;
+    }
+    let name = sel.vs.name.as_deref()?;
+    let filter = extract_filter_labels(&sel.vs.matchers.matchers);
+    let range_ns = sel.range.as_nanos() as u64;
+    let request = crate::batch_rate::GridRateRequest {
+        data_start: ctx.start_ns.saturating_sub(range_ns.max(ctx.step_ns)),
+        start_ns: ctx.start_ns,
+        end_ns: ctx.end_ns,
+        step_ns: ctx.step_ns,
+        span_ns: ctx.rate_span_ns.unwrap_or(ctx.step_ns),
+        group,
+    };
+    let results = ctx.source.counter_grid_rates(name, &filter, &request)?;
+    let series = results
+        .into_iter()
+        .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
+        .collect();
+    Some((series, name.to_string()))
 }
 
 /// `MetricNotFound` for a name the source holds as no kind at all. A
@@ -202,6 +257,14 @@ where
         Some(parser::LabelModifier::Include(ls)) => GroupBy::Include(ls.labels.as_slice()),
         Some(parser::LabelModifier::Exclude(ls)) => GroupBy::Exclude(ls.labels.as_slice()),
     };
+
+    if let Some((series, name)) = batch_rates(ctx, &agg.expr, Some((op, group_by))) {
+        return Ok(Built::Series {
+            series,
+            metric_name: None,
+            metric_name_for_error: Some(name),
+        });
+    }
 
     let Built::Series {
         series: inner_series,
@@ -387,6 +450,13 @@ where
         // `[range]` window is inert, and the value is the per-step rate. The
         // mode only chooses point placement (see `RateMode`).
         "rate" | "irate" => {
+            if let Some((series, _)) = batch_rates(ctx, &Expr::Call(call.clone()), None) {
+                return Ok(Built::Series {
+                    series,
+                    metric_name: Some(metric_name),
+                    metric_name_for_error: Some(metric_name.to_string()),
+                });
+            }
             // Grid needs at least one step of lookback to bracket the first
             // interval's left edge, regardless of the (inert) query range.
             let lookback = match ctx.rate_mode {

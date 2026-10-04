@@ -184,7 +184,8 @@ fn batch_rate() {
     };
     let table = std::env::var("BATCH_RATE_TABLE")
         .unwrap_or_else(|_| "cpu_usage/cpu_usage_task".to_string());
-    let metric = std::env::var("BATCH_RATE_METRIC").unwrap_or_else(|_| "task_cpu_usage".to_string());
+    let metric =
+        std::env::var("BATCH_RATE_METRIC").unwrap_or_else(|_| "task_cpu_usage".to_string());
     let step_s: f64 = std::env::var("BATCH_RATE_STEP")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -220,7 +221,10 @@ fn batch_rate() {
     let mut by_labels: BTreeMap<BTreeMap<String, String>, usize> = BTreeMap::new();
     let occupants = format!("{table}/occupants");
     for (seq, _) in catalog.segment_meta(source, &occupants).unwrap() {
-        let bytes = catalog.segment_bytes(source, &occupants, seq).unwrap().unwrap();
+        let bytes = catalog
+            .segment_bytes(source, &occupants, seq)
+            .unwrap()
+            .unwrap();
         for (_, o) in metriken_segment::occupants::decode_segment(&bytes).unwrap() {
             let n = by_labels.len();
             let idx = *by_labels.entry(o.labels).or_insert(n);
@@ -262,18 +266,21 @@ fn batch_rate() {
     let td = Instant::now();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let decoded: Vec<std::sync::Mutex<Vec<arrow::record_batch::RecordBatch>>> =
-        blobs.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let decoded: Vec<std::sync::Mutex<Vec<arrow::record_batch::RecordBatch>>> = blobs
+        .iter()
+        .map(|_| std::sync::Mutex::new(Vec::new()))
+        .collect();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(bytes) = blobs.get(i) else { break };
-                let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone()))
-                    .unwrap()
-                    .with_batch_size(64 * 1024)
-                    .build()
-                    .unwrap();
+                let reader =
+                    ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone()))
+                        .unwrap()
+                        .with_batch_size(64 * 1024)
+                        .build()
+                        .unwrap();
                 *decoded[i].lock().unwrap() = reader.map(|b| b.unwrap()).collect();
             });
         }
@@ -339,10 +346,7 @@ fn batch_rate() {
         let interp = sums.interpolated[k];
         let ours_b = (sums.bounded[k] && !interp).then(|| (sums.lo[k], sums.hi[k]));
         let theirs_b = engine.bands.as_ref().and_then(|b| b[i]);
-        let theirs_i = engine
-            .interpolated
-            .as_ref()
-            .is_some_and(|f| f[i]);
+        let theirs_i = engine.interpolated.as_ref().is_some_and(|f| f[i]);
         let ok = sums.count[k] > 0
             && close(ours_v, *v)
             && interp == theirs_i

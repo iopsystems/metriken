@@ -150,6 +150,10 @@ impl<'a> LabeledSeries<'a> {
 /// Output of a streaming evaluation stage.
 pub type SeriesSet<'a> = Vec<LabeledSeries<'a>>;
 
+/// A series' labels and its points, computed in one pass by a source; see
+/// [`crate::batch_rate`].
+pub(crate) type LabeledPoints = (crate::labels::Labels, Vec<Point>);
+
 /// Boundary collector: drain a streaming result into the same
 /// `MatrixSample` shape the eager engine returns.
 pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) -> Vec<MatrixSample> {

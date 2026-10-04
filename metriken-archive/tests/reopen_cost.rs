@@ -7,6 +7,9 @@
 //! - `REOPEN_COST_POOL_MB`: the buffer pool's size (default 256).
 //! - `REOPEN_COST_FRAC=a,b`: query that fraction of the recording.
 //! - `REOPEN_COST_COLD_ONLY`: stop after the cold query.
+//! - `REOPEN_COST_WARM_ONLY`: three warm queries after the cold one, then stop.
+//! - `REOPEN_COST_STEP`: the step in seconds (default 5).
+//! - `REOPEN_COST_PER_SERIES`: compute rates one series at a time.
 //! - `REOPEN_COST_SAVE=file`: write the answer, canonicalized.
 //! - `REOPEN_COST_COMPARE=other.dendro`: fail unless the other archive gives
 //!   the same answer; `REOPEN_COST_DUMP=dir` says where the two go when not.
@@ -89,21 +92,29 @@ fn reopen_cost() {
         }
         Err(_) => (lo, hi),
     };
+    let opts = metriken_query::QueryOptions::default()
+        .with_per_series_rates(std::env::var("REOPEN_COST_PER_SERIES").is_ok());
     let t = Instant::now();
-    reader.query_range(&query, lo, hi, step).unwrap();
+    reader
+        .query_range_opts(&query, lo, hi, step, &opts)
+        .unwrap();
     println!(
         "REOPEN cold query {:?}; pool {:?}",
         t.elapsed(),
         pool.stats()
     );
     if let Ok(out) = std::env::var("REOPEN_COST_SAVE") {
-        let a = reader.query_range(&query, lo, hi, step).unwrap();
+        let a = reader
+            .query_range_opts(&query, lo, hi, step, &opts)
+            .unwrap();
         std::fs::write(&out, canonical(&a).join("\n")).unwrap();
     }
     if let Ok(other) = std::env::var("REOPEN_COST_COMPARE") {
-        let a = reader.query_range(&query, lo, hi, step).unwrap();
+        let a = reader
+            .query_range_opts(&query, lo, hi, step, &opts)
+            .unwrap();
         let b = open(&other, &pool)
-            .query_range(&query, lo, hi, step)
+            .query_range_opts(&query, lo, hi, step, &opts)
             .unwrap();
         let (ca, cb) = (canonical(&a), canonical(&b));
         if ca != cb {
@@ -117,10 +128,26 @@ fn reopen_cost() {
     if std::env::var("REOPEN_COST_COLD_ONLY").is_ok() {
         return;
     }
+    // `REOPEN_COST_WARM_ONLY`: three warm queries after the cold one, then
+    // stop.
+    if std::env::var("REOPEN_COST_WARM_ONLY").is_ok() {
+        let mut warm = Vec::new();
+        for _ in 0..3 {
+            let t = Instant::now();
+            reader
+                .query_range_opts(&query, lo, hi, step, &opts)
+                .unwrap();
+            warm.push(t.elapsed());
+        }
+        println!("REOPEN warm {:?}", warm);
+        return;
+    }
     let mut warm = Vec::new();
     for _ in 0..5 {
         let t = Instant::now();
-        reader.query_range(&query, lo, hi, step).unwrap();
+        reader
+            .query_range_opts(&query, lo, hi, step, &opts)
+            .unwrap();
         warm.push(t.elapsed());
     }
     let (mut opens, mut after) = (Vec::new(), Vec::new());

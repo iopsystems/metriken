@@ -175,6 +175,20 @@ impl ParquetReader {
         }
     }
 
+    /// Columns of a single-file reader for a batch read; see
+    /// [`BatchColumns`].
+    pub(crate) fn batch_columns(
+        &self,
+        cols: &[usize],
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<BatchColumns> {
+        match self.inner.files.as_slice() {
+            [(f, _)] => f.batch_columns(cols, start_ns, end_ns),
+            _ => None,
+        }
+    }
+
     /// What this reader holds in memory while open, estimated: its bytes if
     /// it was opened from bytes, plus a per-column charge for the parsed
     /// footer and column descriptors.
@@ -1581,6 +1595,16 @@ impl DataSource for FileSource {
         }
     }
 
+    fn batch_columns(&self, cols: &[usize], start_ns: u64, end_ns: u64) -> Option<BatchColumns> {
+        match read_batch_columns(&self.0, cols, start_ns, end_ns) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(source_id = self.0.id, error = %e, "reading columns for a batch read");
+                None
+            }
+        }
+    }
+
     fn column_count(&self) -> usize {
         self.0.meta.schema().fields().len()
     }
@@ -2722,7 +2746,7 @@ fn read_gauge_values_per_rg(
 ///    collection window (same `[begin, begin+elapsed]` shape the agent records).
 ///    Lets windowless (older/plain-parquet) recordings still carry rate bands.
 /// 3. **Degenerate** `[base, base]` — neither sidecar nor duration available.
-fn resolve_window(
+pub(crate) fn resolve_window(
     base: u64,
     begin_off: Option<i64>,
     width: Option<u64>,
@@ -3013,6 +3037,103 @@ fn read_counter_column(
         timestamps,
         values,
         windows,
+    })
+}
+
+/// Columns of every row group a range touches, decoded once, for a read of
+/// many series at a time (see `crate::batch_rate`). Besides the columns
+/// asked for it holds the timestamp column, and the duration and occupant
+/// columns where the file has them.
+pub(crate) struct BatchColumns {
+    pub batches: Vec<arrow::record_batch::RecordBatch>,
+    /// The schema index of each projected column, in batch order.
+    cols: Vec<usize>,
+    pub ts: usize,
+    pub duration: Option<usize>,
+    pub occupant: Option<usize>,
+}
+
+impl BatchColumns {
+    /// Column `col` (a schema index) of `batch` as `UInt64`.
+    pub fn u64s<'b>(
+        &self,
+        batch: &'b arrow::record_batch::RecordBatch,
+        col: usize,
+    ) -> Option<&'b UInt64Array> {
+        let at = self.cols.binary_search(&col).ok()?;
+        batch.column(at).as_any().downcast_ref::<UInt64Array>()
+    }
+
+    /// Column `col` (a schema index) of `batch` as `Int64`.
+    pub fn i64s<'b>(
+        &self,
+        batch: &'b arrow::record_batch::RecordBatch,
+        col: usize,
+    ) -> Option<&'b Int64Array> {
+        let at = self.cols.binary_search(&col).ok()?;
+        batch.column(at).as_any().downcast_ref::<Int64Array>()
+    }
+}
+
+/// Decode `cols` of every row group of `pf` that `[start_ns, end_ns]`
+/// touches, with the timestamp, duration and occupant columns. A batch that
+/// will not decode ends its row group with the rows read so far, as the
+/// single-column readers do.
+fn read_batch_columns(
+    pf: &ParquetSource,
+    cols: &[usize],
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<BatchColumns, Box<dyn Error>> {
+    let (ts, duration) = pf.fixed_cols();
+    let ts = ts.ok_or("missing timestamp")?;
+    let occupant = pf.occupant_col();
+    let mut all: Vec<usize> = cols.to_vec();
+    all.extend([Some(ts), duration, occupant].into_iter().flatten());
+    all.sort_unstable();
+    all.dedup();
+    let schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let mut batches = Vec::new();
+    for rg_idx in 0..pf.meta.metadata().num_row_groups() {
+        match rg_classify(pf.meta.metadata().row_group(rg_idx), ts, start_ns, end_ns) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let reader =
+            pf.build_batch_reader(rg_idx, ProjectionMask::roots(&schema, all.iter().copied()))?;
+        let decoded = catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch in reader {
+                match batch {
+                    Ok(b) => out.push(b),
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting batch read on parquet error",
+                        );
+                        break;
+                    }
+                }
+            }
+            out
+        });
+        match decoded {
+            Ok(out) => batches.extend(out),
+            Err(panic) => {
+                return Err(
+                    format!("parquet decode panic in a batch read (rg={rg_idx}): {panic}").into(),
+                )
+            }
+        }
+    }
+    Ok(BatchColumns {
+        batches,
+        cols: all,
+        ts,
+        duration,
+        occupant,
     })
 }
 
