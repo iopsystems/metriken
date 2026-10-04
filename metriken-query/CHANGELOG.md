@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with two columns in one segment, and a segment that cannot be read take
   the per-series path as before. On a 9.6-hour recording of a per-task
   group (6,644 series, 76 M rows) at a 1 s step, a warm `sum(irate(...))`
-  took 9.7-14.5 s and takes 0.63-0.94 s; `sum by (comm)` took 11-14 s and
-  takes 0.7-1.0 s; long and wide tables alike.
+  took 9.7 s on the table stored long and 14 s stored wide, and takes
+  0.89 s and 1.18 s; `sum by (comm)` took 10-11 s and 15 s, and takes
+  1.07 s and 1.38 s.
 - `QueryOptions::per_series_rates` (`with_per_series_rates`) computes rates
   one series at a time, for comparison and diagnosis.
 
@@ -32,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the interpolated flag are the same, for samples in increasing time order.
 - A one-pass read does not go through the buffer pool: a warm query decodes
   its segments again rather than finding them in the pool. A grouped
-  aggregate holds 88 bytes per group per grid point outside the pool, for
-  the stretches of the grid where the group has points.
+  aggregate holds 88 bytes per group per grid point outside the pool,
+  allocated in blocks of 1,024 points where the group has points, and once
+  per partition (up to 8) for a group spread across partitions.
 - A column decoded into the buffer pool reserves its row group's row count,
   taken from the footer as a hint, and is shrunk to its length after
   decoding. Timestamp, counter and gauge columns used to grow batch by batch

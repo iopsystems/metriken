@@ -2051,7 +2051,7 @@ impl MetricsSource for SegmentedParquetReader {
 }
 
 /// Threads a batch read uses: segments decoded at once, and the most
-/// partitions. At most 8, so concurrent queries share the machine.
+/// partitions. At most 8.
 fn batch_threads() -> usize {
     #[cfg(target_arch = "wasm32")]
     {
@@ -4877,5 +4877,175 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A row of [`segment_with_windows`]: timestamp, value, duration,
+    /// window begin offset and width.
+    type WindowRow = (u64, u64, u64, Option<i64>, Option<u64>);
+
+    /// A counter with `duration` and, when `windowed`, nullable
+    /// `:window_begin`/`:window_width` columns: rows `(timestamp, value,
+    /// duration, begin, width)`.
+    fn segment_with_windows(rows: &[WindowRow], windowed: bool) -> Vec<u8> {
+        let mut metadata = HashMap::new();
+        metadata.insert("metric".to_string(), "cpu_cycles".to_string());
+        metadata.insert("metric_type".to_string(), "counter".to_string());
+        let mut fields = vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("duration", DataType::UInt64, true),
+        ];
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+            )),
+        ];
+        if windowed {
+            fields.push(Field::new(":window_begin", DataType::Int64, true));
+            fields.push(Field::new(":window_width", DataType::UInt64, true));
+            cols.push(Arc::new(arrow::array::Int64Array::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )));
+            cols.push(Arc::new(UInt64Array::from(
+                rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+            )));
+        }
+        fields.push(Field::new("cpu_cycles", DataType::UInt64, true).with_metadata(metadata));
+        cols.push(Arc::new(UInt64Array::from(
+            rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+        )));
+        let schema = Arc::new(Schema::new(fields));
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, cols).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// Where a row's window columns are null, and in a later segment with
+    /// only a duration column, the window comes from the duration on both
+    /// paths, and the bands agree.
+    #[test]
+    fn a_batch_read_with_mixed_windows_matches_the_per_series_path() {
+        let s = 1_000_000_000u64;
+        let segs = vec![
+            segment_with_windows(
+                &[
+                    (s, 10, 300_000, Some(-5), Some(100)),
+                    (2 * s, 20, 310_000, None, None),
+                    (3 * s, 35, 290_000, Some(-7), Some(120)),
+                    (4 * s, 50, 300_000, Some(-3), Some(90)),
+                ],
+                true,
+            ),
+            segment_with_windows(
+                &[
+                    (5 * s, 60, 305_000, None, None),
+                    (6 * s, 75, 300_000, None, None),
+                    (7 * s, 90, 300_000, None, None),
+                ],
+                false,
+            ),
+        ];
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        for q in ["rate(cpu_cycles[1s])", "sum(irate(cpu_cycles[1s]))"] {
+            for step in [1.0, 0.5] {
+                let pool = BufferPool::new(64 * 1024 * 1024);
+                let r =
+                    SegmentedParquetReader::open_bytes_with_pool(segs.clone(), Arc::clone(&pool))
+                        .unwrap();
+                let batch = r.query_range(q, 1.0, 7.0, step).unwrap();
+                assert_eq!(pool.stats().misses, 0, "{q}: the batch path ran");
+                let streams = r.query_range_opts(q, 1.0, 7.0, step, &per_series).unwrap();
+                assert_eq!(
+                    format!("{batch:?}"),
+                    format!("{streams:?}"),
+                    "{q} step {step}"
+                );
+            }
+        }
+    }
+
+    /// Samples outside the range a query reads do not make edges outside
+    /// it observed: with samples half a second off the grid, a query over
+    /// 10-15 s has points at 11-14 s on both paths.
+    #[test]
+    fn a_batch_read_keeps_to_the_range() {
+        let rows: Vec<(u64, u64)> = (0..30u64)
+            .map(|k| (k * 1_000_000_000 + 500_000_000, k * 10))
+            .collect();
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_cycles", &[], &rows)],
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        let batch = r
+            .query_range("rate(cpu_cycles[1s])", 10.0, 15.0, 1.0)
+            .unwrap();
+        let streams = r
+            .query_range_opts("rate(cpu_cycles[1s])", 10.0, 15.0, 1.0, &per_series)
+            .unwrap();
+        assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
+        let QueryResult::Matrix { result } = batch else {
+            panic!("a matrix");
+        };
+        let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0]);
+    }
+
+    /// A store whose segments become unreadable after open.
+    struct Failing {
+        segments: Vec<Bytes>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl SegmentStore for Failing {
+        fn len(&self) -> usize {
+            self.segments.len()
+        }
+
+        fn bytes(&self, idx: usize) -> SegmentBytes {
+            if idx == 1 && self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("unreadable".into());
+            }
+            Ok(self.segments.get(idx).cloned())
+        }
+    }
+
+    /// A segment that cannot be read ends the batch read: the query takes
+    /// the per-series path and answers as it does, rather than losing that
+    /// segment's rows to the batch path alone.
+    #[test]
+    fn an_unreadable_segment_falls_back_to_the_per_series_path() {
+        let s = 1_000_000_000u64;
+        let store = Arc::new(Failing {
+            segments: vec![
+                Bytes::from(segment("cpu_cycles", &[], &[(s, 10), (2 * s, 20)])),
+                Bytes::from(segment("cpu_cycles", &[], &[(3 * s, 35), (4 * s, 50)])),
+                Bytes::from(segment("cpu_cycles", &[], &[(5 * s, 70), (6 * s, 80)])),
+            ],
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(
+            Arc::clone(&store) as Arc<dyn SegmentStore>,
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let batch = r
+            .query_range("sum(rate(cpu_cycles[1s]))", 1.0, 6.0, 1.0)
+            .unwrap();
+        assert!(pool.stats().misses > 0, "the per-series path ran");
+        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
+        let streams = r
+            .query_range_opts("sum(rate(cpu_cycles[1s]))", 1.0, 6.0, 1.0, &per_series)
+            .unwrap();
+        assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
     }
 }
