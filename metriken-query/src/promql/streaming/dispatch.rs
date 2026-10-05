@@ -257,8 +257,9 @@ thread_local! {
 }
 
 /// A display query computed by the source as it reads, holding one bucket
-/// per series: `expr` must be `rate`/`irate` of a selector, optionally under
-/// scalar ops against number literals. `None` for any other expression or
+/// per series: `expr` must be `rate`/`irate` of a selector, or `sum`, `avg`,
+/// `min`, `max` or `count` of one, optionally under scalar ops against
+/// number literals. `None` for any other expression or
 /// where the batch path does not apply; the caller then evaluates it in
 /// full and reduces the result.
 fn batch_display(
@@ -291,18 +292,49 @@ fn batch_display(
                     _ => return Ok(None),
                 }
             }
-            Expr::Call(call) => break call,
+            Expr::Call(call) => break (call, None),
+            Expr::Aggregate(agg) => {
+                let op = match agg.op.to_string().as_str() {
+                    "sum" => AggOp::Sum,
+                    "avg" => AggOp::Avg,
+                    "min" => AggOp::Min,
+                    "max" => AggOp::Max,
+                    "count" => AggOp::Count,
+                    _ => return Ok(None),
+                };
+                let group_by: GroupBy<'_> = match &agg.modifier {
+                    None => GroupBy::Include(&[]),
+                    Some(parser::LabelModifier::Include(ls)) => {
+                        GroupBy::Include(ls.labels.as_slice())
+                    }
+                    Some(parser::LabelModifier::Exclude(ls)) => {
+                        GroupBy::Exclude(ls.labels.as_slice())
+                    }
+                };
+                let mut inner: &Expr = &agg.expr;
+                while let Expr::Paren(p) = inner {
+                    inner = &p.expr;
+                }
+                let Expr::Call(call) = inner else {
+                    return Ok(None);
+                };
+                break (call, Some((op, group_by)));
+            }
             _ => return Ok(None),
         }
     };
+    let (call, group) = call;
     ops.reverse();
     let scaled = !ops.is_empty();
+    // As the per-series path names the result: `rate` keeps the metric's
+    // name, an aggregation or a scalar op drops it.
+    let named = !scaled && group.is_none();
     let grid_display = crate::batch_rate::GridDisplay {
         width: crate::display::bucket_width(start, end, step, display.budget),
         band: display.band,
         ops,
     };
-    let Some((name, filter, request)) = grid_request(ctx, call, None, Some(&grid_display)) else {
+    let Some((name, filter, request)) = grid_request(ctx, call, group, Some(&grid_display)) else {
         return Ok(None);
     };
     let Some(crate::batch_rate::GridRates::Display(results)) =
@@ -310,15 +342,13 @@ fn batch_display(
     else {
         return Ok(None);
     };
-    // As the per-series path names them: `rate` keeps the metric's name,
-    // and a scalar op drops it.
     let series: Vec<crate::DisplaySeries> = results
         .into_iter()
         .filter(|(_, r)| !r.is_empty())
         .map(|(labels, r)| {
             let mut metric: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
-            if !scaled {
+            if named {
                 metric.insert("__name__".to_string(), name.to_string());
             }
             for (k, v) in labels.inner {

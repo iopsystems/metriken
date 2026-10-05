@@ -1133,7 +1133,8 @@ impl SegmentedSource {
         request: &crate::batch_rate::GridRateRequest<'_>,
     ) -> Option<crate::batch_rate::GridRates> {
         use crate::batch_rate::{
-            DisplaySink, Grid, GridRates, Grouped, PerSeries, Sample, SeriesRate, Sink,
+            Compact, DisplaySink, Grid, GridRates, Grouped, PerSeries, Sample, SeriesRate, Sink,
+            Slot,
         };
         if !self
             .relabel
@@ -1257,8 +1258,9 @@ impl SegmentedSource {
         }
         enum PartSink<'d> {
             Series(PerSeries),
-            Groups(Grouped),
+            Groups(Grouped<Slot>),
             Display(DisplaySink<'d>),
+            GroupsDisplay(Grouped<Compact>),
         }
         impl PartSink<'_> {
             fn sink(&mut self) -> &mut dyn Sink {
@@ -1266,18 +1268,27 @@ impl SegmentedSource {
                     PartSink::Series(s) => s,
                     PartSink::Groups(g) => g,
                     PartSink::Display(d) => d,
+                    PartSink::GroupsDisplay(g) => g,
                 }
             }
         }
         let mut sinks: Vec<PartSink> = members
             .iter()
             .map(|m| match &groups {
-                Some((op, (glabels, group_of))) => PartSink::Groups(Grouped::new(
-                    *op,
-                    glabels.clone(),
-                    m.iter().map(|s| group_of[*s]).collect(),
-                    &grid,
-                )),
+                Some((op, (glabels, group_of))) => {
+                    let group_of: Vec<usize> = m.iter().map(|s| group_of[*s]).collect();
+                    match request.display {
+                        Some(_) => PartSink::GroupsDisplay(Grouped::new(
+                            *op,
+                            glabels.clone(),
+                            group_of,
+                            &grid,
+                        )),
+                        None => {
+                            PartSink::Groups(Grouped::new(*op, glabels.clone(), group_of, &grid))
+                        }
+                    }
+                }
                 None => match request.display {
                     Some(display) => PartSink::Display(DisplaySink {
                         reducers: (0..m.len())
@@ -1479,6 +1490,17 @@ impl SegmentedSource {
                 .collect()
         }
         Some(match groups {
+            Some(_) if request.display.is_some() => {
+                let mut sinks = sinks.into_iter().map(|s| match s {
+                    PartSink::GroupsDisplay(g) => g,
+                    _ => unreachable!("grouped display sinks"),
+                });
+                let mut all = sinks.next()?;
+                for g in sinks {
+                    all.merge(g);
+                }
+                GridRates::Display(all.finish_display(&grid, request.display?))
+            }
             Some(_) => {
                 let mut sinks = sinks.into_iter().map(|s| match s {
                     PartSink::Groups(g) => g,
@@ -5434,15 +5456,21 @@ mod tests {
         // Whether the source computes the display query as it reads.
         for (r, q, as_read) in [
             (&r, "rate(cpu_cycles[1s])", true),
-            (&r, "sum(irate(cpu_cycles[1s]))", false),
+            (&r, "sum(irate(cpu_cycles[1s]))", true),
             (&windowed, "rate(cpu_cycles[1s])", true),
             (&windowed, "irate(cpu_cycles[1s]) / 1000", true),
             (&windowed, "2 * (rate(cpu_cycles[1s]) - 3)", true),
             (&windowed, "1 / rate(cpu_cycles[1s])", true),
-            (&windowed, "sum(irate(cpu_cycles[1s])) * 2", false),
-            (&r, "sum by (id) (rate(cpu_cycles[2s]))", false),
+            (&windowed, "sum(irate(cpu_cycles[1s])) * 2", true),
+            (&r, "sum by (id) (rate(cpu_cycles[2s]))", true),
             (&r, "irate(cpu_cycles[1s]) - 40", true),
             (&r, "irate(cpu_cycles[1s]) * 2", true),
+            (&windowed, "avg(irate(cpu_cycles[1s]))", true),
+            (&r, "min(irate(cpu_cycles[1s]))", true),
+            (&r, "max by (id) (irate(cpu_cycles[1s]))", true),
+            (&r, "count(irate(cpu_cycles[1s]))", true),
+            (&r, "sum without (id) (irate(cpu_cycles[1s])) / 1000", true),
+            (&r, "sum(irate(cpu_cycles[1s]) * 2)", false),
         ] {
             for budget in [0, 5] {
                 let display = DisplayOptions {
