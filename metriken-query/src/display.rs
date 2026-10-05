@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::promql::{HistogramHeatmapResult, Sample};
+use crate::QueryResult;
 
 /// One decimated point: a boxplot over the samples in a time-bucket.
 ///
@@ -737,5 +738,65 @@ mod tests {
             !s_without.contains("unc"),
             "absent band omitted: {s_without}"
         );
+    }
+}
+
+/// One series reduced to `opts`'s budget. `bands` and `interpolated`, when
+/// present, are parallel to `values`.
+pub(crate) fn display_series(
+    metric: HashMap<String, String>,
+    values: &[(f64, f64)],
+    bands: Option<&[Option<(f64, f64)>]>,
+    interpolated: Option<&[bool]>,
+    step_s: f64,
+    opts: &DisplayOptions,
+) -> DisplaySeries {
+    let raw_points = values.len() as u64;
+    let points = opts
+        .reducer
+        .reduce(values, bands, interpolated, opts.budget, opts.band);
+    DisplaySeries {
+        decimated: (points.len() as u64) < raw_points,
+        metric,
+        points,
+        native_interval: step_s,
+        raw_points,
+        reducer: opts.reducer,
+        band: opts.band,
+    }
+}
+
+/// `result` in display form: each matrix series reduced with
+/// [`display_series`], other results passed through.
+pub(crate) fn display_from_result(
+    result: QueryResult,
+    step_s: f64,
+    opts: &DisplayOptions,
+) -> DisplayResult {
+    match result {
+        // `bands`, not `intervals`: the legacy field is all-or-nothing and
+        // goes absent for the whole series as soon as one point lacks a
+        // band, which is exactly what a hole causes; display mode would then
+        // show no uncertainty at all for a series that has it almost
+        // everywhere.
+        QueryResult::Matrix { result } => DisplayResult::Series {
+            result: result
+                .into_iter()
+                .map(|s| {
+                    display_series(
+                        s.metric,
+                        &s.values,
+                        s.bands.as_deref(),
+                        s.interpolated.as_deref(),
+                        step_s,
+                        opts,
+                    )
+                })
+                .collect(),
+            budget: opts.budget as u32,
+        },
+        QueryResult::HistogramHeatmap { result } => DisplayResult::HistogramHeatmap { result },
+        QueryResult::Scalar { result } => DisplayResult::Scalar { result },
+        QueryResult::Vector { result } => DisplayResult::Vector { result },
     }
 }

@@ -46,29 +46,7 @@ pub fn try_streaming(
     step: f64,
     opts: &QueryOptions,
 ) -> Result<QueryResult, QueryError> {
-    let rate_mode = opts.rate_mode;
-    let step_ns = (step * 1e9) as u64;
-    let raw_start_ns = crate::promql::range_start_ns(start);
-    // Grid mode fixes the evaluation-grid phase to the step boundary so two
-    // recordings on the same step share a grid (A/B alignment) and gauge/rate
-    // labels land on round step multiples. Raw keeps the caller's start. Snap
-    // once here so every downstream producer inherits the fixed phase.
-    let start_ns = match rate_mode {
-        RateMode::Grid if step_ns > 0 => (raw_start_ns / step_ns) * step_ns,
-        _ => raw_start_ns,
-    };
-    let ctx = Ctx {
-        source,
-        start_ns,
-        end_ns: crate::promql::range_end_ns(end),
-        step_ns,
-        interval_ns: (source.interval() * 1e9) as u64,
-        rate_mode,
-        rate_span_ns: opts.rate_span_ns,
-        eval_timestamps: opts.eval_timestamps.clone(),
-        per_series_rates: opts.per_series_rates,
-    };
-
+    let ctx = make_ctx(source, start, end, step, opts);
     let result = match build(&ctx, expr)? {
         Built::Series {
             series,
@@ -90,6 +68,78 @@ pub fn try_streaming(
             QueryResult::Matrix { result }
         }
         Built::Scalar(v) => QueryResult::Scalar { result: (start, v) },
+    };
+    Ok(result)
+}
+
+/// The evaluation context for `[start, end]` at `step`.
+fn make_ctx<'a>(
+    source: &'a dyn DataSource,
+    start: f64,
+    end: f64,
+    step: f64,
+    opts: &QueryOptions,
+) -> Ctx<'a> {
+    let rate_mode = opts.rate_mode;
+    let step_ns = (step * 1e9) as u64;
+    let raw_start_ns = crate::promql::range_start_ns(start);
+    // Grid mode fixes the evaluation-grid phase to the step boundary so two
+    // recordings on the same step share a grid (A/B alignment) and gauge/rate
+    // labels land on round step multiples. Raw keeps the caller's start. Snap
+    // once here so every downstream producer inherits the fixed phase.
+    let start_ns = match rate_mode {
+        RateMode::Grid if step_ns > 0 => (raw_start_ns / step_ns) * step_ns,
+        _ => raw_start_ns,
+    };
+    Ctx {
+        source,
+        start_ns,
+        end_ns: crate::promql::range_end_ns(end),
+        step_ns,
+        interval_ns: (source.interval() * 1e9) as u64,
+        rate_mode,
+        rate_span_ns: opts.rate_span_ns,
+        eval_timestamps: opts.eval_timestamps.clone(),
+        per_series_rates: opts.per_series_rates,
+    }
+}
+
+/// [`try_streaming`] in display form: each series is reduced per `display`
+/// as it is collected (see `collect_to_display`).
+pub(crate) fn try_streaming_display(
+    source: &dyn DataSource,
+    expr: &Expr,
+    start: f64,
+    end: f64,
+    step: f64,
+    opts: &QueryOptions,
+    display: &crate::DisplayOptions,
+) -> Result<crate::DisplayResult, QueryError> {
+    let ctx = make_ctx(source, start, end, step, opts);
+    let result = match build(&ctx, expr)? {
+        Built::Series {
+            series,
+            metric_name,
+            metric_name_for_error,
+        } => {
+            let collected = super::collect_to_display(series, metric_name, step, display);
+            if collected.is_empty() {
+                if let Some(name) = metric_name_for_error {
+                    held_somewhere(source, &name)?;
+                }
+            }
+            crate::DisplayResult::Series {
+                result: collected,
+                budget: display.budget as u32,
+            }
+        }
+        Built::Materialized { result, name } => {
+            if result.is_empty() {
+                held_somewhere(source, &name)?;
+            }
+            crate::display::display_from_result(QueryResult::Matrix { result }, step, display)
+        }
+        Built::Scalar(v) => crate::DisplayResult::Scalar { result: (start, v) },
     };
     Ok(result)
 }

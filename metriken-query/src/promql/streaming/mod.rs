@@ -154,6 +154,51 @@ pub type SeriesSet<'a> = Vec<LabeledSeries<'a>>;
 /// [`crate::batch_rate`].
 pub(crate) type LabeledPoints = (crate::labels::Labels, Vec<Point>);
 
+/// Boundary collector for display mode: each series is collected, reduced
+/// with [`crate::display::display_series`] and dropped before the next, so
+/// the full-resolution matrix is never built. Gives what
+/// [`collect_to_matrix`] followed by that reduction gives.
+pub(crate) fn collect_to_display(
+    streaming: SeriesSet<'_>,
+    metric_name: Option<&str>,
+    step_s: f64,
+    opts: &crate::DisplayOptions,
+) -> Vec<crate::DisplaySeries> {
+    streaming
+        .into_iter()
+        .filter_map(|ls| {
+            let mut values: Vec<(f64, f64)> = Vec::new();
+            let mut bands: Vec<Option<(f64, f64)>> = Vec::new();
+            let mut interpolated: Vec<bool> = Vec::new();
+            for p in ls.iter {
+                values.push((p.t as f64 / 1e9, p.v));
+                bands.push(p.bounds);
+                interpolated.push(p.interpolated);
+            }
+            if values.is_empty() {
+                return None;
+            }
+            let any_band = bands.iter().any(Option::is_some);
+            let any_interpolated = interpolated.iter().any(|i| *i);
+            let mut metric: HashMap<String, String> = HashMap::new();
+            if let Some(name) = metric_name {
+                metric.insert("__name__".to_string(), name.to_string());
+            }
+            for (k, v) in ls.labels.inner.iter() {
+                metric.insert(k.clone(), v.clone());
+            }
+            Some(crate::display::display_series(
+                metric,
+                &values,
+                any_band.then_some(&bands[..]),
+                any_interpolated.then_some(&interpolated[..]),
+                step_s,
+                opts,
+            ))
+        })
+        .collect()
+}
+
 /// Boundary collector: drain a streaming result into the same
 /// `MatrixSample` shape the eager engine returns.
 pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) -> Vec<MatrixSample> {

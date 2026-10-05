@@ -411,6 +411,19 @@ impl MetricsSource for UnionMetricsSource {
             .query_range_opts(expr, start_s, end_s, step_s, opts)
     }
 
+    fn query_range_display_opts(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &crate::DisplayOptions,
+        qopts: &QueryOptions,
+    ) -> Result<crate::DisplayResult, QueryError> {
+        self.engine
+            .query_range_display_opts(expr, start_s, end_s, step_s, opts, qopts)
+    }
+
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
         self.engine.query(expr, time)
     }

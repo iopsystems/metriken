@@ -839,6 +839,37 @@ impl QueryEngine {
         self.evaluate_range(query_str, start, end, step, opts)
     }
 
+    /// [`query_range_opts`](Self::query_range_opts) in display form; see
+    /// [`crate::MetricsSource::query_range_display_opts`]. A series from the
+    /// streaming engine is reduced as it is collected.
+    pub(crate) fn query_range_display_opts(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+        step: f64,
+        display: &crate::DisplayOptions,
+        opts: &QueryOptions,
+    ) -> Result<crate::DisplayResult, QueryError> {
+        self.evaluate_range_as(
+            query_str,
+            start,
+            end,
+            |r| crate::display::display_from_result(r, step, display),
+            |expr| {
+                streaming::dispatch::try_streaming_display(
+                    &*self.source,
+                    expr,
+                    start,
+                    end,
+                    step,
+                    opts,
+                    display,
+                )
+            },
+        )
+    }
+
     fn evaluate_range(
         &self,
         query_str: &str,
@@ -847,15 +878,38 @@ impl QueryEngine {
         step: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
+        self.evaluate_range_as(
+            query_str,
+            start,
+            end,
+            |r| r,
+            |expr| self.evaluate_expr(expr, start, end, step, opts),
+        )
+    }
+
+    /// Evaluate `query_str`, converting the result of a histogram function
+    /// with `from_result` and evaluating any other expression with `expr`.
+    fn evaluate_range_as<T>(
+        &self,
+        query_str: &str,
+        start: f64,
+        end: f64,
+        from_result: impl Fn(QueryResult) -> T,
+        expr: impl FnOnce(&Expr) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
         if (query_str.starts_with("histogram_quantiles(")
             || query_str.starts_with("histogram_percentiles("))
             && query_str.ends_with(")")
         {
-            return self.handle_histogram_quantiles(query_str, start, end);
+            return self
+                .handle_histogram_quantiles(query_str, start, end)
+                .map(from_result);
         }
 
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
-            return self.handle_histogram_heatmap(query_str, start, end);
+            return self
+                .handle_histogram_heatmap(query_str, start, end)
+                .map(from_result);
         }
 
         let rewritten = unwrap_sum_around_histogram(query_str);
@@ -863,15 +917,19 @@ impl QueryEngine {
 
         for func in ["histogram_mean", "histogram_count", "histogram_sum"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
-                return self.handle_histogram_scalar(func, inner, group_by, start, end);
+                return self
+                    .handle_histogram_scalar(func, inner, group_by, start, end)
+                    .map(from_result);
             }
         }
         if let Some((inner, group_by)) = parse_histogram_call("histogram_irate", query_str)? {
-            return self.handle_histogram_irate(inner, group_by, start, end);
+            return self
+                .handle_histogram_irate(inner, group_by, start, end)
+                .map(from_result);
         }
 
         match parser::parse(query_str) {
-            Ok(expr) => self.evaluate_expr(&expr, start, end, step, opts),
+            Ok(parsed) => expr(&parsed),
             Err(err) => {
                 let error_msg = format!("{:?}", err);
                 if error_msg.contains("invalid promql query") && query_str.contains(" by ") {

@@ -452,47 +452,8 @@ pub trait MetricsSource: Send + Sync {
         opts: &DisplayOptions,
         qopts: &QueryOptions,
     ) -> Result<DisplayResult, QueryError> {
-        match self.query_range_opts(expr, start_s, end_s, step_s, qopts)? {
-            QueryResult::Matrix { result } => {
-                let series = result
-                    .into_iter()
-                    .map(|s| {
-                        let raw_points = s.values.len() as u64;
-                        // `bands`, not `intervals`: the legacy field is
-                        // all-or-nothing and goes absent for the whole series
-                        // as soon as one point lacks a band, which is exactly
-                        // what a hole causes — display mode would then show no
-                        // uncertainty at all for a series that has it almost
-                        // everywhere.
-                        let points = opts.reducer.reduce(
-                            &s.values,
-                            s.bands.as_deref(),
-                            s.interpolated.as_deref(),
-                            opts.budget,
-                            opts.band,
-                        );
-                        DisplaySeries {
-                            decimated: (points.len() as u64) < raw_points,
-                            metric: s.metric,
-                            points,
-                            native_interval: step_s,
-                            raw_points,
-                            reducer: opts.reducer,
-                            band: opts.band,
-                        }
-                    })
-                    .collect();
-                Ok(DisplayResult::Series {
-                    result: series,
-                    budget: opts.budget as u32,
-                })
-            }
-            QueryResult::HistogramHeatmap { result } => {
-                Ok(DisplayResult::HistogramHeatmap { result })
-            }
-            QueryResult::Scalar { result } => Ok(DisplayResult::Scalar { result }),
-            QueryResult::Vector { result } => Ok(DisplayResult::Vector { result }),
-        }
+        let result = self.query_range_opts(expr, start_s, end_s, step_s, qopts)?;
+        Ok(display::display_from_result(result, step_s, opts))
     }
 
     /// Execute an instant PromQL query at a single timestamp (uses the latest
