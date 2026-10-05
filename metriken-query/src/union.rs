@@ -163,6 +163,16 @@ impl DataSource for UnionSource {
         self.children[i].counter_streams(name, filter, start_ns, end_ns)
     }
 
+    fn counter_grid_rates(
+        &self,
+        name: &str,
+        filter: &Labels,
+        request: &crate::batch_rate::GridRateRequest<'_>,
+    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
+        let i = *self.counter_index.get(name)?;
+        self.children[i].counter_grid_rates(name, filter, request)
+    }
+
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let i = *self.gauge_index.get(name)?;
         self.children[i].gauges(name, filter, start_ns, end_ns)
