@@ -855,7 +855,7 @@ impl QueryEngine {
             query_str,
             start,
             end,
-            |r| crate::display::display_from_result(r, step, display),
+            |r| crate::display::display_from_result(r, start, end, step, display),
             |expr| {
                 streaming::dispatch::try_streaming_display(
                     &*self.source,

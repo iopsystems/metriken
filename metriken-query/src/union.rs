@@ -168,7 +168,7 @@ impl DataSource for UnionSource {
         name: &str,
         filter: &Labels,
         request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
+    ) -> Option<crate::batch_rate::GridRates> {
         let i = *self.counter_index.get(name)?;
         self.children[i].counter_grid_rates(name, filter, request)
     }

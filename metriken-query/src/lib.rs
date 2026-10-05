@@ -279,7 +279,7 @@ pub(crate) trait DataSource: Send + Sync {
         name: &str,
         filter: &Labels,
         request: &batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<promql::streaming::LabeledPoints>> {
+    ) -> Option<batch_rate::GridRates> {
         let _ = (name, filter, request);
         None
     }
@@ -453,7 +453,9 @@ pub trait MetricsSource: Send + Sync {
         qopts: &QueryOptions,
     ) -> Result<DisplayResult, QueryError> {
         let result = self.query_range_opts(expr, start_s, end_s, step_s, qopts)?;
-        Ok(display::display_from_result(result, step_s, opts))
+        Ok(display::display_from_result(
+            result, start_s, end_s, step_s, opts,
+        ))
     }
 
     /// Execute an instant PromQL query at a single timestamp (uses the latest

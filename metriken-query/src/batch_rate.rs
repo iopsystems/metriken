@@ -14,9 +14,11 @@
 
 use std::collections::VecDeque;
 
+use crate::display::BucketReducer;
 use crate::labels::Labels;
 use crate::promql::streaming::{
-    derive_group_labels, AggOp, GroupBy, Point, RateEdges, SPACING_PROBE,
+    derive_group_labels, scalar_point, AggOp, BinOp, GroupBy, LabeledPoints, Point, RateEdges,
+    SPACING_PROBE,
 };
 
 /// What the dispatcher asks a source for.
@@ -33,6 +35,27 @@ pub(crate) struct GridRateRequest<'a> {
     pub span_ns: u64,
     /// Aggregate the series, or `None` for one result per series.
     pub group: Option<(AggOp, GroupBy<'a>)>,
+    /// Reduce each series for display as its points are computed, or
+    /// `None` for the points.
+    pub display: Option<&'a GridDisplay>,
+}
+
+/// A display reduction applied while rates are computed.
+pub(crate) struct GridDisplay {
+    /// See [`BucketReducer::new`].
+    pub width: Option<f64>,
+    pub band: [f64; 2],
+    /// Scalar ops applied to each point before it is reduced, innermost
+    /// first: `(op, scalar, scalar_first)` as `scalar_point` takes them.
+    pub ops: Vec<(BinOp, f64, bool)>,
+}
+
+/// What a source computes for a [`GridRateRequest`].
+pub(crate) enum GridRates {
+    /// Each series' or group's points.
+    Points(Vec<LabeledPoints>),
+    /// Each series reduced for display, for a request with `display`.
+    Display(Vec<(Labels, BucketReducer)>),
 }
 
 #[derive(Clone, Copy)]
@@ -362,6 +385,24 @@ pub(crate) struct PerSeries {
 impl Sink for PerSeries {
     fn emit(&mut self, series: usize, _index: usize, point: Point) {
         self.points[series].push(point);
+    }
+}
+
+/// One reducer per series, fed each point after the request's scalar ops.
+pub(crate) struct DisplaySink<'d> {
+    pub reducers: Vec<BucketReducer>,
+    pub display: &'d GridDisplay,
+}
+
+impl Sink for DisplaySink<'_> {
+    fn emit(&mut self, series: usize, _index: usize, point: Point) {
+        let mut point = Some(point);
+        for (op, scalar, scalar_first) in &self.display.ops {
+            point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
+        }
+        if let Some(p) = point {
+            self.reducers[series].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
+        }
     }
 }
 

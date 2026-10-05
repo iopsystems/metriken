@@ -384,6 +384,166 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     }
 }
 
+/// The bucket width, in seconds, of a display query over `[start_s,
+/// end_s]` at `step_s` with `budget` points per series; `None` when the
+/// range's grid fits the budget and each point is its own bucket. Every
+/// series of the query shares it, so buckets line up across series.
+pub(crate) fn bucket_width(start_s: f64, end_s: f64, step_s: f64, budget: usize) -> Option<f64> {
+    if budget == 0 || step_s <= 0.0 {
+        return None;
+    }
+    let span = (end_s - start_s).max(0.0);
+    // The grid holds `floor(span / step) + 1` points.
+    if ((span / step_s).floor() as usize) < budget {
+        return None;
+    }
+    Some(nice_bucket_secs(span / budget as f64))
+}
+
+/// A series reduced point by point, in time order, into buckets of a fixed
+/// width: [`reduce_boxplot`]'s per-bucket summary, with only the open
+/// bucket's points held.
+pub(crate) struct BucketReducer {
+    width: Option<f64>,
+    band: [f64; 2],
+    bucket: i64,
+    values: Vec<(f64, f64)>,
+    bands: Vec<Option<(f64, f64)>>,
+    interpolated: Vec<bool>,
+    out: Vec<EnvPoint>,
+    raw_points: u64,
+}
+
+impl BucketReducer {
+    /// Buckets of `width` seconds, aligned to multiples of it; `None` for
+    /// one bucket per point.
+    pub fn new(width: Option<f64>, band: [f64; 2]) -> Self {
+        Self {
+            width,
+            band,
+            bucket: 0,
+            values: Vec::new(),
+            bands: Vec::new(),
+            interpolated: Vec::new(),
+            out: Vec::new(),
+            raw_points: 0,
+        }
+    }
+
+    /// Add the point at `t` seconds. Points arrive in increasing time.
+    pub fn push(&mut self, t: f64, v: f64, band: Option<(f64, f64)>, interpolated: bool) {
+        self.raw_points += 1;
+        let Some(width) = self.width else {
+            self.out.push(EnvPoint {
+                t,
+                min: v,
+                lo: v,
+                median: v,
+                hi: v,
+                max: v,
+                unc_lo: band.map(|(lo, _)| lo),
+                unc_hi: band.map(|(_, hi)| hi),
+                interpolated,
+            });
+            return;
+        };
+        let bucket = (t / width).floor() as i64;
+        if !self.values.is_empty() && bucket != self.bucket {
+            self.close(width);
+        }
+        self.bucket = bucket;
+        self.values.push((t, v));
+        self.bands.push(band);
+        self.interpolated.push(interpolated);
+    }
+
+    fn close(&mut self, width: f64) {
+        let bands = self
+            .bands
+            .iter()
+            .any(Option::is_some)
+            .then_some(&self.bands[..]);
+        let interpolated = self
+            .interpolated
+            .iter()
+            .any(|i| *i)
+            .then_some(&self.interpolated[..]);
+        let mut ep = boxplot_of(&self.values, bands, interpolated, self.band);
+        ep.t = self.bucket as f64 * width;
+        self.out.push(ep);
+        self.values.clear();
+        self.bands.clear();
+        self.interpolated.clear();
+    }
+
+    /// Whether no point has been added.
+    pub fn is_empty(&self) -> bool {
+        self.raw_points == 0
+    }
+
+    /// The series, with `metric`'s labels.
+    pub fn finish(
+        mut self,
+        metric: HashMap<String, String>,
+        step_s: f64,
+        opts: &DisplayOptions,
+    ) -> DisplaySeries {
+        if let (Some(width), false) = (self.width, self.values.is_empty()) {
+            self.close(width);
+        }
+        DisplaySeries {
+            decimated: (self.out.len() as u64) < self.raw_points,
+            metric,
+            points: self.out,
+            native_interval: step_s,
+            raw_points: self.raw_points,
+            reducer: opts.reducer,
+            band: opts.band,
+        }
+    }
+}
+
+/// `result`, a query over `[start_s, end_s]` at `step_s`, in display form:
+/// each matrix series reduced with a [`BucketReducer`], other results
+/// passed through.
+pub(crate) fn display_from_result(
+    result: QueryResult,
+    start_s: f64,
+    end_s: f64,
+    step_s: f64,
+    opts: &DisplayOptions,
+) -> DisplayResult {
+    let width = bucket_width(start_s, end_s, step_s, opts.budget);
+    match result {
+        // `bands`, not `intervals`: the legacy field is all-or-nothing and
+        // goes absent for the whole series as soon as one point lacks a
+        // band, which is exactly what a hole causes; display mode would then
+        // show no uncertainty at all for a series that has it almost
+        // everywhere.
+        QueryResult::Matrix { result } => DisplayResult::Series {
+            result: result
+                .into_iter()
+                .map(|s| {
+                    let mut r = BucketReducer::new(width, opts.band);
+                    for (i, (t, v)) in s.values.iter().enumerate() {
+                        r.push(
+                            *t,
+                            *v,
+                            s.bands.as_ref().and_then(|b| b[i]),
+                            s.interpolated.as_ref().is_some_and(|f| f[i]),
+                        );
+                    }
+                    r.finish(s.metric, step_s, opts)
+                })
+                .collect(),
+            budget: opts.budget as u32,
+        },
+        QueryResult::HistogramHeatmap { result } => DisplayResult::HistogramHeatmap { result },
+        QueryResult::Scalar { result } => DisplayResult::Scalar { result },
+        QueryResult::Vector { result } => DisplayResult::Vector { result },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,64 +899,68 @@ mod tests {
             "absent band omitted: {s_without}"
         );
     }
-}
-
-/// One series reduced to `opts`'s budget. `bands` and `interpolated`, when
-/// present, are parallel to `values`.
-pub(crate) fn display_series(
-    metric: HashMap<String, String>,
-    values: &[(f64, f64)],
-    bands: Option<&[Option<(f64, f64)>]>,
-    interpolated: Option<&[bool]>,
-    step_s: f64,
-    opts: &DisplayOptions,
-) -> DisplaySeries {
-    let raw_points = values.len() as u64;
-    let points = opts
-        .reducer
-        .reduce(values, bands, interpolated, opts.budget, opts.band);
-    DisplaySeries {
-        decimated: (points.len() as u64) < raw_points,
-        metric,
-        points,
-        native_interval: step_s,
-        raw_points,
-        reducer: opts.reducer,
-        band: opts.band,
+    fn reduced(
+        points: &[(f64, f64)],
+        bands: Option<&[Option<(f64, f64)>]>,
+        interpolated: Option<&[bool]>,
+        width: Option<f64>,
+    ) -> Vec<EnvPoint> {
+        let mut r = BucketReducer::new(width, IQR);
+        for (i, (t, v)) in points.iter().enumerate() {
+            r.push(
+                *t,
+                *v,
+                bands.and_then(|b| b[i]),
+                interpolated.is_some_and(|f| f[i]),
+            );
+        }
+        r.finish(HashMap::new(), 1.0, &DisplayOptions::default())
+            .points
     }
-}
 
-/// `result` in display form: each matrix series reduced with
-/// [`display_series`], other results passed through.
-pub(crate) fn display_from_result(
-    result: QueryResult,
-    step_s: f64,
-    opts: &DisplayOptions,
-) -> DisplayResult {
-    match result {
-        // `bands`, not `intervals`: the legacy field is all-or-nothing and
-        // goes absent for the whole series as soon as one point lacks a
-        // band, which is exactly what a hole causes; display mode would then
-        // show no uncertainty at all for a series that has it almost
-        // everywhere.
-        QueryResult::Matrix { result } => DisplayResult::Series {
-            result: result
-                .into_iter()
-                .map(|s| {
-                    display_series(
-                        s.metric,
-                        &s.values,
-                        s.bands.as_deref(),
-                        s.interpolated.as_deref(),
-                        step_s,
-                        opts,
-                    )
-                })
-                .collect(),
-            budget: opts.budget as u32,
-        },
-        QueryResult::HistogramHeatmap { result } => DisplayResult::HistogramHeatmap { result },
-        QueryResult::Scalar { result } => DisplayResult::Scalar { result },
-        QueryResult::Vector { result } => DisplayResult::Vector { result },
+    /// For a series over the whole range, the streaming reducer gives what
+    /// `reduce_boxplot` gives, bands, holes and interpolated points included.
+    #[test]
+    fn the_streaming_reducer_matches_reduce_boxplot_over_the_whole_range() {
+        let points: Vec<(f64, f64)> = (0..3600u64)
+            .filter(|t| !(1000..1100).contains(t))
+            .map(|t| (t as f64, ((t * 7919) % 101) as f64))
+            .collect();
+        let bands: Vec<Option<(f64, f64)>> = points
+            .iter()
+            .map(|(t, v)| (!(*t as u64).is_multiple_of(13)).then_some((v - 1.0, v + 2.0)))
+            .collect();
+        let interpolated: Vec<bool> = points
+            .iter()
+            .map(|(t, _)| (*t as u64).is_multiple_of(17))
+            .collect();
+        for budget in [0, 50, 500, 3600, 5000] {
+            let width = bucket_width(0.0, 3599.0, 1.0, budget);
+            for (b, f) in [
+                (None, None),
+                (Some(&bands[..]), None),
+                (Some(&bands[..]), Some(&interpolated[..])),
+            ] {
+                assert_eq!(
+                    reduced(&points, b, f, width),
+                    reduce_boxplot(&points, b, f, budget, IQR),
+                    "budget {budget}"
+                );
+            }
+        }
+    }
+
+    /// A series over part of the range takes the range's buckets, as every
+    /// other series of the query does.
+    #[test]
+    fn a_short_series_takes_the_ranges_buckets() {
+        let width = bucket_width(0.0, 3599.0, 1.0, 60);
+        assert_eq!(width, Some(60.0));
+        let points: Vec<(f64, f64)> = (600..720u64).map(|t| (t as f64, 1.0)).collect();
+        let out = reduced(&points, None, None, width);
+        assert_eq!(
+            out.iter().map(|p| p.t).collect::<Vec<_>>(),
+            vec![600.0, 660.0]
+        );
     }
 }

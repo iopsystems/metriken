@@ -116,13 +116,17 @@ pub(crate) fn try_streaming_display(
     display: &crate::DisplayOptions,
 ) -> Result<crate::DisplayResult, QueryError> {
     let ctx = make_ctx(source, start, end, step, opts);
+    if let Some(result) = batch_display(&ctx, expr, start, end, step, display)? {
+        return Ok(result);
+    }
     let result = match build(&ctx, expr)? {
         Built::Series {
             series,
             metric_name,
             metric_name_for_error,
         } => {
-            let collected = super::collect_to_display(series, metric_name, step, display);
+            let collected =
+                super::collect_to_display(series, metric_name, start, end, step, display);
             if collected.is_empty() {
                 if let Some(name) = metric_name_for_error {
                     held_somewhere(source, &name)?;
@@ -137,7 +141,13 @@ pub(crate) fn try_streaming_display(
             if result.is_empty() {
                 held_somewhere(source, &name)?;
             }
-            crate::display::display_from_result(QueryResult::Matrix { result }, step, display)
+            crate::display::display_from_result(
+                QueryResult::Matrix { result },
+                start,
+                end,
+                step,
+                display,
+            )
         }
         Built::Scalar(v) => crate::DisplayResult::Scalar { result: (start, v) },
     };
@@ -184,6 +194,31 @@ fn batch_rates<'a>(
     call: &parser::Call,
     group: Option<(AggOp, GroupBy<'_>)>,
 ) -> Option<(SeriesSet<'a>, String)> {
+    let (name, filter, request) = grid_request(ctx, call, group, None)?;
+    let crate::batch_rate::GridRates::Points(results) =
+        ctx.source.counter_grid_rates(name, &filter, &request)?
+    else {
+        return None;
+    };
+    let series = results
+        .into_iter()
+        .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
+        .collect();
+    Some((series, name.to_string()))
+}
+
+/// The metric, filter and request for a batch `rate`/`irate` of `call`, or
+/// `None` where the batch path does not apply; see [`batch_rates`].
+fn grid_request<'c, 'g>(
+    ctx: &Ctx<'_>,
+    call: &'c parser::Call,
+    group: Option<(AggOp, GroupBy<'g>)>,
+    display: Option<&'g crate::batch_rate::GridDisplay>,
+) -> Option<(
+    &'c str,
+    crate::labels::Labels,
+    crate::batch_rate::GridRateRequest<'g>,
+)> {
     if ctx.per_series_rates
         || ctx.eval_timestamps.is_some()
         || !matches!(ctx.rate_mode, RateMode::Grid)
@@ -210,13 +245,97 @@ fn batch_rates<'a>(
         step_ns: ctx.step_ns,
         span_ns: ctx.rate_span_ns.unwrap_or(ctx.step_ns),
         group,
+        display,
     };
-    let results = ctx.source.counter_grid_rates(name, &filter, &request)?;
-    let series = results
+    Some((name, filter, request))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Display queries [`batch_display`] answered on this thread.
+    pub(crate) static BATCH_DISPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A display query computed by the source as it reads, holding one bucket
+/// per series: `expr` must be `rate`/`irate` of a selector, optionally under
+/// scalar ops against number literals. `None` for any other expression or
+/// where the batch path does not apply; the caller then evaluates it in
+/// full and reduces the result.
+fn batch_display(
+    ctx: &Ctx<'_>,
+    expr: &Expr,
+    start: f64,
+    end: f64,
+    step: f64,
+    display: &crate::DisplayOptions,
+) -> Result<Option<crate::DisplayResult>, QueryError> {
+    let mut ops = Vec::new();
+    let mut e = expr;
+    let call = loop {
+        match e {
+            Expr::Paren(p) => e = &p.expr,
+            Expr::Binary(bin) if bin.modifier.is_none() => {
+                let Some(op) = BinOp::from_token(&bin.op) else {
+                    return Ok(None);
+                };
+                match (&*bin.lhs, &*bin.rhs) {
+                    (Expr::NumberLiteral(_), Expr::NumberLiteral(_)) => return Ok(None),
+                    (Expr::NumberLiteral(n), other) => {
+                        ops.push((op, n.val, true));
+                        e = other;
+                    }
+                    (other, Expr::NumberLiteral(n)) => {
+                        ops.push((op, n.val, false));
+                        e = other;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            Expr::Call(call) => break call,
+            _ => return Ok(None),
+        }
+    };
+    ops.reverse();
+    let scaled = !ops.is_empty();
+    let grid_display = crate::batch_rate::GridDisplay {
+        width: crate::display::bucket_width(start, end, step, display.budget),
+        band: display.band,
+        ops,
+    };
+    let Some((name, filter, request)) = grid_request(ctx, call, None, Some(&grid_display)) else {
+        return Ok(None);
+    };
+    let Some(crate::batch_rate::GridRates::Display(results)) =
+        ctx.source.counter_grid_rates(name, &filter, &request)
+    else {
+        return Ok(None);
+    };
+    // As the per-series path names them: `rate` keeps the metric's name,
+    // and a scalar op drops it.
+    let series: Vec<crate::DisplaySeries> = results
         .into_iter()
-        .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
+        .filter(|(_, r)| !r.is_empty())
+        .map(|(labels, r)| {
+            let mut metric: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            if !scaled {
+                metric.insert("__name__".to_string(), name.to_string());
+            }
+            for (k, v) in labels.inner {
+                metric.insert(k, v);
+            }
+            r.finish(metric, step, display)
+        })
         .collect();
-    Some((series, name.to_string()))
+    if series.is_empty() && !scaled {
+        held_somewhere(ctx.source, name)?;
+    }
+    #[cfg(test)]
+    BATCH_DISPLAYS.with(|n| n.set(n.get() + 1));
+    Ok(Some(crate::DisplayResult::Series {
+        result: series,
+        budget: display.budget as u32,
+    }))
 }
 
 /// `MetricNotFound` for a name the source holds as no kind at all. A

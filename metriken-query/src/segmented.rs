@@ -1131,8 +1131,10 @@ impl SegmentedSource {
         name: &str,
         filter: &Labels,
         request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
-        use crate::batch_rate::{Grid, Grouped, PerSeries, Sample, SeriesRate, Sink};
+    ) -> Option<crate::batch_rate::GridRates> {
+        use crate::batch_rate::{
+            DisplaySink, Grid, GridRates, Grouped, PerSeries, Sample, SeriesRate, Sink,
+        };
         if !self
             .relabel
             .as_deref()
@@ -1253,15 +1255,17 @@ impl SegmentedSource {
         for (s, rate) in rates.into_iter().enumerate() {
             part_rates[partition[s]].push(rate);
         }
-        enum PartSink {
+        enum PartSink<'d> {
             Series(PerSeries),
             Groups(Grouped),
+            Display(DisplaySink<'d>),
         }
-        impl PartSink {
+        impl PartSink<'_> {
             fn sink(&mut self) -> &mut dyn Sink {
                 match self {
                     PartSink::Series(s) => s,
                     PartSink::Groups(g) => g,
+                    PartSink::Display(d) => d,
                 }
             }
         }
@@ -1274,9 +1278,19 @@ impl SegmentedSource {
                     m.iter().map(|s| group_of[*s]).collect(),
                     &grid,
                 )),
-                None => PartSink::Series(PerSeries {
-                    points: vec![Vec::new(); m.len()],
-                }),
+                None => match request.display {
+                    Some(display) => PartSink::Display(DisplaySink {
+                        reducers: (0..m.len())
+                            .map(|_| {
+                                crate::display::BucketReducer::new(display.width, display.band)
+                            })
+                            .collect(),
+                        display,
+                    }),
+                    None => PartSink::Series(PerSeries {
+                        points: vec![Vec::new(); m.len()],
+                    }),
+                },
             })
             .collect();
 
@@ -1445,35 +1459,69 @@ impl SegmentedSource {
         };
         run_partitions(&mut part_rates, &mut sinks, &finish);
 
+        // Each series' result, in the order of `labels`, from the
+        // partitions' per-series results.
+        fn in_order<T: Default>(
+            labels: Vec<Labels>,
+            mut parts: Vec<Vec<T>>,
+            partition: &[usize],
+            local: &[u32],
+        ) -> Vec<(Labels, T)> {
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(s, l)| {
+                    (
+                        l,
+                        std::mem::take(&mut parts[partition[s]][local[s] as usize]),
+                    )
+                })
+                .collect()
+        }
         Some(match groups {
             Some(_) => {
                 let mut sinks = sinks.into_iter().map(|s| match s {
                     PartSink::Groups(g) => g,
-                    PartSink::Series(_) => unreachable!("grouped sinks"),
+                    _ => unreachable!("grouped sinks"),
                 });
                 let mut all = sinks.next()?;
                 for g in sinks {
                     all.merge(g);
                 }
-                all.finish(&grid)
+                GridRates::Points(all.finish(&grid))
+            }
+            None if request.display.is_some() => {
+                let reducers: Vec<Vec<Option<crate::display::BucketReducer>>> = sinks
+                    .into_iter()
+                    .map(|s| match s {
+                        PartSink::Display(d) => d.reducers.into_iter().map(Some).collect(),
+                        _ => unreachable!("display sinks"),
+                    })
+                    .collect();
+                GridRates::Display(
+                    in_order(labels, reducers, &partition, &local)
+                        .into_iter()
+                        .map(|(l, r)| (l, r.expect("each series' reducer, once")))
+                        .collect(),
+                )
             }
             None => {
-                let mut points: Vec<Vec<Vec<crate::promql::streaming::Point>>> = sinks
+                let points: Vec<Vec<Vec<crate::promql::streaming::Point>>> = sinks
                     .into_iter()
                     .map(|s| match s {
                         PartSink::Series(p) => p.points,
-                        PartSink::Groups(_) => unreachable!("per-series sinks"),
+                        _ => unreachable!("per-series sinks"),
                     })
                     .collect();
-                labels
-                    .into_iter()
-                    .enumerate()
-                    .map(|(s, l)| {
-                        let mut p = std::mem::take(&mut points[partition[s]][local[s] as usize]);
-                        p.shrink_to_fit();
-                        (l, p)
-                    })
-                    .collect()
+                GridRates::Points(
+                    in_order(labels, points, &partition, &local)
+                        .into_iter()
+                        .map(|(l, mut p)| {
+                            p.shrink_to_fit();
+                            (l, p)
+                        })
+                        .collect(),
+                )
             }
         })
     }
@@ -1806,7 +1854,7 @@ impl DataSource for SegmentedSource {
         name: &str,
         filter: &Labels,
         request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
+    ) -> Option<crate::batch_rate::GridRates> {
         self.grid_rates(name, filter, request)
     }
 
@@ -5355,6 +5403,7 @@ mod tests {
                 .map(|t| (t * s, t * t * k))
                 .collect()
         };
+        let pool = BufferPool::new(64 * 1024 * 1024);
         let r = SegmentedParquetReader::open_bytes_with_pool(
             vec![
                 segment("cpu_cycles", &[("id", "0")], &rows(1)[..20]),
@@ -5362,7 +5411,7 @@ mod tests {
                 segment("cpu_cycles", &[("id", "0")], &rows(1)[20..]),
                 segment("cpu_cycles", &[("id", "1")], &rows(3)[20..]),
             ],
-            BufferPool::new(64 * 1024 * 1024),
+            Arc::clone(&pool),
         )
         .unwrap();
         let windows: Vec<WindowRow> = (1..=40u64)
@@ -5372,22 +5421,28 @@ mod tests {
                 (t * s, t * t, 300, w.map(|_| -50_000_000), w)
             })
             .collect();
+        let windowed_pool = BufferPool::new(64 * 1024 * 1024);
         let windowed = SegmentedParquetReader::open_bytes_with_pool(
             vec![
                 segment_with_windows(&windows[..17], true),
                 segment_with_windows(&windows[17..], true),
             ],
-            BufferPool::new(64 * 1024 * 1024),
+            Arc::clone(&windowed_pool),
         )
         .unwrap();
         let per_series = crate::QueryOptions::default().with_per_series_rates(true);
-        for (r, q) in [
-            (&r, "rate(cpu_cycles[1s])"),
-            (&r, "sum(irate(cpu_cycles[1s]))"),
-            (&windowed, "rate(cpu_cycles[1s])"),
-            (&windowed, "sum(irate(cpu_cycles[1s])) * 2"),
-            (&r, "sum by (id) (rate(cpu_cycles[2s]))"),
-            (&r, "irate(cpu_cycles[1s]) * 2"),
+        // Whether the source computes the display query as it reads.
+        for (r, q, as_read) in [
+            (&r, "rate(cpu_cycles[1s])", true),
+            (&r, "sum(irate(cpu_cycles[1s]))", false),
+            (&windowed, "rate(cpu_cycles[1s])", true),
+            (&windowed, "irate(cpu_cycles[1s]) / 1000", true),
+            (&windowed, "2 * (rate(cpu_cycles[1s]) - 3)", true),
+            (&windowed, "1 / rate(cpu_cycles[1s])", true),
+            (&windowed, "sum(irate(cpu_cycles[1s])) * 2", false),
+            (&r, "sum by (id) (rate(cpu_cycles[2s]))", false),
+            (&r, "irate(cpu_cycles[1s]) - 40", true),
+            (&r, "irate(cpu_cycles[1s]) * 2", true),
         ] {
             for budget in [0, 5] {
                 let display = DisplayOptions {
@@ -5395,11 +5450,20 @@ mod tests {
                     ..Default::default()
                 };
                 for qopts in [crate::QueryOptions::default(), per_series.clone()] {
+                    let displays =
+                        || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
+                    let before = displays();
                     let streamed = r
                         .query_range_display_opts(q, 1.0, 40.0, 1.0, &display, &qopts)
                         .unwrap();
+                    assert_eq!(
+                        displays() > before,
+                        as_read && !qopts.per_series_rates,
+                        "{q}: computed as read"
+                    );
                     let matrix = r.query_range_opts(q, 1.0, 40.0, 1.0, &qopts).unwrap();
-                    let reduced = crate::display::display_from_result(matrix, 1.0, &display);
+                    let reduced =
+                        crate::display::display_from_result(matrix, 1.0, 40.0, 1.0, &display);
                     // The per-series path gives `by` groups in no fixed
                     // order, so the series are compared as a set.
                     let sorted = |d: &crate::DisplayResult| {
