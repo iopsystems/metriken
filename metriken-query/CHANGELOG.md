@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Opening a segmented table asks its relabel for a column's identities once
+  per column instead of three times per segment, and registers each
+  column's identities once. On a 9.6-hour recording of a per-task group
+  stored long (6,644 occupants, 291 segments), a query over 0.1% of the
+  range, which is mostly the table's open, took 2.7-3.0 s and takes
+  1.5-1.65 s; `sum(irate(...))` over the whole range took 3.6 s and takes
+  2.4 s, with half as many allocations (92 M to 48 M) and the same peak
+  live heap. A table without a relabel opens as before.
+
 ## [0.34.4] - 2026-10-04
 
 ### Changed

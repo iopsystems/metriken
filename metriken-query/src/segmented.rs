@@ -291,6 +291,7 @@ impl SegmentedParquetReader {
                     Some((prev, len)) if *len == keys.len() => Some(Arc::clone(prev)),
                     _ => None,
                 };
+                let mut memo = IdentityMemo::default();
                 for idx in start..store.len() {
                     if reusable && idx == keys.len() && !keys.is_empty() && sealed.is_none() {
                         sealed = Some(Arc::new(state.clone()));
@@ -304,7 +305,7 @@ impl SegmentedParquetReader {
                     // Footer only: nothing is decoded into the pool here, so
                     // the segment needs no content-derived id.
                     let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
-                    state.fold(idx, &seg, relabel.as_ref())?;
+                    state.fold(idx, &seg, relabel.as_ref(), &mut memo)?;
                 }
                 if state.opened == 0 {
                     return Err(
@@ -454,6 +455,123 @@ impl SegmentedParquetReader {
     }
 }
 
+/// What one open asks of a relabel and of the identity indexes, kept so
+/// each is done once per column rather than once per segment: a relabel's
+/// answer depends on the metric and the column's labels, not the segment.
+#[derive(Default)]
+struct IdentityMemo {
+    /// metric -> column labels -> the sets the column presents as.
+    sets: HashMap<String, HashMap<Labels, Presented>>,
+    /// metric -> column labels -> counter positions of its sets, once they
+    /// are registered.
+    positions: HashMap<String, HashMap<Labels, Positions>>,
+    /// Per [`Kind`], metric -> the column labels already registered.
+    registered: [HashMap<String, std::collections::HashSet<Labels>>; 3],
+}
+
+/// The counter positions of a column's sets; `None` for a set the index
+/// does not hold.
+type Positions = Arc<[Option<usize>]>;
+
+/// The label sets a column presents as.
+#[derive(Clone)]
+enum Presented {
+    /// Its own labels.
+    Own,
+    /// The relabel's.
+    Sets(Arc<[Labels]>),
+}
+
+impl Presented {
+    /// The sets, given the column's own labels.
+    fn of<'a>(&'a self, own: &'a Labels) -> &'a [Labels] {
+        match self {
+            Presented::Own => std::slice::from_ref(own),
+            Presented::Sets(sets) => sets,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Counter = 0,
+    Gauge = 1,
+    ColumnMap = 2,
+}
+
+impl IdentityMemo {
+    /// The label sets a column of `name` with `labels` presents as: its
+    /// own, unless the relabel says otherwise. Sets `unresolved` for a
+    /// column naming an occupant the relabel did not describe.
+    fn presents(
+        &mut self,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+        name: &str,
+        labels: &Labels,
+        unresolved: &mut bool,
+    ) -> Presented {
+        let Some(r) = relabel else {
+            return Presented::Own;
+        };
+        if let Some(sets) = self.sets.get(name).and_then(|m| m.get(labels)) {
+            return sets.clone();
+        }
+        let sets = match r.identities(name, labels) {
+            Some(sets) => Presented::Sets(sets.into()),
+            None => {
+                if labels.inner.contains_key(crate::long::OCCUPANT_LABEL) {
+                    *unresolved = true;
+                }
+                Presented::Own
+            }
+        };
+        self.sets
+            .entry(name.to_string())
+            .or_default()
+            .insert(labels.clone(), sets.clone());
+        sets
+    }
+
+    /// Whether this is the first time `(kind, name, labels)` is seen.
+    fn register(&mut self, kind: Kind, name: &str, labels: &Labels) -> bool {
+        let seen = &mut self.registered[kind as usize];
+        if seen.get(name).is_some_and(|m| m.contains(labels)) {
+            return false;
+        }
+        seen.entry(name.to_string())
+            .or_default()
+            .insert(labels.clone());
+        true
+    }
+
+    /// The positions in `identity` of the sets a counter column presents
+    /// as. Ask after registering the column: the answer is kept, and a set
+    /// not yet registered has no position.
+    fn positions(
+        &mut self,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+        identity: &SeriesIdentity,
+        name: &str,
+        labels: &Labels,
+        unresolved: &mut bool,
+    ) -> Positions {
+        if let Some(p) = self.positions.get(name).and_then(|m| m.get(labels)) {
+            return Arc::clone(p);
+        }
+        let sets = self.presents(relabel, name, labels, unresolved);
+        let p: Positions = sets
+            .of(labels)
+            .iter()
+            .map(|l| identity.position(name, l))
+            .collect();
+        self.positions
+            .entry(name.to_string())
+            .or_default()
+            .insert(labels.clone(), Arc::clone(&p));
+        p
+    }
+}
+
 /// What [`SegmentedParquetReader`]'s open builds from a table's segments:
 /// the identity indexes, catalog and column locations. Cloned so a reader
 /// reopened over the same table starts from the state its predecessor had
@@ -491,42 +609,39 @@ impl OpenState {
         idx: usize,
         seg: &ParquetReader,
         relabel: Option<&Arc<dyn ColumnRelabel>>,
+        memo: &mut IdentityMemo,
     ) -> Result<(), Box<dyn Error>> {
         check_histogram_configs(idx, seg)?;
-        let unresolved = std::cell::Cell::new(false);
-        let identities = |r: &Arc<dyn ColumnRelabel>, name: &str, labels: &Labels| {
-            let sets = r.identities(name, labels);
-            if sets.is_none() && labels.inner.contains_key(crate::long::OCCUPANT_LABEL) {
-                unresolved.set(true);
+        let mut unresolved = false;
+        // Each counter and gauge column's identities, registered once per
+        // open.
+        for (kind, identity, columns) in [
+            (
+                Kind::Counter,
+                &mut self.counter_identity,
+                seg.counter_columns(),
+            ),
+            (Kind::Gauge, &mut self.gauge_identity, seg.gauge_columns()),
+        ] {
+            for (name, labels) in columns {
+                let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
+                if memo.register(kind, &name, &labels) {
+                    identity.extend(sets.of(&labels).iter().map(|l| (name.clone(), l.clone())));
+                }
             }
-            sets
-        };
-        // Each column contributes every label set it can present as —
-        // one, unless a relabelling says otherwise.
-        let presented = |columns: Vec<(String, Labels)>| -> Vec<(String, Labels)> {
-            match relabel {
-                None => columns,
-                Some(r) => columns
-                    .into_iter()
-                    .flat_map(|(name, labels)| {
-                        let sets = identities(r, &name, &labels).unwrap_or_else(|| vec![labels]);
-                        sets.into_iter().map(move |l| (name.clone(), l))
-                    })
-                    .collect(),
-            }
-        };
-        self.counter_identity
-            .extend(presented(seg.counter_columns()));
+        }
         // Where each counter series' samples are, by segment: the
         // column, located once here so a stream can read it back
         // without a schema scan. A relabelled column feeds every series
         // it can present as.
         for col in seg.counter_column_refs() {
-            let sets = match relabel {
-                Some(r) => identities(r, &col.name, &col.labels)
-                    .unwrap_or_else(|| vec![col.labels.clone()]),
-                None => vec![col.labels.clone()],
-            };
+            let positions = memo.positions(
+                relabel,
+                &self.counter_identity,
+                &col.name,
+                &col.labels,
+                &mut unresolved,
+            );
             let table = self.counter_columns.entry(col.name.clone()).or_default();
             // The column's own labels, interned: one copy per distinct
             // set rather than one per segment it appears in.
@@ -540,22 +655,30 @@ impl OpenState {
                     table.labels.len() - 1
                 }
             } as u32;
-            for labels in sets {
-                let Some(pos) = self.counter_identity.position(&col.name, &labels) else {
-                    continue;
-                };
-                if table.by_series.len() <= pos {
+            for pos in positions.iter().flatten() {
+                if table.by_series.len() <= *pos {
                     table.by_series.resize_with(pos + 1, Vec::new);
                 }
-                table.by_series[pos].push(Location {
+                table.by_series[*pos].push(Location {
                     segment: idx as u32,
                     column_labels,
                     position: col.position,
                 });
             }
         }
-        self.gauge_identity.extend(presented(seg.gauge_columns()));
-        let histogram_columns = presented(seg.histogram_columns());
+        // Histograms are tracked per segment (their runs), so their sets
+        // are listed every time.
+        let histogram_columns: Vec<(String, Labels)> = seg
+            .histogram_columns()
+            .into_iter()
+            .flat_map(|(name, labels)| {
+                let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
+                sets.of(&labels)
+                    .iter()
+                    .map(|l| (name.clone(), l.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         self.histogram_runs.observe(idx, seg.histogram_configs());
         self.histogram_runs.observe_labels(idx, &histogram_columns);
         self.histogram_identity.extend(histogram_columns);
@@ -579,15 +702,18 @@ impl OpenState {
             let run = self.histogram_runs.segment_run(&metric, idx);
             let entry = self.column_map.entry(metric.clone()).or_default();
             for (labels, col) in cols {
-                let sets = match relabel {
-                    Some(r) => identities(r, &metric, &labels).unwrap_or_else(|| vec![labels]),
-                    None => vec![labels],
-                };
-                for mut labels in sets {
+                let sets = memo.presents(relabel, &metric, &labels, &mut unresolved);
+                // Without a run tag a column's entries are the same in
+                // every segment, and the first one stays.
+                if run.is_none() && !memo.register(Kind::ColumnMap, &metric, &labels) {
+                    continue;
+                }
+                for set in sets.of(&labels) {
+                    let mut set = set.clone();
                     if let Some(run) = run {
-                        labels.inner.insert("__run__".to_string(), run.to_string());
+                        set.inner.insert("__run__".to_string(), run.to_string());
                     }
-                    entry.entry(labels).or_insert_with(|| col.clone());
+                    entry.entry(set).or_insert_with(|| col.clone());
                 }
             }
         }
@@ -599,7 +725,7 @@ impl OpenState {
             present: true,
         });
         self.opened += 1;
-        self.unresolved |= unresolved.get();
+        self.unresolved |= unresolved;
         Ok(())
     }
 }
@@ -4729,6 +4855,59 @@ mod tests {
         fn identities_are_fixed(&self) -> bool {
             true
         }
+    }
+
+    /// [`AllA`], counting the calls to `identities`.
+    struct Counted(std::sync::atomic::AtomicUsize);
+
+    impl ColumnRelabel for Counted {
+        fn identities(&self, name: &str, labels: &Labels) -> Option<Vec<Labels>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AllA.identities(name, labels)
+        }
+
+        fn split(&self, name: &str, labels: &Labels, timestamps: &[u64]) -> Option<Vec<Run>> {
+            AllA.split(name, labels, timestamps)
+        }
+
+        fn at(&self, name: &str, labels: &Labels, timestamp: u64) -> Option<Labels> {
+            AllA.at(name, labels, timestamp)
+        }
+
+        fn segment_filter(&self, name: &str, filter: &Labels) -> Labels {
+            AllA.segment_filter(name, filter)
+        }
+
+        fn identities_are_fixed(&self) -> bool {
+            true
+        }
+    }
+
+    /// An open asks the relabel for a column's identities once, however
+    /// many segments hold the column.
+    #[test]
+    fn an_open_asks_for_each_columns_identities_once() {
+        let seg = |from| segment("cpu_cycles", &[("slot", "0")], &rows(from, 4));
+        let relabel = Arc::new(Counted(std::sync::atomic::AtomicUsize::new(0)));
+        let r = SegmentedParquetReader::open_after(
+            KeyedSegments::new(vec![
+                (Some(1), seg(1)),
+                (Some(2), seg(5)),
+                (Some(3), seg(9)),
+            ]),
+            BufferPool::new(64 * 1024 * 1024),
+            Some(Arc::clone(&relabel) as Arc<dyn ColumnRelabel>),
+            None,
+        )
+        .unwrap();
+        assert_eq!(relabel.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            r.counter_labels("cpu_cycles"),
+            vec![BTreeMap::from([
+                ("slot".to_string(), "0".to_string()),
+                ("who".to_string(), "a".to_string())
+            ])]
+        );
     }
 
     /// A reader opened without a relabel is not reused by an open with one,
