@@ -165,10 +165,12 @@ fn write_histogram(
         // Summary-style: emit percentile gauges
         write_type_help(output, name, "summary", metric, options);
 
-        if let Ok(Some(results)) = snapshot.percentiles(&options.percentiles) {
-            for (percentile, bucket) in results {
+        if let Ok(Some(results)) =
+            histogram::SampleQuantiles::quantiles(snapshot, &options.percentiles)
+        {
+            for (quantile, bucket) in results.entries() {
                 let value = bucket.end();
-                let quantile_label = format!("quantile=\"{percentile}\"");
+                let quantile_label = format!("quantile=\"{}\"", quantile.as_f64());
                 let combined = match labels {
                     Some(l) if !l.is_empty() => format!("{l}, {quantile_label}"),
                     _ => quantile_label,
