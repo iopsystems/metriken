@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `ArchiveReader` forwards `query_range_display_opts` to the table or union
+  a query routes to, with the cross-cadence evaluation timestamps
+  `query_range_opts` applies, so a display query is reduced by the reader
+  as it computes rather than after building the full matrix.
+
 ## [0.3.4] - 2026-10-04
 
 ### Changed

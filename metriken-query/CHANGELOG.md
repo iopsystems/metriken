@@ -17,6 +17,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.5-1.65 s; `sum(irate(...))` over the whole range took 3.6 s and takes
   2.4 s, with half as many allocations (92 M to 48 M) and the same peak
   live heap. A table without a relabel opens as before.
+- A display query (`query_range_display`, `query_range_display_opts`) cuts
+  every series into buckets of one width, taken from the query's range: the
+  smallest round width at least `(end - start) / budget`. The width used to
+  come from each series' own first and last points, so a series covering
+  part of the range now has the same buckets as the rest, and one with
+  fewer points than the budget is no longer returned point by point when
+  the range holds more. A series covering the range is reduced as before,
+  with the same per-bucket values and bands.
+- The readers in this crate reduce a display query's series as they are
+  computed instead of building the full-resolution matrix first. On a
+  segmented reader, `rate`/`irate` of a selector, alone, under `sum`,
+  `avg`, `min`, `max` or `count`, and under scalar ops against number
+  literals, is reduced as the segments are read: each series or group holds
+  its open bucket, and a group's accumulators per grid point take 32 bytes
+  instead of 96. On a 9.6-hour recording of a per-task group (6,644
+  series) stored long, at budget 500, `irate(...)` took 9.4 GB of memory
+  and 6.0 s and takes 434-486 MB and 2.7 s, and `sum by (comm) (irate(...))`
+  took 1.3 GB and takes about 500 MB. Other expressions reduce each series
+  as it is collected.
+- A segmented reader's batched rates hold each in-flight segment's decoded
+  columns and a 4-byte series index per row, instead of a 48-byte copy of
+  every sample.
 
 ## [0.34.4] - 2026-10-04
 

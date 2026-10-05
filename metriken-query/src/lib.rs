@@ -412,22 +412,27 @@ pub trait MetricsSource: Send + Sync {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError>;
 
-    /// Execute a PromQL range query in *display* mode: evaluate at native
-    /// resolution (`step_s`), then decimate each result series per `opts`
-    /// (see [`DisplayOptions`]) into per-bucket boxplots — a robust median
-    /// line, a configurable inner band, and a hard min/max envelope so
-    /// short-lived spikes survive the downsample.
+    /// Execute a PromQL range query in display mode: evaluate at `step_s`,
+    /// then reduce each result series per `opts` (see [`DisplayOptions`])
+    /// into per-bucket boxplots: a median line, a configurable inner band,
+    /// and a min/max envelope that keeps short spikes visible.
     ///
-    /// Only `Matrix` results are decimated (into `Series`); heatmap, scalar,
-    /// and vector results pass through unchanged. `opts.budget == 0` disables
-    /// decimation (full resolution). Analysis consumers that recompute on the
-    /// data should call [`query_range`](Self::query_range) instead — the
-    /// envelope is lossy for anything but display.
+    /// When the range `[start_s, end_s]` holds more grid points than
+    /// `opts.budget`, every series is cut into buckets of one width, the
+    /// smallest round width at least `(end_s - start_s) / budget`, aligned to
+    /// multiples of it. Otherwise each point is its own bucket. A series
+    /// covering part of the range gets the same buckets as the rest.
     ///
-    /// The default implementation post-processes [`query_range`](Self::query_range),
-    /// so it works for every backend without per-impl code. (A future
-    /// engine-level optimization could decimate before materializing the full
-    /// matrix, saving memory on long recordings.)
+    /// Only `Matrix` results are reduced (into `Series`); heatmap, scalar
+    /// and vector results pass through unchanged. `opts.budget == 0` returns
+    /// full resolution. Analysis consumers that recompute on the data should
+    /// call [`query_range`](Self::query_range) instead.
+    ///
+    /// The default implementation reduces the result of
+    /// [`query_range_opts`](Self::query_range_opts). The readers in this
+    /// crate reduce each series as it is computed and never hold the full
+    /// matrix; a source that wraps one should forward
+    /// [`query_range_display_opts`](Self::query_range_display_opts) to it.
     fn query_range_display(
         &self,
         expr: &str,
@@ -439,10 +444,8 @@ pub trait MetricsSource: Send + Sync {
         self.query_range_display_opts(expr, start_s, end_s, step_s, opts, &QueryOptions::default())
     }
 
-    /// Display-mode range query with explicit [`QueryOptions`]. Mirrors
-    /// [`query_range_display`](Self::query_range_display), post-processing
-    /// [`query_range_opts`](Self::query_range_opts) so the rate mode threads
-    /// through decimation. The default works for every backend.
+    /// [`query_range_display`](Self::query_range_display) with explicit
+    /// [`QueryOptions`].
     fn query_range_display_opts(
         &self,
         expr: &str,
