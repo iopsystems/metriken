@@ -13,10 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per column instead of three times per segment, and registers each
   column's identities once. On a 9.6-hour recording of a per-task group
   stored long (6,644 occupants, 291 segments), a query over 0.1% of the
-  range, which is mostly the table's open, took 2.7-3.0 s and takes
-  1.5-1.65 s; `sum(irate(...))` over the whole range took 3.6 s and takes
-  2.4 s, with half as many allocations (92 M to 48 M) and the same peak
-  live heap. A table without a relabel opens as before.
+  range, whose time is mostly spent opening the table, took 2.7-3.0 s and
+  takes 1.5-1.65 s; `sum(irate(...))` over the whole range took 3.6 s and
+  takes 2.4 s, with half as many allocations (92 M to 48 M) and the same
+  peak live heap. A table without a relabel opens as before.
 - A display query (`query_range_display`, `query_range_display_opts`) cuts
   every series into buckets of one width, taken from the query's range: the
   smallest of 1, 2, 5, 10, 15, 20 or 30 s, 1, 2, 5, 10, 15 or 30 min, 1, 2,
@@ -31,17 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     functions, explicit evaluation timestamps), which were returned at full
     resolution when the step grid fit the budget;
   - a series whose span is shorter than the range can get a wider bucket
-    than before, where the range crosses to the next width.
+    than before, when `(end - start) / budget` rounds up to a larger width
+    than the series' span divided by the budget did.
 - The readers in this crate reduce a display query's series as they are
   computed instead of building the full-resolution matrix first. On a
-  segmented reader in grid rate mode, without explicit evaluation
-  timestamps, `per_series_rates`, `offset` or `@`, `rate`/`irate` of a
-  selector, alone, under `sum`, `avg`, `min`, `max` or `count`, and under
-  scalar ops against number literals, is reduced as the segments are read:
-  each series holds its open bucket, and each group one accumulator per grid
-  point, of 32 bytes instead of 88. On a 9.6-hour recording of a per-task
-  group (6,644 series) stored long, at budget 500, `irate(...)` took 9.4 GB
-  of memory and 6.0 s and takes 434-486 MB and 2.7 s, and
+  segmented reader, `rate`/`irate` of a selector is reduced as the segments
+  are read when it appears alone, under `sum`, `avg`, `min`, `max` or
+  `count`, or under a scalar op against a number literal. This applies in
+  grid rate mode, and not with explicit evaluation timestamps,
+  `per_series_rates`, `offset` or `@`. Each series holds only its open
+  bucket, and each group holds one 32-byte accumulator per grid point
+  instead of 88 bytes. On a 9.6-hour recording of a per-task group (6,644
+  series) stored long, at budget 500, `irate(...)` took 9.4 GB of memory
+  and 6.0 s and takes 434-486 MB and 2.7 s, and
   `sum by (comm) (irate(...))` took 1.3 GB and takes about 500 MB. Other
   expressions reduce each series as it is collected; histogram functions
   are evaluated in full and then reduced.

@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ArchiveReader` forwards `query_range_display_opts` to the table or union
   a query routes to, with the cross-cadence evaluation timestamps
-  `query_range_opts` applies, so a display query is reduced by the reader
-  as it computes rather than after building the full matrix.
+  `query_range_opts` applies, so a display query through `ArchiveReader`
+  gets metriken-query's reduction during evaluation instead of the trait
+  default, which reduced the full matrix.
 
 ## [0.3.4] - 2026-10-04
 
