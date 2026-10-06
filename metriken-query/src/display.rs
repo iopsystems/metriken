@@ -25,10 +25,10 @@ use crate::QueryResult;
 /// `median` is the representative (line) value — robust, so a spike stays in
 /// `max` rather than pulling the line up. `lo`/`hi` are the configurable inner
 /// band (the [`DisplaySeries::band`] quantiles) bounding the typical spread;
-/// `min`/`max` are the hard extremes so a spike cannot be hidden. When no
-/// decimation happens (`budget >= raw points`) each sample becomes its own
-/// point with `min == lo == median == hi == max`, so full-resolution and
-/// decimated data share one shape.
+/// `min`/`max` are the hard extremes so a spike cannot be hidden. A bucket
+/// holding one sample gives that sample as its own point, with
+/// `min == lo == median == hi == max`, so full-resolution and decimated data
+/// share one shape.
 ///
 /// `#[non_exhaustive]`: build with [`EnvPoint::new`] plus
 /// [`with_band`](EnvPoint::with_band) / [`with_interpolated`](EnvPoint::with_interpolated),
