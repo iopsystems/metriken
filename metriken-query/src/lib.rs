@@ -418,12 +418,13 @@ pub trait MetricsSource: Send + Sync {
     /// and a min/max envelope that keeps short spikes visible.
     ///
     /// Every series is cut into buckets of one width, aligned to multiples
-    /// of it: the smallest of 1, 2, 5, 10, 15, 20 or 30 s, 1, 2, 5, 10, 15 or
-    /// 30 min, 1, 2, 3, 6 or 12 h, or a whole number of days, at least
-    /// `(end_s - start_s) / opts.budget`. A bucket holding one point gives
-    /// that point at its own time, so a series no denser than the buckets is
-    /// returned as it is. `opts.budget == 0`, or `end_s <= start_s`, returns
-    /// full resolution.
+    /// of it. When `(end_s - start_s) / opts.budget` is at most `step_s` the
+    /// width is `step_s`, so a series on the step grid is returned point by
+    /// point. Otherwise it is the smallest of 1, 2, 5, 10, 15, 20 or 30 s, 1,
+    /// 2, 5, 10, 15 or 30 min, 1, 2, 3, 6 or 12 h, or a whole number of days,
+    /// at least `(end_s - start_s) / opts.budget`. A bucket holding one point
+    /// gives that point at its own time. `opts.budget == 0`, or
+    /// `end_s <= start_s`, returns full resolution.
     ///
     /// Only `Matrix` results are reduced (into `Series`); heatmap, scalar
     /// and vector results pass through unchanged. Analysis consumers that

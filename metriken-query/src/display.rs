@@ -385,17 +385,33 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
 }
 
 /// The bucket width, in seconds, of a display query over `[start_s,
-/// end_s]` with `budget` points per series: the smallest of
-/// [`nice_bucket_secs`]'s widths at least `(end_s - start_s) / budget`.
-/// `None`, one bucket per point, when `budget` is 0 or the range is empty.
-/// Every series of the query shares it, so buckets line up across series,
-/// and no series has more than `budget + 1` buckets.
-pub(crate) fn bucket_width(start_s: f64, end_s: f64, budget: usize) -> Option<f64> {
+/// end_s]` at `step_s` with `budget` points per series. When the range's
+/// grid fits the budget, `(end_s - start_s) / budget <= step_s`, it is
+/// `step_s`, so points on the grid are each their own bucket at any step.
+/// Otherwise it is the smallest of [`nice_bucket_secs`]'s widths at least
+/// `(end_s - start_s) / budget`. `None`, one bucket per point, when `budget`
+/// is 0 or the range is empty. Every series of the query shares it, so
+/// buckets line up across series, and no series has more than about
+/// `budget + 1` buckets.
+pub(crate) fn bucket_width(start_s: f64, end_s: f64, step_s: f64, budget: usize) -> Option<f64> {
     let span = end_s - start_s;
     if budget == 0 || span <= 0.0 {
         return None;
     }
-    Some(nice_bucket_secs(span / budget as f64))
+    let raw = span / budget as f64;
+    if step_s > 0.0 && raw <= step_s {
+        return Some(step_s);
+    }
+    Some(nice_bucket_secs(raw))
+}
+
+/// The bucket holding time `t` for buckets of `width` aligned to its
+/// multiples. A time within 1e-4 of a bucket below a boundary counts as on
+/// it: a step such as 0.1 s is not exact in floating point, and without the
+/// allowance a grid point at a multiple of the step can land in the bucket
+/// before.
+fn bucket_of(t: f64, width: f64) -> i64 {
+    (t / width + 1e-4).floor() as i64
 }
 
 /// A series reduced point by point, in time order, into buckets of a fixed
@@ -436,7 +452,7 @@ impl BucketReducer {
             self.out.push(Self::single(t, v, band, interpolated));
             return;
         };
-        let bucket = (t / width).floor() as i64;
+        let bucket = bucket_of(t, width);
         if !self.values.is_empty() && bucket != self.bucket {
             self.close(width);
         }
@@ -525,7 +541,7 @@ pub(crate) fn display_from_result(
     step_s: f64,
     opts: &DisplayOptions,
 ) -> DisplayResult {
-    let width = bucket_width(start_s, end_s, opts.budget);
+    let width = bucket_width(start_s, end_s, step_s, opts.budget);
     match result {
         // `bands`, not `intervals`: the legacy field is all-or-nothing and
         // goes absent for the whole series as soon as one point lacks a
@@ -952,7 +968,7 @@ mod tests {
             .map(|(t, _)| (*t as u64).is_multiple_of(17))
             .collect();
         for budget in [0, 50, 500, 3600, 5000] {
-            let width = bucket_width(0.0, 3599.0, budget);
+            let width = bucket_width(0.0, 3599.0, 1.0, budget);
             for (b, f) in [
                 (None, None),
                 (Some(&bands[..]), None),
@@ -980,7 +996,7 @@ mod tests {
     /// other series of the query does.
     #[test]
     fn a_short_series_takes_the_ranges_buckets() {
-        let width = bucket_width(0.0, 3599.0, 60);
+        let width = bucket_width(0.0, 3599.0, 1.0, 60);
         assert_eq!(width, Some(60.0));
         let points: Vec<(f64, f64)> = (600..720u64).map(|t| (t as f64, 1.0)).collect();
         let out = reduced(&points, None, None, width);
@@ -993,7 +1009,7 @@ mod tests {
     /// The budget holds for points closer together than the query's step.
     #[test]
     fn points_off_the_step_grid_keep_to_the_budget() {
-        let width = bucket_width(1.0, 600.0, 50);
+        let width = bucket_width(1.0, 600.0, 60.0, 50);
         let points: Vec<(f64, f64)> = (1..600u64).map(|t| (t as f64, t as f64)).collect();
         let mut r = BucketReducer::new(width, IQR);
         for (t, v) in &points {
@@ -1008,7 +1024,7 @@ mod tests {
     /// and is not marked decimated.
     #[test]
     fn a_point_alone_in_its_bucket_keeps_its_time() {
-        let width = bucket_width(0.0, 3600.0, 500);
+        let width = bucket_width(0.0, 3600.0, 1.0, 500);
         let points: Vec<(f64, f64)> = (0..360u64).map(|k| ((3 + 10 * k) as f64, 1.0)).collect();
         let mut r = BucketReducer::new(width, IQR);
         for (t, v) in &points {
@@ -1024,5 +1040,37 @@ mod tests {
             (s.points[0].unc_lo, s.points[0].unc_hi),
             (Some(0.5), Some(1.5))
         );
+    }
+
+    /// A range that fits the budget at its step comes back point by point,
+    /// for a step under a second at epoch timestamps and for one that is
+    /// not among the round widths.
+    #[test]
+    fn a_range_that_fits_the_budget_keeps_every_point() {
+        for (start, step, n, budget) in [
+            (1_790_144_092.0, 0.1, 40u64, 48),
+            (1_790_144_092.0, 0.25, 400, 400),
+            (0.0, 3.0, 49, 50),
+        ] {
+            let end = start + step * (n - 1) as f64;
+            let width = bucket_width(start, end, step, budget);
+            let points: Vec<(f64, f64)> = (0..n)
+                .map(|k| (((start + step * k as f64) * 1e9).round() / 1e9, k as f64))
+                .collect();
+            let mut r = BucketReducer::new(width, IQR);
+            for (t, v) in &points {
+                r.push(*t, *v, None, false);
+            }
+            let out = r.finish(HashMap::new(), step, &DisplayOptions::default());
+            assert!(!out.decimated, "step {step}");
+            assert_eq!(
+                out.points
+                    .iter()
+                    .map(|p| (p.t, p.median))
+                    .collect::<Vec<_>>(),
+                points,
+                "step {step}"
+            );
+        }
     }
 }

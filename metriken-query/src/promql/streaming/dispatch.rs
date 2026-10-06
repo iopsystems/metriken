@@ -331,7 +331,7 @@ fn batch_display(
     // name, an aggregation or a scalar op drops it.
     let named = !scaled && group.is_none();
     let grid_display = crate::batch_rate::GridDisplay {
-        width: crate::display::bucket_width(start, end, display.budget),
+        width: crate::display::bucket_width(start, end, step, display.budget),
         band: display.band,
         ops,
     };
