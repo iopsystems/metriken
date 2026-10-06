@@ -5,18 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.34.6] - 2026-10-05
 
 ### Fixed
 
-- A display query whose range fits the budget at its step is returned
-  point by point again, as in 0.34.4. In 0.34.5 every bucket was one of the
-  round widths, 1 s or more. A series at an interval under 1 s was never
-  shown at its own interval, and a 3 s series came back in uneven buckets.
-  The bucket width is now at most the step when `(end - start) / budget` is
-  at most the step. Points off the step grid still keep to the budget, and
-  points denser than the step, as raw rate mode and histogram functions
-  give them, are still bucketed finer than the step when the budget allows.
+- A series on the step grid of a display query whose range fits the budget
+  at its step is again returned point by point, as 0.34.4 returned it. In
+  0.34.5 every bucket was one of the round widths, 1 s or more. A series at
+  an interval under 1 s was never shown at its own interval, and a 3 s
+  series whose range gave a 5 s width came back in buckets of one and two
+  points. The bucket width is now at most the step when `(end - start) /
+  budget` is at most the step.
+- Points off the step grid are still reduced to the budget. Points closer
+  together than the step, as raw rate mode gives them, are still put in
+  buckets narrower than the step when the budget allows.
+- A point less than `max(1e-4, 1e-15 * t / width)` bucket widths before a
+  bucket boundary is placed in the bucket after it, so rounding from
+  nanoseconds to f64 seconds does not move a grid point into the previous
+  bucket.
 
 ## [0.34.5] - 2026-10-05
 
