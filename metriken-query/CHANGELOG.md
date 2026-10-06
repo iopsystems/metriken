@@ -12,17 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A grouped display query on a segmented reader (`sum`, `avg`, `min`, `max`
   or `count` of `rate`/`irate`) gives each group's points to its reducer
   once no member of the group can emit before them, instead of holding an
-  accumulator for every grid point until the read ends. After each read of
-  up to eight segments, a series whose last sample is more than ten times
-  the larger of its sample spacing and the step before the earliest unread
-  segment is ended. If an ended series has a later sample, the query is
-  evaluated per series instead. A group then holds the grid points from its
-  slowest member's next point, rounded down to a block of 1,024, through the
-  latest point emitted; it holds them all when a later segment has no
-  timestamp statistics. Points can differ in the last bits of a float when a
-  series with fewer than nine samples is ended. On a 9.6-hour recording of a
-  per-task group stored long, `sum by (comm) (irate(...))` at budget 500
-  peaked at 480-483 MB and peaks at 387-399 MB.
+  accumulator for every grid point until the read ends.
+- After each read of up to eight segments, a series is ended if its last
+  sample is more than 10 × max(sample spacing, step) before the earliest
+  unread segment. A series with fewer than two samples uses the median
+  spacing of the other series. If an ended series has a later sample, the
+  query is evaluated per series instead.
+- A group then holds the grid points from the earliest point any member can
+  still emit, rounded down to a block of 1,024, through the latest point
+  emitted. It holds every point until each later segment without timestamp
+  statistics has been read.
+- With `sum` or `avg`, a point can differ from 0.34.6 in the last bits of a
+  float when a series with fewer than nine samples is ended, because that
+  series' points are added to its group in a different order.
+- On a 9.6-hour recording of a per-task group stored long, the peak memory
+  of `sum by (comm) (irate(...))` at budget 500 fell from 480-483 MB in
+  0.34.6 to 387-399 MB.
 
 ## [0.34.6] - 2026-10-05
 
