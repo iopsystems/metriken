@@ -93,6 +93,8 @@ pub(crate) struct SeriesRate {
     /// left edge when the span is one step, and its value is reused unless a
     /// later sample has the edge's timestamp.
     last_edge: Option<(u64, Edge)>,
+    /// Finished before its samples ran out; see [`end_early`](Self::end_early).
+    ended_early: bool,
 }
 
 /// An edge's interpolated cumulative and, when real reads describe it, its
@@ -119,7 +121,38 @@ impl SeriesRate {
             cursor_ns: start_ns,
             done: false,
             last_edge: None,
+            ended_early: false,
         }
+    }
+
+    /// The time of the last sample pushed, or `None` before the first.
+    pub fn last_ts(&self) -> Option<u64> {
+        if self.settled {
+            self.last_ts
+        } else {
+            self.probe.last().map(|s| s.ts)
+        }
+    }
+
+    /// The time of the earliest grid point this series can still emit, or
+    /// `None` once it can emit no more. Points are emitted in increasing
+    /// time from here.
+    pub fn pending_ns(&self) -> Option<u64> {
+        (!self.done).then_some(self.cursor_ns)
+    }
+
+    /// Finish now, on the expectation that no more samples come: what
+    /// [`finish`](Self::finish) at the end would emit, emitted now. A sample
+    /// pushed afterwards would have changed what was emitted;
+    /// [`ended_early`](Self::ended_early) says to check for one.
+    pub fn end_early(&mut self, grid: &Grid, series: usize, sink: &mut dyn Sink) {
+        self.finish(grid, series, sink);
+        self.ended_early = true;
+    }
+
+    /// Whether [`end_early`](Self::end_early) finished this series.
+    pub fn ended_early(&self) -> bool {
+        self.ended_early
     }
 
     pub fn push(&mut self, s: Sample, grid: &Grid, series: usize, sink: &mut dyn Sink) {
@@ -620,7 +653,7 @@ impl Accum for Compact {
 }
 
 /// Grid points per block of accumulators.
-const BLOCK: usize = 1024;
+pub(crate) const BLOCK: usize = 1024;
 
 /// Accumulators per group and grid point. A group's accumulators are
 /// allocated in blocks of [`BLOCK`] grid points, a block when a point first
@@ -669,6 +702,16 @@ impl<A: Accum> Grouped<A> {
         }
     }
 
+    /// Blocks of [`BLOCK`] grid points per group.
+    pub fn blocks_per_group(&self) -> usize {
+        self.grid_len.div_ceil(BLOCK)
+    }
+
+    /// Group `g`'s block `b`, taken out of this sink.
+    pub fn take_block(&mut self, g: usize, b: usize) -> Option<Box<[A]>> {
+        self.blocks[g][b].take()
+    }
+
     /// Each group's points in order, handed to `f` with the group's index;
     /// each block is freed once read.
     fn drain(self, grid: &Grid, mut f: impl FnMut(usize, Point)) -> Vec<Labels> {
@@ -695,28 +738,99 @@ impl<A: Accum> Grouped<A> {
         let labels = self.drain(grid, |g, p| points[g].push(p));
         labels.into_iter().zip(points).collect()
     }
+}
 
-    /// Each group reduced for `display`, its points put through the
-    /// display's scalar ops.
-    pub fn finish_display(
-        self,
-        grid: &Grid,
-        display: &GridDisplay,
-    ) -> Vec<(Labels, BucketReducer)> {
-        let mut reducers: Vec<BucketReducer> = (0..self.labels.len())
-            .map(|_| BucketReducer::new(display.width, display.band))
-            .collect();
-        let labels = self.drain(grid, |g, p| {
-            let mut point = Some(p);
-            for (op, scalar, scalar_first) in &display.ops {
-                point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
-            }
-            if let Some(p) = point {
-                reducers[g].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
-            }
-        });
-        labels.into_iter().zip(reducers).collect()
+#[cfg(test)]
+thread_local! {
+    /// Blocks a grouped display read had fed when its last chunk was read,
+    /// on this thread.
+    pub(crate) static FED_BEFORE_END: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Each group's display reducer, fed group points block by block in time
+/// order as the blocks become final, from the partitions' sinks.
+pub(crate) struct GroupFlush<'d> {
+    op: AggOp,
+    display: &'d GridDisplay,
+    reducers: Vec<BucketReducer>,
+    /// Per group, the first block not yet fed.
+    next: Vec<usize>,
+}
+
+impl<'d> GroupFlush<'d> {
+    pub fn new(op: AggOp, groups: usize, display: &'d GridDisplay) -> Self {
+        Self {
+            op,
+            display,
+            reducers: (0..groups)
+                .map(|_| BucketReducer::new(display.width, display.band))
+                .collect(),
+            next: vec![0; groups],
+        }
     }
+
+    /// Feed group `g`'s blocks before block `upto`, each merged across
+    /// `parts` in order as [`Grouped::merge`] merges them, and free them.
+    pub fn feed(
+        &mut self,
+        g: usize,
+        upto: usize,
+        parts: &mut [&mut Grouped<Compact>],
+        grid: &Grid,
+    ) {
+        while self.next[g] < upto {
+            let b = self.next[g];
+            self.next[g] += 1;
+            let mut merged: Option<Box<[Compact]>> = None;
+            for part in parts.iter_mut() {
+                let Some(theirs) = part.take_block(g, b) else {
+                    continue;
+                };
+                match &mut merged {
+                    None => merged = Some(theirs),
+                    Some(mine) => {
+                        for (a, t) in mine.iter_mut().zip(theirs.iter()) {
+                            a.merge(self.op, t);
+                        }
+                    }
+                }
+            }
+            let Some(block) = merged else {
+                continue;
+            };
+            for (i, a) in block.iter().enumerate() {
+                if a.count() == 0 {
+                    continue;
+                }
+                let k = b * BLOCK + i;
+                let mut point = Some(a.point(self.op, grid.start_ns + k as u64 * grid.step_ns));
+                for (op, scalar, scalar_first) in &self.display.ops {
+                    point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
+                }
+                if let Some(p) = point {
+                    self.reducers[g].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
+                }
+            }
+        }
+    }
+
+    /// Blocks fed, over all groups.
+    pub fn fed(&self) -> usize {
+        self.next.iter().sum()
+    }
+
+    /// The reducers, in group order.
+    pub fn into_reducers(self) -> Vec<BucketReducer> {
+        self.reducers
+    }
+}
+
+/// The number of grid points before `t`.
+pub(crate) fn points_before(grid: &Grid, t: u64) -> usize {
+    if t <= grid.start_ns || grid.step_ns == 0 {
+        return 0;
+    }
+    (((t - grid.start_ns).div_ceil(grid.step_ns)) as usize).min(grid.len())
 }
 
 impl<A: Accum> Sink for Grouped<A> {
