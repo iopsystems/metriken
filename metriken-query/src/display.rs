@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::promql::{HistogramHeatmapResult, Sample};
+use crate::QueryResult;
 
 /// One decimated point: a boxplot over the samples in a time-bucket.
 ///
@@ -383,6 +384,182 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     }
 }
 
+/// The bucket width, in seconds, of a display query over `[start_s,
+/// end_s]` with `budget` points per series: the smallest of
+/// [`nice_bucket_secs`]'s widths at least `(end_s - start_s) / budget`.
+/// `None`, one bucket per point, when `budget` is 0 or the range is empty.
+/// Every series of the query shares it, so buckets line up across series,
+/// and no series has more than `budget + 1` buckets.
+pub(crate) fn bucket_width(start_s: f64, end_s: f64, budget: usize) -> Option<f64> {
+    let span = end_s - start_s;
+    if budget == 0 || span <= 0.0 {
+        return None;
+    }
+    Some(nice_bucket_secs(span / budget as f64))
+}
+
+/// A series reduced point by point, in time order, into buckets of a fixed
+/// width: [`reduce_boxplot`]'s per-bucket summary, with only the open
+/// bucket's points held. A bucket holding one point gives that point as it
+/// is, at its own time.
+pub(crate) struct BucketReducer {
+    width: Option<f64>,
+    band: [f64; 2],
+    bucket: i64,
+    values: Vec<(f64, f64)>,
+    bands: Vec<Option<(f64, f64)>>,
+    interpolated: Vec<bool>,
+    out: Vec<EnvPoint>,
+    raw_points: u64,
+}
+
+impl BucketReducer {
+    /// Buckets of `width` seconds, aligned to multiples of it; `None` for
+    /// one bucket per point.
+    pub fn new(width: Option<f64>, band: [f64; 2]) -> Self {
+        Self {
+            width,
+            band,
+            bucket: 0,
+            values: Vec::new(),
+            bands: Vec::new(),
+            interpolated: Vec::new(),
+            out: Vec::new(),
+            raw_points: 0,
+        }
+    }
+
+    /// Add the point at `t` seconds. Points arrive in increasing time.
+    pub fn push(&mut self, t: f64, v: f64, band: Option<(f64, f64)>, interpolated: bool) {
+        self.raw_points += 1;
+        let Some(width) = self.width else {
+            self.out.push(Self::single(t, v, band, interpolated));
+            return;
+        };
+        let bucket = (t / width).floor() as i64;
+        if !self.values.is_empty() && bucket != self.bucket {
+            self.close(width);
+        }
+        self.bucket = bucket;
+        self.values.push((t, v));
+        self.bands.push(band);
+        self.interpolated.push(interpolated);
+    }
+
+    /// The point at `t` as its own bucket.
+    fn single(t: f64, v: f64, band: Option<(f64, f64)>, interpolated: bool) -> EnvPoint {
+        EnvPoint {
+            t,
+            min: v,
+            lo: v,
+            median: v,
+            hi: v,
+            max: v,
+            unc_lo: band.map(|(lo, _)| lo),
+            unc_hi: band.map(|(_, hi)| hi),
+            interpolated,
+        }
+    }
+
+    fn close(&mut self, width: f64) {
+        if let [(t, v)] = self.values[..] {
+            self.out
+                .push(Self::single(t, v, self.bands[0], self.interpolated[0]));
+            self.values.clear();
+            self.bands.clear();
+            self.interpolated.clear();
+            return;
+        }
+        let bands = self
+            .bands
+            .iter()
+            .any(Option::is_some)
+            .then_some(&self.bands[..]);
+        let interpolated = self
+            .interpolated
+            .iter()
+            .any(|i| *i)
+            .then_some(&self.interpolated[..]);
+        let mut ep = boxplot_of(&self.values, bands, interpolated, self.band);
+        ep.t = self.bucket as f64 * width;
+        self.out.push(ep);
+        self.values.clear();
+        self.bands.clear();
+        self.interpolated.clear();
+    }
+
+    /// Whether no point has been added.
+    pub fn is_empty(&self) -> bool {
+        self.raw_points == 0
+    }
+
+    /// The series, with `metric`'s labels.
+    pub fn finish(
+        mut self,
+        metric: HashMap<String, String>,
+        step_s: f64,
+        opts: &DisplayOptions,
+    ) -> DisplaySeries {
+        if let (Some(width), false) = (self.width, self.values.is_empty()) {
+            self.close(width);
+        }
+        DisplaySeries {
+            decimated: (self.out.len() as u64) < self.raw_points,
+            metric,
+            points: self.out,
+            native_interval: step_s,
+            raw_points: self.raw_points,
+            reducer: opts.reducer,
+            band: opts.band,
+        }
+    }
+}
+
+/// `result`, a query over `[start_s, end_s]` at `step_s`, in display form:
+/// each matrix series reduced with a [`BucketReducer`], other results
+/// passed through.
+pub(crate) fn display_from_result(
+    result: QueryResult,
+    start_s: f64,
+    end_s: f64,
+    step_s: f64,
+    opts: &DisplayOptions,
+) -> DisplayResult {
+    let width = bucket_width(start_s, end_s, opts.budget);
+    match result {
+        // `bands`, not `intervals`: the legacy field is all-or-nothing and
+        // goes absent for the whole series as soon as one point lacks a
+        // band, which is exactly what a hole causes; display mode would then
+        // show no uncertainty at all for a series that has it almost
+        // everywhere.
+        QueryResult::Matrix { result } => DisplayResult::Series {
+            result: result
+                .into_iter()
+                .map(|s| {
+                    let mut r = BucketReducer::new(width, opts.band);
+                    // Only arrays parallel to the values are read.
+                    let n = s.values.len();
+                    let bands = s.bands.as_ref().filter(|b| b.len() == n);
+                    let interpolated = s.interpolated.as_ref().filter(|f| f.len() == n);
+                    for (i, (t, v)) in s.values.iter().enumerate() {
+                        r.push(
+                            *t,
+                            *v,
+                            bands.and_then(|b| b[i]),
+                            interpolated.is_some_and(|f| f[i]),
+                        );
+                    }
+                    r.finish(s.metric, step_s, opts)
+                })
+                .collect(),
+            budget: opts.budget as u32,
+        },
+        QueryResult::HistogramHeatmap { result } => DisplayResult::HistogramHeatmap { result },
+        QueryResult::Scalar { result } => DisplayResult::Scalar { result },
+        QueryResult::Vector { result } => DisplayResult::Vector { result },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +913,116 @@ mod tests {
         assert!(
             !s_without.contains("unc"),
             "absent band omitted: {s_without}"
+        );
+    }
+    fn reduced(
+        points: &[(f64, f64)],
+        bands: Option<&[Option<(f64, f64)>]>,
+        interpolated: Option<&[bool]>,
+        width: Option<f64>,
+    ) -> Vec<EnvPoint> {
+        let mut r = BucketReducer::new(width, IQR);
+        for (i, (t, v)) in points.iter().enumerate() {
+            r.push(
+                *t,
+                *v,
+                bands.and_then(|b| b[i]),
+                interpolated.is_some_and(|f| f[i]),
+            );
+        }
+        r.finish(HashMap::new(), 1.0, &DisplayOptions::default())
+            .points
+    }
+
+    /// For a series over the whole range, the streaming reducer gives what
+    /// `reduce_boxplot` gives, bands, holes and interpolated points included,
+    /// except that a bucket holding one point keeps that point's time.
+    #[test]
+    fn the_streaming_reducer_matches_reduce_boxplot_over_the_whole_range() {
+        let points: Vec<(f64, f64)> = (0..3600u64)
+            .filter(|t| !(1000..1100).contains(t))
+            .map(|t| (t as f64, ((t * 7919) % 101) as f64))
+            .collect();
+        let bands: Vec<Option<(f64, f64)>> = points
+            .iter()
+            .map(|(t, v)| (!(*t as u64).is_multiple_of(13)).then_some((v - 1.0, v + 2.0)))
+            .collect();
+        let interpolated: Vec<bool> = points
+            .iter()
+            .map(|(t, _)| (*t as u64).is_multiple_of(17))
+            .collect();
+        for budget in [0, 50, 500, 3600, 5000] {
+            let width = bucket_width(0.0, 3599.0, budget);
+            for (b, f) in [
+                (None, None),
+                (Some(&bands[..]), None),
+                (Some(&bands[..]), Some(&interpolated[..])),
+            ] {
+                let mut expected = reduce_boxplot(&points, b, f, budget, IQR);
+                if let Some(w) = width.filter(|_| points.len() > budget) {
+                    for e in &mut expected {
+                        let one: Vec<f64> = points
+                            .iter()
+                            .map(|(t, _)| *t)
+                            .filter(|t| (t / w).floor() * w == e.t)
+                            .collect();
+                        if let [t] = one[..] {
+                            e.t = t;
+                        }
+                    }
+                }
+                assert_eq!(reduced(&points, b, f, width), expected, "budget {budget}");
+            }
+        }
+    }
+
+    /// A series over part of the range takes the range's buckets, as every
+    /// other series of the query does.
+    #[test]
+    fn a_short_series_takes_the_ranges_buckets() {
+        let width = bucket_width(0.0, 3599.0, 60);
+        assert_eq!(width, Some(60.0));
+        let points: Vec<(f64, f64)> = (600..720u64).map(|t| (t as f64, 1.0)).collect();
+        let out = reduced(&points, None, None, width);
+        assert_eq!(
+            out.iter().map(|p| p.t).collect::<Vec<_>>(),
+            vec![600.0, 660.0]
+        );
+    }
+
+    /// The budget holds for points closer together than the query's step.
+    #[test]
+    fn points_off_the_step_grid_keep_to_the_budget() {
+        let width = bucket_width(1.0, 600.0, 50);
+        let points: Vec<(f64, f64)> = (1..600u64).map(|t| (t as f64, t as f64)).collect();
+        let mut r = BucketReducer::new(width, IQR);
+        for (t, v) in &points {
+            r.push(*t, *v, None, false);
+        }
+        let s = r.finish(HashMap::new(), 60.0, &DisplayOptions::default());
+        assert!(s.points.len() <= 51, "{} points", s.points.len());
+        assert!(s.decimated);
+    }
+
+    /// A series sparser than the buckets keeps each point at its own time
+    /// and is not marked decimated.
+    #[test]
+    fn a_point_alone_in_its_bucket_keeps_its_time() {
+        let width = bucket_width(0.0, 3600.0, 500);
+        let points: Vec<(f64, f64)> = (0..360u64).map(|k| ((3 + 10 * k) as f64, 1.0)).collect();
+        let mut r = BucketReducer::new(width, IQR);
+        for (t, v) in &points {
+            r.push(*t, *v, Some((0.5, 1.5)), false);
+        }
+        let s = r.finish(HashMap::new(), 1.0, &DisplayOptions::default());
+        assert!(!s.decimated);
+        assert_eq!(
+            s.points.iter().map(|p| p.t).collect::<Vec<_>>(),
+            points.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (s.points[0].unc_lo, s.points[0].unc_hi),
+            (Some(0.5), Some(1.5))
         );
     }
 }

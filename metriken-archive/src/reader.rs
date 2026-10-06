@@ -1816,6 +1816,29 @@ impl MetricsSource for ArchiveReader {
             .as_dyn()
             .query_range_opts(expr, start_s, end_s, step_s, opts)
     }
+    /// Routed as [`query_range_opts`](Self::query_range_opts) is, with the
+    /// same evaluation timestamps.
+    fn query_range_display_opts(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &metriken_query::DisplayOptions,
+        qopts: &QueryOptions,
+    ) -> Result<metriken_query::DisplayResult, QueryError> {
+        let aligned;
+        let qopts = match self.cross_cadence_eval_timestamps(expr, step_s, qopts.rate_mode) {
+            Some(points) => {
+                aligned = qopts.clone().with_eval_timestamps(Some(points));
+                &aligned
+            }
+            None => qopts,
+        };
+        self.route(expr)?
+            .as_dyn()
+            .query_range_display_opts(expr, start_s, end_s, step_s, opts, qopts)
+    }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
         self.route(expr)?.as_dyn().query(expr, time)
     }

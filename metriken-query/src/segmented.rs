@@ -1131,8 +1131,11 @@ impl SegmentedSource {
         name: &str,
         filter: &Labels,
         request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
-        use crate::batch_rate::{Grid, Grouped, PerSeries, Sample, SeriesRate, Sink};
+    ) -> Option<crate::batch_rate::GridRates> {
+        use crate::batch_rate::{
+            Compact, DisplaySink, Grid, GridRates, Grouped, PerSeries, Sample, SeriesRate, Sink,
+            Slot,
+        };
         if !self
             .relabel
             .as_deref()
@@ -1253,41 +1256,78 @@ impl SegmentedSource {
         for (s, rate) in rates.into_iter().enumerate() {
             part_rates[partition[s]].push(rate);
         }
-        enum PartSink {
+        enum PartSink<'d> {
             Series(PerSeries),
-            Groups(Grouped),
+            Groups(Grouped<Slot>),
+            Display(DisplaySink<'d>),
+            GroupsDisplay(Grouped<Compact>),
         }
-        impl PartSink {
+        impl PartSink<'_> {
             fn sink(&mut self) -> &mut dyn Sink {
                 match self {
                     PartSink::Series(s) => s,
                     PartSink::Groups(g) => g,
+                    PartSink::Display(d) => d,
+                    PartSink::GroupsDisplay(g) => g,
                 }
             }
         }
         let mut sinks: Vec<PartSink> = members
             .iter()
             .map(|m| match &groups {
-                Some((op, (glabels, group_of))) => PartSink::Groups(Grouped::new(
-                    *op,
-                    glabels.clone(),
-                    m.iter().map(|s| group_of[*s]).collect(),
-                    &grid,
-                )),
-                None => PartSink::Series(PerSeries {
-                    points: vec![Vec::new(); m.len()],
-                }),
+                Some((op, (glabels, group_of))) => {
+                    let group_of: Vec<usize> = m.iter().map(|s| group_of[*s]).collect();
+                    match request.display {
+                        Some(_) => PartSink::GroupsDisplay(Grouped::new(
+                            *op,
+                            glabels.clone(),
+                            group_of,
+                            &grid,
+                        )),
+                        None => {
+                            PartSink::Groups(Grouped::new(*op, glabels.clone(), group_of, &grid))
+                        }
+                    }
+                }
+                None => match request.display {
+                    Some(display) => PartSink::Display(DisplaySink {
+                        reducers: (0..m.len())
+                            .map(|_| {
+                                crate::display::BucketReducer::new(display.width, display.band)
+                            })
+                            .collect(),
+                        display,
+                    }),
+                    None => PartSink::Series(PerSeries {
+                        points: vec![Vec::new(); m.len()],
+                    }),
+                },
             })
             .collect();
 
-        // A segment's samples, in row order, bucketed by partition and named
-        // by their series' index within it.
+        // A segment's decoded columns, and which series each row of each
+        // read column is. The partition threads read the samples from the
+        // columns, each taking its own series' rows.
         let segments: Vec<u32> = plans.keys().copied().collect();
+        enum RowSeries {
+            /// Every row is this series (a wide column).
+            One(u32),
+            /// Row `r` is series `v[r]`, or none when `u32::MAX` (a long
+            /// column, by occupant); empty for a column with neither.
+            PerRow(Vec<u32>),
+        }
+        struct SegmentRows {
+            seg: u32,
+            columns: crate::parquet::BatchColumns,
+            /// The read columns, in the order of `series`'s inner vec.
+            cols: Vec<u32>,
+            /// Per batch, per read column.
+            series: Vec<Vec<RowSeries>>,
+        }
         // `Ok(None)` for a segment that is gone, as the per-series path
         // skips it; `Err` for one that cannot be read, which ends the batch
         // read.
-        type Buckets = Vec<Vec<(u32, Sample)>>;
-        type Read = Result<Option<Buckets>, ()>;
+        type Read = Result<Option<SegmentRows>, ()>;
         let read = |seg: u32| -> Read {
             let reader = match self.segment(seg as usize) {
                 Ok(Some(r)) => r,
@@ -1298,8 +1338,10 @@ impl SegmentedSource {
                 }
             };
             let plan = &plans[&seg];
+            let mut read_cols: Vec<u32> = Vec::new();
             let mut cols: Vec<usize> = Vec::new();
             for (col, p) in plan {
+                read_cols.push(*col);
                 cols.push(*col as usize);
                 cols.extend(p.begin.map(|c| c as usize));
                 cols.extend(p.width.map(|c| c as usize));
@@ -1307,74 +1349,115 @@ impl SegmentedSource {
             let Some(columns) = reader.batch_columns(&cols, start, end) else {
                 return Err(());
             };
-            let mut buckets: Vec<Vec<(u32, Sample)>> = vec![Vec::new(); parts];
-            let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
-                a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
-            };
-            for batch in &columns.batches {
-                let Some(ts) = columns.u64s(batch, columns.ts) else {
-                    continue;
-                };
-                let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
-                let occupant = columns.occupant.and_then(|c| columns.u64s(batch, c));
-                for (col, p) in plan {
-                    let Some(values) = columns.u64s(batch, *col as usize) else {
-                        continue;
-                    };
-                    let begin = p.begin.and_then(|c| columns.i64s(batch, c as usize));
-                    let width = p.width.and_then(|c| columns.u64s(batch, c as usize));
-                    let windowed = (begin.is_some() && width.is_some()) || duration.is_some();
-                    for r in 0..batch.num_rows() {
-                        let series = match (p.wide, occupant) {
-                            (Some(s), _) if p.long.is_empty() => s,
-                            (_, Some(occ)) => {
-                                match get(Some(occ), r).and_then(|o| p.long.get(&o)) {
-                                    Some(s) => *s,
-                                    None => continue,
-                                }
+            let series = columns
+                .batches
+                .iter()
+                .map(|batch| {
+                    let occupant = columns.occupant.and_then(|c| columns.u64s(batch, c));
+                    read_cols
+                        .iter()
+                        .map(|col| {
+                            let p = &plan[col];
+                            match (p.wide, occupant) {
+                                (Some(s), _) if p.long.is_empty() => RowSeries::One(s as u32),
+                                (_, Some(occ)) => RowSeries::PerRow(
+                                    (0..batch.num_rows())
+                                        .map(|r| {
+                                            (!arrow::array::Array::is_null(occ, r))
+                                                .then(|| p.long.get(&occ.value(r)))
+                                                .flatten()
+                                                .map_or(u32::MAX, |s| *s as u32)
+                                        })
+                                        .collect(),
+                                ),
+                                _ => RowSeries::PerRow(Vec::new()),
                             }
-                            _ => continue,
-                        };
-                        let (Some(base), Some(value)) = (get(Some(ts), r), get(Some(values), r))
-                        else {
-                            continue;
-                        };
-                        if base < start || base > end {
-                            continue;
-                        }
-                        let window = windowed.then(|| {
-                            let bo = begin.and_then(|b| {
-                                (!arrow::array::Array::is_null(b, r)).then(|| b.value(r))
-                            });
-                            crate::parquet::resolve_window(
-                                base,
-                                bo,
-                                get(width, r),
-                                get(duration, r),
-                            )
-                        });
-                        buckets[partition[series]].push((
-                            local[series],
-                            Sample {
-                                ts: base,
-                                value,
-                                window,
-                            },
-                        ));
-                    }
-                }
-            }
-            Ok(Some(buckets))
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(Some(SegmentRows {
+                seg,
+                columns,
+                cols: read_cols,
+                series,
+            }))
         };
         for chunk in segments.chunks(batch_threads()) {
-            let read_chunk: Vec<Option<Buckets>> = read_all(chunk, &read)
+            let read_chunk: Vec<Option<SegmentRows>> = read_all(chunk, &read)
                 .into_iter()
                 .collect::<Result<_, ()>>()
                 .ok()?;
-            let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, p: usize| {
-                for buckets in read_chunk.iter().flatten() {
-                    for (s, sample) in &buckets[p] {
-                        rates[*s as usize].push(*sample, &grid, *s as usize, sink.sink());
+            let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
+                let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
+                    a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
+                };
+                for rows in read_chunk.iter().flatten() {
+                    let columns = &rows.columns;
+                    let plan = &plans[&rows.seg];
+                    for (batch, series) in columns.batches.iter().zip(&rows.series) {
+                        let Some(ts) = columns.u64s(batch, columns.ts) else {
+                            continue;
+                        };
+                        let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
+                        for (col, series) in rows.cols.iter().zip(series) {
+                            let p = &plan[col];
+                            let Some(values) = columns.u64s(batch, *col as usize) else {
+                                continue;
+                            };
+                            let begin = p.begin.and_then(|c| columns.i64s(batch, c as usize));
+                            let width = p.width.and_then(|c| columns.u64s(batch, c as usize));
+                            let windowed =
+                                (begin.is_some() && width.is_some()) || duration.is_some();
+                            let mut push = |r: usize, series: usize| {
+                                let (Some(base), Some(value)) =
+                                    (get(Some(ts), r), get(Some(values), r))
+                                else {
+                                    return;
+                                };
+                                if base < start || base > end {
+                                    return;
+                                }
+                                let window = windowed.then(|| {
+                                    let bo = begin.and_then(|b| {
+                                        (!arrow::array::Array::is_null(b, r)).then(|| b.value(r))
+                                    });
+                                    crate::parquet::resolve_window(
+                                        base,
+                                        bo,
+                                        get(width, r),
+                                        get(duration, r),
+                                    )
+                                });
+                                let s = local[series] as usize;
+                                rates[s].push(
+                                    Sample {
+                                        ts: base,
+                                        value,
+                                        window,
+                                    },
+                                    &grid,
+                                    s,
+                                    sink.sink(),
+                                );
+                            };
+                            match series {
+                                RowSeries::One(s) => {
+                                    if partition[*s as usize] == part {
+                                        for r in 0..batch.num_rows() {
+                                            push(r, *s as usize);
+                                        }
+                                    }
+                                }
+                                RowSeries::PerRow(v) => {
+                                    for (r, s) in v.iter().enumerate() {
+                                        if *s != u32::MAX && partition[*s as usize] == part {
+                                            push(r, *s as usize);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             };
@@ -1387,35 +1470,80 @@ impl SegmentedSource {
         };
         run_partitions(&mut part_rates, &mut sinks, &finish);
 
+        // Each series' result, in the order of `labels`, from the
+        // partitions' per-series results.
+        fn in_order<T: Default>(
+            labels: Vec<Labels>,
+            mut parts: Vec<Vec<T>>,
+            partition: &[usize],
+            local: &[u32],
+        ) -> Vec<(Labels, T)> {
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(s, l)| {
+                    (
+                        l,
+                        std::mem::take(&mut parts[partition[s]][local[s] as usize]),
+                    )
+                })
+                .collect()
+        }
         Some(match groups {
-            Some(_) => {
+            Some(_) if request.display.is_some() => {
                 let mut sinks = sinks.into_iter().map(|s| match s {
-                    PartSink::Groups(g) => g,
-                    PartSink::Series(_) => unreachable!("grouped sinks"),
+                    PartSink::GroupsDisplay(g) => g,
+                    _ => unreachable!("grouped display sinks"),
                 });
                 let mut all = sinks.next()?;
                 for g in sinks {
                     all.merge(g);
                 }
-                all.finish(&grid)
+                GridRates::Display(all.finish_display(&grid, request.display?))
+            }
+            Some(_) => {
+                let mut sinks = sinks.into_iter().map(|s| match s {
+                    PartSink::Groups(g) => g,
+                    _ => unreachable!("grouped sinks"),
+                });
+                let mut all = sinks.next()?;
+                for g in sinks {
+                    all.merge(g);
+                }
+                GridRates::Points(all.finish(&grid))
+            }
+            None if request.display.is_some() => {
+                let reducers: Vec<Vec<Option<crate::display::BucketReducer>>> = sinks
+                    .into_iter()
+                    .map(|s| match s {
+                        PartSink::Display(d) => d.reducers.into_iter().map(Some).collect(),
+                        _ => unreachable!("display sinks"),
+                    })
+                    .collect();
+                GridRates::Display(
+                    in_order(labels, reducers, &partition, &local)
+                        .into_iter()
+                        .map(|(l, r)| (l, r.expect("each series' reducer, once")))
+                        .collect(),
+                )
             }
             None => {
-                let mut points: Vec<Vec<Vec<crate::promql::streaming::Point>>> = sinks
+                let points: Vec<Vec<Vec<crate::promql::streaming::Point>>> = sinks
                     .into_iter()
                     .map(|s| match s {
                         PartSink::Series(p) => p.points,
-                        PartSink::Groups(_) => unreachable!("per-series sinks"),
+                        _ => unreachable!("per-series sinks"),
                     })
                     .collect();
-                labels
-                    .into_iter()
-                    .enumerate()
-                    .map(|(s, l)| {
-                        let mut p = std::mem::take(&mut points[partition[s]][local[s] as usize]);
-                        p.shrink_to_fit();
-                        (l, p)
-                    })
-                    .collect()
+                GridRates::Points(
+                    in_order(labels, points, &partition, &local)
+                        .into_iter()
+                        .map(|(l, mut p)| {
+                            p.shrink_to_fit();
+                            (l, p)
+                        })
+                        .collect(),
+                )
             }
         })
     }
@@ -1748,7 +1876,7 @@ impl DataSource for SegmentedSource {
         name: &str,
         filter: &Labels,
         request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<crate::promql::streaming::LabeledPoints>> {
+    ) -> Option<crate::batch_rate::GridRates> {
         self.grid_rates(name, filter, request)
     }
 
@@ -2103,6 +2231,19 @@ impl MetricsSource for SegmentedParquetReader {
     ) -> Result<QueryResult, QueryError> {
         self.engine
             .query_range_opts(expr, start_s, end_s, step_s, opts)
+    }
+
+    fn query_range_display_opts(
+        &self,
+        expr: &str,
+        start_s: f64,
+        end_s: f64,
+        step_s: f64,
+        opts: &crate::DisplayOptions,
+        qopts: &QueryOptions,
+    ) -> Result<crate::DisplayResult, QueryError> {
+        self.engine
+            .query_range_display_opts(expr, start_s, end_s, step_s, opts, qopts)
     }
 
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
@@ -5270,5 +5411,135 @@ mod tests {
             panic!("a matrix");
         };
         assert_eq!(result[0].values, vec![(2.0, 5.0), (3.0, 15.0), (4.0, 3.0)]);
+    }
+
+    /// A display query reduces each series as the engine produces it, and
+    /// gives what reducing the full matrix gives.
+    #[test]
+    fn a_display_query_matches_reducing_the_matrix() {
+        use crate::{DisplayOptions, MetricsSource};
+        let s = 1_000_000_000u64;
+        let rows = |k: u64| -> Vec<(u64, u64)> {
+            (1..=40)
+                .filter(|t| *t != 17)
+                .map(|t| (t * s, t * t * k))
+                .collect()
+        };
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_bytes_with_pool(
+            vec![
+                segment("cpu_cycles", &[("id", "0")], &rows(1)[..20]),
+                segment("cpu_cycles", &[("id", "1")], &rows(3)[..20]),
+                segment("cpu_cycles", &[("id", "0")], &rows(1)[20..]),
+                segment("cpu_cycles", &[("id", "1")], &rows(3)[20..]),
+            ],
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        let windows: Vec<WindowRow> = (1..=40u64)
+            .filter(|t| !(15..=20).contains(t))
+            .map(|t| {
+                let w = (t != 9).then_some(100_000_000);
+                (t * s, t * t, 300, w.map(|_| -50_000_000), w)
+            })
+            .collect();
+        let windowed_pool = BufferPool::new(64 * 1024 * 1024);
+        let windowed = SegmentedParquetReader::open_bytes_with_pool(
+            vec![
+                segment_with_windows(&windows[..17], true),
+                segment_with_windows(&windows[17..], true),
+            ],
+            Arc::clone(&windowed_pool),
+        )
+        .unwrap();
+        // Flat from 10 s to 20 s: a zero rate, which `1 / rate` drops.
+        let flat_rows: Vec<(u64, u64)> = (1..=40u64)
+            .map(|t| (t * s, t.clamp(10, 20) * 7 + t.saturating_sub(20) * 3))
+            .collect();
+        let flat = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_cycles", &[("id", "0")], &flat_rows)],
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        // Enough series that one group is spread across partitions.
+        let many = SegmentedParquetReader::open_bytes_with_pool(
+            (0..20u64)
+                .map(|id| {
+                    let id_s = id.to_string();
+                    segment("cpu_cycles", &[("id", id_s.as_str())], &rows(id + 1))
+                })
+                .collect(),
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let options = [
+            crate::QueryOptions::default(),
+            crate::QueryOptions::default().with_per_series_rates(true),
+            crate::QueryOptions::with_rate_mode(crate::RateMode::Raw),
+            crate::QueryOptions::default()
+                .with_eval_timestamps(Some((1..=13u64).map(|k| k * 3 * s).collect())),
+        ];
+        let displays = || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
+        // The per-series path gives `by` groups in no fixed order, so the
+        // series are compared as a set.
+        let sorted = |d: &crate::DisplayResult| {
+            let mut v = serde_json::to_value(d).unwrap();
+            if let Some(series) = v["result"].as_array_mut() {
+                series.sort_by_key(|s| s["metric"].to_string());
+            }
+            v
+        };
+        // Whether the source computes the display query as it reads, with
+        // the default options.
+        for (r, q, as_read) in [
+            (&r, "rate(cpu_cycles[1s])", true),
+            (&r, "sum(irate(cpu_cycles[1s]))", true),
+            (&windowed, "rate(cpu_cycles[1s])", true),
+            (&windowed, "irate(cpu_cycles[1s]) / 1000", true),
+            (&windowed, "2 * (rate(cpu_cycles[1s]) - 3)", true),
+            (&windowed, "1 / rate(cpu_cycles[1s])", true),
+            (&windowed, "sum(irate(cpu_cycles[1s])) * 2", true),
+            (&r, "sum by (id) (rate(cpu_cycles[2s]))", true),
+            (&r, "irate(cpu_cycles[1s]) - 40", true),
+            (&r, "5 - irate(cpu_cycles[1s])", true),
+            (&r, "irate(cpu_cycles[1s]) * 2", true),
+            (&windowed, "avg(irate(cpu_cycles[1s]))", true),
+            (&r, "min(irate(cpu_cycles[1s]))", true),
+            (&r, "max by (id) (irate(cpu_cycles[1s]))", true),
+            (&r, "count(irate(cpu_cycles[1s]))", true),
+            (&r, "sum without (id) (irate(cpu_cycles[1s])) / 1000", true),
+            (&r, "sum(irate(cpu_cycles[1s]) * 2)", false),
+            (&flat, "1 / rate(cpu_cycles[1s])", true),
+            (&flat, "sum(1 / rate(cpu_cycles[1s]))", false),
+            (&many, "sum(irate(cpu_cycles[1s]))", true),
+            (&many, "avg by (id) (irate(cpu_cycles[1s]))", true),
+            (&r, "rate(not_a_metric[1s])", false),
+        ] {
+            for budget in [0, 5, 50] {
+                let display = DisplayOptions {
+                    budget,
+                    ..Default::default()
+                };
+                for (o, qopts) in options.iter().enumerate() {
+                    let before = displays();
+                    let streamed = r.query_range_display_opts(q, 1.0, 40.0, 1.0, &display, qopts);
+                    assert_eq!(
+                        displays() > before,
+                        as_read && o == 0,
+                        "{q} options {o}: computed as read"
+                    );
+                    let reduced = r
+                        .query_range_opts(q, 1.0, 40.0, 1.0, qopts)
+                        .map(|m| crate::display::display_from_result(m, 1.0, 40.0, 1.0, &display));
+                    match (streamed, reduced) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(sorted(&a), sorted(&b), "{q} options {o} budget {budget}")
+                        }
+                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{q}"),
+                        (a, b) => panic!("{q} options {o}: {a:?} against {b:?}"),
+                    }
+                }
+            }
+        }
     }
 }

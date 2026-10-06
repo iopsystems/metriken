@@ -279,7 +279,7 @@ pub(crate) trait DataSource: Send + Sync {
         name: &str,
         filter: &Labels,
         request: &batch_rate::GridRateRequest<'_>,
-    ) -> Option<Vec<promql::streaming::LabeledPoints>> {
+    ) -> Option<batch_rate::GridRates> {
         let _ = (name, filter, request);
         None
     }
@@ -412,22 +412,30 @@ pub trait MetricsSource: Send + Sync {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError>;
 
-    /// Execute a PromQL range query in *display* mode: evaluate at native
-    /// resolution (`step_s`), then decimate each result series per `opts`
-    /// (see [`DisplayOptions`]) into per-bucket boxplots — a robust median
-    /// line, a configurable inner band, and a hard min/max envelope so
-    /// short-lived spikes survive the downsample.
+    /// Execute a PromQL range query in display mode: evaluate at `step_s`,
+    /// then reduce each result series per `opts` (see [`DisplayOptions`])
+    /// into per-bucket boxplots: a median line, a configurable inner band,
+    /// and a min/max envelope that keeps short spikes visible.
     ///
-    /// Only `Matrix` results are decimated (into `Series`); heatmap, scalar,
-    /// and vector results pass through unchanged. `opts.budget == 0` disables
-    /// decimation (full resolution). Analysis consumers that recompute on the
-    /// data should call [`query_range`](Self::query_range) instead — the
-    /// envelope is lossy for anything but display.
+    /// Every series is cut into buckets of one width, aligned to multiples
+    /// of it: the smallest of 1, 2, 5, 10, 15, 20 or 30 s, 1, 2, 5, 10, 15 or
+    /// 30 min, 1, 2, 3, 6 or 12 h, or a whole number of days, at least
+    /// `(end_s - start_s) / opts.budget`. A bucket holding one point gives
+    /// that point at its own time, so a series no denser than the buckets is
+    /// returned as it is. `opts.budget == 0`, or `end_s <= start_s`, returns
+    /// full resolution.
     ///
-    /// The default implementation post-processes [`query_range`](Self::query_range),
-    /// so it works for every backend without per-impl code. (A future
-    /// engine-level optimization could decimate before materializing the full
-    /// matrix, saving memory on long recordings.)
+    /// Only `Matrix` results are reduced (into `Series`); heatmap, scalar
+    /// and vector results pass through unchanged. Analysis consumers that
+    /// recompute on the data should call [`query_range`](Self::query_range)
+    /// instead.
+    ///
+    /// The default implementation reduces the result of
+    /// [`query_range_opts`](Self::query_range_opts). The readers in this
+    /// crate reduce each series of a streamed expression as it is collected;
+    /// histogram functions are evaluated in full and then reduced. A source
+    /// that wraps one of them should forward
+    /// [`query_range_display_opts`](Self::query_range_display_opts) to it.
     fn query_range_display(
         &self,
         expr: &str,
@@ -439,10 +447,8 @@ pub trait MetricsSource: Send + Sync {
         self.query_range_display_opts(expr, start_s, end_s, step_s, opts, &QueryOptions::default())
     }
 
-    /// Display-mode range query with explicit [`QueryOptions`]. Mirrors
-    /// [`query_range_display`](Self::query_range_display), post-processing
-    /// [`query_range_opts`](Self::query_range_opts) so the rate mode threads
-    /// through decimation. The default works for every backend.
+    /// [`query_range_display`](Self::query_range_display) with explicit
+    /// [`QueryOptions`].
     fn query_range_display_opts(
         &self,
         expr: &str,
@@ -452,47 +458,10 @@ pub trait MetricsSource: Send + Sync {
         opts: &DisplayOptions,
         qopts: &QueryOptions,
     ) -> Result<DisplayResult, QueryError> {
-        match self.query_range_opts(expr, start_s, end_s, step_s, qopts)? {
-            QueryResult::Matrix { result } => {
-                let series = result
-                    .into_iter()
-                    .map(|s| {
-                        let raw_points = s.values.len() as u64;
-                        // `bands`, not `intervals`: the legacy field is
-                        // all-or-nothing and goes absent for the whole series
-                        // as soon as one point lacks a band, which is exactly
-                        // what a hole causes — display mode would then show no
-                        // uncertainty at all for a series that has it almost
-                        // everywhere.
-                        let points = opts.reducer.reduce(
-                            &s.values,
-                            s.bands.as_deref(),
-                            s.interpolated.as_deref(),
-                            opts.budget,
-                            opts.band,
-                        );
-                        DisplaySeries {
-                            decimated: (points.len() as u64) < raw_points,
-                            metric: s.metric,
-                            points,
-                            native_interval: step_s,
-                            raw_points,
-                            reducer: opts.reducer,
-                            band: opts.band,
-                        }
-                    })
-                    .collect();
-                Ok(DisplayResult::Series {
-                    result: series,
-                    budget: opts.budget as u32,
-                })
-            }
-            QueryResult::HistogramHeatmap { result } => {
-                Ok(DisplayResult::HistogramHeatmap { result })
-            }
-            QueryResult::Scalar { result } => Ok(DisplayResult::Scalar { result }),
-            QueryResult::Vector { result } => Ok(DisplayResult::Vector { result }),
-        }
+        let result = self.query_range_opts(expr, start_s, end_s, step_s, qopts)?;
+        Ok(display::display_from_result(
+            result, start_s, end_s, step_s, opts,
+        ))
     }
 
     /// Execute an instant PromQL query at a single timestamp (uses the latest

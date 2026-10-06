@@ -49,7 +49,9 @@ mod tests;
 
 pub(crate) use aggregate::derive_group_labels;
 pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
-pub(crate) use binary::{interval_binop, matrix_matrix_op, matrix_scalar_op, BinOp, MatchSpec};
+pub(crate) use binary::{
+    interval_binop, matrix_matrix_op, matrix_scalar_op, scalar_point, BinOp, MatchSpec,
+};
 pub(crate) use deriv::StreamingDeriv;
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
 pub(crate) use rate::{CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
@@ -153,6 +155,42 @@ pub type SeriesSet<'a> = Vec<LabeledSeries<'a>>;
 /// A series' labels and its points, computed in one pass by a source; see
 /// [`crate::batch_rate`].
 pub(crate) type LabeledPoints = (crate::labels::Labels, Vec<Point>);
+
+/// Boundary collector for display mode, for a query over `[start_s,
+/// end_s]` at `step_s`: each series is reduced as its points are pulled,
+/// holding one bucket of them, so the full-resolution matrix is never built.
+/// Gives what [`collect_to_matrix`] followed by
+/// [`crate::display::display_from_result`] gives.
+pub(crate) fn collect_to_display(
+    streaming: SeriesSet<'_>,
+    metric_name: Option<&str>,
+    start_s: f64,
+    end_s: f64,
+    step_s: f64,
+    opts: &crate::DisplayOptions,
+) -> Vec<crate::DisplaySeries> {
+    let width = crate::display::bucket_width(start_s, end_s, opts.budget);
+    streaming
+        .into_iter()
+        .filter_map(|ls| {
+            let mut r = crate::display::BucketReducer::new(width, opts.band);
+            for p in ls.iter {
+                r.push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
+            }
+            if r.is_empty() {
+                return None;
+            }
+            let mut metric: HashMap<String, String> = HashMap::new();
+            if let Some(name) = metric_name {
+                metric.insert("__name__".to_string(), name.to_string());
+            }
+            for (k, v) in ls.labels.inner.iter() {
+                metric.insert(k.clone(), v.clone());
+            }
+            Some(r.finish(metric, step_s, opts))
+        })
+        .collect()
+}
 
 /// Boundary collector: drain a streaming result into the same
 /// `MatrixSample` shape the eager engine returns.

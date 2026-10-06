@@ -14,9 +14,11 @@
 
 use std::collections::VecDeque;
 
+use crate::display::BucketReducer;
 use crate::labels::Labels;
 use crate::promql::streaming::{
-    derive_group_labels, AggOp, GroupBy, Point, RateEdges, SPACING_PROBE,
+    derive_group_labels, scalar_point, AggOp, BinOp, GroupBy, LabeledPoints, Point, RateEdges,
+    SPACING_PROBE,
 };
 
 /// What the dispatcher asks a source for.
@@ -33,6 +35,27 @@ pub(crate) struct GridRateRequest<'a> {
     pub span_ns: u64,
     /// Aggregate the series, or `None` for one result per series.
     pub group: Option<(AggOp, GroupBy<'a>)>,
+    /// Reduce each series for display as its points are computed, or
+    /// `None` for the points.
+    pub display: Option<&'a GridDisplay>,
+}
+
+/// A display reduction applied while rates are computed.
+pub(crate) struct GridDisplay {
+    /// See [`BucketReducer::new`].
+    pub width: Option<f64>,
+    pub band: [f64; 2],
+    /// Scalar ops applied to each point before it is reduced, innermost
+    /// first: `(op, scalar, scalar_first)` as `scalar_point` takes them.
+    pub ops: Vec<(BinOp, f64, bool)>,
+}
+
+/// What a source computes for a [`GridRateRequest`].
+pub(crate) enum GridRates {
+    /// Each series' or group's points.
+    Points(Vec<LabeledPoints>),
+    /// Each series reduced for display, for a request with `display`.
+    Display(Vec<(Labels, BucketReducer)>),
 }
 
 #[derive(Clone, Copy)]
@@ -365,9 +388,74 @@ impl Sink for PerSeries {
     }
 }
 
-/// What `MergeReduce` accumulates for one group at one grid point.
+/// One reducer per series, fed each point after the request's scalar ops.
+pub(crate) struct DisplaySink<'d> {
+    pub reducers: Vec<BucketReducer>,
+    pub display: &'d GridDisplay,
+}
+
+impl Sink for DisplaySink<'_> {
+    fn emit(&mut self, series: usize, _index: usize, point: Point) {
+        let mut point = Some(point);
+        for (op, scalar, scalar_first) in &self.display.ops {
+            point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
+        }
+        if let Some(p) = point {
+            self.reducers[series].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
+        }
+    }
+}
+
+/// What a group accumulates at one grid point, reducing as `MergeReduce`
+/// does.
+pub(crate) trait Accum: Copy + Default + Send {
+    /// Add a member's point.
+    fn add(&mut self, op: AggOp, p: &Point);
+    /// Fold in `other`, the same grid point's accumulator for other members.
+    fn merge(&mut self, op: AggOp, other: &Self);
+    /// Members added.
+    fn count(&self) -> u32;
+    /// The group's point at `t`; only for an accumulator with members.
+    fn point(&self, op: AggOp, t: u64) -> Point;
+}
+
+/// The value, band and flags `MergeReduce` gives for an accumulated point.
+fn group_point(
+    op: AggOp,
+    t: u64,
+    (sum, min, max, count): (f64, f64, f64, u32),
+    (lo, hi, any_bounded, any_interpolated): (f64, f64, bool, bool),
+    edges: Option<RateEdges>,
+) -> Point {
+    let v = match op {
+        AggOp::Sum => sum,
+        AggOp::Avg => sum / count as f64,
+        AggOp::Min => min,
+        AggOp::Max => max,
+        AggOp::Count => count as f64,
+    };
+    let bounds = if any_bounded && !any_interpolated {
+        match op {
+            AggOp::Sum => Some((lo, hi)),
+            AggOp::Avg => Some((lo / count as f64, hi / count as f64)),
+            AggOp::Min | AggOp::Max | AggOp::Count => None,
+        }
+    } else {
+        None
+    };
+    Point {
+        t,
+        v,
+        bounds,
+        edges,
+        interpolated: any_interpolated,
+    }
+}
+
+/// Everything `MergeReduce` keeps, including the members' window edges, which
+/// a binary op against another table needs.
 #[derive(Clone, Copy)]
-struct Slot {
+pub(crate) struct Slot {
     sum: f64,
     count: u32,
     min: f64,
@@ -397,22 +485,156 @@ impl Default for Slot {
     }
 }
 
+impl Accum for Slot {
+    fn add(&mut self, _op: AggOp, p: &Point) {
+        let v = p.v;
+        if self.count == 0 {
+            self.edges = p.edges;
+        } else if self.edges != p.edges {
+            self.unanimous = false;
+        }
+        self.sum += v;
+        self.count += 1;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        let (lo, hi) = p.bounds.unwrap_or((v, v));
+        self.lo += lo;
+        self.hi += hi;
+        self.any_bounded |= p.bounds.is_some();
+        self.any_interpolated |= p.interpolated;
+    }
+
+    fn merge(&mut self, _op: AggOp, b: &Self) {
+        if b.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = *b;
+            return;
+        }
+        self.unanimous = self.unanimous && b.unanimous && self.edges == b.edges;
+        self.sum += b.sum;
+        self.count += b.count;
+        self.min = self.min.min(b.min);
+        self.max = self.max.max(b.max);
+        self.lo += b.lo;
+        self.hi += b.hi;
+        self.any_bounded |= b.any_bounded;
+        self.any_interpolated |= b.any_interpolated;
+    }
+
+    fn count(&self) -> u32 {
+        self.count
+    }
+
+    fn point(&self, op: AggOp, t: u64) -> Point {
+        group_point(
+            op,
+            t,
+            (self.sum, self.min, self.max, self.count),
+            (self.lo, self.hi, self.any_bounded, self.any_interpolated),
+            if self.unanimous { self.edges } else { None },
+        )
+    }
+}
+
+/// What a display needs of a group's point: the op's value, the band and
+/// the flags, without the window edges: 32 bytes, against 88 for a
+/// [`Slot`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Compact {
+    /// The sum for `Sum` and `Avg`, the minimum for `Min`, the maximum for
+    /// `Max`; unused for `Count`.
+    v: f64,
+    lo: f64,
+    hi: f64,
+    count: u32,
+    any_bounded: bool,
+    any_interpolated: bool,
+}
+
+impl Compact {
+    /// `a` and `b` combined as `op` combines values.
+    fn combine(op: AggOp, a: f64, b: f64) -> f64 {
+        match op {
+            AggOp::Sum | AggOp::Avg | AggOp::Count => a + b,
+            AggOp::Min => a.min(b),
+            AggOp::Max => a.max(b),
+        }
+    }
+
+    /// `v` before any member, as [`Slot`] starts each of its fields.
+    fn empty(op: AggOp) -> f64 {
+        match op {
+            AggOp::Min => f64::INFINITY,
+            AggOp::Max => f64::NEG_INFINITY,
+            AggOp::Sum | AggOp::Avg | AggOp::Count => 0.0,
+        }
+    }
+}
+
+impl Accum for Compact {
+    fn add(&mut self, op: AggOp, p: &Point) {
+        if self.count == 0 {
+            self.v = Self::empty(op);
+        }
+        let v = p.v;
+        self.v = Self::combine(op, self.v, v);
+        self.count += 1;
+        let (lo, hi) = p.bounds.unwrap_or((v, v));
+        self.lo += lo;
+        self.hi += hi;
+        self.any_bounded |= p.bounds.is_some();
+        self.any_interpolated |= p.interpolated;
+    }
+
+    fn merge(&mut self, op: AggOp, b: &Self) {
+        if b.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = *b;
+            return;
+        }
+        self.v = Self::combine(op, self.v, b.v);
+        self.count += b.count;
+        self.lo += b.lo;
+        self.hi += b.hi;
+        self.any_bounded |= b.any_bounded;
+        self.any_interpolated |= b.any_interpolated;
+    }
+
+    fn count(&self) -> u32 {
+        self.count
+    }
+
+    fn point(&self, op: AggOp, t: u64) -> Point {
+        group_point(
+            op,
+            t,
+            (self.v, self.v, self.v, self.count),
+            (self.lo, self.hi, self.any_bounded, self.any_interpolated),
+            None,
+        )
+    }
+}
+
 /// Grid points per block of accumulators.
 const BLOCK: usize = 1024;
 
-/// Accumulators per group and grid point, reducing as `MergeReduce` does. A
-/// group's accumulators are allocated in blocks of [`BLOCK`] grid points, a
-/// block when a point first reaches it, so a group with points in a short
-/// stretch holds that stretch.
-pub(crate) struct Grouped {
+/// Accumulators per group and grid point. A group's accumulators are
+/// allocated in blocks of [`BLOCK`] grid points, a block when a point first
+/// reaches it, so a group with points in a short stretch holds that
+/// stretch.
+pub(crate) struct Grouped<A> {
     op: AggOp,
     group_of: Vec<usize>,
     labels: Vec<Labels>,
-    blocks: Vec<Vec<Option<Box<[Slot]>>>>,
+    blocks: Vec<Vec<Option<Box<[A]>>>>,
     grid_len: usize,
 }
 
-impl Grouped {
+impl<A: Accum> Grouped<A> {
     /// Accumulators for groups `labels`, where series `s` (an index into
     /// what this sink is fed) belongs to group `group_of[s]`.
     pub fn new(op: AggOp, labels: Vec<Labels>, group_of: Vec<usize>, grid: &Grid) -> Self {
@@ -429,7 +651,8 @@ impl Grouped {
     }
 
     /// Fold `other`, holding the same groups for other series, into this.
-    pub fn merge(&mut self, other: Grouped) {
+    pub fn merge(&mut self, other: Grouped<A>) {
+        let op = self.op;
         for (mine, theirs) in self.blocks.iter_mut().zip(other.blocks) {
             for (mine, theirs) in mine.iter_mut().zip(theirs) {
                 let Some(theirs) = theirs else {
@@ -439,106 +662,71 @@ impl Grouped {
                     *mine = Some(theirs);
                     continue;
                 };
-                merge_block(mine, &theirs);
+                for (a, b) in mine.iter_mut().zip(theirs.iter()) {
+                    a.merge(op, b);
+                }
             }
         }
     }
 
+    /// Each group's points in order, handed to `f` with the group's index;
+    /// each block is freed once read.
+    fn drain(self, grid: &Grid, mut f: impl FnMut(usize, Point)) -> Vec<Labels> {
+        let op = self.op;
+        for (g, blocks) in self.blocks.into_iter().enumerate() {
+            for (b, block) in blocks.into_iter().enumerate() {
+                let Some(block) = block else {
+                    continue;
+                };
+                for (i, a) in block.iter().enumerate() {
+                    if a.count() > 0 {
+                        let k = b * BLOCK + i;
+                        f(g, a.point(op, grid.start_ns + k as u64 * grid.step_ns));
+                    }
+                }
+            }
+        }
+        self.labels
+    }
+
     /// Each group's points, as `MergeReduce` emits them.
     pub fn finish(self, grid: &Grid) -> Vec<(Labels, Vec<Point>)> {
-        let op = self.op;
-        self.labels
-            .into_iter()
-            .zip(self.blocks)
-            .map(|(labels, blocks)| {
-                let points = blocks
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(b, block)| block.map(|block| (b, block)))
-                    .flat_map(|(b, block)| {
-                        block
-                            .into_vec()
-                            .into_iter()
-                            .enumerate()
-                            .map(move |(i, s)| (b * BLOCK + i, s))
-                    })
-                    .filter(|(_, s)| s.count > 0)
-                    .map(|(k, s)| {
-                        let v = match op {
-                            AggOp::Sum => s.sum,
-                            AggOp::Avg => s.sum / s.count as f64,
-                            AggOp::Min => s.min,
-                            AggOp::Max => s.max,
-                            AggOp::Count => s.count as f64,
-                        };
-                        let bounds = if s.any_bounded && !s.any_interpolated {
-                            match op {
-                                AggOp::Sum => Some((s.lo, s.hi)),
-                                AggOp::Avg => Some((s.lo / s.count as f64, s.hi / s.count as f64)),
-                                AggOp::Min | AggOp::Max | AggOp::Count => None,
-                            }
-                        } else {
-                            None
-                        };
-                        Point {
-                            t: grid.start_ns + k as u64 * grid.step_ns,
-                            v,
-                            bounds,
-                            edges: if s.unanimous { s.edges } else { None },
-                            interpolated: s.any_interpolated,
-                        }
-                    })
-                    .collect();
-                (labels, points)
-            })
-            .collect()
+        let mut points: Vec<Vec<Point>> = vec![Vec::new(); self.labels.len()];
+        let labels = self.drain(grid, |g, p| points[g].push(p));
+        labels.into_iter().zip(points).collect()
+    }
+
+    /// Each group reduced for `display`, its points put through the
+    /// display's scalar ops.
+    pub fn finish_display(
+        self,
+        grid: &Grid,
+        display: &GridDisplay,
+    ) -> Vec<(Labels, BucketReducer)> {
+        let mut reducers: Vec<BucketReducer> = (0..self.labels.len())
+            .map(|_| BucketReducer::new(display.width, display.band))
+            .collect();
+        let labels = self.drain(grid, |g, p| {
+            let mut point = Some(p);
+            for (op, scalar, scalar_first) in &display.ops {
+                point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
+            }
+            if let Some(p) = point {
+                reducers[g].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
+            }
+        });
+        labels.into_iter().zip(reducers).collect()
     }
 }
 
-/// Fold block `b` into block `a`, both covering the same grid points.
-fn merge_block(a: &mut [Slot], b: &[Slot]) {
-    for (a, b) in a.iter_mut().zip(b) {
-        if b.count == 0 {
-            continue;
-        }
-        if a.count == 0 {
-            *a = *b;
-            continue;
-        }
-        a.unanimous = a.unanimous && b.unanimous && a.edges == b.edges;
-        a.sum += b.sum;
-        a.count += b.count;
-        a.min = a.min.min(b.min);
-        a.max = a.max.max(b.max);
-        a.lo += b.lo;
-        a.hi += b.hi;
-        a.any_bounded |= b.any_bounded;
-        a.any_interpolated |= b.any_interpolated;
-    }
-}
-
-impl Sink for Grouped {
+impl<A: Accum> Sink for Grouped<A> {
     fn emit(&mut self, series: usize, index: usize, p: Point) {
+        let op = self.op;
         let block = self.blocks[self.group_of[series]][index / BLOCK].get_or_insert_with(|| {
             let len = BLOCK.min(self.grid_len - index / BLOCK * BLOCK);
-            vec![Slot::default(); len].into_boxed_slice()
+            vec![A::default(); len].into_boxed_slice()
         });
-        let s = &mut block[index % BLOCK];
-        let v = p.v;
-        if s.count == 0 {
-            s.edges = p.edges;
-        } else if s.edges != p.edges {
-            s.unanimous = false;
-        }
-        s.sum += v;
-        s.count += 1;
-        s.min = s.min.min(v);
-        s.max = s.max.max(v);
-        let (lo, hi) = p.bounds.unwrap_or((v, v));
-        s.lo += lo;
-        s.hi += hi;
-        s.any_bounded |= p.bounds.is_some();
-        s.any_interpolated |= p.interpolated;
+        block[index % BLOCK].add(op, &p);
     }
 }
 
@@ -753,36 +941,41 @@ mod tests {
                 .map(|s| (s.labels, s.iter.collect()))
                 .collect();
                 let (glabels, group_of) = groups(GroupBy::Include(&by), &labels);
-                let reduce = |parts: usize, rng: &mut Rng| {
+                for parts in [1, 3] {
                     let part: Vec<usize> =
                         (0..n).map(|_| rng.below(parts as u64) as usize).collect();
-                    let mut sinks: Vec<Grouped> = (0..parts)
-                        .map(|p| {
-                            let members: Vec<usize> = (0..n).filter(|s| part[*s] == p).collect();
-                            Grouped::new(
-                                op,
-                                glabels.clone(),
-                                members.iter().map(|s| group_of[*s]).collect(),
-                                &grid,
-                            )
-                        })
-                        .collect();
-                    let mut local = vec![0usize; parts];
-                    for (s, (_, points)) in series.iter().enumerate() {
-                        let p = part[s];
-                        for point in points {
-                            sinks[p].emit(local[p], grid.index(point.t), *point);
+                    let run = |compact: bool| {
+                        let args: ReduceArgs<'_> = (
+                            op,
+                            &glabels[..],
+                            &group_of[..],
+                            &part[..],
+                            &series[..],
+                            &grid,
+                        );
+                        if compact {
+                            reduce_with::<Compact>(parts, args)
+                        } else {
+                            reduce_with::<Slot>(parts, args)
                         }
-                        local[p] += 1;
-                    }
-                    let mut all = sinks.remove(0);
-                    for g in sinks {
-                        all.merge(g);
-                    }
-                    all.finish(&grid)
-                };
-                for parts in [1, 3] {
-                    let got = reduce(parts, &mut rng);
+                    };
+                    let got = run(false);
+                    // The compact accumulator gives the same points, without
+                    // the window edges it does not keep.
+                    let without_edges = |r: &[(Labels, Vec<Point>)]| {
+                        r.iter()
+                            .map(|(l, p)| {
+                                let p: Vec<Point> =
+                                    p.iter().map(|p| Point { edges: None, ..*p }).collect();
+                                format!("{l:?} {p:?}")
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        without_edges(&run(true)),
+                        without_edges(&got),
+                        "case {case} {op:?} parts {parts}"
+                    );
                     for (labels, points) in &expected {
                         let (_, mine) = got
                             .iter()
@@ -807,5 +1000,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    type ReduceArgs<'a> = (
+        AggOp,
+        &'a [Labels],
+        &'a [usize],
+        &'a [usize],
+        &'a [(Labels, Vec<Point>)],
+        &'a Grid,
+    );
+
+    /// `series` split across `parts` partitions by `part`, each fed to its
+    /// own sink of accumulators `A`, merged in partition order.
+    fn reduce_with<A: Accum>(
+        parts: usize,
+        (op, glabels, group_of, part, series, grid): ReduceArgs<'_>,
+    ) -> Vec<(Labels, Vec<Point>)> {
+        let n = series.len();
+        let mut sinks: Vec<Grouped<A>> = (0..parts)
+            .map(|p| {
+                let members: Vec<usize> = (0..n).filter(|s| part[*s] == p).collect();
+                Grouped::new(
+                    op,
+                    glabels.to_vec(),
+                    members.iter().map(|s| group_of[*s]).collect(),
+                    grid,
+                )
+            })
+            .collect();
+        let mut local = vec![0usize; parts];
+        for (s, (_, points)) in series.iter().enumerate() {
+            let p = part[s];
+            for point in points {
+                sinks[p].emit(local[p], grid.index(point.t), *point);
+            }
+            local[p] += 1;
+        }
+        let mut all = sinks.remove(0);
+        for g in sinks {
+            all.merge(g);
+        }
+        all.finish(grid)
     }
 }
