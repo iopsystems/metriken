@@ -385,33 +385,39 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
 }
 
 /// The bucket width, in seconds, of a display query over `[start_s,
-/// end_s]` at `step_s` with `budget` points per series. When the range's
-/// grid fits the budget, `(end_s - start_s) / budget <= step_s`, it is
-/// `step_s`, so points on the grid are each their own bucket at any step.
-/// Otherwise it is the smallest of [`nice_bucket_secs`]'s widths at least
-/// `(end_s - start_s) / budget`. `None`, one bucket per point, when `budget`
-/// is 0 or the range is empty. Every series of the query shares it, so
-/// buckets line up across series, and no series has more than about
-/// `budget + 1` buckets.
+/// end_s]` at `step_s` with `budget` points per series: the smallest of
+/// [`nice_bucket_secs`]'s widths at least `(end_s - start_s) / budget`, or
+/// `step_s` when that is smaller and `(end_s - start_s) / budget <= step_s`.
+/// Each point on the step grid is then alone in its bucket whenever the
+/// grid fits the budget. `None`, one bucket per point, when `budget` is 0 or
+/// the range is empty.
+///
+/// Every series of the query shares the width, so buckets line up across
+/// series. A series has at most `budget + 1` buckets, or `budget + 2` when
+/// grid mode moves the start back to a multiple of the step and the width
+/// is not a multiple of the step.
 pub(crate) fn bucket_width(start_s: f64, end_s: f64, step_s: f64, budget: usize) -> Option<f64> {
     let span = end_s - start_s;
     if budget == 0 || span <= 0.0 {
         return None;
     }
     let raw = span / budget as f64;
+    let nice = nice_bucket_secs(raw);
     if step_s > 0.0 && raw <= step_s {
-        return Some(step_s);
+        return Some(nice.min(step_s));
     }
-    Some(nice_bucket_secs(raw))
+    Some(nice)
 }
 
 /// The bucket holding time `t` for buckets of `width` aligned to its
-/// multiples. A time within 1e-4 of a bucket below a boundary counts as on
-/// it: a step such as 0.1 s is not exact in floating point, and without the
-/// allowance a grid point at a multiple of the step can land in the bucket
-/// before.
+/// multiples. A time less than `max(1e-4, 1e-15 * t / width)` bucket widths
+/// before a boundary is placed in the bucket after it: converting epoch
+/// nanoseconds to f64 seconds and dividing by a width such as 0.1 s or 1 ms
+/// puts a grid point up to a few ulps of `t / width` below its multiple,
+/// which at a 1 ms width is about 3e-4 widths.
 fn bucket_of(t: f64, width: f64) -> i64 {
-    (t / width + 1e-4).floor() as i64
+    let q = t / width;
+    (q + (q.abs() * 1e-15).max(1e-4)).floor() as i64
 }
 
 /// A series reduced point by point, in time order, into buckets of a fixed

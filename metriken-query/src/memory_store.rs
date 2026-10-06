@@ -925,6 +925,82 @@ mod ingest_tests {
             other => panic!("expected Series, got {other:?}"),
         }
     }
+
+    /// A display range that fits its budget at its step comes back point by
+    /// point through the engine, at steps under a second on epoch
+    /// timestamps, for a gauge and for a rate.
+    #[test]
+    fn a_display_range_that_fits_keeps_every_point_at_epoch_timestamps() {
+        use crate::{DisplayOptions, DisplayResult, MetricsSource};
+        let opts = DisplayOptions {
+            budget: 48,
+            ..Default::default()
+        };
+        for step_ms in [1u64, 2, 100, 250, 3000] {
+            for start_ms in [1_790_144_092_000u64, 1_790_144_092_007, 1_700_000_000_123] {
+                let start_ms = start_ms / step_ms * step_ms;
+                let store = crate::MemoryStore::builder()
+                    .sampling_interval_ms(step_ms)
+                    .build();
+                for i in 0..40u64 {
+                    let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(start_ms + i * step_ms);
+                    store.ingest_snapshot(make_gauge_snap(ts, "load", i as i64));
+                    store.ingest_snapshot(make_counter_snap(ts, "ops", i * i, &[]));
+                }
+                let lo = start_ms as f64 / 1e3;
+                let hi = (start_ms + 39 * step_ms) as f64 / 1e3;
+                for q in ["load", "rate(ops[1m])"] {
+                    let r = store
+                        .query_range_display(q, lo, hi, step_ms as f64 / 1e3, &opts)
+                        .unwrap();
+                    let DisplayResult::Series { result, .. } = r else {
+                        panic!("{q}: series");
+                    };
+                    for s in &result {
+                        assert!(
+                            !s.decimated && s.points.len() as u64 == s.raw_points,
+                            "{q} step {step_ms} ms start {start_ms}: {} points of {}",
+                            s.points.len(),
+                            s.raw_points
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Points denser than the step, as raw rate mode gives them, are
+    /// bucketed finer than the step when the budget allows.
+    #[test]
+    fn points_denser_than_the_step_use_the_budget() {
+        use crate::{DisplayOptions, DisplayResult, MetricsSource, QueryOptions, RateMode};
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        for i in 0..3600u64 {
+            let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + i);
+            store.ingest_snapshot(make_counter_snap(ts, "ops", i * 3, &[]));
+        }
+        let opts = DisplayOptions {
+            budget: 1000,
+            ..Default::default()
+        };
+        let r = store
+            .query_range_display_opts(
+                "rate(ops[1m])",
+                1_000_000.0,
+                1_003_599.0,
+                60.0,
+                &opts,
+                &QueryOptions::with_rate_mode(RateMode::Raw),
+            )
+            .unwrap();
+        let DisplayResult::Series { result, .. } = r else {
+            panic!("series");
+        };
+        let n = result[0].points.len();
+        assert!((600..=1001).contains(&n), "{n} points");
+    }
 }
 
 #[cfg(test)]
