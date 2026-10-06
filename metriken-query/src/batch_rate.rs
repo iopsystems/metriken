@@ -539,7 +539,8 @@ impl Accum for Slot {
 }
 
 /// What a display needs of a group's point: the op's value, the band and
-/// the flags, without the window edges. A third of a [`Slot`]'s size.
+/// the flags, without the window edges: 32 bytes, against 88 for a
+/// [`Slot`].
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Compact {
     /// The sum for `Sum` and `Avg`, the minimum for `Min`, the maximum for

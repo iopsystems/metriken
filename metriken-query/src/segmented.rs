@@ -1313,7 +1313,7 @@ impl SegmentedSource {
             /// Every row is this series (a wide column).
             One(u32),
             /// Row `r` is series `v[r]`, or none when `u32::MAX` (a long
-            /// column, by occupant).
+            /// column, by occupant); empty for a column with neither.
             PerRow(Vec<u32>),
         }
         struct SegmentRows {
@@ -5452,8 +5452,45 @@ mod tests {
             Arc::clone(&windowed_pool),
         )
         .unwrap();
-        let per_series = crate::QueryOptions::default().with_per_series_rates(true);
-        // Whether the source computes the display query as it reads.
+        // Flat from 10 s to 20 s: a zero rate, which `1 / rate` drops.
+        let flat_rows: Vec<(u64, u64)> = (1..=40u64)
+            .map(|t| (t * s, t.clamp(10, 20) * 7 + t.saturating_sub(20) * 3))
+            .collect();
+        let flat = SegmentedParquetReader::open_bytes_with_pool(
+            vec![segment("cpu_cycles", &[("id", "0")], &flat_rows)],
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        // Enough series that one group is spread across partitions.
+        let many = SegmentedParquetReader::open_bytes_with_pool(
+            (0..20u64)
+                .map(|id| {
+                    let id_s = id.to_string();
+                    segment("cpu_cycles", &[("id", id_s.as_str())], &rows(id + 1))
+                })
+                .collect(),
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let options = [
+            crate::QueryOptions::default(),
+            crate::QueryOptions::default().with_per_series_rates(true),
+            crate::QueryOptions::with_rate_mode(crate::RateMode::Raw),
+            crate::QueryOptions::default()
+                .with_eval_timestamps(Some((1..=13u64).map(|k| k * 3 * s).collect())),
+        ];
+        let displays = || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
+        // The per-series path gives `by` groups in no fixed order, so the
+        // series are compared as a set.
+        let sorted = |d: &crate::DisplayResult| {
+            let mut v = serde_json::to_value(d).unwrap();
+            if let Some(series) = v["result"].as_array_mut() {
+                series.sort_by_key(|s| s["metric"].to_string());
+            }
+            v
+        };
+        // Whether the source computes the display query as it reads, with
+        // the default options.
         for (r, q, as_read) in [
             (&r, "rate(cpu_cycles[1s])", true),
             (&r, "sum(irate(cpu_cycles[1s]))", true),
@@ -5464,6 +5501,7 @@ mod tests {
             (&windowed, "sum(irate(cpu_cycles[1s])) * 2", true),
             (&r, "sum by (id) (rate(cpu_cycles[2s]))", true),
             (&r, "irate(cpu_cycles[1s]) - 40", true),
+            (&r, "5 - irate(cpu_cycles[1s])", true),
             (&r, "irate(cpu_cycles[1s]) * 2", true),
             (&windowed, "avg(irate(cpu_cycles[1s]))", true),
             (&r, "min(irate(cpu_cycles[1s]))", true),
@@ -5471,37 +5509,35 @@ mod tests {
             (&r, "count(irate(cpu_cycles[1s]))", true),
             (&r, "sum without (id) (irate(cpu_cycles[1s])) / 1000", true),
             (&r, "sum(irate(cpu_cycles[1s]) * 2)", false),
+            (&flat, "1 / rate(cpu_cycles[1s])", true),
+            (&flat, "sum(1 / rate(cpu_cycles[1s]))", false),
+            (&many, "sum(irate(cpu_cycles[1s]))", true),
+            (&many, "avg by (id) (irate(cpu_cycles[1s]))", true),
+            (&r, "rate(not_a_metric[1s])", false),
         ] {
-            for budget in [0, 5] {
+            for budget in [0, 5, 50] {
                 let display = DisplayOptions {
                     budget,
                     ..Default::default()
                 };
-                for qopts in [crate::QueryOptions::default(), per_series.clone()] {
-                    let displays =
-                        || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
+                for (o, qopts) in options.iter().enumerate() {
                     let before = displays();
-                    let streamed = r
-                        .query_range_display_opts(q, 1.0, 40.0, 1.0, &display, &qopts)
-                        .unwrap();
+                    let streamed = r.query_range_display_opts(q, 1.0, 40.0, 1.0, &display, qopts);
                     assert_eq!(
                         displays() > before,
-                        as_read && !qopts.per_series_rates,
-                        "{q}: computed as read"
+                        as_read && o == 0,
+                        "{q} options {o}: computed as read"
                     );
-                    let matrix = r.query_range_opts(q, 1.0, 40.0, 1.0, &qopts).unwrap();
-                    let reduced =
-                        crate::display::display_from_result(matrix, 1.0, 40.0, 1.0, &display);
-                    // The per-series path gives `by` groups in no fixed
-                    // order, so the series are compared as a set.
-                    let sorted = |d: &crate::DisplayResult| {
-                        let mut v = serde_json::to_value(d).unwrap();
-                        if let Some(series) = v["result"].as_array_mut() {
-                            series.sort_by_key(|s| s["metric"].to_string());
+                    let reduced = r
+                        .query_range_opts(q, 1.0, 40.0, 1.0, qopts)
+                        .map(|m| crate::display::display_from_result(m, 1.0, 40.0, 1.0, &display));
+                    match (streamed, reduced) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(sorted(&a), sorted(&b), "{q} options {o} budget {budget}")
                         }
-                        v
-                    };
-                    assert_eq!(sorted(&streamed), sorted(&reduced), "{q} budget {budget}");
+                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{q}"),
+                        (a, b) => panic!("{q} options {o}: {a:?} against {b:?}"),
+                    }
                 }
             }
         }

@@ -169,7 +169,7 @@ pub(crate) fn collect_to_display(
     step_s: f64,
     opts: &crate::DisplayOptions,
 ) -> Vec<crate::DisplaySeries> {
-    let width = crate::display::bucket_width(start_s, end_s, step_s, opts.budget);
+    let width = crate::display::bucket_width(start_s, end_s, opts.budget);
     streaming
         .into_iter()
         .filter_map(|ls| {

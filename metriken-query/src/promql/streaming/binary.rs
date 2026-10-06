@@ -247,8 +247,6 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
     }
 }
 
-/// `series OP scalar` (or `scalar OP series` if `scalar_first`)
-/// applied across every input series.
 /// One point through `op` against `scalar`, as [`matrix_scalar_op`] applies
 /// it; `None` where the op drops the point.
 pub(crate) fn scalar_point(p: Point, op: BinOp, scalar: f64, scalar_first: bool) -> Option<Point> {
@@ -261,6 +259,8 @@ pub(crate) fn scalar_point(p: Point, op: BinOp, scalar: f64, scalar_first: bool)
     .next()
 }
 
+/// `series OP scalar` (or `scalar OP series` if `scalar_first`)
+/// applied across every input series.
 pub fn matrix_scalar_op<'a>(
     series: SeriesSet<'a>,
     op: BinOp,

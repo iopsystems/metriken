@@ -417,21 +417,24 @@ pub trait MetricsSource: Send + Sync {
     /// into per-bucket boxplots: a median line, a configurable inner band,
     /// and a min/max envelope that keeps short spikes visible.
     ///
-    /// When the range `[start_s, end_s]` holds more grid points than
-    /// `opts.budget`, every series is cut into buckets of one width, the
-    /// smallest round width at least `(end_s - start_s) / budget`, aligned to
-    /// multiples of it. Otherwise each point is its own bucket. A series
-    /// covering part of the range gets the same buckets as the rest.
+    /// Every series is cut into buckets of one width, aligned to multiples
+    /// of it: the smallest of 1, 2, 5, 10, 15, 20 or 30 s, 1, 2, 5, 10, 15 or
+    /// 30 min, 1, 2, 3, 6 or 12 h, or a whole number of days, at least
+    /// `(end_s - start_s) / opts.budget`. A bucket holding one point gives
+    /// that point at its own time, so a series no denser than the buckets is
+    /// returned as it is. `opts.budget == 0`, or `end_s <= start_s`, returns
+    /// full resolution.
     ///
     /// Only `Matrix` results are reduced (into `Series`); heatmap, scalar
-    /// and vector results pass through unchanged. `opts.budget == 0` returns
-    /// full resolution. Analysis consumers that recompute on the data should
-    /// call [`query_range`](Self::query_range) instead.
+    /// and vector results pass through unchanged. Analysis consumers that
+    /// recompute on the data should call [`query_range`](Self::query_range)
+    /// instead.
     ///
     /// The default implementation reduces the result of
     /// [`query_range_opts`](Self::query_range_opts). The readers in this
-    /// crate reduce each series as it is computed and never hold the full
-    /// matrix; a source that wraps one should forward
+    /// crate reduce each series of a streamed expression as it is collected;
+    /// histogram functions are evaluated in full and then reduced. A source
+    /// that wraps one of them should forward
     /// [`query_range_display_opts`](Self::query_range_display_opts) to it.
     fn query_range_display(
         &self,

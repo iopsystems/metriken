@@ -385,16 +385,14 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
 }
 
 /// The bucket width, in seconds, of a display query over `[start_s,
-/// end_s]` at `step_s` with `budget` points per series; `None` when the
-/// range's grid fits the budget and each point is its own bucket. Every
-/// series of the query shares it, so buckets line up across series.
-pub(crate) fn bucket_width(start_s: f64, end_s: f64, step_s: f64, budget: usize) -> Option<f64> {
-    if budget == 0 || step_s <= 0.0 {
-        return None;
-    }
-    let span = (end_s - start_s).max(0.0);
-    // The grid holds `floor(span / step) + 1` points.
-    if ((span / step_s).floor() as usize) < budget {
+/// end_s]` with `budget` points per series: the smallest of
+/// [`nice_bucket_secs`]'s widths at least `(end_s - start_s) / budget`.
+/// `None`, one bucket per point, when `budget` is 0 or the range is empty.
+/// Every series of the query shares it, so buckets line up across series,
+/// and no series has more than `budget + 1` buckets.
+pub(crate) fn bucket_width(start_s: f64, end_s: f64, budget: usize) -> Option<f64> {
+    let span = end_s - start_s;
+    if budget == 0 || span <= 0.0 {
         return None;
     }
     Some(nice_bucket_secs(span / budget as f64))
@@ -402,7 +400,8 @@ pub(crate) fn bucket_width(start_s: f64, end_s: f64, step_s: f64, budget: usize)
 
 /// A series reduced point by point, in time order, into buckets of a fixed
 /// width: [`reduce_boxplot`]'s per-bucket summary, with only the open
-/// bucket's points held.
+/// bucket's points held. A bucket holding one point gives that point as it
+/// is, at its own time.
 pub(crate) struct BucketReducer {
     width: Option<f64>,
     band: [f64; 2],
@@ -434,17 +433,7 @@ impl BucketReducer {
     pub fn push(&mut self, t: f64, v: f64, band: Option<(f64, f64)>, interpolated: bool) {
         self.raw_points += 1;
         let Some(width) = self.width else {
-            self.out.push(EnvPoint {
-                t,
-                min: v,
-                lo: v,
-                median: v,
-                hi: v,
-                max: v,
-                unc_lo: band.map(|(lo, _)| lo),
-                unc_hi: band.map(|(_, hi)| hi),
-                interpolated,
-            });
+            self.out.push(Self::single(t, v, band, interpolated));
             return;
         };
         let bucket = (t / width).floor() as i64;
@@ -457,7 +446,30 @@ impl BucketReducer {
         self.interpolated.push(interpolated);
     }
 
+    /// The point at `t` as its own bucket.
+    fn single(t: f64, v: f64, band: Option<(f64, f64)>, interpolated: bool) -> EnvPoint {
+        EnvPoint {
+            t,
+            min: v,
+            lo: v,
+            median: v,
+            hi: v,
+            max: v,
+            unc_lo: band.map(|(lo, _)| lo),
+            unc_hi: band.map(|(_, hi)| hi),
+            interpolated,
+        }
+    }
+
     fn close(&mut self, width: f64) {
+        if let [(t, v)] = self.values[..] {
+            self.out
+                .push(Self::single(t, v, self.bands[0], self.interpolated[0]));
+            self.values.clear();
+            self.bands.clear();
+            self.interpolated.clear();
+            return;
+        }
         let bands = self
             .bands
             .iter()
@@ -513,7 +525,7 @@ pub(crate) fn display_from_result(
     step_s: f64,
     opts: &DisplayOptions,
 ) -> DisplayResult {
-    let width = bucket_width(start_s, end_s, step_s, opts.budget);
+    let width = bucket_width(start_s, end_s, opts.budget);
     match result {
         // `bands`, not `intervals`: the legacy field is all-or-nothing and
         // goes absent for the whole series as soon as one point lacks a
@@ -525,12 +537,16 @@ pub(crate) fn display_from_result(
                 .into_iter()
                 .map(|s| {
                     let mut r = BucketReducer::new(width, opts.band);
+                    // Only arrays parallel to the values are read.
+                    let n = s.values.len();
+                    let bands = s.bands.as_ref().filter(|b| b.len() == n);
+                    let interpolated = s.interpolated.as_ref().filter(|f| f.len() == n);
                     for (i, (t, v)) in s.values.iter().enumerate() {
                         r.push(
                             *t,
                             *v,
-                            s.bands.as_ref().and_then(|b| b[i]),
-                            s.interpolated.as_ref().is_some_and(|f| f[i]),
+                            bands.and_then(|b| b[i]),
+                            interpolated.is_some_and(|f| f[i]),
                         );
                     }
                     r.finish(s.metric, step_s, opts)
@@ -919,7 +935,8 @@ mod tests {
     }
 
     /// For a series over the whole range, the streaming reducer gives what
-    /// `reduce_boxplot` gives, bands, holes and interpolated points included.
+    /// `reduce_boxplot` gives, bands, holes and interpolated points included,
+    /// except that a bucket holding one point keeps that point's time.
     #[test]
     fn the_streaming_reducer_matches_reduce_boxplot_over_the_whole_range() {
         let points: Vec<(f64, f64)> = (0..3600u64)
@@ -935,17 +952,26 @@ mod tests {
             .map(|(t, _)| (*t as u64).is_multiple_of(17))
             .collect();
         for budget in [0, 50, 500, 3600, 5000] {
-            let width = bucket_width(0.0, 3599.0, 1.0, budget);
+            let width = bucket_width(0.0, 3599.0, budget);
             for (b, f) in [
                 (None, None),
                 (Some(&bands[..]), None),
                 (Some(&bands[..]), Some(&interpolated[..])),
             ] {
-                assert_eq!(
-                    reduced(&points, b, f, width),
-                    reduce_boxplot(&points, b, f, budget, IQR),
-                    "budget {budget}"
-                );
+                let mut expected = reduce_boxplot(&points, b, f, budget, IQR);
+                if let Some(w) = width.filter(|_| points.len() > budget) {
+                    for e in &mut expected {
+                        let one: Vec<f64> = points
+                            .iter()
+                            .map(|(t, _)| *t)
+                            .filter(|t| (t / w).floor() * w == e.t)
+                            .collect();
+                        if let [t] = one[..] {
+                            e.t = t;
+                        }
+                    }
+                }
+                assert_eq!(reduced(&points, b, f, width), expected, "budget {budget}");
             }
         }
     }
@@ -954,13 +980,49 @@ mod tests {
     /// other series of the query does.
     #[test]
     fn a_short_series_takes_the_ranges_buckets() {
-        let width = bucket_width(0.0, 3599.0, 1.0, 60);
+        let width = bucket_width(0.0, 3599.0, 60);
         assert_eq!(width, Some(60.0));
         let points: Vec<(f64, f64)> = (600..720u64).map(|t| (t as f64, 1.0)).collect();
         let out = reduced(&points, None, None, width);
         assert_eq!(
             out.iter().map(|p| p.t).collect::<Vec<_>>(),
             vec![600.0, 660.0]
+        );
+    }
+
+    /// The budget holds for points closer together than the query's step.
+    #[test]
+    fn points_off_the_step_grid_keep_to_the_budget() {
+        let width = bucket_width(1.0, 600.0, 50);
+        let points: Vec<(f64, f64)> = (1..600u64).map(|t| (t as f64, t as f64)).collect();
+        let mut r = BucketReducer::new(width, IQR);
+        for (t, v) in &points {
+            r.push(*t, *v, None, false);
+        }
+        let s = r.finish(HashMap::new(), 60.0, &DisplayOptions::default());
+        assert!(s.points.len() <= 51, "{} points", s.points.len());
+        assert!(s.decimated);
+    }
+
+    /// A series sparser than the buckets keeps each point at its own time
+    /// and is not marked decimated.
+    #[test]
+    fn a_point_alone_in_its_bucket_keeps_its_time() {
+        let width = bucket_width(0.0, 3600.0, 500);
+        let points: Vec<(f64, f64)> = (0..360u64).map(|k| ((3 + 10 * k) as f64, 1.0)).collect();
+        let mut r = BucketReducer::new(width, IQR);
+        for (t, v) in &points {
+            r.push(*t, *v, Some((0.5, 1.5)), false);
+        }
+        let s = r.finish(HashMap::new(), 1.0, &DisplayOptions::default());
+        assert!(!s.decimated);
+        assert_eq!(
+            s.points.iter().map(|p| p.t).collect::<Vec<_>>(),
+            points.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (s.points[0].unc_lo, s.points[0].unc_hi),
+            (Some(0.5), Some(1.5))
         );
     }
 }

@@ -257,11 +257,12 @@ thread_local! {
 }
 
 /// A display query computed by the source as it reads, holding one bucket
-/// per series: `expr` must be `rate`/`irate` of a selector, or `sum`, `avg`,
+/// per series, or one accumulator per group and grid point for an
+/// aggregate: `expr` must be `rate`/`irate` of a selector, or `sum`, `avg`,
 /// `min`, `max` or `count` of one, optionally under scalar ops against
-/// number literals. `None` for any other expression or
-/// where the batch path does not apply; the caller then evaluates it in
-/// full and reduces the result.
+/// number literals. `None` for any other expression or where the batch path
+/// does not apply; the caller then builds it and reduces each series as it
+/// is collected.
 fn batch_display(
     ctx: &Ctx<'_>,
     expr: &Expr,
@@ -330,7 +331,7 @@ fn batch_display(
     // name, an aggregation or a scalar op drops it.
     let named = !scaled && group.is_none();
     let grid_display = crate::batch_rate::GridDisplay {
-        width: crate::display::bucket_width(start, end, step, display.budget),
+        width: crate::display::bucket_width(start, end, display.budget),
         band: display.band,
         ops,
     };
