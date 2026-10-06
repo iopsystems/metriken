@@ -1385,10 +1385,10 @@ impl SegmentedSource {
         };
         // A grouped display query feeds each group's points to its reducer
         // as they become final instead of holding every grid point to the
-        // end. A series whose last sample is more than `lag` before the
-        // next chunk's earliest sample is ended early; one that is pushed a
-        // sample afterwards makes the read return `None`, and the caller
-        // evaluates the query without this path.
+        // end. A series whose last sample is more than `lag` (ten sampling
+        // intervals or steps) before the next chunk's earliest sample is
+        // ended early. If one is pushed a sample afterwards, the read returns
+        // `None` and the caller evaluates the query in full.
         let mut flush =
             match (&groups, request.display) {
                 (Some((op, (glabels, _))), Some(display)) => Some(
@@ -1512,8 +1512,9 @@ impl SegmentedSource {
                     for (s, rate) in rates.iter_mut().enumerate() {
                         let g = group_of[members[p][s]];
                         let earliest = match rate.last_ts() {
-                            // No sample yet: its first point is at or after
-                            // its first sample, which is at or after `w`.
+                            // No sample yet: its first sample is at or after
+                            // `w`, and its first point no earlier than a span
+                            // and a step before that.
                             None => {
                                 Some(w.saturating_sub(grid.span_ns.saturating_add(grid.step_ns)))
                             }
@@ -5661,9 +5662,9 @@ mod tests {
     }
 
     /// A grouped display query gives each group's points to its reducer as
-    /// they become final, a series that stops is ended early, and one that
-    /// comes back after being ended makes the source give the query back to
-    /// the caller. Either way the answer is the full computation's.
+    /// they become final, and a series that stops is ended early. When one
+    /// comes back after being ended, the source returns `None` and the query
+    /// is evaluated in full. Either way the answer is the full computation's.
     #[test]
     fn a_grouped_display_query_feeds_final_points_before_the_end() {
         use crate::{DisplayOptions, MetricsSource};

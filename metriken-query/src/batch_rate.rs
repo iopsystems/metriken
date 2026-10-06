@@ -815,6 +815,7 @@ impl<'d> GroupFlush<'d> {
     }
 
     /// Blocks fed, over all groups.
+    #[cfg(test)]
     pub fn fed(&self) -> usize {
         self.next.iter().sum()
     }

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A grouped display query on a segmented reader (`sum`, `avg`, `min`, `max`
+  or `count` of `rate`/`irate`) gives each group's points to its reducer as
+  they become final, instead of holding an accumulator for every grid
+  point until the read ends. A series whose last sample is more than ten
+  sampling intervals (or steps, if larger) before the rest of the read is
+  ended early. If it has another sample after all, the query is evaluated
+  in full, so the answer does not change. A group then holds about one
+  read chunk of grid points rather than the whole range: on a 9.6-hour
+  recording of a per-task group stored long, `sum by (comm) (irate(...))`
+  at budget 500 peaked at 480-483 MB and peaks at 387-399 MB.
+
 ## [0.34.6] - 2026-10-05
 
 ### Fixed
