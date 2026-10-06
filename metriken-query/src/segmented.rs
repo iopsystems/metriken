@@ -1384,11 +1384,12 @@ impl SegmentedSource {
             }))
         };
         // A grouped display query feeds each group's points to its reducer
-        // as they become final instead of holding every grid point to the
-        // end. A series whose last sample is more than `lag` (ten sampling
-        // intervals or steps) before the next chunk's earliest sample is
-        // ended early. If one is pushed a sample afterwards, the read returns
-        // `None` and the caller evaluates the query in full.
+        // once no member can emit before them. After each chunk, a series
+        // whose last sample is more than ten times the larger of its spacing
+        // and the step before the earliest span start of the unread chunks
+        // is ended early; a series without a spacing yet uses the median of
+        // the others'. If an ended series is pushed a sample afterwards, the
+        // read returns `None` and the caller evaluates the query per series.
         let mut flush =
             match (&groups, request.display) {
                 (Some((op, (glabels, _))), Some(display)) => Some(
@@ -1397,15 +1398,6 @@ impl SegmentedSource {
                 _ => None,
             };
         let resumed = std::sync::atomic::AtomicBool::new(false);
-        let interval_ns = self
-            .state
-            .catalog
-            .iter()
-            .filter(|c| c.present)
-            .map(|c| (c.interval * 1e9) as u64)
-            .min()
-            .unwrap_or(0);
-        let lag = interval_ns.max(grid.step_ns).saturating_mul(10);
         let chunks: Vec<&[u32]> = segments.chunks(batch_threads()).collect();
         // The earliest time a sample can have in the chunks after each one;
         // `None` when one of them has no span.
@@ -1506,26 +1498,33 @@ impl SegmentedSource {
                 let Some(w) = rest_start[c].filter(|w| *w != u64::MAX) else {
                     continue;
                 };
+                // The median spacing of the series that have one.
+                let mut spacings: Vec<u64> = part_rates
+                    .iter()
+                    .flatten()
+                    .filter_map(SeriesRate::spacing_ns)
+                    .collect();
+                let median = (!spacings.is_empty()).then(|| {
+                    let mid = spacings.len() / 2;
+                    *spacings.select_nth_unstable(mid).1
+                });
                 // The earliest grid point each group can still be given.
                 let mut pending = vec![u64::MAX; group_of.iter().max().map_or(0, |g| g + 1)];
                 for (p, (rates, sink)) in part_rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
                     for (s, rate) in rates.iter_mut().enumerate() {
                         let g = group_of[members[p][s]];
-                        let earliest = match rate.last_ts() {
-                            // No sample yet: its first sample is at or after
-                            // `w`, and its first point no earlier than a span
-                            // and a step before that.
-                            None => {
-                                Some(w.saturating_sub(grid.span_ns.saturating_add(grid.step_ns)))
+                        if let Some(last) = rate.last_ts() {
+                            let lag = rate
+                                .spacing_ns()
+                                .or(median)
+                                .map(|sp| sp.max(grid.step_ns).saturating_mul(10));
+                            if rate.pending_ns().is_some()
+                                && lag.is_some_and(|lag| last.saturating_add(lag) < w)
+                            {
+                                rate.end_early(&grid, s, sink.sink());
                             }
-                            Some(last) => {
-                                if rate.pending_ns().is_some() && last.saturating_add(lag) < w {
-                                    rate.end_early(&grid, s, sink.sink());
-                                }
-                                rate.pending_ns()
-                            }
-                        };
-                        if let Some(t) = earliest {
+                        }
+                        if let Some(t) = crate::batch_rate::earliest_point(rate, w, &grid) {
                             pending[g] = pending[g].min(t);
                         }
                     }
@@ -5634,22 +5633,66 @@ mod tests {
         }
     }
 
+    /// The shape of [`grouped_windows`]' recording.
+    #[derive(Clone, Copy, Default)]
+    struct Windows {
+        /// Series 2 comes back in the twenty-sixth window after stopping.
+        resume: bool,
+        /// Each series' samples are offset by a fraction of a second and
+        /// the series of a group are weighted 1, 1e6 and 1e12, so the order
+        /// in which a group's points are summed shows in the low bits.
+        offsets: bool,
+        /// Series 5 starts at 2001 s, before the end of the second block of
+        /// grid points, and is alone in group `d`, so only the bound for a
+        /// series with no sample yet holds that block back.
+        late: bool,
+        /// A seventh series, alone in group `c`, has five samples.
+        short: bool,
+        /// Seconds between samples.
+        every: u64,
+    }
+
     /// Thirty windows of 100 s of six series in two groups, in time order;
-    /// series 2 stops after the ninth window and, when `resume`, comes back
-    /// in the twenty-sixth.
-    fn grouped_windows(resume: bool) -> SegmentedParquetReader {
+    /// series 2 stops after the ninth window.
+    fn grouped_windows(w: Windows) -> SegmentedParquetReader {
         let s = 1_000_000_000u64;
+        let every = w.every.max(1);
         let mut segments = Vec::new();
-        for w in 0..30u64 {
-            for id in 0..6u64 {
-                if id == 2 && w >= 9 && !(resume && w >= 25) {
+        for win in 0..30u64 {
+            for id in 0..7u64 {
+                let stopped = id == 2 && win >= 9 && !(w.resume && win >= 25);
+                let early = id == 5 && w.late && win < 20;
+                let short = id == 6 && !(w.short && win == 9);
+                if stopped || early || short {
                     continue;
                 }
-                let rows: Vec<(u64, u64)> = (w * 100 + 1..=w * 100 + 100)
-                    .map(|t| (t * s, t * (id + 1) * 3 + (t * 7919 * id) % 3))
+                let offset = if w.offsets { (id + 1) * 137_000_000 } else { 0 };
+                let weight = if w.offsets {
+                    1_000_000u64.pow((id % 3) as u32)
+                } else {
+                    1
+                };
+                let ticks: Vec<u64> = if id == 6 {
+                    (950..955).collect()
+                } else {
+                    (win * 100 + 1..=win * 100 + 100)
+                        .filter(|t| t % every == 0)
+                        .collect()
+                };
+                let rows: Vec<(u64, u64)> = ticks
+                    .into_iter()
+                    .map(|t| {
+                        let v = t * (id + 1) * 3 + (t * 7919 * (id + 1)) % 3;
+                        (t * s + offset, v * weight)
+                    })
                     .collect();
                 let id_s = id.to_string();
-                let g = if id < 3 { "a" } else { "b" };
+                let g = match id {
+                    0..3 => "a",
+                    5 if w.late => "d",
+                    3..6 => "b",
+                    _ => "c",
+                };
                 segments.push(segment(
                     "cpu_cycles",
                     &[("id", id_s.as_str()), ("g", g)],
@@ -5661,17 +5704,31 @@ mod tests {
             .unwrap()
     }
 
-    /// A grouped display query gives each group's points to its reducer as
-    /// they become final, and a series that stops is ended early. When one
-    /// comes back after being ended, the source returns `None` and the query
-    /// is evaluated in full. Either way the answer is the full computation's.
     #[test]
     fn a_grouped_display_query_feeds_final_points_before_the_end() {
         use crate::{DisplayOptions, MetricsSource};
         let displays = || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
         let fed = || crate::batch_rate::FED_BEFORE_END.with(|n| n.get());
-        for resume in [false, true] {
-            let r = grouped_windows(resume);
+        let base = Windows::default();
+        // Each shape, and whether a stopped series comes back.
+        for w in [
+            base,
+            Windows {
+                resume: true,
+                ..base
+            },
+            Windows {
+                offsets: true,
+                late: true,
+                ..base
+            },
+            Windows {
+                short: true,
+                ..base
+            },
+            Windows { every: 15, ..base },
+        ] {
+            let r = grouped_windows(w);
             for q in [
                 "sum by (g) (irate(cpu_cycles[1s]))",
                 "avg(rate(cpu_cycles[1s])) / 2",
@@ -5688,11 +5745,12 @@ mod tests {
                     let streamed = r
                         .query_range_display_opts(q, 1.0, 3000.0, 1.0, &display, &qopts)
                         .unwrap();
-                    assert_eq!(displays() > before, !resume, "{q} resume {resume}");
+                    assert_eq!(displays() > before, !w.resume, "{q}");
                     // Three blocks of grid points per group. The first two
                     // are final before the last chunk is read, in group `a`
-                    // only once series 2 is ended early.
-                    if !resume {
+                    // only once series 2 is ended early, and in group `c`
+                    // once its short series is.
+                    if !w.resume {
                         let crate::DisplayResult::Series { result, .. } = &streamed else {
                             panic!("{q}: series");
                         };
@@ -5704,7 +5762,7 @@ mod tests {
                     assert_eq!(
                         serde_json::to_value(&streamed).unwrap(),
                         serde_json::to_value(&reduced).unwrap(),
-                        "{q} resume {resume} budget {budget}"
+                        "{q} budget {budget}"
                     );
                 }
             }

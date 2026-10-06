@@ -10,15 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - A grouped display query on a segmented reader (`sum`, `avg`, `min`, `max`
-  or `count` of `rate`/`irate`) gives each group's points to its reducer as
-  they become final, instead of holding an accumulator for every grid
-  point until the read ends. A series whose last sample is more than ten
-  sampling intervals (or steps, if larger) before the rest of the read is
-  ended early. If it has another sample after all, the query is evaluated
-  in full, so the answer does not change. A group then holds about one
-  read chunk of grid points rather than the whole range: on a 9.6-hour
-  recording of a per-task group stored long, `sum by (comm) (irate(...))`
-  at budget 500 peaked at 480-483 MB and peaks at 387-399 MB.
+  or `count` of `rate`/`irate`) gives each group's points to its reducer
+  once no member of the group can emit before them, instead of holding an
+  accumulator for every grid point until the read ends. After each read of
+  up to eight segments, a series whose last sample is more than ten times
+  the larger of its sample spacing and the step before the earliest unread
+  segment is ended. If an ended series has a later sample, the query is
+  evaluated per series instead. A group then holds the grid points from its
+  slowest member's next point, rounded down to a block of 1,024, through the
+  latest point emitted; it holds them all when a later segment has no
+  timestamp statistics. Points can differ in the last bits of a float when a
+  series with fewer than nine samples is ended. On a 9.6-hour recording of a
+  per-task group stored long, `sum by (comm) (irate(...))` at budget 500
+  peaked at 480-483 MB and peaks at 387-399 MB.
 
 ## [0.34.6] - 2026-10-05
 
