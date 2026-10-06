@@ -10,7 +10,10 @@
 //!
 //! An aggregate's values and bands can differ from the per-series path's in
 //! the last bits of a float: they are summed in the order points are
-//! computed rather than the order of the series.
+//! computed rather than the order of the series. A grouped display read
+//! that ends a series with fewer than nine samples early sums its points
+//! earlier than a read that ends it at the last segment, so the two can
+//! differ the same way.
 
 use std::collections::VecDeque;
 
@@ -93,6 +96,8 @@ pub(crate) struct SeriesRate {
     /// left edge when the span is one step, and its value is reused unless a
     /// later sample has the edge's timestamp.
     last_edge: Option<(u64, Edge)>,
+    /// Finished before its samples ran out; see [`end_early`](Self::end_early).
+    ended_early: bool,
 }
 
 /// An edge's interpolated cumulative and, when real reads describe it, its
@@ -119,7 +124,49 @@ impl SeriesRate {
             cursor_ns: start_ns,
             done: false,
             last_edge: None,
+            ended_early: false,
         }
+    }
+
+    /// The time of the last sample pushed, or `None` before the first.
+    pub fn last_ts(&self) -> Option<u64> {
+        if self.settled {
+            self.last_ts
+        } else {
+            self.probe.last().map(|s| s.ts)
+        }
+    }
+
+    /// The time of the earliest grid point this series can still emit, or
+    /// `None` once it can emit no more. Points are emitted in increasing
+    /// time from here.
+    pub fn pending_ns(&self) -> Option<u64> {
+        (!self.done).then_some(self.cursor_ns)
+    }
+
+    /// Emit what [`finish`](Self::finish) would emit if no more samples
+    /// came. A later [`push`](Self::push) is ignored, so the caller checks
+    /// [`ended_early`](Self::ended_early) before each push and treats a push
+    /// to an ended series as invalidating the result.
+    pub fn end_early(&mut self, grid: &Grid, series: usize, sink: &mut dyn Sink) {
+        self.finish(grid, series, sink);
+        self.ended_early = true;
+    }
+
+    /// The spacing of this series' samples: the typical spacing once
+    /// settled, the mean spacing of the samples so far while probing, or
+    /// `None` with fewer than two.
+    pub fn spacing_ns(&self) -> Option<u64> {
+        if self.settled {
+            return Some(self.typical);
+        }
+        let (first, last) = (self.probe.first()?, self.probe.last()?);
+        (self.probe.len() >= 2).then(|| (last.ts - first.ts) / (self.probe.len() as u64 - 1))
+    }
+
+    /// Whether [`end_early`](Self::end_early) finished this series.
+    pub fn ended_early(&self) -> bool {
+        self.ended_early
     }
 
     pub fn push(&mut self, s: Sample, grid: &Grid, series: usize, sink: &mut dyn Sink) {
@@ -620,7 +667,7 @@ impl Accum for Compact {
 }
 
 /// Grid points per block of accumulators.
-const BLOCK: usize = 1024;
+pub(crate) const BLOCK: usize = 1024;
 
 /// Accumulators per group and grid point. A group's accumulators are
 /// allocated in blocks of [`BLOCK`] grid points, a block when a point first
@@ -669,6 +716,16 @@ impl<A: Accum> Grouped<A> {
         }
     }
 
+    /// Blocks of [`BLOCK`] grid points per group.
+    pub fn blocks_per_group(&self) -> usize {
+        self.grid_len.div_ceil(BLOCK)
+    }
+
+    /// Group `g`'s block `b`, taken out of this sink.
+    pub fn take_block(&mut self, g: usize, b: usize) -> Option<Box<[A]>> {
+        self.blocks[g][b].take()
+    }
+
     /// Each group's points in order, handed to `f` with the group's index;
     /// each block is freed once read.
     fn drain(self, grid: &Grid, mut f: impl FnMut(usize, Point)) -> Vec<Labels> {
@@ -695,28 +752,110 @@ impl<A: Accum> Grouped<A> {
         let labels = self.drain(grid, |g, p| points[g].push(p));
         labels.into_iter().zip(points).collect()
     }
+}
 
-    /// Each group reduced for `display`, its points put through the
-    /// display's scalar ops.
-    pub fn finish_display(
-        self,
-        grid: &Grid,
-        display: &GridDisplay,
-    ) -> Vec<(Labels, BucketReducer)> {
-        let mut reducers: Vec<BucketReducer> = (0..self.labels.len())
-            .map(|_| BucketReducer::new(display.width, display.band))
-            .collect();
-        let labels = self.drain(grid, |g, p| {
-            let mut point = Some(p);
-            for (op, scalar, scalar_first) in &display.ops {
-                point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
-            }
-            if let Some(p) = point {
-                reducers[g].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
-            }
-        });
-        labels.into_iter().zip(reducers).collect()
+#[cfg(test)]
+thread_local! {
+    /// Blocks a grouped display read had fed when its last chunk was read,
+    /// on this thread.
+    pub(crate) static FED_BEFORE_END: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Each group's display reducer, fed group points block by block in time
+/// order as the blocks become final, from the partitions' sinks.
+pub(crate) struct GroupFlush<'d> {
+    op: AggOp,
+    display: &'d GridDisplay,
+    reducers: Vec<BucketReducer>,
+    /// Per group, the first block not yet fed.
+    next: Vec<usize>,
+}
+
+impl<'d> GroupFlush<'d> {
+    pub fn new(op: AggOp, groups: usize, display: &'d GridDisplay) -> Self {
+        Self {
+            op,
+            display,
+            reducers: (0..groups)
+                .map(|_| BucketReducer::new(display.width, display.band))
+                .collect(),
+            next: vec![0; groups],
+        }
     }
+
+    /// Feed group `g`'s blocks before block `upto`, each merged across
+    /// `parts` in order as [`Grouped::merge`] merges them, and free them.
+    pub fn feed(
+        &mut self,
+        g: usize,
+        upto: usize,
+        parts: &mut [&mut Grouped<Compact>],
+        grid: &Grid,
+    ) {
+        while self.next[g] < upto {
+            let b = self.next[g];
+            self.next[g] += 1;
+            let mut merged: Option<Box<[Compact]>> = None;
+            for part in parts.iter_mut() {
+                let Some(theirs) = part.take_block(g, b) else {
+                    continue;
+                };
+                match &mut merged {
+                    None => merged = Some(theirs),
+                    Some(mine) => {
+                        for (a, t) in mine.iter_mut().zip(theirs.iter()) {
+                            a.merge(self.op, t);
+                        }
+                    }
+                }
+            }
+            let Some(block) = merged else {
+                continue;
+            };
+            for (i, a) in block.iter().enumerate() {
+                if a.count() == 0 {
+                    continue;
+                }
+                let k = b * BLOCK + i;
+                let mut point = Some(a.point(self.op, grid.start_ns + k as u64 * grid.step_ns));
+                for (op, scalar, scalar_first) in &self.display.ops {
+                    point = point.and_then(|p| scalar_point(p, *op, *scalar, *scalar_first));
+                }
+                if let Some(p) = point {
+                    self.reducers[g].push(p.t as f64 / 1e9, p.v, p.bounds, p.interpolated);
+                }
+            }
+        }
+    }
+
+    /// Blocks fed, over all groups.
+    #[cfg(test)]
+    pub fn fed(&self) -> usize {
+        self.next.iter().sum()
+    }
+
+    /// The reducers, in group order.
+    pub fn into_reducers(self) -> Vec<BucketReducer> {
+        self.reducers
+    }
+}
+
+/// The earliest grid point `rate` can still emit when every sample still to
+/// come is at or after `w`: its pending point, or, with no sample yet, a span
+/// and a step before `w`. `None` once it can emit no more.
+pub(crate) fn earliest_point(rate: &SeriesRate, w: u64, grid: &Grid) -> Option<u64> {
+    match rate.last_ts() {
+        None => Some(w.saturating_sub(grid.span_ns.saturating_add(grid.step_ns))),
+        Some(_) => rate.pending_ns(),
+    }
+}
+
+/// The number of grid points before `t`.
+pub(crate) fn points_before(grid: &Grid, t: u64) -> usize {
+    if t <= grid.start_ns || grid.step_ns == 0 {
+        return 0;
+    }
+    (((t - grid.start_ns).div_ceil(grid.step_ns)) as usize).min(grid.len())
 }
 
 impl<A: Accum> Sink for Grouped<A> {
@@ -1042,5 +1181,135 @@ mod tests {
             all.merge(g);
         }
         all.finish(grid)
+    }
+
+    /// The grid points before a time, at the boundaries of a block.
+    #[test]
+    fn points_before_counts_the_grid_points_before_a_time() {
+        let grid = Grid {
+            start_ns: 1_000,
+            end_ns: 1_000 + 3_000 * 10,
+            step_ns: 10,
+            span_ns: 10,
+        };
+        for (t, n) in [
+            (0, 0),
+            (1_000, 0),
+            (1_001, 1),
+            (1_010, 1),
+            (1_011, 2),
+            (1_000 + 1_023 * 10, 1_023),
+            (1_000 + 1_023 * 10 + 1, 1_024),
+            (1_000 + 1_024 * 10, 1_024),
+            (u64::MAX, 3_001),
+        ] {
+            assert_eq!(points_before(&grid, t), n, "t {t}");
+        }
+    }
+
+    /// `GroupFlush::feed` merges a group's blocks across partitions in the
+    /// order `Grouped::merge` does, so a group's sum is the same float.
+    #[test]
+    fn feeding_merges_partitions_in_merge_order() {
+        let grid = Grid {
+            start_ns: 0,
+            end_ns: 2 * BLOCK as u64,
+            step_ns: 1,
+            span_ns: 1,
+        };
+        let labels = vec![Labels::default()];
+        // One series per partition, all in group 0, whose sum depends on
+        // the order: (0.1 + 0.2) + 0.3 != 0.1 + (0.2 + 0.3).
+        let point = |v: f64| Point {
+            t: 5,
+            v,
+            bounds: None,
+            edges: None,
+            interpolated: false,
+        };
+        let parts = |values: &[f64]| -> Vec<Grouped<Compact>> {
+            values
+                .iter()
+                .map(|v| {
+                    let mut g = Grouped::new(AggOp::Sum, labels.clone(), vec![0], &grid);
+                    g.emit(0, 5, point(*v));
+                    g
+                })
+                .collect()
+        };
+        let display = GridDisplay {
+            width: None,
+            band: [0.25, 0.75],
+            ops: Vec::new(),
+        };
+        let values = [0.1, 0.2, 0.3];
+        let mut merged = parts(&values);
+        let mut all = merged.remove(0);
+        for g in merged {
+            all.merge(g);
+        }
+        let expected = all.finish(&grid)[0].1[0].v;
+        let mut fed = parts(&values);
+        let mut refs: Vec<&mut Grouped<Compact>> = fed.iter_mut().collect();
+        let mut flush = GroupFlush::new(AggOp::Sum, 1, &display);
+        flush.feed(0, 1, &mut refs, &grid);
+        let reducer = flush.into_reducers().remove(0);
+        let got = reducer
+            .finish(Default::default(), 1e-9, &crate::DisplayOptions::default())
+            .points[0]
+            .median;
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "{got} against {expected}"
+        );
+        assert_ne!(((0.3 + 0.2) + 0.1f64).to_bits(), expected.to_bits());
+    }
+
+    /// A series with no sample yet emits nothing before its earliest point
+    /// once samples start at the bound's `w`, for spans of one to three
+    /// steps and either window.
+    #[test]
+    fn a_series_with_no_sample_emits_nothing_before_its_earliest_point() {
+        struct Collect(Vec<u64>);
+        impl Sink for Collect {
+            fn emit(&mut self, _series: usize, _index: usize, point: Point) {
+                self.0.push(point.t);
+            }
+        }
+        for span in [10, 20, 30] {
+            for windowed in [false, true] {
+                let grid = Grid {
+                    start_ns: 0,
+                    end_ns: 10_000,
+                    step_ns: 10,
+                    span_ns: span,
+                };
+                let w = 5_000;
+                let mut rate = SeriesRate::new(windowed, grid.start_ns);
+                let bound = earliest_point(&rate, w, &grid).unwrap();
+                let mut sink = Collect(Vec::new());
+                for k in 0..40u64 {
+                    let ts = w + k * 10;
+                    rate.push(
+                        Sample {
+                            ts,
+                            value: k * 3,
+                            window: windowed.then_some((ts - 2, ts)),
+                        },
+                        &grid,
+                        0,
+                        &mut sink,
+                    );
+                }
+                rate.finish(&grid, 0, &mut sink);
+                assert!(!sink.0.is_empty());
+                assert!(
+                    sink.0.iter().all(|t| *t >= bound),
+                    "span {span}: first point {} before {bound}",
+                    sink.0[0]
+                );
+            }
+        }
     }
 }
