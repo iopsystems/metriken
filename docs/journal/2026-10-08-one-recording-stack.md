@@ -94,7 +94,8 @@ the Python bindings) are not.
 Each crate and what it depends on:
 
 - `metriken-types`: nothing in metriken.
-- `metriken-core`: `metriken-types`. `metriken`: `metriken-core`.
+- `metriken-core`: `metriken-types`. `metriken`: `metriken-core`,
+  `metriken-types` (for `UID_LABEL`).
 - `metriken-model`: `metriken-types`.
 - `metriken-exposition`: `metriken`, `metriken-model`, dendro (feature
   `stream`).
@@ -114,16 +115,17 @@ Four of these edges need explaining:
   writes and readers interpret: the acquisition window (`Window`, moved from
   `metriken-core`'s `src/window.rs`) and the slot-identity label key
   (`UID_LABEL`, `__uid__`, moved from `metriken`'s `group::identity`, and today
-  also written as a string literal in metriken-segment, metriken-query and
-  metriken-exposition). `metriken-core` re-exports `Window`, so
+  also written as a string literal in metriken-archive's writer (`writer.rs`)
+  and in metriken-segment's and metriken-query's tests). `metriken-core`
+  re-exports `Window` and `metriken` re-exports `UID_LABEL`, so
   `metriken::Window` keeps its path and there is one type with no conversions.
   `Window` takes the union of today's derives (core's, with optional serde, and
   metriken-segment's `PartialOrd`, `Ord`, `Hash`).
-- `metriken-model` does not depend on `metriken-core`, and cannot: core
-  declares `links = "metriken-core"` and its registry's `linkme` slice, which
-  has no wasm32 implementation. Through `metriken-types`, a breaking model
-  release does not touch core, so producers do not move in lockstep with
-  it.
+- `metriken-model` must not depend on `metriken-core`: core declares
+  `links = "metriken-core"` and its registry's `linkme` slice, which has no
+  wasm32 implementation. A breaking model release needs a new
+  `metriken-exposition` but not a new `metriken-core`, so it does not force a
+  producer onto a new `metriken`.
 - `metriken-storage` is below `metriken-query`. Today the order is reversed:
   `metriken-archive`'s reader implements `metriken_query::MetricsSource`, uses
   `ParquetReader`, `UnionMetricsSource` and the long-table relabel from
@@ -161,9 +163,9 @@ Four of these edges need explaining:
 | Crate | Holds | From |
 |---|---|---|
 | `metriken-types` | What the registry writes and readers interpret, and nothing else: `Window` (the acquisition window) and `UID_LABEL` (`__uid__`). No dependencies beyond optional serde; builds for wasm32. | `metriken-core`'s `Window`; `metriken`'s `group::identity::UID_LABEL` |
-| `metriken-model` | Everything about rows, as plain types with no `metriken` dependency: source identity (labels, producer epoch), group snapshots and their schemas, metric descriptions, acquisition windows, histogram configuration, slot identity (`__uid__`, occupants), the row types (`WalGroupRow`, `WalLongRow`, `LongOccupant`, `Occupant`, `WalCell`, `WalValue`) and their msgpack encoding and decoding (split out of metriken-segment's `wal.rs` and `occupants.rs`, which also hold parquet materialization), which are both the WAL and the stream rows, and decoding of the V1, V2 and V3 snapshots that raw recordings hold. Builds for wasm32. Tables (arrow, parquet) are not here, so producers do not compile them. | metriken-exposition's snapshot types; metriken-segment's `schema`, `window` and row types |
+| `metriken-model` | Everything about rows, as plain types with no `metriken` dependency: source identity (labels, producer epoch), group snapshots and their schemas, metric descriptions, histogram configuration, occupants (labels keyed by `metriken-types`' `UID_LABEL`), the row types (`WalGroupRow`, `WalLongRow`, `LongOccupant`, `Occupant`, `WalCell`, `WalValue`) and their msgpack encoding and decoding (split out of metriken-segment's `wal.rs` and `occupants.rs`, which also hold parquet materialization), which are both the WAL and the stream rows, and decoding of the V1, V2 and V3 snapshots that raw recordings hold. Re-exports `metriken-types`. Builds for wasm32. Tables (arrow, parquet) are not here, so producers do not compile them. | metriken-exposition's snapshot types; metriken-segment's `schema` and row types (its `window.rs` copy is deleted in favour of `metriken-types`' `Window`) |
 | `metriken-exposition` | The producer side: registry to model (the snapshotter and group builder), Prometheus text, msgpack, and the stream route behind feature `stream` (piece 1). The only crate here that depends on `metriken`. | itself; `metriken-archive`'s `stream` module |
-| `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s `ParquetReader`, `SegmentedParquetReader`, `UnionMetricsSource` and `long`; metriken-exposition's `MsgpackToParquet` |
+| `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `SegmentedSource`, `UnionSource`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` (`MemoryStore` from snapshots) reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
 | `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.rez` output for agents that cannot stream. Serves both rezolus release lines; 5.x's preview `record --stream -o .rez` is dropped when 5.x adopts it. | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
 | `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, and templates read from source metadata. | rezolus `crates/dashboard` |
@@ -360,9 +362,12 @@ rezolus entry) check that across each step. Library users (systemslab's
    model rows, which removes the decode-and-re-encode round trip in
    `StreamDecoder` and the `metriken` dependency from the write path. The two
    crates release together because the readers cannot leave the engine's crate
-   until the engine reads through the scan. Gate: on the 9.6-hour recording, a
-   full dashboard load takes no longer and peaks no higher in memory than with
-   metriken-query 0.34.7 (#241's measurement).
+   until the engine reads through the scan. Gate: on the 9.6-hour recording
+   with a 6,644-occupant task table that rezolus's
+   `docs/journal/2026-09-23-reader-memory.md` measures, #241's three queries
+   at a budget of 500 and a full `rezolus view` dashboard load, five runs
+   each: median time and peak memory within 5% of metriken-query 0.34.7 on the
+   same host.
 3. **The stream route** in `metriken-exposition` behind `stream` (piece 1),
    and dendro with SQLite optional. The rezolus agent is the first user,
    cachecannon the first outside one.
