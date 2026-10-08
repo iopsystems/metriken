@@ -27,5 +27,3 @@ metriken-types = { version = "0.1.0", path = "../metriken-types" }
 parking_lot.workspace = true
 phf = { version = "0.13", features = ["macros"] }
 
-[dev-dependencies]
-serde_json = "1.0"

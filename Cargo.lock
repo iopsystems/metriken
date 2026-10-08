@@ -1021,7 +1021,6 @@ dependencies = [
  "metriken-types",
  "parking_lot",
  "phf",
- "serde_json",
 ]
 
 [[package]]
