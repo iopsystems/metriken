@@ -19,18 +19,7 @@ use std::sync::Mutex;
 use crate::{CounterGroup, GaugeGroup, HistogramGroup, ShardedCounterGroup};
 use crate::{WindowedCounterGroup, WindowedGaugeGroup};
 
-/// The label that names one occupant of a slot.
-///
-/// A slot's labels say what it means (`comm=redis pid=4112`), and two
-/// different occupants can share them: a PID wraps, a cgroup is deleted and
-/// recreated at the same path, a task restarts under the same name. The uid
-/// is minted once per assignment and travels with the labels, so two
-/// consumers of one process see the same uid for the same occupant without
-/// coordinating.
-///
-/// Internal under the `__` rule: part of a series' identity and matchable,
-/// hidden from listings and legends.
-pub const UID_LABEL: &str = "__uid__";
+pub use metriken_types::UID_LABEL;
 
 /// A group whose slots carry metadata: what [`SlotIdentity`] writes to.
 ///

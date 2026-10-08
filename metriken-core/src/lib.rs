@@ -31,7 +31,6 @@ mod metrics;
 mod null;
 mod provide;
 mod traits;
-mod window;
 mod wrapper;
 
 pub use crate::formatter::{default_formatter, Format};
@@ -41,7 +40,7 @@ pub use crate::provide::{request_ref, request_value, Request};
 pub use crate::traits::{
     CounterGroupMetric, GaugeGroupMetric, HistogramGroupMetric, HistogramMetric,
 };
-pub use crate::window::Window;
+pub use metriken_types::Window;
 
 /// Global interface to a metric.
 ///

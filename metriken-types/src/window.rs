@@ -3,7 +3,7 @@
 //! read-time interpretation, not a write-time loss.
 
 /// A measurement's acquisition window, in nanoseconds since the Unix epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Window {
     /// Start of the acquisition interval (ns since Unix epoch).
