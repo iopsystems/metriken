@@ -367,7 +367,7 @@ rezolus entry) check that across each step. Library users (systemslab's
    `docs/journal/2026-09-23-reader-memory.md` measures, #241's three queries
    at a budget of 500 and a full `rezolus view` dashboard load, five runs
    each: median time and peak memory within 5% of metriken-query 0.34.7 on the
-   same host.
+   same host. Design: [the storage scan](2026-10-09-storage-scan.md).
 3. **The stream route** in `metriken-exposition` behind `stream` (piece 1),
    and dendro with SQLite optional. The rezolus agent is the first user,
    cachecannon the first outside one.
