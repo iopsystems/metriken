@@ -3,11 +3,19 @@
 **Status:** OPEN. Design 2026-10-09, nothing built. This is path step 2 of
 [one recording stack](2026-10-08-one-recording-stack.md). Decided 2026-10-09:
 
-- `metriken-query` re-exports the readers that move to `metriken-storage`
+- `metriken-query` re-exports every public item that moves to
+  `metriken-storage` at its current path for one release, and dependents
+  change imports in the release after. That covers the readers
   (`ParquetReader`, `SegmentedParquetReader`, `UnionMetricsSource`,
-  `MemoryStore`, `SegmentStore`, `BufferPool`, `Labels`, the long-table
-  relabel) at their current paths for one release, so dependents bump the
-  version without changing imports, and change imports in the release after;
+  `MemoryStore`, `MemoryStoreBuilder`), the composition types
+  (`ParquetBuilder`, `CompositionSource`, `CompositionCatalog`, `UnionChild`,
+  `UnionError`), the segment store (`SegmentStore`, `SegmentBytes`,
+  `InMemorySegments`, `Handover`, `BufferPool`), the relabel (`ColumnRelabel`,
+  `Run`), the data types (`Labels`, `CounterSample`, `CounterStream`,
+  `HistogramSnapshot`, `ColumnChunk`, `CounterColumnRef`, `ColumnPosition`),
+  and the modules `long`, `parquet`, `segmented` and `union`.
+  `metriken-archive` gets a last release that re-exports `metriken-storage`.
+  The re-exports do not cover the breaks listed under "What callers change";
 - the three gaps below ("Left alone") stay as they are until step 2 has
   passed its gate, and each is then changed and measured on its own.
 
@@ -15,14 +23,16 @@
 
 `metriken-storage` holds the column readers and has no dependency on the
 engine. `metriken-query` holds every computation and reads through a trait
-that storage defines. Query results, memory and latency do not change.
+that storage defines. Query results are identical, and memory and latency
+stay within the gate below.
 
 ## Today
 
-`metriken-query`'s `DataSource` trait (`src/lib.rs:211`, `pub(crate)`) has 20
-methods. Nineteen return data or metadata:
+`metriken-query`'s `DataSource` trait (`src/lib.rs:211`, `pub(crate)`) has 24
+methods. Twenty-three return data or metadata:
 
-- materialized series: `counters`, `gauges` (`Counter`, `Gauge`, `src/types.rs`);
+- materialized series: `counters`, `gauges` (`Counter`, `Gauge`,
+  `src/types.rs`);
 - per-series iterators: `counter_streams` (`CounterStream`, `src/types.rs:89`);
 - histogram row streams: `histogram_stream` (`HistogramStream`,
   `src/histogram_stream.rs:19`), ordered by `(timestamp, series_idx)`;
@@ -61,9 +71,14 @@ readers cannot move below the engine as they are.
 `metriken-storage` exports `Source`: today's `DataSource` without
 `counter_grid_rates`, with `counter_scan` added. The types its methods return
 move with it: `Labels`, `Counter`, `Gauge`, `Counters`, `Gauges`,
-`CounterSample`, `CounterStream`, `HistogramSnapshot`, `HistogramStream` and
-its rows, `ColumnPosition`, `CounterColumnRef`, `ColDesc`, `BatchColumns`.
-`BufferPool` moves too; its blocks hold `HistogramSnapshot`.
+`CounterSample`, `CounterStream`, `ColumnChunk`, `HistogramSnapshot`,
+`HistogramStream` and its rows, `ColumnPosition`, `CounterColumnRef`,
+`ColDesc`, `BatchColumns`. `BufferPool` moves too; its blocks hold
+`HistogramSnapshot`.
+
+`DataSource`, `HistogramStream`, `Counter`, `Gauge` and `Counters` are
+crate-private today. As `Source` and its types they become public, and with
+the arrow arrays in `ScanChunk` they are part of storage's semver surface.
 
 ### The scan
 
@@ -71,6 +86,10 @@ its rows, `ColumnPosition`, `CounterColumnRef`, `ColDesc`, `BatchColumns`.
 fn counter_scan(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64)
     -> Option<CounterScan<'_>>;
 ```
+
+The engine passes the request's `data_start` (the range start less the
+lookback) as `start_ns`, which is what the plan and the row filter use today
+(`src/segmented.rs:1149`).
 
 `None` means the engine uses the per-series path (`counter_streams`), under
 the conditions that send it there today: a relabel whose identities are not
@@ -82,8 +101,11 @@ column, or nothing matched. A `CounterScan` carries:
   its first location);
 - `next_chunk(n)`: decodes up to `n` of the remaining touched segments, one
   thread per segment (sequentially on wasm32), and returns a `ScanChunk`, or
-  `Ok(None)` when none remain. A read error is `Err`, and the engine falls
-  back to the per-series path as it does on `None` today;
+  `Ok(None)` when none remain. A segment the store no longer has is skipped,
+  as today (`src/segmented.rs:1350`). A read error is `Err`, and the engine
+  discards its accumulators and uses the per-series path, as it does on
+  `None` today; nothing is emitted before the scan ends, so this is the same
+  result;
 - `ScanChunk::batches()`: per batch, the arrow arrays `ts` (`UInt64Array`),
   `duration` (optional), and per column `values` (`UInt64Array`), `begin`
   (`Int64Array`, optional) and `width` (`UInt64Array`, optional), with the
@@ -92,20 +114,25 @@ column, or nothing matched. A `CounterScan` carries:
   column. Rows outside `[start_ns, end_ns]` or with a null `ts` or value are
   the engine's to skip, as today;
 - `ScanChunk::rest_start()`: the earliest catalog start of every segment not
-  yet returned, or `None` if one of them has no span (early finish is then
-  off, as today).
+  yet returned; `None` if one of them has no span (early finish is then off,
+  as today) and after the last chunk.
 
 `resolve_window(ts, begin, width, duration)` (today
 `metriken-query/src/parquet.rs:2762`) is a public storage function, because
 reading a window from those columns is a rule of the storage format.
 
 The engine borrows the arrays, so the accumulators read them directly, as
-`grid_rates` does now. Within one series, samples arrive in increasing time:
-segments come in catalog order and a series has at most one column per
-segment. A live long-table tail keeps that order too: both catalogs read
-unsealed WAL rows `ORDER BY ts` (dendro 0.3.4 `archive.rs:1579`, rezolus
-`crates/rez/src/rez_sqlite.rs:1038`), and one long WAL row is one tick for
-every occupant.
+`grid_rates` does now. `RecordBatch` and `ArrayRef` are `Send + Sync`, so the
+partition threads can share one chunk.
+
+The accumulators require each series' samples in increasing time. A series
+has at most one column per segment, so that holds when segment order is time
+order. It is for both archive catalogs, including a live long-table tail:
+each reads unsealed WAL rows `ORDER BY ts` (dendro 0.3.4 `archive.rs:1579`,
+rezolus `crates/rez/src/rez_sqlite.rs:1038`), its WAL table's primary key
+includes `ts`, so no two rows of one table share a timestamp, and one long
+WAL row is one tick for every occupant. For `InMemorySegments` and readers
+opened from bytes, segment order is the caller's contract, as today.
 
 ### What stays in the engine
 
@@ -120,12 +147,39 @@ data-returning methods and does not change.
 
 `MetricsSource` stays in `metriken-query`, and its implementations for the
 storage readers move there (the trait is query's, so the orphan rule allows
-it). `ArchiveReader`'s routing moves into its implementation: it parses the
-query with `referenced_metrics` and asks storage for the tables holding those
-names. Today `owners` (`metriken-archive/src/reader.rs:1492`) takes the query
-string and parses it; in storage it takes the names. The cross-cadence choice of evaluation
-timestamps (`ArchiveReader::cross_cadence_eval_timestamps`,
-`metriken-archive/src/reader.rs:1726`) is query policy and moves with it.
+it). `ArchiveReader`'s implementation (`metriken-archive/src/reader.rs:1794`)
+moves whole, with its routing: it parses the query with
+`referenced_metrics` and asks storage for the tables holding those names.
+Today `owners` (`reader.rs:1492`) takes the query string and parses it; in
+storage it takes the names. Storage exposes what the implementation reads
+from `ArchiveReader`'s private state today: each table's name catalog, its
+recording, its reader as a `Source`, and the union child built from it. The
+cross-cadence choice of evaluation timestamps
+(`ArchiveReader::cross_cadence_eval_timestamps`, `reader.rs:1726`) is query
+policy and moves with it.
+
+When rezolus's `crates/rez` becomes storage's `rez` feature (step 5),
+`RezReader` and `LiveReader` are storage types, and rezolus can no longer
+implement `MetricsSource` for them (E0117). Their implementations move into
+`metriken-query` behind a `rez` feature.
+
+### What callers change
+
+These follow from the crate boundary, and the re-exports do not cover them:
+
+- `ParquetReader` and `MemoryStore` have inherent `query_range`,
+  `query_range_opts`, `query` and `columns` methods (`src/parquet.rs:342`,
+  `355`, `461`, `467`; `src/memory_store.rs:196`, `208`, `221`, `227`). A
+  type in storage cannot have inherent methods defined in query, so these
+  become `MetricsSource` methods only, and a caller imports `MetricsSource`.
+  In this repository that is `benches/query_latency.rs` and
+  `examples/cachecannon_mem.rs`.
+- `ArchiveReader::eval_timestamps_for` (`reader.rs:1020`) becomes a function
+  in query, `metriken_query::eval_timestamps_for(&ArchiveReader, ..)`.
+  rezolus calls it through `RezReader`'s `Deref` in four tests
+  (`crates/rez/src/reader.rs`).
+- Every `metriken_archive::` import becomes `metriken_storage::`, through the
+  last `metriken-archive` release in the meantime.
 
 ### Left alone
 
@@ -142,12 +196,16 @@ Kept as they are through step 2, so the gate compares the same algorithm:
 ## Order of work
 
 All of it is one release of `metriken-storage` 0.1.0 and `metriken-query`
-0.35.0; nothing is published before the last PR.
+0.35.0; nothing is published before the last PR. rezolus builds and tests
+each step through a `[patch.crates-io]` git pin on the branch.
 
 1. The scan inside `metriken-query`: define `CounterScan` and `ScanChunk`,
    implement it for `SegmentedSource` and `UnionSource`, and rewrite
-   `grid_rates` as an engine function over it. No file moves. The gate runs
-   here, because this is the only part that changes the hot path.
+   `grid_rates` as an engine function over it. No file moves. Adds the
+   gate's query probe as an ignored test
+   (`metriken-archive/tests/display_peak.rs`).
+   The gate runs here, because this is the only part that changes the hot
+   path.
 2. `metriken-archive` renamed `metriken-storage`; metriken-segment's tables
    moved in.
 3. The column readers, `long`, `buffer_pool`, `types`, `histogram_stream`,
@@ -159,20 +217,49 @@ All of it is one release of `metriken-storage` 0.1.0 and `metriken-query`
 7. The gate again on the result, then the release.
 
 Steps 2 to 6 move about 15,000 lines of `metriken-query` and the 5,000 of
-`metriken-archive`, mostly without changing them; that size follows from the crate
-boundaries the plan chose.
+`metriken-archive`, mostly without changing them; that size follows from the
+crate boundaries the plan chose.
 
 ## GO / NO-GO
 
-GO for the release when, on `~/rezolus-bench/metrics-9.6h.dendro` (9h37m56s,
-5,874 segments, a 6,644-occupant task table; made from a `.rez` with
-`rezolus recording upgrade --to dendro`), #241's three queries at a budget of
-500 and a full `rezolus view` dashboard load, five runs each, have median time
-and peak memory within 5% of `metriken-query` 0.34.7 on the same host, and
-every query returns the same result as 0.34.7.
+The archives are under `~/rezolus-bench` on the author's host. They derive
+from one 9h37m56s rezolus recording (a `.rez`, converted with
+`rezolus recording upgrade --to dendro`):
+
+- `metrics-9.6h.dendro`: the whole recording, 5,874 segments; its per-task
+  table is wide;
+- `long.dendro` and `wide.dendro`: that per-task table
+  (`cpu_usage/cpu_usage_task`, 6,644 tasks) alone, rewritten long and wide by
+  `metriken-archive/tests/long_rewrite.rs`.
+
+The queries are #241's, each through `query_range_display_opts` over the full
+range at step 1 s and budget 500 (`display_peak.rs`):
+
+| archive | query |
+|---|---|
+| `long.dendro` | `sum by (comm) (irate(task_cpu_usage[5s]))` |
+| `metrics-9.6h.dendro` | `sum by (id) (irate(cpu_usage[5m])) / 1000000000` |
+| `wide.dendro` | `sum by (comm) (irate(task_cpu_usage[5s]))` |
+
+The dashboard load is `rezolus view metrics-9.6h.dendro` with a Playwright
+probe that visits every section, scrolls until no request has been issued for
+5 s, and records each `/api/v1` request; it measures the summed server time of
+the `query_range` requests and the peak footprint of the `rezolus view`
+process. The probe is committed to rezolus with step 7.
+
+GO for the release when the candidate and `metriken-query` 0.34.7, run
+alternately on the same host, five runs each, have median time and peak
+footprint within 5% of each other on every query and the dashboard load, and
+every query returns a bit-identical `DisplayResult` (serialized and compared).
+The 0.34.7 runs on 2026-10-09 spread more than 5% on two of the queries:
+`wide.dendro` peak footprint 1,339 to 1,513 MB, and `long.dendro` time 2.52 to
+2.92 s. Where the two builds' ranges overlap and their medians differ by more
+than 5%, the result is reported with both ranges rather than called a pass or
+a fail.
 
 NO-GO for the scan if the engine cannot read the arrays without copying them
-or cannot keep the per-partition threads over a chunk. In that case
-`counter_grid_rates` stays a storage method that takes an engine-defined sink
-trait, which keeps the computation in the engine's types but leaves a
-callback across the crate boundary.
+or cannot keep the per-partition threads over a chunk, or if step 1 builds but
+misses the gate. In that case `counter_grid_rates` stays a storage method that
+takes a sink trait defined in `metriken-storage` and implemented by the
+engine, which keeps the computation in the engine but leaves a callback
+across the crate boundary; it is measured against the same gate.
