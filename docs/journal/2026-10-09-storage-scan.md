@@ -286,16 +286,20 @@ last response, the sum over `/api/v1/query_range` requests of response end
 less request start as Playwright reports them, and the peak footprint of the
 `rezolus view` process.
 
-GO for the release when the candidate and `metriken-query` 0.34.7, run
-alternately on the same host, five runs each, have median time and peak
-footprint within 5% of each other on every query and the dashboard load, and
-every query returns a bit-identical `DisplayResult` (serialized and compared).
-The 0.34.7 runs on 2026-10-09 spread more than 5% on three measures:
-`wide.dendro` peak footprint 1,339 to 1,513 MB, `long.dendro` peak footprint
-384 to 405 MB, and `long.dendro` time 2.52 to 2.92 s. Where the two builds'
-ranges overlap and their medians differ by more than 5%, the result is
-reported with both ranges rather than called a pass or a fail, and GO waits
-on the owner's decision.
+The candidate and `metriken-query` 0.34.7 run alternately on the same host,
+five runs each, on every query and the dashboard load. Every query must return
+a bit-identical `DisplayResult` (serialized and compared). For median time and
+peak footprint, a measure passes when the two medians are within 5% of each
+other, or when the two builds' min-to-max ranges overlap. It fails when the
+candidate's median is more than 5% worse and outside the 0.34.7 range. GO for
+the release when every measure passes.
+
+Overlap counts as a pass because the 0.34.7 runs on 2026-10-09 spread more
+than 5% on three measures: `wide.dendro` peak footprint 1,339 to 1,513 MB,
+`long.dendro` peak footprint 384 to 405 MB, and `long.dendro` time 2.52 to
+2.92 s. On those measures five runs cannot tell a difference smaller than the
+spread from noise, and a regression of that size would pass. Decided
+2026-10-09.
 
 NO-GO for the scan if the engine cannot read the arrays without copying them
 or cannot keep the per-partition threads over a chunk, or if step 1 below
