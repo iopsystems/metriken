@@ -9,7 +9,8 @@
 //! Prints the number of points and the query's time. `DP_OUT=file` writes
 //! the result's `Debug` text, which prints each `f64` in its shortest
 //! round-trip form, so equal files are bit-identical results. Peak memory is
-//! measured around the process (`/usr/bin/time -l`).
+//! measured around the process (`/usr/bin/time -l` on macOS, `-v` on
+//! Linux).
 
 use metriken_archive::{ArchiveReader, DendroCatalog};
 use metriken_query::{BufferPool, DisplayOptions, DisplayResult, MetricsSource, QueryOptions};

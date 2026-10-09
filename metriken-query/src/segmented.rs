@@ -2078,6 +2078,7 @@ impl SegmentedScan<'_> {
     }
 }
 
+/// Decodes a chunk's segments one thread per segment where threads exist.
 impl crate::scan::ChunkReader for SegmentedScan<'_> {
     fn next_chunk(
         &mut self,
@@ -2108,19 +2109,6 @@ impl crate::scan::ChunkReader for SegmentedScan<'_> {
     }
 }
 
-/// Threads a batch read uses: segments decoded at once, and the most
-/// partitions. At most 8.
-pub(crate) fn batch_threads() -> usize {
-    #[cfg(target_arch = "wasm32")]
-    {
-        1
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
-    }
-}
-
 /// Read `segments`, in parallel where threads exist, in their order. A
 /// panic in a read is raised again here.
 fn read_all<T, F>(segments: &[u32], read: &F) -> Vec<T>
@@ -2147,36 +2135,6 @@ where
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         })
-    }
-}
-
-/// Run `f` over each partition's series and sink, one thread per partition
-/// where threads exist.
-pub(crate) fn run_partitions<R, S, F>(rates: &mut [R], sinks: &mut [S], f: &F)
-where
-    R: Send,
-    S: Send,
-    F: Fn(&mut R, &mut S, usize) + Sync,
-{
-    #[cfg(target_arch = "wasm32")]
-    {
-        for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-            f(r, s, p);
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if rates.len() < 2 {
-            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-                f(r, s, p);
-            }
-            return;
-        }
-        std::thread::scope(|scope| {
-            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-                scope.spawn(move || f(r, s, p));
-            }
-        });
     }
 }
 
@@ -4227,6 +4185,38 @@ mod tests {
         assert_eq!(r.segment_count(), 3, "the catalog still counts it");
     }
 
+    /// The counter scan skips a segment lost after open, and the batched
+    /// rate path then gives what the per-series path gives.
+    #[test]
+    fn the_counter_scan_skips_a_segment_lost_after_open() {
+        let store = CountingStore::new(three_segments());
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1 << 26))
+            .unwrap();
+        store.gone.lock().unwrap().insert(0);
+        let mut scan = r
+            .source
+            .scan_counters("c", &Labels::default(), 0, 6_000_000_000)
+            .expect("c scans");
+        let mut read = 0;
+        while let Some(chunk) = scan.next_chunk(1).expect("no read error") {
+            read += chunk.segments.len();
+        }
+        assert_eq!(read, 2, "the lost segment is skipped, the others read");
+
+        let range = |opts: &QueryOptions| {
+            let QueryResult::Matrix { result } = r
+                .query_range_opts("irate(c[2s])", 0.0, 6.0, 1.0, opts)
+                .unwrap()
+            else {
+                panic!("matrix");
+            };
+            result[0].values.clone()
+        };
+        let batched = range(&QueryOptions::default());
+        let per_series = range(&QueryOptions::default().with_per_series_rates(true));
+        assert_eq!(batched, per_series);
+    }
+
     /// A store that has lost a segment BEFORE open still opens; one that has
     /// lost every segment does not.
     #[test]
@@ -5403,6 +5393,33 @@ mod tests {
         }
         SegmentedParquetReader::open_bytes_with_pool(segments, BufferPool::new(64 * 1024 * 1024))
             .unwrap()
+    }
+
+    /// Each chunk's `rest_start` is the catalog start of the first segment
+    /// after it, and `None` after the last, at any chunk size.
+    #[test]
+    fn rest_start_is_the_start_of_the_next_unread_segment() {
+        let r = grouped_windows(Windows::default());
+        let starts: Vec<u64> = r
+            .source
+            .state
+            .catalog
+            .iter()
+            .map(|c| c.span.expect("every segment has a span").0)
+            .collect();
+        for n in [1, 3, 8] {
+            let mut scan = r
+                .source
+                .scan_counters("cpu_cycles", &Labels::default(), 0, u64::MAX)
+                .expect("cpu_cycles scans");
+            let mut read = 0;
+            while let Some(chunk) = scan.next_chunk(n).expect("no read error") {
+                read += chunk.segments.len();
+                let next = starts[read..].iter().min().copied();
+                assert_eq!(chunk.rest_start, next, "chunk size {n}, {read} read");
+            }
+            assert_eq!(read, starts.len(), "chunk size {n}");
+        }
     }
 
     #[test]

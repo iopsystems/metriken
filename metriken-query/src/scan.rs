@@ -61,9 +61,10 @@ pub(crate) trait ChunkReader {
     fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError>;
 }
 
-/// A counter's matched series and its decoded segments. Samples of one
-/// series come in increasing time: segments are in time order and a series
-/// has at most one column per segment.
+/// A counter's matched series and its decoded segments. A reader returns
+/// segments in time order, and a series has at most one column per segment,
+/// so each series' samples arrive in increasing time; `SeriesRate` requires
+/// it.
 pub(crate) struct CounterScan<'a> {
     pub series: Vec<ScanSeries>,
     reader: Box<dyn ChunkReader + 'a>,
@@ -74,8 +75,7 @@ impl<'a> CounterScan<'a> {
         Self { series, reader }
     }
 
-    /// Decodes up to `n` of the remaining segments, one thread per segment
-    /// where threads exist.
+    /// Decodes up to `n` of the remaining segments.
     pub fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError> {
         self.reader.next_chunk(n)
     }

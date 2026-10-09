@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The batched `rate`/`irate` path reads through a counter scan
-  (`DataSource::counter_scan`), which returns the matched series and their
-  segments' decoded columns a chunk at a time, and computes in
-  `batch_rate::grid_rates`. Results are unchanged.
+- Internal: the batched `rate`/`irate` path on a segmented reader is split
+  into a reader scan and an engine pass. Results are unchanged, apart from
+  the last-bit differences between runs that grouped queries over wide
+  tables already had.
 - Each chunk's decoded columns are freed before a grouped display query
   feeds its groups, rather than after. On a 9.6-hour recording of a per-task
   group stored long, the peak memory of `sum by (comm) (irate(...))` at

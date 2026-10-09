@@ -877,13 +877,15 @@ pub(crate) fn grid_rates(
     request: &GridRateRequest<'_>,
 ) -> Option<GridRates> {
     use crate::scan::RowSeries;
-    use crate::segmented::{batch_threads, run_partitions};
     let (start, end) = (request.data_start, request.end_ns);
-    let labels: Vec<Labels> = scan.series.iter().map(|s| s.labels.clone()).collect();
     let rates: Vec<SeriesRate> = scan
         .series
         .iter()
         .map(|s| SeriesRate::new(s.windowed, request.start_ns))
+        .collect();
+    let labels: Vec<Labels> = std::mem::take(&mut scan.series)
+        .into_iter()
+        .map(|s| s.labels)
         .collect();
 
     let grid = Grid::from_request(request);
@@ -896,7 +898,8 @@ pub(crate) fn grid_rates(
     // than twice a partition's share of the series is spread across all
     // partitions by series, each holding its accumulators, merged at the
     // end. Fewer than half the partition count of groups can be that large.
-    let parts = batch_threads().min(n).max(1);
+    let threads = batch_threads();
+    let parts = threads.min(n).max(1);
     let groups = request.group.map(|(op, by)| (op, groups(by, &labels)));
     let partition: Vec<usize> = match &groups {
         Some((_, (glabels, group_of))) => {
@@ -993,7 +996,7 @@ pub(crate) fn grid_rates(
         _ => None,
     };
     let resumed = std::sync::atomic::AtomicBool::new(false);
-    while let Some(chunk) = scan.next_chunk(batch_threads()).ok()? {
+    while let Some(chunk) = scan.next_chunk(threads).ok()? {
         let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
             let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
                 a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
@@ -1215,6 +1218,49 @@ pub(crate) fn grid_rates(
             )
         }
     })
+}
+
+/// Threads the batched path uses: segments a chunk decodes at once, and
+/// the most partitions. At most 8.
+fn batch_threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
+    }
+}
+
+/// Run `f` over each partition's series and sink, one thread per partition
+/// where threads exist.
+fn run_partitions<R, S, F>(rates: &mut [R], sinks: &mut [S], f: &F)
+where
+    R: Send,
+    S: Send,
+    F: Fn(&mut R, &mut S, usize) + Sync,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+            f(r, s, p);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if rates.len() < 2 {
+            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+                f(r, s, p);
+            }
+            return;
+        }
+        std::thread::scope(|scope| {
+            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+                scope.spawn(move || f(r, s, p));
+            }
+        });
+    }
 }
 
 #[cfg(test)]
