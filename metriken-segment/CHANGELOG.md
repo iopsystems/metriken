@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-10-09
+
+### Changed
+
+- The group schema, the write-ahead-log row types and their encodings, and
+  the occupant stream's rows and naming are `metriken-model`'s, re-exported
+  at the same paths. `window::Window` is `metriken_types::Window`, the same
+  type as `metriken::Window` from `metriken` 0.11.3, which the `metriken`
+  feature now requires; the `From` conversions between the two are gone and
+  `.into()` between them is the identity conversion. A downstream crate that
+  implemented one trait for both copies of a merged type gets conflicting
+  implementations (E0119).
+
 ## [0.1.6] - 2026-09-30
 
 ### Added

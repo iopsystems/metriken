@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.21.4"
+version = "0.21.5"
 dependencies = [
  "arrow",
  "chrono",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-segment"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow",
  "bytes",
