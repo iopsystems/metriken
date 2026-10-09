@@ -46,6 +46,7 @@ pub(crate) mod memory;
 pub(crate) mod memory_store;
 pub mod parquet;
 pub(crate) mod promql;
+pub(crate) mod scan;
 pub mod segmented;
 pub(crate) mod types;
 pub mod union;
@@ -270,17 +271,18 @@ pub(crate) trait DataSource: Send + Sync {
         let _ = (cols, start_ns, end_ns);
         None
     }
-    /// `rate`/`irate` of counter `name` on the evaluation grid, computed by
-    /// the source in one pass over its data, optionally aggregated; see
-    /// `batch_rate`. `None` when the source does not compute it; the
-    /// dispatcher then uses the per-series path.
-    fn counter_grid_rates(
+    /// Counter `name`'s matched series and their decoded columns between
+    /// `start_ns` and `end_ns`, for the batched rate path
+    /// (`batch_rate::grid_rates`). `None` when the source cannot scan this
+    /// counter; the dispatcher then uses the per-series path.
+    fn counter_scan(
         &self,
         name: &str,
         filter: &Labels,
-        request: &batch_rate::GridRateRequest<'_>,
-    ) -> Option<batch_rate::GridRates> {
-        let _ = (name, filter, request);
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<scan::CounterScan<'_>> {
+        let _ = (name, filter, start_ns, end_ns);
         None
     }
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges>;

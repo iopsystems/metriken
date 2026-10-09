@@ -921,7 +921,7 @@ mod reader_tests {
         }
     }
 
-    /// The batch path (`DataSource::counter_grid_rates`) gives what the
+    /// The batch path (`batch_rate::grid_rates` over `DataSource::counter_scan`) gives what the
     /// per-series path gives, on long and wide segments, for rate and irate,
     /// alone and under each aggregation, with `by`, on a cut range, on a step
     /// between samples, and with a wider span, over regular samples with

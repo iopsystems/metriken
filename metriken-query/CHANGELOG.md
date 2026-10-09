@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- The batched `rate`/`irate` path reads through a counter scan
+  (`DataSource::counter_scan`), which returns the matched series and their
+  segments' decoded columns a chunk at a time, and computes in
+  `batch_rate::grid_rates`. Results are unchanged.
+- Each chunk's decoded columns are freed before a grouped display query
+  feeds its groups, rather than after. On a 9.6-hour recording of a per-task
+  group stored long, the peak memory of `sum by (comm) (irate(...))` at
+  budget 500 falls from 382-409 MB to 333-345 MB.
+
 ## [0.34.7] - 2026-10-05
 
 ### Changed

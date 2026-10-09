@@ -869,6 +869,354 @@ impl<A: Accum> Sink for Grouped<A> {
     }
 }
 
+/// `rate`/`irate` of a scanned counter on `request`'s grid. `None` when a
+/// segment cannot be read or an ended series is pushed a sample; the
+/// dispatcher then evaluates the query per series.
+pub(crate) fn grid_rates(
+    mut scan: crate::scan::CounterScan<'_>,
+    request: &GridRateRequest<'_>,
+) -> Option<GridRates> {
+    use crate::scan::RowSeries;
+    use crate::segmented::{batch_threads, run_partitions};
+    let (start, end) = (request.data_start, request.end_ns);
+    let labels: Vec<Labels> = scan.series.iter().map(|s| s.labels.clone()).collect();
+    let rates: Vec<SeriesRate> = scan
+        .series
+        .iter()
+        .map(|s| SeriesRate::new(s.windowed, request.start_ns))
+        .collect();
+
+    let grid = Grid::from_request(request);
+    let n = labels.len();
+
+    // Series are split across partitions, each run by one thread with its
+    // own sink. Without aggregation, by series. With it, by group, largest
+    // first to the partition with the fewest series, so a group's
+    // accumulators exist in one partition; except that a group with more
+    // than twice a partition's share of the series is spread across all
+    // partitions by series, each holding its accumulators, merged at the
+    // end. Fewer than half the partition count of groups can be that large.
+    let parts = batch_threads().min(n).max(1);
+    let groups = request.group.map(|(op, by)| (op, groups(by, &labels)));
+    let partition: Vec<usize> = match &groups {
+        Some((_, (glabels, group_of))) => {
+            let mut size = vec![0usize; glabels.len()];
+            for g in group_of {
+                size[*g] += 1;
+            }
+            let spread = |g: usize| size[g] > 2 * n / parts;
+            let mut load = vec![0usize; parts];
+            for g in (0..glabels.len()).filter(|g| spread(*g)) {
+                for l in load.iter_mut() {
+                    *l += size[g] / parts;
+                }
+            }
+            let mut by_size: Vec<usize> = (0..glabels.len()).filter(|g| !spread(*g)).collect();
+            by_size.sort_unstable_by_key(|g| std::cmp::Reverse(size[*g]));
+            let mut part_of = vec![0usize; glabels.len()];
+            for g in by_size {
+                let p = (0..parts).min_by_key(|p| load[*p]).unwrap_or(0);
+                part_of[g] = p;
+                load[p] += size[g];
+            }
+            group_of
+                .iter()
+                .enumerate()
+                .map(|(s, g)| if spread(*g) { s % parts } else { part_of[*g] })
+                .collect()
+        }
+        None => (0..n).map(|s| s % parts).collect(),
+    };
+    let mut local = vec![0u32; n];
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); parts];
+    for (s, p) in partition.iter().enumerate() {
+        local[s] = members[*p].len() as u32;
+        members[*p].push(s);
+    }
+    let mut part_rates: Vec<Vec<SeriesRate>> = (0..parts).map(|_| Vec::new()).collect();
+    for (s, rate) in rates.into_iter().enumerate() {
+        part_rates[partition[s]].push(rate);
+    }
+    enum PartSink<'d> {
+        Series(PerSeries),
+        Groups(Grouped<Slot>),
+        Display(DisplaySink<'d>),
+        GroupsDisplay(Grouped<Compact>),
+    }
+    impl PartSink<'_> {
+        fn sink(&mut self) -> &mut dyn Sink {
+            match self {
+                PartSink::Series(s) => s,
+                PartSink::Groups(g) => g,
+                PartSink::Display(d) => d,
+                PartSink::GroupsDisplay(g) => g,
+            }
+        }
+    }
+    let mut sinks: Vec<PartSink> = members
+        .iter()
+        .map(|m| match &groups {
+            Some((op, (glabels, group_of))) => {
+                let group_of: Vec<usize> = m.iter().map(|s| group_of[*s]).collect();
+                match request.display {
+                    Some(_) => {
+                        PartSink::GroupsDisplay(Grouped::new(*op, glabels.clone(), group_of, &grid))
+                    }
+                    None => PartSink::Groups(Grouped::new(*op, glabels.clone(), group_of, &grid)),
+                }
+            }
+            None => match request.display {
+                Some(display) => PartSink::Display(DisplaySink {
+                    reducers: (0..m.len())
+                        .map(|_| BucketReducer::new(display.width, display.band))
+                        .collect(),
+                    display,
+                }),
+                None => PartSink::Series(PerSeries {
+                    points: vec![Vec::new(); m.len()],
+                }),
+            },
+        })
+        .collect();
+
+    // A grouped display query feeds each group's points to its reducer once
+    // no member can emit before them. After each chunk, a series whose last
+    // sample is more than ten times the larger of its spacing and the step
+    // before the earliest span start of the unread chunks is ended early; a
+    // series without a spacing yet uses the median of the others'. If an
+    // ended series is pushed a sample afterwards, the read returns `None` and
+    // the caller evaluates the query per series.
+    let mut flush = match (&groups, request.display) {
+        (Some((op, (glabels, _))), Some(display)) => {
+            Some(GroupFlush::new(*op, glabels.len(), display))
+        }
+        _ => None,
+    };
+    let resumed = std::sync::atomic::AtomicBool::new(false);
+    while let Some(chunk) = scan.next_chunk(batch_threads()).ok()? {
+        let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
+            let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
+                a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
+            };
+            for rows in &chunk.segments {
+                let columns = &rows.columns;
+                for (batch, series) in columns.batches.iter().zip(&rows.series) {
+                    let Some(ts) = columns.u64s(batch, columns.ts) else {
+                        continue;
+                    };
+                    let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
+                    for (col, series) in rows.cols.iter().zip(series) {
+                        let Some(values) = columns.u64s(batch, col.values) else {
+                            continue;
+                        };
+                        let begin = col.begin.and_then(|c| columns.i64s(batch, c));
+                        let width = col.width.and_then(|c| columns.u64s(batch, c));
+                        let windowed = (begin.is_some() && width.is_some()) || duration.is_some();
+                        let mut push = |r: usize, series: usize| {
+                            let (Some(base), Some(value)) =
+                                (get(Some(ts), r), get(Some(values), r))
+                            else {
+                                return;
+                            };
+                            if base < start || base > end {
+                                return;
+                            }
+                            let window = windowed.then(|| {
+                                let bo = begin.and_then(|b| {
+                                    (!arrow::array::Array::is_null(b, r)).then(|| b.value(r))
+                                });
+                                crate::parquet::resolve_window(
+                                    base,
+                                    bo,
+                                    get(width, r),
+                                    get(duration, r),
+                                )
+                            });
+                            let s = local[series] as usize;
+                            if rates[s].ended_early() {
+                                resumed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            rates[s].push(
+                                Sample {
+                                    ts: base,
+                                    value,
+                                    window,
+                                },
+                                &grid,
+                                s,
+                                sink.sink(),
+                            );
+                        };
+                        match series {
+                            RowSeries::One(s) => {
+                                if partition[*s as usize] == part {
+                                    for r in 0..batch.num_rows() {
+                                        push(r, *s as usize);
+                                    }
+                                }
+                            }
+                            RowSeries::PerRow(v) => {
+                                for (r, s) in v.iter().enumerate() {
+                                    if *s != u32::MAX && partition[*s as usize] == part {
+                                        push(r, *s as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        run_partitions(&mut part_rates, &mut sinks, &run);
+        let rest_start = chunk.rest_start;
+        drop(chunk);
+        if let (Some(flush), Some((_, (_, group_of)))) = (flush.as_mut(), &groups) {
+            if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let Some(w) = rest_start else {
+                continue;
+            };
+            // The median spacing of the series that have one.
+            let mut spacings: Vec<u64> = part_rates
+                .iter()
+                .flatten()
+                .filter_map(SeriesRate::spacing_ns)
+                .collect();
+            let median = (!spacings.is_empty()).then(|| {
+                let mid = spacings.len() / 2;
+                *spacings.select_nth_unstable(mid).1
+            });
+            // The earliest grid point each group can still be given.
+            let mut pending = vec![u64::MAX; group_of.iter().max().map_or(0, |g| g + 1)];
+            for (p, (rates, sink)) in part_rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
+                for (s, rate) in rates.iter_mut().enumerate() {
+                    let g = group_of[members[p][s]];
+                    if let Some(last) = rate.last_ts() {
+                        let lag = rate
+                            .spacing_ns()
+                            .or(median)
+                            .map(|sp| sp.max(grid.step_ns).saturating_mul(10));
+                        if rate.pending_ns().is_some()
+                            && lag.is_some_and(|lag| last.saturating_add(lag) < w)
+                        {
+                            rate.end_early(&grid, s, sink.sink());
+                        }
+                    }
+                    if let Some(t) = earliest_point(rate, w, &grid) {
+                        pending[g] = pending[g].min(t);
+                    }
+                }
+            }
+            let mut parts: Vec<&mut Grouped<Compact>> = sinks
+                .iter_mut()
+                .map(|s| match s {
+                    PartSink::GroupsDisplay(g) => g,
+                    _ => unreachable!("grouped display sinks"),
+                })
+                .collect();
+            for (g, t) in pending.iter().enumerate() {
+                let upto = points_before(&grid, *t) / BLOCK;
+                flush.feed(g, upto, &mut parts, &grid);
+            }
+        }
+    }
+    if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let finish = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, _p: usize| {
+        for (s, rate) in rates.iter_mut().enumerate() {
+            rate.finish(&grid, s, sink.sink());
+        }
+    };
+    run_partitions(&mut part_rates, &mut sinks, &finish);
+
+    // Each series' result, in the order of `labels`, from the partitions'
+    // per-series results.
+    fn in_order<T: Default>(
+        labels: Vec<Labels>,
+        mut parts: Vec<Vec<T>>,
+        partition: &[usize],
+        local: &[u32],
+    ) -> Vec<(Labels, T)> {
+        labels
+            .into_iter()
+            .enumerate()
+            .map(|(s, l)| {
+                (
+                    l,
+                    std::mem::take(&mut parts[partition[s]][local[s] as usize]),
+                )
+            })
+            .collect()
+    }
+    Some(match groups {
+        Some((_, (glabels, _))) if request.display.is_some() => {
+            let mut flush = flush?;
+            #[cfg(test)]
+            FED_BEFORE_END.with(|n| n.set(flush.fed()));
+            let mut parts: Vec<Grouped<Compact>> = sinks
+                .into_iter()
+                .map(|s| match s {
+                    PartSink::GroupsDisplay(g) => g,
+                    _ => unreachable!("grouped display sinks"),
+                })
+                .collect();
+            let blocks = parts.first().map_or(0, |p| p.blocks_per_group());
+            let mut parts: Vec<&mut Grouped<Compact>> = parts.iter_mut().collect();
+            for g in 0..glabels.len() {
+                flush.feed(g, blocks, &mut parts, &grid);
+            }
+            GridRates::Display(glabels.into_iter().zip(flush.into_reducers()).collect())
+        }
+        Some(_) => {
+            let mut sinks = sinks.into_iter().map(|s| match s {
+                PartSink::Groups(g) => g,
+                _ => unreachable!("grouped sinks"),
+            });
+            let mut all = sinks.next()?;
+            for g in sinks {
+                all.merge(g);
+            }
+            GridRates::Points(all.finish(&grid))
+        }
+        None if request.display.is_some() => {
+            let reducers: Vec<Vec<Option<BucketReducer>>> = sinks
+                .into_iter()
+                .map(|s| match s {
+                    PartSink::Display(d) => d.reducers.into_iter().map(Some).collect(),
+                    _ => unreachable!("display sinks"),
+                })
+                .collect();
+            GridRates::Display(
+                in_order(labels, reducers, &partition, &local)
+                    .into_iter()
+                    .map(|(l, r)| (l, r.expect("each series' reducer, once")))
+                    .collect(),
+            )
+        }
+        None => {
+            let points: Vec<Vec<Vec<Point>>> = sinks
+                .into_iter()
+                .map(|s| match s {
+                    PartSink::Series(p) => p.points,
+                    _ => unreachable!("per-series sinks"),
+                })
+                .collect();
+            GridRates::Points(
+                in_order(labels, points, &partition, &local)
+                    .into_iter()
+                    .map(|(l, mut p)| {
+                        p.shrink_to_fit();
+                        (l, p)
+                    })
+                    .collect(),
+            )
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

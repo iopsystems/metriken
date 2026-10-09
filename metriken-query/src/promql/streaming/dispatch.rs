@@ -195,8 +195,11 @@ fn batch_rates<'a>(
     group: Option<(AggOp, GroupBy<'_>)>,
 ) -> Option<(SeriesSet<'a>, String)> {
     let (name, filter, request) = grid_request(ctx, call, group, None)?;
-    let crate::batch_rate::GridRates::Points(results) =
-        ctx.source.counter_grid_rates(name, &filter, &request)?
+    let crate::batch_rate::GridRates::Points(results) = crate::batch_rate::grid_rates(
+        ctx.source
+            .counter_scan(name, &filter, request.data_start, request.end_ns)?,
+        &request,
+    )?
     else {
         return None;
     };
@@ -338,8 +341,10 @@ fn batch_display(
     let Some((name, filter, request)) = grid_request(ctx, call, group, Some(&grid_display)) else {
         return Ok(None);
     };
-    let Some(crate::batch_rate::GridRates::Display(results)) =
-        ctx.source.counter_grid_rates(name, &filter, &request)
+    let Some(crate::batch_rate::GridRates::Display(results)) = ctx
+        .source
+        .counter_scan(name, &filter, request.data_start, request.end_ns)
+        .and_then(|scan| crate::batch_rate::grid_rates(scan, &request))
     else {
         return Ok(None);
     };
