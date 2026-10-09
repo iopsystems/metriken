@@ -51,12 +51,12 @@ three things in one function:
    `BucketReducer`, the partition assignment, and early finish against the
    earliest start of the remaining segments (#241).
 
-The readers are in two halves. `FileSource`, `MultiParquetSource`,
-`SegmentedSource` and `UnionSource` implement `DataSource`;
-`ParquetReader`, `SegmentedParquetReader`, `UnionMetricsSource` and
-`MemoryStore` wrap one and implement `MetricsSource` by owning a
-`QueryEngine`. Because of (3), the `DataSource` halves cannot move below the
-engine as they are.
+The readers are in two halves. `FileSource`, `MultiParquetSource`, `LazySource`,
+`SegmentedSource`, `UnionSource` and `MemoryStoreInner` implement `DataSource`.
+`ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource` wrap one and
+implement `MetricsSource` by owning a `QueryEngine`; `MemoryStore` builds one
+per call (`src/memory_store.rs:188`). Because of (3), the `DataSource` halves
+cannot move below the engine as they are.
 
 ## Design
 
@@ -66,12 +66,38 @@ As the plan's crate table says, the `DataSource` halves move to storage and
 the `MetricsSource` wrappers stay in query. `ParquetReader`,
 `SegmentedParquetReader`, `UnionMetricsSource`, `MemoryStore`,
 `MemoryStoreBuilder` and `ParquetBuilder` keep their paths and their
-inherent methods; each holds a storage source and a `QueryEngine` over it.
+inherent methods. `ParquetReader`, `SegmentedParquetReader` and
+`UnionMetricsSource` hold a storage source and a `QueryEngine`; `MemoryStore`
+builds one per call; the builders build these.
+
+Storage cannot name the wrappers, and today its halves are built on them, so
+the following change:
+
+- In storage a segment is a file source (`ParquetSource`, `src/parquet.rs:1345`)
+  rather than a `ParquetReader`. `SegmentedSource`'s segment cache
+  (`src/segmented.rs:773`) and `Handover` (`:1089`) hold it, and the
+  `ParquetReader` helpers the open path calls (`src/parquet.rs:142-317`:
+  `counter_columns`, `gauge_columns`, `histogram_configs`,
+  `counter_column_refs`, `batch_columns`, `resident_estimate`) become its
+  methods. A cached segment no longer carries a `QueryEngine`.
+- `SegmentedParquetReader`'s open path (`open_with_pool`,
+  `open_relabeled_with_pool`, `open_after`, `handover`;
+  `src/segmented.rs:166-355`) becomes public constructors on
+  `SegmentedSource`, which `ArchiveReader` calls. The wrapper's constructors
+  forward to them.
+- Opening a file's footer from bytes (`ParquetReader::open_bytes_with_pool`,
+  which `ArchiveReader` uses to probe tables, `reader.rs:129`, `1423`,
+  `1439`) becomes public on the file source.
+- `UnionChild` and `CompositionSource` get public constructors from a
+  `Source` in storage, and query implements their `From<&wrapper>`
+  conversions (`src/union.rs:68-87`, `src/parquet.rs:593-611`).
+  `UnionSource::try_new` in storage holds the empty and duplicate-name checks
+  (`src/union.rs:333-398`), and `UnionMetricsSource::try_new` forwards to it.
 
 The modules `long`, `buffer_pool`, `types`, `histogram_stream`, `labels`,
-`lazy` and `memory` move to storage, with the source halves of `parquet`,
-`segmented`, `union` and `memory_store`. `metriken-query` re-exports these
-public items at their current paths for one release:
+`lazy`, `memory` and `util` move to storage, with the source halves of
+`parquet`, `segmented`, `union` and `memory_store`. `metriken-query` re-exports
+these public items at their current paths for one release:
 
 - composition: `CompositionSource`, `CompositionCatalog`, `UnionChild`,
   `UnionError`;
@@ -83,9 +109,11 @@ public items at their current paths for one release:
   `HistogramSnapshot`, `ColumnChunk`, `CounterColumnRef`, `ColumnPosition`;
 - `fixtures` (feature `fixtures`), which builds parquet files.
 
-`metriken-query`'s `ingest` and `lz4` features forward to storage's for one
-release. `ingest` gates `MemoryStore`'s snapshot loading, which reads
-`metriken-model` types and moves with the in-memory source.
+`metriken-query`'s `ingest`, `lz4` and `fixtures` features forward to storage's
+for one release. The `fixtures` tests that open a `ParquetReader`
+(`fixtures/synthetic.rs`, `fixtures/augment.rs`) stay in query. `ingest` gates
+`MemoryStore`'s snapshot loading, which reads `metriken-model` types and moves
+with the in-memory source.
 
 `metriken-archive` is renamed `metriken-storage` (step 2 below). A new
 `metriken-archive` 0.4.0 re-exports `metriken-storage`, forwarding its
@@ -180,12 +208,12 @@ data-returning methods and does not change.
 `ArchiveReader` is a storage type, and its `MetricsSource` implementation
 (`metriken-archive/src/reader.rs:1794`) moves to query whole (the trait is
 query's, so the orphan rule allows it). Today `ArchiveReader` holds a
-`ParquetReader` or `SegmentedParquetReader` per table (`reader.rs:63`) and
-builds a `UnionMetricsSource` per query (`reader.rs:1581`). In storage it
-holds the sources, and the implementation in query builds the wrapper over
-the routed source. I don't know yet what building a `QueryEngine` per query
-costs; step 3 below measures it, and if it shows in the gate the archive
-keeps one wrapper per table on the query side.
+`SegmentedParquetReader` per table (`reader.rs:63`) and builds a
+`UnionMetricsSource` per query (`reader.rs:1581`). In storage it holds a
+`SegmentedSource` per table, and the implementation in query builds the
+wrapper over the routed source. A `QueryEngine` is one `Arc<dyn DataSource>`
+(`src/promql/mod.rs:261`), so building one per query costs an `Arc` clone, as
+`MemoryStore` already does per call.
 
 Routing moves with the implementation: it parses the query with
 `referenced_metrics` and asks storage for the tables holding those names.
@@ -200,9 +228,10 @@ When rezolus's `crates/rez` becomes storage's `rez` feature (step 5 below),
 `RezReader` is a storage type, and rezolus can no longer implement
 `MetricsSource` for it (E0117). Its implementation only forwards to the
 `ArchiveReader` it wraps, so it moves into query behind a `rez` feature.
-`LiveReader` (`crates/rez/src/live.rs`) uses only public API and its only
-user is rezolus's `src/viewer/follow.rs`, so it stays in rezolus with its
-implementation.
+`LiveReader` (`crates/rez/src/live.rs`) uses only public API, and its users
+are rezolus's viewer (`src/viewer/follow.rs`, `live.rs`, `mod.rs`), so it
+moves from `crates/rez` into the rezolus binary with its implementation.
+`FileId`, which `crates/rez/src/catalog.rs` uses to reopen, moves to storage.
 
 ### What callers change
 
@@ -288,11 +317,13 @@ less request start as Playwright reports them, and the peak footprint of the
 
 The candidate and `metriken-query` 0.34.7 run alternately on the same host,
 five runs each, on every query and the dashboard load. Every query must return
-a bit-identical `DisplayResult` (serialized and compared). For median time and
-peak footprint, a measure passes when the two medians are within 5% of each
-other, or when the two builds' min-to-max ranges overlap. It fails when the
-candidate's median is more than 5% worse and outside the 0.34.7 range. GO for
-the release when every measure passes.
+a bit-identical `DisplayResult` (serialized and compared). The measures are
+each query's time and peak footprint, and the dashboard's wall time, summed
+`query_range` time and peak footprint. A measure fails when the candidate's
+median is more than 5% worse than 0.34.7's and the two builds' min-to-max
+ranges do not overlap; otherwise it passes, including when the candidate is
+better. GO for the release when every measure passes and every result is
+identical.
 
 Overlap counts as a pass because the 0.34.7 runs on 2026-10-09 spread more
 than 5% on three measures: `wide.dendro` peak footprint 1,339 to 1,513 MB,
@@ -301,9 +332,9 @@ than 5% on three measures: `wide.dendro` peak footprint 1,339 to 1,513 MB,
 spread from noise, and a regression of that size would pass. Decided
 2026-10-09.
 
-NO-GO for the scan if the engine cannot read the arrays without copying them
-or cannot keep the per-partition threads over a chunk, or if step 1 below
-builds but misses the gate. In that case `counter_grid_rates` stays a storage
-method that takes a sink trait defined in `metriken-storage` and implemented
-by the engine, which keeps the computation in the engine but leaves a
-callback across the crate boundary; it is measured against the same gate.
+NO-GO for the scan if the engine cannot read the arrays without copying them or
+cannot keep the per-partition threads over a chunk, or if step 1 of the order of
+work builds but misses the gate. In that case `counter_grid_rates` stays a
+storage method that takes a sink trait defined in `metriken-storage` and
+implemented by the engine, which keeps the computation in the engine but leaves
+a callback across the crate boundary; it is measured against the same gate.
