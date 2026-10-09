@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use metriken::Window;
+use crate::schema::GroupSchema;
 
-#[cfg(feature = "msgpack")]
+use metriken_types::Window;
 use rmp_serde::encode::Error as SerializeMsgpackError;
 #[cfg(feature = "json")]
 use serde_json::Error as JsonError;
@@ -14,17 +14,13 @@ use serde_json::Error as JsonError;
 // downstream construction. Build them with `new(..)` + `with_window(..)`
 // rather than a struct literal.
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct Counter {
     pub name: String,
     pub value: u64,
     pub metadata: HashMap<String, String>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
 }
 
@@ -46,17 +42,13 @@ impl Counter {
     }
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct Gauge {
     pub name: String,
     pub value: i64,
     pub metadata: HashMap<String, String>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
 }
 
@@ -78,17 +70,13 @@ impl Gauge {
     }
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct Histogram {
     pub name: String,
     pub value: histogram::Histogram,
     pub metadata: HashMap<String, String>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
 }
 
@@ -115,12 +103,11 @@ impl Histogram {
 }
 
 /// Contains a snapshot of metric readings.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotV1 {
     pub systemtime: SystemTime,
 
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub metadata: HashMap<String, String>,
 
     pub counters: Vec<Counter>,
@@ -129,13 +116,12 @@ pub struct SnapshotV1 {
 }
 
 /// Contains a snapshot of metric readings.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotV2 {
     pub systemtime: SystemTime,
     pub duration: Duration,
 
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub metadata: HashMap<String, String>,
 
     pub counters: Vec<Counter>,
@@ -149,60 +135,6 @@ pub struct SnapshotV2 {
 // the arity note on SnapshotV3 and on the Snapshot enum below); advertising
 // room to grow via `#[non_exhaustive]` would be false. A future field means
 // a V4, not an addition here.
-
-/// One metric's identity within a [`GroupSchema`]: its column key (the
-/// snapshot entry name, e.g. `"5"` / `"5x3"`) plus its annotations
-/// (`metric`, `sampler`, labels, and for histograms `grouping_power` /
-/// `max_value_power`). Metadata is a `BTreeMap` so serialization — and
-/// therefore the group schema hash — is deterministic.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct MetricDesc {
-    /// MUST be unique across ALL groups in a snapshot, not only within this
-    /// one's own group. Downstream code keys metrics by name, so a
-    /// cross-group collision silently drops one of the two readings rather
-    /// than erroring. V1/V2 had this structurally for free — one flat,
-    /// global counter/gauge/histogram list — so nothing enforced it
-    /// explicitly. V3 splits names into per-group schemas, so producers are
-    /// now responsible for preserving global uniqueness themselves.
-    pub name: String,
-    pub metadata: BTreeMap<String, String>,
-}
-
-/// The membership of one acquisition group: descriptors for every counter,
-/// gauge and histogram slot, in the order the value arrays use.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct GroupSchema {
-    pub counters: Vec<MetricDesc>,
-    pub gauges: Vec<MetricDesc>,
-    pub histograms: Vec<MetricDesc>,
-}
-
-impl GroupSchema {
-    /// FNV-1a-128 over the schema's canonical msgpack encoding, returned as
-    /// `(hi, lo)` because msgpack (and rmp-serde) has no 128-bit integer.
-    ///
-    /// Deterministic because `MetricDesc.metadata` is a `BTreeMap`. Only the
-    /// producer computes this; receivers treat it as an opaque cache key —
-    /// but the algorithm is still pinned by a known-answer test so hashes
-    /// stay comparable across producer versions. 128 bits because a
-    /// collision mis-associates an entire group's values with the wrong
-    /// schema.
-    #[cfg(feature = "msgpack")]
-    pub fn hash(&self) -> (u64, u64) {
-        const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
-        const PRIME: u128 = 0x0000000001000000000000000000013b;
-        let bytes =
-            rmp_serde::encode::to_vec(self).expect("GroupSchema serialization is infallible");
-        let mut h = OFFSET;
-        for &b in &bytes {
-            h ^= b as u128;
-            h = h.wrapping_mul(PRIME);
-        }
-        ((h >> 64) as u64, h as u64)
-    }
-}
 
 /// One acquisition group's readings for one tick.
 ///
@@ -223,8 +155,7 @@ impl GroupSchema {
 /// `Option` is msgpack nil). Do not add `skip_serializing_if` to any field —
 /// the untagged [`Snapshot`] enum distinguishes versions by positional
 /// shape, and variable arity would break decoding.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GroupSnapshot {
     /// Stable group identity, `"<sampler>/<group>"` (e.g. `"cpu_usage/percpu"`).
     pub name: String,
@@ -245,7 +176,7 @@ pub struct GroupSnapshot {
     ///
     /// `Arc`-wrapped so a cache-hit producer (schema unchanged since the last
     /// tick) can hand out another reference to the same allocation instead of
-    /// deep-cloning every [`MetricDesc`] on every tick. `Arc<T>` is
+    /// deep-cloning every [`MetricDesc`](crate::schema::MetricDesc) on every tick. `Arc<T>` is
     /// serde-transparent — with the `rc` feature enabled it serializes
     /// exactly as a bare `T` — so this is wire-compatible with the
     /// pre-`Arc` field; see the `arc_schema_wire_compat` test.
@@ -262,7 +193,6 @@ pub struct GroupSnapshot {
 /// (`counters()`/`gauges()`/`histograms()`) skip such groups silently
 /// instead of surfacing this type — call [`GroupSnapshot::validate`]
 /// directly when the distinction matters.
-#[cfg(feature = "msgpack")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupValidationError {
     /// A value vector's length disagrees with its schema list.
@@ -270,8 +200,6 @@ pub enum GroupValidationError {
     /// `schema_hash` does not equal the transmitted schema's [`GroupSchema::hash`].
     SchemaHashMismatch,
 }
-
-#[cfg(feature = "msgpack")]
 impl GroupSnapshot {
     /// Check the cross-field invariants the wire format cannot express:
     /// per-kind schema/value arity, and — when a schema is transmitted —
@@ -303,13 +231,12 @@ impl GroupSnapshot {
 /// removing, or reordering a field once this ships breaks decoding for every
 /// deployed consumer — extend by adding a `V4` variant, not by editing this
 /// struct.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotV3 {
     pub systemtime: SystemTime,
     pub duration: Duration,
 
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub metadata: HashMap<String, String>,
 
     pub groups: Vec<GroupSnapshot>,
@@ -356,22 +283,12 @@ pub struct SnapshotV3 {
 /// attempt fail rather than ignore them. Adding a field to `SnapshotV3` (or
 /// `GroupSnapshot`) is a breaking change for every deployed consumer —
 /// extensions require a new `V4` variant, not an edit to an existing one.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(untagged))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
 pub enum Snapshot {
     V1(SnapshotV1),
     V2(SnapshotV2),
     V3(SnapshotV3),
-}
-
-#[cfg(feature = "parquet")]
-pub(crate) struct HashedSnapshot {
-    pub(crate) ts: u64,
-    pub(crate) duration: Option<u64>,
-    pub(crate) counters: HashMap<String, Counter>,
-    pub(crate) gauges: HashMap<String, Gauge>,
-    pub(crate) histograms: HashMap<String, Histogram>,
 }
 
 /// Rebuild a decoded histogram through the validating constructor,
@@ -589,8 +506,6 @@ impl Snapshot {
         res.push(b'\n');
         Ok(res)
     }
-
-    #[cfg(feature = "msgpack")]
     pub fn to_msgpack<T>(val: &T) -> Result<Vec<u8>, SerializeMsgpackError>
     where
         T: serde::Serialize + ?Sized,
@@ -603,7 +518,6 @@ impl Snapshot {
     /// allocation bombs that bare `rmp_serde::from_slice` amplifies to hundreds
     /// of MB before erroring) and rejection of trailing bytes (`from_slice`
     /// silently ignores them — two concatenated snapshots would decode as one).
-    #[cfg(feature = "msgpack")]
     pub fn from_msgpack(bytes: &[u8]) -> Result<Snapshot, rmp_serde::decode::Error> {
         use serde::Deserialize;
 
@@ -619,42 +533,10 @@ impl Snapshot {
     }
 }
 
-#[cfg(feature = "parquet")]
-impl From<Snapshot> for HashedSnapshot {
-    fn from(mut snapshot: Snapshot) -> Self {
-        let ts: u64 = snapshot
-            .systemtime()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("System Clock is earlier than 1970; needs reset")
-            .as_nanos() as u64;
-
-        let duration: Option<u64> = snapshot.duration().map(|x| x.as_nanos() as u64);
-
-        let counters: HashMap<String, Counter> =
-            HashMap::from_iter(snapshot.counters().into_iter().map(|v| (v.name.clone(), v)));
-        let gauges: HashMap<String, Gauge> =
-            HashMap::from_iter(snapshot.gauges().into_iter().map(|v| (v.name.clone(), v)));
-        let histograms: HashMap<String, Histogram> = HashMap::from_iter(
-            snapshot
-                .histograms()
-                .into_iter()
-                .map(|v| (v.name.clone(), v)),
-        );
-
-        Self {
-            ts,
-            duration,
-            counters,
-            gauges,
-            histograms,
-        }
-    }
-}
-
 #[cfg(all(test, feature = "json"))]
 mod window_tests {
     use super::*;
-    use metriken::Window;
+    use metriken_types::Window;
 
     fn gauge(window: Option<Window>) -> Gauge {
         Gauge {
@@ -690,8 +572,6 @@ mod window_tests {
         let g: Gauge = serde_json::from_str(old).unwrap();
         assert!(g.window.is_none());
     }
-
-    #[cfg(feature = "msgpack")]
     #[test]
     fn window_msgpack_roundtrip() {
         for w in [None, Some(Window::new(1, 2))] {
@@ -702,10 +582,11 @@ mod window_tests {
     }
 }
 
-#[cfg(all(test, feature = "msgpack"))]
+#[cfg(test)]
 mod v3_tests {
     use super::*;
-    use metriken::Window;
+    use crate::schema::MetricDesc;
+    use metriken_types::Window;
 
     fn desc(name: &str, metric: &str) -> MetricDesc {
         MetricDesc {
@@ -1184,31 +1065,6 @@ mod v3_tests {
             panic!("wrong version")
         };
         assert_eq!(s.groups[0].counters, vec![Some(7), None]);
-    }
-
-    #[test]
-    #[cfg(feature = "parquet")]
-    fn v3_and_equivalent_v2_hash_identically_for_parquet() {
-        // The compatibility contract for MsgpackToParquet: a V3 snapshot and
-        // the V2 snapshot describing the same readings produce the same
-        // HashedSnapshot, so legacy parquet output is unchanged by V3 input.
-        let hv3: HashedSnapshot = Snapshot::V3(v3()).into();
-        let mut v2 = v2();
-        v2.counters = vec![Counter::new(
-            "0".to_string(),
-            7,
-            [("metric".to_string(), "cpu_cycles".to_string())].into(),
-        )
-        .with_window(Some(Window::new(999_000, 999_400)))];
-        let hv2: HashedSnapshot = Snapshot::V2(v2).into();
-        assert_eq!(hv3.ts, hv2.ts);
-        assert_eq!(hv3.duration, hv2.duration);
-        assert_eq!(hv3.counters.len(), hv2.counters.len());
-        let (a, b) = (&hv3.counters["0"], &hv2.counters["0"]);
-        assert_eq!(
-            (a.value, &a.metadata, a.window),
-            (b.value, &b.metadata, b.window)
-        );
     }
 
     #[test]

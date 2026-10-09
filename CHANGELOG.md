@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-model 0.1.0
+
+- **Added:** the observation model as plain types with no `metriken`
+  dependency: the snapshot types (`Snapshot`, `SnapshotV1`/`V2`/`V3`,
+  `Counter`, `Gauge`, `Histogram`, `GroupSnapshot`, `GroupValidationError`)
+  and their msgpack and JSON (feature `json`) encodings, the group schema
+  (`GroupSchema`, `MetricDesc`), the write-ahead-log rows (`WalCell`,
+  `WalValue`, `WalGroupRow`, `WalLongRow`, `LongOccupant`) and their
+  encodings, the occupant stream's rows (`Occupant`) and stream naming, and
+  `convert::wal_group_row`. Re-exports `metriken-types`' `Window` and
+  `UID_LABEL`. Builds for wasm32. Plan:
+  `docs/journal/2026-10-08-one-recording-stack.md`, path step 1.
+
+### metriken-exposition 0.21.5
+
+- **Changed:** the snapshot types and `GroupSchema`/`MetricDesc` are
+  `metriken-model`'s, re-exported at the same paths, and `wal_group_row` is
+  `metriken_model::convert::wal_group_row`. Serde, msgpack encoding and
+  `GroupSnapshot::validate` no longer depend on this crate's `serde` and
+  `msgpack` features. The `From<&GroupSchema>` conversions into
+  `metriken-segment`'s schema are gone: the two are one type, and
+  `metriken-model` provides `From<&GroupSchema> for GroupSchema`, so
+  `(&schema).into()` still compiles.
+
+### metriken-segment 0.1.7
+
+- **Changed:** `schema::{GroupSchema, MetricDesc, fnv1a_128}`, the WAL row
+  types and their `encode_*`/`decode_*` functions, and the occupant stream's
+  `Occupant`, `encode_wal_row`, `decode_wal_row`, `stream_of`, `table_of` and
+  `SUFFIX` are `metriken-model`'s, re-exported at the same paths.
+  `window::Window` is `metriken_types::Window`, the same type as
+  `metriken::Window`, so the `From` conversions between them are gone; `.into()`
+  between them still compiles. The `metriken` feature has no effect and no
+  longer pulls in `metriken`.
+
 ### metriken-types 0.1.0
 
 - **Added:** a crate below `metriken-core` for the types the registry writes

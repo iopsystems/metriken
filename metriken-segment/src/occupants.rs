@@ -18,10 +18,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema, UInt64Type};
 use arrow::record_batch::RecordBatch;
-use serde::{Deserialize, Serialize};
-
-/// The suffix that makes a stream a table's occupant stream.
-pub const SUFFIX: &str = "/occupants";
+pub use metriken_model::occupants::{
+    decode_wal_row, encode_wal_row, stream_of, table_of, Occupant, SUFFIX,
+};
 
 /// Field metadata key saying how a `UInt64` label column maps back to the
 /// label's text: [`DECIMAL`] or [`HEX16`].
@@ -30,33 +29,6 @@ const DECIMAL: &str = "decimal";
 /// Sixteen lowercase hex digits, the format rezolus's agent writes
 /// `__uid__` in.
 const HEX16: &str = "hex16";
-
-/// `table`'s occupant stream.
-pub fn stream_of(table: &str) -> String {
-    format!("{table}{SUFFIX}")
-}
-
-/// The table an occupant stream belongs to, if `stream` is one.
-pub fn table_of(stream: &str) -> Option<&str> {
-    stream.strip_suffix(SUFFIX)
-}
-
-/// One occupant and its labels.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Occupant {
-    pub occupant: u64,
-    pub labels: BTreeMap<String, String>,
-}
-
-/// A WAL row of an occupant stream: the occupants first seen or restated
-/// at one tick, msgpack.
-pub fn encode_wal_row(occupants: &[Occupant]) -> Vec<u8> {
-    rmp_serde::to_vec(occupants).expect("occupant rows serialize")
-}
-
-pub fn decode_wal_row(row: &[u8]) -> Result<Vec<Occupant>, String> {
-    rmp_serde::from_slice(row).map_err(|e| format!("decoding an occupant WAL row: {e}"))
-}
 
 /// How a label column is stored.
 #[derive(Clone, Copy, PartialEq, Eq)]

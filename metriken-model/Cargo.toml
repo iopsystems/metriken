@@ -1,0 +1,25 @@
+[package]
+name = "metriken-model"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+]
+license = "Apache-2.0"
+description = "The metriken observation model: snapshots, group schemas and the rows a recording stores"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
+
+[features]
+json = ["dep:serde_json"]
+
+[dependencies]
+histogram = { workspace = true, features = ["serde"] }
+metriken-types = { version = "0.1.0", path = "../metriken-types", features = ["serde"] }
+rmp = "0.8"
+rmp-serde = "1.3"
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

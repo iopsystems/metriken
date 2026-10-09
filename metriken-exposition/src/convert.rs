@@ -5,7 +5,7 @@ use std::path::Path;
 
 use parquet::errors::ParquetError;
 
-use crate::snapshot::Snapshot;
+use crate::Snapshot;
 use crate::{ParquetOptions, ParquetSchema};
 
 /// A struct for converting msgpack'd metriken snapshots into a parquet file.
