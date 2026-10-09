@@ -989,6 +989,7 @@ dependencies = [
  "histogram",
  "metriken-core",
  "metriken-derive",
+ "metriken-types",
  "once_cell",
  "parking_lot",
  "trybuild",
@@ -1017,10 +1018,9 @@ version = "0.3.2"
 dependencies = [
  "histogram",
  "linkme",
+ "metriken-types",
  "parking_lot",
  "phf",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1085,6 +1085,14 @@ dependencies = [
  "rmp-serde",
  "serde",
  "tracing",
+]
+
+[[package]]
+name = "metriken-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

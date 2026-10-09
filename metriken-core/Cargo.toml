@@ -18,14 +18,12 @@ repository = "https://github.com/iopsystems/metriken"
 links = "metriken-core"
 
 [features]
-serde = ["dep:serde"]
+serde = ["metriken-types/serde"]
 
 [dependencies]
 histogram.workspace = true
 linkme = "0.3"
+metriken-types = { version = "0.1.0", path = "../metriken-types" }
 parking_lot.workspace = true
 phf = { version = "0.13", features = ["macros"] }
-serde = { version = "1.0", optional = true, features = ["derive"] }
 
-[dev-dependencies]
-serde_json = "1.0"

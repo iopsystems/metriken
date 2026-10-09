@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- `Window` moves to the new `metriken-types` crate and is re-exported here at
+  the same path, so `metriken_core::Window` and `metriken::Window` name the
+  same type as before. It gains `PartialOrd`, `Ord` and `Hash`. The `serde`
+  feature now turns on `metriken-types/serde`, and the crate no longer
+  depends on serde directly.
+
 ## 0.3.2
 
 ### Added

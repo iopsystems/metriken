@@ -9,6 +9,7 @@ members = [
     "metriken-archive",
     "metriken-query",
     "metriken-segment",
+    "metriken-types",
 ]
 
 [workspace.dependencies]

@@ -1,9 +1,9 @@
 //! Acquisition window for a metric observation: the interval over which the
-//! value was read. Both ends are recorded so "when did we read it" is a
-//! read-time interpretation, not a write-time loss.
+//! value was read. Both ends are recorded so a reader can choose which instant
+//! to attribute the value to.
 
 /// A measurement's acquisition window, in nanoseconds since the Unix epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Window {
     /// Start of the acquisition interval (ns since Unix epoch).

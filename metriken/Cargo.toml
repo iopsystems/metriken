@@ -14,6 +14,7 @@ serde = ["metriken-core/serde"]
 [dependencies]
 metriken-core   = { version = "0.3.2",  path = "../metriken-core" }
 metriken-derive = { version = "=0.6.0", path = "../metriken-derive" }
+metriken-types  = { version = "0.1.0",  path = "../metriken-types" }
 
 histogram.workspace = true
 getrandom = "0.3"

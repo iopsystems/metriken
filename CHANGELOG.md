@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-types 0.1.0
+
+- **Added:** a crate below `metriken-core` for the types the registry writes
+  and readers interpret: `Window`, the acquisition window, and `UID_LABEL`
+  (`__uid__`), the slot-identity label. It does not depend on the registry, so
+  it builds for wasm32 and carries no `links` key. `Window` derives what
+  `metriken-core`'s and `metriken-segment`'s copies derived between them:
+  `Clone`, `Copy`, `Debug`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, and
+  serde behind the `serde` feature. Plan:
+  `docs/journal/2026-10-08-one-recording-stack.md`, path step 1.
+
+### metriken-core 0.3.3
+
+- **Changed:** `Window` is `metriken_types::Window`, re-exported at the same
+  path. It gains `PartialOrd`, `Ord` and `Hash`. The `serde` feature turns on
+  `metriken-types/serde`; `metriken-core` no longer depends on serde
+  directly.
+
+### metriken 0.11.3
+
+- **Changed:** `group::UID_LABEL` is `metriken_types::UID_LABEL`, re-exported
+  at the same path.
+
 ### metriken-archive 0.3.2
 
 - **Added:** the long form on the replication stream. `EncodedLongGroup`
