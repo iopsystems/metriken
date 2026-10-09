@@ -1,12 +1,11 @@
-//! The write-ahead log's row format: what a row holds before it is sealed
-//! into a segment, and the materialization that turns a live WAL tail back
-//! into a parquet segment. Moved from rezolus's `crates/rez` (phase 2 of
-//! `docs/journal/2026-09-28-high-cardinality-stack.md`).
+//! Materializing a live write-ahead-log tail into a parquet segment. The row
+//! types and their encodings are `metriken-model`'s (`metriken_model::wal`),
+//! re-exported here; building a row from a snapshot is
+//! `metriken_model::convert::wal_group_row`.
 //!
 //! Materializing a tail is a READ operation (every reader of a live archive
 //! does it, including one in a browser), so nothing here needs a metrics
-//! registry. Building a row from a snapshot is the producer's, in
-//! `metriken-exposition`.
+//! registry.
 
 use std::collections::HashMap;
 

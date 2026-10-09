@@ -26,10 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `metriken-model`'s, re-exported at the same paths, and `wal_group_row` is
   `metriken_model::convert::wal_group_row`. Serde, msgpack encoding and
   `GroupSnapshot::validate` no longer depend on this crate's `serde` and
-  `msgpack` features. The `From<&GroupSchema>` conversions into
+  `msgpack` features. `metriken-model` is an unconditional dependency, so
+  serde and rmp-serde are built even with no features; `metriken` 0.11.3 is
+  required. The `From<&GroupSchema>` conversions into
   `metriken-segment`'s schema are gone: the two are one type, and
   `metriken-model` provides `From<&GroupSchema> for GroupSchema`, so
-  `(&schema).into()` still compiles.
+  `(&schema).into()` still compiles. Because the two schema types are now
+  one, a downstream crate that implemented one trait for both gets
+  conflicting implementations (E0119).
 
 ### metriken-segment 0.1.7
 
@@ -38,9 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Occupant`, `encode_wal_row`, `decode_wal_row`, `stream_of`, `table_of` and
   `SUFFIX` are `metriken-model`'s, re-exported at the same paths.
   `window::Window` is `metriken_types::Window`, the same type as
-  `metriken::Window`, so the `From` conversions between them are gone; `.into()`
-  between them still compiles. The `metriken` feature has no effect and no
-  longer pulls in `metriken`.
+  `metriken::Window` from `metriken` 0.11.3, which the `metriken` feature now
+  requires, so the `From` conversions between them are gone and `.into()`
+  between them is the identity conversion. A downstream crate that
+  implemented one trait for both `Window` types gets conflicting
+  implementations (E0119).
 
 ### metriken-types 0.1.0
 

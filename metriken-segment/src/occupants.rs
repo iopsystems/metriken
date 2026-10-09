@@ -8,8 +8,8 @@
 //! rezolus's `docs/journal/2026-09-25-dendro-archive-layout.md`, "The
 //! occupant stream".
 //!
-//! The stream's format, for writers and readers alike: the WAL row and the
-//! segment encoding. `metriken-query`'s `long::OccupantLabels` puts the
+//! The stream's segment encoding. The WAL row (`Occupant`, `encode_wal_row`,
+//! `decode_wal_row`) is `metriken-model`'s, re-exported here. `metriken-query`'s `long::OccupantLabels` puts the
 //! labels on a long table's series.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

@@ -30,7 +30,7 @@ tempfile.workspace = true
 
 [features]
 default = ["parquet-conversion", "segment"]
-# `From` conversions into the segment format's mirror of `GroupSchema`.
+# `group_approx_bytes` and the `wal_group_row` re-export.
 segment = ["dep:metriken-segment", "serde"]
 serde = ["dep:serde", "chrono/serde", "histogram/serde", "metriken/serde"]
 json = ["serde", "dep:serde_json", "metriken-model/json"]

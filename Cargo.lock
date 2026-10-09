@@ -1093,6 +1093,7 @@ dependencies = [
  "arrow",
  "bytes",
  "histogram",
+ "metriken",
  "metriken-model",
  "metriken-types",
  "parquet",

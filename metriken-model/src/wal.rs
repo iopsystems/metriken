@@ -27,7 +27,7 @@ pub struct WalCell {
     /// The snapshot **entry's** metadata, verbatim — NOT the parquet column's.
     ///
     /// The difference matters to a reader. `metric_type` is **not** in here:
-    /// `TableBuilder::push_row` injects it (`rez.rs`, the `or_insert_with` that
+    /// `TableBuilder::push_row` injects it (`metriken-segment`'s `builder.rs`, the `or_insert_with` that
     /// builds a `Column`) and `metriken-exposition` never carries it. A
     /// recovery path that built `Column { metadata: cell.metadata, .. }`
     /// directly would produce a column a natively sealed segment does not
