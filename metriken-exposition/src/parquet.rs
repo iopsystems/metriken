@@ -10,7 +10,8 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
 
-use crate::snapshot::{HashedSnapshot, Snapshot};
+use crate::hashed::HashedSnapshot;
+use crate::Snapshot;
 
 /// The batch size (or maximum row group size) is the number of rows that
 /// the `ArrowWriter` caches in memory before attempting to write them to
@@ -449,58 +450,27 @@ mod tests {
     use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use arrow::array::*;
     use metriken::histogram::Histogram as H2Histogram;
-    use snapshot::{SnapshotV1, SnapshotV2};
 
     use crate::*;
 
     #[allow(clippy::type_complexity)]
     fn build_metrics() -> (Vec<Vec<Counter>>, Vec<Vec<Gauge>>, Vec<Vec<Histogram>>) {
         let counters: Vec<Vec<Counter>> = vec![
-            vec![Counter {
-                name: "counter".to_string(),
-                value: 100,
-                metadata: HashMap::new(),
-                window: None,
-            }],
-            vec![Counter {
-                name: "counter".to_string(),
-                value: 121,
-                metadata: HashMap::new(),
-                window: None,
-            }],
+            vec![Counter::new("counter".to_string(), 100, HashMap::new())],
+            vec![Counter::new("counter".to_string(), 121, HashMap::new())],
         ];
 
         let gauges: Vec<Vec<Gauge>> = vec![
-            vec![Gauge {
-                name: "gauge".to_string(),
-                value: 16,
-                metadata: HashMap::new(),
-                window: None,
-            }],
-            vec![Gauge {
-                name: "gauge".to_string(),
-                value: 6,
-                metadata: HashMap::new(),
-                window: None,
-            }],
+            vec![Gauge::new("gauge".to_string(), 16, HashMap::new())],
+            vec![Gauge::new("gauge".to_string(), 6, HashMap::new())],
         ];
 
         let h1 = H2Histogram::from_buckets(1, 3, vec![0, 1, 1, 0, 0, 0]).unwrap();
         let h2 = H2Histogram::from_buckets(1, 3, vec![0, 1, 1, 0, 1, 0]).unwrap();
 
         let histograms: Vec<Vec<Histogram>> = vec![
-            vec![Histogram {
-                name: "histogram".to_string(),
-                value: h1,
-                metadata: HashMap::new(),
-                window: None,
-            }],
-            vec![Histogram {
-                name: "histogram".to_string(),
-                value: h2,
-                metadata: HashMap::new(),
-                window: None,
-            }],
+            vec![Histogram::new("histogram".to_string(), h1, HashMap::new())],
+            vec![Histogram::new("histogram".to_string(), h2, HashMap::new())],
         ];
 
         (counters, gauges, histograms)

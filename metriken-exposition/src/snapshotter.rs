@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use metriken::{MetricEntry, Value};
 
-use crate::snapshot::{Counter, Gauge, Histogram, Snapshot, SnapshotV1};
+use crate::{Counter, Gauge, Histogram, Snapshot, SnapshotV1};
 
 /// Produces a snapshot of metric readings.
 pub struct Snapshotter {
@@ -88,20 +88,16 @@ impl Snapshotter {
 
             match metric.value_with_window() {
                 (Some(Value::Counter(value)), window) => {
-                    counters.push(Counter {
-                        name: column_name.clone(),
-                        value,
-                        metadata: build_metadata(metric),
-                        window,
-                    });
+                    counters.push(
+                        Counter::new(column_name.clone(), value, build_metadata(metric))
+                            .with_window(window),
+                    );
                 }
                 (Some(Value::Gauge(value)), window) => {
-                    gauges.push(Gauge {
-                        name: column_name.clone(),
-                        value,
-                        metadata: build_metadata(metric),
-                        window,
-                    });
+                    gauges.push(
+                        Gauge::new(column_name.clone(), value, build_metadata(metric))
+                            .with_window(window),
+                    );
                 }
                 (Some(Value::Histogram(h)), window) => {
                     if let Some(histogram) = h.load() {
@@ -115,12 +111,10 @@ impl Snapshotter {
                             histogram.config().max_value_power().to_string(),
                         );
 
-                        histograms.push(Histogram {
-                            name: column_name.clone(),
-                            value: histogram,
-                            metadata,
-                            window,
-                        });
+                        histograms.push(
+                            Histogram::new(column_name.clone(), histogram, metadata)
+                                .with_window(window),
+                        );
                     }
                 }
                 (Some(Value::CounterGroup(g)), _) => {
@@ -130,12 +124,10 @@ impl Snapshotter {
                         if let Some(value) = value {
                             let mut metadata = base_metadata.clone();
                             metadata.extend(entry_meta);
-                            counters.push(Counter {
-                                name: format!("{column_name}x{idx}"),
-                                value,
-                                metadata,
-                                window,
-                            });
+                            counters.push(
+                                Counter::new(format!("{column_name}x{idx}"), value, metadata)
+                                    .with_window(window),
+                            );
                         }
                     }
                 }
@@ -146,12 +138,10 @@ impl Snapshotter {
                         if let Some(value) = value {
                             let mut metadata = base_metadata.clone();
                             metadata.extend(entry_meta);
-                            gauges.push(Gauge {
-                                name: format!("{column_name}x{idx}"),
-                                value,
-                                metadata,
-                                window,
-                            });
+                            gauges.push(
+                                Gauge::new(format!("{column_name}x{idx}"), value, metadata)
+                                    .with_window(window),
+                            );
                         }
                     }
                 }
@@ -170,12 +160,10 @@ impl Snapshotter {
                                 "max_value_power".to_string(),
                                 histogram.config().max_value_power().to_string(),
                             );
-                            histograms.push(Histogram {
-                                name: format!("{column_name}x{idx}"),
-                                value: histogram,
-                                metadata,
-                                window: None,
-                            });
+                            histograms.push(
+                                Histogram::new(format!("{column_name}x{idx}"), histogram, metadata)
+                                    .with_window(None),
+                            );
                         }
                     }
                 }

@@ -1,7 +1,8 @@
 //! Exposition of Metriken metrics
 //!
-//! Provides a standardized struct for a snapshot of the metric readings as well
-//! as a way of producing the snapshots.
+//! Produces snapshots of the registered metrics and exposes them: as
+//! `metriken-model`'s snapshot types (re-exported here), as Prometheus text,
+//! and as parquet.
 
 #[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
 mod convert;
@@ -14,20 +15,19 @@ mod prometheus;
 mod segment;
 #[cfg(feature = "segment")]
 pub use segment::{group_approx_bytes, wal_group_row};
-mod snapshot;
+#[cfg(feature = "parquet")]
+mod hashed;
 mod snapshotter;
 
 #[cfg(all(feature = "serde", feature = "msgpack", feature = "parquet"))]
 pub use convert::MsgpackToParquet;
+pub use metriken_model::{
+    Counter, Gauge, GroupSchema, GroupSnapshot, GroupValidationError, Histogram, MetricDesc,
+    Snapshot, SnapshotV1, SnapshotV2, SnapshotV3,
+};
 #[cfg(feature = "parquet")]
 pub use parquet::{
     ParquetCompression, ParquetHistogramType, ParquetOptions, ParquetSchema, ParquetWriter,
 };
 pub use prometheus::{prometheus_text, PrometheusOptions};
-#[cfg(feature = "msgpack")]
-pub use snapshot::GroupValidationError;
-pub use snapshot::{
-    Counter, Gauge, GroupSchema, GroupSnapshot, Histogram, MetricDesc, Snapshot, SnapshotV1,
-    SnapshotV2, SnapshotV3,
-};
 pub use snapshotter::{Snapshotter, SnapshotterBuilder};
