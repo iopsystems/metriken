@@ -203,6 +203,8 @@ fn batch_rates<'a>(
     else {
         return None;
     };
+    #[cfg(test)]
+    BATCH_RATES.with(|n| n.set(n.get() + 1));
     let series = results
         .into_iter()
         .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
@@ -257,6 +259,8 @@ fn grid_request<'c, 'g>(
 thread_local! {
     /// Display queries [`batch_display`] answered on this thread.
     pub(crate) static BATCH_DISPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Queries [`batch_rates`] answered on this thread.
+    pub(crate) static BATCH_RATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A display query computed by the source as it reads, holding one bucket

@@ -1994,7 +1994,7 @@ struct ColPlan {
 }
 
 /// A segmented source's counter scan: the planned segments, read a chunk at
-/// a time.
+/// a time, one thread per segment where threads exist.
 struct SegmentedScan<'a> {
     source: &'a SegmentedSource,
     plans: BTreeMap<u32, HashMap<u32, ColPlan>>,
@@ -2078,7 +2078,6 @@ impl SegmentedScan<'_> {
     }
 }
 
-/// Decodes a chunk's segments one thread per segment where threads exist.
 impl crate::scan::ChunkReader for SegmentedScan<'_> {
     fn next_chunk(
         &mut self,
@@ -4212,7 +4211,10 @@ mod tests {
             };
             result[0].values.clone()
         };
+        let rates = || crate::promql::streaming::dispatch::BATCH_RATES.with(|n| n.get());
+        let before = rates();
         let batched = range(&QueryOptions::default());
+        assert_eq!(rates(), before + 1, "the batched path answered");
         let per_series = range(&QueryOptions::default().with_per_series_rates(true));
         assert_eq!(batched, per_series);
     }
