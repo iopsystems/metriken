@@ -73,26 +73,46 @@ builds one per call; the builders build these.
 Storage cannot name the wrappers, and today its halves are built on them, so
 the following change:
 
-- In storage a segment is a file source (`ParquetSource`, `src/parquet.rs:1345`)
-  rather than a `ParquetReader`. `SegmentedSource`'s segment cache
-  (`src/segmented.rs:773`) and `Handover` (`:1089`) hold it, and the
-  `ParquetReader` helpers the open path calls (`src/parquet.rs:142-317`:
-  `counter_columns`, `gauge_columns`, `histogram_configs`,
-  `counter_column_refs`, `batch_columns`, `resident_estimate`) become its
-  methods. A cached segment no longer carries a `QueryEngine`.
-- `SegmentedParquetReader`'s open path (`open_with_pool`,
-  `open_relabeled_with_pool`, `open_after`, `handover`;
-  `src/segmented.rs:166-355`) becomes public constructors on
-  `SegmentedSource`, which `ArchiveReader` calls. The wrapper's constructors
-  forward to them.
+- In storage a segment is a `FileSource` (`src/parquet.rs:1461`, over a
+  `ParquetSource`, `:1345`) rather than a `ParquetReader`.
+  `SegmentedSource`'s segment cache (`src/segmented.rs:773`) and `Handover`
+  (`:1089`) hold it. The `ParquetReader` helpers the open path calls
+  (`src/parquet.rs:142-317`: `counter_columns`, `gauge_columns`,
+  `histogram_columns`, `histogram_configs`, `histogram_config_variants`,
+  `counter_column_refs`, `counter_column`, `batch_columns`,
+  `resident_estimate`) become its methods, and the engine-routed `interval`,
+  `time_range` and `file_metadata` become its `Source` calls. A cached
+  segment no longer carries a `QueryEngine`.
+- `SegmentedParquetReader`'s open path (`src/segmented.rs:166-355`) becomes
+  public on `SegmentedSource`: `open_with_pool`, `open_relabeled_with_pool`
+  and `open_after` as constructors, `handover` and `segment_count` as
+  methods, which `ArchiveReader` calls (`keep_handover`, `reuse_from`). The
+  wrapper's constructors forward to them.
 - Opening a file's footer from bytes (`ParquetReader::open_bytes_with_pool`,
   which `ArchiveReader` uses to probe tables, `reader.rs:129`, `1423`,
-  `1439`) becomes public on the file source.
+  `1439`) becomes public on `FileSource`.
 - `UnionChild` and `CompositionSource` get public constructors from a
   `Source` in storage, and query implements their `From<&wrapper>`
   conversions (`src/union.rs:68-87`, `src/parquet.rs:593-611`).
   `UnionSource::try_new` in storage holds the empty and duplicate-name checks
   (`src/union.rs:333-398`), and `UnionMetricsSource::try_new` forwards to it.
+
+The wrappers that stay in query hold storage sources, so each of those gets
+public constructors and accessors in storage:
+
+- `ParquetSource`'s opens (`src/parquet.rs:1874-1974`) and
+  `MultiParquetSource::new(files)` with an accessor for its children, for
+  `ParquetBuilder` and `ParquetReader` (`src/parquet.rs:48-111`);
+- `MemoryStoreInner`'s insert, set and read methods, for `MemoryStore`'s
+  inherent methods and `MemoryStoreBuilder::build`
+  (`src/memory_store.rs:56-342`);
+- `UnionSource::new`, for `UnionMetricsSource::new` (`src/union.rs:369`).
+
+A unit test in a moving module that opens a wrapper or calls `MetricsSource`
+stays in query, in `metriken-query/tests`: about 6,000 lines, most of them
+`segmented.rs`'s 3,290 (also `long.rs`, `parquet.rs`, `memory_store.rs`,
+`union.rs`, `lazy.rs`, and the `fixtures` tests in `fixtures/synthetic.rs`
+and `fixtures/augment.rs`).
 
 The modules `long`, `buffer_pool`, `types`, `histogram_stream`, `labels`,
 `lazy`, `memory` and `util` move to storage, with the source halves of
@@ -110,8 +130,7 @@ these public items at their current paths for one release:
 - `fixtures` (feature `fixtures`), which builds parquet files.
 
 `metriken-query`'s `ingest`, `lz4` and `fixtures` features forward to storage's
-for one release. The `fixtures` tests that open a `ParquetReader`
-(`fixtures/synthetic.rs`, `fixtures/augment.rs`) stay in query. `ingest` gates
+for one release. `ingest` gates
 `MemoryStore`'s snapshot loading, which reads `metriken-model` types and moves
 with the in-memory source.
 
@@ -133,7 +152,10 @@ blocks hold `HistogramSnapshot`.
 
 `DataSource`, `Counter`, `Gauge`, `Counters`, `Gauges`, `HistogramStream`,
 `HistogramStreamMeta`, `HistogramRow`, `ColDesc` (private fields),
-`BatchColumns` and `resolve_window` are crate-private today. As storage's
+`BatchColumns` and `resolve_window` are crate-private today, as are the
+source types the wrappers hold (`FileSource`, `ParquetSource`,
+`MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`,
+`MemoryStoreInner`, `Memory`). As storage's
 public API they, and the arrow arrays in `ScanChunk`, become part of
 storage's semver surface.
 
@@ -228,10 +250,11 @@ When rezolus's `crates/rez` becomes storage's `rez` feature (step 5 below),
 `RezReader` is a storage type, and rezolus can no longer implement
 `MetricsSource` for it (E0117). Its implementation only forwards to the
 `ArchiveReader` it wraps, so it moves into query behind a `rez` feature.
-`LiveReader` (`crates/rez/src/live.rs`) uses only public API, and its users
-are rezolus's viewer (`src/viewer/follow.rs`, `live.rs`, `mod.rs`), so it
-moves from `crates/rez` into the rezolus binary with its implementation.
-`FileId`, which `crates/rez/src/catalog.rs` uses to reopen, moves to storage.
+`LiveReader` (`crates/rez/src/live.rs`) is used by rezolus's viewer
+(`src/viewer/follow.rs`, `live.rs`, `mod.rs`), so it moves from `crates/rez`
+into the rezolus binary with its implementation. `FileId` and `open_file`,
+which `crates/rez/src/catalog.rs` uses to reopen and `LiveReader` uses to
+open, move to storage, and `FileId::of` becomes public.
 
 ### What callers change
 
@@ -283,8 +306,9 @@ on the branch.
    release.
 
 Steps 2 to 6 move about 15,000 lines of `metriken-query` and the 5,000 of
-`metriken-archive`, mostly without changing them; that size follows from the
-crate boundaries the plan chose.
+`metriken-archive`, mostly without changing them apart from the visibility
+and test moves above; that size follows from the crate boundaries the plan
+chose.
 
 ## GO / NO-GO
 
