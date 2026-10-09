@@ -343,7 +343,8 @@ users of the `rezolus` binary the CLI, the files it writes and reads, and the
 wire stay the same, apart from 5.x's preview `record --stream -o .rez`, which
 is dropped; rezolus's own tests (including the compatibility fixtures in the
 rezolus entry) check that across each step. Library users (systemslab's
-`rez` and `dashboard` pins) change imports when they bump.
+`rez` and `dashboard` pins) change imports when they bump, or, where a
+step re-exports what it moves, in the release after.
 
 1. **`metriken-types` and `metriken-model`.** Move `Window` from
    `metriken-core` and `UID_LABEL` from `metriken` into `metriken-types` (a
@@ -362,12 +363,8 @@ rezolus entry) check that across each step. Library users (systemslab's
    model rows, which removes the decode-and-re-encode round trip in
    `StreamDecoder` and the `metriken` dependency from the write path. The two
    crates release together because the readers cannot leave the engine's crate
-   until the engine reads through the scan. Gate: on the 9.6-hour recording
-   with a 6,644-occupant task table that rezolus's
-   `docs/journal/2026-09-23-reader-memory.md` measures, #241's three queries
-   at a budget of 500 and a full `rezolus view` dashboard load, five runs
-   each: median time and peak memory within 5% of metriken-query 0.34.7 on the
-   same host. Design: [the storage scan](2026-10-09-storage-scan.md).
+   until the engine reads through the scan. Design and gate: [the storage
+   scan](2026-10-09-storage-scan.md).
 3. **The stream route** in `metriken-exposition` behind `stream` (piece 1),
    and dendro with SQLite optional. The rezolus agent is the first user,
    cachecannon the first outside one.
