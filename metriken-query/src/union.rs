@@ -163,14 +163,15 @@ impl DataSource for UnionSource {
         self.children[i].counter_streams(name, filter, start_ns, end_ns)
     }
 
-    fn counter_grid_rates(
+    fn counter_scan(
         &self,
         name: &str,
         filter: &Labels,
-        request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<crate::batch_rate::GridRates> {
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::scan::CounterScan<'_>> {
         let i = *self.counter_index.get(name)?;
-        self.children[i].counter_grid_rates(name, filter, request)
+        self.children[i].counter_scan(name, filter, start_ns, end_ns)
     }
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {

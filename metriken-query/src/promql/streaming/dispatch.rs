@@ -195,11 +195,16 @@ fn batch_rates<'a>(
     group: Option<(AggOp, GroupBy<'_>)>,
 ) -> Option<(SeriesSet<'a>, String)> {
     let (name, filter, request) = grid_request(ctx, call, group, None)?;
-    let crate::batch_rate::GridRates::Points(results) =
-        ctx.source.counter_grid_rates(name, &filter, &request)?
+    let crate::batch_rate::GridRates::Points(results) = crate::batch_rate::grid_rates(
+        ctx.source
+            .counter_scan(name, &filter, request.data_start, request.end_ns)?,
+        &request,
+    )?
     else {
         return None;
     };
+    #[cfg(test)]
+    BATCH_RATES.with(|n| n.set(n.get() + 1));
     let series = results
         .into_iter()
         .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
@@ -254,6 +259,8 @@ fn grid_request<'c, 'g>(
 thread_local! {
     /// Display queries [`batch_display`] answered on this thread.
     pub(crate) static BATCH_DISPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Queries [`batch_rates`] answered on this thread.
+    pub(crate) static BATCH_RATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A display query computed by the source as it reads, holding one bucket
@@ -338,8 +345,10 @@ fn batch_display(
     let Some((name, filter, request)) = grid_request(ctx, call, group, Some(&grid_display)) else {
         return Ok(None);
     };
-    let Some(crate::batch_rate::GridRates::Display(results)) =
-        ctx.source.counter_grid_rates(name, &filter, &request)
+    let Some(crate::batch_rate::GridRates::Display(results)) = ctx
+        .source
+        .counter_scan(name, &filter, request.data_start, request.end_ns)
+        .and_then(|scan| crate::batch_rate::grid_rates(scan, &request))
     else {
         return Ok(None);
     };

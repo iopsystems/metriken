@@ -1122,20 +1122,18 @@ impl Handover {
 }
 
 impl SegmentedSource {
-    /// See [`DataSource::counter_grid_rates`]. `None` when the relabel's
+    /// See [`DataSource::counter_scan`]. `None` when the relabel's
     /// identities are not fixed, when a series has two locations in one
-    /// segment, when nothing matches, or when a segment's columns cannot be
-    /// read; the dispatcher then uses the per-series path.
-    fn grid_rates(
+    /// segment, or when nothing matches; the dispatcher then uses the
+    /// per-series path.
+    fn scan_counters(
         &self,
         name: &str,
         filter: &Labels,
-        request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<crate::batch_rate::GridRates> {
-        use crate::batch_rate::{
-            Compact, DisplaySink, Grid, GridRates, Grouped, PerSeries, Sample, SeriesRate, Sink,
-            Slot,
-        };
+        start: u64,
+        end: u64,
+    ) -> Option<crate::scan::CounterScan<'_>> {
+        use crate::scan::{CounterScan, ScanSeries};
         if !self
             .relabel
             .as_deref()
@@ -1145,18 +1143,10 @@ impl SegmentedSource {
         }
         let order = self.state.counter_identity.order(name);
         let table = self.state.counter_columns.get(name)?;
-        let (start, end) = (request.data_start, request.end_ns);
 
         // The series read, and per segment which column (and occupant, in a
         // long column) each is.
-        struct ColPlan {
-            begin: Option<u32>,
-            width: Option<u32>,
-            wide: Option<usize>,
-            long: HashMap<u64, usize>,
-        }
-        let mut labels: Vec<Labels> = Vec::new();
-        let mut rates: Vec<SeriesRate> = Vec::new();
+        let mut series: Vec<ScanSeries> = Vec::new();
         let mut plans: BTreeMap<u32, HashMap<u32, ColPlan>> = BTreeMap::new();
         for (pos, l) in order.iter().enumerate() {
             if !l.matches(filter) {
@@ -1165,7 +1155,7 @@ impl SegmentedSource {
             let Some(locations) = table.by_series.get(pos) else {
                 continue;
             };
-            let series = labels.len();
+            let s = series.len();
             let windowed = locations
                 .first()
                 .is_some_and(|l| l.position.begin_col.is_some() && l.position.width_col.is_some());
@@ -1188,454 +1178,41 @@ impl SegmentedSource {
                         long: HashMap::new(),
                     });
                 let duplicate = match l.position.occupant {
-                    Some(o) => plan.long.insert(o, series).is_some(),
-                    None => plan.wide.replace(series).is_some(),
+                    Some(o) => plan.long.insert(o, s).is_some(),
+                    None => plan.wide.replace(s).is_some(),
                 };
                 if duplicate {
                     return None;
                 }
             }
-            labels.push(l.clone());
-            rates.push(SeriesRate::new(windowed, request.start_ns));
-        }
-        if labels.is_empty() {
-            return None;
-        }
-
-        let grid = Grid::from_request(request);
-        let n = labels.len();
-
-        // Series are split across partitions, each run by one thread with
-        // its own sink. Without aggregation, by series. With it, by group,
-        // largest first to the partition with the fewest series, so a
-        // group's accumulators exist in one partition; except that a group
-        // with more than twice a partition's share of the series is spread
-        // across all partitions by series, each holding its accumulators,
-        // merged at the end. Fewer than half the partition count of groups
-        // can be that large.
-        let parts = batch_threads().min(n).max(1);
-        let groups = request
-            .group
-            .map(|(op, by)| (op, crate::batch_rate::groups(by, &labels)));
-        let partition: Vec<usize> = match &groups {
-            Some((_, (glabels, group_of))) => {
-                let mut size = vec![0usize; glabels.len()];
-                for g in group_of {
-                    size[*g] += 1;
-                }
-                let spread = |g: usize| size[g] > 2 * n / parts;
-                let mut load = vec![0usize; parts];
-                for g in (0..glabels.len()).filter(|g| spread(*g)) {
-                    for l in load.iter_mut() {
-                        *l += size[g] / parts;
-                    }
-                }
-                let mut by_size: Vec<usize> = (0..glabels.len()).filter(|g| !spread(*g)).collect();
-                by_size.sort_unstable_by_key(|g| std::cmp::Reverse(size[*g]));
-                let mut part_of = vec![0usize; glabels.len()];
-                for g in by_size {
-                    let p = (0..parts).min_by_key(|p| load[*p]).unwrap_or(0);
-                    part_of[g] = p;
-                    load[p] += size[g];
-                }
-                group_of
-                    .iter()
-                    .enumerate()
-                    .map(|(s, g)| if spread(*g) { s % parts } else { part_of[*g] })
-                    .collect()
-            }
-            None => (0..n).map(|s| s % parts).collect(),
-        };
-        let mut local = vec![0u32; n];
-        let mut members: Vec<Vec<usize>> = vec![Vec::new(); parts];
-        for (s, p) in partition.iter().enumerate() {
-            local[s] = members[*p].len() as u32;
-            members[*p].push(s);
-        }
-        let mut part_rates: Vec<Vec<SeriesRate>> = (0..parts).map(|_| Vec::new()).collect();
-        for (s, rate) in rates.into_iter().enumerate() {
-            part_rates[partition[s]].push(rate);
-        }
-        enum PartSink<'d> {
-            Series(PerSeries),
-            Groups(Grouped<Slot>),
-            Display(DisplaySink<'d>),
-            GroupsDisplay(Grouped<Compact>),
-        }
-        impl PartSink<'_> {
-            fn sink(&mut self) -> &mut dyn Sink {
-                match self {
-                    PartSink::Series(s) => s,
-                    PartSink::Groups(g) => g,
-                    PartSink::Display(d) => d,
-                    PartSink::GroupsDisplay(g) => g,
-                }
-            }
-        }
-        let mut sinks: Vec<PartSink> = members
-            .iter()
-            .map(|m| match &groups {
-                Some((op, (glabels, group_of))) => {
-                    let group_of: Vec<usize> = m.iter().map(|s| group_of[*s]).collect();
-                    match request.display {
-                        Some(_) => PartSink::GroupsDisplay(Grouped::new(
-                            *op,
-                            glabels.clone(),
-                            group_of,
-                            &grid,
-                        )),
-                        None => {
-                            PartSink::Groups(Grouped::new(*op, glabels.clone(), group_of, &grid))
-                        }
-                    }
-                }
-                None => match request.display {
-                    Some(display) => PartSink::Display(DisplaySink {
-                        reducers: (0..m.len())
-                            .map(|_| {
-                                crate::display::BucketReducer::new(display.width, display.band)
-                            })
-                            .collect(),
-                        display,
-                    }),
-                    None => PartSink::Series(PerSeries {
-                        points: vec![Vec::new(); m.len()],
-                    }),
-                },
-            })
-            .collect();
-
-        // A segment's decoded columns, and which series each row of each
-        // read column is. The partition threads read the samples from the
-        // columns, each taking its own series' rows.
-        let segments: Vec<u32> = plans.keys().copied().collect();
-        enum RowSeries {
-            /// Every row is this series (a wide column).
-            One(u32),
-            /// Row `r` is series `v[r]`, or none when `u32::MAX` (a long
-            /// column, by occupant); empty for a column with neither.
-            PerRow(Vec<u32>),
-        }
-        struct SegmentRows {
-            seg: u32,
-            columns: crate::parquet::BatchColumns,
-            /// The read columns, in the order of `series`'s inner vec.
-            cols: Vec<u32>,
-            /// Per batch, per read column.
-            series: Vec<Vec<RowSeries>>,
-        }
-        // `Ok(None)` for a segment that is gone, as the per-series path
-        // skips it; `Err` for one that cannot be read, which ends the batch
-        // read.
-        type Read = Result<Option<SegmentRows>, ()>;
-        let read = |seg: u32| -> Read {
-            let reader = match self.segment(seg as usize) {
-                Ok(Some(r)) => r,
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    tracing::warn!(segment = seg, "fetching a segment: {e}");
-                    return Err(());
-                }
-            };
-            let plan = &plans[&seg];
-            let mut read_cols: Vec<u32> = Vec::new();
-            let mut cols: Vec<usize> = Vec::new();
-            for (col, p) in plan {
-                read_cols.push(*col);
-                cols.push(*col as usize);
-                cols.extend(p.begin.map(|c| c as usize));
-                cols.extend(p.width.map(|c| c as usize));
-            }
-            let Some(columns) = reader.batch_columns(&cols, start, end) else {
-                return Err(());
-            };
-            let series = columns
-                .batches
-                .iter()
-                .map(|batch| {
-                    let occupant = columns.occupant.and_then(|c| columns.u64s(batch, c));
-                    read_cols
-                        .iter()
-                        .map(|col| {
-                            let p = &plan[col];
-                            match (p.wide, occupant) {
-                                (Some(s), _) if p.long.is_empty() => RowSeries::One(s as u32),
-                                (_, Some(occ)) => RowSeries::PerRow(
-                                    (0..batch.num_rows())
-                                        .map(|r| {
-                                            (!arrow::array::Array::is_null(occ, r))
-                                                .then(|| p.long.get(&occ.value(r)))
-                                                .flatten()
-                                                .map_or(u32::MAX, |s| *s as u32)
-                                        })
-                                        .collect(),
-                                ),
-                                _ => RowSeries::PerRow(Vec::new()),
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            Ok(Some(SegmentRows {
-                seg,
-                columns,
-                cols: read_cols,
-                series,
-            }))
-        };
-        // A grouped display query feeds each group's points to its reducer
-        // once no member can emit before them. After each chunk, a series
-        // whose last sample is more than ten times the larger of its spacing
-        // and the step before the earliest span start of the unread chunks
-        // is ended early; a series without a spacing yet uses the median of
-        // the others'. If an ended series is pushed a sample afterwards, the
-        // read returns `None` and the caller evaluates the query per series.
-        let mut flush =
-            match (&groups, request.display) {
-                (Some((op, (glabels, _))), Some(display)) => Some(
-                    crate::batch_rate::GroupFlush::new(*op, glabels.len(), display),
-                ),
-                _ => None,
-            };
-        let resumed = std::sync::atomic::AtomicBool::new(false);
-        let chunks: Vec<&[u32]> = segments.chunks(batch_threads()).collect();
-        // The earliest time a sample can have in the chunks after each one;
-        // `None` when one of them has no span.
-        let mut rest_start: Vec<Option<u64>> = vec![Some(u64::MAX); chunks.len()];
-        for c in (0..chunks.len().saturating_sub(1)).rev() {
-            let next = chunks[c + 1].iter().try_fold(u64::MAX, |m, seg| {
-                Some(m.min(self.state.catalog[*seg as usize].span?.0))
+            series.push(ScanSeries {
+                labels: l.clone(),
+                windowed,
             });
-            rest_start[c] = rest_start[c + 1].zip(next).map(|(a, b)| a.min(b));
         }
-        for (c, chunk) in chunks.iter().enumerate() {
-            let read_chunk: Vec<Option<SegmentRows>> = read_all(chunk, &read)
-                .into_iter()
-                .collect::<Result<_, ()>>()
-                .ok()?;
-            let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
-                let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
-                    a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
-                };
-                for rows in read_chunk.iter().flatten() {
-                    let columns = &rows.columns;
-                    let plan = &plans[&rows.seg];
-                    for (batch, series) in columns.batches.iter().zip(&rows.series) {
-                        let Some(ts) = columns.u64s(batch, columns.ts) else {
-                            continue;
-                        };
-                        let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
-                        for (col, series) in rows.cols.iter().zip(series) {
-                            let p = &plan[col];
-                            let Some(values) = columns.u64s(batch, *col as usize) else {
-                                continue;
-                            };
-                            let begin = p.begin.and_then(|c| columns.i64s(batch, c as usize));
-                            let width = p.width.and_then(|c| columns.u64s(batch, c as usize));
-                            let windowed =
-                                (begin.is_some() && width.is_some()) || duration.is_some();
-                            let mut push = |r: usize, series: usize| {
-                                let (Some(base), Some(value)) =
-                                    (get(Some(ts), r), get(Some(values), r))
-                                else {
-                                    return;
-                                };
-                                if base < start || base > end {
-                                    return;
-                                }
-                                let window = windowed.then(|| {
-                                    let bo = begin.and_then(|b| {
-                                        (!arrow::array::Array::is_null(b, r)).then(|| b.value(r))
-                                    });
-                                    crate::parquet::resolve_window(
-                                        base,
-                                        bo,
-                                        get(width, r),
-                                        get(duration, r),
-                                    )
-                                });
-                                let s = local[series] as usize;
-                                if rates[s].ended_early() {
-                                    resumed.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return;
-                                }
-                                rates[s].push(
-                                    Sample {
-                                        ts: base,
-                                        value,
-                                        window,
-                                    },
-                                    &grid,
-                                    s,
-                                    sink.sink(),
-                                );
-                            };
-                            match series {
-                                RowSeries::One(s) => {
-                                    if partition[*s as usize] == part {
-                                        for r in 0..batch.num_rows() {
-                                            push(r, *s as usize);
-                                        }
-                                    }
-                                }
-                                RowSeries::PerRow(v) => {
-                                    for (r, s) in v.iter().enumerate() {
-                                        if *s != u32::MAX && partition[*s as usize] == part {
-                                            push(r, *s as usize);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            run_partitions(&mut part_rates, &mut sinks, &run);
-            if let (Some(flush), Some((_, (_, group_of)))) = (flush.as_mut(), &groups) {
-                if resumed.load(std::sync::atomic::Ordering::Relaxed) {
-                    return None;
-                }
-                let Some(w) = rest_start[c].filter(|w| *w != u64::MAX) else {
-                    continue;
-                };
-                // The median spacing of the series that have one.
-                let mut spacings: Vec<u64> = part_rates
-                    .iter()
-                    .flatten()
-                    .filter_map(SeriesRate::spacing_ns)
-                    .collect();
-                let median = (!spacings.is_empty()).then(|| {
-                    let mid = spacings.len() / 2;
-                    *spacings.select_nth_unstable(mid).1
-                });
-                // The earliest grid point each group can still be given.
-                let mut pending = vec![u64::MAX; group_of.iter().max().map_or(0, |g| g + 1)];
-                for (p, (rates, sink)) in part_rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-                    for (s, rate) in rates.iter_mut().enumerate() {
-                        let g = group_of[members[p][s]];
-                        if let Some(last) = rate.last_ts() {
-                            let lag = rate
-                                .spacing_ns()
-                                .or(median)
-                                .map(|sp| sp.max(grid.step_ns).saturating_mul(10));
-                            if rate.pending_ns().is_some()
-                                && lag.is_some_and(|lag| last.saturating_add(lag) < w)
-                            {
-                                rate.end_early(&grid, s, sink.sink());
-                            }
-                        }
-                        if let Some(t) = crate::batch_rate::earliest_point(rate, w, &grid) {
-                            pending[g] = pending[g].min(t);
-                        }
-                    }
-                }
-                let mut parts: Vec<&mut Grouped<Compact>> = sinks
-                    .iter_mut()
-                    .map(|s| match s {
-                        PartSink::GroupsDisplay(g) => g,
-                        _ => unreachable!("grouped display sinks"),
-                    })
-                    .collect();
-                for (g, t) in pending.iter().enumerate() {
-                    let upto =
-                        crate::batch_rate::points_before(&grid, *t) / crate::batch_rate::BLOCK;
-                    flush.feed(g, upto, &mut parts, &grid);
-                }
-            }
-        }
-        if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+        if series.is_empty() {
             return None;
         }
-        let finish = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, _p: usize| {
-            for (s, rate) in rates.iter_mut().enumerate() {
-                rate.finish(&grid, s, sink.sink());
-            }
-        };
-        run_partitions(&mut part_rates, &mut sinks, &finish);
-
-        // Each series' result, in the order of `labels`, from the
-        // partitions' per-series results.
-        fn in_order<T: Default>(
-            labels: Vec<Labels>,
-            mut parts: Vec<Vec<T>>,
-            partition: &[usize],
-            local: &[u32],
-        ) -> Vec<(Labels, T)> {
-            labels
-                .into_iter()
-                .enumerate()
-                .map(|(s, l)| {
-                    (
-                        l,
-                        std::mem::take(&mut parts[partition[s]][local[s] as usize]),
-                    )
-                })
-                .collect()
+        let segments: Vec<u32> = plans.keys().copied().collect();
+        // The earliest time a sample can have from each segment on; `None`
+        // when one of them has no span.
+        let mut rest_from: Vec<Option<u64>> = vec![Some(u64::MAX); segments.len() + 1];
+        for (i, seg) in segments.iter().enumerate().rev() {
+            let span = self.state.catalog[*seg as usize].span.map(|s| s.0);
+            rest_from[i] = rest_from[i + 1].zip(span).map(|(a, b)| a.min(b));
         }
-        Some(match groups {
-            Some((_, (glabels, _))) if request.display.is_some() => {
-                let mut flush = flush?;
-                #[cfg(test)]
-                crate::batch_rate::FED_BEFORE_END.with(|n| n.set(flush.fed()));
-                let mut parts: Vec<Grouped<Compact>> = sinks
-                    .into_iter()
-                    .map(|s| match s {
-                        PartSink::GroupsDisplay(g) => g,
-                        _ => unreachable!("grouped display sinks"),
-                    })
-                    .collect();
-                let blocks = parts.first().map_or(0, |p| p.blocks_per_group());
-                let mut parts: Vec<&mut Grouped<Compact>> = parts.iter_mut().collect();
-                for g in 0..glabels.len() {
-                    flush.feed(g, blocks, &mut parts, &grid);
-                }
-                GridRates::Display(glabels.into_iter().zip(flush.into_reducers()).collect())
-            }
-            Some(_) => {
-                let mut sinks = sinks.into_iter().map(|s| match s {
-                    PartSink::Groups(g) => g,
-                    _ => unreachable!("grouped sinks"),
-                });
-                let mut all = sinks.next()?;
-                for g in sinks {
-                    all.merge(g);
-                }
-                GridRates::Points(all.finish(&grid))
-            }
-            None if request.display.is_some() => {
-                let reducers: Vec<Vec<Option<crate::display::BucketReducer>>> = sinks
-                    .into_iter()
-                    .map(|s| match s {
-                        PartSink::Display(d) => d.reducers.into_iter().map(Some).collect(),
-                        _ => unreachable!("display sinks"),
-                    })
-                    .collect();
-                GridRates::Display(
-                    in_order(labels, reducers, &partition, &local)
-                        .into_iter()
-                        .map(|(l, r)| (l, r.expect("each series' reducer, once")))
-                        .collect(),
-                )
-            }
-            None => {
-                let points: Vec<Vec<Vec<crate::promql::streaming::Point>>> = sinks
-                    .into_iter()
-                    .map(|s| match s {
-                        PartSink::Series(p) => p.points,
-                        _ => unreachable!("per-series sinks"),
-                    })
-                    .collect();
-                GridRates::Points(
-                    in_order(labels, points, &partition, &local)
-                        .into_iter()
-                        .map(|(l, mut p)| {
-                            p.shrink_to_fit();
-                            (l, p)
-                        })
-                        .collect(),
-                )
-            }
-        })
+        Some(CounterScan::new(
+            series,
+            Box::new(SegmentedScan {
+                source: self,
+                plans,
+                segments,
+                rest_from,
+                next: 0,
+                start,
+                end,
+            }),
+        ))
     }
 
     /// The filter a segment is asked with: the query's own, unless a
@@ -1961,13 +1538,14 @@ fn splice_histogram_streams(
 }
 
 impl DataSource for SegmentedSource {
-    fn counter_grid_rates(
+    fn counter_scan(
         &self,
         name: &str,
         filter: &Labels,
-        request: &crate::batch_rate::GridRateRequest<'_>,
-    ) -> Option<crate::batch_rate::GridRates> {
-        self.grid_rates(name, filter, request)
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::scan::CounterScan<'_>> {
+        self.scan_counters(name, filter, start_ns, end_ns)
     }
 
     fn counters(
@@ -2407,16 +1985,126 @@ impl MetricsSource for SegmentedParquetReader {
     }
 }
 
-/// Threads a batch read uses: segments decoded at once, and the most
-/// partitions. At most 8.
-fn batch_threads() -> usize {
-    #[cfg(target_arch = "wasm32")]
-    {
-        1
+/// Per segment, how a read column's rows map to series.
+struct ColPlan {
+    begin: Option<u32>,
+    width: Option<u32>,
+    wide: Option<usize>,
+    long: HashMap<u64, usize>,
+}
+
+/// A segmented source's counter scan: the planned segments, read a chunk at
+/// a time, one thread per segment where threads exist.
+struct SegmentedScan<'a> {
+    source: &'a SegmentedSource,
+    plans: BTreeMap<u32, HashMap<u32, ColPlan>>,
+    segments: Vec<u32>,
+    /// `rest_from[i]`: the earliest catalog start of `segments[i..]`;
+    /// `None` when one of them has no span.
+    rest_from: Vec<Option<u64>>,
+    next: usize,
+    start: u64,
+    end: u64,
+}
+
+impl SegmentedScan<'_> {
+    /// Segment `seg`'s planned columns. `Ok(None)` for a segment the store
+    /// no longer has, as the per-series path skips it.
+    fn read(&self, seg: u32) -> Result<Option<crate::scan::ScanSegment>, crate::scan::ScanError> {
+        use crate::scan::{RowSeries, ScanColumn, ScanError, ScanSegment};
+        let reader = match self.source.segment(seg as usize) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(segment = seg, "fetching a segment: {e}");
+                return Err(ScanError);
+            }
+        };
+        let plan = &self.plans[&seg];
+        let mut read_cols: Vec<u32> = Vec::new();
+        let mut cols: Vec<usize> = Vec::new();
+        for (col, p) in plan {
+            read_cols.push(*col);
+            cols.push(*col as usize);
+            cols.extend(p.begin.map(|c| c as usize));
+            cols.extend(p.width.map(|c| c as usize));
+        }
+        let Some(columns) = reader.batch_columns(&cols, self.start, self.end) else {
+            return Err(ScanError);
+        };
+        let series = columns
+            .batches
+            .iter()
+            .map(|batch| {
+                let occupant = columns.occupant.and_then(|c| columns.u64s(batch, c));
+                read_cols
+                    .iter()
+                    .map(|col| {
+                        let p = &plan[col];
+                        match (p.wide, occupant) {
+                            (Some(s), _) if p.long.is_empty() => RowSeries::One(s as u32),
+                            (_, Some(occ)) => RowSeries::PerRow(
+                                (0..batch.num_rows())
+                                    .map(|r| {
+                                        (!arrow::array::Array::is_null(occ, r))
+                                            .then(|| p.long.get(&occ.value(r)))
+                                            .flatten()
+                                            .map_or(u32::MAX, |s| *s as u32)
+                                    })
+                                    .collect(),
+                            ),
+                            _ => RowSeries::PerRow(Vec::new()),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let cols = read_cols
+            .iter()
+            .map(|col| {
+                let p = &plan[col];
+                ScanColumn {
+                    values: *col as usize,
+                    begin: p.begin.map(|c| c as usize),
+                    width: p.width.map(|c| c as usize),
+                }
+            })
+            .collect();
+        Ok(Some(ScanSegment {
+            columns,
+            cols,
+            series,
+        }))
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
+}
+
+impl crate::scan::ChunkReader for SegmentedScan<'_> {
+    fn next_chunk(
+        &mut self,
+        n: usize,
+    ) -> Result<Option<crate::scan::ScanChunk>, crate::scan::ScanError> {
+        if self.next >= self.segments.len() {
+            return Ok(None);
+        }
+        let to = (self.next + n.max(1)).min(self.segments.len());
+        let chunk = &self.segments[self.next..to];
+        let this = &*self;
+        let segments = read_all(chunk, &|seg| this.read(seg))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        self.next = to;
+        let rest_start = if to == self.segments.len() {
+            None
+        } else {
+            self.rest_from[to]
+        };
+        Ok(Some(crate::scan::ScanChunk {
+            segments,
+            rest_start,
+        }))
     }
 }
 
@@ -2446,36 +2134,6 @@ where
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         })
-    }
-}
-
-/// Run `f` over each partition's series and sink, one thread per partition
-/// where threads exist.
-fn run_partitions<R, S, F>(rates: &mut [R], sinks: &mut [S], f: &F)
-where
-    R: Send,
-    S: Send,
-    F: Fn(&mut R, &mut S, usize) + Sync,
-{
-    #[cfg(target_arch = "wasm32")]
-    {
-        for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-            f(r, s, p);
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if rates.len() < 2 {
-            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-                f(r, s, p);
-            }
-            return;
-        }
-        std::thread::scope(|scope| {
-            for (p, (r, s)) in rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-                scope.spawn(move || f(r, s, p));
-            }
-        });
     }
 }
 
@@ -4526,6 +4184,41 @@ mod tests {
         assert_eq!(r.segment_count(), 3, "the catalog still counts it");
     }
 
+    /// The counter scan skips a segment lost after open, and the batched
+    /// rate path then gives what the per-series path gives.
+    #[test]
+    fn the_counter_scan_skips_a_segment_lost_after_open() {
+        let store = CountingStore::new(three_segments());
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1 << 26))
+            .unwrap();
+        store.gone.lock().unwrap().insert(0);
+        let mut scan = r
+            .source
+            .scan_counters("c", &Labels::default(), 0, 6_000_000_000)
+            .expect("c scans");
+        let mut read = 0;
+        while let Some(chunk) = scan.next_chunk(1).expect("no read error") {
+            read += chunk.segments.len();
+        }
+        assert_eq!(read, 2, "the lost segment is skipped, the others read");
+
+        let range = |opts: &QueryOptions| {
+            let QueryResult::Matrix { result } = r
+                .query_range_opts("irate(c[2s])", 0.0, 6.0, 1.0, opts)
+                .unwrap()
+            else {
+                panic!("matrix");
+            };
+            result[0].values.clone()
+        };
+        let rates = || crate::promql::streaming::dispatch::BATCH_RATES.with(|n| n.get());
+        let before = rates();
+        let batched = range(&QueryOptions::default());
+        assert_eq!(rates(), before + 1, "the batched path answered");
+        let per_series = range(&QueryOptions::default().with_per_series_rates(true));
+        assert_eq!(batched, per_series);
+    }
+
     /// A store that has lost a segment BEFORE open still opens; one that has
     /// lost every segment does not.
     #[test]
@@ -5702,6 +5395,33 @@ mod tests {
         }
         SegmentedParquetReader::open_bytes_with_pool(segments, BufferPool::new(64 * 1024 * 1024))
             .unwrap()
+    }
+
+    /// Each chunk's `rest_start` is the catalog start of the first segment
+    /// after it, and `None` after the last, at any chunk size.
+    #[test]
+    fn rest_start_is_the_start_of_the_next_unread_segment() {
+        let r = grouped_windows(Windows::default());
+        let starts: Vec<u64> = r
+            .source
+            .state
+            .catalog
+            .iter()
+            .map(|c| c.span.expect("every segment has a span").0)
+            .collect();
+        for n in [1, 3, 8] {
+            let mut scan = r
+                .source
+                .scan_counters("cpu_cycles", &Labels::default(), 0, u64::MAX)
+                .expect("cpu_cycles scans");
+            let mut read = 0;
+            while let Some(chunk) = scan.next_chunk(n).expect("no read error") {
+                read += chunk.segments.len();
+                let next = starts[read..].iter().min().copied();
+                assert_eq!(chunk.rest_start, next, "chunk size {n}, {read} read");
+            }
+            assert_eq!(read, starts.len(), "chunk size {n}");
+        }
     }
 
     #[test]
