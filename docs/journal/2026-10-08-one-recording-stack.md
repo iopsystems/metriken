@@ -360,11 +360,11 @@ step re-exports what it moves, in the release after.
    `crates/rez` (feature `rez`, without `caller_rows`). Define the scan, move
    the rate, grouping and display accumulators onto it in the engine, and move
    query routing into the engine; `ingest` reads model types. The writer
-   depends on model types, not the `metriken` registry; the decode-and-re-encode
-   round trip in `StreamDecoder` is deferred (see the storage scan entry). The two
-   crates release together because the readers cannot leave the engine's crate
-   until the engine reads through the scan. Design and gate: [the storage
-   scan](2026-10-09-storage-scan.md).
+   depends on model types, not the `metriken` registry; the
+   decode-and-re-encode round trip in `StreamDecoder` is deferred (see the
+   storage scan entry). The two crates release together because the readers
+   cannot leave the engine's crate until the engine reads through the scan.
+   Design and gate: [the storage scan](2026-10-09-storage-scan.md).
 3. **The stream route** in `metriken-exposition` behind `stream` (piece 1),
    and dendro with SQLite optional. The rezolus agent is the first user,
    cachecannon the first outside one.
