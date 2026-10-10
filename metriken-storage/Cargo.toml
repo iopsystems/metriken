@@ -25,7 +25,11 @@ metriken-types = { version = "0.1.0", path = "../metriken-types" }
 parquet = { workspace = true, features = ["arrow", "lz4", "zstd"] }
 rmp-serde = "1.3"
 rmp = "0.8"
-serde.workspace = true
+rusqlite = { version = "0.40", features = ["bundled", "blob", "serialize"], optional = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, optional = true }
+tar = { version = "0.4.45", default-features = false, optional = true }
+tempfile = { workspace = true, optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
@@ -42,6 +46,10 @@ dendro = { version = "0.3.4" }
 
 [features]
 default = ["lz4"]
+# The `.rez` archive format: reading it, and with `write` its writers.
+rez = ["dep:rusqlite", "dep:serde_json", "dep:tar", "dep:tempfile"]
+# Fixture builders other crates' tests use (the tar `.rez` writer).
+test-support = ["rez", "write"]
 # Loading `metriken-model` snapshots into an in-memory source.
 ingest = []
 # Requires `metriken` 0.11.3, whose `Window` is `metriken-types`' type, the

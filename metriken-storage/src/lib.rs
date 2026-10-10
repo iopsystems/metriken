@@ -37,6 +37,8 @@ mod names;
 pub mod occupants;
 pub mod parquet;
 pub mod reader;
+#[cfg(feature = "rez")]
+pub mod rez;
 pub mod scan;
 pub mod schema;
 pub mod segmented;
