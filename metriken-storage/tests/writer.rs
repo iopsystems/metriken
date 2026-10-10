@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use dendro::seal::SealPolicy;
-use metriken_archive::{
-    ArchiveReader, ArchiveWriter, Catalog, DendroCatalog, SourceRecorder, WriterConfig,
-};
 use metriken_exposition::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
 use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_storage::{
+    ArchiveReader, ArchiveWriter, Catalog, DendroCatalog, SourceRecorder, WriterConfig,
+};
 
 const S: u64 = 1_000_000_000;
 const BASE: u64 = 1_700_000_000 * S;
@@ -484,7 +484,7 @@ fn a_v2_snapshot_is_written_one_table_per_sampler() {
     let free = rows("free");
     assert_eq!(free.len(), 1);
     assert_eq!(free[0].1.last().unwrap().1.parse::<f64>().unwrap(), 11.0);
-    use metriken_archive::Catalog;
+    use metriken_storage::Catalog;
     let catalog = DendroCatalog::open(&path).unwrap();
     let id = catalog.sources().unwrap()[0].id;
     let rows_in = |t: &str| -> u64 {
@@ -509,7 +509,7 @@ fn a_v2_snapshot_is_written_one_table_per_sampler() {
 fn an_encoder_for_an_archives_streams_copies_a_live_long_table() {
     use dendro::archive::{Archive, ArchiveMut};
     use dendro::rewrite::{copy_sources_into, CopySpec};
-    use metriken_archive::writer::Encoder;
+    use metriken_storage::writer::Encoder;
 
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("live.dendro");
@@ -538,8 +538,8 @@ fn an_encoder_for_an_archives_streams_copies_a_live_long_table() {
 /// default, and LZ4 when asked.
 #[test]
 fn sealed_segments_use_the_configured_codec() {
-    use metriken_archive::writer::Compression;
-    use metriken_archive::Catalog;
+    use metriken_storage::writer::Compression;
+    use metriken_storage::Catalog;
 
     let codecs = |path: &Path| -> BTreeSet<String> {
         let catalog = DendroCatalog::open(path).unwrap();
@@ -606,8 +606,8 @@ fn sealed_segments_use_the_configured_codec() {
 fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
     use dendro::archive::{Archive, ArchiveMut};
     use dendro::rewrite::{copy_sources_into, CopySpec};
-    use metriken_archive::writer::Encoder;
-    use metriken_archive::{default_compression, segment_props, KeepMetrics};
+    use metriken_storage::writer::Encoder;
+    use metriken_storage::{default_compression, segment_props, KeepMetrics};
 
     let dir = tempfile::tempdir().unwrap();
     let src_path = dir.path().join("src.dendro");
@@ -681,8 +681,8 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
 /// rather than misread.
 #[test]
 fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
-    use metriken_archive::Catalog;
     use metriken_storage::format::{FORMAT_KEY, FORMAT_VERSION};
+    use metriken_storage::Catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rec.dendro");
@@ -695,7 +695,7 @@ fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
             .metadata
             .get(dendro::keys::ENCODER)
             .map(String::as_str),
-        Some(metriken_archive::ENCODER_VERSION)
+        Some(metriken_storage::ENCODER_VERSION)
     );
     let mut segments = 0;
     for table in catalog.tables(source.id).unwrap() {
@@ -885,7 +885,7 @@ impl Fetched {
 }
 
 impl Catalog for Counting {
-    fn sources(&self) -> Result<Vec<metriken_archive::catalog::Source>, String> {
+    fn sources(&self) -> Result<Vec<metriken_storage::catalog::Source>, String> {
         self.inner.sources()
     }
     fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {
@@ -895,7 +895,7 @@ impl Catalog for Counting {
         &self,
         source_id: i64,
         table: &str,
-    ) -> Result<Vec<(u64, metriken_archive::catalog::SegmentMeta)>, String> {
+    ) -> Result<Vec<(u64, metriken_storage::catalog::SegmentMeta)>, String> {
         self.inner.segment_meta(source_id, table)
     }
     fn segment_bytes(
@@ -916,28 +916,28 @@ impl Catalog for Counting {
         &self,
         source_id: i64,
         table: &str,
-    ) -> Result<Vec<metriken_archive::catalog::WalRow>, String> {
+    ) -> Result<Vec<metriken_storage::catalog::WalRow>, String> {
         self.inner.live_wal(source_id, table)
     }
     fn segment_indexes(
         &self,
         source_id: i64,
         table: &str,
-    ) -> Result<Vec<metriken_archive::SegmentIndex>, String> {
+    ) -> Result<Vec<metriken_storage::SegmentIndex>, String> {
         self.inner.segment_indexes(source_id, table)
     }
     fn segment_span(
         &self,
         source_id: i64,
         table: &str,
-    ) -> Result<(u64, metriken_archive::catalog::Span), String> {
+    ) -> Result<(u64, metriken_storage::catalog::Span), String> {
         self.inner.segment_span(source_id, table)
     }
     fn live_wal_span(
         &self,
         source_id: i64,
         table: &str,
-    ) -> Result<metriken_archive::catalog::Span, String> {
+    ) -> Result<metriken_storage::catalog::Span, String> {
         self.inner.live_wal_span(source_id, table)
     }
     fn caller_row_streams(&self, source_id: i64) -> Result<Vec<String>, String> {

@@ -35,6 +35,7 @@
 //!     .unwrap();
 //! ```
 
+mod archive;
 pub(crate) mod batch_rate;
 pub mod display;
 pub mod long;
@@ -60,6 +61,7 @@ pub use metriken_storage::{
     SegmentStore, UnionChild, UnionError, STORAGE_KEYS,
 };
 
+pub use archive::eval_timestamps_for;
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{ParquetBuilder, ParquetReader};

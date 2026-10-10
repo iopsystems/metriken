@@ -9,13 +9,13 @@ use dendro::replicate::wire::{self, FrameReader};
 use dendro::replicate::{Frame, Subscriber};
 use dendro::writer::Writer;
 use metriken::{metric, MetricEntry};
-use metriken_archive::stream::{encode_groups, FrameProducer, SchemaCache};
-use metriken_archive::{ArchiveReader, DendroCatalog, Encoder};
 use metriken_exposition::group_builder::{
     is_family, Acquisition, GroupBuilder, GroupId, Membership, NoGuard, Route, Router, Stamp,
 };
 use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_storage::stream::{encode_groups, FrameProducer, SchemaCache};
 use metriken_storage::wal::decode_wal_group_row;
+use metriken_storage::{ArchiveReader, DendroCatalog, Encoder};
 
 #[metric(name = "stream_requests")]
 static REQUESTS: metriken::Counter = metriken::Counter::new();

@@ -1,7 +1,7 @@
 //! Prototype: rewrite one wide table of a dendro archive through the writer,
 //! long and wide, to compare how they query. Ignored; needs an archive:
 //! `LONG_REWRITE_SRC=in.dendro LONG_REWRITE_TABLE=cpu_usage/cpu_usage_task
-//! LONG_REWRITE_OUT=dir cargo test --release -p metriken-archive --all-features
+//! LONG_REWRITE_OUT=dir cargo test --release -p metriken-storage --all-features
 //! --test long_rewrite -- --ignored --nocapture`. Writes `dir/long.dendro` and
 //! `dir/wide.dendro`, each holding only that table.
 #![cfg(feature = "write")]
@@ -10,9 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use metriken_archive::{ArchiveWriter, Catalog, DendroCatalog, WriterConfig};
 use metriken_exposition::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
 use metriken_storage::table::{read_table_parquet, Values};
+use metriken_storage::{ArchiveWriter, Catalog, DendroCatalog, WriterConfig};
 
 fn rewrite(src: &DendroCatalog, table: &str, out: &Path, long_groups: bool) {
     let source = &src.sources().unwrap()[0];

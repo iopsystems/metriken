@@ -50,6 +50,13 @@ pub struct SegmentedParquetReader {
 }
 
 impl SegmentedParquetReader {
+    /// A reader over an already-open segmented source, such as one table of
+    /// an archive.
+    pub fn from_source(source: Arc<SegmentedSource>) -> Self {
+        let engine = QueryEngine::new(Arc::clone(&source) as Arc<dyn DataSource>);
+        Self { source, engine }
+    }
+
     /// Open `segments` (raw parquet bytes, in logical/time order) that are
     /// already in memory. The bytes stay resident for the reader's life; see
     /// [`open_with_pool`](Self::open_with_pool) for the on-demand form.

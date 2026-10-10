@@ -6,10 +6,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use crate::occupants::{self, Occupant};
+use crate::wal::{self, WalRowSource};
 use dendro::archive::WalRow as DWalRow;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use metriken_storage::occupants::{self, Occupant};
-use metriken_storage::wal::{self, WalRowSource};
 
 use crate::{default_compression, segment_props as sealed_props};
 

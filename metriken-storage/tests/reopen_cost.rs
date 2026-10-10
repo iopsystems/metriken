@@ -1,6 +1,6 @@
 //! What a query costs on a freshly reopened reader, as a live viewer reopens
 //! one every interval. Ignored; needs a recording:
-//! `REOPEN_COST_ARCHIVE=path.dendro cargo test --release -p metriken-archive
+//! `REOPEN_COST_ARCHIVE=path.dendro cargo test --release -p metriken-storage
 //! --test reopen_cost -- --ignored --nocapture`. Optional settings:
 //!
 //! - `REOPEN_COST_QUERY`: the query (default `sum(irate(task_cpu_usage[5s]))`).
@@ -16,8 +16,8 @@
 
 use std::time::{Duration, Instant};
 
-use metriken_archive::{ArchiveReader, DendroCatalog};
 use metriken_query::{BufferPool, MetricsSource};
+use metriken_storage::{ArchiveReader, DendroCatalog};
 
 fn open(path: &str, pool: &std::sync::Arc<BufferPool>) -> ArchiveReader {
     let mut recordings = ArchiveReader::from_catalog(

@@ -12,15 +12,15 @@ use dendro::replicate::Frame;
 use dendro::seal::SealPolicy;
 use metriken::group::SlotIdentity;
 use metriken::{metric, MetricEntry, Window};
-use metriken_archive::stream::{EncodedStreamGroup, FrameProducer, SchemaCache};
-use metriken_archive::{
-    ArchiveReader, ArchiveWriter, DendroCatalog, SourceRecorder, StreamDecoder, WriterConfig,
-};
 use metriken_exposition::group_builder::{
     Acquisition, GroupBuilder, GroupId, Membership, NoGuard, Route, Router, Stamp,
 };
 use metriken_exposition::Snapshot;
 use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_storage::stream::{EncodedStreamGroup, FrameProducer, SchemaCache};
+use metriken_storage::{
+    ArchiveReader, ArchiveWriter, DendroCatalog, SourceRecorder, StreamDecoder, WriterConfig,
+};
 
 #[metric(name = "long_tasks_cpu", metadata = { acq_group = "tasks" })]
 static TASK_CPU: metriken::CounterGroup = metriken::CounterGroup::new(16);
@@ -348,10 +348,10 @@ fn the_long_stream_records_what_wide_snapshots_record() {
 #[test]
 fn the_decoder_follows_a_group_that_changes_form() {
     use dendro::archive::WalRow;
-    use metriken_archive::StreamedGroup;
     use metriken_storage::occupants::{self, Occupant};
     use metriken_storage::schema::{GroupSchema, MetricDesc};
     use metriken_storage::wal::{self, LongOccupant, WalGroupRow, WalLongRow};
+    use metriken_storage::StreamedGroup;
 
     const STREAM: &str = "t/switch";
     let schema = GroupSchema {

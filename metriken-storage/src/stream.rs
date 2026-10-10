@@ -57,18 +57,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::occupants::{self, Occupant};
+use crate::schema::GroupSchema;
+#[cfg(doc)]
+use crate::wal::WalGroupRow;
+use crate::wal::{
+    decode_wal_long_row, encode_wal_group_row, encode_wal_group_row_with_schema,
+    encode_wal_long_row, LongOccupant, WalLongRow,
+};
 use dendro::archive::WalRow;
 use dendro::replicate::{Frame, NO_INDEX_STATE};
 use metriken_exposition::group_builder::{LongGroupSnapshot, StreamGroup};
 use metriken_exposition::GroupSnapshot;
-use metriken_storage::occupants::{self, Occupant};
-use metriken_storage::schema::GroupSchema;
-#[cfg(doc)]
-use metriken_storage::wal::WalGroupRow;
-use metriken_storage::wal::{
-    decode_wal_long_row, encode_wal_group_row, encode_wal_group_row_with_schema,
-    encode_wal_long_row, LongOccupant, WalLongRow,
-};
 
 /// The ordinal a producer's own source takes. A producer is one source, so
 /// it is always this; the field exists because a connection may carry
@@ -567,8 +567,8 @@ fn with_long_schema(payload: &[u8], schema: &GroupSchema) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metriken_storage::schema::MetricDesc;
-    use metriken_storage::wal::{decode_wal_group_row, WalGroupRow};
+    use crate::schema::MetricDesc;
+    use crate::wal::{decode_wal_group_row, WalGroupRow};
 
     const STREAM: &str = "cpu_usage/cpu_usage_task";
     const UUID: &str = "11111111-2222-4333-8444-555555555555";

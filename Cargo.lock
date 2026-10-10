@@ -997,19 +997,9 @@ dependencies = [
 
 [[package]]
 name = "metriken-archive"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
- "arrow",
- "bytes",
- "dendro",
- "histogram",
- "metriken",
- "metriken-exposition",
- "metriken-query",
  "metriken-storage",
- "parquet",
- "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -1091,10 +1081,12 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "dendro",
  "foldhash 0.2.0",
  "histogram",
  "lru",
  "metriken",
+ "metriken-exposition",
  "metriken-model",
  "metriken-query",
  "metriken-types",

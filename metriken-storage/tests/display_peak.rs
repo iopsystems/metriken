@@ -3,7 +3,7 @@
 //! needs an archive:
 //!
 //! `DP_ARCHIVE=in.dendro DP_QUERY='sum by (comm) (irate(task_cpu_usage[5s]))'
-//! cargo test --release -p metriken-archive --test display_peak -- --ignored
+//! cargo test --release -p metriken-storage --test display_peak -- --ignored
 //! --nocapture`
 //!
 //! Prints the number of points and the query's time. `DP_OUT=file` writes
@@ -12,8 +12,8 @@
 //! measured around the process (`/usr/bin/time -l` on macOS, `-v` on
 //! Linux).
 
-use metriken_archive::{ArchiveReader, DendroCatalog};
 use metriken_query::{BufferPool, DisplayOptions, DisplayResult, MetricsSource, QueryOptions};
+use metriken_storage::{ArchiveReader, DendroCatalog};
 
 #[test]
 #[ignore]

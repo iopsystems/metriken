@@ -6,7 +6,7 @@
 //! ([`DendroCatalog`]); another container (rezolus's `.rez`) implements it
 //! where it lives.
 
-use metriken_storage::wal::WalRowSource;
+use crate::wal::WalRowSource;
 
 /// One source (a recording) of an archive.
 #[derive(Clone, Debug, PartialEq, Eq)]

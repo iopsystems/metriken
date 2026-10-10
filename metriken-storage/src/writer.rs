@@ -2,7 +2,7 @@
 //!
 //! dendro's `Writer` supplies the container: one writer thread, one
 //! transaction per tick across every source, sealing off the tick path
-//! through a [`SegmentEncoder`], checkpoints, eviction, finalize. This module
+//! through a `SegmentEncoder`, checkpoints, eviction, finalize. This module
 //! supplies what goes in it (see `docs/journal/2026-09-28-archive-writer.md`):
 //!
 //! - a group whose members carry a slot `id` is written **long**: one row per
@@ -26,13 +26,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::occupants::{self, Occupant};
+use crate::schema::{GroupSchema, MetricDesc};
+use crate::wal::{self, LongOccupant, WalLongRow};
 use dendro::archive::{SourceMeta, WalRow as DWalRow};
 use dendro::seal::{SealPolicy, SegmentAccount};
 use dendro::writer::{SourceWriter, Writer};
 use metriken_exposition::{GroupSnapshot, Snapshot};
-use metriken_storage::occupants::{self, Occupant};
-use metriken_storage::schema::{GroupSchema, MetricDesc};
-use metriken_storage::wal::{self, LongOccupant, WalLongRow};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -119,7 +119,7 @@ pub enum StreamedGroup {
 /// the row that carried it; a group row whose schema this connection was
 /// never sent is skipped and counted in [`unresolved`](Self::unresolved).
 ///
-/// [`WalGroupRow`]: metriken_storage::wal::WalGroupRow
+/// [`WalGroupRow`]: crate::wal::WalGroupRow
 #[derive(Default)]
 pub struct StreamDecoder {
     schemas: HashMap<String, ((u64, u64), Arc<metriken_exposition::GroupSchema>)>,
@@ -205,7 +205,7 @@ impl StreamDecoder {
 /// Which row type an encoded stream payload is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowForm {
-    /// A [`WalGroupRow`](metriken_storage::wal::WalGroupRow): six fields.
+    /// A [`WalGroupRow`](crate::wal::WalGroupRow): six fields.
     Group,
     /// A [`WalLongRow`]: four fields.
     Long,
@@ -969,8 +969,8 @@ impl SourceRecorder {
         wall_offset: i64,
         rows: &mut Vec<DWalRow>,
     ) -> Result<(), Error> {
-        use metriken_storage::builder::{cells_approx_bytes, Cell, CellValue};
-        use metriken_storage::wal::{WalCell, WalValue};
+        use crate::builder::{cells_approx_bytes, Cell, CellValue};
+        use crate::wal::{WalCell, WalValue};
 
         struct Entry<'a> {
             name: &'a str,
@@ -1062,9 +1062,9 @@ impl SourceRecorder {
                     .map(|e| Cell {
                         name: e.name,
                         metadata: e.metadata,
-                        window: e.window.map(|(begin_ns, end_ns)| {
-                            metriken_storage::window::Window { begin_ns, end_ns }
-                        }),
+                        window: e
+                            .window
+                            .map(|(begin_ns, end_ns)| crate::window::Window { begin_ns, end_ns }),
                         value: match e.value {
                             CellValue::Counter(v) => CellValue::Counter(v),
                             CellValue::Gauge(v) => CellValue::Gauge(v),
@@ -1364,7 +1364,7 @@ impl SourceRecorder {
 #[cfg(test)]
 mod row_form_tests {
     use super::*;
-    use metriken_storage::wal::WalGroupRow;
+    use crate::wal::WalGroupRow;
 
     /// The decoder tells the two row types apart by their field counts, so
     /// those must differ and match what the encoders write.

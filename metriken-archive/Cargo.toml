@@ -1,36 +1,18 @@
 [package]
 name = "metriken-archive"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
 ]
 license = "MIT OR Apache-2.0"
-description = "Archives of metriken metrics read as one PromQL source per recording"
+description = "Moved to metriken-storage; this crate re-exports it"
 homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 
 [dependencies]
-arrow.workspace = true
-bytes = "1"
-dendro = { version = "0.3.4", default-features = false }
-metriken-query = { version = "0.34.5", path = "../metriken-query", default-features = false, features = ["lz4"] }
-parquet = { version = "58.2.0", default-features = false, features = ["arrow", "lz4", "zstd"] }
 metriken-storage = { version = "0.1.0", path = "../metriken-storage", default-features = false, features = ["lz4"] }
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-metriken-exposition = { version = "0.21.4", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
-metriken = { version = "0.11.2", path = "../metriken", optional = true }
-histogram = { workspace = true, optional = true }
 
 [features]
-# The archive writer. Off, this crate is a reader that builds for wasm32:
-# metriken-exposition depends on the registry, which does not.
-write = ["dendro/write", "dep:metriken-exposition", "dep:metriken", "dep:histogram"]
-# A producer's groups as dendro replication frames (`stream::FrameProducer`).
-# Separate from `write`: a producer serving a stream needs neither the
-# archive writer nor dendro's.
-stream = ["dep:metriken-exposition", "dep:metriken"]
-
-[dev-dependencies]
-metriken = { version = "0.11.0", path = "../metriken" }
-tempfile = "3"
+write = ["metriken-storage/write"]
+stream = ["metriken-storage/stream"]

@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use metriken_archive::{ArchiveReader, ArchiveWriter, DendroCatalog, StreamedGroup, WriterConfig};
 use metriken_exposition::{
     GroupSchema as XSchema, GroupSnapshot, MetricDesc as XDesc, Snapshot, SnapshotV3,
 };
@@ -15,6 +14,7 @@ use metriken_query::{BufferPool, MetricsSource, QueryResult};
 use metriken_storage::occupants::Occupant;
 use metriken_storage::schema::{GroupSchema, MetricDesc};
 use metriken_storage::wal::{LongOccupant, WalLongRow};
+use metriken_storage::{ArchiveReader, ArchiveWriter, DendroCatalog, StreamedGroup, WriterConfig};
 
 const S: u64 = 1_000_000_000;
 const BASE: u64 = 1_700_000_000 * S;
@@ -110,7 +110,7 @@ fn described(keys: &[(u64, &str)]) -> StreamedGroup {
 
 fn record(
     path: &Path,
-    ticks: impl FnOnce(&mut metriken_archive::SourceRecorder, &mut ArchiveWriter),
+    ticks: impl FnOnce(&mut metriken_storage::SourceRecorder, &mut ArchiveWriter),
 ) {
     let mut writer = ArchiveWriter::create(path, WriterConfig::default()).unwrap();
     let mut source = writer

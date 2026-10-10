@@ -2,7 +2,7 @@
 //! `metriken_query::MetricsSource`, composed of one sub-source per table: a
 //! `ParquetReader` for a single-segment table, a `SegmentedParquetReader`
 //! for one sealed more than once. A table's live WAL tail is materialized
-//! as its newest segment (`metriken_storage::wal::materialize_wal_tail`).
+//! as its newest segment (`crate::wal::materialize_wal_tail`).
 //!
 //! Moved from rezolus's `crates/rez` (`RezReader`), phase 3 of
 //! `docs/journal/2026-09-28-high-cardinality-stack.md`.
@@ -13,7 +13,7 @@
 //! table is answered by that table's own (lazy, footer-only) reader. A query
 //! naming metrics from several tables of the SAME sampler OF THE SAME source
 //! is answered by composing their readers into one
-//! [`metriken_query::UnionMetricsSource`] (through its checking `try_new`,
+//! `metriken_query::UnionMetricsSource` (through its checking `try_new`,
 //! so a producer bug that put one metric name in two tables is a loud
 //! error, not a silent first-wins). The union dispatches by metric name, with
 //! no timestamp join: each metric keeps its acquisition window from its own
@@ -24,15 +24,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use metriken_query::{
-    BufferPool, CompositionSource, MetricsSource, ParquetReader, QueryError, QueryOptions,
-    QueryResult, RateMode, SegmentedParquetReader, UnionChild, UnionError, UnionMetricsSource,
-};
+use crate::parquet::MultiParquetSource;
+use crate::segmented::SegmentedSource;
+use crate::{BufferPool, CompositionSource, DataSource, UnionChild};
 
 use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
 
-use metriken_storage::occupants::Occupant;
+use crate::occupants::Occupant;
 
 /// Each occupant's first row, in the order the rows came.
 fn first_per_occupant(rows: impl IntoIterator<Item = Occupant>) -> Vec<Occupant> {
@@ -50,17 +49,17 @@ type OccupantSegments = BTreeMap<u64, Arc<Vec<Occupant>>>;
 #[derive(Clone, Default)]
 struct Carried {
     /// The built table's state; `None` when it saved none.
-    handover: Option<metriken_query::Handover>,
+    handover: Option<crate::Handover>,
     /// The occupant-stream segments it decoded.
     occupant_segments: OccupantSegments,
 }
 
-enum TableReader {
+pub enum TableReader {
     /// A table read from its segments on demand — one segment or many; the
     /// segmented reader fetches only what a query touches either way. A
     /// group table whose slots the identity index describes opens as the
     /// same reader with a relabelling (see [`IndexRelabel`]).
-    Segmented(SegmentedParquetReader),
+    Segmented(Arc<SegmentedSource>),
 }
 
 /// Parse one probe segment's footer per table.
@@ -126,7 +125,7 @@ fn probe_one(
     let mut names = TableNames::default();
     let mut interval = None;
     for bytes in probes {
-        let probe = ParquetReader::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
+        let probe = MultiParquetSource::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
             .map_err(|e| format!("probing table {sampler}: {e}"))?;
         names.counters.extend(probe.counter_names());
         names.gauges.extend(probe.gauge_names());
@@ -148,7 +147,7 @@ type PendingProbe = (String, Vec<Vec<u8>>, Option<(u64, u64)>);
 ///   first segment's names, which is what the reader assumed of every segment
 ///   before;
 /// - the rows of its live tail that name its columns
-///   (`metriken_storage::wal::schema_rows`), materialized alone.
+///   (`crate::wal::schema_rows`), materialized alone.
 fn table_probes(
     db: &dyn Catalog,
     recording_id: i64,
@@ -174,12 +173,12 @@ fn table_probes(
         }
     }
     let rows = db.live_wal(recording_id, table)?;
-    let naming = metriken_storage::wal::schema_rows(table, long, &rows)?;
+    let naming = crate::wal::schema_rows(table, long, &rows)?;
     let props = crate::segment_props(crate::default_compression());
     let tail = if long {
-        metriken_storage::wal::materialize_long_wal_tail_with(table, &naming, false, props)?
+        crate::wal::materialize_long_wal_tail_with(table, &naming, false, props)?
     } else {
-        metriken_storage::wal::materialize_wal_tail_with(table, &naming, props)?
+        crate::wal::materialize_wal_tail_with(table, &naming, props)?
     };
     probes.extend(tail.map(|t| t.bytes));
     Ok(probes)
@@ -300,13 +299,13 @@ fn live_tail(
     recording_id: i64,
     table: &str,
     long: bool,
-) -> Result<Option<metriken_storage::wal::MaterializedTail>, Box<dyn std::error::Error>> {
+) -> Result<Option<crate::wal::MaterializedTail>, Box<dyn std::error::Error>> {
     let rows = db.live_wal(recording_id, table)?;
     let props = crate::segment_props(crate::default_compression());
     if long {
-        metriken_storage::wal::materialize_long_wal_tail_with(table, &rows, false, props)
+        crate::wal::materialize_long_wal_tail_with(table, &rows, false, props)
     } else {
-        metriken_storage::wal::materialize_wal_tail_with(table, &rows, props)
+        crate::wal::materialize_wal_tail_with(table, &rows, props)
     }
 }
 
@@ -325,7 +324,7 @@ impl DbSegmentStore {
                     .unzip();
                 let long = db
                     .tables(recording_id)?
-                    .contains(&metriken_storage::occupants::stream_of(sampler));
+                    .contains(&crate::occupants::stream_of(sampler));
                 let tail = live_tail(db, recording_id, sampler, long)
                     .map_err(|e| e.to_string())?
                     .map(|t| bytes::Bytes::from(t.bytes));
@@ -343,7 +342,7 @@ impl DbSegmentStore {
     }
 }
 
-impl metriken_query::SegmentStore for DbSegmentStore {
+impl crate::SegmentStore for DbSegmentStore {
     fn len(&self) -> usize {
         self.seqs.len() + usize::from(self.tail.is_some())
     }
@@ -353,7 +352,7 @@ impl metriken_query::SegmentStore for DbSegmentStore {
         self.keys.get(idx).copied()
     }
 
-    fn bytes(&self, idx: usize) -> metriken_query::SegmentBytes {
+    fn bytes(&self, idx: usize) -> crate::SegmentBytes {
         match self.seqs.get(idx) {
             Some(seq) => {
                 let seq = *seq;
@@ -382,11 +381,9 @@ impl SegmentSource {
     /// This table as a store the segmented reader fetches from on demand.
     /// `None` when the table has no segments and no tail any more — evicted
     /// between the probe and the query.
-    fn store(
-        &self,
-    ) -> Result<Option<Arc<dyn metriken_query::SegmentStore>>, Box<dyn std::error::Error>> {
-        let store: Arc<dyn metriken_query::SegmentStore> = match self {
-            SegmentSource::Bytes(b) => Arc::new(metriken_query::InMemorySegments::new(b.clone())),
+    fn store(&self) -> Result<Option<Arc<dyn crate::SegmentStore>>, Box<dyn std::error::Error>> {
+        let store: Arc<dyn crate::SegmentStore> = match self {
+            SegmentSource::Bytes(b) => Arc::new(crate::InMemorySegments::new(b.clone())),
             SegmentSource::Db {
                 reopen,
                 recording_id,
@@ -444,7 +441,7 @@ impl SegmentSource {
                         // no series carries that key, so a filter on it
                         // matches the same series either way.
                         Some(bytes) => Arc::new(first_per_occupant(
-                            metriken_storage::occupants::decode_segment(&bytes)?
+                            crate::occupants::decode_segment(&bytes)?
                                 .into_iter()
                                 .map(|(_, o)| o),
                         )),
@@ -455,7 +452,7 @@ impl SegmentSource {
                 decoded.insert(key, rows);
             }
             for row in db.live_wal(recording_id, stream)? {
-                out.extend(metriken_storage::occupants::decode_wal_row(&row.row)?);
+                out.extend(crate::occupants::decode_wal_row(&row.row)?);
             }
             Ok((out, decoded))
         };
@@ -514,25 +511,30 @@ impl TableNames {
 }
 
 impl TableReader {
-    fn as_dyn(&self) -> &dyn MetricsSource {
+    /// The table's source.
+    pub fn source(&self) -> Arc<dyn DataSource> {
+        match self {
+            TableReader::Segmented(r) => Arc::clone(r) as Arc<dyn DataSource>,
+        }
+    }
+
+    /// The table's segmented source.
+    pub fn segmented(&self) -> &Arc<SegmentedSource> {
         match self {
             TableReader::Segmented(r) => r,
         }
     }
 
-    fn union_child(&self) -> UnionChild {
-        match self {
-            TableReader::Segmented(r) => UnionChild::from(r),
-        }
+    /// The table as a child of a same-recording union.
+    pub fn union_child(&self) -> UnionChild {
+        UnionChild::from_source(self.source())
     }
 
     /// The same borrow as [`union_child`](Self::union_child), for the other
     /// composition: merging this table into a labelled multi-source rather
     /// than into a same-recording union.
-    fn composition_source(&self) -> CompositionSource {
-        match self {
-            TableReader::Segmented(r) => CompositionSource::from(r),
-        }
+    pub fn composition_source(&self) -> CompositionSource {
+        CompositionSource::from_source(self.source())
     }
 }
 
@@ -555,7 +557,7 @@ impl TableReader {
 /// `dir` is a display name derived from labels (`recording_dir_slug`), not a
 /// guaranteed-unique identity — two recordings with the same labels are
 /// entirely legal and would collide on `dir`.
-struct SamplerReader {
+pub struct SamplerReader {
     recording: usize,
     sampler: String,
     /// Every metric name this table holds, probed from ONE segment's footer at
@@ -592,7 +594,7 @@ struct SamplerReader {
     indexed: bool,
     /// The table's occupant stream, when it is a long table: its series
     /// carry only an occupant number, and this stream says which labels each
-    /// number stands for. See `metriken_storage::occupants`.
+    /// number stands for. See `crate::occupants`.
     occupants: Option<String>,
     /// What reads an indexed table's caller rows into a relabelling. The
     /// archive's own long tables need none (their occupant stream is read
@@ -622,6 +624,16 @@ struct SamplerReader {
 }
 
 impl SamplerReader {
+    /// The index of the recording this table belongs to.
+    pub fn recording(&self) -> usize {
+        self.recording
+    }
+
+    /// The table's key: `<sampler>/<group>` or `<sampler>`.
+    pub fn sampler(&self) -> &str {
+        &self.sampler
+    }
+
     /// The table's reader, built on first use — `None` if its segments have
     /// gone since the probe.
     ///
@@ -700,7 +712,7 @@ impl SamplerReader {
         out
     }
 
-    fn reader(&self) -> Option<&TableReader> {
+    pub fn reader(&self) -> Option<&TableReader> {
         self.reader
             .get_or_init(|| {
                 // Taken before anything can fail, so a table whose build
@@ -733,18 +745,14 @@ impl SamplerReader {
                     None => None,
                 };
                 let opened = match self.keep.load(std::sync::atomic::Ordering::Relaxed) {
-                    true => SegmentedParquetReader::open_after(
+                    true => SegmentedSource::open(
                         store,
                         pool,
                         relabel,
                         previous.as_ref().and_then(|p| p.handover.as_ref()),
+                        true,
                     ),
-                    false => match relabel {
-                        Some(relabel) => {
-                            SegmentedParquetReader::open_relabeled_with_pool(store, pool, relabel)
-                        }
-                        None => SegmentedParquetReader::open_with_pool(store, pool),
-                    },
+                    false => SegmentedSource::open(store, pool, relabel, None, false),
                 };
                 opened
                     .map(TableReader::Segmented)
@@ -776,7 +784,7 @@ impl SamplerReader {
     fn relabel(
         &self,
         previous: Option<&Carried>,
-    ) -> Option<Result<Arc<dyn metriken_query::ColumnRelabel>, ()>> {
+    ) -> Option<Result<Arc<dyn crate::ColumnRelabel>, ()>> {
         if let Some(stream) = &self.occupants {
             let empty = OccupantSegments::new();
             let known = previous.map_or(&empty, |p| &p.occupant_segments);
@@ -788,7 +796,7 @@ impl SamplerReader {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner()) = decoded;
                     }
-                    Ok(Arc::new(metriken_query::long::OccupantLabels::new(rows)))
+                    Ok(Arc::new(crate::long::OccupantLabels::new(rows)))
                 }
                 Err(e) => {
                     tracing::warn!("reading the occupant stream {stream}: {e}");
@@ -810,10 +818,10 @@ impl SamplerReader {
         }))
     }
 
-    fn row_timestamps(&self) -> &[u64] {
+    pub fn row_timestamps(&self) -> &[u64] {
         self.row_timestamps.get_or_init(|| {
             self.reader()
-                .map(|r| r.as_dyn().sample_timestamps())
+                .map(|r| r.source().sample_timestamps())
                 .unwrap_or_default()
         })
     }
@@ -909,7 +917,7 @@ impl ArchiveReader {
     /// # Errors
     ///
     /// Refuses a reader that **flattens several recordings**, which is what
-    /// [`open_with_pool`](Self::open_with_pool) produces. Every recording holds
+    /// `open_with_pool` produces. Every recording holds
     /// the same sampler names, so composing a flattened reader hands the
     /// builder several children carrying the same metric names under one
     /// label. `ParquetBuilder` does not dedup or dispatch — it CONCATENATES
@@ -920,7 +928,7 @@ impl ArchiveReader {
     /// version of this comment claimed, one recording replacing another: that
     /// is `UnionSource`'s first-wins, a different composer.
     ///
-    /// Open with [`open_recordings`](Self::open_recordings) instead: one
+    /// Open with `open_recordings` instead: one
     /// reader per recording, each composable under its own label.
     ///
     /// Also refuses when every table was skipped but the recording has tables,
@@ -956,7 +964,7 @@ impl ArchiveReader {
             .tables
             .iter()
             .map(|t| {
-                let mut catalog = metriken_query::CompositionCatalog::new(t.interval)
+                let mut catalog = crate::CompositionCatalog::new(t.interval)
                     .counters(t.names.counters.iter().cloned())
                     .gauges(t.names.gauges.iter().cloned())
                     .histograms(t.names.histograms.iter().cloned())
@@ -978,59 +986,11 @@ impl ArchiveReader {
 
         Ok(sources)
     }
-    /// The evaluation timestamps a composed query needs to stay faithful to
-    /// this recording's cadences, or `None` when it does not need any.
-    ///
-    /// Querying this reader directly applies the cross-cadence policy itself
-    /// (see `query_range_opts`): when a query spans samplers recording at
-    /// different rates, the points are moved onto the SLOW table's own rows, so
-    /// every point lands where both operands genuinely have data. A caller that
-    /// instead composes [`composition_sources`](Self::composition_sources) into
-    /// a labelled multi-source queries that composed reader, never this one, and
-    /// so silently loses the policy — the composed reader falls back to the
-    /// uniform grid and holds the slow operand's value forward between its real
-    /// readings.
-    ///
-    /// Pass the result to `QueryOptions::with_eval_timestamps` on the composed
-    /// query to restore it:
-    ///
-    /// ```rust,ignore
-    /// let mut opts = QueryOptions::default();
-    /// if let Some(points) = reader.eval_timestamps_for(query, step_s, opts.rate_mode) {
-    ///     opts = opts.with_eval_timestamps(Some(points));
-    /// }
-    /// composed.query_range_opts(query, start_s, end_s, step_s, &opts)
-    /// ```
-    ///
-    /// `None` means the composed query needs no adjustment: the query touches
-    /// one cadence (the overwhelming majority), or `rate_mode` is
-    /// [`RateMode::Raw`], which places points at real un-snapped sample times
-    /// by contract and must not have them relocated.
-    ///
-    /// # This answers for ONE recording
-    ///
-    /// The timestamps are absolute, so they describe this recording's timeline
-    /// and no other. A caller composing SEVERAL recordings cannot simply pick
-    /// one: two jobs that ran at different wall-clock times share no instants,
-    /// and imposing one's rows on the other puts every point where the other
-    /// has no data — the very fault this exists to avoid. Apply this when
-    /// exactly one recording is in the composition, or when every recording
-    /// answers with the same timestamps; otherwise there is no well-defined
-    /// alignment and the uniform grid is the honest fallback.
-    pub fn eval_timestamps_for(
-        &self,
-        query: &str,
-        step_s: f64,
-        rate_mode: RateMode,
-    ) -> Option<Arc<[u64]>> {
-        self.cross_cadence_eval_timestamps(query, step_s, rate_mode)
-    }
-
     /// Every metric's column metadata: `unit`, `description`, `metric_type`,
     /// and the metric's label keys, exactly as the recorder wrote them into the
     /// parquet schema.
     ///
-    /// [`MetricsSource`] answers which metrics exist and what labels they
+    /// `metriken_query::MetricsSource` answers which metrics exist and what labels they
     /// carry, but not what they MEAN — a consumer building a metric catalog
     /// (systemslab populates one at import) needs the unit and description too,
     /// and those live only in the columns' arrow metadata.
@@ -1262,7 +1222,7 @@ impl ArchiveReader {
             let (occupant_streams, samplers): (Vec<String>, Vec<String>) = db
                 .tables(rec.id)?
                 .into_iter()
-                .partition(|s| metriken_storage::occupants::table_of(s).is_some());
+                .partition(|s| crate::occupants::table_of(s).is_some());
             let occupant_streams: HashSet<String> = occupant_streams.into_iter().collect();
             for sampler in samplers {
                 let metas = db.segment_meta(rec.id, &sampler)?;
@@ -1278,7 +1238,7 @@ impl ArchiveReader {
                     rec.id,
                     &sampler,
                     &metas,
-                    occupant_streams.contains(&metriken_storage::occupants::stream_of(&sampler)),
+                    occupant_streams.contains(&crate::occupants::stream_of(&sampler)),
                 )?;
                 // Nothing sealed and nothing live: the table has no rows at
                 // all, so there is nothing to open. Same skip as the eager path.
@@ -1342,8 +1302,8 @@ impl ArchiveReader {
                     interval,
                     indexed: indexed.contains(&sampler),
                     occupants: occupant_streams
-                        .contains(&metriken_storage::occupants::stream_of(&sampler))
-                        .then(|| metriken_storage::occupants::stream_of(&sampler)),
+                        .contains(&crate::occupants::stream_of(&sampler))
+                        .then(|| crate::occupants::stream_of(&sampler)),
                     index: index.clone(),
                     segments: match &reopen {
                         Some(reopen) => SegmentSource::Db {
@@ -1420,14 +1380,15 @@ impl ArchiveReader {
                 let probe = segments
                     .first()
                     .ok_or_else(|| format!("table {sampler} has no segments"))?;
-                let probe = ParquetReader::open_bytes_with_pool(probe.clone(), Arc::clone(&pool))
-                    .map_err(|e| format!("probing table {sampler}: {e}"))?;
+                let probe =
+                    MultiParquetSource::open_bytes_with_pool(probe.clone(), Arc::clone(&pool))
+                        .map_err(|e| format!("probing table {sampler}: {e}"))?;
                 let names = TableNames {
                     counters: probe.counter_names().into_iter().collect(),
                     gauges: probe.gauge_names().into_iter().collect(),
                     histograms: probe.histogram_names().into_iter().collect(),
                 };
-                let first_span = probe.time_range_ns();
+                let first_span = probe.time_range();
                 let interval = probe.interval();
                 drop(probe);
 
@@ -1436,12 +1397,12 @@ impl ArchiveReader {
                 let last_span = match segments.len() {
                     0 | 1 => first_span,
                     _ => {
-                        let last = ParquetReader::open_bytes_with_pool(
+                        let last = MultiParquetSource::open_bytes_with_pool(
                             segments[segments.len() - 1].clone(),
                             Arc::clone(&pool),
                         )
                         .map_err(|e| format!("probing table {sampler} tail: {e}"))?;
-                        let s = last.time_range_ns();
+                        let s = last.time_range();
                         drop(last);
                         s
                     }
@@ -1478,447 +1439,90 @@ impl ArchiveReader {
             recordings: recording_count,
         })
     }
-
-    /// Sub-readers that hold at least one metric the query references.
-    ///
-    /// Answered from each table's name catalog, so a table the query cannot
-    /// touch is never opened. `referenced_metrics` is parse-only — it does not
-    /// need a source, which is exactly why routing can use it and `columns`
-    /// (which expands selectors through the source's column map) cannot.
-    ///
-    /// Label matchers are not consulted: a table holding the metric with no
-    /// matching series answers with an empty result, which is correct, and
-    /// skipping it here would route on data the catalog does not carry.
-    fn owners(&self, query: &str) -> Result<Vec<&SamplerReader>, QueryError> {
-        let referenced = metriken_query::referenced_metrics(query)?;
-        Ok(self
-            .tables
-            .iter()
-            .map(|t| &**t)
-            .filter(|t| referenced.iter().any(|m| t.names.holds(m)))
-            .collect())
-    }
-
-    /// Resolve the reader that answers every metric a query references: the
-    /// single owning table directly, or — when every owner lives in ONE
-    /// RECORDING — a fresh [`UnionMetricsSource`] over exactly those tables.
-    ///
-    /// Tables of different samplers union freely within a recording. They did
-    /// not always: a query spanning two samplers used to be refused as
-    /// "cross-timeline", because there was no way to say what treating two
-    /// separately-read values as simultaneous costs. The query engine now
-    /// prices that itself — operands whose acquisition edges differ have their
-    /// bands widened to the union of both spans — so the refusal has nothing
-    /// left to protect. Measured, the join costs 1.5–3.0 ms on a 32-core host,
-    /// under 1% of a 200 ms interval.
-    ///
-    /// Still refused: the SAME sampler across two DIFFERENT recordings of a
-    /// multi-recording (A/B) archive. Those are genuinely different timelines
-    /// — different agents, hosts or arms — and unioning them would let
-    /// first-wins silently answer from one recording. Errors too when the
-    /// query references no known metric.
-    fn route(&self, query: &str) -> Result<Routed<'_>, QueryError> {
-        let owners = self.owners(query)?;
-        match owners.as_slice() {
-            [] => Err(QueryError::ParseError(format!(
-                "query references no metric present in this .rez: {query}"
-            ))),
-            // A table whose segments have gone since the probe is absent, so
-            // its metrics are too: the same error a query naming a metric this
-            // archive never held gets.
-            [one] => one.reader().map(Routed::Direct).ok_or_else(|| {
-                QueryError::ParseError(format!(
-                    "query references {query}, whose table ({}) has been evicted since \
-                     this archive was opened",
-                    one.sampler
-                ))
-            }),
-            many => {
-                // Group owners by (RECORDING, SAMPLER), not by sampler alone:
-                // two group tables of one sampler are a same-timeline union
-                // ONLY within one recording. `from_recordings` flattens every
-                // recording's tables into one `tables` vec, so a metric
-                // present in every recording of a multi-recording (A/B)
-                // archive — e.g. `cpu_cycles` in each side's `cpu_usage`
-                // table — would otherwise look exactly like two group tables
-                // of one sampler, and unioning them would let
-                // `UnionSource`'s first-wins silently answer from ONE
-                // recording instead of refusing (see the module docs).
-                // `rez::table_sampler` is the identity function for every V2
-                // (or unsplit V3) table, so within one recording this
-                // reduces to today's behavior whenever nothing actually
-                // split.
-                let mut groups: Vec<usize> = many.iter().map(|t| t.recording).collect();
-                groups.sort();
-                groups.dedup();
-                match groups.as_slice() {
-                    [_] => {
-                        // Building the union only touches each table's
-                        // already-open, footer-level name catalog (no
-                        // row-group decode), so a fresh one per query is
-                        // cheap enough not to need caching.
-                        //
-                        // `try_new`, not `new`: this composition set is
-                        // derived from archive bytes (table schemas plus
-                        // parsed table keys), not hand-picked by trusted
-                        // code, so a producer/archive bug that put the same
-                        // metric name in two "disjoint" group tables of this
-                        // sampler must be a loud error, not `UnionSource`'s
-                        // silent first-wins.
-                        // `filter_map`, not `map`: on a live archive one of
-                        // several owners can have been evicted between the
-                        // probe and here, and the rest still answer.
-                        let children: Vec<UnionChild> = many
-                            .iter()
-                            .filter_map(|t| t.reader().map(TableReader::union_child))
-                            .collect();
-                        if children.is_empty() {
-                            return Err(QueryError::ParseError(format!(
-                                "query references {query}, whose tables have all been \
-                                 evicted since this archive was opened"
-                            )));
-                        }
-                        UnionMetricsSource::try_new(children)
-                            .map(Routed::Union)
-                            .map_err(|e| match e {
-                                UnionError::NonDisjoint { duplicates } => {
-                                    // Two very different situations produce
-                                    // this, and conflating them tells the
-                                    // operator their archive is corrupt when
-                                    // it is not. Distinct SAMPLERS sharing a
-                                    // metric name is legitimate and shipped:
-                                    // `gpu_amd_smi` and `gpu_nvidia` both
-                                    // publish the vendor-neutral
-                                    // `gpu_utilization`, `gpu_temperature` and
-                                    // six more, because only one of them ever
-                                    // populates on a given host. Two group
-                                    // tables of ONE sampler sharing a name is
-                                    // a real archive defect.
-                                    let mut samplers: Vec<&str> = many
-                                        .iter()
-                                        .map(|t| crate::table_sampler(&t.sampler))
-                                        .collect();
-                                    samplers.sort();
-                                    samplers.dedup();
-                                    if samplers.len() > 1 {
-                                        QueryError::ParseError(format!(
-                                            "query {query} references metric name(s) published \
-                                             by more than one sampler ({}), so it is ambiguous \
-                                             which is meant: {}. This is not an archive fault — \
-                                             those samplers deliberately share vendor-neutral \
-                                             names. Query one of them at a time.",
-                                            samplers.join(", "),
-                                            duplicates.join(", ")
-                                        ))
-                                    } else {
-                                        QueryError::ParseError(format!(
-                                            "query {query} references metric name(s) present in \
-                                             more than one acquisition-group table of the same \
-                                             sampler — the archive's own tables are not \
-                                             disjoint, which should never happen: {}",
-                                            duplicates.join(", ")
-                                        ))
-                                    }
-                                }
-                                UnionError::Empty => {
-                                    unreachable!("the `many` arm always has at least 2 owners")
-                                }
-                            })
-                    }
-                    _ => {
-                        // Only one case reaches here now: metrics drawn from
-                        // more than one RECORDING of a multi-recording
-                        // archive. Those are different agents, hosts or arms
-                        // on genuinely different timelines, and the widened
-                        // band does not make them comparable — unioning them
-                        // would let first-wins silently answer from one side.
-                        let mut samplers: Vec<&str> = many
-                            .iter()
-                            .map(|t| crate::table_sampler(&t.sampler))
-                            .collect();
-                        samplers.sort();
-                        samplers.dedup();
-                        Err(QueryError::ParseError(format!(
-                            "query {query} references metrics ({}) from {} different \
-                             recordings of this multi-recording .rez — cross-recording \
-                             queries are not supported; query one recording at a time \
-                             (see `ArchiveReader::open_recordings`)",
-                            samplers.join(", "),
-                            groups.len()
-                        )))
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// What `route()` resolves a query to: either a borrowed reference straight
-/// into one of `ArchiveReader`'s own tables (the common, zero-allocation case),
-/// or an owned same-timeline union built fresh for this one query.
-enum Routed<'a> {
-    Direct(&'a TableReader),
-    Union(UnionMetricsSource),
-}
-
-impl Routed<'_> {
-    fn as_dyn(&self) -> &dyn MetricsSource {
-        match self {
-            Routed::Direct(r) => r.as_dyn(),
-            Routed::Union(u) => u,
-        }
-    }
-}
-
-/// The typical spacing between consecutive rows, or `None` for fewer than two
-/// rows (no gap to measure).
-///
-/// The median, not the mean: a sampler's rows are irregular — 30 s then 60 s
-/// apart on a real recording — and a mean is dragged around by the long gaps
-/// and by any restart-sized hole in the middle of a recording. The median
-/// answers "how often does this table usually produce a row", which is the
-/// question being asked.
-fn typical_gap_ns(timestamps: &[u64]) -> Option<u64> {
-    if timestamps.len() < 2 {
-        return None;
-    }
-    let mut gaps: Vec<u64> = timestamps
-        .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]))
-        .collect();
-    gaps.sort_unstable();
-    Some(gaps[gaps.len() / 2]).filter(|g| *g > 0)
 }
 
 impl ArchiveReader {
-    /// The timestamps a query should be evaluated at, when it spans samplers of
-    /// different cadence — `None` when it does not and the uniform grid is
-    /// right.
-    ///
-    /// The grid walks `start + k·step`. A query combining a fast sampler with a
-    /// slow one therefore produces most of its points where the slow sampler
-    /// has no reading at all: that value is held forward and combined with the fast
-    /// operand as if the two were simultaneous.
-    ///
-    /// The grid cannot be tuned out of this. A slow sampler's rows are not
-    /// evenly spaced — measured on a real recording, one sampler's readings
-    /// fell 30 s apart and then 60 s apart — so no step and no phase puts a
-    /// uniform grid on them. Two earlier attempts are worth recording:
-    /// coarsening the STEP relocated the grid and made the combined band
-    /// explode (0.85% wide before, 6.7x after), and widening only the averaging
-    /// SPAN left the points on the grid, still between the slow sampler's real
-    /// readings.
-    ///
-    /// So hand the engine the slow sampler's own row timestamps. Every point then
-    /// lands where both operands genuinely have data, and each rate averages
-    /// over the gap it actually spans.
-    ///
-    /// Returns `None` unless the query really touches more than one cadence, so
-    /// single-sampler queries — the overwhelming majority — are untouched.
-    ///
-    /// Also `None` under [`RateMode::Raw`], which already answers this question
-    /// its own way: Raw places points at the real, un-snapped sample
-    /// timestamps. Relocating them would contradict that contract, and would
-    /// break the query outright — Raw's counter producer reads sample pairs
-    /// and ignores supplied points, while the gauge producers honour them, so
-    /// a counter-and-gauge expression would have its two sides land on
-    /// different instants and intersect nowhere.
-    fn cross_cadence_eval_timestamps(
-        &self,
-        query: &str,
-        step_s: f64,
-        rate_mode: RateMode,
-    ) -> Option<Arc<[u64]>> {
-        use crate::table_sampler;
-
-        if matches!(rate_mode, RateMode::Raw) {
-            return None;
-        }
-
-        let owners = self.owners(query).ok()?;
-        if owners.len() < 2 {
-            return None;
-        }
-
-        // Cadence comes from the ROWS, not from `interval()`: that reports the
-        // recording's nominal interval, which every table in an archive shares
-        // — on a real recording a 1 s sampler and a 30 s one both answered 1.0,
-        // so asking it can never detect a cadence difference. These are the
-        // instants the query path reads, nothing having rounded them.
-        //
-        // Cadence is a property of the SAMPLER, not of a table. Two group
-        // tables of one sampler are read together on one schedule; a group that
-        // dedups or skips ticks is sparse WITHIN that cadence, not a second
-        // cadence, and relocating a query onto its rows would silently change
-        // the answer for a query that merely named a sibling group's metric.
-        //
-        // So a sampler's cadence is the spacing of its DENSEST participating
-        // table — the one that shows the underlying read schedule.
-        let mut by_sampler: BTreeMap<&str, (u64, &[u64])> = BTreeMap::new();
-        for t in &owners {
-            let ts = t.row_timestamps();
-            let Some(gap) = typical_gap_ns(ts) else {
-                continue;
-            };
-            by_sampler
-                .entry(table_sampler(&t.sampler))
-                .and_modify(|slot| {
-                    if gap < slot.0 {
-                        *slot = (gap, ts);
-                    }
-                })
-                .or_insert((gap, ts));
-        }
-        if by_sampler.len() < 2 {
-            return None;
-        }
-
-        let fastest = by_sampler.values().map(|(gap, _)| *gap).min()?;
-        let (slowest, timestamps) = by_sampler.into_values().max_by_key(|(gap, _)| *gap)?;
-        // Deliberately a ratio, not equality: gaps measured from real rows are
-        // never exactly equal, so "different cadence" has to mean *materially*
-        // different. A sampler read at least twice as far apart as another is a
-        // different cadence in any sense that matters here.
-        if slowest < fastest.saturating_mul(2) {
-            return None;
-        }
-        // A slow sampler finer than the step is already oversampled by the
-        // grid; moving off it would only lose points.
-        if (slowest as f64) <= step_s * 1e9 {
-            return None;
-        }
-        Some(timestamps.into())
-    }
-}
-
-impl MetricsSource for ArchiveReader {
-    // ── Query methods: route to the sub-reader owning the referenced metrics. ──
-    fn query_range_opts(
-        &self,
-        expr: &str,
-        start_s: f64,
-        end_s: f64,
-        step_s: f64,
-        opts: &QueryOptions,
-    ) -> Result<QueryResult, QueryError> {
-        let aligned;
-        let opts = match self.cross_cadence_eval_timestamps(expr, step_s, opts.rate_mode) {
-            Some(points) => {
-                // Clone and set the one field: `QueryOptions` is
-                // `#[non_exhaustive]`, so it cannot be built by literal from
-                // here — and cloning preserves whatever else the caller set.
-                aligned = opts.clone().with_eval_timestamps(Some(points));
-                &aligned
-            }
-            None => opts,
-        };
-        self.route(expr)?
-            .as_dyn()
-            .query_range_opts(expr, start_s, end_s, step_s, opts)
-    }
-    /// Routed as [`query_range_opts`](Self::query_range_opts) is, with the
-    /// same evaluation timestamps.
-    fn query_range_display_opts(
-        &self,
-        expr: &str,
-        start_s: f64,
-        end_s: f64,
-        step_s: f64,
-        opts: &metriken_query::DisplayOptions,
-        qopts: &QueryOptions,
-    ) -> Result<metriken_query::DisplayResult, QueryError> {
-        let aligned;
-        let qopts = match self.cross_cadence_eval_timestamps(expr, step_s, qopts.rate_mode) {
-            Some(points) => {
-                aligned = qopts.clone().with_eval_timestamps(Some(points));
-                &aligned
-            }
-            None => qopts,
-        };
-        self.route(expr)?
-            .as_dyn()
-            .query_range_display_opts(expr, start_s, end_s, step_s, opts, qopts)
-    }
-    fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        self.route(expr)?.as_dyn().query(expr, time)
-    }
-    fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
-        // columns() is answerable as the union — it never crosses timelines.
-        let mut out = HashSet::new();
-        for t in self.owners(query)? {
-            let Some(r) = t.reader() else {
-                continue;
-            };
-            out.extend(r.as_dyn().columns(query)?);
-        }
-        Ok(out)
+    /// The tables holding any of `metrics`, under any kind. Label matchers
+    /// are not consulted: a table holding the metric with no matching
+    /// series answers with an empty result.
+    pub fn owners_of(&self, metrics: &[String]) -> Vec<&SamplerReader> {
+        self.tables
+            .iter()
+            .map(|t| &**t)
+            .filter(|t| metrics.iter().any(|m| t.names.holds(m)))
+            .collect()
     }
 
-    // ── Union metadata / naming / labels ──
-    fn counter_names(&self) -> Vec<String> {
+    /// Counter names across every table, sorted and deduplicated.
+    pub fn counter_names(&self) -> Vec<String> {
         union_sorted(
             self.tables
                 .iter()
                 .map(|t| t.names.counters.iter().cloned().collect()),
         )
     }
-    fn gauge_names(&self) -> Vec<String> {
+
+    /// Gauge names across every table, sorted and deduplicated.
+    pub fn gauge_names(&self) -> Vec<String> {
         union_sorted(
             self.tables
                 .iter()
                 .map(|t| t.names.gauges.iter().cloned().collect()),
         )
     }
-    fn histogram_names(&self) -> Vec<String> {
+
+    /// Histogram names across every table, sorted and deduplicated.
+    pub fn histogram_names(&self) -> Vec<String> {
         union_sorted(
             self.tables
                 .iter()
                 .map(|t| t.names.histograms.iter().cloned().collect()),
         )
     }
-    fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+
+    /// The label sets of counter `name`, from every table holding it.
+    pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.tables
             .iter()
             .filter(|t| t.names.counters.contains(name))
             .filter_map(|t| t.reader())
-            .flat_map(|r| r.as_dyn().counter_labels(name))
+            .flat_map(|r| r.source().counter_labels(name))
             .collect()
     }
-    fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+
+    /// The label sets of gauge `name`, from every table holding it.
+    pub fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.tables
             .iter()
             .filter(|t| t.names.gauges.contains(name))
             .filter_map(|t| t.reader())
-            .flat_map(|r| r.as_dyn().gauge_labels(name))
+            .flat_map(|r| r.source().gauge_labels(name))
             .collect()
     }
-    fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+
+    /// The label sets of histogram `name`, from every table holding it.
+    pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.tables
             .iter()
             .filter(|t| t.names.histograms.contains(name))
             .filter_map(|t| t.reader())
-            .flat_map(|r| r.as_dyn().histogram_labels(name))
+            .flat_map(|r| r.source().histogram_labels(name))
             .collect()
     }
 
-    // ── Time / interval: union extent, finest interval ──
-    fn time_range(&self) -> Option<(f64, f64)> {
-        // Seconds view of the same probed spans — see `time_range_ns`.
-        self.time_range_ns()
-            .map(|(b, e)| (b as f64 / 1e9, e as f64 / 1e9))
-    }
-    fn time_range_ns(&self) -> Option<(u64, u64)> {
-        // From the probed spans, not the readers: this is asked before any
-        // query runs, and answering it through `reader()` would open every
-        // table and undo the lazy build.
+    /// The union of the tables' probed spans, in nanoseconds. From the
+    /// probe, not the readers: this is asked before any query runs, and
+    /// opening every table to answer it would undo the lazy build.
+    pub fn time_range_ns(&self) -> Option<(u64, u64)> {
         self.tables
             .iter()
             .filter_map(|t| t.span)
             .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
     }
-    fn interval(&self) -> f64 {
-        // Probed per table, not read through `reader()` — see `span`. The
-        // finest cadence still wins; only where the number comes from changed.
+
+    /// The finest probed table interval in seconds, or 1.0 when no table
+    /// has one.
+    pub fn interval(&self) -> f64 {
         let finest = self
             .tables
             .iter()
@@ -1932,24 +1536,14 @@ impl MetricsSource for ArchiveReader {
         }
     }
 
-    // ── File-level metadata from the recording manifest ──
-    fn source(&self) -> String {
-        self.metadata.get("source").cloned().unwrap_or_default()
+    /// The (first) recording's file-level metadata.
+    pub fn metadata(&self) -> &BTreeMap<String, String> {
+        &self.metadata
     }
-    fn version(&self) -> String {
-        self.metadata.get("version").cloned().unwrap_or_default()
-    }
-    fn filename(&self) -> Option<String> {
+
+    /// The archive's display name, when it has one.
+    pub fn filename(&self) -> Option<String> {
         self.filename.clone()
-    }
-    fn metadata_get(&self, key: &str) -> Option<String> {
-        self.metadata.get(key).cloned()
-    }
-    fn file_metadata(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
     }
 }
 
@@ -1979,25 +1573,5 @@ mod tests {
             .map(|o| (o.occupant, o.labels["comm"].as_str()))
             .collect();
         assert_eq!(got, vec![(5, "a"), (3, "b")]);
-    }
-
-    /// The typical gap is the MEDIAN, so one long hole (a restart, a missed
-    /// poll) does not masquerade as the table's cadence. Moved from rezolus.
-    #[test]
-    fn typical_gap_is_robust_to_a_single_long_hole() {
-        const S: u64 = 1_000_000_000;
-        let steady: Vec<u64> = (0..10).map(|i| i * S).collect();
-        assert_eq!(typical_gap_ns(&steady), Some(S));
-
-        let mut holed = steady.clone();
-        holed.extend((0..10).map(|i| 110 * S + i * S));
-        assert_eq!(
-            typical_gap_ns(&holed),
-            Some(S),
-            "a mean would be dragged upward by the hole; the median must not be"
-        );
-
-        assert_eq!(typical_gap_ns(&[]), None);
-        assert_eq!(typical_gap_ns(&[42]), None);
     }
 }
