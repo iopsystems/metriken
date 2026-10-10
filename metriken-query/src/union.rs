@@ -65,15 +65,22 @@ use crate::{DataSource, MetricsSource, QueryOptions};
 /// original reader stays usable on its own after contributing to a union.
 pub struct UnionChild(Arc<dyn DataSource>);
 
+impl UnionChild {
+    /// A child over `source`.
+    pub(crate) fn from_source(source: Arc<dyn DataSource>) -> Self {
+        UnionChild(source)
+    }
+}
+
 impl From<&ParquetReader> for UnionChild {
     fn from(reader: &ParquetReader) -> Self {
-        UnionChild(reader.data_source())
+        UnionChild::from_source(reader.data_source())
     }
 }
 
 impl From<&SegmentedParquetReader> for UnionChild {
     fn from(reader: &SegmentedParquetReader) -> Self {
-        UnionChild(reader.data_source())
+        UnionChild::from_source(reader.data_source())
     }
 }
 
@@ -82,7 +89,7 @@ impl From<&SegmentedParquetReader> for UnionChild {
 /// tables read straight from parquet.
 impl From<&crate::MemoryStore> for UnionChild {
     fn from(store: &crate::MemoryStore) -> Self {
-        UnionChild(store.data_source())
+        UnionChild::from_source(store.data_source())
     }
 }
 
@@ -121,7 +128,30 @@ struct UnionSource {
 }
 
 impl UnionSource {
-    fn new(children: Vec<Arc<dyn DataSource>>) -> Self {
+    /// A union over `children`, trusting the caller's partitioning; see
+    /// [`UnionMetricsSource::new`].
+    pub(crate) fn new(children: Vec<UnionChild>) -> Self {
+        Self::from_sources(children.into_iter().map(|c| c.0).collect())
+    }
+
+    /// A union over `children`, rejecting empty input or a metric name
+    /// (within one kind) present in more than one child; see
+    /// [`UnionMetricsSource::try_new`].
+    pub(crate) fn try_new(children: Vec<UnionChild>) -> Result<Self, UnionError> {
+        if children.is_empty() {
+            return Err(UnionError::Empty);
+        }
+        let raw: Vec<Arc<dyn DataSource>> = children.into_iter().map(|c| c.0).collect();
+        let duplicates = duplicate_names(&raw);
+        if !duplicates.is_empty() {
+            return Err(UnionError::NonDisjoint {
+                duplicates: duplicates.into_iter().collect(),
+            });
+        }
+        Ok(Self::from_sources(raw))
+    }
+
+    fn from_sources(children: Vec<Arc<dyn DataSource>>) -> Self {
         debug_assert!(
             !children.is_empty(),
             "UnionSource requires at least one child — an empty union has no \
@@ -372,7 +402,7 @@ impl UnionMetricsSource {
     /// bytes) rather than chosen by code that can vouch for disjointness
     /// directly.
     pub fn new(children: Vec<UnionChild>) -> Self {
-        let source = UnionSource::new(children.into_iter().map(|c| c.0).collect());
+        let source = UnionSource::new(children);
         Self {
             engine: QueryEngine::new(Arc::new(source)),
         }
@@ -382,17 +412,7 @@ impl UnionMetricsSource {
     /// building a union that would silently drop series: empty input, or
     /// any metric name (within one kind) present in more than one child.
     pub fn try_new(children: Vec<UnionChild>) -> Result<Self, UnionError> {
-        if children.is_empty() {
-            return Err(UnionError::Empty);
-        }
-        let raw: Vec<Arc<dyn DataSource>> = children.into_iter().map(|c| c.0).collect();
-        let duplicates = duplicate_names(&raw);
-        if !duplicates.is_empty() {
-            return Err(UnionError::NonDisjoint {
-                duplicates: duplicates.into_iter().collect(),
-            });
-        }
-        let source = UnionSource::new(raw);
+        let source = UnionSource::try_new(children)?;
         Ok(Self {
             engine: QueryEngine::new(Arc::new(source)),
         })

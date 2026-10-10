@@ -415,15 +415,22 @@ impl MetricsSource for ParquetReader {
 /// reader stays usable after contributing to a composition.
 pub struct CompositionSource(pub(crate) Arc<dyn DataSource>);
 
+impl CompositionSource {
+    /// A composition entry over `source`.
+    pub(crate) fn from_source(source: Arc<dyn DataSource>) -> Self {
+        CompositionSource(source)
+    }
+}
+
 impl From<&ParquetReader> for CompositionSource {
     fn from(reader: &ParquetReader) -> Self {
-        CompositionSource(reader.data_source())
+        CompositionSource::from_source(reader.data_source())
     }
 }
 
 impl From<&crate::SegmentedParquetReader> for CompositionSource {
     fn from(reader: &crate::SegmentedParquetReader) -> Self {
-        CompositionSource(reader.data_source())
+        CompositionSource::from_source(reader.data_source())
     }
 }
 
@@ -431,7 +438,7 @@ impl From<&crate::SegmentedParquetReader> for CompositionSource {
 /// [`crate::UnionChild`] takes one.
 impl From<&crate::MemoryStore> for CompositionSource {
     fn from(store: &crate::MemoryStore) -> Self {
-        CompositionSource(store.data_source())
+        CompositionSource::from_source(store.data_source())
     }
 }
 
