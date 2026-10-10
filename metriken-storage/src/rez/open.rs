@@ -176,7 +176,7 @@ fn read_v3_recordings(path: &Path) -> Result<Vec<RecordingBytes>, Box<dyn std::e
 /// duplicates. The prune runs outside the seal transaction, so `wal` routinely
 /// still holds rows a sealed segment already covers; replaying the raw table
 /// would splice those rows in a second time.
-fn table_segments(
+pub fn table_segments(
     db: &RezDb,
     recording_id: i64,
     sampler: &str,
