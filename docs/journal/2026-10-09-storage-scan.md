@@ -310,6 +310,52 @@ Steps 2 to 6 move about 15,000 lines of `metriken-query` and the 5,000 of
 and test moves above; that size follows from the crate boundaries the plan
 chose.
 
+## As built (through step 4)
+
+Branch `refactor/metriken-storage` on the step 1 branch (#249). The order
+above changed where the crate graph forced it:
+
+- `metriken-storage` started as `metriken-segment` renamed, not as
+  `metriken-archive`. `metriken-query` depends on `metriken-segment` and
+  `metriken-archive` depends on `metriken-query`, so the segment tables could
+  not move into the archive crate before the archive stopped depending on the
+  engine. The archive moved in last.
+- The row cost meters (`group_approx_bytes`, the WAL row meters and the slot
+  sizes) moved to `metriken-model` first: `metriken-exposition` took them from
+  `metriken-segment`, which would have been a cycle once storage's writer
+  depended on exposition.
+- The writer (`write`) depends on `metriken-model`, not `metriken-exposition`
+  and `metriken`; it only used the model types exposition re-exported.
+  `stream` (`FrameProducer`) still depends on both and moves to exposition
+  with the stream route (path step 3).
+- `MsgpackToParquet` stays in `metriken-exposition` for this release. While
+  storage's `stream` depends on exposition, exposition cannot depend on
+  storage to re-export it. It moves with path step 3.
+- The decode and re-encode round trip in `StreamDecoder` stays: removing it
+  changes the public `StreamedGroup`, which rezolus's recorder matches on, for
+  a recorder CPU saving not yet measured.
+- `fixtures` stays in `metriken-query`; it only builds parquet files, and the
+  query tests and benches use it.
+- `metriken-query`'s `ingest` reads `metriken-model`, so `metriken-query`
+  depends on the `metriken` registry under no feature.
+- Unit tests that open a wrapper or query through the engine are in
+  `metriken-query`'s modules; tests of storage internals alone are in
+  `metriken-storage`. `metriken-storage` has a path-only dev-dependency on
+  `metriken-query` for its integration tests (the archive's), which link the
+  same `metriken-storage` as `metriken-query` does; a unit test would not.
+- `metriken-segment` 0.2.0, like `metriken-archive` 0.4.0, re-exports
+  `metriken-storage`.
+
+rezolus main with `metriken-archive` 0.4 and `metriken-segment` 0.2 builds
+against the branch and passes its tests after changing the four
+`eval_timestamps_for` calls to the free function.
+
+The step 1 memory saving on the long table (about 45 MB) is not stable across
+builds: six runs each put step 1 at 333 to 361 MB, two later builds whose
+changes do not touch the query path at 387 to 413 MB, and another at 356 to
+358 MB. I don't know the cause; allocation layout is my guess, unverified.
+Every build is within the gate's 0.34.7 range (382 to 409 MB).
+
 ## GO / NO-GO
 
 The archives are under `~/rezolus-bench` on the author's host. They derive
