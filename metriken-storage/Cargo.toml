@@ -48,9 +48,8 @@ ingest = []
 # conversion. Off by default: `metriken` pulls in the registry, which does not
 # build for wasm32.
 metriken = ["dep:metriken"]
-# The archive writer. Off, this crate is a reader that builds for wasm32:
-# metriken-exposition depends on the registry, which does not.
-write = ["dendro/write", "dep:metriken-exposition", "dep:metriken"]
+# The archive writer, over dendro's. Off, this crate is a reader.
+write = ["dendro/write"]
 # A producer's groups as dendro replication frames (`stream::FrameProducer`).
 # Separate from `write`: a producer serving a stream needs neither the
 # archive writer nor dendro's.

@@ -32,7 +32,7 @@ use crate::wal::{self, LongOccupant, WalLongRow};
 use dendro::archive::{SourceMeta, WalRow as DWalRow};
 use dendro::seal::{SealPolicy, SegmentAccount};
 use dendro::writer::{SourceWriter, Writer};
-use metriken_exposition::{GroupSnapshot, Snapshot};
+use metriken_model::{GroupSnapshot, Snapshot};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -122,7 +122,7 @@ pub enum StreamedGroup {
 /// [`WalGroupRow`]: crate::wal::WalGroupRow
 #[derive(Default)]
 pub struct StreamDecoder {
-    schemas: HashMap<String, ((u64, u64), Arc<metriken_exposition::GroupSchema>)>,
+    schemas: HashMap<String, ((u64, u64), Arc<metriken_model::GroupSchema>)>,
     /// Group rows skipped because their schema was never sent. Long rows
     /// are checked by the writer ([`SourceRecorder::stage_streamed`]), not
     /// counted here.
@@ -162,10 +162,7 @@ impl StreamDecoder {
             }
             let decoded =
                 wal::decode_wal_group_row(&row.row).map_err(|e| format!("stream {stream}: {e}"))?;
-            let arrived = decoded
-                .schema
-                .as_ref()
-                .map(|s| Arc::new(exposition_schema(s)));
+            let arrived = decoded.schema.as_ref().map(|s| Arc::new(s.clone()));
             if let Some(schema) = &arrived {
                 self.schemas
                     .insert(stream.clone(), (decoded.schema_hash, Arc::clone(schema)));
@@ -192,7 +189,9 @@ impl StreamDecoder {
                 name: stream,
                 schema_hash: decoded.schema_hash,
                 schema: arrived,
-                window: decoded.window.map(|(b, e)| metriken::Window::new(b, e)),
+                window: decoded
+                    .window
+                    .map(|(b, e)| metriken_types::Window::new(b, e)),
                 counters: decoded.counters,
                 gauges: decoded.gauges,
                 histograms,
@@ -230,24 +229,6 @@ fn row_form(payload: &[u8]) -> Option<RowForm> {
 
 const GROUP_ROW_FIELDS: usize = 6;
 const LONG_ROW_FIELDS: usize = 4;
-
-/// A segment-format schema as metriken-exposition's, which a
-/// [`GroupSnapshot`] carries.
-fn exposition_schema(s: &GroupSchema) -> metriken_exposition::GroupSchema {
-    let convert = |list: &[MetricDesc]| {
-        list.iter()
-            .map(|d| metriken_exposition::MetricDesc {
-                name: d.name.clone(),
-                metadata: d.metadata.clone(),
-            })
-            .collect()
-    };
-    metriken_exposition::GroupSchema {
-        counters: convert(&s.counters),
-        gauges: convert(&s.gauges),
-        histograms: convert(&s.histograms),
-    }
-}
 
 impl ArchiveWriter {
     /// Create a new archive at `path`.
@@ -415,7 +396,7 @@ impl Layout {
 
 /// Whether a group with this schema is written long: any member carries a
 /// slot `id`.
-fn slotted(schema: &metriken_exposition::GroupSchema) -> bool {
+fn slotted(schema: &metriken_model::GroupSchema) -> bool {
     schema
         .counters
         .iter()
@@ -428,10 +409,10 @@ impl LongLayout {
     /// Lay a slotted group's schema out over its long columns, adding any
     /// column it is the first to need. A member without an `id` is the
     /// occupant of slot `""`.
-    fn of(schema: &metriken_exposition::GroupSchema, cols: &mut LongColumns) -> Self {
-        type Desc = metriken_exposition::MetricDesc;
+    fn of(schema: &metriken_model::GroupSchema, cols: &mut LongColumns) -> Self {
+        type Desc = metriken_model::MetricDesc;
         let kinds: [&Vec<Desc>; 3] = [&schema.counters, &schema.gauges, &schema.histograms];
-        fn slot_of(d: &metriken_exposition::MetricDesc) -> &str {
+        fn slot_of(d: &metriken_model::MetricDesc) -> &str {
             d.metadata.get("id").map(String::as_str).unwrap_or("")
         }
 
@@ -962,9 +943,9 @@ impl SourceRecorder {
     /// segment. The `.rez` v3 writer's rule, so the two tables match.
     fn stage_flat(
         &mut self,
-        counters: &[metriken_exposition::Counter],
-        gauges: &[metriken_exposition::Gauge],
-        histograms: &[metriken_exposition::Histogram],
+        counters: &[metriken_model::Counter],
+        gauges: &[metriken_model::Gauge],
+        histograms: &[metriken_model::Histogram],
         ts: u64,
         wall_offset: i64,
         rows: &mut Vec<DWalRow>,
@@ -1129,9 +1110,11 @@ impl SourceRecorder {
         match layout.as_ref() {
             Layout::Wide(schema) => {
                 let anchor = state.anchored.insert(g.schema_hash);
-                let row =
-                    metriken_exposition::wal_group_row(g, anchor.then(|| schema.as_ref().clone()));
-                let bytes = metriken_exposition::group_approx_bytes(g);
+                let row = metriken_model::convert::wal_group_row(
+                    g,
+                    anchor.then(|| schema.as_ref().clone()),
+                );
+                let bytes = metriken_model::cost::group_approx_bytes(g);
                 rows.push(DWalRow {
                     stream: g.name.clone(),
                     ts: ts as i64,
