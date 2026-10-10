@@ -1,6 +1,7 @@
 # The storage scan: metriken-storage and metriken-query split
 
-**Status:** OPEN. Design 2026-10-09, nothing built. This is path step 2 of
+**Status:** OPEN. Design 2026-10-09; step 1 merged (#249); steps 2 and 3 built
+on `refactor/metriken-storage` ("As built"). This is path step 2 of
 [one recording stack](2026-10-08-one-recording-stack.md). "Step N below"
 means this entry's own order of work. Decided 2026-10-09:
 
@@ -109,10 +110,9 @@ public constructors and accessors in storage:
 - `UnionSource::new`, for `UnionMetricsSource::new` (`src/union.rs:369`).
 
 A unit test in a moving module that opens a wrapper or calls `MetricsSource`
-stays in query, in `metriken-query/tests`: about 6,000 lines, most of them
-`segmented.rs`'s 3,290 (also `long.rs`, `parquet.rs`, `memory_store.rs`,
-`union.rs`, `lazy.rs`, and the `fixtures` tests in `fixtures/synthetic.rs`
-and `fixtures/augment.rs`).
+stays in query: about 6,000 lines, most of them `segmented.rs`'s 3,290 (also
+`long.rs`, `parquet.rs`, `memory_store.rs`, `union.rs` and `lazy.rs`). Where
+they went is under "As built".
 
 The modules `long`, `buffer_pool`, `types`, `histogram_stream`, `labels`,
 `lazy`, `memory` and `util` move to storage, with the source halves of
@@ -126,13 +126,12 @@ these public items at their current paths for one release:
 - the relabel: `ColumnRelabel`, `Run`, and the module `long`;
 - data types and label functions: `Labels`, `is_internal_label`,
   `is_storage_key`, `STORAGE_KEYS`, `CounterSample`, `CounterStream`,
-  `HistogramSnapshot`, `ColumnChunk`, `CounterColumnRef`, `ColumnPosition`;
-- `fixtures` (feature `fixtures`), which builds parquet files.
+  `HistogramSnapshot`, `ColumnChunk`, `CounterColumnRef`, `ColumnPosition`.
 
-`metriken-query`'s `ingest`, `lz4` and `fixtures` features forward to storage's
-for one release. `ingest` gates
-`MemoryStore`'s snapshot loading, which reads `metriken-model` types and moves
-with the in-memory source.
+`metriken-query`'s `ingest` and `lz4` features forward to storage's. `ingest`
+gates `MemoryStore::ingest_snapshot`, which stays in query and reads
+`metriken-model`; storage's `ingest` gates the `Memory` upsert methods it
+calls.
 
 `metriken-archive` is renamed `metriken-storage` (step 2 below). A new
 `metriken-archive` 0.4.0 re-exports `metriken-storage`, forwarding its
@@ -264,8 +263,9 @@ These follow from the crate boundary, and the re-exports do not cover them:
   in query, `metriken_query::eval_timestamps_for(&ArchiveReader, ..)`.
   rezolus calls it through `RezReader`'s `Deref` four times in two tests
   (`crates/rez/src/reader.rs`).
-- Every `metriken_archive::` import becomes `metriken_storage::`, through
-  `metriken-archive` 0.4.0 in the meantime.
+- Every `metriken_archive::` and `metriken_segment::` import becomes
+  `metriken_storage::`, through `metriken-archive` 0.4.0 and
+  `metriken-segment` 0.2.0 in the meantime.
 
 ### Left alone
 
@@ -282,10 +282,12 @@ algorithm:
 
 ## Order of work
 
-All of it is one release of `metriken-storage` 0.1.0, `metriken-query`
-0.35.0 and `metriken-archive` 0.4.0; nothing is published before the last
-PR. rezolus builds and tests each step through a `[patch.crates-io]` git pin
-on the branch.
+All of it is one release; nothing is published before the last PR. The
+release is `metriken-storage` 0.1.0, `metriken-query` 0.35.0,
+`metriken-archive` 0.4.0 and `metriken-segment` 0.2.0 (both re-exports),
+`metriken-model` 0.1.1 (the cost meters) and `metriken-exposition` 0.21.6 (no
+longer depends on `metriken-segment`). rezolus builds and tests each step
+against the branch through `[patch.crates-io]`.
 
 1. The scan inside `metriken-query`: define `CounterScan` and `ScanChunk`,
    implement it for `SegmentedSource` and `UnionSource`, and rewrite
@@ -298,22 +300,25 @@ on the branch.
    moved in.
 3. The `DataSource` halves and the modules under "What moves" moved to
    storage; `ArchiveReader`'s `MetricsSource` implementation and routing in
-   query; the re-exports. `display_peak.rs` moves to `metriken-query/tests`.
-4. `MsgpackToParquet` from `metriken-exposition`.
-5. rezolus's `crates/rez` as feature `rez`, without `caller_rows`.
-6. Writers take model rows (`StreamDecoder` stops decoding and re-encoding).
-7. The gate again on the result; the new `metriken-archive` crate; the
-   release.
+   query; the re-exports.
+4. `MsgpackToParquet` from `metriken-exposition`. Moved to path step 3 (see
+   "As built").
+5. rezolus's `crates/rez` as feature `rez`, without `caller_rows`. Not
+   started; whether the `.rez` writers move with the reader is open.
+6. Writers take model rows. The writer's dependency is done; the
+   `StreamDecoder` round trip is deferred (see "As built").
+7. The gate again on the result, then the release.
 
 Steps 2 to 6 move about 15,000 lines of `metriken-query` and the 5,000 of
 `metriken-archive`, mostly without changing them apart from the visibility
 and test moves above; that size follows from the crate boundaries the plan
 chose.
 
-## As built (through step 4)
+## As built (through step 3)
 
-Branch `refactor/metriken-storage` on the step 1 branch (#249). The order
-above changed where the crate graph forced it:
+Branch `refactor/metriken-storage` on step 1 (#249). The order above changed
+as follows. The first four changes were forced by the crate graph; keeping
+`StreamDecoder`'s round trip and keeping `fixtures` in query were choices.
 
 - `metriken-storage` started as `metriken-segment` renamed, not as
   `metriken-archive`. `metriken-query` depends on `metriken-segment` and
@@ -321,9 +326,9 @@ above changed where the crate graph forced it:
   not move into the archive crate before the archive stopped depending on the
   engine. The archive moved in last.
 - The row cost meters (`group_approx_bytes`, the WAL row meters and the slot
-  sizes) moved to `metriken-model` first: `metriken-exposition` took them from
-  `metriken-segment`, which would have been a cycle once storage's writer
-  depended on exposition.
+  sizes) moved to `metriken-model` first: `metriken-exposition` defined
+  `group_approx_bytes` and depended on `metriken-segment` for the rest, which
+  would have been a cycle once storage's writer depended on exposition.
 - The writer (`write`) depends on `metriken-model`, not `metriken-exposition`
   and `metriken`; it only used the model types exposition re-exported.
   `stream` (`FrameProducer`) still depends on both and moves to exposition
@@ -343,6 +348,8 @@ above changed where the crate graph forced it:
   `metriken-storage`. `metriken-storage` has a path-only dev-dependency on
   `metriken-query` for its integration tests (the archive's), which link the
   same `metriken-storage` as `metriken-query` does; a unit test would not.
+  `display_peak.rs` and `long_rewrite.rs` are among them, in
+  `metriken-storage/tests`.
 - `metriken-segment` 0.2.0, like `metriken-archive` 0.4.0, re-exports
   `metriken-storage`.
 
@@ -351,10 +358,13 @@ against the branch and passes its tests after changing the four
 `eval_timestamps_for` calls to the free function.
 
 The step 1 memory saving on the long table (about 45 MB) is not stable across
-builds: six runs each put step 1 at 333 to 361 MB, two later builds whose
-changes do not touch the query path at 387 to 413 MB, and another at 356 to
-358 MB. I don't know the cause; allocation layout is my guess, unverified.
-Every build is within the gate's 0.34.7 range (382 to 409 MB).
+builds. In one session, six runs of each build put step 1 at 333 to 361 MB,
+two later builds whose changes do not touch the query path at 387 to 413 MB,
+and another at 356 to 358 MB; only two sets of step 1's runs are saved
+(`ab-scan-1.txt`, `ab-scan-2.txt`). I don't know the cause; allocation layout
+is my guess, unverified. Under the gate's rule every build passes on this
+measure: each range overlaps 0.34.7's (384 to 405 MB on 2026-10-09; 382 to
+409 MB across all fifteen 0.34.7 runs).
 
 ## GO / NO-GO
 
@@ -388,12 +398,16 @@ less request start as Playwright reports them, and the peak footprint of the
 The candidate and `metriken-query` 0.34.7 run alternately on the same host,
 five runs each, on every query and the dashboard load. Every query must return
 a bit-identical `DisplayResult` (serialized and compared) where 0.34.7's own
-result is repeatable. Where it is not, the candidate's numbers may differ from
-0.34.7's by no more than 0.34.7's differ between its own runs. A grouped
-query over a wide table is such a case: a segment's planned columns are
-iterated from a `HashMap`, so the order a group sums its series changes
-between processes. On `wide.dendro`, three 0.34.7 runs differed from each
-other in about 960 of 358,169 numbers, by at most 9.7e-16 relative.
+result is repeatable, and where it is not, each number within 1e-14 relative
+of 0.34.7's (about 45 units in the last place). Whether 0.34.7 is repeatable
+on a query is decided by saving its result from two of its runs and comparing
+them. A grouped query over a wide table is not: a segment's planned columns
+are iterated from a `HashMap`, so the order a group sums its series changes
+between processes. On `wide.dendro`, three 0.34.7 runs differed pairwise in
+953 to 968 of 358,169 numbers, by at most 1.08e-15 relative; step 1 and the
+storage branch against 0.34.7 measured 8.2e-16 to 1.16e-15. The bound is
+about ten times those, so it fails a change in what is summed, not a change
+in summation order.
 
 The measures are each query's time and peak footprint, and the dashboard's wall
 time, summed `query_range` time and peak footprint. A measure fails when the
