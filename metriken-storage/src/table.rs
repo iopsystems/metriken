@@ -311,7 +311,7 @@ fn u64_col(a: &ArrayRef) -> &UInt64Array {
 /// The production read path decodes most tables lazily via metriken-query's
 /// `ParquetReader` (`read_archive_bytes` → `RezReader`). This eager decoder
 /// was written to verify the write path independently, and is now also the
-/// decoder behind [`crate::indexed`]: a table whose slots are described by
+/// decoder behind rezolus's `indexed` module: a table whose slots are described by
 /// the identity index is split by occupant before the query engine sees it,
 /// and that split needs every row in hand rather than a footer.
 pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Error> {

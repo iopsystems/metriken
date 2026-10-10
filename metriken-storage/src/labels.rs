@@ -67,9 +67,7 @@ impl Labels {
     ///
     /// The one place metadata becomes labels, for both loaders, so they
     /// cannot disagree about which keys are labels.
-    pub(crate) fn from_metadata<'a, K, V>(
-        metadata: impl IntoIterator<Item = (&'a K, &'a V)>,
-    ) -> Self
+    pub fn from_metadata<'a, K, V>(metadata: impl IntoIterator<Item = (&'a K, &'a V)>) -> Self
     where
         K: AsRef<str> + 'a,
         V: AsRef<str> + 'a,

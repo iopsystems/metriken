@@ -1,0 +1,3274 @@
+// Several nested `Result<Result<…>, _>` types arise naturally from
+// `catch_unwind` wrapping fallible decode functions; flattening them through
+// type aliases is more confusing than the inline form.
+#![allow(clippy::type_complexity)]
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs::File;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
+
+use arrow::array::{Int64Array, ListArray, UInt64Array};
+use arrow::datatypes::DataType;
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
+use parquet::arrow::ProjectionMask;
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::statistics::Statistics;
+
+use crate::buffer_pool::{content_source_id, next_source_id, BufferPool, CacheKey};
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::labels::Labels;
+
+use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
+use crate::DataSource;
+
+/// An already-open source handed to `metriken_query::ParquetBuilder::source_labeled`.
+///
+/// Opaque on purpose. The underlying [`DataSource`] trait returns the crate's
+/// internal row representations (`Counters`, `Gauges`, `HistogramStream`), so
+/// exposing the trait itself would make all of those public API and bind them
+/// to semver. This wrapper keeps composition open to callers while leaving the
+/// row types internal -- the same trade [`crate::UnionChild`] makes.
+///
+/// Built via `From<&ParquetReader>` / `From<&SegmentedParquetReader>`, which
+/// borrow (an `Arc` clone underneath) rather than consume, so the original
+/// reader stays usable after contributing to a composition.
+pub struct CompositionSource(pub Arc<dyn DataSource>);
+
+impl CompositionSource {
+    /// A composition entry over `source`.
+    pub fn from_source(source: Arc<dyn DataSource>) -> Self {
+        CompositionSource(source)
+    }
+}
+
+// ─── Multi-file source ────────────────────────────────────────────────────────
+
+/// Several sources presented as one, each contributing its series under its
+/// own injected labels.
+///
+/// Children are `Arc<dyn DataSource>`, not `Arc<ParquetSource>`: a `.rez`
+/// table is a segmented source whenever its writer sealed more than once, and
+/// composing those alongside plain files is what a job-spanning query needs.
+pub struct MultiParquetSource {
+    pub files: Vec<(Arc<dyn DataSource>, Labels)>,
+}
+
+/// Given a file's injected `extra` labels and the query `filter`:
+/// - Returns `None` if `extra` contains a key from `filter` whose value
+///   doesn't satisfy the filter constraint (skip this file entirely).
+/// - Returns the filter with `extra`'s keys removed (since parquet columns
+///   don't carry injected labels; the filter for those keys is already satisfied).
+fn resolve_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
+    if extra.inner.is_empty() {
+        return Some(filter.clone());
+    }
+    // Build a sub-filter containing only keys present in extra.
+    let extra_constrained = Labels {
+        inner: filter
+            .inner
+            .iter()
+            .filter(|(k, _)| extra.inner.contains_key(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    // Check whether extra's values satisfy those constraints.
+    if !extra.matches(&extra_constrained) {
+        return None;
+    }
+    // Return filter with extra's keys stripped (parquet doesn't have them).
+    Some(Labels {
+        inner: filter
+            .inner
+            .iter()
+            .filter(|(k, _)| !extra.inner.contains_key(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    })
+}
+
+impl DataSource for MultiParquetSource {
+    // NOTE: Counter series are naively concatenated across files.
+    // Same (metric, label) pairs in multiple files produce duplicate series.
+    // Label injection via file_labeled() enables filtering on injected keys.
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Counters> {
+        let series: Vec<Counter> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let counters = pf.counters(name, &pq_filter, start_ns, end_ns)?;
+                Some((counters.series, extra.clone()))
+            })
+            .flat_map(|(series, extra)| {
+                series.into_iter().map(move |mut c| {
+                    for (k, v) in &extra.inner {
+                        debug_assert!(
+                            !c.labels.inner.contains_key(k),
+                            "injected label key '{}' conflicts with native parquet label",
+                            k
+                        );
+                        c.labels.inner.insert(k.clone(), v.clone());
+                    }
+                    c
+                })
+            })
+            .collect();
+        if series.is_empty() {
+            None
+        } else {
+            Some(Counters { series })
+        }
+    }
+
+    /// Each child's streams under its injected labels, concatenated the way
+    /// `counters` concatenates series. Without this a composed reader fell to
+    /// the trait default and materialized every child's every series through
+    /// `counters` before a rate could start — the whole table again, which
+    /// the segmented reader's streams exist to avoid.
+    fn counter_streams<'s>(
+        &'s self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<crate::CounterStream<'s>>> {
+        let mut out: Vec<crate::CounterStream<'s>> = Vec::new();
+        for (pf, extra) in &self.files {
+            let Some(pq_filter) = resolve_filter(extra, filter) else {
+                continue;
+            };
+            let Some(streams) = pf.counter_streams(name, &pq_filter, start_ns, end_ns) else {
+                continue;
+            };
+            for mut stream in streams {
+                for (k, v) in &extra.inner {
+                    debug_assert!(
+                        !stream.labels.inner.contains_key(k),
+                        "injected label key '{}' conflicts with native parquet label",
+                        k
+                    );
+                    stream.labels.inner.insert(k.clone(), v.clone());
+                }
+                out.push(stream);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        let series: Vec<Gauge> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let gauges = pf.gauges(name, &pq_filter, start_ns, end_ns)?;
+                Some((gauges.series, extra.clone()))
+            })
+            .flat_map(|(series, extra)| {
+                series.into_iter().map(move |mut g| {
+                    for (k, v) in &extra.inner {
+                        debug_assert!(
+                            !g.labels.inner.contains_key(k),
+                            "injected label key '{}' conflicts with native parquet label",
+                            k
+                        );
+                        g.labels.inner.insert(k.clone(), v.clone());
+                    }
+                    g
+                })
+            })
+            .collect();
+        if series.is_empty() {
+            None
+        } else {
+            Some(Gauges { series })
+        }
+    }
+
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let streams: Vec<HistogramStream> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let mut stream = pf.histogram_stream(name, &pq_filter, start_ns, end_ns)?;
+                if !extra.inner.is_empty() {
+                    for series_labels in &mut stream.meta.series {
+                        for (k, v) in &extra.inner {
+                            debug_assert!(
+                                !series_labels.inner.contains_key(k),
+                                "injected label key '{}' conflicts with native parquet label",
+                                k
+                            );
+                            series_labels.inner.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Some(stream)
+            })
+            .collect();
+        HistogramStream::merge(streams)
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for (pf, _) in &self.files {
+            out.extend(pf.file_metadata());
+        }
+        out
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        // Walk files; last value wins (matches file_metadata() merge semantics).
+        let mut last: Option<String> = None;
+        for (pf, _) in &self.files {
+            if let Some(v) = pf.metadata_get(key) {
+                last = Some(v);
+            }
+        }
+        last
+    }
+
+    fn interval(&self) -> f64 {
+        self.files
+            .iter()
+            .map(|(pf, _)| pf.interval())
+            .fold(f64::MAX, f64::min)
+    }
+
+    fn time_range(&self) -> Option<(u64, u64)> {
+        let (mut lo, mut hi): (Option<u64>, Option<u64>) = (None, None);
+        for (pf, _) in &self.files {
+            if let Some((a, b)) = pf.time_range() {
+                lo = Some(lo.map_or(a, |m: u64| m.min(a)));
+                hi = Some(hi.map_or(b, |m: u64| m.max(b)));
+            }
+        }
+        lo.zip(hi)
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            names.extend(pf.counter_names());
+        }
+        names.into_iter().collect()
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            names.extend(pf.gauge_names());
+        }
+        names.into_iter().collect()
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            names.extend(pf.histogram_names());
+        }
+        names.into_iter().collect()
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            for mut labels in pf.counter_labels(name) {
+                for (k, v) in &extra.inner {
+                    labels.insert(k.clone(), v.clone());
+                }
+                sets.push(labels);
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            for mut labels in pf.gauge_labels(name) {
+                for (k, v) in &extra.inner {
+                    labels.insert(k.clone(), v.clone());
+                }
+                sets.push(labels);
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            for mut labels in pf.histogram_labels(name) {
+                for (k, v) in &extra.inner {
+                    labels.insert(k.clone(), v.clone());
+                }
+                sets.push(labels);
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        let mut out = std::collections::HashMap::new();
+        for (pf, _) in &self.files {
+            for (metric, cols) in pf.column_map() {
+                out.entry(metric)
+                    .or_insert_with(std::collections::HashMap::new)
+                    .extend(cols);
+            }
+        }
+        out
+    }
+
+    /// Through the trait as well as the inherent method: a composite holding
+    /// this source as a `dyn DataSource` (the segmented reader) got the
+    /// trait's empty default here, while `ParquetReader::sample_timestamps`
+    /// on the concrete type got the rows.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        MultiParquetSource::sample_timestamps(self)
+    }
+
+    /// The sum of every child's count, less the series that several children
+    /// share. Asking each child lets a lazy child answer from its catalog.
+    ///
+    /// Two children can share a series only if they hold the same metric
+    /// name of the same kind and their injected labels agree on every key
+    /// they both set. Metric names are free from every child, so only the
+    /// names that pass both tests are walked, and only across the children
+    /// holding them. For each such name the correction is the per-child label
+    /// count less the merged, deduplicated count -- what the full label walk
+    /// would have counted once.
+    fn series_count(&self) -> usize {
+        type Names = fn(&dyn DataSource) -> Vec<String>;
+        type LabelSets =
+            fn(&dyn DataSource, &str) -> Vec<std::collections::BTreeMap<String, String>>;
+        let kinds: [(Names, LabelSets); 3] = [
+            (|s| s.counter_names(), |s, n| s.counter_labels(n)),
+            (|s| s.gauge_names(), |s, n| s.gauge_labels(n)),
+            (|s| s.histogram_names(), |s, n| s.histogram_labels(n)),
+        ];
+
+        let mut total: usize = self.files.iter().map(|(pf, _)| pf.series_count()).sum();
+        for (names, label_sets) in kinds {
+            let mut holders: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (i, (pf, _)) in self.files.iter().enumerate() {
+                for name in names(pf.as_ref()) {
+                    holders.entry(name).or_default().push(i);
+                }
+            }
+            for (name, idx) in holders {
+                if !self.may_share_series(&idx) {
+                    continue;
+                }
+                let mut merged = std::collections::BTreeSet::new();
+                let mut per_child = 0;
+                for &i in &idx {
+                    let (pf, extra) = &self.files[i];
+                    for mut labels in label_sets(pf.as_ref(), &name) {
+                        per_child += 1;
+                        for (k, v) in &extra.inner {
+                            labels.insert(k.clone(), v.clone());
+                        }
+                        merged.insert(labels);
+                    }
+                }
+                total -= per_child - merged.len();
+            }
+        }
+        total
+    }
+}
+
+impl MultiParquetSource {
+    /// One file from in-memory bytes, with no extra labels, read through
+    /// `pool`. Footer only: nothing is decoded.
+    pub fn open_bytes_with_pool(
+        bytes: impl Into<Bytes>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let src = ParquetSource::open_bytes_with_pool(bytes.into(), pool)?;
+        Ok(Self {
+            files: vec![(
+                Arc::new(FileSource(src)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
+        })
+    }
+
+    /// [`open_bytes_with_pool`](Self::open_bytes_with_pool), with cached
+    /// blocks keyed by the bytes' content, so another source opened from the
+    /// same bytes on the same pool shares them.
+    pub fn open_content_keyed(
+        bytes: impl Into<Bytes>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let bytes = bytes.into();
+        let id = content_source_id(&bytes);
+        let src = ParquetSource::open_bytes_with_pool_id(bytes, pool, id)?;
+        Ok(Self {
+            files: vec![(
+                Arc::new(FileSource(src)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
+        })
+    }
+
+    /// The counter columns of a single-file reader (a segment), located for
+    /// [`counter_column`](Self::counter_column). Empty for a multi-file one.
+    pub fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
+        match self.files.as_slice() {
+            [(f, _)] => f.counter_column_refs(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One counter column of a single-file reader, read directly.
+    pub fn counter_column(
+        &self,
+        at: &crate::ColumnPosition,
+        start_ns: u64,
+        end_ns: u64,
+        selective: bool,
+    ) -> Option<crate::ColumnChunk> {
+        match self.files.as_slice() {
+            [(f, _)] => f.counter_column(at, start_ns, end_ns, selective),
+            _ => None,
+        }
+    }
+
+    /// Columns of a single-file reader for a batch read; see
+    /// [`BatchColumns`].
+    pub fn batch_columns(
+        &self,
+        cols: &[usize],
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<BatchColumns> {
+        match self.files.as_slice() {
+            [(f, _)] => f.batch_columns(cols, start_ns, end_ns),
+            _ => None,
+        }
+    }
+
+    /// What this reader holds in memory while open, estimated: its bytes if
+    /// it was opened from bytes, plus a per-column charge for the parsed
+    /// footer and column descriptors.
+    ///
+    /// A footer's parsed form is not measurable cheaply, so it is estimated
+    /// from the one thing that scales it, the column count. Measured on a
+    /// task table of 159 segments with ~2,500 columns each (4.2 MB of parquet
+    /// per segment): a cache budgeted at 500 MB under a 2 KiB-per-column
+    /// charge held about 850 MB of process memory, so the parsed footer,
+    /// column-chunk metadata and label maps come to roughly 4 KiB per
+    /// column, and that is the charge. What this feeds is a cache bound,
+    /// where being off by a factor of two costs a cache half as deep, not
+    /// correctness.
+    pub fn resident_estimate(&self) -> usize {
+        const PER_COLUMN: usize = 4096;
+        self.files
+            .iter()
+            .map(|(f, _)| f.resident_bytes() + PER_COLUMN * f.column_count())
+            .sum()
+    }
+
+    /// Histogram `(grouping_power, max_value_power)` per metric name, read from
+    /// parquet **field metadata only** — no row group is touched.
+    ///
+    /// First column wins for a given name, mirroring how
+    /// `ParquetSource::histogram_stream` picks the config it decodes with.
+    /// Used by `metriken_query::SegmentedParquetReader` to reject segments whose
+    /// histogram configs disagree, which would otherwise splice into silently
+    /// wrong bucket boundaries.
+    pub fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
+        let mut out = std::collections::BTreeMap::new();
+        for (pf, _) in &self.files {
+            for col in pf.columns_desc() {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    out.entry(col.name)
+                        .or_insert((grouping_power, max_value_power));
+                }
+            }
+        }
+        out
+    }
+
+    /// All distinct histogram `(grouping_power, max_value_power)` configs
+    /// observed per metric name in this reader, footer-only (no row-group
+    /// decode). Unlike [`histogram_configs`](Self::histogram_configs)
+    /// (first column wins), this surfaces EVERY distinct config so a caller
+    /// can detect a same-file conflict: `ParquetSource::histogram_stream`
+    /// groups columns purely by name and decodes every matching column
+    /// under the first one's config, so two differently-configured columns
+    /// for the same name within one file can never be decoded separately.
+    /// Used by `metriken_query::SegmentedParquetReader` to reject that case at
+    /// open (a cross-*segment* difference is fine — that's handled by
+    /// splitting into distinct runs, not rejected).
+    pub fn histogram_config_variants(&self) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
+        let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
+            std::collections::BTreeMap::new();
+        for (pf, _) in &self.files {
+            for col in pf.columns_desc() {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    let cfg = (grouping_power, max_value_power);
+                    let list = out.entry(col.name).or_default();
+                    if !list.contains(&cfg) {
+                        list.push(cfg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `(name, labels)` for every counter column, in RAW SCHEMA order —
+    /// unlike [`counter_labels`](Self::counter_labels), this does not sort
+    /// or dedupe. Footer-only: one pass over the schema, no row-group
+    /// decode. Used by `metriken_query::SegmentedParquetReader` to build an
+    /// open-time identity index that preserves "first appearance across
+    /// segments" splicing order without re-scanning the schema per metric
+    /// name.
+    pub fn counter_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            for col in pf.columns_desc() {
+                if matches!(col.kind, ColKind::Counter) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Gauge twin of [`counter_columns`](Self::counter_columns).
+    pub fn gauge_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            for col in pf.columns_desc() {
+                if matches!(col.kind, ColKind::Gauge) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Histogram twin of [`counter_columns`](Self::counter_columns).
+    pub fn histogram_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            for col in pf.columns_desc() {
+                if matches!(col.kind, ColKind::Histogram { .. }) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether any two of these children could hold the same series. Two
+    /// children whose injected labels set one key to different values
+    /// cannot: every series of one differs from every series of the other
+    /// in that label.
+    fn may_share_series(&self, children: &[usize]) -> bool {
+        children.iter().enumerate().any(|(n, &a)| {
+            children[n + 1..].iter().any(|&b| {
+                let (x, y) = (&self.files[a].1.inner, &self.files[b].1.inner);
+                x.iter().all(|(k, v)| y.get(k).is_none_or(|w| w == v))
+            })
+        })
+    }
+
+    /// `timestamp` column values across every file, in file-list then
+    /// row-group order.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (pf, _labels) in &self.files {
+            out.extend(pf.sample_timestamps());
+        }
+        out
+    }
+}
+
+// ─── Private file reader ──────────────────────────────────────────────────────
+
+enum ParquetBacking {
+    /// File-backed. We hold the `File` in an `Arc` so that concurrent queries
+    /// against the same source share the file descriptor without duplicating
+    /// it. Reads go through `PositionalFile`'s `ChunkReader` impl, which uses
+    /// positional reads — they do not touch the shared seek offset, so
+    /// concurrent reads cannot interleave-corrupt each other.
+    File(PositionalFile),
+    Bytes(Bytes),
+}
+
+/// Positional read into `file` at byte `offset`. Does not touch the shared
+/// seek offset on Unix (via `pread`) or Windows (via `seek_read`). On other
+/// targets falls back to a non-atomic `seek + read` — those platforms must
+/// avoid concurrent reads on the same file handle.
+fn pread(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f: &File = file;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read(buf)
+    }
+}
+
+/// Wrapper around `Arc<File>` that implements parquet's `ChunkReader` trait
+/// using positional reads. Cloning is cheap (`Arc::clone`). On Unix and
+/// Windows, two readers from different threads can read concurrently without
+/// interfering because positional reads do not advance the file's current
+/// offset.
+#[derive(Clone)]
+pub struct PositionalFile {
+    inner: Arc<File>,
+    len: u64,
+}
+
+impl PositionalFile {
+    fn new(file: File) -> std::io::Result<Self> {
+        let len = file.metadata()?.len();
+        Ok(Self {
+            inner: Arc::new(file),
+            len,
+        })
+    }
+}
+
+impl parquet::file::reader::Length for PositionalFile {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// `Read` adapter built on `pread` so it does not depend on or modify the
+/// file's seek offset.
+pub struct PositionalReader {
+    file: Arc<File>,
+    pos: u64,
+    end: u64,
+}
+
+impl std::io::Read for PositionalReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end {
+            return Ok(0);
+        }
+        let remaining = (self.end - self.pos) as usize;
+        let to_read = buf.len().min(remaining);
+        let n = pread(&self.file, &mut buf[..to_read], self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl parquet::file::reader::ChunkReader for PositionalFile {
+    type T = PositionalReader;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(PositionalReader {
+            file: Arc::clone(&self.inner),
+            pos: start,
+            end: self.len,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        let mut buf = vec![0u8; length];
+        let mut read_total = 0usize;
+        // pread can be a partial read; loop until full or EOF.
+        while read_total < length {
+            let n = pread(
+                &self.inner,
+                &mut buf[read_total..],
+                start + read_total as u64,
+            )?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        buf.truncate(read_total);
+        Ok(Bytes::from(buf))
+    }
+}
+
+pub struct ParquetSource {
+    /// Unique numeric identity assigned at construction; used as the `source_id`
+    /// component of every `CacheKey` produced by this source.
+    id: u64,
+    backing: ParquetBacking,
+    meta: ArrowReaderMetadata,
+    sampling_interval_ms: u64,
+    /// Optional shared buffer pool for decoded row-group blocks.
+    pool: Option<Arc<BufferPool>>,
+    /// The parsed schema, computed on first use.
+    ///
+    /// `parse_schema` walks every field in the file, so re-running it per
+    /// lookup makes any "for each metric name" loop O(names x columns). It
+    /// depends only on `meta`, which never changes after construction, so
+    /// there is nothing to invalidate.
+    columns: OnceLock<Vec<ColDesc>>,
+    /// The `timestamp` and `duration` column positions, resolved once.
+    ///
+    /// `Schema::index_of` scans the fields by name and, when the name is
+    /// absent, formats every field name into its error. A `.rez` segment has
+    /// no `duration` column, so asking per column read on a 2,500-column
+    /// table formatted 2,500 names a million times over one query — a third
+    /// of its CPU, measured.
+    fixed_cols: OnceLock<(Option<usize>, Option<usize>)>,
+    /// The `occupant` column, if this is a long segment; see
+    /// [`ParquetSource::occupant_col`].
+    occupant_col: OnceLock<Option<usize>>,
+    /// A long segment's metadata with its page index, loaded the first time
+    /// a read might prune; see [`ParquetSource::occupant_selection`].
+    page_meta: OnceLock<Option<ArrowReaderMetadata>>,
+}
+
+/// A pruned read is used only when the pages it keeps are at most this
+/// fraction (1/n) of the row group's rows.
+const PRUNE_MAX_FRACTION: usize = 4;
+
+/// A read of a long segment prunes only when it wants at most this many
+/// occupants. Beyond that the pages approach the whole group, and a query
+/// streaming that many series is better served by one decode of each row
+/// group, shared through the pool, than by a pruned read per series.
+pub const PRUNE_MAX_OCCUPANTS: usize = 64;
+
+/// Which rows of one row group belong to each occupant: `rows` holds every
+/// row number, grouped by occupant and ascending within each, and `ranges`
+/// maps an occupant to its slice of `rows`.
+#[derive(Default)]
+struct OccupantRows {
+    ranges: HashMap<u64, (u32, u32), foldhash::fast::RandomState>,
+    rows: Vec<u32>,
+}
+
+impl OccupantRows {
+    fn build(occupants: &[Option<u64>]) -> Self {
+        // First the count of each occupant's rows, held as its end; then
+        // each row is placed at its occupant's cursor.
+        let mut ranges: HashMap<u64, (u32, u32), foldhash::fast::RandomState> = HashMap::default();
+        for occ in occupants.iter().flatten() {
+            ranges.entry(*occ).or_default().1 += 1;
+        }
+        let mut start = 0u32;
+        for range in ranges.values_mut() {
+            let n = range.1;
+            *range = (start, start);
+            start += n;
+        }
+        let mut rows = vec![0u32; start as usize];
+        for (row, occ) in occupants.iter().enumerate() {
+            if let Some(occ) = occ {
+                let (_, end) = ranges.get_mut(occ).expect("counted");
+                rows[*end as usize] = row as u32;
+                *end += 1;
+            }
+        }
+        Self { ranges, rows }
+    }
+
+    /// Estimated heap size for the pool's budget: 4 bytes per row, plus 24
+    /// bytes per map slot (a 16-byte entry, its control byte, and load-factor
+    /// slack).
+    fn bytes(&self) -> usize {
+        self.rows.capacity() * 4 + self.ranges.capacity() * 24
+    }
+
+    #[cfg(test)]
+    fn get(&self, occupant: &u64) -> Option<&[u32]> {
+        let (start, end) = *self.ranges.get(occupant)?;
+        Some(&self.rows[start as usize..end as usize])
+    }
+}
+
+fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
+    let mut file_metadata: HashMap<String, String> = HashMap::new();
+    if let Some(kv) = meta.metadata().file_metadata().key_value_metadata() {
+        for entry in kv {
+            file_metadata.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+        }
+    }
+    file_metadata
+        .get("sampling_interval_ms")
+        .map(|v| v.parse::<u64>().expect("bad interval"))
+        .unwrap_or(1000)
+}
+
+/// A single parquet file answering the `DataSource` contract directly.
+///
+/// Before this impl, `MultiParquetSource` reached into each file through free
+/// functions (`read_counters`) and inherent methods (`time_range_from_stats`,
+/// `read_file_metadata`), which is why it could only ever hold
+/// `Arc<ParquetSource>`. Going through the trait is what lets a composite hold
+/// heterogeneous children -- a segmented source among plain ones.
+/// One parquet file as a `DataSource`.
+///
+/// A newtype rather than `impl DataSource for ParquetSource` because the
+/// inherent `ParquetSource::histogram_stream` takes `self: &Arc<Self>` (it
+/// clones the handle into the returned lazy stream), which a `&self` trait
+/// method cannot supply. Holding the `Arc` here gives it one.
+pub struct FileSource(pub Arc<ParquetSource>);
+
+impl DataSource for FileSource {
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Counters> {
+        read_counters(&self.0, name, filter, start_ns, end_ns).ok()
+    }
+
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        read_gauges(&self.0, name, filter, start_ns, end_ns).ok()
+    }
+
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        // Fully qualified: the inherent method shares this name and would
+        // otherwise win method resolution and recurse.
+        ParquetSource::histogram_stream(&self.0, name, filter, start_ns, end_ns)
+    }
+
+    fn interval(&self) -> f64 {
+        self.0.sampling_interval_ms as f64 / 1000.0
+    }
+
+    fn time_range(&self) -> Option<(u64, u64)> {
+        self.0.time_range_from_stats()
+    }
+
+    fn counter_names(&self) -> Vec<String> {
+        self.0.names_of(|k| matches!(k, ColKind::Counter))
+    }
+
+    fn gauge_names(&self) -> Vec<String> {
+        self.0.names_of(|k| matches!(k, ColKind::Gauge))
+    }
+
+    fn histogram_names(&self) -> Vec<String> {
+        self.0.names_of(|k| matches!(k, ColKind::Histogram { .. }))
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0.labels_of(name, |k| matches!(k, ColKind::Counter))
+    }
+
+    fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0.labels_of(name, |k| matches!(k, ColKind::Gauge))
+    }
+
+    fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0
+            .labels_of(name, |k| matches!(k, ColKind::Histogram { .. }))
+    }
+
+    fn file_metadata(&self) -> std::collections::HashMap<String, String> {
+        self.0.read_file_metadata()
+    }
+
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.0.read_file_metadata_value(key)
+    }
+
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        // Fully qualified for the same reason as `histogram_stream` above.
+        ParquetSource::column_map(&self.0)
+    }
+
+    /// Raw `timestamp` column values in row-group order. This moved down from
+    /// `MultiParquetSource`, which used to reach through `Arc<ParquetSource>`
+    /// into `meta.schema()` and row groups to gather it -- the one piece of
+    /// genuinely file-shaped behavior that blocked the generalization.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let Ok(ts_col_idx) = self.0.meta.schema().index_of("timestamp") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for rg_idx in 0..self.0.meta.metadata().num_row_groups() {
+            match read_raw_u64_rg(&self.0, rg_idx, ts_col_idx) {
+                Ok(values) => out.extend(values),
+                Err(e) => {
+                    tracing::warn!(
+                        source_id = self.0.id,
+                        rg_idx,
+                        error = %e,
+                        "skipping row group in sample_timestamps",
+                    );
+                }
+            }
+        }
+        // A long segment has a row per occupant per tick; a sample is a tick.
+        if self.0.occupant_col().is_some() {
+            out.sort_unstable();
+            out.dedup();
+        }
+        out
+    }
+
+    fn columns_desc(&self) -> Vec<ColDesc> {
+        self.0.columns().to_vec()
+    }
+
+    fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
+        self.0
+            .columns()
+            .iter()
+            .filter(|c| matches!(c.kind, ColKind::Counter))
+            .map(|c| crate::CounterColumnRef {
+                name: c.name.clone(),
+                labels: c.labels.clone(),
+                position: crate::ColumnPosition {
+                    col_idx: c.col_idx as u32,
+                    begin_col: c.begin_col.map(|i| i as u32),
+                    width_col: c.width_col.map(|i| i as u32),
+                    occupant: c.occupant,
+                },
+            })
+            .collect()
+    }
+
+    fn counter_column(
+        &self,
+        at: &crate::ColumnPosition,
+        start_ns: u64,
+        end_ns: u64,
+        selective: bool,
+    ) -> Option<crate::ColumnChunk> {
+        match read_counter_column(&self.0, at, start_ns, end_ns, selective) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    source_id = self.0.id,
+                    col_idx = at.col_idx,
+                    error = %e,
+                    "reading a counter column"
+                );
+                None
+            }
+        }
+    }
+
+    fn batch_columns(&self, cols: &[usize], start_ns: u64, end_ns: u64) -> Option<BatchColumns> {
+        match read_batch_columns(&self.0, cols, start_ns, end_ns) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(source_id = self.0.id, error = %e, "reading columns for a batch read");
+                None
+            }
+        }
+    }
+
+    fn column_count(&self) -> usize {
+        self.0.meta.schema().fields().len()
+    }
+
+    fn resident_bytes(&self) -> usize {
+        match &self.0.backing {
+            ParquetBacking::Bytes(b) => b.len(),
+            ParquetBacking::File(_) => 0,
+        }
+    }
+}
+
+impl ParquetSource {
+    /// The `occupant` column of a [long](crate::long) segment; `None` for
+    /// any other file, including one with a column of that name that is
+    /// not marked long.
+    fn occupant_col(&self) -> Option<usize> {
+        *self.occupant_col.get_or_init(|| {
+            if self
+                .read_file_metadata_value(crate::long::LAYOUT_KEY)
+                .as_deref()
+                != Some(crate::long::LAYOUT_LONG)
+            {
+                return None;
+            }
+            self.meta
+                .schema()
+                .index_of(crate::long::OCCUPANT_COLUMN)
+                .ok()
+        })
+    }
+
+    /// The rows each occupant has in row group `rg_idx` of a long segment.
+    ///
+    /// A single-series read of a long segment (`read_counter_column`, which
+    /// a stream calls once per series per segment) would otherwise scan
+    /// every row of the column for its occupant, and a query streaming every
+    /// series would cost rows times series. Built from the `occupant` column
+    /// and shared. With a pool it is a pool entry under `usize::MAX - col`,
+    /// an index no column reaches: counted against the budget, evicted in LRU
+    /// order like a column, and rebuilt from the occupant column after
+    /// eviction. An index larger than the whole pool is not cached. Without
+    /// a pool it is built on every call; every reader of long segments has
+    /// one.
+    fn occupant_rows(&self, rg_idx: usize) -> Result<Arc<OccupantRows>, Box<dyn Error>> {
+        let col = self.occupant_col().ok_or("not a long segment")?;
+        // A pool entry under a column index no column reaches.
+        let key = CacheKey {
+            source_id: self.id,
+            column_idx: usize::MAX - col,
+            row_group_idx: rg_idx,
+        };
+        if let Some(pool) = &self.pool {
+            if let Some(index) = pool.get_derived::<OccupantRows>(key) {
+                return Ok(index);
+            }
+        }
+        let occupants = read_counter_values_per_rg(self, rg_idx, col)?;
+        let index = Arc::new(OccupantRows::build(&occupants));
+        if let Some(pool) = &self.pool {
+            pool.put_derived(key, Arc::clone(&index), index.bytes());
+        }
+        Ok(index)
+    }
+
+    /// The rows of row group `rg_idx` that can hold any of `occupants`, from
+    /// the page index's bounds on the `occupant` column, when reading only
+    /// those is worth it; `None` means decode the whole group.
+    ///
+    /// Worth it means: this is a long segment written with a page index, the
+    /// read wants at most [`PRUNE_MAX_OCCUPANTS`], and the kept pages are at
+    /// most 1/[`PRUNE_MAX_FRACTION`] of the group. A pruned read bypasses the
+    /// pool's per-column cache, which suits a query reading a few series; a
+    /// query streaming every series says so (`selective: false` on
+    /// `counter_column`) and never gets here. Pruning on page bounds is
+    /// correct in any row order and selective when the segment is sorted by
+    /// occupant.
+    fn occupant_selection(&self, rg_idx: usize, occupants: &[u64]) -> Option<RowSelection> {
+        let col = self.occupant_col()?;
+        if occupants.is_empty() || occupants.len() > PRUNE_MAX_OCCUPANTS {
+            return None;
+        }
+        let meta = self.page_meta()?;
+        let md = meta.metadata();
+        let index = md.column_index()?.get(rg_idx)?.get(col)?;
+        let locations = md.offset_index()?.get(rg_idx)?.get(col)?.page_locations();
+        let parquet::file::page_index::column_index::ColumnIndexMetaData::INT64(bounds) = index
+        else {
+            return None;
+        };
+        let rows = md.row_group(rg_idx).num_rows() as usize;
+        let mut selectors = Vec::with_capacity(locations.len());
+        let mut kept = 0usize;
+        for (page, loc) in locations.iter().enumerate() {
+            let first = loc.first_row_index as usize;
+            let next = locations
+                .get(page + 1)
+                .map(|l| l.first_row_index as usize)
+                .unwrap_or(rows);
+            let keep = match (bounds.min_value(page), bounds.max_value(page)) {
+                (Some(lo), Some(hi)) => occupants
+                    .iter()
+                    .any(|o| (*lo as u64) <= *o && *o <= (*hi as u64)),
+                _ => true,
+            };
+            if keep {
+                kept += next - first;
+                selectors.push(RowSelector::select(next - first));
+            } else {
+                selectors.push(RowSelector::skip(next - first));
+            }
+        }
+        if kept * PRUNE_MAX_FRACTION > rows {
+            return None;
+        }
+        Some(RowSelection::from(selectors))
+    }
+
+    /// The metadata with the page index, for a long segment. Loaded once, and
+    /// only here: a wide file's page index is as wide as the file.
+    fn page_meta(&self) -> Option<&ArrowReaderMetadata> {
+        self.page_meta
+            .get_or_init(|| {
+                self.occupant_col()?;
+                let options = ArrowReaderOptions::new()
+                    .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
+                let loaded = match &self.backing {
+                    ParquetBacking::Bytes(b) => ArrowReaderMetadata::load(b, options),
+                    ParquetBacking::File(f) => ArrowReaderMetadata::load(f, options),
+                };
+                match loaded {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::warn!(source_id = self.id, error = %e, "loading a long segment's page index");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Decode `cols` of row group `rg_idx`, only the rows `selection` keeps.
+    fn read_selected(
+        &self,
+        rg_idx: usize,
+        cols: &[usize],
+        selection: RowSelection,
+    ) -> Result<HashMap<usize, arrow::array::ArrayRef>, Box<dyn Error>> {
+        let meta = self.page_meta().ok_or("no page index")?.clone();
+        let mut cols: Vec<usize> = cols.to_vec();
+        cols.sort_unstable();
+        cols.dedup();
+        let mask = ProjectionMask::roots(
+            meta.metadata().file_metadata().schema_descr(),
+            cols.iter().copied(),
+        );
+        let batches: Vec<arrow::record_batch::RecordBatch> = match &self.backing {
+            ParquetBacking::File(f) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(f.clone(), meta)
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(mask)
+                    .with_row_selection(selection)
+                    .build()?
+                    .collect::<Result<_, _>>()?
+            }
+            ParquetBacking::Bytes(b) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(b.clone(), meta)
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(mask)
+                    .with_row_selection(selection)
+                    .build()?
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        let mut out = HashMap::new();
+        for (i, col) in cols.iter().enumerate() {
+            let parts: Vec<&dyn arrow::array::Array> =
+                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            let joined = if parts.is_empty() {
+                arrow::array::new_empty_array(self.meta.schema().field(*col).data_type())
+            } else {
+                arrow::compute::concat(&parts)?
+            };
+            out.insert(*col, joined);
+        }
+        Ok(out)
+    }
+
+    /// `(timestamp, duration)` column positions, resolved once per source.
+    fn fixed_cols(&self) -> (Option<usize>, Option<usize>) {
+        *self.fixed_cols.get_or_init(|| {
+            let schema = self.meta.schema();
+            (
+                schema.index_of("timestamp").ok(),
+                schema.index_of("duration").ok(),
+            )
+        })
+    }
+
+    /// The parsed schema, parsed once and reused.
+    ///
+    /// One shared parse serves every caller even though they do *not* derive
+    /// `ts_col_idx` the same way. They resolve the same column -- each is
+    /// `index_of("timestamp")` -- and differ only in how they treat its
+    /// absence: the readers bail (`.ok()?`, `.map_err(..)?`) while the schema
+    /// helpers fall back to `usize::MAX`, which is what is cached here.
+    /// `parse_schema` spends the index solely on skipping that column, so
+    /// where the column exists every caller agrees on the parse, and where it
+    /// does not the callers that would have disagreed return before reaching
+    /// this cache. See
+    /// `a_source_with_no_timestamp_column_still_parses_and_reads_nothing`.
+    fn columns(&self) -> &[ColDesc] {
+        self.columns.get_or_init(|| {
+            let ts = self
+                .meta
+                .schema()
+                .index_of("timestamp")
+                .unwrap_or(usize::MAX);
+            parse_schema(self, ts)
+        })
+    }
+
+    /// Schema-derived metric names whose column kind satisfies `want`.
+    fn names_of(&self, want: impl Fn(&ColKind) -> bool) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for col in self.columns() {
+            if want(&col.kind) {
+                names.insert(col.name.clone());
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// Label sets carried by columns of metric `name` whose kind satisfies
+    /// `want`.
+    fn labels_of(
+        &self,
+        name: &str,
+        want: impl Fn(&ColKind) -> bool,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for col in self.columns() {
+            if want(&col.kind) && col.name == name {
+                sets.push(col.labels.inner.clone());
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+}
+
+impl ParquetSource {
+    pub fn open(path: &Path) -> Result<Arc<Self>, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        crate::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+            columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            page_meta: OnceLock::new(),
+        }))
+    }
+
+    pub fn open_bytes(bytes: Bytes) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        crate::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::Bytes(bytes),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+            columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            page_meta: OnceLock::new(),
+        }))
+    }
+
+    pub fn open_file(file: File) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        crate::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: None,
+            columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            page_meta: OnceLock::new(),
+        }))
+    }
+
+    pub fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        crate::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+            columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            page_meta: OnceLock::new(),
+        }))
+    }
+
+    pub fn open_bytes_with_pool(
+        bytes: Bytes,
+        pool: Arc<BufferPool>,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        Self::open_bytes_with_pool_id(bytes, pool, next_source_id())
+    }
+
+    /// [`open_bytes_with_pool`](Self::open_bytes_with_pool) with the cache id
+    /// given rather than drawn from the counter.
+    pub fn open_bytes_with_pool_id(
+        bytes: Bytes,
+        pool: Arc<BufferPool>,
+        id: u64,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
+        crate::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id,
+            backing: ParquetBacking::Bytes(bytes),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+            columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            page_meta: OnceLock::new(),
+        }))
+    }
+
+    pub fn open_file_with_pool(
+        file: File,
+        pool: Arc<BufferPool>,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
+        crate::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        let sampling_interval_ms = parse_sampling_interval(&meta);
+        Ok(Arc::new(Self {
+            id: next_source_id(),
+            backing: ParquetBacking::File(PositionalFile::new(file)?),
+            meta,
+            sampling_interval_ms,
+            pool: Some(pool),
+            columns: OnceLock::new(),
+            fixed_cols: OnceLock::new(),
+            occupant_col: OnceLock::new(),
+            page_meta: OnceLock::new(),
+        }))
+    }
+
+    fn build_batch_reader(
+        &self,
+        rg_idx: usize,
+        projection: ProjectionMask,
+    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, Box<dyn Error>> {
+        let reader = match &self.backing {
+            ParquetBacking::File(f) => {
+                // PositionalFile is Clone (Arc), and ChunkReader, so we don't
+                // need (and must not use) try_clone — its positional reads are
+                // concurrency-safe across queries against the same source.
+                ParquetRecordBatchReaderBuilder::new_with_metadata(f.clone(), self.meta.clone())
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(projection)
+                    .build()?
+            }
+            ParquetBacking::Bytes(b) => {
+                ParquetRecordBatchReaderBuilder::new_with_metadata(b.clone(), self.meta.clone())
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(projection)
+                    .build()?
+            }
+        };
+        Ok(reader)
+    }
+
+    fn read_file_metadata(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        if let Some(kv) = self.meta.metadata().file_metadata().key_value_metadata() {
+            for entry in kv {
+                out.insert(entry.key.clone(), entry.value.clone().unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// Walk key-value metadata entries looking for `key` without building a HashMap.
+    fn read_file_metadata_value(&self, key: &str) -> Option<String> {
+        self.meta
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()?
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.clone().unwrap_or_default())
+    }
+
+    fn time_range_from_stats(&self) -> Option<(u64, u64)> {
+        let ts_col_idx = self.meta.schema().index_of("timestamp").ok()?;
+        let pq_metadata = self.meta.metadata();
+        let mut min_ns: Option<u64> = None;
+        let mut max_ns: Option<u64> = None;
+        for rg_idx in 0..pq_metadata.num_row_groups() {
+            let Some(stats) = pq_metadata
+                .row_group(rg_idx)
+                .column(ts_col_idx)
+                .statistics()
+            else {
+                continue;
+            };
+            if let Statistics::Int64(s) = stats {
+                if let Some(v) = s.min_opt() {
+                    let ts = *v as u64;
+                    min_ns = Some(min_ns.map_or(ts, |m: u64| m.min(ts)));
+                }
+                if let Some(v) = s.max_opt() {
+                    let ts = *v as u64;
+                    max_ns = Some(max_ns.map_or(ts, |m: u64| m.max(ts)));
+                }
+            }
+        }
+        min_ns.zip(max_ns)
+    }
+
+    fn histogram_stream(
+        self: &Arc<Self>,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let ts_col_idx = self.meta.schema().index_of("timestamp").ok()?;
+        let num_rgs = self.meta.metadata().num_row_groups();
+
+        let col_descs: Vec<ColDesc> = self
+            .columns()
+            .iter()
+            .filter(|c| {
+                matches!(c.kind, ColKind::Histogram { .. })
+                    && c.name == name
+                    && (filter.inner.is_empty() || c.labels.matches(filter))
+            })
+            .cloned()
+            .collect();
+
+        if col_descs.is_empty() {
+            return None;
+        }
+
+        let config = col_descs.iter().find_map(|c| match c.kind {
+            ColKind::Histogram {
+                grouping_power: gp,
+                max_value_power: mvp,
+            } => ::histogram::Config::new(gp, mvp).ok(),
+            _ => None,
+        })?;
+
+        let series: Vec<Labels> = col_descs.iter().map(|c| c.labels.clone()).collect();
+
+        let rg_queue: std::collections::VecDeque<usize> = (0..num_rgs)
+            .filter(|&rg_idx| {
+                !matches!(
+                    rg_classify(
+                        self.meta.metadata().row_group(rg_idx),
+                        ts_col_idx,
+                        start_ns,
+                        end_ns,
+                    ),
+                    RgClass::Before | RgClass::After,
+                )
+            })
+            .collect();
+
+        let groups = plan_reads(self, &col_descs);
+        let cursor = ParquetHistogramCursor {
+            pf: Arc::clone(self),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+            wanted: wanted_occupants(&groups),
+            groups,
+            rg_queue,
+            pending: std::collections::VecDeque::new(),
+        };
+
+        Some(HistogramStream {
+            meta: HistogramStreamMeta { config, series },
+            rows: Box::new(cursor),
+        })
+    }
+
+    fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+        let mut out: HashMap<String, HashMap<Labels, String>> = HashMap::new();
+        for c in self.columns() {
+            out.entry(c.name.clone())
+                .or_default()
+                .insert(c.labels.clone(), c.column_name.clone());
+        }
+        out
+    }
+}
+
+// ─── Row group classification ─────────────────────────────────────────────────
+
+enum RgClass {
+    Before,
+    Overlaps,
+    After,
+    Unknown,
+}
+
+fn rg_classify(rg: &RowGroupMetaData, ts_col_idx: usize, start_ns: u64, end_ns: u64) -> RgClass {
+    let Some(stats) = rg.column(ts_col_idx).statistics() else {
+        return RgClass::Unknown;
+    };
+    let Statistics::Int64(s) = stats else {
+        return RgClass::Unknown;
+    };
+    let (Some(rg_min), Some(rg_max)) = (s.min_opt(), s.max_opt()) else {
+        return RgClass::Unknown;
+    };
+    let (rg_min, rg_max) = (*rg_min as u64, *rg_max as u64);
+    if rg_max < start_ns {
+        RgClass::Before
+    } else if rg_min > end_ns {
+        RgClass::After
+    } else {
+        RgClass::Overlaps
+    }
+}
+
+// ─── Schema parsing ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum ColKind {
+    Counter,
+    Gauge,
+    Histogram {
+        grouping_power: u8,
+        max_value_power: u8,
+    },
+}
+
+#[derive(Clone)]
+pub struct ColDesc {
+    col_idx: usize,
+    name: String,
+    labels: Labels,
+    column_name: String,
+    kind: ColKind,
+    /// Column index of this metric's acquisition-window begin (Int64 offset
+    /// from the raw row timestamp), if present. Resolved atomically with
+    /// `width_col` by [`resolve_window_cols`]: the metric's own
+    /// `<m>:window_begin` sidecar (only if its `<m>:window_width` twin is
+    /// also present), else the table-level bare `:window_begin` column
+    /// (only if `:window_width` is also present), else `None`.
+    begin_col: Option<usize>,
+    /// Column index of this metric's acquisition-window width (UInt64 ns),
+    /// if present. Resolved as an atomic pair with `begin_col` — see there.
+    width_col: Option<usize>,
+    /// In a [long](crate::long) segment, the occupant whose rows of
+    /// `col_idx` are this series. `None` when the column is the series.
+    occupant: Option<u64>,
+}
+
+/// Resolve one metric's acquisition-window sidecar columns as an ATOMIC
+/// pair, never mixing one source's begin with another's width (that would
+/// fabricate a window describing no real acquisition, and the band math
+/// would be silently wrong rather than absent).
+///
+/// Precedence:
+/// 1. The metric's own `<m>:window_begin`/`<m>:window_width` sidecar,
+///    only if BOTH are present.
+/// 2. Else the table-level bare `:window_begin`/`:window_width` pair,
+///    only if BOTH are present.
+/// 3. Else neither (`(None, None)`) — including when either source has
+///    only one half of its pair (e.g. a bare `:window_begin` with no
+///    matching `:window_width`).
+fn resolve_window_cols(
+    own_begin: Option<usize>,
+    own_width: Option<usize>,
+    table_begin: Option<usize>,
+    table_width: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match (own_begin, own_width) {
+        (Some(b), Some(w)) => (Some(b), Some(w)),
+        _ => match (table_begin, table_width) {
+            (Some(b), Some(w)) => (Some(b), Some(w)),
+            _ => (None, None),
+        },
+    }
+}
+
+fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
+    let fields = pf.meta.schema().fields();
+    let occupant_col = pf.occupant_col();
+    // Pass 1: window sidecar column indices, keyed by base column name.
+    // A column named exactly `:window_begin` / `:window_width` (no base
+    // name — `strip_suffix` yields "") is the table-level pair: one shared
+    // acquisition window for every metric in the table, used as the
+    // fallback when a metric has no `<m>:window_begin`/`<m>:window_width`
+    // sidecar of its own. Both bare names are reserved (see the metric-skip
+    // check below) and never surface as metrics themselves.
+    let mut win_begin: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut win_width: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (col_idx, field) in fields.iter().enumerate() {
+        let n = field.name();
+        if let Some(base) = n.strip_suffix(":window_begin") {
+            win_begin.insert(base.to_string(), col_idx);
+        } else if let Some(base) = n.strip_suffix(":window_width") {
+            win_width.insert(base.to_string(), col_idx);
+        }
+    }
+    let table_begin_col = win_begin.get("").copied();
+    let table_width_col = win_width.get("").copied();
+    // Pass 2: metric ColDescs, attaching window indices by column name.
+    let descs = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(col_idx, field)| {
+            if col_idx == ts_col_idx || Some(col_idx) == occupant_col {
+                return None;
+            }
+            let meta = field.metadata().clone();
+            let column_name = field.name().to_string();
+            // Acquisition-window sidecar columns (`<m>:window_begin` Int64,
+            // `<m>:window_width` UInt64 — per-metric; or the bare
+            // `:window_begin`/`:window_width` table-level pair) describe an
+            // observation window — they are not metrics. Without this skip
+            // they would classify by Arrow type as a phantom gauge / counter.
+            // The window path reads them for rate/histogram error bars.
+            //
+            // NOTE: `:window_begin` / `:window_width`, both as a per-metric
+            // suffix and as the bare table-level column name, are therefore
+            // RESERVED — a real metric literally named `foo:window_begin` (or
+            // just `window_begin`, colon-prefixed) would be silently treated
+            // as a sidecar and dropped. Acceptable given the recorder never
+            // emits such names, but the reservation is intentional.
+            if column_name.ends_with(":window_begin") || column_name.ends_with(":window_width") {
+                return None;
+            }
+            // `:wall_offset` is a bare, table-level sidecar (one per table, not
+            // one per metric): the raw wall-clock reading at each row's tick,
+            // vs. the monotonic-anchored `timestamp` column. It carries no
+            // `metric` metadata and would otherwise classify by Arrow type as
+            // a phantom gauge. Unlike `:window_begin`/`:window_width`, it is
+            // not a per-metric suffix — it has no name prefix — so match it
+            // exactly rather than by `ends_with`.
+            //
+            // NOTE: `:wall_offset` is therefore also a RESERVED column name,
+            // alongside the `:window_begin` / `:window_width` suffixes above.
+            if column_name == ":wall_offset" {
+                return None;
+            }
+            let name = meta.get("metric").cloned().unwrap_or_else(|| {
+                column_name
+                    .strip_suffix(":buckets")
+                    .unwrap_or(&column_name)
+                    .to_string()
+            });
+            // Read, not removed: `Labels::from_metadata` is what keeps the
+            // histogram configuration out of the label set, for this loader
+            // and the `ingest` one alike. Removing the keys here too would
+            // let this path keep working if the shared list regressed, and
+            // then the two loaders could drift again without a test noticing.
+            let grouping_power: Option<u8> =
+                meta.get("grouping_power").and_then(|v| v.parse().ok());
+            let max_value_power: Option<u8> =
+                meta.get("max_value_power").and_then(|v| v.parse().ok());
+            let labels = Labels::from_metadata(meta.iter());
+            let kind = match field.data_type() {
+                DataType::UInt64 => ColKind::Counter,
+                DataType::Int64 => ColKind::Gauge,
+                DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
+                    let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
+                        return None;
+                    };
+                    ColKind::Histogram {
+                        grouping_power: gp,
+                        max_value_power: mvp,
+                    }
+                }
+                _ => return None,
+            };
+            // Precedence, resolved as an atomic pair (see resolve_window_cols):
+            // this metric's own sidecar pair, else the table-level bare pair,
+            // else no window columns at all. Never mixes one source's begin
+            // with another's width.
+            let (begin_col, width_col) = resolve_window_cols(
+                win_begin.get(&column_name).copied(),
+                win_width.get(&column_name).copied(),
+                table_begin_col,
+                table_width_col,
+            );
+            Some(ColDesc {
+                col_idx,
+                name,
+                labels,
+                column_name,
+                kind,
+                begin_col,
+                width_col,
+                occupant: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    match occupant_col {
+        None => descs,
+        Some(_) => expand_long(pf, descs),
+    }
+}
+
+/// A long segment's column descriptions: each metric column once per
+/// occupant the footer lists, labelled with [`crate::long::OCCUPANT_LABEL`].
+/// A malformed list leaves the segment with no series, reported once.
+fn expand_long(pf: &ParquetSource, descs: Vec<ColDesc>) -> Vec<ColDesc> {
+    let rows = pf.meta.metadata().file_metadata().num_rows().max(0) as u64;
+    let list = pf
+        .read_file_metadata_value(crate::long::OCCUPANTS_KEY)
+        .unwrap_or_default();
+    let occupants = match crate::long::decode_occupant_ranges(&list, rows) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(source_id = pf.id, error = %e, "long segment has a malformed occupant list; it presents no series");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(descs.len() * occupants.len());
+    for desc in descs {
+        for &occ in &occupants {
+            let mut d = desc.clone();
+            d.labels
+                .inner
+                .insert(crate::long::OCCUPANT_LABEL.to_string(), occ.to_string());
+            d.occupant = Some(occ);
+            out.push(d);
+        }
+    }
+    out
+}
+
+// ─── Timestamp reader ─────────────────────────────────────────────────────────
+
+/// Run a parquet decode block, catching any panic from the parquet crate so a
+/// malformed file (e.g. dictionary pages out of order — apache/arrow-rs has
+/// known panics like "Decoder for dict should have been set") doesn't crash
+/// the server.
+///
+/// Also suppresses the global panic hook (e.g. sentry's panic_handler) for
+/// the duration of the call so deliberate catches don't pollute the error
+/// reporting pipeline. The first call to this function installs a chained
+/// panic hook that defers to the previously-installed hook for all panics
+/// EXCEPT those that occur inside `catch_decode_panic`.
+fn catch_decode_panic<T>(op: impl FnOnce() -> T) -> Result<T, String> {
+    ensure_panic_hook_installed();
+    SUPPRESS_DECODE_PANIC.with(|f| f.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op));
+    SUPPRESS_DECODE_PANIC.with(|f| f.set(false));
+
+    result.map_err(|payload| {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unknown panic payload>".to_string()
+        }
+    })
+}
+
+std::thread_local! {
+    static SUPPRESS_DECODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static PANIC_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+/// Install a panic hook (once per process) that chains on top of whatever
+/// hook is currently active. When a panic fires while a thread has
+/// `SUPPRESS_DECODE_PANIC` set, we skip the upstream hook so the panic
+/// doesn't reach reporters like Sentry. All other panics still propagate
+/// normally.
+fn ensure_panic_hook_installed() {
+    PANIC_HOOK_INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SUPPRESS_DECODE_PANIC.with(|f| f.get()) {
+                // Suppressed: this panic is caught by catch_decode_panic.
+                return;
+            }
+            previous(info);
+        }));
+    });
+}
+
+/// The `timestamp` column of one row group, as recorded.
+///
+/// These used to be rounded to a nominal sampling grid derived from the
+/// file's `sampling_interval_ms`. That discarded the one thing the file
+/// states exactly — when each row was read — in favour of a value it only
+/// declares, and a file that declared the wrong one (or, lacking the key,
+/// inherited the 1000 ms default) had its rows moved: at a 100 ms cadence all
+/// ten rows of a second landed on the same instant and nine of the ten values
+/// were lost. A cadence is still useful as a staleness hint, where being
+/// approximate costs nothing; it has no business rewriting the data.
+fn read_timestamps(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    ts_col_idx: usize,
+) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: ts_col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_timestamps(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [ts_col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // BAIL on first error instead of silently retrying via .flatten().
+                        // Returning Err repeatedly without advancing internal state has been
+                        // observed to spin the reader in production. We log and stop reading
+                        // this row group, accepting whatever batches we got so far.
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx = ts_col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting timestamp read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("timestamp column is not UInt64".into())?;
+                out.extend(arr.iter());
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx = ts_col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading timestamps",
+            );
+            return Err(format!(
+                "parquet decode panic reading timestamps (rg={rg_idx}, col={ts_col_idx}): {panic_msg}"
+            )
+            .into());
+        }
+    };
+    let mut out = out;
+    // Capacity equal to length, which is what the pool counts.
+    out.shrink_to_fit();
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_timestamps(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+/// The most rows [`reserve_rows`] reserves up front.
+const RESERVE_ROWS_MAX: usize = 1 << 22;
+
+/// Reserve room for a row group's rows from the footer's count. The count
+/// is a hint: a negative one reserves nothing, a larger one than
+/// [`RESERVE_ROWS_MAX`] reserves that many, an unallocatable one reserves
+/// nothing, and the vector grows past the reservation as rows are decoded.
+fn reserve_rows<T>(out: &mut Vec<T>, rows: i64) {
+    if let Ok(rows) = usize::try_from(rows) {
+        let _ = out.try_reserve_exact(rows.min(RESERVE_ROWS_MAX));
+    }
+}
+
+/// Read UInt64 values from `col_idx` in a single row group, in row order,
+/// dropping nulls. Unlike `read_timestamps` this returns a dense `Vec<u64>`
+/// rather than a nullable one and does not go through the buffer pool, which
+/// is what a caller reading a column for its own sake (e.g. jitter
+/// visualization) wants.
+fn read_raw_u64_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<u64>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Same bail-on-first-error rationale as read_timestamps: stop this
+                        // row group rather than risk spinning the reader on repeated errors.
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting raw column read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("column is not UInt64".into())?;
+                out.extend(arr.iter().flatten());
+            }
+            Ok(out)
+        });
+    match decode_result {
+        Ok(inner) => inner,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading raw column",
+            );
+            Err(format!(
+                "parquet decode panic reading raw column (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into())
+        }
+    }
+}
+
+fn read_counter_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_counter_values(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<u64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting counter read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or::<Box<dyn Error>>("counter column is not UInt64".into())?;
+                for v in arr.iter() {
+                    out.push(v); // preserve None so row indexing stays aligned with timestamps
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading counter",
+            );
+            return Err(format!(
+                "parquet decode panic reading counter (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into());
+        }
+    };
+    let mut out = out;
+    // Capacity equal to length, which is what the pool counts.
+    out.shrink_to_fit();
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_counter_values(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+fn read_gauge_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<i64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_gauge_values(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<i64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting gauge read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or::<Box<dyn Error>>("gauge column is not Int64".into())?;
+                for v in arr.iter() {
+                    out.push(v); // preserve None for row alignment
+                }
+            }
+            Ok(out)
+        });
+    let out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading gauge",
+            );
+            return Err(format!(
+                "parquet decode panic reading gauge (rg={rg_idx}, col={col_idx}): {panic_msg}"
+            )
+            .into());
+        }
+    };
+    let mut out = out;
+    // Capacity equal to length, which is what the pool counts.
+    out.shrink_to_fit();
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_gauge_values(key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+// ─── Counter reader ───────────────────────────────────────────────────────────
+
+/// Resolve one row's acquisition window, `base` being the raw row timestamp.
+///
+/// Precedence:
+/// 1. **Per-observation sidecar** `[base+begin, base+begin+width]` — the tight,
+///    per-metric window (`.rez` / live). `begin` may be negative; the start is
+///    saturated and clamped to 0 so a corrupt offset can't wrap or overflow.
+/// 2. **Fleet fallback** `[base, base+duration]` — when there is no sidecar but a
+///    snapshot `duration` is present, synthesize the coarse per-snapshot
+///    collection window (same `[begin, begin+elapsed]` shape the agent records).
+///    Lets windowless (older/plain-parquet) recordings still carry rate bands.
+/// 3. **Degenerate** `[base, base]` — neither sidecar nor duration available.
+pub fn resolve_window(
+    base: u64,
+    begin_off: Option<i64>,
+    width: Option<u64>,
+    duration: Option<u64>,
+) -> (u64, u64) {
+    match (begin_off, width) {
+        (Some(bo), Some(wd)) => {
+            let begin_ns = (base as i64).saturating_add(bo).max(0) as u64;
+            (begin_ns, begin_ns.saturating_add(wd))
+        }
+        _ => match duration {
+            Some(dur) => (base, base.saturating_add(dur)),
+            None => (base, base),
+        },
+    }
+}
+
+/// One counter column by schema position: the same rows, values and
+/// reconstructed windows [`read_counters`] produces for it, without the
+/// schema scan that finds it. For a reader that located the column at open
+/// and reads it back one segment at a time.
+/// Where a read gets one row group's columns: the whole group through the
+/// pool's per-column caches, or only the rows a page-index selection kept.
+enum RowSource {
+    Full,
+    Selected(HashMap<usize, arrow::array::ArrayRef>),
+}
+
+impl RowSource {
+    /// For a long read wanting `occupants`: the pruned rows of `cols` if
+    /// [`ParquetSource::occupant_selection`] says pruning is worth it.
+    fn for_occupants(
+        pf: &ParquetSource,
+        rg_idx: usize,
+        occupants: &[u64],
+        cols: impl IntoIterator<Item = Option<usize>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let Some(selection) = pf.occupant_selection(rg_idx, occupants) else {
+            return Ok(RowSource::Full);
+        };
+        let mut want: Vec<usize> = cols.into_iter().flatten().collect();
+        want.extend(pf.occupant_col());
+        Ok(RowSource::Selected(
+            pf.read_selected(rg_idx, &want, selection)?,
+        ))
+    }
+
+    fn timestamps(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_timestamps(pf, rg_idx, col),
+            RowSource::Selected(_) => self.u64s(pf, rg_idx, col),
+        }
+    }
+
+    fn u64s(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<u64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_counter_values_per_rg(pf, rg_idx, col),
+            RowSource::Selected(cols) => {
+                let a = cols.get(&col).ok_or("column not in the pruned read")?;
+                let a = a
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or("column is not UInt64")?;
+                Ok(Arc::new(a.iter().collect()))
+            }
+        }
+    }
+
+    fn i64s(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<i64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_gauge_values_per_rg(pf, rg_idx, col),
+            RowSource::Selected(cols) => {
+                let a = cols.get(&col).ok_or("column not in the pruned read")?;
+                let a = a
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("column is not Int64")?;
+                Ok(Arc::new(a.iter().collect()))
+            }
+        }
+    }
+
+    /// The row group's `occupant` column, when a group routes by occupant.
+    fn occupants(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        groups: &[ReadGroup],
+    ) -> Result<Option<Arc<Vec<Option<u64>>>>, Box<dyn Error>> {
+        match groups
+            .iter()
+            .find(|g| g.single.is_none())
+            .and_then(|g| g.occupant_col)
+        {
+            Some(c) => Ok(Some(self.u64s(pf, rg_idx, c)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// The occupants a long read wants, when every group routes by occupant.
+fn wanted_occupants(groups: &[ReadGroup]) -> Vec<u64> {
+    if groups.is_empty() || groups.iter().any(|g| g.single.is_some()) {
+        return Vec::new();
+    }
+    let mut v: Vec<u64> = groups
+        .iter()
+        .flat_map(|g| g.by_occupant.keys().copied())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Every column a grouped read touches, for a pruned decode.
+fn group_columns(groups: &[ReadGroup]) -> Vec<Option<usize>> {
+    groups
+        .iter()
+        .flat_map(|g| [Some(g.col_idx), g.begin_col, g.width_col])
+        .collect()
+}
+
+/// One physical column a read decodes, and which series its rows belong to.
+///
+/// In a wide file a column is one series. In a [long](crate::long) segment
+/// it is many, one per occupant, and a row belongs to the series of the
+/// occupant in the `occupant` column. Grouping by column is what keeps a
+/// long read linear in rows: the column is decoded once and each row is
+/// routed, rather than every series scanning every row.
+struct ReadGroup {
+    col_idx: usize,
+    begin_col: Option<usize>,
+    width_col: Option<usize>,
+    /// The series, when the column is one.
+    single: Option<usize>,
+    /// The series of each occupant, when the column is many.
+    by_occupant: HashMap<u64, usize>,
+    /// The long segment's `occupant` column.
+    occupant_col: Option<usize>,
+}
+
+impl ReadGroup {
+    /// The series row `row` belongs to, if any.
+    fn series(&self, occupants: Option<&[Option<u64>]>, row: usize) -> Option<usize> {
+        match self.single {
+            Some(i) => Some(i),
+            None => {
+                let occ = occupants?.get(row).copied().flatten()?;
+                self.by_occupant.get(&occ).copied()
+            }
+        }
+    }
+}
+
+/// Group `cols` (indices are series positions) by the column they read.
+fn plan_reads(pf: &ParquetSource, cols: &[ColDesc]) -> Vec<ReadGroup> {
+    let occupant_col = pf.occupant_col();
+    let mut groups: Vec<ReadGroup> = Vec::new();
+    let mut at: HashMap<usize, usize> = HashMap::new();
+    for (i, c) in cols.iter().enumerate() {
+        let g = *at.entry(c.col_idx).or_insert_with(|| {
+            groups.push(ReadGroup {
+                col_idx: c.col_idx,
+                begin_col: c.begin_col,
+                width_col: c.width_col,
+                single: None,
+                by_occupant: HashMap::new(),
+                occupant_col,
+            });
+            groups.len() - 1
+        });
+        match c.occupant {
+            None => groups[g].single = Some(i),
+            Some(occ) => {
+                groups[g].by_occupant.insert(occ, i);
+            }
+        }
+    }
+    groups
+}
+
+fn read_counter_column(
+    pf: &ParquetSource,
+    at: &crate::ColumnPosition,
+    start_ns: u64,
+    end_ns: u64,
+    selective: bool,
+) -> Result<crate::ColumnChunk, Box<dyn Error>> {
+    let (ts_col_idx, dur_col_idx) = pf.fixed_cols();
+    let ts_col_idx = ts_col_idx.ok_or("missing timestamp")?;
+    let col_idx = at.col_idx as usize;
+    let begin_col = at.begin_col.map(|i| i as usize);
+    let width_col = at.width_col.map(|i| i as usize);
+    let num_rgs = pf.meta.metadata().num_row_groups();
+    let mut timestamps: Vec<u64> = Vec::new();
+    let mut values: Vec<u64> = Vec::new();
+    let windowed = (begin_col.is_some() && width_col.is_some()) || dur_col_idx.is_some();
+    let mut windows: Option<Vec<(u64, u64)>> = windowed.then(Vec::new);
+
+    for rg_idx in 0..num_rgs {
+        match rg_classify(
+            pf.meta.metadata().row_group(rg_idx),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+        ) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        // In a long segment the column holds many series. Read only the
+        // pages that can hold this one's rows when that is worth it, and
+        // visit only its rows either way.
+        let src = match at.occupant.filter(|_| selective) {
+            Some(occ) => RowSource::for_occupants(
+                pf,
+                rg_idx,
+                &[occ],
+                [
+                    Some(ts_col_idx),
+                    Some(col_idx),
+                    begin_col,
+                    width_col,
+                    dur_col_idx,
+                ],
+            )?,
+            None => RowSource::Full,
+        };
+        let ts = src.timestamps(pf, rg_idx, ts_col_idx)?;
+        let vals = src.u64s(pf, rg_idx, col_idx)?;
+        let rows: Box<dyn Iterator<Item = usize>> = match (&src, at.occupant) {
+            (RowSource::Selected(_), Some(occ)) => {
+                let col = pf.occupant_col().ok_or("not a long segment")?;
+                let occupants = src.u64s(pf, rg_idx, col)?;
+                let mine: Vec<usize> = (0..occupants.len())
+                    .filter(|r| occupants[*r] == Some(occ))
+                    .collect();
+                Box::new(mine.into_iter())
+            }
+            (RowSource::Full, Some(occ)) => {
+                let index = pf.occupant_rows(rg_idx)?;
+                let Some(&(start, end)) = index.ranges.get(&occ) else {
+                    continue;
+                };
+                Box::new((start as usize..end as usize).map(move |i| index.rows[i] as usize))
+            }
+            (_, None) => Box::new(0..ts.len()),
+        };
+        let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        let begins = begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
+        let widths = width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        for row in rows {
+            let (Some(Some(base)), Some(Some(v))) = (ts.get(row), vals.get(row)) else {
+                continue;
+            };
+            let base = *base;
+            if base < start_ns || base > end_ns {
+                continue;
+            }
+            timestamps.push(base);
+            values.push(*v);
+            if let Some(w) = windows.as_mut() {
+                let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                let dur = durations
+                    .as_ref()
+                    .and_then(|d| d.get(row).copied())
+                    .flatten();
+                w.push(resolve_window(base, bo, wd, dur));
+            }
+        }
+    }
+    Ok(crate::ColumnChunk {
+        timestamps,
+        values,
+        windows,
+    })
+}
+
+/// Columns of every row group a range touches, decoded once, for a read of
+/// many series at a time (see `crate::batch_rate`). Besides the columns
+/// asked for it holds the timestamp column, and the duration and occupant
+/// columns where the file has them.
+pub struct BatchColumns {
+    pub batches: Vec<arrow::record_batch::RecordBatch>,
+    /// The schema index of each projected column, in batch order.
+    cols: Vec<usize>,
+    pub ts: usize,
+    pub duration: Option<usize>,
+    pub occupant: Option<usize>,
+}
+
+impl BatchColumns {
+    /// Column `col` (a schema index) of `batch` as `UInt64`.
+    pub fn u64s<'b>(
+        &self,
+        batch: &'b arrow::record_batch::RecordBatch,
+        col: usize,
+    ) -> Option<&'b UInt64Array> {
+        let at = self.cols.binary_search(&col).ok()?;
+        batch.column(at).as_any().downcast_ref::<UInt64Array>()
+    }
+
+    /// Column `col` (a schema index) of `batch` as `Int64`.
+    pub fn i64s<'b>(
+        &self,
+        batch: &'b arrow::record_batch::RecordBatch,
+        col: usize,
+    ) -> Option<&'b Int64Array> {
+        let at = self.cols.binary_search(&col).ok()?;
+        batch.column(at).as_any().downcast_ref::<Int64Array>()
+    }
+}
+
+/// Decode `cols` of every row group of `pf` that `[start_ns, end_ns]`
+/// touches, with the timestamp, duration and occupant columns. A batch that
+/// will not decode is an error: every projected column would lose its rows
+/// from there, where a single-column read loses only that column's.
+fn read_batch_columns(
+    pf: &ParquetSource,
+    cols: &[usize],
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<BatchColumns, Box<dyn Error>> {
+    let (ts, duration) = pf.fixed_cols();
+    let ts = ts.ok_or("missing timestamp")?;
+    let occupant = pf.occupant_col();
+    let mut all: Vec<usize> = cols.to_vec();
+    all.extend([Some(ts), duration, occupant].into_iter().flatten());
+    all.sort_unstable();
+    all.dedup();
+    let schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let mut batches = Vec::new();
+    for rg_idx in 0..pf.meta.metadata().num_row_groups() {
+        match rg_classify(pf.meta.metadata().row_group(rg_idx), ts, start_ns, end_ns) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let reader =
+            pf.build_batch_reader(rg_idx, ProjectionMask::roots(&schema, all.iter().copied()))?;
+        let decoded = catch_decode_panic(|| {
+            let mut out = Vec::new();
+            let mut failed = None;
+            for batch in reader {
+                match batch {
+                    Ok(b) => out.push(b),
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+            (out, failed)
+        });
+        match decoded {
+            Ok((_, Some(e))) => {
+                return Err(format!("parquet error in a batch read (rg={rg_idx}): {e}").into())
+            }
+            Ok((out, None)) => batches.extend(out),
+            Err(panic) => {
+                return Err(
+                    format!("parquet decode panic in a batch read (rg={rg_idx}): {panic}").into(),
+                )
+            }
+        }
+    }
+    Ok(BatchColumns {
+        batches,
+        cols: all,
+        ts,
+        duration,
+        occupant,
+    })
+}
+
+fn read_counters(
+    pf: &ParquetSource,
+    name: &str,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Counters, Box<dyn Error>> {
+    let ts_col_idx = pf
+        .meta
+        .schema()
+        .index_of("timestamp")
+        .map_err(|_| "missing timestamp")?;
+    // PROTOTYPE (duration fallback): the snapshot-level collection window. When a
+    // metric has no per-observation :window_* sidecar, we synthesize a coarse
+    // fleet window [timestamp, timestamp + duration] from this column — the same
+    // [begin, begin+elapsed] formula the agent uses, just per-snapshot. Lets old
+    // (windowless) recordings carry rate() uncertainty.
+    let dur_col_idx = pf.meta.schema().index_of("duration").ok();
+    let num_rgs = pf.meta.metadata().num_row_groups();
+
+    let cols: Vec<ColDesc> = pf
+        .columns()
+        .iter()
+        .filter(|c| {
+            matches!(c.kind, ColKind::Counter)
+                && c.name == name
+                && (filter.inner.is_empty() || c.labels.matches(filter))
+        })
+        .cloned()
+        .collect();
+    if cols.is_empty() {
+        return Ok(Counters { series: vec![] });
+    }
+    let groups = plan_reads(pf, &cols);
+    let wanted = wanted_occupants(&groups);
+
+    let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    // Reconstruct windows when a metric carries sidecars OR a duration column
+    // exists to synthesize the fleet fallback.
+    let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
+        .iter()
+        .map(|c| {
+            if (c.begin_col.is_some() && c.width_col.is_some()) || dur_col_idx.is_some() {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for rg_idx in 0..num_rgs {
+        match rg_classify(
+            pf.meta.metadata().row_group(rg_idx),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+        ) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let src = RowSource::for_occupants(
+            pf,
+            rg_idx,
+            &wanted,
+            group_columns(&groups)
+                .into_iter()
+                .chain([Some(ts_col_idx), dur_col_idx]),
+        )?;
+        let timestamps = src.timestamps(pf, rg_idx, ts_col_idx)?;
+        // Window offsets were written by the recorder relative to the row's
+        // own timestamp, which is what `read_timestamps` now returns — so the
+        // column this reconstructs windows against and the column the point is
+        // emitted at are the same one. They were not while the read path
+        // snapped, which is why this used to decode the column a second time.
+        // Per-snapshot collection duration for the fleet fallback window.
+        let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        let occupants = src.occupants(pf, rg_idx, &groups)?;
+        for g in &groups {
+            let values = src.u64s(pf, rg_idx, g.col_idx)?;
+            debug_assert_eq!(
+                values.len(),
+                timestamps.len(),
+                "row count mismatch in row group"
+            );
+            let begins = g.begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
+            let widths = g.width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
+                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+                    let base = *ts;
+                    if base >= start_ns && base <= end_ns {
+                        let Some(i) = g.series(occupants.as_ref().map(|o| o.as_slice()), row)
+                        else {
+                            continue;
+                        };
+                        // One timestamp, both modes: the row's own. `raw`
+                        // still selects point PLACEMENT in the streaming
+                        // layer (see `Placement`), but there is no longer a
+                        // second, rounded timestamp for it to choose between.
+                        ts_acc[i].push(base);
+                        val_acc[i].push(*v);
+                        if let Some(w) = win_acc[i].as_mut() {
+                            let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                            let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                            let dur = durations
+                                .as_ref()
+                                .and_then(|d| d.get(row).copied())
+                                .flatten();
+                            w.push(resolve_window(base, bo, wd, dur));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Counters {
+        series: cols
+            .into_iter()
+            .zip(ts_acc)
+            .zip(val_acc)
+            .zip(win_acc)
+            .filter(|(((_, ts), _), _)| !ts.is_empty())
+            .map(|(((col, timestamps), values), windows)| Counter {
+                labels: col.labels,
+                timestamps,
+                values,
+                windows,
+            })
+            .collect(),
+    })
+}
+
+// ─── Gauge reader ─────────────────────────────────────────────────────────────
+
+fn read_gauges(
+    pf: &ParquetSource,
+    name: &str,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Gauges, Box<dyn Error>> {
+    let ts_col_idx = pf
+        .meta
+        .schema()
+        .index_of("timestamp")
+        .map_err(|_| "missing timestamp")?;
+    // Snapshot collection duration for the fleet fallback window (see read_counters).
+    let dur_col_idx = pf.meta.schema().index_of("duration").ok();
+    let num_rgs = pf.meta.metadata().num_row_groups();
+
+    let cols: Vec<ColDesc> = pf
+        .columns()
+        .iter()
+        .filter(|c| {
+            matches!(c.kind, ColKind::Gauge)
+                && c.name == name
+                && (filter.inner.is_empty() || c.labels.matches(filter))
+        })
+        .cloned()
+        .collect();
+    if cols.is_empty() {
+        return Ok(Gauges { series: vec![] });
+    }
+    let groups = plan_reads(pf, &cols);
+    let wanted = wanted_occupants(&groups);
+
+    let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut val_acc: Vec<Vec<i64>> = vec![Vec::new(); cols.len()];
+    let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
+        .iter()
+        .map(|c| {
+            if (c.begin_col.is_some() && c.width_col.is_some()) || dur_col_idx.is_some() {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for rg_idx in 0..num_rgs {
+        match rg_classify(
+            pf.meta.metadata().row_group(rg_idx),
+            ts_col_idx,
+            start_ns,
+            end_ns,
+        ) {
+            RgClass::Before | RgClass::After => continue,
+            _ => {}
+        }
+        let src = RowSource::for_occupants(
+            pf,
+            rg_idx,
+            &wanted,
+            group_columns(&groups)
+                .into_iter()
+                .chain([Some(ts_col_idx), dur_col_idx]),
+        )?;
+        let timestamps = src.timestamps(pf, rg_idx, ts_col_idx)?;
+        // See read_counters: the window anchor and the emitted point are the
+        // same timestamp now that nothing rounds it.
+        let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+        let occupants = src.occupants(pf, rg_idx, &groups)?;
+        for g in &groups {
+            let values = src.i64s(pf, rg_idx, g.col_idx)?;
+            debug_assert_eq!(
+                values.len(),
+                timestamps.len(),
+                "row count mismatch in row group"
+            );
+            let begins = g.begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
+            let widths = g.width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
+            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
+                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+                    let base = *ts;
+                    if base >= start_ns && base <= end_ns {
+                        let Some(i) = g.series(occupants.as_ref().map(|o| o.as_slice()), row)
+                        else {
+                            continue;
+                        };
+                        // One timestamp, both modes: the row's own. `raw`
+                        // still selects point PLACEMENT in the streaming
+                        // layer (see `Placement`), but there is no longer a
+                        // second, rounded timestamp for it to choose between.
+                        ts_acc[i].push(base);
+                        val_acc[i].push(*v);
+                        if let Some(w) = win_acc[i].as_mut() {
+                            let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
+                            let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
+                            let dur = durations
+                                .as_ref()
+                                .and_then(|d| d.get(row).copied())
+                                .flatten();
+                            w.push(resolve_window(base, bo, wd, dur));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Gauges {
+        series: cols
+            .into_iter()
+            .zip(ts_acc)
+            .zip(val_acc)
+            .zip(win_acc)
+            .filter(|(((_, ts), _), _)| !ts.is_empty())
+            .map(|(((col, timestamps), values), windows)| Gauge {
+                labels: col.labels,
+                timestamps,
+                values,
+                windows,
+            })
+            .collect(),
+    })
+}
+
+// ─── Histogram cursor ─────────────────────────────────────────────────────────
+
+/// Streams histogram rows from a parquet file one row group at a time.
+/// Assumes row groups appear in chronological timestamp order, which
+/// metriken-exposition guarantees. Rows within each row group are sorted
+/// by (timestamp, series_idx) before being buffered.
+struct ParquetHistogramCursor {
+    pf: Arc<ParquetSource>,
+    ts_col_idx: usize,
+    start_ns: u64,
+    end_ns: u64,
+    /// The columns to decode and the series their rows belong to, indexing
+    /// the pre-filtered histogram columns for this metric (series order).
+    groups: Vec<ReadGroup>,
+    /// In a long segment, the occupants this stream reads, for pruning.
+    wanted: Vec<u64>,
+    /// Overlapping row group indices remaining to process.
+    rg_queue: std::collections::VecDeque<usize>,
+    /// Buffered rows from the current row group (sorted, ready to yield).
+    pending: std::collections::VecDeque<HistogramRow>,
+}
+
+impl ParquetHistogramCursor {
+    /// Load the next overlapping row group into `self.pending`.
+    /// Returns false if no more row groups remain.
+    fn fill_next_rg(&mut self) -> bool {
+        while let Some(rg_idx) = self.rg_queue.pop_front() {
+            // A long read of few occupants decodes only their pages.
+            let Ok(src) = RowSource::for_occupants(
+                &self.pf,
+                rg_idx,
+                &self.wanted,
+                group_columns(&self.groups)
+                    .into_iter()
+                    .chain([Some(self.ts_col_idx)]),
+            ) else {
+                continue;
+            };
+            let Ok(timestamps) = src.timestamps(&self.pf, rg_idx, self.ts_col_idx) else {
+                continue;
+            };
+
+            let mut rg_rows: Vec<HistogramRow> = Vec::new();
+            let Ok(occupants) = src.occupants(&self.pf, rg_idx, &self.groups) else {
+                continue;
+            };
+
+            for g in &self.groups {
+                let key = CacheKey {
+                    source_id: self.pf.id,
+                    column_idx: g.col_idx,
+                    row_group_idx: rg_idx,
+                };
+
+                let snapshots: Arc<Vec<Option<HistogramSnapshot>>> =
+                    if let RowSource::Selected(cols) = &src {
+                        match cols
+                            .get(&g.col_idx)
+                            .and_then(|a| a.as_any().downcast_ref::<ListArray>())
+                        {
+                            Some(list) => Arc::new(snapshots_of(list)),
+                            None => continue,
+                        }
+                    } else if let Some(pool) = &self.pf.pool {
+                        if let Some(cached) = pool.get_histogram_snapshots(key) {
+                            cached
+                        } else {
+                            let decoded = Arc::new(self.decode_histogram_column(rg_idx, g.col_idx));
+                            pool.put_histogram_snapshots(key, Arc::clone(&decoded));
+                            decoded
+                        }
+                    } else {
+                        Arc::new(self.decode_histogram_column(rg_idx, g.col_idx))
+                    };
+
+                for (row, (ts_opt, snap)) in timestamps.iter().zip(snapshots.iter()).enumerate() {
+                    let (Some(ts), Some(snap)) = (ts_opt, snap) else {
+                        continue;
+                    };
+                    if *ts < self.start_ns || *ts > self.end_ns {
+                        continue;
+                    }
+                    let Some(si) = g.series(occupants.as_ref().map(|o| o.as_slice()), row) else {
+                        continue;
+                    };
+                    rg_rows.push(HistogramRow {
+                        series_idx: si,
+                        timestamp: *ts,
+                        snapshot: snap.clone(),
+                    });
+                }
+            }
+
+            if !rg_rows.is_empty() {
+                rg_rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+                self.pending.extend(rg_rows);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Decode all rows for one histogram column in one row group.
+    /// Returns an empty Vec on panic or read error (the streaming operator
+    /// will then see no data for that column in that row group).
+    fn decode_histogram_column(
+        &self,
+        rg_idx: usize,
+        col_idx: usize,
+    ) -> Vec<Option<HistogramSnapshot>> {
+        let parquet_schema = self.pf.meta.metadata().file_metadata().schema_descr_ptr();
+        let Ok(reader) = self
+            .pf
+            .build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))
+        else {
+            return Vec::new();
+        };
+
+        let rg_idx_captured = rg_idx;
+        let col_idx_captured = col_idx;
+        let source_id_captured = self.pf.id;
+        let decode_result = catch_decode_panic(|| {
+            let mut out = Vec::new();
+            reserve_rows(
+                &mut out,
+                self.pf.meta.metadata().row_group(rg_idx).num_rows(),
+            );
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx = rg_idx_captured,
+                            col_idx = col_idx_captured,
+                            source_id = source_id_captured,
+                            error = %e,
+                            "aborting histogram read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let list = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("histogram column is not List");
+                out.extend(snapshots_of(list));
+            }
+            out
+        });
+
+        match decode_result {
+            Ok(mut out) => {
+                out.shrink_to_fit();
+                out
+            }
+            Err(panic_msg) => {
+                tracing::error!(
+                    rg_idx,
+                    col_idx,
+                    source_id = self.pf.id,
+                    panic = %panic_msg,
+                    "parquet decode panic reading histogram; returning empty data for this row group",
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+impl Iterator for ParquetHistogramCursor {
+    type Item = HistogramRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Some(row);
+            }
+            if !self.fill_next_rg() {
+                return None;
+            }
+        }
+    }
+}
+
+// ─── Histogram snapshot helper ────────────────────────────────────────────────
+
+/// One snapshot per row of a histogram list column; `None` for a null cell.
+///
+/// A null cell is a row where the series has no value (a wide table's column
+/// for a member absent that tick), not a histogram of zeros. Reading it as
+/// zeros made the series' next value count as an increase from zero, so a
+/// member's first reading was counted in full or not at all depending on
+/// whether an earlier row of the same segment held a null for it.
+fn snapshots_of(list: &ListArray) -> Vec<Option<HistogramSnapshot>> {
+    list.iter()
+        .map(|value| {
+            value.and_then(|lv| {
+                lv.as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .map(raw_to_sparse_cumulative)
+            })
+        })
+        .collect()
+}
+
+/// Convert a raw bucket array (individual counts per bucket) into a
+/// sparse cumulative prefix-sum snapshot. Only non-zero buckets are stored.
+fn raw_to_sparse_cumulative(arr: &UInt64Array) -> HistogramSnapshot {
+    let mut index = Vec::new();
+    let mut count = Vec::new();
+    let mut running = 0u64;
+    for (i, v) in arr.iter().enumerate() {
+        let v = v.unwrap_or(0);
+        if v > 0 {
+            running = running.saturating_add(v);
+            index.push(i as u32);
+            count.push(running);
+        }
+    }
+    HistogramSnapshot { index, count }
+}
+
+#[cfg(test)]
+mod occupant_rows_tests {
+    use super::*;
+
+    /// Each occupant's rows, ascending, from one flat vector.
+    #[test]
+    fn rows_are_grouped_by_occupant_in_order() {
+        let occupants = [Some(7), Some(3), None, Some(7), Some(3), Some(9), Some(7)];
+        let index = OccupantRows::build(&occupants);
+        assert_eq!(index.get(&7), Some(&[0u32, 3, 6][..]));
+        assert_eq!(index.get(&3), Some(&[1u32, 4][..]));
+        assert_eq!(index.get(&9), Some(&[5u32][..]));
+        assert_eq!(index.get(&1), None);
+        assert_eq!(index.rows.len(), 6);
+    }
+
+    /// Without a pool, a long segment's index is built from its occupant
+    /// column.
+    #[test]
+    fn without_a_pool_the_index_is_built() {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new(crate::long::OCCUPANT_COLUMN, DataType::UInt64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 1, 2, 2])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![5u64, 6, 5, 6])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                crate::long::LAYOUT_KEY.to_string(),
+                crate::long::LAYOUT_LONG.to_string(),
+            )]))
+            .build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let src = ParquetSource::open_bytes(buf.into()).unwrap();
+        assert!(src.pool.is_none());
+        let index = src.occupant_rows(0).unwrap();
+        assert_eq!(index.get(&5), Some(&[0u32, 2][..]));
+        assert_eq!(index.get(&6), Some(&[1u32, 3][..]));
+    }
+
+    /// A footer's row count that is negative or huge reserves at most
+    /// `RESERVE_ROWS_MAX` rather than failing.
+    #[test]
+    fn a_corrupt_row_count_reserves_nothing() {
+        for rows in [-1i64, i64::MAX, 1 << 60] {
+            let mut v: Vec<Option<u64>> = Vec::new();
+            reserve_rows(&mut v, rows);
+            assert!(v.capacity() <= RESERVE_ROWS_MAX, "{rows}: {}", v.capacity());
+        }
+    }
+
+    /// A column decoded for the pool has no spare capacity, whatever the
+    /// number of batches it was read in.
+    #[test]
+    fn a_decoded_column_is_sized_to_its_row_group() {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::UInt64, true)]));
+        let values: Vec<u64> = (0..20_000).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(values)) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let pool = BufferPool::new(64 << 20);
+        let src = ParquetSource::open_bytes_with_pool_id(buf.into(), pool, 1).unwrap();
+        let col = read_counter_values_per_rg(&src, 0, 0).unwrap();
+        assert_eq!(col.len(), 20_000);
+        assert_eq!(col.capacity(), col.len());
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::metadata::KeyValue;
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+
+    /// Minimal parquet writer for timestamp-jitter tests: a `timestamp`
+    /// UInt64 column set to exactly `raw` (no grid alignment) plus one dummy
+    /// gauge column, mirroring the schema shape `FixtureBuilder` produces but
+    /// without its "timestamp = tick * interval" grid assumption.
+    fn build_parquet_with_timestamps(raw: &[u64], sampling_interval_ms: u64) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("dummy_gauge", DataType::Int64, true).with_metadata(HashMap::from([
+                ("metric".to_string(), "dummy_gauge".to_string()),
+                ("metric_type".to_string(), "gauge".to_string()),
+            ])),
+        ]));
+
+        let kv = vec![KeyValue {
+            key: "sampling_interval_ms".to_string(),
+            value: Some(sampling_interval_ms.to_string()),
+        }];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_key_value_metadata(Some(kv))
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+
+        let ts_array = Arc::new(UInt64Array::from(raw.to_vec())) as ArrayRef;
+        let gauge_array = Arc::new(Int64Array::from(vec![0i64; raw.len()])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ts_array, gauge_array]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// The parsed schema is computed once per source and reused.
+    ///
+    /// Every "for each metric name" loop -- `total_series_count`, `has_metric`,
+    /// a dashboard deciding which service templates a recording needs -- goes
+    /// through a per-name lookup, and each lookup used to re-walk every field
+    /// in the file. That made those loops O(names x columns): ~540ms on a real
+    /// 950-column recording, paid per call with nothing memoised.
+    ///
+    /// Slice identity is the assertion because it proves the parse did not
+    /// repeat; a timing budget would be flaky on a loaded machine.
+    #[test]
+    fn the_parsed_schema_is_parsed_once() {
+        let bytes = build_parquet_with_timestamps(&[1_000_000_000, 2_000_000_000], 1000);
+        let source = ParquetSource::open_bytes(bytes.into()).expect("fixture parquet is valid");
+
+        let first = source.columns().as_ptr();
+        let second = source.columns().as_ptr();
+        assert_eq!(
+            first, second,
+            "columns() re-parsed the schema instead of reusing the cached parse"
+        );
+
+        // The cached parse still answers the questions built on it.
+        assert_eq!(
+            source.names_of(|k| matches!(k, ColKind::Gauge)),
+            vec!["dummy_gauge".to_string()]
+        );
+        assert_eq!(
+            source.labels_of("dummy_gauge", |k| matches!(k, ColKind::Gauge)),
+            vec![std::collections::BTreeMap::new()]
+        );
+    }
+
+    /// A parquet with no `timestamp` column at all.
+    ///
+    /// This is the one case where the call sites disagree. They all resolve
+    /// the same column -- `index_of("timestamp")` -- but differ in what they
+    /// do when it is missing: the readers bail (`.ok()?`,
+    /// `.map_err(..)?`) while the schema helpers fall back to `usize::MAX`.
+    /// The cache uses the fallback, and `parse_schema` spends the index
+    /// solely on skipping that column, so the sites that would have
+    /// disagreed never reach the cached parse -- they return before touching
+    /// it. This pins that reasoning.
+    #[test]
+    fn a_source_with_no_timestamp_column_still_parses_and_reads_nothing() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "lonely_gauge",
+            DataType::Int64,
+            true,
+        )
+        .with_metadata(HashMap::from([
+            ("metric".to_string(), "lonely_gauge".to_string()),
+            ("metric_type".to_string(), "gauge".to_string()),
+        ]))]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2])) as ArrayRef],
+        )
+        .unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let source = ParquetSource::open_bytes(buf.into()).expect("a parquet without a timestamp");
+
+        // The schema helpers see the column, because nothing was skipped.
+        assert_eq!(
+            source.names_of(|k| matches!(k, ColKind::Gauge)),
+            vec!["lonely_gauge".to_string()]
+        );
+        // And the cache is still a cache.
+        assert_eq!(source.columns().as_ptr(), source.columns().as_ptr());
+
+        // The readers bail before they would consult it.
+        assert!(read_gauges(&source, "lonely_gauge", &Labels::default(), 0, u64::MAX).is_err());
+    }
+}

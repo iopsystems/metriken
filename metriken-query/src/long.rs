@@ -1,130 +1,7 @@
-//! The long segment layout, read. The format is `metriken-storage`'s
-//! ([`metriken_storage::long`]), re-exported here so existing paths keep
-//! working; this module adds the reader's side of an occupant's labels,
-//! [`OccupantLabels`].
+//! The long segment layout and the reader's occupant relabel
+//! ([`OccupantLabels`]), from `metriken-storage`.
 
 pub use metriken_storage::long::*;
-
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-use crate::labels::Labels;
-use crate::segmented::{ColumnRelabel, Run};
-
-/// Puts each occupant's labels on its series: a long table's series carry
-/// only [`OCCUPANT_LABEL`] and the metric column's fixed labels, and this is
-/// metriken-query's hook for the rest.
-///
-/// An occupant never changes labels, so a series is one run. The occupant
-/// number stays on the series: two occupants can share every other label
-/// (a recording with no `__uid__`), and it keeps them apart. It is internal
-/// by the `__` rule, so listings and legends hide it.
-pub struct OccupantLabels {
-    labels: HashMap<u64, BTreeMap<String, String>>,
-    /// Every key in the rows this was built from. A query filter on one of these cannot
-    /// be answered by the columns, so it is taken off the segment filter and
-    /// applied to the relabelled series.
-    keys: BTreeSet<String>,
-}
-
-impl OccupantLabels {
-    /// From an occupant stream's rows. An occupant restated with the same
-    /// labels is one entry; restated with different ones is a defect of the
-    /// writer, and the first labels win.
-    pub fn new(rows: impl IntoIterator<Item = metriken_storage::occupants::Occupant>) -> Self {
-        let mut labels: HashMap<u64, BTreeMap<String, String>> = HashMap::new();
-        let mut keys = BTreeSet::new();
-        for o in rows {
-            keys.extend(o.labels.keys().cloned());
-            labels.entry(o.occupant).or_insert(o.labels);
-        }
-        Self { labels, keys }
-    }
-
-    pub fn len(&self) -> usize {
-        self.labels.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.labels.is_empty()
-    }
-
-    fn with(&self, labels: &Labels) -> Option<Labels> {
-        let occ: u64 = labels.inner.get(OCCUPANT_LABEL)?.parse().ok()?;
-        let extra = self.labels.get(&occ)?;
-        let mut out = labels.clone();
-        for (k, v) in extra {
-            out.inner.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        Some(out)
-    }
-}
-
-impl ColumnRelabel for OccupantLabels {
-    /// Returns true: an occupant's labels do not change, and each occupant
-    /// column presents as one label set for all its samples. A segment
-    /// naming an occupant the stream does not describe saves no state
-    /// (see [`SegmentedParquetReader::handover`](crate::SegmentedParquetReader::handover)).
-    fn identities_are_fixed(&self) -> bool {
-        true
-    }
-
-    fn identities(&self, _name: &str, labels: &Labels) -> Option<Vec<Labels>> {
-        self.with(labels).map(|l| vec![l])
-    }
-
-    fn split(&self, _name: &str, labels: &Labels, timestamps: &[u64]) -> Option<Vec<Run>> {
-        self.with(labels).map(|l| vec![(l, 0..timestamps.len())])
-    }
-
-    fn at(&self, _name: &str, labels: &Labels, _timestamp: u64) -> Option<Labels> {
-        self.with(labels)
-    }
-
-    fn segment_filter(&self, _name: &str, filter: &Labels) -> Labels {
-        let mut f = filter.clone();
-        f.inner.retain(|k, _| !self.keys.contains(k));
-        f
-    }
-}
-
-#[cfg(test)]
-mod relabel_tests {
-    use super::*;
-    use metriken_storage::occupants::Occupant;
-
-    fn occ(n: u64, pairs: &[(&str, &str)]) -> Occupant {
-        Occupant {
-            occupant: n,
-            labels: pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn the_relabel_adds_an_occupants_labels_and_keeps_its_number() {
-        let r = OccupantLabels::new([occ(5, &[("comm", "w"), ("id", "3")])]);
-        let col = Labels::from([(OCCUPANT_LABEL, "5"), ("state", "user")]);
-        let got = r.identities("cpu", &col).unwrap();
-        assert_eq!(
-            got,
-            vec![Labels::from([
-                (OCCUPANT_LABEL, "5"),
-                ("state", "user"),
-                ("comm", "w"),
-                ("id", "3")
-            ])]
-        );
-        // An occupant the stream does not know is left alone.
-        assert!(r
-            .identities("cpu", &Labels::from([(OCCUPANT_LABEL, "6")]))
-            .is_none());
-        // Filters on occupant keys come off the segment filter.
-        let f = r.segment_filter("cpu", &Labels::from([("comm", "w"), ("state", "user")]));
-        assert_eq!(f, Labels::from([("state", "user")]));
-    }
-}
 
 /// The reader over long segments: every query a long table answers must
 /// equal what the wide table it replaces answers, when the wide columns
@@ -145,7 +22,8 @@ mod reader_tests {
 
     use super::*;
     use crate::segmented::{ColumnRelabel, InMemorySegments, Run, SegmentedParquetReader};
-    use crate::{BufferPool, Labels, MetricsSource};
+    use crate::MetricsSource;
+    use crate::{BufferPool, Labels};
 
     const GP: u8 = 2;
     const MVP: u8 = 8;

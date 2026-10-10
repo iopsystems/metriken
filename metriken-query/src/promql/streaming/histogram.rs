@@ -38,10 +38,64 @@ type GroupBands = Vec<Vec<Option<Band>>>;
 
 // ─── impl HistogramStream ────────────────────────────────────────────────────
 
-impl HistogramStream {
+/// The histogram operators, over a source's histogram row stream.
+pub(crate) trait HistogramOps: Sized {
     /// Compute quantiles over `[start_ns, end_ns]`. Returns one `MatrixSample`
     /// per requested quantile (labeled `quantile: <q>`).
-    pub fn quantiles(
+    fn quantiles(
+        self,
+        quantiles_in: &[f64],
+        start_ns: u64,
+        end_ns: u64,
+        stride_ns: Option<u64>,
+        metric_name: &str,
+    ) -> Vec<MatrixSample>;
+
+    fn mean(
+        self,
+        group_by: GroupBy<'_>,
+        start_ns: u64,
+        end_ns: u64,
+        stride_ns: Option<u64>,
+        metric_name: &str,
+    ) -> Vec<MatrixSample>;
+
+    fn count(
+        self,
+        group_by: GroupBy<'_>,
+        start_ns: u64,
+        end_ns: u64,
+        stride_ns: Option<u64>,
+        metric_name: &str,
+    ) -> Vec<MatrixSample>;
+
+    fn sum(
+        self,
+        group_by: GroupBy<'_>,
+        start_ns: u64,
+        end_ns: u64,
+        stride_ns: Option<u64>,
+        metric_name: &str,
+    ) -> Vec<MatrixSample>;
+
+    fn irate(
+        self,
+        group_by: GroupBy<'_>,
+        start_ns: u64,
+        end_ns: u64,
+        metric_name: &str,
+    ) -> Vec<MatrixSample>;
+
+    fn heatmap(
+        self,
+        start_ns: u64,
+        end_ns: u64,
+        stride_ns: Option<u64>,
+    ) -> Option<HistogramHeatmapResult>;
+}
+
+impl HistogramOps for HistogramStream {
+    fn quantiles(
         self,
         quantiles_in: &[f64],
         start_ns: u64,
@@ -52,7 +106,7 @@ impl HistogramStream {
         quantiles_impl(self, quantiles_in, start_ns, end_ns, stride_ns, metric_name)
     }
 
-    pub fn mean(
+    fn mean(
         self,
         group_by: GroupBy<'_>,
         start_ns: u64,
@@ -83,7 +137,7 @@ impl HistogramStream {
         )
     }
 
-    pub fn count(
+    fn count(
         self,
         group_by: GroupBy<'_>,
         start_ns: u64,
@@ -107,7 +161,7 @@ impl HistogramStream {
         )
     }
 
-    pub fn sum(
+    fn sum(
         self,
         group_by: GroupBy<'_>,
         start_ns: u64,
@@ -135,7 +189,7 @@ impl HistogramStream {
         )
     }
 
-    pub fn irate(
+    fn irate(
         self,
         group_by: GroupBy<'_>,
         start_ns: u64,
@@ -145,7 +199,7 @@ impl HistogramStream {
         irate_impl(self, group_by, start_ns, end_ns, metric_name)
     }
 
-    pub fn heatmap(
+    fn heatmap(
         self,
         start_ns: u64,
         end_ns: u64,

@@ -10,7 +10,7 @@ use crate::labels::Labels;
 use crate::parquet::BatchColumns;
 
 /// A matched series.
-pub(crate) struct ScanSeries {
+pub struct ScanSeries {
     /// Its labels after relabelling.
     pub labels: Labels,
     /// Whether its first column carries acquisition-window columns.
@@ -18,7 +18,7 @@ pub(crate) struct ScanSeries {
 }
 
 /// Which series each row of a read column is.
-pub(crate) enum RowSeries {
+pub enum RowSeries {
     /// Every row is this series (a wide column).
     One(u32),
     /// Row `r` is series `v[r]`, or none when `u32::MAX` (a long column, by
@@ -27,14 +27,14 @@ pub(crate) enum RowSeries {
 }
 
 /// A read column's schema positions in its segment.
-pub(crate) struct ScanColumn {
+pub struct ScanColumn {
     pub values: usize,
     pub begin: Option<usize>,
     pub width: Option<usize>,
 }
 
 /// One segment's decoded columns.
-pub(crate) struct ScanSegment {
+pub struct ScanSegment {
     pub columns: BatchColumns,
     pub cols: Vec<ScanColumn>,
     /// Per batch, per entry of `cols`.
@@ -42,7 +42,7 @@ pub(crate) struct ScanSegment {
 }
 
 /// Up to `n` segments, decoded.
-pub(crate) struct ScanChunk {
+pub struct ScanChunk {
     /// The chunk's segments that the store still has, in time order.
     pub segments: Vec<ScanSegment>,
     /// The earliest catalog start of every segment after this chunk; `None`
@@ -53,10 +53,10 @@ pub(crate) struct ScanChunk {
 /// A segment could not be read. The engine discards the scan and evaluates
 /// the query per series.
 #[derive(Debug)]
-pub(crate) struct ScanError;
+pub struct ScanError;
 
 /// Where a scan's chunks come from.
-pub(crate) trait ChunkReader {
+pub trait ChunkReader {
     /// The next up to `n` segments, or `None` when none remain.
     fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError>;
 }
@@ -65,7 +65,7 @@ pub(crate) trait ChunkReader {
 /// segments in time order, and a series has at most one column per segment,
 /// so each series' samples arrive in increasing time; `SeriesRate` requires
 /// it.
-pub(crate) struct CounterScan<'a> {
+pub struct CounterScan<'a> {
     pub series: Vec<ScanSeries>,
     reader: Box<dyn ChunkReader + 'a>,
 }

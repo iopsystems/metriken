@@ -1091,15 +1091,21 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "foldhash 0.2.0",
  "histogram",
+ "lru",
  "metriken",
  "metriken-model",
+ "metriken-query",
  "metriken-types",
  "parquet",
  "rmp",
  "rmp-serde",
  "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]

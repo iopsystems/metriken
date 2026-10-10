@@ -22,7 +22,7 @@ use crate::types::HistogramSnapshot;
 
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) fn next_source_id() -> u64 {
+pub fn next_source_id() -> u64 {
     NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn next_source_id() -> u64 {
 /// bits. XXH3 is not collision-resistant against chosen inputs; the seed
 /// keeps a file crafted elsewhere from colliding with a known segment's id
 /// in this process.
-pub(crate) fn content_source_id(bytes: &[u8]) -> u64 {
+pub fn content_source_id(bytes: &[u8]) -> u64 {
     static SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
         use std::hash::BuildHasher;
         std::collections::hash_map::RandomState::new().hash_one(0u8)
@@ -78,7 +78,7 @@ pub struct BufferPoolStats {
 
 /// Identifies a single decoded column block within a parquet source.
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
-pub(crate) struct CacheKey {
+pub struct CacheKey {
     pub source_id: u64,
     pub column_idx: usize,
     pub row_group_idx: usize,
@@ -96,7 +96,7 @@ struct CachedEntry {
 /// distinction from the parquet column, keeping row alignment with the
 /// timestamp column consistent.
 #[derive(Clone)]
-pub(crate) enum Block {
+pub enum Block {
     Timestamps(Arc<Vec<Option<u64>>>),
     CounterValues(Arc<Vec<Option<u64>>>),
     GaugeValues(Arc<Vec<Option<i64>>>),
@@ -151,7 +151,7 @@ impl BufferPool {
 
     // ─── Timestamp column ────────────────────────────────────────────────────
 
-    pub(crate) fn get_timestamps(&self, key: CacheKey) -> Option<Arc<Vec<Option<u64>>>> {
+    pub fn get_timestamps(&self, key: CacheKey) -> Option<Arc<Vec<Option<u64>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
             if let Block::Timestamps(v) = &entry.data {
@@ -168,7 +168,7 @@ impl BufferPool {
         result
     }
 
-    pub(crate) fn put_timestamps(&self, key: CacheKey, data: Arc<Vec<Option<u64>>>) {
+    pub fn put_timestamps(&self, key: CacheKey, data: Arc<Vec<Option<u64>>>) {
         // Vec<Option<u64>>: 16 bytes per element on x86_64 (None + discriminant)
         let size = data.len() * std::mem::size_of::<Option<u64>>();
         self.put(key, Block::Timestamps(data), size);
@@ -176,7 +176,7 @@ impl BufferPool {
 
     // ─── Counter value column ────────────────────────────────────────────────
 
-    pub(crate) fn get_counter_values(&self, key: CacheKey) -> Option<Arc<Vec<Option<u64>>>> {
+    pub fn get_counter_values(&self, key: CacheKey) -> Option<Arc<Vec<Option<u64>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
             if let Block::CounterValues(v) = &entry.data {
@@ -193,16 +193,13 @@ impl BufferPool {
         result
     }
 
-    pub(crate) fn put_counter_values(&self, key: CacheKey, data: Arc<Vec<Option<u64>>>) {
+    pub fn put_counter_values(&self, key: CacheKey, data: Arc<Vec<Option<u64>>>) {
         let size = data.len() * std::mem::size_of::<Option<u64>>();
         self.put(key, Block::CounterValues(data), size);
     }
 
     /// A value derived from a row group, cached and counted like a column.
-    pub(crate) fn get_derived<T: std::any::Any + Send + Sync>(
-        &self,
-        key: CacheKey,
-    ) -> Option<Arc<T>> {
+    pub fn get_derived<T: std::any::Any + Send + Sync>(&self, key: CacheKey) -> Option<Arc<T>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| match &entry.data {
             Block::Derived(v) => Arc::clone(v).downcast::<T>().ok(),
@@ -216,7 +213,7 @@ impl BufferPool {
         result
     }
 
-    pub(crate) fn put_derived<T: std::any::Any + Send + Sync>(
+    pub fn put_derived<T: std::any::Any + Send + Sync>(
         &self,
         key: CacheKey,
         data: Arc<T>,
@@ -227,7 +224,7 @@ impl BufferPool {
 
     // ─── Gauge value column ──────────────────────────────────────────────────
 
-    pub(crate) fn get_gauge_values(&self, key: CacheKey) -> Option<Arc<Vec<Option<i64>>>> {
+    pub fn get_gauge_values(&self, key: CacheKey) -> Option<Arc<Vec<Option<i64>>>> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.cache.get(&key).and_then(|entry| {
             if let Block::GaugeValues(v) = &entry.data {
@@ -244,14 +241,14 @@ impl BufferPool {
         result
     }
 
-    pub(crate) fn put_gauge_values(&self, key: CacheKey, data: Arc<Vec<Option<i64>>>) {
+    pub fn put_gauge_values(&self, key: CacheKey, data: Arc<Vec<Option<i64>>>) {
         let size = data.len() * std::mem::size_of::<Option<i64>>();
         self.put(key, Block::GaugeValues(data), size);
     }
 
     // ─── Histogram snapshot column ───────────────────────────────────────────
 
-    pub(crate) fn get_histogram_snapshots(
+    pub fn get_histogram_snapshots(
         &self,
         key: CacheKey,
     ) -> Option<Arc<Vec<Option<HistogramSnapshot>>>> {
@@ -271,7 +268,7 @@ impl BufferPool {
         result
     }
 
-    pub(crate) fn put_histogram_snapshots(
+    pub fn put_histogram_snapshots(
         &self,
         key: CacheKey,
         data: Arc<Vec<Option<HistogramSnapshot>>>,

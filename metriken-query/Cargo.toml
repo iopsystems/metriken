@@ -34,7 +34,7 @@ sysinfo = "0.32"
 
 [features]
 default = ["lz4", "ingest"]
-ingest = ["dep:metriken-exposition"]
+ingest = ["dep:metriken-exposition", "metriken-storage/ingest"]
 lz4 = ["parquet/lz4", "metriken-storage/lz4"]
 fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
 

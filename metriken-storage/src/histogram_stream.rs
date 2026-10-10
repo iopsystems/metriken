@@ -3,20 +3,20 @@ use std::collections::BinaryHeap;
 use crate::labels::Labels;
 use crate::types::HistogramSnapshot;
 
-pub(crate) struct HistogramStreamMeta {
+pub struct HistogramStreamMeta {
     pub config: ::histogram::Config,
     /// Labels for each series, indexed by `HistogramRow::series_idx`.
     pub series: Vec<Labels>,
 }
 
-pub(crate) struct HistogramRow {
+pub struct HistogramRow {
     /// Index into `HistogramStreamMeta::series`.
     pub series_idx: usize,
     pub timestamp: u64,
     pub snapshot: HistogramSnapshot,
 }
 
-pub(crate) struct HistogramStream {
+pub struct HistogramStream {
     pub meta: HistogramStreamMeta,
     /// Rows in ascending `(timestamp, series_idx)` order.
     pub rows: Box<dyn Iterator<Item = HistogramRow> + Send>,

@@ -1,3 +1,4 @@
+use crate::promql::streaming::histogram::HistogramOps;
 use std::collections::HashMap;
 use std::sync::Arc;
 

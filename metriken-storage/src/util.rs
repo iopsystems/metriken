@@ -7,7 +7,7 @@
 /// (`UnionSource`, several tables of disjoint identity) — the set-union
 /// itself is identical either way, only what the caller does with the
 /// index differs.
-pub(crate) fn union_names<I: IntoIterator<Item = Vec<String>>>(lists: I) -> Vec<String> {
+pub fn union_names<I: IntoIterator<Item = Vec<String>>>(lists: I) -> Vec<String> {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for list in lists {
         names.extend(list);

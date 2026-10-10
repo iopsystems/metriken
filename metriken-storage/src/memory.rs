@@ -10,7 +10,7 @@ use crate::DataSource;
 /// In-memory data source for tests. Callers build `Counter`/`Gauge`/`Histogram`
 /// values directly and hand them in; the source handles time-range filtering on
 /// query.
-pub(crate) struct Memory {
+pub struct Memory {
     counters: HashMap<String, Vec<Counter>>,
     gauges: HashMap<String, Vec<Gauge>>,
     histograms: HashMap<String, Vec<Histogram>>,
@@ -23,7 +23,7 @@ pub(crate) struct Memory {
 }
 
 impl Memory {
-    pub(crate) fn new(interval_ms: u64) -> Self {
+    pub fn new(interval_ms: u64) -> Self {
         Self {
             counters: HashMap::new(),
             gauges: HashMap::new(),
@@ -36,47 +36,50 @@ impl Memory {
     /// Add a whole counter series, windows included. A second series with
     /// the same name and labels is kept as a second series — this is not
     /// the sample-level upsert `ingest` does.
-    pub(crate) fn push_counter_series(&mut self, name: &str, counter: Counter) {
+    pub fn push_counter_series(&mut self, name: &str, counter: Counter) {
         self.counters
             .entry(name.to_string())
             .or_default()
             .push(counter);
     }
 
-    pub(crate) fn push_gauge_series(&mut self, name: &str, gauge: Gauge) {
+    pub fn push_gauge_series(&mut self, name: &str, gauge: Gauge) {
         self.gauges.entry(name.to_string()).or_default().push(gauge);
     }
 
-    pub(crate) fn push_histogram_series(&mut self, name: &str, histogram: Histogram) {
+    pub fn push_histogram_series(&mut self, name: &str, histogram: Histogram) {
         self.histograms
             .entry(name.to_string())
             .or_default()
             .push(histogram);
     }
 
-    pub(crate) fn set_sample_timestamps(&mut self, ts: Vec<u64>) {
+    pub fn set_sample_timestamps(&mut self, ts: Vec<u64>) {
         self.sample_timestamps = Some(ts);
     }
 
-    pub(crate) fn set_interval_ms(&mut self, ms: u64) {
+    pub fn set_interval_ms(&mut self, ms: u64) {
         self.interval_ms = ms;
     }
 
-    #[cfg(test)]
-    pub(crate) fn add_counter(&mut self, name: &str, counter: Counter) {
+    /// Adds a whole series, for tests that build a source in memory.
+    #[doc(hidden)]
+    pub fn add_counter(&mut self, name: &str, counter: Counter) {
         self.counters
             .entry(name.to_string())
             .or_default()
             .push(counter);
     }
 
-    #[cfg(test)]
-    pub(crate) fn add_gauge(&mut self, name: &str, gauge: Gauge) {
+    /// Adds a whole series, for tests that build a source in memory.
+    #[doc(hidden)]
+    pub fn add_gauge(&mut self, name: &str, gauge: Gauge) {
         self.gauges.entry(name.to_string()).or_default().push(gauge);
     }
 
-    #[cfg(test)]
-    pub(crate) fn add_histogram(&mut self, name: &str, histogram: Histogram) {
+    /// Adds a whole series, for tests that build a source in memory.
+    #[doc(hidden)]
+    pub fn add_histogram(&mut self, name: &str, histogram: Histogram) {
         self.histograms
             .entry(name.to_string())
             .or_default()
@@ -86,13 +89,7 @@ impl Memory {
     /// Append a counter sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
     #[cfg(feature = "ingest")]
-    pub(crate) fn upsert_counter_sample(
-        &mut self,
-        name: &str,
-        labels: Labels,
-        ts: u64,
-        value: u64,
-    ) {
+    pub fn upsert_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: u64) {
         let series = self.counters.entry(name.to_string()).or_default();
         if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
             c.timestamps.push(ts);
@@ -110,7 +107,7 @@ impl Memory {
     /// Append a gauge sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
     #[cfg(feature = "ingest")]
-    pub(crate) fn upsert_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: i64) {
+    pub fn upsert_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: i64) {
         let series = self.gauges.entry(name.to_string()).or_default();
         if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
             g.timestamps.push(ts);
@@ -128,7 +125,7 @@ impl Memory {
     /// Append a histogram sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
     #[cfg(feature = "ingest")]
-    pub(crate) fn upsert_histogram_sample(
+    pub fn upsert_histogram_sample(
         &mut self,
         name: &str,
         labels: Labels,
@@ -157,7 +154,7 @@ impl Memory {
 /// that is not a storage key — the same rule, from the same function, as the
 /// parquet loader (`Labels::from_metadata`).
 #[cfg(feature = "ingest")]
-pub(crate) fn extract_name_labels(
+pub fn extract_name_labels(
     metadata: &std::collections::HashMap<String, String>,
     default_name: &str,
 ) -> (String, Labels) {

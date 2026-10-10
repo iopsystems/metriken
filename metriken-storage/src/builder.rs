@@ -1,4 +1,4 @@
-//! Growing a wide [`Table`](crate::table::Table) row by row: `TableBuilder`
+//! Growing a wide [`Table`] row by row: `TableBuilder`
 //! for a table of individually windowed metrics, `GroupTableBuilder` for an
 //! acquisition group's table with one window per row.
 
@@ -24,7 +24,7 @@ pub enum CellValue<'a> {
 /// One reading in one row, as the archive stores it: a name, the producer's
 /// metadata, an optional acquisition window, and a value.
 ///
-/// **The builder's input type, deliberately separate from [`Entry`].** Rows
+/// **The builder's input type, deliberately separate from `Entry`.** Rows
 /// reach a table from two directions — an agent snapshot at ingest, and this
 /// archive's own WAL when a live tail is materialized into a segment — and
 /// only the first has `metriken-exposition` values behind it. Making the
@@ -304,7 +304,7 @@ impl TableBuilder {
 /// A growing V3 acquisition-group table: like [`TableBuilder`], but rows
 /// carry ONE table-level acquisition window (`Table::table_window`)
 /// instead of a window per metric, and membership per row comes from a
-/// [`GroupSchema`] rather than from an `Entry` list. Columns are still
+/// [`GroupSchema`](crate::schema::GroupSchema) rather than from an `Entry` list. Columns are still
 /// sparse and keyed by name — a schema-hash change mid-table (a cgroup
 /// added/removed) is handled the same lazy-padding way `TableBuilder`
 /// handles a metric appearing or vanishing.
@@ -454,7 +454,7 @@ impl GroupTableBuilder {
 
     /// Append one row: `ts`/`wall_offset_ns` as in `TableBuilder::push_row`,
     /// `window` the group's single shared acquisition window for this tick,
-    /// and `schema` the [`GroupSchema`] the three value slices align with
+    /// and `schema` the [`GroupSchema`](crate::schema::GroupSchema) the three value slices align with
     /// (counters, then gauges, then histograms, matching `GroupSnapshot`'s
     /// own field order). A member's `None` slot ("registered, no reading
     /// this tick") is pushed as `None` in its column — it stays a member,
