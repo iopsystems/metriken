@@ -393,13 +393,14 @@ result is repeatable. Where it is not, the candidate's numbers may differ from
 query over a wide table is such a case: a segment's planned columns are
 iterated from a `HashMap`, so the order a group sums its series changes
 between processes. On `wide.dendro`, three 0.34.7 runs differed from each
-other in about 960 of 358,169 numbers, by at most 9.7e-16 relative. The measures are
-each query's time and peak footprint, and the dashboard's wall time, summed
-`query_range` time and peak footprint. A measure fails when the candidate's
-median is more than 5% worse than 0.34.7's and the two builds' min-to-max
-ranges do not overlap; otherwise it passes, including when the candidate is
-better. GO for the release when every measure passes and every result is
-identical as defined above.
+other in about 960 of 358,169 numbers, by at most 9.7e-16 relative.
+
+The measures are each query's time and peak footprint, and the dashboard's wall
+time, summed `query_range` time and peak footprint. A measure fails when the
+candidate's median is more than 5% worse than 0.34.7's and the two builds'
+min-to-max ranges do not overlap; otherwise it passes, including when the
+candidate is better. GO for the release when every measure passes and every
+result passes the check above.
 
 Overlap counts as a pass because the 0.34.7 runs on 2026-10-09 spread more
 than 5% on three measures: `wide.dendro` peak footprint 1,339 to 1,513 MB,
