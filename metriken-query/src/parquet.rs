@@ -152,181 +152,6 @@ impl ParquetReader {
         self.inner.clone()
     }
 
-    /// The counter columns of a single-file reader (a segment), located for
-    /// [`counter_column`](Self::counter_column). Empty for a multi-file one.
-    pub(crate) fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
-        match self.inner.files.as_slice() {
-            [(f, _)] => f.counter_column_refs(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// One counter column of a single-file reader, read directly.
-    pub(crate) fn counter_column(
-        &self,
-        at: &crate::ColumnPosition,
-        start_ns: u64,
-        end_ns: u64,
-        selective: bool,
-    ) -> Option<crate::ColumnChunk> {
-        match self.inner.files.as_slice() {
-            [(f, _)] => f.counter_column(at, start_ns, end_ns, selective),
-            _ => None,
-        }
-    }
-
-    /// Columns of a single-file reader for a batch read; see
-    /// [`BatchColumns`].
-    pub(crate) fn batch_columns(
-        &self,
-        cols: &[usize],
-        start_ns: u64,
-        end_ns: u64,
-    ) -> Option<BatchColumns> {
-        match self.inner.files.as_slice() {
-            [(f, _)] => f.batch_columns(cols, start_ns, end_ns),
-            _ => None,
-        }
-    }
-
-    /// What this reader holds in memory while open, estimated: its bytes if
-    /// it was opened from bytes, plus a per-column charge for the parsed
-    /// footer and column descriptors.
-    ///
-    /// A footer's parsed form is not measurable cheaply, so it is estimated
-    /// from the one thing that scales it, the column count. Measured on a
-    /// task table of 159 segments with ~2,500 columns each (4.2 MB of parquet
-    /// per segment): a cache budgeted at 500 MB under a 2 KiB-per-column
-    /// charge held about 850 MB of process memory, so the parsed footer,
-    /// column-chunk metadata and label maps come to roughly 4 KiB per
-    /// column, and that is the charge. What this feeds is a cache bound,
-    /// where being off by a factor of two costs a cache half as deep, not
-    /// correctness.
-    pub(crate) fn resident_estimate(&self) -> usize {
-        const PER_COLUMN: usize = 4096;
-        self.inner
-            .files
-            .iter()
-            .map(|(f, _)| f.resident_bytes() + PER_COLUMN * f.column_count())
-            .sum()
-    }
-
-    /// Histogram `(grouping_power, max_value_power)` per metric name, read from
-    /// parquet **field metadata only** — no row group is touched.
-    ///
-    /// First column wins for a given name, mirroring how
-    /// `ParquetSource::histogram_stream` picks the config it decodes with.
-    /// Used by [`crate::SegmentedParquetReader`] to reject segments whose
-    /// histogram configs disagree, which would otherwise splice into silently
-    /// wrong bucket boundaries.
-    pub(crate) fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
-        let mut out = std::collections::BTreeMap::new();
-        for (pf, _) in &self.inner.files {
-            for col in pf.columns_desc() {
-                if let ColKind::Histogram {
-                    grouping_power,
-                    max_value_power,
-                } = col.kind
-                {
-                    out.entry(col.name)
-                        .or_insert((grouping_power, max_value_power));
-                }
-            }
-        }
-        out
-    }
-
-    /// All distinct histogram `(grouping_power, max_value_power)` configs
-    /// observed per metric name in this reader, footer-only (no row-group
-    /// decode). Unlike [`histogram_configs`](Self::histogram_configs)
-    /// (first column wins), this surfaces EVERY distinct config so a caller
-    /// can detect a same-file conflict: `ParquetSource::histogram_stream`
-    /// groups columns purely by name and decodes every matching column
-    /// under the first one's config, so two differently-configured columns
-    /// for the same name within one file can never be decoded separately.
-    /// Used by [`crate::SegmentedParquetReader`] to reject that case at
-    /// open (a cross-*segment* difference is fine — that's handled by
-    /// splitting into distinct runs, not rejected).
-    pub(crate) fn histogram_config_variants(
-        &self,
-    ) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
-        let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
-            std::collections::BTreeMap::new();
-        for (pf, _) in &self.inner.files {
-            for col in pf.columns_desc() {
-                if let ColKind::Histogram {
-                    grouping_power,
-                    max_value_power,
-                } = col.kind
-                {
-                    let cfg = (grouping_power, max_value_power);
-                    let list = out.entry(col.name).or_default();
-                    if !list.contains(&cfg) {
-                        list.push(cfg);
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// `(name, labels)` for every counter column, in RAW SCHEMA order —
-    /// unlike [`counter_labels`](Self::counter_labels), this does not sort
-    /// or dedupe. Footer-only: one pass over the schema, no row-group
-    /// decode. Used by [`crate::SegmentedParquetReader`] to build an
-    /// open-time identity index that preserves "first appearance across
-    /// segments" splicing order without re-scanning the schema per metric
-    /// name.
-    pub(crate) fn counter_columns(&self) -> Vec<(String, Labels)> {
-        let mut out = Vec::new();
-        for (pf, extra) in &self.inner.files {
-            for col in pf.columns_desc() {
-                if matches!(col.kind, ColKind::Counter) {
-                    let mut labels = col.labels;
-                    for (k, v) in &extra.inner {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
-                    out.push((col.name, labels));
-                }
-            }
-        }
-        out
-    }
-
-    /// Gauge twin of [`counter_columns`](Self::counter_columns).
-    pub(crate) fn gauge_columns(&self) -> Vec<(String, Labels)> {
-        let mut out = Vec::new();
-        for (pf, extra) in &self.inner.files {
-            for col in pf.columns_desc() {
-                if matches!(col.kind, ColKind::Gauge) {
-                    let mut labels = col.labels;
-                    for (k, v) in &extra.inner {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
-                    out.push((col.name, labels));
-                }
-            }
-        }
-        out
-    }
-
-    /// Histogram twin of [`counter_columns`](Self::counter_columns).
-    pub(crate) fn histogram_columns(&self) -> Vec<(String, Labels)> {
-        let mut out = Vec::new();
-        for (pf, extra) in &self.inner.files {
-            for col in pf.columns_desc() {
-                if matches!(col.kind, ColKind::Histogram { .. }) {
-                    let mut labels = col.labels;
-                    for (k, v) in &extra.inner {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
-                    out.push((col.name, labels));
-                }
-            }
-        }
-        out
-    }
-
     /// Set the display name. Useful when constructing from bytes or
     /// after the fact (e.g. a WASM viewer setting the original upload name).
     pub fn with_filename(mut self, name: impl Into<String>) -> Self {
@@ -613,9 +438,6 @@ impl From<&crate::MemoryStore> for CompositionSource {
 enum BuilderEntry {
     Path(std::path::PathBuf, Labels),
     Bytes(Bytes, Labels),
-    /// Bytes whose cache id is derived from their content; see
-    /// [`content_source_id`].
-    ContentKeyedBytes(Bytes),
     OwnedFile(File, Labels),
     Source(Arc<dyn DataSource>, Labels),
 }
@@ -648,15 +470,6 @@ impl ParquetBuilder {
     /// by passing the same `Arc`.
     pub fn pool(mut self, pool: Arc<BufferPool>) -> Self {
         self.pool = Some(pool);
-        self
-    }
-
-    /// Add in-memory bytes whose cached blocks are keyed by their content,
-    /// so another source opened from the same bytes on the same pool shares
-    /// them.
-    pub(crate) fn content_keyed_bytes(mut self, bytes: impl Into<Bytes>) -> Self {
-        self.entries
-            .push(BuilderEntry::ContentKeyedBytes(bytes.into()));
         self
     }
 
@@ -804,19 +617,6 @@ impl ParquetBuilder {
                     };
                     Ok((Arc::new(FileSource(src)) as Arc<dyn DataSource>, labels))
                 }
-                BuilderEntry::ContentKeyedBytes(bytes) => {
-                    let src = match &pool {
-                        Some(p) => {
-                            let id = content_source_id(&bytes);
-                            ParquetSource::open_bytes_with_pool_id(bytes, Arc::clone(p), id)?
-                        }
-                        None => ParquetSource::open_bytes(bytes)?,
-                    };
-                    Ok((
-                        Arc::new(FileSource(src)) as Arc<dyn DataSource>,
-                        Labels::default(),
-                    ))
-                }
                 BuilderEntry::OwnedFile(file, labels) => {
                     let src = match &pool {
                         Some(p) => ParquetSource::open_file_with_pool(file, Arc::clone(p))?,
@@ -845,8 +645,8 @@ impl ParquetBuilder {
 /// Children are `Arc<dyn DataSource>`, not `Arc<ParquetSource>`: a `.rez`
 /// table is a segmented source whenever its writer sealed more than once, and
 /// composing those alongside plain files is what a job-spanning query needs.
-struct MultiParquetSource {
-    files: Vec<(Arc<dyn DataSource>, Labels)>,
+pub(crate) struct MultiParquetSource {
+    pub(crate) files: Vec<(Arc<dyn DataSource>, Labels)>,
 }
 
 /// Given a file's injected `extra` labels and the query `filter`:
@@ -1203,6 +1003,213 @@ impl DataSource for MultiParquetSource {
 }
 
 impl MultiParquetSource {
+    /// One file from in-memory bytes, with no extra labels, read through
+    /// `pool`. Footer only: nothing is decoded.
+    pub(crate) fn open_bytes_with_pool(
+        bytes: impl Into<Bytes>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let src = ParquetSource::open_bytes_with_pool(bytes.into(), pool)?;
+        Ok(Self {
+            files: vec![(
+                Arc::new(FileSource(src)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
+        })
+    }
+
+    /// [`open_bytes_with_pool`](Self::open_bytes_with_pool), with cached
+    /// blocks keyed by the bytes' content, so another source opened from the
+    /// same bytes on the same pool shares them.
+    pub(crate) fn open_content_keyed(
+        bytes: impl Into<Bytes>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let bytes = bytes.into();
+        let id = content_source_id(&bytes);
+        let src = ParquetSource::open_bytes_with_pool_id(bytes, pool, id)?;
+        Ok(Self {
+            files: vec![(
+                Arc::new(FileSource(src)) as Arc<dyn DataSource>,
+                Labels::default(),
+            )],
+        })
+    }
+
+    /// The counter columns of a single-file reader (a segment), located for
+    /// [`counter_column`](Self::counter_column). Empty for a multi-file one.
+    pub(crate) fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
+        match self.files.as_slice() {
+            [(f, _)] => f.counter_column_refs(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One counter column of a single-file reader, read directly.
+    pub(crate) fn counter_column(
+        &self,
+        at: &crate::ColumnPosition,
+        start_ns: u64,
+        end_ns: u64,
+        selective: bool,
+    ) -> Option<crate::ColumnChunk> {
+        match self.files.as_slice() {
+            [(f, _)] => f.counter_column(at, start_ns, end_ns, selective),
+            _ => None,
+        }
+    }
+
+    /// Columns of a single-file reader for a batch read; see
+    /// [`BatchColumns`].
+    pub(crate) fn batch_columns(
+        &self,
+        cols: &[usize],
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<BatchColumns> {
+        match self.files.as_slice() {
+            [(f, _)] => f.batch_columns(cols, start_ns, end_ns),
+            _ => None,
+        }
+    }
+
+    /// What this reader holds in memory while open, estimated: its bytes if
+    /// it was opened from bytes, plus a per-column charge for the parsed
+    /// footer and column descriptors.
+    ///
+    /// A footer's parsed form is not measurable cheaply, so it is estimated
+    /// from the one thing that scales it, the column count. Measured on a
+    /// task table of 159 segments with ~2,500 columns each (4.2 MB of parquet
+    /// per segment): a cache budgeted at 500 MB under a 2 KiB-per-column
+    /// charge held about 850 MB of process memory, so the parsed footer,
+    /// column-chunk metadata and label maps come to roughly 4 KiB per
+    /// column, and that is the charge. What this feeds is a cache bound,
+    /// where being off by a factor of two costs a cache half as deep, not
+    /// correctness.
+    pub(crate) fn resident_estimate(&self) -> usize {
+        const PER_COLUMN: usize = 4096;
+        self.files
+            .iter()
+            .map(|(f, _)| f.resident_bytes() + PER_COLUMN * f.column_count())
+            .sum()
+    }
+
+    /// Histogram `(grouping_power, max_value_power)` per metric name, read from
+    /// parquet **field metadata only** — no row group is touched.
+    ///
+    /// First column wins for a given name, mirroring how
+    /// `ParquetSource::histogram_stream` picks the config it decodes with.
+    /// Used by [`crate::SegmentedParquetReader`] to reject segments whose
+    /// histogram configs disagree, which would otherwise splice into silently
+    /// wrong bucket boundaries.
+    pub(crate) fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
+        let mut out = std::collections::BTreeMap::new();
+        for (pf, _) in &self.files {
+            for col in pf.columns_desc() {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    out.entry(col.name)
+                        .or_insert((grouping_power, max_value_power));
+                }
+            }
+        }
+        out
+    }
+
+    /// All distinct histogram `(grouping_power, max_value_power)` configs
+    /// observed per metric name in this reader, footer-only (no row-group
+    /// decode). Unlike [`histogram_configs`](Self::histogram_configs)
+    /// (first column wins), this surfaces EVERY distinct config so a caller
+    /// can detect a same-file conflict: `ParquetSource::histogram_stream`
+    /// groups columns purely by name and decodes every matching column
+    /// under the first one's config, so two differently-configured columns
+    /// for the same name within one file can never be decoded separately.
+    /// Used by [`crate::SegmentedParquetReader`] to reject that case at
+    /// open (a cross-*segment* difference is fine — that's handled by
+    /// splitting into distinct runs, not rejected).
+    pub(crate) fn histogram_config_variants(
+        &self,
+    ) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
+        let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
+            std::collections::BTreeMap::new();
+        for (pf, _) in &self.files {
+            for col in pf.columns_desc() {
+                if let ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                } = col.kind
+                {
+                    let cfg = (grouping_power, max_value_power);
+                    let list = out.entry(col.name).or_default();
+                    if !list.contains(&cfg) {
+                        list.push(cfg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `(name, labels)` for every counter column, in RAW SCHEMA order —
+    /// unlike [`counter_labels`](Self::counter_labels), this does not sort
+    /// or dedupe. Footer-only: one pass over the schema, no row-group
+    /// decode. Used by [`crate::SegmentedParquetReader`] to build an
+    /// open-time identity index that preserves "first appearance across
+    /// segments" splicing order without re-scanning the schema per metric
+    /// name.
+    pub(crate) fn counter_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            for col in pf.columns_desc() {
+                if matches!(col.kind, ColKind::Counter) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Gauge twin of [`counter_columns`](Self::counter_columns).
+    pub(crate) fn gauge_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            for col in pf.columns_desc() {
+                if matches!(col.kind, ColKind::Gauge) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
+    /// Histogram twin of [`counter_columns`](Self::counter_columns).
+    pub(crate) fn histogram_columns(&self) -> Vec<(String, Labels)> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            for col in pf.columns_desc() {
+                if matches!(col.kind, ColKind::Histogram { .. }) {
+                    let mut labels = col.labels;
+                    for (k, v) in &extra.inner {
+                        labels.inner.insert(k.clone(), v.clone());
+                    }
+                    out.push((col.name, labels));
+                }
+            }
+        }
+        out
+    }
+
     /// Whether any two of these children could hold the same series. Two
     /// children whose injected labels set one key to different values
     /// cannot: every series of one differs from every series of the other

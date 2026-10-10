@@ -14,11 +14,10 @@ use lru::LruCache;
 
 use crate::histogram_stream::{HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
+use crate::parquet::MultiParquetSource;
 use crate::promql::QueryEngine;
 use crate::types::{Counter, Counters, Gauge, Gauges};
-use crate::{
-    BufferPool, DataSource, MetricsSource, ParquetReader, QueryError, QueryOptions, QueryResult,
-};
+use crate::{BufferPool, DataSource, MetricsSource, QueryError, QueryOptions, QueryResult};
 
 /// Where a segmented table's bytes come from, fetched on demand.
 ///
@@ -304,7 +303,7 @@ impl SegmentedParquetReader {
                     };
                     // Footer only: nothing is decoded into the pool here, so
                     // the segment needs no content-derived id.
-                    let seg = ParquetReader::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
+                    let seg = MultiParquetSource::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
                     state.fold(idx, &seg, relabel.as_ref(), &mut memo)?;
                 }
                 if state.opened == 0 {
@@ -607,7 +606,7 @@ impl OpenState {
     fn fold(
         &mut self,
         idx: usize,
-        seg: &ParquetReader,
+        seg: &MultiParquetSource,
         relabel: Option<&Arc<dyn ColumnRelabel>>,
         memo: &mut IdentityMemo,
     ) -> Result<(), Box<dyn Error>> {
@@ -682,7 +681,7 @@ impl OpenState {
         self.histogram_runs.observe(idx, seg.histogram_configs());
         self.histogram_runs.observe_labels(idx, &histogram_columns);
         self.histogram_identity.extend(histogram_columns);
-        for (metric, cols) in seg.data_source().column_map() {
+        for (metric, cols) in seg.column_map() {
             // Mirror the run tagging `histogram_stream` and
             // `histogram_labels` apply. `QueryEngine::columns` requires
             // every filter key to be PRESENT on the label set, so without
@@ -720,7 +719,7 @@ impl OpenState {
         // Last segment wins on collision.
         self.file_metadata.extend(seg.file_metadata());
         self.catalog.push(SegmentCatalog {
-            span: seg.time_range_ns(),
+            span: seg.time_range(),
             interval: seg.interval(),
             present: true,
         });
@@ -765,12 +764,12 @@ impl SegmentCatalog {
 ///
 /// A segment is fetched from the store and its footer parsed when a query
 /// first touches it; the next query over the same range finds it here. Each
-/// entry is charged [`ParquetReader::resident_estimate`] — its bytes plus
+/// entry is charged [`MultiParquetSource::resident_estimate`] — its bytes plus
 /// what its parsed footer and column descriptors take, which on a wide
 /// table is more than the bytes — against the budget the pool already asks
 /// the operator for.
 struct SegmentCache {
-    entries: LruCache<usize, (Arc<ParquetReader>, usize)>,
+    entries: LruCache<usize, (Arc<MultiParquetSource>, usize)>,
     bytes: usize,
     max_bytes: usize,
 }
@@ -784,14 +783,14 @@ impl SegmentCache {
         }
     }
 
-    fn get(&mut self, idx: usize) -> Option<Arc<ParquetReader>> {
+    fn get(&mut self, idx: usize) -> Option<Arc<MultiParquetSource>> {
         self.entries.get(&idx).map(|(seg, _)| Arc::clone(seg))
     }
 
     /// Insert, then evict least recently used entries until within budget —
     /// never the one just inserted, so a segment larger than the whole
     /// budget still opens.
-    fn insert(&mut self, idx: usize, seg: Arc<ParquetReader>, size: usize) {
+    fn insert(&mut self, idx: usize, seg: Arc<MultiParquetSource>, size: usize) {
         if let Some((_, old)) = self.entries.push(idx, (seg, size)) {
             self.bytes = self.bytes.saturating_sub(old.1);
         }
@@ -825,8 +824,8 @@ impl SegmentCache {
 /// `__run__`-labeled series instead of rejecting the whole archive.
 ///
 /// Reads parquet field metadata only (via
-/// [`ParquetReader::histogram_config_variants`]) — no row-group decode.
-fn check_histogram_configs(idx: usize, segment: &ParquetReader) -> Result<(), Box<dyn Error>> {
+/// [`MultiParquetSource::histogram_config_variants`]) — no row-group decode.
+fn check_histogram_configs(idx: usize, segment: &MultiParquetSource) -> Result<(), Box<dyn Error>> {
     for (name, configs) in segment.histogram_config_variants() {
         if configs.len() > 1 {
             let detail = configs
@@ -853,7 +852,7 @@ type LabelsHash = foldhash::fast::RandomState;
 
 /// `(name, labels) -> position` for one metric kind (counter, gauge, or raw
 /// per-column histogram identity), built ONCE at open from footer-only
-/// column lists (see [`ParquetReader::counter_columns`] and its gauge/
+/// column lists (see [`MultiParquetSource::counter_columns`] and its gauge/
 /// histogram twins) — no row-group decode.
 ///
 /// Splicing used to find a series' accumulator by scanning the
@@ -925,7 +924,7 @@ impl SeriesIdentity {
 }
 
 /// Per-histogram-metric run assignment, built once at open from field
-/// metadata only (via [`ParquetReader::histogram_configs`], itself
+/// metadata only (via [`MultiParquetSource::histogram_configs`], itself
 /// footer-only).
 ///
 /// A `.rez` agent restart can remap a numeric column id to a histogram with
@@ -1086,7 +1085,7 @@ pub struct Handover {
     pool: Arc<BufferPool>,
     /// Opened keyed segments, `(index, segment, size)`, least recently used
     /// first.
-    segments: Vec<(usize, Arc<ParquetReader>, usize)>,
+    segments: Vec<(usize, Arc<MultiParquetSource>, usize)>,
 }
 
 impl std::fmt::Debug for Handover {
@@ -1227,7 +1226,7 @@ impl SegmentedSource {
 
     /// Segment `idx`, opened footer-only — from the cache, or fetched from
     /// the store and cached. `None` when the store no longer has it.
-    fn segment(&self, idx: usize) -> Result<Option<Arc<ParquetReader>>, Box<dyn Error>> {
+    fn segment(&self, idx: usize) -> Result<Option<Arc<MultiParquetSource>>, Box<dyn Error>> {
         if let Some(seg) = self
             .cache
             .lock()
@@ -1241,12 +1240,10 @@ impl SegmentedSource {
         let Some(bytes) = self.store.bytes(idx).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let seg = Arc::new(
-            ParquetReader::builder()
-                .pool(Arc::clone(&self.pool))
-                .content_keyed_bytes(bytes)
-                .build()?,
-        );
+        let seg = Arc::new(MultiParquetSource::open_content_keyed(
+            bytes,
+            Arc::clone(&self.pool),
+        )?);
         let size = seg.resident_estimate();
         self.cache
             .lock()
@@ -1272,7 +1269,7 @@ impl SegmentedSource {
         &self,
         start_ns: u64,
         end_ns: u64,
-    ) -> impl Iterator<Item = (usize, Arc<ParquetReader>)> + '_ {
+    ) -> impl Iterator<Item = (usize, Arc<MultiParquetSource>)> + '_ {
         self.state
             .catalog
             .iter()
@@ -1567,10 +1564,7 @@ impl DataSource for SegmentedSource {
         let mut slots: Vec<Option<Counter>> = (0..order.len()).map(|_| None).collect();
         let seg_filter = self.segment_filter(name, filter);
         for (_, seg) in self.touched(start_ns, end_ns) {
-            let Some(chunk) = seg
-                .data_source()
-                .counters(name, &seg_filter, start_ns, end_ns)
-            else {
+            let Some(chunk) = seg.counters(name, &seg_filter, start_ns, end_ns) else {
                 continue;
             };
             for c in chunk
@@ -1697,10 +1691,7 @@ impl DataSource for SegmentedSource {
         let mut slots: Vec<Option<Gauge>> = (0..order.len()).map(|_| None).collect();
         let seg_filter = self.segment_filter(name, filter);
         for (_, seg) in self.touched(start_ns, end_ns) {
-            let Some(chunk) = seg
-                .data_source()
-                .gauges(name, &seg_filter, start_ns, end_ns)
-            else {
+            let Some(chunk) = seg.gauges(name, &seg_filter, start_ns, end_ns) else {
                 continue;
             };
             for g in chunk
@@ -1753,10 +1744,7 @@ impl DataSource for SegmentedSource {
             let seg_filter = self.segment_filter(name, &effective);
             let streams: Vec<HistogramStream> = self
                 .touched(start_ns, end_ns)
-                .filter_map(|(_, seg)| {
-                    seg.data_source()
-                        .histogram_stream(name, &seg_filter, start_ns, end_ns)
-                })
+                .filter_map(|(_, seg)| seg.histogram_stream(name, &seg_filter, start_ns, end_ns))
                 .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &effective, s))
                 .collect();
             return splice_histogram_streams(name, &self.state.histogram_identity, streams);
@@ -1782,10 +1770,7 @@ impl DataSource for SegmentedSource {
         let streams: Vec<HistogramStream> = self
             .touched(start_ns, end_ns)
             .filter(|(idx, _)| self.state.histogram_runs.segment_run(name, *idx) == Some(want_run))
-            .filter_map(|(_, seg)| {
-                seg.data_source()
-                    .histogram_stream(name, &seg_filter, start_ns, end_ns)
-            })
+            .filter_map(|(_, seg)| seg.histogram_stream(name, &seg_filter, start_ns, end_ns))
             .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &inner_filter, s))
             .collect();
 
@@ -1882,7 +1867,7 @@ impl DataSource for SegmentedSource {
         // contract as the query path, no sort/dedup. Touches every segment.
         let mut out = Vec::new();
         for (_, seg) in self.touched(0, u64::MAX) {
-            out.extend(seg.data_source().sample_timestamps());
+            out.extend(seg.sample_timestamps());
         }
         out
     }
@@ -2140,6 +2125,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ParquetReader;
 
     use arrow::array::{ArrayRef, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -3823,12 +3809,12 @@ mod tests {
         // per query.
         let n2 = ::histogram::Config::new(2, 8).unwrap().total_buckets();
         let n3 = ::histogram::Config::new(3, 8).unwrap().total_buckets();
-        let seg_a = ParquetReader::open_bytes_with_pool(
+        let seg_a = MultiParquetSource::open_bytes_with_pool(
             segment_histogram("latency", 2, 8, &[(1_000_000_000, vec![0u64; n2])]),
             BufferPool::new(64 * 1024 * 1024),
         )
         .unwrap();
-        let seg_b = ParquetReader::open_bytes_with_pool(
+        let seg_b = MultiParquetSource::open_bytes_with_pool(
             segment_histogram("latency", 3, 8, &[(2_000_000_000, vec![0u64; n3])]),
             BufferPool::new(64 * 1024 * 1024),
         )
@@ -4130,7 +4116,7 @@ mod tests {
         // What one opened segment is charged: its bytes plus the footer
         // estimate, the same figure the cache uses.
         let one =
-            ParquetReader::open_bytes_with_pool(segments[0].clone(), BufferPool::new(1 << 20))
+            MultiParquetSource::open_bytes_with_pool(segments[0].clone(), BufferPool::new(1 << 20))
                 .unwrap()
                 .resident_estimate();
         let store = CountingStore::new(segments);
