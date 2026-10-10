@@ -52,14 +52,8 @@ impl Cell<'_> {
     }
 }
 
-/// In-memory cost of a cell's value slot: `Option<u64>` / `Option<i64>` /
-/// `Option<Box<[u64]>>` are all 16 B (the histogram's buckets are counted
-/// separately below).
-pub const VALUE_SLOT_BYTES: usize = 16;
-/// In-memory cost of the `Option<Window>` that `push_row` pushes alongside
-/// every counted cell: 24 B, because `Window` is two `u64`s with no niche, so
-/// the option tag costs a whole word of padding.
-pub const WINDOW_SLOT_BYTES: usize = 24;
+pub use metriken_model::cost::{HISTOGRAM_BUCKET_BYTES, VALUE_SLOT_BYTES, WINDOW_SLOT_BYTES};
+
 /// Per-cell overhead: value slot + window slot.
 ///
 /// **Both slots, and that is the point.** This is a bound on resident memory,
@@ -69,9 +63,6 @@ pub const WINDOW_SLOT_BYTES: usize = 24;
 /// cap that is supposed to bound it. `push_row_accumulates_approx_bytes` and
 /// `approx_bytes_counts_the_window_slot` pin both halves against the layout.
 pub const CELL_OVERHEAD_BYTES: usize = VALUE_SLOT_BYTES + WINDOW_SLOT_BYTES;
-/// Bytes per histogram bucket: `push_row` clones the histogram's bucket
-/// `Box<[u64]>` into the column.
-pub const HISTOGRAM_BUCKET_BYTES: usize = 8;
 
 /// What one row of `entries` adds to a table's `approx_bytes`.
 ///

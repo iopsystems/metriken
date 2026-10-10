@@ -11,10 +11,7 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
-use crate::builder::{
-    Cell, CellValue, GroupTableBuilder, TableBuilder, HISTOGRAM_BUCKET_BYTES, VALUE_SLOT_BYTES,
-    WINDOW_SLOT_BYTES,
-};
+use crate::builder::{Cell, CellValue, GroupTableBuilder, TableBuilder};
 use crate::table::{segment_writer_props, write_table_parquet_with};
 use crate::window::Window;
 use parquet::file::properties::WriterProperties;
@@ -383,35 +380,7 @@ fn materialize_group_wal_tail(
     }))
 }
 
-/// A WAL group row's cost against a writer's segment byte budget: one
-/// window slot for the row, a value slot per present member, and a bucket
-/// slot per histogram bucket. `metriken-exposition`'s `group_approx_bytes`
-/// meters a `GroupSnapshot` the same way, and a test there pins the two, so
-/// a recording taken off the stream seals where a scraped one does.
-pub fn wal_group_row_approx_bytes(row: &WalGroupRow) -> usize {
-    let mut bytes = WINDOW_SLOT_BYTES;
-    bytes += row.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-    bytes += row.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-    for (_, _, buckets) in row.histograms.iter().flatten() {
-        bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
-    }
-    bytes
-}
-
-/// A long row's cost against a writer's segment byte budget: one window
-/// slot, and per occupant an occupant slot plus its present values.
-pub fn wal_long_row_approx_bytes(row: &WalLongRow) -> usize {
-    let mut bytes = WINDOW_SLOT_BYTES;
-    for o in &row.occupants {
-        bytes += VALUE_SLOT_BYTES;
-        bytes += o.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-        bytes += o.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-        for (_, _, buckets) in o.histograms.iter().flatten() {
-            bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
-        }
-    }
-    bytes
-}
+pub use metriken_model::cost::{wal_group_row_approx_bytes, wal_long_row_approx_bytes};
 
 /// A long table's live WAL rows as one long segment (`None` when there is no
 /// tail). A table is long when it has an occupant stream, which is how a
