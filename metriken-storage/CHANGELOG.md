@@ -16,6 +16,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are `metriken-model`'s (`metriken_model::cost`), re-exported at the same
   paths.
 
+### Added
+
+- The column readers, from `metriken-query`: the data-access trait
+  (`DataSource`) and its implementations for parquet files, segmented
+  tables, unions, compositions and in-memory sources; the long-table
+  relabel (`long::OccupantLabels`); the buffer pool; the counter scan
+  (`DataSource::counter_scan`), which returns a counter's matched series and
+  its segments' decoded columns a chunk at a time. Queries over them are
+  `metriken-query`'s, through its `MetricsSource` wrappers.
+- The archive, from `metriken-archive`: the catalog (`Catalog`,
+  `DendroCatalog`), `ArchiveReader`, and with feature `write` the writer
+  (`ArchiveWriter`, `SourceRecorder`, `StreamDecoder`); with feature
+  `stream`, `FrameProducer`. `ArchiveReader` answers its names, labels, span
+  and interval from its probed catalog and finds the tables holding given
+  metric names (`owners_of`); routing a query, and `MetricsSource` for it,
+  are `metriken-query`'s. The writer depends on `metriken-model`, not on
+  `metriken-exposition` or the `metriken` registry.
+- The `.rez` format, from rezolus (feature `rez`): the container (v1/v2 tar
+  reading, the v3 SQLite `RezDb`), its `Catalog` implementation, format
+  detection, opening an archive by content (`rez::open`), the v3 rewrite
+  tooling and parquet ingest; with `write`, the v3 writer and the
+  `.rez`-to-dendro conversion; with `test-support`, the tar writer for
+  fixtures. A 5.x `record --stream` `.rez`'s identity index is not read; its
+  slot columns carry the labels each segment was built with.
+
 ## [0.1.7] - 2026-10-09
 
 ### Changed

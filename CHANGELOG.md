@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-model 0.1.1
+
+- **Added:** `cost`, a row's cost against a writer's segment byte budget:
+  `group_approx_bytes`, `wal_group_row_approx_bytes`,
+  `wal_long_row_approx_bytes` and the slot sizes, from `metriken-exposition`
+  and `metriken-segment`, which re-export them.
+
+### metriken-exposition 0.21.6
+
+- **Changed:** `group_approx_bytes` is `metriken_model::cost`'s, re-exported
+  at the same path. The crate no longer depends on `metriken-segment`; its
+  `segment` feature only enables `serde`.
+
+### metriken-segment 0.2.0
+
+- **Changed:** renamed `metriken-storage`. This release re-exports it; its
+  history continues in `metriken-storage/CHANGELOG.md`.
+
+### metriken-storage 0.1.0, metriken-query 0.35.0, metriken-archive 0.4.0
+
+- See each crate's CHANGELOG. Plan and gate:
+  `docs/journal/2026-10-09-storage-scan.md`.
+
 ### metriken-model 0.1.0
 
 - **Added:** the observation model as plain types with no `metriken`
