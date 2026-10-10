@@ -29,9 +29,10 @@ serde.workspace = true
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# Tests that read through the query engine. A path-only dev-dependency, so
-# `cargo publish` strips it; tests must not pass this crate's values to the
-# engine, which links its own copy.
+# The archive's integration tests query through the engine; an integration
+# test links the same metriken-storage that metriken-query does. A unit test
+# does not (it builds this crate a second time), so unit tests that query
+# live in metriken-query. Path-only, so `cargo publish` strips it.
 metriken-query = { path = "../metriken-query", features = ["fixtures"] }
 serde_json.workspace = true
 tempfile.workspace = true
