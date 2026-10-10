@@ -387,20 +387,26 @@ less request start as Playwright reports them, and the peak footprint of the
 
 The candidate and `metriken-query` 0.34.7 run alternately on the same host,
 five runs each, on every query and the dashboard load. Every query must return
-a bit-identical `DisplayResult` (serialized and compared). The measures are
+a bit-identical `DisplayResult` (serialized and compared) where 0.34.7's own
+result is repeatable. Where it is not, the candidate's numbers may differ from
+0.34.7's by no more than 0.34.7's differ between its own runs. A grouped
+query over a wide table is such a case: a segment's planned columns are
+iterated from a `HashMap`, so the order a group sums its series changes
+between processes. On `wide.dendro`, three 0.34.7 runs differed from each
+other in about 960 of 358,169 numbers, by at most 9.7e-16 relative. The measures are
 each query's time and peak footprint, and the dashboard's wall time, summed
 `query_range` time and peak footprint. A measure fails when the candidate's
 median is more than 5% worse than 0.34.7's and the two builds' min-to-max
 ranges do not overlap; otherwise it passes, including when the candidate is
 better. GO for the release when every measure passes and every result is
-identical.
+identical as defined above.
 
 Overlap counts as a pass because the 0.34.7 runs on 2026-10-09 spread more
 than 5% on three measures: `wide.dendro` peak footprint 1,339 to 1,513 MB,
 `long.dendro` peak footprint 384 to 405 MB, and `long.dendro` time 2.52 to
 2.92 s. On those measures five runs cannot tell a difference smaller than the
-spread from noise, and a regression of that size would pass. Decided
-2026-10-09.
+spread from noise, and a regression of that size would pass. Both rules
+decided 2026-10-09.
 
 NO-GO for the scan if the engine cannot read the arrays without copying them or
 cannot keep the per-partition threads over a chunk, or if step 1 of the order of
