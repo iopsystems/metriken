@@ -309,7 +309,7 @@ against the branch through `[patch.crates-io]`.
    `StreamDecoder` round trip is deferred (see "As built").
 7. The gate again on the result, then the release.
 
-Steps 2 to 6 move about 15,000 lines of `metriken-query` and the 5,000 of
+Steps 2, 3 and 5 move about 15,000 lines of `metriken-query` and the 5,000 of
 `metriken-archive`, mostly without changing them apart from the visibility
 and test moves above; that size follows from the crate boundaries the plan
 chose.
@@ -317,8 +317,8 @@ chose.
 ## As built (through step 3)
 
 Branch `refactor/metriken-storage` on step 1 (#249). The order above changed
-as follows. The first four changes were forced by the crate graph; keeping
-`StreamDecoder`'s round trip and keeping `fixtures` in query were choices.
+as follows. The first, second and fourth changes were forced by the crate
+graph; the rest were choices.
 
 - `metriken-storage` started as `metriken-segment` renamed, not as
   `metriken-archive`. `metriken-query` depends on `metriken-segment` and
@@ -327,7 +327,7 @@ as follows. The first four changes were forced by the crate graph; keeping
   engine. The archive moved in last.
 - The row cost meters (`group_approx_bytes`, the WAL row meters and the slot
   sizes) moved to `metriken-model` first: `metriken-exposition` defined
-  `group_approx_bytes` and depended on `metriken-segment` for the rest, which
+  `group_approx_bytes` and took the slot sizes from `metriken-segment`, which
   would have been a cycle once storage's writer depended on exposition.
 - The writer (`write`) depends on `metriken-model`, not `metriken-exposition`
   and `metriken`; it only used the model types exposition re-exported.
@@ -341,8 +341,8 @@ as follows. The first four changes were forced by the crate graph; keeping
   a recorder CPU saving not yet measured.
 - `fixtures` stays in `metriken-query`; it only builds parquet files, and the
   query tests and benches use it.
-- `metriken-query`'s `ingest` reads `metriken-model`, so `metriken-query`
-  depends on the `metriken` registry under no feature.
+- `metriken-query`'s `ingest` reads `metriken-model`, so no feature of
+  `metriken-query` pulls in the `metriken` registry.
 - Unit tests that open a wrapper or query through the engine are in
   `metriken-query`'s modules; tests of storage internals alone are in
   `metriken-storage`. `metriken-storage` has a path-only dev-dependency on
@@ -358,13 +358,14 @@ against the branch and passes its tests after changing the four
 `eval_timestamps_for` calls to the free function.
 
 The step 1 memory saving on the long table (about 45 MB) is not stable across
-builds. In one session, six runs of each build put step 1 at 333 to 361 MB,
-two later builds whose changes do not touch the query path at 387 to 413 MB,
-and another at 356 to 358 MB; only two sets of step 1's runs are saved
-(`ab-scan-1.txt`, `ab-scan-2.txt`). I don't know the cause; allocation layout
+builds. In one session, five runs of each build in each saved set
+(`ab-scan-1.txt`, `ab-scan-2.txt`) put step 1 at 333 to 360 MB; two later
+builds whose changes do not touch the query path measured 387 to 413 MB, and
+another 356 to 358 MB (neither saved). I don't know the cause; allocation layout
 is my guess, unverified. Under the gate's rule every build passes on this
-measure: each range overlaps 0.34.7's (384 to 405 MB on 2026-10-09; 382 to
-409 MB across all fifteen 0.34.7 runs).
+measure: each range overlaps 0.34.7's (384 to 405 MB in
+`baseline-0347.txt`'s five runs; 382 to 409 MB across all fifteen 0.34.7
+runs).
 
 ## GO / NO-GO
 
@@ -396,18 +397,19 @@ less request start as Playwright reports them, and the peak footprint of the
 `rezolus view` process.
 
 The candidate and `metriken-query` 0.34.7 run alternately on the same host,
-five runs each, on every query and the dashboard load. Every query must return
-a bit-identical `DisplayResult` (serialized and compared) where 0.34.7's own
-result is repeatable, and where it is not, each number within 1e-14 relative
-of 0.34.7's (about 45 units in the last place). Whether 0.34.7 is repeatable
-on a query is decided by saving its result from two of its runs and comparing
-them. A grouped query over a wide table is not: a segment's planned columns
-are iterated from a `HashMap`, so the order a group sums its series changes
-between processes. On `wide.dendro`, three 0.34.7 runs differed pairwise in
-953 to 968 of 358,169 numbers, by at most 1.08e-15 relative; step 1 and the
-storage branch against 0.34.7 measured 8.2e-16 to 1.16e-15. The bound is
-about ten times those, so it fails a change in what is summed, not a change
-in summation order.
+five runs each, on every query and the dashboard load. The first run of each
+build saves its serialized `DisplayResult`. 0.34.7 is repeatable on a query
+when the results of two of its runs are byte-identical (`cmp`); this needs a
+second saved 0.34.7 run, which `run-ab.sh` does not make. Where it is
+repeatable the candidate's result must be byte-identical to 0.34.7's; where it
+is not, each number must be within 1e-14 relative of 0.34.7's (45 to 90 units
+in the last place). A grouped query over a wide table is not repeatable: a
+segment's planned columns are iterated from a `HashMap`, so the order a group
+sums its series changes between processes. On `wide.dendro`, three 0.34.7
+runs differed pairwise in 953 to 968 of 358,169 numbers, by at most 1.08e-15
+relative; step 1 and the storage branch against 0.34.7 measured 8.2e-16 to
+1.16e-15. The bound is about nine times the largest of those, so a
+summation-order difference passes with margin.
 
 The measures are each query's time and peak footprint, and the dashboard's wall
 time, summed `query_range` time and peak footprint. A measure fails when the

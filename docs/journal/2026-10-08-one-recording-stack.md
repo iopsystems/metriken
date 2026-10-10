@@ -359,9 +359,9 @@ step re-exports what it moves, in the release after.
    column readers and long-table relabel, `MsgpackToParquet`, and rezolus's
    `crates/rez` (feature `rez`, without `caller_rows`). Define the scan, move
    the rate, grouping and display accumulators onto it in the engine, and move
-   query routing into the engine; `ingest` reads model types. Writers take
-   model rows, which removes the decode-and-re-encode round trip in
-   `StreamDecoder` and the `metriken` dependency from the write path. The two
+   query routing into the engine; `ingest` reads model types. The writer
+   depends on model types, not the `metriken` registry; the decode-and-re-encode
+   round trip in `StreamDecoder` is deferred (see the storage scan entry). The two
    crates release together because the readers cannot leave the engine's crate
    until the engine reads through the scan. Design and gate: [the storage
    scan](2026-10-09-storage-scan.md).
