@@ -236,21 +236,7 @@ impl SegmentedParquetReader {
     /// occupant the relabel did not describe. A handover holds no
     /// [`SegmentStore`].
     pub fn handover(&self) -> Option<Handover> {
-        let sealed = self.source.sealed.clone()?;
-        let cache = self.source.cache.lock().unwrap_or_else(|e| e.into_inner());
-        // Least recently used first, so a cache filled in this order keeps it.
-        let segments = cache
-            .entries
-            .iter()
-            .rev()
-            .filter(|(idx, _)| **idx < sealed.keys.len())
-            .map(|(idx, (seg, size))| (*idx, Arc::clone(seg), *size))
-            .collect();
-        Some(Handover {
-            sealed,
-            pool: Arc::clone(&self.source.pool),
-            segments,
-        })
+        self.source.handover()
     }
 
     fn open(
@@ -260,102 +246,14 @@ impl SegmentedParquetReader {
         previous: Option<&Handover>,
         keep: bool,
     ) -> Result<Self, Box<dyn Error>> {
-        if store.is_empty() {
-            return Err("SegmentedParquetReader requires at least one segment".into());
-        }
-
-        // The leading segments the store can name, whose bytes do not
-        // change while their keys stay the same. The state after them is
-        // what a later reopen can reuse.
-        let keys: Vec<u64> = (0..store.len()).map_while(|i| store.key(i)).collect();
-        let relabeled = relabel.is_some();
-        // Only a reader opened with `open_after` saves state or starts from it.
-        let reusable = keep && relabel.as_ref().is_none_or(|r| r.identities_are_fixed());
-        let reused = previous
-            .filter(|_| reusable)
-            .and_then(|p| p.sealed_prefix(&keys, relabeled));
-
-        let (state, sealed) = match &reused {
-            // Every segment is one the previous reader read: its state is
-            // this reader's, unchanged.
-            Some((prev, len)) if *len == store.len() => (Arc::clone(prev), Some(Arc::clone(prev))),
-            _ => {
-                let (mut state, start) = match &reused {
-                    Some((prev, len)) => ((**prev).clone(), *len),
-                    None => (OpenState::default(), 0),
-                };
-                // Taken at the boundary between the keyed segments and the
-                // rest; when there is no rest, the full state serves as both.
-                let mut sealed = match &reused {
-                    Some((prev, len)) if *len == keys.len() => Some(Arc::clone(prev)),
-                    _ => None,
-                };
-                let mut memo = IdentityMemo::default();
-                for idx in start..store.len() {
-                    if reusable && idx == keys.len() && !keys.is_empty() && sealed.is_none() {
-                        sealed = Some(Arc::new(state.clone()));
-                    }
-                    let Some(bytes) = store.bytes(idx).map_err(|e| e.to_string())? else {
-                        // Gone between the store's construction and now. The
-                        // catalog keeps its place so indices stay positions.
-                        state.catalog.push(SegmentCatalog::GONE);
-                        continue;
-                    };
-                    // Footer only: nothing is decoded into the pool here, so
-                    // the segment needs no content-derived id.
-                    let seg = MultiParquetSource::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
-                    state.fold(idx, &seg, relabel.as_ref(), &mut memo)?;
-                }
-                if state.opened == 0 {
-                    return Err(
-                        "every segment of the table was gone by the time it was opened".into(),
-                    );
-                }
-                state.histogram_runs.report();
-                let state = Arc::new(state);
-                if !keys.is_empty() && keys.len() == store.len() {
-                    sealed = Some(Arc::clone(&state));
-                }
-                (state, sealed)
-            }
-        };
-        // A column naming an occupant the relabel did not describe can
-        // present differently to a later reader, so nothing is saved.
-        let sealed = sealed.filter(|s| reusable && !s.unresolved);
-
-        // The previous reader's opened segments for the shared ones, so a
-        // query after a reopen does not fetch and parse them again. Only on
-        // the same pool, whose budget they are decoded into.
-        let mut cache = SegmentCache::new(pool.max_bytes());
-        if let (Some(prev), Some((_, len))) = (previous, &reused) {
-            if Arc::ptr_eq(&prev.pool, &pool) {
-                for (idx, seg, size) in &prev.segments {
-                    if idx < len {
-                        cache.insert(*idx, Arc::clone(seg), *size);
-                    }
-                }
-            }
-        }
-
-        let source = Arc::new(SegmentedSource {
-            store,
-            cache: Mutex::new(cache),
-            pool,
-            relabel,
-            state,
-            sealed: sealed.map(|state| Sealed {
-                keys,
-                relabeled,
-                state,
-            }),
-        });
+        let source = SegmentedSource::open(store, pool, relabel, previous, keep)?;
         let engine = QueryEngine::new(Arc::clone(&source) as Arc<dyn DataSource>);
         Ok(Self { source, engine })
     }
 
     /// Number of segments backing this reader, gone ones included.
     pub fn segment_count(&self) -> usize {
-        self.source.state.catalog.len()
+        self.source.segment_count()
     }
 
     /// The reader's spliced [`DataSource`] (the same [`SegmentedSource`]
@@ -449,8 +347,7 @@ impl SegmentedParquetReader {
     /// How many segments the cache currently holds open, and their bytes.
     /// For tests and diagnostics.
     pub fn cached_segments(&self) -> (usize, usize) {
-        let cache = self.source.cache.lock().unwrap_or_else(|e| e.into_inner());
-        (cache.entries.len(), cache.bytes)
+        self.source.cached_segments()
     }
 }
 
@@ -1121,6 +1018,134 @@ impl Handover {
 }
 
 impl SegmentedSource {
+    pub(crate) fn open(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+        relabel: Option<Arc<dyn ColumnRelabel>>,
+        previous: Option<&Handover>,
+        keep: bool,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        if store.is_empty() {
+            return Err("SegmentedParquetReader requires at least one segment".into());
+        }
+
+        // The leading segments the store can name, whose bytes do not
+        // change while their keys stay the same. The state after them is
+        // what a later reopen can reuse.
+        let keys: Vec<u64> = (0..store.len()).map_while(|i| store.key(i)).collect();
+        let relabeled = relabel.is_some();
+        // Only a reader opened with `open_after` saves state or starts from it.
+        let reusable = keep && relabel.as_ref().is_none_or(|r| r.identities_are_fixed());
+        let reused = previous
+            .filter(|_| reusable)
+            .and_then(|p| p.sealed_prefix(&keys, relabeled));
+
+        let (state, sealed) = match &reused {
+            // Every segment is one the previous reader read: its state is
+            // this reader's, unchanged.
+            Some((prev, len)) if *len == store.len() => (Arc::clone(prev), Some(Arc::clone(prev))),
+            _ => {
+                let (mut state, start) = match &reused {
+                    Some((prev, len)) => ((**prev).clone(), *len),
+                    None => (OpenState::default(), 0),
+                };
+                // Taken at the boundary between the keyed segments and the
+                // rest; when there is no rest, the full state serves as both.
+                let mut sealed = match &reused {
+                    Some((prev, len)) if *len == keys.len() => Some(Arc::clone(prev)),
+                    _ => None,
+                };
+                let mut memo = IdentityMemo::default();
+                for idx in start..store.len() {
+                    if reusable && idx == keys.len() && !keys.is_empty() && sealed.is_none() {
+                        sealed = Some(Arc::new(state.clone()));
+                    }
+                    let Some(bytes) = store.bytes(idx).map_err(|e| e.to_string())? else {
+                        // Gone between the store's construction and now. The
+                        // catalog keeps its place so indices stay positions.
+                        state.catalog.push(SegmentCatalog::GONE);
+                        continue;
+                    };
+                    // Footer only: nothing is decoded into the pool here, so
+                    // the segment needs no content-derived id.
+                    let seg = MultiParquetSource::open_bytes_with_pool(bytes, Arc::clone(&pool))?;
+                    state.fold(idx, &seg, relabel.as_ref(), &mut memo)?;
+                }
+                if state.opened == 0 {
+                    return Err(
+                        "every segment of the table was gone by the time it was opened".into(),
+                    );
+                }
+                state.histogram_runs.report();
+                let state = Arc::new(state);
+                if !keys.is_empty() && keys.len() == store.len() {
+                    sealed = Some(Arc::clone(&state));
+                }
+                (state, sealed)
+            }
+        };
+        // A column naming an occupant the relabel did not describe can
+        // present differently to a later reader, so nothing is saved.
+        let sealed = sealed.filter(|s| reusable && !s.unresolved);
+
+        // The previous reader's opened segments for the shared ones, so a
+        // query after a reopen does not fetch and parse them again. Only on
+        // the same pool, whose budget they are decoded into.
+        let mut cache = SegmentCache::new(pool.max_bytes());
+        if let (Some(prev), Some((_, len))) = (previous, &reused) {
+            if Arc::ptr_eq(&prev.pool, &pool) {
+                for (idx, seg, size) in &prev.segments {
+                    if idx < len {
+                        cache.insert(*idx, Arc::clone(seg), *size);
+                    }
+                }
+            }
+        }
+
+        let source = Arc::new(SegmentedSource {
+            store,
+            cache: Mutex::new(cache),
+            pool,
+            relabel,
+            state,
+            sealed: sealed.map(|state| Sealed {
+                keys,
+                relabeled,
+                state,
+            }),
+        });
+        Ok(source)
+    }
+
+    pub(crate) fn handover(&self) -> Option<Handover> {
+        let sealed = self.sealed.clone()?;
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Least recently used first, so a cache filled in this order keeps it.
+        let segments = cache
+            .entries
+            .iter()
+            .rev()
+            .filter(|(idx, _)| **idx < sealed.keys.len())
+            .map(|(idx, (seg, size))| (*idx, Arc::clone(seg), *size))
+            .collect();
+        Some(Handover {
+            sealed,
+            pool: Arc::clone(&self.pool),
+            segments,
+        })
+    }
+
+    /// Number of segments backing this source, gone ones included.
+    pub(crate) fn segment_count(&self) -> usize {
+        self.state.catalog.len()
+    }
+
+    /// How many segments the cache currently holds open, and their bytes.
+    pub(crate) fn cached_segments(&self) -> (usize, usize) {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        (cache.entries.len(), cache.bytes)
+    }
+
     /// See [`DataSource::counter_scan`]. `None` when the relabel's
     /// identities are not fixed, when a series has two locations in one
     /// segment, or when nothing matches; the dispatcher then uses the
