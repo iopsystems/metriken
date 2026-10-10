@@ -18,7 +18,7 @@ bytes = "1"
 histogram.workspace = true
 lru = "0.12"
 metriken-storage = { version = "0.1.0", path = "../metriken-storage", default-features = false }
-metriken-model = { version = "0.1.0", path = "../metriken-model", optional = true }
+metriken-model = { version = "0.1.1", path = "../metriken-model", optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true

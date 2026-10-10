@@ -31,7 +31,7 @@ use crate::{
 ///
 /// ```rust,ignore
 /// let mut opts = QueryOptions::default();
-/// if let Some(points) = reader.eval_timestamps_for(query, step_s, opts.rate_mode) {
+/// if let Some(points) = eval_timestamps_for(&reader, query, step_s, opts.rate_mode) {
 ///     opts = opts.with_eval_timestamps(Some(points));
 /// }
 /// composed.query_range_opts(query, start_s, end_s, step_s, &opts)
