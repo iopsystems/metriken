@@ -18,7 +18,7 @@ bytes = "1"
 histogram.workspace = true
 lru = "0.12"
 metriken-storage = { version = "0.1.0", path = "../metriken-storage", default-features = false }
-metriken-exposition = { version = "0.21.0", path = "../metriken-exposition", default-features = false, features = ["serde"], optional = true }
+metriken-model = { version = "0.1.0", path = "../metriken-model", optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
 serde.workspace = true
@@ -34,7 +34,7 @@ sysinfo = "0.32"
 
 [features]
 default = ["lz4", "ingest"]
-ingest = ["dep:metriken-exposition", "metriken-storage/ingest"]
+ingest = ["dep:metriken-model", "metriken-storage/ingest"]
 lz4 = ["parquet/lz4", "metriken-storage/lz4"]
 fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
 

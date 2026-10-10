@@ -9,7 +9,7 @@
 //!   not `O(file size)`.
 //! * [`MemoryStore`] — in-memory source for live agent polling.
 //!   Available with the `ingest` feature flag; ingests
-//!   `metriken_exposition::Snapshot` values.
+//!   `metriken_model::Snapshot` values.
 //!
 //! Queries go through the source's [`MetricsSource::query_range`]
 //! method, which parses a PromQL expression, dispatches recognised

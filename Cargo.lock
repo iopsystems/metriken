@@ -1062,7 +1062,7 @@ dependencies = [
  "foldhash 0.2.0",
  "histogram",
  "lru",
- "metriken-exposition",
+ "metriken-model",
  "metriken-storage",
  "parquet",
  "promql-parser",
@@ -1073,6 +1073,13 @@ dependencies = [
  "thiserror",
  "tracing",
  "twox-hash",
+]
+
+[[package]]
+name = "metriken-segment"
+version = "0.2.0"
+dependencies = [
+ "metriken-storage",
 ]
 
 [[package]]

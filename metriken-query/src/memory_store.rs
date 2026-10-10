@@ -489,7 +489,7 @@ impl MemoryStore {
     /// For histograms: a `HistogramSnapshot` is stored representing the
     /// cumulative (running) bucket counts. Quantile/rate computations are
     /// performed at query time against pairs of consecutive snapshots.
-    pub fn ingest_snapshot(&self, mut snapshot: metriken_exposition::Snapshot) {
+    pub fn ingest_snapshot(&self, mut snapshot: metriken_model::Snapshot) {
         use crate::memory::extract_name_labels;
 
         let raw_ts = snapshot
@@ -622,17 +622,17 @@ mod ingest_tests {
         counter_name: &str,
         value: u64,
         labels: &[(&str, &str)],
-    ) -> metriken_exposition::Snapshot {
+    ) -> metriken_model::Snapshot {
         let mut metadata: HashMap<String, String> = labels
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         metadata.insert("metric".to_string(), counter_name.to_string());
-        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
-            counters: vec![metriken_exposition::Counter::new(
+            counters: vec![metriken_model::Counter::new(
                 counter_name.to_string(),
                 value,
                 metadata,
@@ -662,13 +662,13 @@ mod ingest_tests {
         metadata.insert("op".to_string(), "read".to_string());
         let mut h = ::histogram::Histogram::new(7, 64).unwrap();
         h.increment(1_000).unwrap();
-        let snap = metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        let snap = metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
             counters: vec![],
             gauges: vec![],
-            histograms: vec![metriken_exposition::Histogram::new(
+            histograms: vec![metriken_model::Histogram::new(
                 "latency".to_string(),
                 h,
                 metadata,
@@ -728,15 +728,15 @@ mod ingest_tests {
         assert_eq!(labels.len(), 2);
     }
 
-    fn make_gauge_snap(ts: SystemTime, name: &str, value: i64) -> metriken_exposition::Snapshot {
+    fn make_gauge_snap(ts: SystemTime, name: &str, value: i64) -> metriken_model::Snapshot {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("metric".to_string(), name.to_string());
-        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
             counters: vec![],
-            gauges: vec![metriken_exposition::Gauge::new(
+            gauges: vec![metriken_model::Gauge::new(
                 name.to_string(),
                 value,
                 metadata,

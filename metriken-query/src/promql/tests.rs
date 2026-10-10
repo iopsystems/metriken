@@ -2434,20 +2434,15 @@ fn test_memory_store_label_values_ingest() {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    fn make_snap(
-        ts: SystemTime,
-        name: &str,
-        value: u64,
-        cpu: &str,
-    ) -> metriken_exposition::Snapshot {
+    fn make_snap(ts: SystemTime, name: &str, value: u64, cpu: &str) -> metriken_model::Snapshot {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("metric".to_string(), name.to_string());
         metadata.insert("cpu".to_string(), cpu.to_string());
-        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
-            counters: vec![metriken_exposition::Counter::new(
+            counters: vec![metriken_model::Counter::new(
                 name.to_string(),
                 value,
                 metadata,
