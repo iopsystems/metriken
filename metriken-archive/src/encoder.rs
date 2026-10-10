@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use dendro::archive::WalRow as DWalRow;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use metriken_segment::occupants::{self, Occupant};
-use metriken_segment::wal::{self, WalRowSource};
+use metriken_storage::occupants::{self, Occupant};
+use metriken_storage::wal::{self, WalRowSource};
 
 use crate::{default_compression, segment_props as sealed_props};
 
@@ -74,7 +74,7 @@ impl Encoder {
     }
 }
 
-/// A dendro WAL row, as metriken-segment's materialization reads one.
+/// A dendro WAL row, as metriken-storage's materialization reads one.
 struct Row<'a>(&'a DWalRow);
 
 impl WalRowSource for Row<'_> {

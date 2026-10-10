@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 
 use arrow::datatypes::Field;
 use dendro::rewrite::ColumnFilter;
-use metriken_segment::occupants;
-use metriken_segment::table::{WALL_OFFSET_COLUMN, WINDOW_BEGIN_COLUMN, WINDOW_WIDTH_COLUMN};
+use metriken_storage::occupants;
+use metriken_storage::table::{WALL_OFFSET_COLUMN, WINDOW_BEGIN_COLUMN, WINDOW_WIDTH_COLUMN};
 
 /// A long table's column naming each row's occupant.
 const OCCUPANT_COLUMN: &str = "occupant";

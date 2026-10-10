@@ -2,7 +2,7 @@
 //! `metriken_query::MetricsSource`, composed of one sub-source per table: a
 //! `ParquetReader` for a single-segment table, a `SegmentedParquetReader`
 //! for one sealed more than once. A table's live WAL tail is materialized
-//! as its newest segment (`metriken_segment::wal::materialize_wal_tail`).
+//! as its newest segment (`metriken_storage::wal::materialize_wal_tail`).
 //!
 //! Moved from rezolus's `crates/rez` (`RezReader`), phase 3 of
 //! `docs/journal/2026-09-28-high-cardinality-stack.md`.
@@ -32,7 +32,7 @@ use metriken_query::{
 use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
 
-use metriken_segment::occupants::Occupant;
+use metriken_storage::occupants::Occupant;
 
 /// Each occupant's first row, in the order the rows came.
 fn first_per_occupant(rows: impl IntoIterator<Item = Occupant>) -> Vec<Occupant> {
@@ -148,7 +148,7 @@ type PendingProbe = (String, Vec<Vec<u8>>, Option<(u64, u64)>);
 ///   first segment's names, which is what the reader assumed of every segment
 ///   before;
 /// - the rows of its live tail that name its columns
-///   (`metriken_segment::wal::schema_rows`), materialized alone.
+///   (`metriken_storage::wal::schema_rows`), materialized alone.
 fn table_probes(
     db: &dyn Catalog,
     recording_id: i64,
@@ -174,12 +174,12 @@ fn table_probes(
         }
     }
     let rows = db.live_wal(recording_id, table)?;
-    let naming = metriken_segment::wal::schema_rows(table, long, &rows)?;
+    let naming = metriken_storage::wal::schema_rows(table, long, &rows)?;
     let props = crate::segment_props(crate::default_compression());
     let tail = if long {
-        metriken_segment::wal::materialize_long_wal_tail_with(table, &naming, false, props)?
+        metriken_storage::wal::materialize_long_wal_tail_with(table, &naming, false, props)?
     } else {
-        metriken_segment::wal::materialize_wal_tail_with(table, &naming, props)?
+        metriken_storage::wal::materialize_wal_tail_with(table, &naming, props)?
     };
     probes.extend(tail.map(|t| t.bytes));
     Ok(probes)
@@ -300,13 +300,13 @@ fn live_tail(
     recording_id: i64,
     table: &str,
     long: bool,
-) -> Result<Option<metriken_segment::wal::MaterializedTail>, Box<dyn std::error::Error>> {
+) -> Result<Option<metriken_storage::wal::MaterializedTail>, Box<dyn std::error::Error>> {
     let rows = db.live_wal(recording_id, table)?;
     let props = crate::segment_props(crate::default_compression());
     if long {
-        metriken_segment::wal::materialize_long_wal_tail_with(table, &rows, false, props)
+        metriken_storage::wal::materialize_long_wal_tail_with(table, &rows, false, props)
     } else {
-        metriken_segment::wal::materialize_wal_tail_with(table, &rows, props)
+        metriken_storage::wal::materialize_wal_tail_with(table, &rows, props)
     }
 }
 
@@ -325,7 +325,7 @@ impl DbSegmentStore {
                     .unzip();
                 let long = db
                     .tables(recording_id)?
-                    .contains(&metriken_segment::occupants::stream_of(sampler));
+                    .contains(&metriken_storage::occupants::stream_of(sampler));
                 let tail = live_tail(db, recording_id, sampler, long)
                     .map_err(|e| e.to_string())?
                     .map(|t| bytes::Bytes::from(t.bytes));
@@ -444,7 +444,7 @@ impl SegmentSource {
                         // no series carries that key, so a filter on it
                         // matches the same series either way.
                         Some(bytes) => Arc::new(first_per_occupant(
-                            metriken_segment::occupants::decode_segment(&bytes)?
+                            metriken_storage::occupants::decode_segment(&bytes)?
                                 .into_iter()
                                 .map(|(_, o)| o),
                         )),
@@ -455,7 +455,7 @@ impl SegmentSource {
                 decoded.insert(key, rows);
             }
             for row in db.live_wal(recording_id, stream)? {
-                out.extend(metriken_segment::occupants::decode_wal_row(&row.row)?);
+                out.extend(metriken_storage::occupants::decode_wal_row(&row.row)?);
             }
             Ok((out, decoded))
         };
@@ -592,7 +592,7 @@ struct SamplerReader {
     indexed: bool,
     /// The table's occupant stream, when it is a long table: its series
     /// carry only an occupant number, and this stream says which labels each
-    /// number stands for. See `metriken_segment::occupants`.
+    /// number stands for. See `metriken_storage::occupants`.
     occupants: Option<String>,
     /// What reads an indexed table's caller rows into a relabelling. The
     /// archive's own long tables need none (their occupant stream is read
@@ -1262,7 +1262,7 @@ impl ArchiveReader {
             let (occupant_streams, samplers): (Vec<String>, Vec<String>) = db
                 .tables(rec.id)?
                 .into_iter()
-                .partition(|s| metriken_segment::occupants::table_of(s).is_some());
+                .partition(|s| metriken_storage::occupants::table_of(s).is_some());
             let occupant_streams: HashSet<String> = occupant_streams.into_iter().collect();
             for sampler in samplers {
                 let metas = db.segment_meta(rec.id, &sampler)?;
@@ -1278,7 +1278,7 @@ impl ArchiveReader {
                     rec.id,
                     &sampler,
                     &metas,
-                    occupant_streams.contains(&metriken_segment::occupants::stream_of(&sampler)),
+                    occupant_streams.contains(&metriken_storage::occupants::stream_of(&sampler)),
                 )?;
                 // Nothing sealed and nothing live: the table has no rows at
                 // all, so there is nothing to open. Same skip as the eager path.
@@ -1342,8 +1342,8 @@ impl ArchiveReader {
                     interval,
                     indexed: indexed.contains(&sampler),
                     occupants: occupant_streams
-                        .contains(&metriken_segment::occupants::stream_of(&sampler))
-                        .then(|| metriken_segment::occupants::stream_of(&sampler)),
+                        .contains(&metriken_storage::occupants::stream_of(&sampler))
+                        .then(|| metriken_storage::occupants::stream_of(&sampler)),
                     index: index.clone(),
                     segments: match &reopen {
                         Some(reopen) => SegmentSource::Db {

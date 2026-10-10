@@ -1,9 +1,9 @@
-//! The long segment layout, read. The format is `metriken-segment`'s
-//! ([`metriken_segment::long`]), re-exported here so existing paths keep
+//! The long segment layout, read. The format is `metriken-storage`'s
+//! ([`metriken_storage::long`]), re-exported here so existing paths keep
 //! working; this module adds the reader's side of an occupant's labels,
 //! [`OccupantLabels`].
 
-pub use metriken_segment::long::*;
+pub use metriken_storage::long::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -30,7 +30,7 @@ impl OccupantLabels {
     /// From an occupant stream's rows. An occupant restated with the same
     /// labels is one entry; restated with different ones is a defect of the
     /// writer, and the first labels win.
-    pub fn new(rows: impl IntoIterator<Item = metriken_segment::occupants::Occupant>) -> Self {
+    pub fn new(rows: impl IntoIterator<Item = metriken_storage::occupants::Occupant>) -> Self {
         let mut labels: HashMap<u64, BTreeMap<String, String>> = HashMap::new();
         let mut keys = BTreeSet::new();
         for o in rows {
@@ -90,7 +90,7 @@ impl ColumnRelabel for OccupantLabels {
 #[cfg(test)]
 mod relabel_tests {
     use super::*;
-    use metriken_segment::occupants::Occupant;
+    use metriken_storage::occupants::Occupant;
 
     fn occ(n: u64, pairs: &[(&str, &str)]) -> Occupant {
         Occupant {

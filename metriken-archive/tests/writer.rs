@@ -682,7 +682,7 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
 #[test]
 fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
     use metriken_archive::Catalog;
-    use metriken_segment::format::{FORMAT_KEY, FORMAT_VERSION};
+    use metriken_storage::format::{FORMAT_KEY, FORMAT_VERSION};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rec.dendro");

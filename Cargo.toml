@@ -9,7 +9,7 @@ members = [
     "metriken-archive",
     "metriken-query",
     "metriken-model",
-    "metriken-segment",
+    "metriken-storage",
     "metriken-types",
 ]
 

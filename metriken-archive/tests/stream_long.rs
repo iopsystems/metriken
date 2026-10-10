@@ -196,7 +196,7 @@ fn record(wide: &Path, long: &Path, finalize: bool, on_tick: &mut dyn FnMut(u64)
             rows.iter()
                 .filter(|r| r.stream == "t/tasks/occupants")
                 .map(|r| {
-                    metriken_segment::occupants::decode_wal_row(&r.row)
+                    metriken_storage::occupants::decode_wal_row(&r.row)
                         .unwrap()
                         .len()
                 })
@@ -349,9 +349,9 @@ fn the_long_stream_records_what_wide_snapshots_record() {
 fn the_decoder_follows_a_group_that_changes_form() {
     use dendro::archive::WalRow;
     use metriken_archive::StreamedGroup;
-    use metriken_segment::occupants::{self, Occupant};
-    use metriken_segment::schema::{GroupSchema, MetricDesc};
-    use metriken_segment::wal::{self, LongOccupant, WalGroupRow, WalLongRow};
+    use metriken_storage::occupants::{self, Occupant};
+    use metriken_storage::schema::{GroupSchema, MetricDesc};
+    use metriken_storage::wal::{self, LongOccupant, WalGroupRow, WalLongRow};
 
     const STREAM: &str = "t/switch";
     let schema = GroupSchema {

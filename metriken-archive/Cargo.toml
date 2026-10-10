@@ -16,7 +16,7 @@ bytes = "1"
 dendro = { version = "0.3.4", default-features = false }
 metriken-query = { version = "0.34.5", path = "../metriken-query", default-features = false, features = ["lz4"] }
 parquet = { version = "58.2.0", default-features = false, features = ["arrow", "lz4", "zstd"] }
-metriken-segment = { version = "0.1.6", path = "../metriken-segment", default-features = false, features = ["lz4"] }
+metriken-storage = { version = "0.1.0", path = "../metriken-storage", default-features = false, features = ["lz4"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 metriken-exposition = { version = "0.21.4", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
 metriken = { version = "0.11.2", path = "../metriken", optional = true }

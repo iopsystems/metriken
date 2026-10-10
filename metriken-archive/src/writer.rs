@@ -30,9 +30,9 @@ use dendro::archive::{SourceMeta, WalRow as DWalRow};
 use dendro::seal::{SealPolicy, SegmentAccount};
 use dendro::writer::{SourceWriter, Writer};
 use metriken_exposition::{GroupSnapshot, Snapshot};
-use metriken_segment::occupants::{self, Occupant};
-use metriken_segment::schema::{GroupSchema, MetricDesc};
-use metriken_segment::wal::{self, LongOccupant, WalLongRow};
+use metriken_storage::occupants::{self, Occupant};
+use metriken_storage::schema::{GroupSchema, MetricDesc};
+use metriken_storage::wal::{self, LongOccupant, WalLongRow};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -119,7 +119,7 @@ pub enum StreamedGroup {
 /// the row that carried it; a group row whose schema this connection was
 /// never sent is skipped and counted in [`unresolved`](Self::unresolved).
 ///
-/// [`WalGroupRow`]: metriken_segment::wal::WalGroupRow
+/// [`WalGroupRow`]: metriken_storage::wal::WalGroupRow
 #[derive(Default)]
 pub struct StreamDecoder {
     schemas: HashMap<String, ((u64, u64), Arc<metriken_exposition::GroupSchema>)>,
@@ -205,7 +205,7 @@ impl StreamDecoder {
 /// Which row type an encoded stream payload is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowForm {
-    /// A [`WalGroupRow`](metriken_segment::wal::WalGroupRow): six fields.
+    /// A [`WalGroupRow`](metriken_storage::wal::WalGroupRow): six fields.
     Group,
     /// A [`WalLongRow`]: four fields.
     Long,
@@ -969,8 +969,8 @@ impl SourceRecorder {
         wall_offset: i64,
         rows: &mut Vec<DWalRow>,
     ) -> Result<(), Error> {
-        use metriken_segment::builder::{cells_approx_bytes, Cell, CellValue};
-        use metriken_segment::wal::{WalCell, WalValue};
+        use metriken_storage::builder::{cells_approx_bytes, Cell, CellValue};
+        use metriken_storage::wal::{WalCell, WalValue};
 
         struct Entry<'a> {
             name: &'a str,
@@ -1063,7 +1063,7 @@ impl SourceRecorder {
                         name: e.name,
                         metadata: e.metadata,
                         window: e.window.map(|(begin_ns, end_ns)| {
-                            metriken_segment::window::Window { begin_ns, end_ns }
+                            metriken_storage::window::Window { begin_ns, end_ns }
                         }),
                         value: match e.value {
                             CellValue::Counter(v) => CellValue::Counter(v),
@@ -1364,7 +1364,7 @@ impl SourceRecorder {
 #[cfg(test)]
 mod row_form_tests {
     use super::*;
-    use metriken_segment::wal::WalGroupRow;
+    use metriken_storage::wal::WalGroupRow;
 
     /// The decoder tells the two row types apart by their field counts, so
     /// those must differ and match what the encoders write.

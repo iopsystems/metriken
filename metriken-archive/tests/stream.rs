@@ -15,7 +15,7 @@ use metriken_exposition::group_builder::{
     is_family, Acquisition, GroupBuilder, GroupId, Membership, NoGuard, Route, Router, Stamp,
 };
 use metriken_query::{BufferPool, MetricsSource, QueryResult};
-use metriken_segment::wal::decode_wal_group_row;
+use metriken_storage::wal::decode_wal_group_row;
 
 #[metric(name = "stream_requests")]
 static REQUESTS: metriken::Counter = metriken::Counter::new();

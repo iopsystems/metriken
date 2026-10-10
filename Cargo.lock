@@ -1006,7 +1006,7 @@ dependencies = [
  "metriken",
  "metriken-exposition",
  "metriken-query",
- "metriken-segment",
+ "metriken-storage",
  "parquet",
  "tempfile",
  "tracing",
@@ -1073,7 +1073,7 @@ dependencies = [
  "histogram",
  "lru",
  "metriken-exposition",
- "metriken-segment",
+ "metriken-storage",
  "parquet",
  "promql-parser",
  "serde",
@@ -1086,8 +1086,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "metriken-segment"
-version = "0.1.7"
+name = "metriken-storage"
+version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use metriken_archive::{ArchiveWriter, Catalog, DendroCatalog, WriterConfig};
 use metriken_exposition::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
-use metriken_segment::table::{read_table_parquet, Values};
+use metriken_storage::table::{read_table_parquet, Values};
 
 fn rewrite(src: &DendroCatalog, table: &str, out: &Path, long_groups: bool) {
     let source = &src.sources().unwrap()[0];

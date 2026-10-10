@@ -1,7 +1,7 @@
 //! The write-ahead log's row format: what a row holds before it is sealed
 //! into a segment, and its msgpack encoding. The same rows are what a
 //! producer sends on dendro's replication stream. Turning rows into a parquet
-//! segment is storage's (`metriken-segment`'s `wal` module).
+//! segment is storage's (`metriken-storage`'s `wal` module).
 
 use std::collections::BTreeMap;
 
@@ -27,7 +27,7 @@ pub struct WalCell {
     /// The snapshot **entry's** metadata, verbatim — NOT the parquet column's.
     ///
     /// The difference matters to a reader. `metric_type` is **not** in here:
-    /// `TableBuilder::push_row` injects it (`metriken-segment`'s `builder.rs`, the `or_insert_with` that
+    /// `TableBuilder::push_row` injects it (`metriken-storage`'s `builder.rs`, the `or_insert_with` that
     /// builds a `Column`) and `metriken-exposition` never carries it. A
     /// recovery path that built `Column { metadata: cell.metadata, .. }`
     /// directly would produce a column a natively sealed segment does not

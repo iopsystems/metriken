@@ -1874,7 +1874,7 @@ impl ParquetSource {
     fn open(path: &Path) -> Result<Arc<Self>, Box<dyn Error>> {
         let file = File::open(path)?;
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
-        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        metriken_storage::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1891,7 +1891,7 @@ impl ParquetSource {
 
     fn open_bytes(bytes: Bytes) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
-        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        metriken_storage::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1908,7 +1908,7 @@ impl ParquetSource {
 
     fn open_file(file: File) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
-        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        metriken_storage::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1926,7 +1926,7 @@ impl ParquetSource {
     fn open_with_pool(path: &Path, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
         let file = File::open(path)?;
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
-        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        metriken_storage::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -1956,7 +1956,7 @@ impl ParquetSource {
         id: u64,
     ) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
-        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        metriken_storage::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id,
@@ -1973,7 +1973,7 @@ impl ParquetSource {
 
     fn open_file_with_pool(file: File, pool: Arc<BufferPool>) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
-        metriken_segment::format::check(meta.metadata().file_metadata().key_value_metadata())?;
+        metriken_storage::format::check(meta.metadata().file_metadata().key_value_metadata())?;
         let sampling_interval_ms = parse_sampling_interval(&meta);
         Ok(Arc::new(Self {
             id: next_source_id(),
@@ -3690,8 +3690,8 @@ mod tests {
             w.close().unwrap();
             buf
         };
-        use metriken_segment::format::FORMAT_KEY;
-        use metriken_segment::long::LAYOUT_KEY;
+        use metriken_storage::format::FORMAT_KEY;
+        use metriken_storage::long::LAYOUT_KEY;
         assert!(ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "1")])).is_ok());
         let err = ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "2")]))
             .err()

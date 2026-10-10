@@ -44,7 +44,7 @@ pub fn default_compression() -> Compression {
 /// a caller re-encoding a segment (a column projection) passes so the result
 /// matches a sealed one.
 pub fn segment_props(compression: Compression) -> parquet::file::properties::WriterProperties {
-    metriken_segment::table::segment_writer_props()
+    metriken_storage::table::segment_writer_props()
         .into_builder()
         .set_compression(compression)
         .build()

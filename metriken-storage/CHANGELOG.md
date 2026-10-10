@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased: metriken-storage 0.1.0
+
+### Changed
+
+- Renamed from `metriken-segment`; its 0.1.x history is below. Paths are
+  unchanged apart from the crate name (`metriken_segment::` becomes
+  `metriken_storage::`).
+- The slot-size constants in `builder` and the row cost functions in `wal`
+  are `metriken-model`'s (`metriken_model::cost`), re-exported at the same
+  paths.
+
 ## [0.1.7] - 2026-10-09
 
 ### Changed

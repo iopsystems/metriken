@@ -4876,7 +4876,7 @@ mod tests {
     #[test]
     fn an_undescribed_occupant_hands_nothing_on() {
         use crate::long::{OccupantLabels, OCCUPANT_LABEL};
-        use metriken_segment::occupants::Occupant;
+        use metriken_storage::occupants::Occupant;
         let seg = |from| segment("cpu_cycles", &[(OCCUPANT_LABEL, "5")], &rows(from, 4));
         let pool = BufferPool::new(64 * 1024 * 1024);
         let segments = || vec![(Some(1), seg(1)), (Some(2), seg(5)), (None, seg(9))];

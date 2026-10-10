@@ -61,11 +61,11 @@ use dendro::archive::WalRow;
 use dendro::replicate::{Frame, NO_INDEX_STATE};
 use metriken_exposition::group_builder::{LongGroupSnapshot, StreamGroup};
 use metriken_exposition::GroupSnapshot;
-use metriken_segment::occupants::{self, Occupant};
-use metriken_segment::schema::GroupSchema;
+use metriken_storage::occupants::{self, Occupant};
+use metriken_storage::schema::GroupSchema;
 #[cfg(doc)]
-use metriken_segment::wal::WalGroupRow;
-use metriken_segment::wal::{
+use metriken_storage::wal::WalGroupRow;
+use metriken_storage::wal::{
     decode_wal_long_row, encode_wal_group_row, encode_wal_group_row_with_schema,
     encode_wal_long_row, LongOccupant, WalLongRow,
 };
@@ -567,8 +567,8 @@ fn with_long_schema(payload: &[u8], schema: &GroupSchema) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metriken_segment::schema::MetricDesc;
-    use metriken_segment::wal::{decode_wal_group_row, WalGroupRow};
+    use metriken_storage::schema::MetricDesc;
+    use metriken_storage::wal::{decode_wal_group_row, WalGroupRow};
 
     const STREAM: &str = "cpu_usage/cpu_usage_task";
     const UUID: &str = "11111111-2222-4333-8444-555555555555";

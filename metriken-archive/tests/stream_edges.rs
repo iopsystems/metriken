@@ -12,9 +12,9 @@ use metriken_exposition::{
     GroupSchema as XSchema, GroupSnapshot, MetricDesc as XDesc, Snapshot, SnapshotV3,
 };
 use metriken_query::{BufferPool, MetricsSource, QueryResult};
-use metriken_segment::occupants::Occupant;
-use metriken_segment::schema::{GroupSchema, MetricDesc};
-use metriken_segment::wal::{LongOccupant, WalLongRow};
+use metriken_storage::occupants::Occupant;
+use metriken_storage::schema::{GroupSchema, MetricDesc};
+use metriken_storage::wal::{LongOccupant, WalLongRow};
 
 const S: u64 = 1_000_000_000;
 const BASE: u64 = 1_700_000_000 * S;
