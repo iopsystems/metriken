@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 description = "Storage for metriken recordings: the segment format, column readers, and the dendro and .rez archives"
 homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
+# The integration tests query through metriken-query, a path-only
+# dev-dependency that publishing strips, so they cannot build from the package.
+exclude = ["tests/"]
 
 [dependencies]
 arrow.workspace = true
