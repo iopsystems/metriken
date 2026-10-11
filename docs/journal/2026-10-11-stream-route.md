@@ -415,10 +415,10 @@ Prometheus scrape and this entry records why.
 
 ## As built
 
-dendro 0.4.0 as merged (8cc03ee, 0.4.0-alpha.0, not yet released) leaves
-`seal` ungated, since it has no dependencies; the line above said
-otherwise. metriken depends on it as `0.4.0-alpha.0` through a workspace
-`[patch.crates-io]` to that commit, which goes before metriken's release.
+dendro 0.4.0 (#31, released through #32) leaves `seal` ungated, since it
+has no dependencies; the line above said otherwise. metriken built against
+it through a workspace `[patch.crates-io]` until the release, then depends
+on `0.4.0`.
 
 Step 2 is on metriken branch `feat/stream-route`, off c2b939c. Where it
 differs from the design, or the design left a choice open:
