@@ -163,7 +163,8 @@ pub trait Pass: Send + Sync + 'static {
     fn stamp(&self) -> PassStamp;
     fn rows(&self) -> &[Self::Row];
 }
-// exposition implements it for `(PassStamp, Vec<R>)` and `Arc<P: Pass>`;
+// exposition implements it for `(PassStamp, Vec<R>)` with
+// `R: StreamRow + Send + Sync + 'static`, and for `Arc<P: Pass>`;
 // storage for `AgentRows`; rezolus for its `StreamRows`.
 
 /// `interval` and `layout` from a request's query string. Refuses a zero or
@@ -212,11 +213,15 @@ Feature `stream-tokio` adds:
 
 ```rust
 impl StreamSubscription {
-    /// Sleeps to each deadline, reads `now`, awaits `fetch(now)` and yields
-    /// `frame_at(pass, now)`. `keep_alive` is dropped with the stream, which
-    /// is how a producer ties a registration (rezolus's `Subscribers` guard)
-    /// to the stream's lifetime.
-    pub fn into_stream<P, F, Fut>(self, fetch: F, keep_alive: impl Send + 'static)
+    /// Sleeps to each deadline, reads `now` from `wall_now`, awaits
+    /// `fetch(now)` and yields `frame_at(pass, now)`. `keep_alive` is dropped
+    /// with the stream, which is how a producer ties a registration
+    /// (rezolus's `Subscribers` guard) to the stream's lifetime. `wall_now` is
+    /// `SystemTime::now` outside tests; rezolus's tests inject a clock, since
+    /// `tokio::time::pause` does not control `SystemTime`
+    /// (`http/mod.rs:772`, `:858`).
+    pub fn into_stream<P, F, Fut>(self, fetch: F, keep_alive: impl Send + 'static,
+                                  wall_now: impl Fn() -> SystemTime + Send + 'static)
         -> impl Stream<Item = io::Result<Bytes>> + Send + 'static
     where P: Pass, F: FnMut(SystemTime) -> Fut + Send + 'static,
           Fut: Future<Output = Option<P>> + Send;
@@ -280,7 +285,10 @@ changes its imports (rezolus at `src/main.rs:5`, `parquet_tools/convert.rs:11`,
   gates the modules that use dendro: the catalog, reader and writer,
   `encoder.rs` (`dendro::segment`), `filter.rs` (`dendro::rewrite`), the
   private `archive.rs`, `rez`, and the `lib.rs` re-exports of `Encoder`,
-  `KeepMetrics`, `Catalog`, `DendroCatalog` and `ArchiveReader`. A producer
+  `KeepMetrics`, `Catalog`, `DendroCatalog` and `ArchiveReader`, and the rest
+  of the `lib.rs` re-exports from those modules (`lib.rs:74-78`: `archive::*`,
+  `SegmentIndex`, `ENCODER_VERSION`, `READABLE_ENCODERS`,
+  `LabeledRecordings`). A producer
   that converts to parquet uses `default-features = false, features =
   ["convert"]` and compiles no SQLite. The existing `rez` feature implies
   `archive`.
@@ -301,7 +309,8 @@ metriken-archive and metriken-segment leave the workspace's `members` in this
 PR: as members on storage 0.1 they fail `cargo metadata` once storage is 0.2,
 and pointing them at crates.io storage 0.1 would bring a second `metriken-core`,
 which declares `links`. Their last releases (0.4.0, 0.2.0) stay on storage 0.1
-and get no new release; their users move to `metriken_storage` paths.
+and get no new release; their users move to `metriken_storage` paths. Their
+directories are deleted; the published sources stay in git history.
 
 There is no cycle: exposition depends on model and dendro; storage depends on
 exposition only under `stream`.
@@ -315,8 +324,11 @@ exposition only under `stream`.
   `stream_long_at` (long, `Arc<StreamRows>`) as today, so the router, refresh,
   TTL, `external/main` and the pass cache shared with `/metrics/rows` stay.
   `frames.rs`'s producer and `rows_frames` go.
-- `metriken-storage` is declared with `default-features = false` in rezolus's
-  workspace; the `rez` feature brings `archive` with it.
+- `metriken-query` stays `default-features = false` in rezolus's workspace, so
+  `crates/rez` declares it with `features = ["archive"]`, unconditionally: the
+  read path, the wasm viewer's included, needs `MetricsSource for
+  ArchiveReader`. `metriken-storage` is already `default-features = false`;
+  storage's `rez` feature implies `archive`.
 - The recorder's `Subscription::connect` takes a `&[WireNames]`. It matches the
   `Content-Type` against each entry's `content_type` and reads that entry's
   headers. rezolus passes `WIRE_NAMES` and its own `REZOLUS_LEGACY_WIRE_NAMES`
@@ -354,11 +366,13 @@ GO for this step when all hold:
    sequence of passes (a repeated pass, a window that does not advance, a
    missing pass, wide and long) into a committed fixture, using
    `FrameProducer::for_source` (`stream.rs:388`) with a fixed uuid and anchor.
-   The same sequence through `StreamSubscription` built the same way (a test
-   constructor taking the uuid and anchor) gives byte-equal frames. Only the
+   The same sequence through `StreamSubscription` built the same way (a
+   `#[doc(hidden)] pub` constructor taking the uuid and anchor, since the test
+   is in rezolus) gives byte-equal frames. Only the
    HTTP headers' names change.
 2. **One build per pass.** A rezolus test runs three `into_stream`
-   subscriptions at one interval (50 ms, TTL at least the interval) against
+   subscriptions on the real clock (not `start_paused`) at one interval
+   (50 ms, TTL at least the interval) against
    one `SnapshotBuilder` for N ticks and asserts `samples()` is at most N. One
    encode per pass holds by the `OnceLock`s on `rows_full` and `stream_long`
    (`snapshot.rs:98-101`), which this change does not touch.
