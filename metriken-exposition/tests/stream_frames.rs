@@ -139,6 +139,8 @@ fn long_row(g: &G) -> EncodedStreamGroup {
 /// `(wall_ns, ts, wall_offset)`.
 type Stamp = (u64, i64, i64);
 
+type TestPass<R> = (PassStamp, Vec<R>);
+
 /// The sequence, as `(wake time, pass)`:
 ///
 /// 1. First pass: `cpu/a` and `cpu/b` windowed, `external/main` windowless.
@@ -152,7 +154,7 @@ type Stamp = (u64, i64, i64);
 ///    occupant).
 /// 6. The wall clock steps back half a second, same pass: an empty frame
 ///    whose `seq` is held at the previous one plus one.
-fn sequence<R>(row: fn(&G) -> R) -> Vec<(u64, Option<(PassStamp, Vec<R>)>)> {
+fn sequence<R>(row: fn(&G) -> R) -> Vec<(u64, Option<TestPass<R>>)> {
     let pass = |stamp: Stamp, groups: &[G]| {
         (
             PassStamp {
