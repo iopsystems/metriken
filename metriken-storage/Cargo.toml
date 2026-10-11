@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 description = "Storage for metriken recordings: the segment format, column readers, and the dendro and .rez archives"
 homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
+# The integration tests query through metriken-query, a path-only
+# dev-dependency that publishing strips, so they cannot build from the package.
+exclude = ["tests/"]
 
 [dependencies]
 arrow.workspace = true
@@ -16,7 +19,7 @@ bytes = "1"
 dendro = { version = "0.3.4", default-features = false }
 foldhash = "0.2.0"
 lru = "0.12"
-metriken-exposition = { version = "0.21.5", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
+metriken-exposition = { version = "0.21.6", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 histogram.workspace = true
 metriken = { version = "0.11.3", path = "../metriken", optional = true }
