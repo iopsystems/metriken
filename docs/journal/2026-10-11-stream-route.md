@@ -1,8 +1,14 @@
 # The stream route: any registry serves `/metrics/stream`
 
-**Status:** OPEN. Design 2026-10-11. Step 2 built 2026-10-11 on metriken
-branch `feat/stream-route` ("As built"); checks 1, 3 and 6 pass in metriken.
-Steps 3 and 4 and checks 2, 4 and 5 remain. This is path step 3 of
+**Status:** OPEN for llm-perf. dendro 0.4.0 (dendro#31, #32),
+metriken-exposition 0.22.0, metriken-storage 0.2.0 and metriken-query 0.36.0
+(#253, #254) released 2026-10-11; the rezolus agent serves the stream through
+the helper (rezolus#1435) and cachecannon does (cachecannon#205 on main,
+cachecannon#206 on its 0.0.x line). cachecannon's network library ringline had
+to move to metriken 0.11 first, since a build holds one metriken-core:
+ringline-rs/ringline#649 on main, and 0.6.10 from release/0.6.x (ringline#651,
+#652). All six checks pass ("As built"). The plan's GO for piece 1 also needs
+llm-perf, which serves the stream in its own step 4. This is path step 3 of
 [one recording stack](2026-10-08-one-recording-stack.md) (piece 1). "Step N
 below" means this entry's own order of work. Decided 2026-10-11:
 
@@ -374,8 +380,11 @@ GO for this step when all hold:
    HTTP headers' names change.
 2. **One build per pass.** A rezolus test runs three `into_stream`
    subscriptions on the real clock (not `start_paused`) at one interval
-   (50 ms, TTL at least the interval) against
-   one `SnapshotBuilder` for N ticks and asserts `samples()` is at most N. One
+   against one `SnapshotBuilder` and asserts one row timestamp per `seq`
+   across the subscriptions. (Amended 2026-10-11: this said 50 ms with a TTL
+   at least the interval and `samples()` at most N; as run it is 400 ms with
+   a 100 ms TTL and a 250 ms sampler. At a TTL equal to the interval a
+   correct agent can send a pass one interval late; see As built.) One
    encode per pass holds by the `OnceLock`s on `rows_full` and `stream_long`
    (`snapshot.rs:98-101`), which this change does not touch.
 3. **No SQLite.** `cargo tree -e normal` lists no rusqlite, arrow or parquet
@@ -384,7 +393,8 @@ GO for this step when all hold:
    convert`.
 4. **Agent cost.** Agent utime+stime from `/proc/<pid>/stat` over 300 passes
    with one `record -o x.dendro` long subscriber, five alternating runs per
-   build on one Linux host, against rezolus at 9ac10de7. Both builds are
+   build on one Linux host, against rezolus main (amended 2026-10-11: run
+   against 9f59f9e8, not 9ac10de7, since #1436 landed first). Both builds are
    recorded by the new recorder, which accepts both names. A build fails when its
    median is more than 5% worse and the ranges do not overlap, the storage
    scan's rule.
@@ -501,16 +511,28 @@ Checks, run 2026-10-11:
   buckets equal to `load(idx)` under its labels, the writer stages the rows,
   and `ArchiveReader` lists one histogram series per member.
 
-Check 4 runs on the rezolus PR.
+- **4.** Agent cost, on delta (32 cores, steady background load, no
+  systemslab job): agent utime+stime over 300 one-second passes with one
+  long-layout `record -o x.dendro` subscriber, five alternating runs per
+  build, both recorded by the new recorder. rezolus main at 9f59f9e8 (with
+  #1436, which landed on main before the branch merged it at bf365042, so
+  the base moved from the 9ac10de7 the design named): 0.84, 0.85, 0.91,
+  0.90, 0.83 s, median 0.85 s. The branch at
+  bf365042: 0.88, 0.86, 0.85, 0.88, 0.87 s, median 0.87 s. The median is
+  +2.4% and the ranges overlap, so it passes the rule. Both cost about 3 ms
+  of agent CPU per pass; one 10 ms clock tick is about 1.2% of the total.
+  The base agent served the legacy names, so the run also recorded a real
+  legacy agent with the new recorder.
 
-Checks 2 and 5 ran in rezolus against this branch (rezolus branch
-`feat/stream-route-adopt`, path-patched), and check 1 there too:
+Checks 1, 2 and 5 ran in rezolus on `feat/stream-route-adopt`: first
+against this branch through `[patch]`, and check 2's final form against the
+released crates.
 
 - Check 1: rezolus's `stream_frame_fixture` drives `StreamSubscription` with
   its own `Arc<AgentRows>` and `Arc<StreamRows>` and matches the committed
   fixtures byte for byte, unchanged.
-- Check 2: rezolus's test runs three subscriptions at 50 ms on the real
-  clock. Its first bound, passes per distinct interval, passed while hiding
+- Check 2: rezolus's test runs three subscriptions on the real clock. Its
+  first bound, passes per distinct interval, passed while hiding
   a real defect: the agent's fetch read the instant after waiting for the
   builder lock, so a subscriber queued behind a pass longer than the TTL
   found it stale and sampled again, three passes at one `seq` (measured in
@@ -518,9 +540,43 @@ Checks 2 and 5 ran in rezolus against this branch (rezolus branch
   enough to pass. The defect predates the route; rezolus's `rows_frames`
   had the same line. The fix reads the instant on waking, before the lock,
   and the test asserts one row timestamp per `seq` across the
-  subscriptions, which fails with the old line and passes with the new.
+  subscriptions. As merged it runs a 400 ms interval and a 100 ms TTL with
+  a sampler whose refresh sleeps 250 ms, so every pass outlasts the TTL on
+  any build: the old line fails 5/5 in release and 2/2 in debug, the fix
+  passes. A TTL equal to the interval (the test's first setting, 50 ms
+  each) failed in CI for a different reason: a subscriber that wakes at the
+  next boundary sooner after it than the last pass's builder woke after its
+  own finds that pass still fresh, sends an empty frame, and then sends that
+  pass one interval late at the new pass's `seq`. With the agent's 10 ms TTL
+  under 1 s intervals, this needs a builder to wake 990 ms late.
 - Check 5: `rezolus record` writes one `.dendro` from a fake agent serving the
   legacy names and one serving the new names.
+
+## Follow-ups
+
+From cachecannon's adoption (cachecannon#205):
+
+- metriken-query 0.36 has no HTTP routes and `QueryEngine` is
+  `pub(crate)`, so a viewer writes its own `/api/v1` layer (162 lines in
+  cachecannon's `src/viewer/api.rs`). Piece 5 (one viewer) is where this
+  goes away.
+- `Refusal` carries a numeric status but no reason phrase; a producer with
+  a hand-written HTTP server maps 400 to "Bad Request" itself.
+- Nothing says whether a producer's version belongs in the handshake's
+  labels or its metadata; cachecannon puts it in metadata. Piece 3
+  (templates in the archive), which puts the template in the handshake's
+  metadata, should settle it.
+- rezolus's recorder names a streamed source from its own endpoint probe,
+  not the handshake's `source` label, so `--url` records cachecannon as
+  `source=rezolus` unless `--endpoint url,source=cachecannon` or
+  `--metadata source=cachecannon` is given. Nothing in the plan yet has the
+  recorder adopt the handshake's labels; rezolus's endpoint detection is the
+  natural place.
+- cachecannon refuses an interval below its floor with a 400, where the
+  design accepts it and sends empty frames: a subscription at `interval=1ns`
+  measured 26% of cachecannon's admin thread and about 1,300 missed-interval
+  warnings in two seconds on the host generating load. Whether the helper
+  should refuse below the floor for every producer is open.
 
 ## Left alone
 
