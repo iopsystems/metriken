@@ -1,6 +1,8 @@
 # One recording stack for every metriken producer
 
-**Status:** OPEN. Plan opened 2026-10-08, nothing built. Decided 2026-10-08:
+**Status:** OPEN. Plan opened 2026-10-08. Path steps 1 to 3 built and
+released by 2026-10-11 (metriken-model; metriken-storage and metriken-query;
+the stream route, open for llm-perf). Decided 2026-10-08:
 
 - recording, exposition and viewing converge on one stack, and per-project
   recorders and viewer implementations are retired as their projects move;
