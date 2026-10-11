@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use crate::{Counter, Gauge, Histogram, Snapshot};
+use metriken_model::{Counter, Gauge, Histogram, Snapshot};
 
 pub(crate) struct HashedSnapshot {
     pub(crate) ts: u64,
@@ -48,7 +48,7 @@ impl From<Snapshot> for HashedSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GroupSchema, GroupSnapshot, MetricDesc, SnapshotV2, SnapshotV3};
+    use metriken_model::{GroupSchema, GroupSnapshot, MetricDesc, SnapshotV2, SnapshotV3};
     use metriken_types::Window;
     use std::sync::Arc;
     use std::time::Duration;

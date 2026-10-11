@@ -1,3 +1,14 @@
+//! Msgpack snapshots into one parquet file (feature `convert`): one row per
+//! snapshot, one column per metric. [`MsgpackToParquet`] converts a file of
+//! concatenated msgpack [`Snapshot`]s; [`ParquetSchema`] and
+//! [`ParquetWriter`] build the file from snapshots in hand.
+//!
+//! The column layout and file metadata are what `metriken-query`'s
+//! `ParquetReader` reads.
+
+mod hashed;
+mod writer;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
@@ -5,8 +16,10 @@ use std::path::Path;
 
 use parquet::errors::ParquetError;
 
-use crate::Snapshot;
-use crate::{ParquetOptions, ParquetSchema};
+use metriken_model::Snapshot;
+pub use writer::{
+    ParquetCompression, ParquetHistogramType, ParquetOptions, ParquetSchema, ParquetWriter,
+};
 
 /// A struct for converting msgpack'd metriken snapshots into a parquet file.
 #[derive(Clone, Debug, Default)]
