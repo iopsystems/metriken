@@ -1,7 +1,8 @@
 # The storage scan: metriken-storage and metriken-query split
 
-**Status:** OPEN. Design 2026-10-09; step 1 merged (#249); steps 2 and 3 built
-on `refactor/metriken-storage` ("As built"). This is path step 2 of
+**Status:** OPEN. Design 2026-10-09; step 1 merged (#249); steps 2, 3 and 5
+built ("As built"); the gate run on 2026-10-10 failed one measure, released
+under an exception ("Gate result"). This is path step 2 of
 [one recording stack](2026-10-08-one-recording-stack.md). "Step N below"
 means this entry's own order of work. Decided 2026-10-09:
 
@@ -303,8 +304,8 @@ against the branch through `[patch.crates-io]`.
    query; the re-exports.
 4. `MsgpackToParquet` from `metriken-exposition`. Moved to path step 3 (see
    "As built").
-5. rezolus's `crates/rez` as feature `rez`, without `caller_rows`. Not
-   started; whether the `.rez` writers move with the reader is open.
+5. rezolus's `crates/rez` as feature `rez`, without `caller_rows`: all of it
+   except `RezReader` and `LiveReader` (see "As built").
 6. Writers take model rows. The writer's dependency is done; the
    `StreamDecoder` round trip is deferred (see "As built").
 7. The gate again on the result, then the release.
@@ -314,7 +315,7 @@ Steps 2, 3 and 5 move about 15,000 lines of `metriken-query` and the 5,000 of
 and test moves above; that size follows from the crate boundaries the plan
 chose.
 
-## As built (through step 3)
+## As built
 
 Branch `refactor/metriken-storage` on step 1 (#249). The order above changed
 as follows. The first, second and fourth changes were forced by the crate
@@ -352,10 +353,26 @@ graph; the rest were choices.
   `metriken-storage/tests`.
 - `metriken-segment` 0.2.0, like `metriken-archive` 0.4.0, re-exports
   `metriken-storage`.
+- All of rezolus's `crates/rez` moved behind storage's `rez` feature: the
+  container (v1/v2 tar, the v3 SQLite `RezDb` with its whole schema), its
+  `Catalog`, format detection, opening by content (`rez::open`), the rewrite
+  tooling, parquet ingest, the seal policy and the row wire; with `write`
+  the v3 writer and the `.rez`-to-dendro conversion; with `test-support` the
+  tar fixture writer. The writers read `metriken-model` types, so no
+  registry. `RezReader` and `LiveReader` stay in rezolus: they implement
+  `MetricsSource`, which is `metriken-query`'s, so storage cannot. The
+  `caller_rows` identity index is dropped; a 5.x preview `record --stream`
+  `.rez` opens with slot columns labelled as each segment was built. A
+  `RezDb` split into read and write halves was considered and not done: the
+  write half would have needed a hidden accessor to the connection, and the
+  schema would have had two owners.
 
 rezolus main with `metriken-archive` 0.4 and `metriken-segment` 0.2 builds
 against the branch and passes its tests after changing the four
-`eval_timestamps_for` calls to the free function.
+`eval_timestamps_for` calls to the free function. With `crates/rez` reduced
+to `RezReader`, `LiveReader` and re-exports of storage's `rez` modules, it
+builds, passes its tests (41 left in `rez`; 172 moved, the identity-index
+ones removed) and builds for wasm32.
 
 The step 1 memory saving on the long table (about 45 MB) is not stable across
 builds. In one session, five runs of each build in each saved set
@@ -366,6 +383,47 @@ is my guess, unverified. Under the gate's rule every build passes on this
 measure: each range overlaps 0.34.7's (384 to 405 MB in
 `baseline-0347.txt`'s five runs; 382 to 409 MB across all fifteen 0.34.7
 runs).
+
+## Gate result
+
+Run 2026-10-10 on the final branch against 0.34.7, alternating, five runs
+each (`~/rezolus-bench/gate-queries.txt`, `gate-dash.txt`):
+
+| measure | 0.34.7 median [range] | final median [range] |
+|---|---|---|
+| long table peak | 389 MB [380-410] | 401 MB [394-403] |
+| long table time | 2.47 s [2.42-2.53] | 2.41 s [2.39-2.42] |
+| per-CPU peak / time | 55 MB / 70 ms | 55 MB / 70 ms |
+| wide table peak | 1,451 MB [1,353-1,496] | 1,475 MB [1,369-1,604] |
+| wide table time | 4.19 s [4.17-4.25] | 4.15 s [4.10-4.15] |
+| dashboard section time | 13.5 s | 13.5 s |
+| dashboard summed `query_range` time | 130.1 s | 129.5 s |
+| dashboard peak footprint | 2,304 MB [2,285-2,332] | 2,505 MB [2,479-2,523] |
+
+Results: `long.dendro` and `metrics-9.6h.dendro` byte-identical, 0.34.7
+repeatable on both; `wide.dendro` not repeatable on 0.34.7 (9.88e-16 between
+its runs), the final within 9.79e-16 of it. Every measure passes except
+dashboard peak footprint, +8.7% with no overlap.
+
+The footprint difference is not data the code holds. After `/cgroups`, where
+the dashboard's footprint jumps, `heap -s` shows the same live heap in every
+build: 0.34.7 2,089.1 MB in 7,134,500 allocations, the final 2,088.0 MB in
+7,130,319, repeatable to a fraction of a MB. What differs is how much freed
+memory macOS's allocator still counts in the footprint (`MALLOC_SMALL`
+dirty) and how much it has marked reclaimable: one 0.34.7 run at 2,230 MB
+dirty and 757 MB reclaimable peaked at 2,582 MB, another at 2,004 and 975 MB
+peaked at 2,336 MB. Two builds of the same source (one built just before
+step 5, one from the final commits with storage's `rez` module not compiled)
+differed by about 200 MB on every run with identical live heaps
+(2,087.96 MB). Peak footprint on this host varies by about 250 MB with when
+the allocator returns freed pages, in any build.
+
+The owner granted an exception for this release on 2026-10-10, without
+changing the gate: the next step is to be judged as written, and the owner
+asks that each change be a clear win. Live heap after the dashboard load
+(`~/rezolus-bench/dash-snapshot.sh`) repeats to within 0.05 MB and is the
+measure to add; reducing allocator churn during `/cgroups`' concurrent
+queries is what would move peak footprint.
 
 ## GO / NO-GO
 
