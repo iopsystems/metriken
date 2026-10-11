@@ -367,7 +367,10 @@ step re-exports what it moves, in the release after.
    Design and gate: [the storage scan](2026-10-09-storage-scan.md).
 3. **The stream route** in `metriken-exposition` behind `stream` (piece 1),
    and dendro with SQLite optional. The rezolus agent is the first user,
-   cachecannon the first outside one.
+   cachecannon the first outside one. `MsgpackToParquet`, which stayed in
+   exposition in step 2, moves to storage here, and `GroupBuilder` learns
+   `HistogramGroup` for llm-perf. The wire takes neutral names. Design and
+   gate: [the stream route](2026-10-11-stream-route.md).
 4. **`metriken-recorder`** from rezolus's recorder (piece 2), with detection
    by stream. rezolus's `record`, `hindsight` and live viewer use it from both
    release lines; then llm-perf records in process.
