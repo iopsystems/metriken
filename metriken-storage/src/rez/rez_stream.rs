@@ -348,14 +348,25 @@ fn rename_aside_if_present(partial: &Path) -> Result<(), String> {
     ))
 }
 
+/// Makes a rename or create in `path`'s directory durable. On Windows a
+/// directory cannot be opened as a file to sync it, and NTFS journals the
+/// rename itself, so this does nothing there.
 fn sync_parent_dir(path: &Path) -> Result<(), String> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| format!("failed to sync directory {}: {e}", parent.display()))
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("failed to sync directory {}: {e}", parent.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn sync(builder: &mut tar::Builder<File>) -> Result<(), String> {
