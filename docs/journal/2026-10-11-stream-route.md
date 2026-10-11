@@ -4,11 +4,11 @@
 metriken-exposition 0.22.0, metriken-storage 0.2.0 and metriken-query 0.36.0
 (#253, #254) released 2026-10-11; the rezolus agent serves the stream through
 the helper (rezolus#1435) and cachecannon does (cachecannon#205 on main,
-cachecannon#206 on its 0.0.x line). cachecannon's network library ringline
-had to move to metriken 0.11 first, since a build holds one metriken-core:
-ringline-rs/ringline#649 on main, and 0.6.10 from release/0.6.x (#651,
-#652). All six checks pass ("As built"). The plan's
-GO for piece 1 also needs llm-perf, which serves the stream in its own step 4. This is path step 3 of
+cachecannon#206 on its 0.0.x line). cachecannon's network library ringline had
+to move to metriken 0.11 first, since a build holds one metriken-core:
+ringline-rs/ringline#649 on main, and 0.6.10 from release/0.6.x (#651, #652).
+All six checks pass ("As built"). The plan's GO for piece 1 also needs
+llm-perf, which serves the stream in its own step 4. This is path step 3 of
 [one recording stack](2026-10-08-one-recording-stack.md) (piece 1). "Step N
 below" means this entry's own order of work. Decided 2026-10-11:
 
