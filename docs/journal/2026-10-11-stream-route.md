@@ -509,15 +509,16 @@ Checks 2 and 5 ran in rezolus against this branch (rezolus branch
 - Check 1: rezolus's `stream_frame_fixture` drives `StreamSubscription` with
   its own `Arc<AgentRows>` and `Arc<StreamRows>` and matches the committed
   fixtures byte for byte, unchanged.
-- Check 2: the bound as written, "`samples()` is at most N" for N ticks, does
-  not hold under load and was wrong. Three subscriptions at 50 ms skip
-  boundaries when a frame takes longer than an interval to build (a first
-  frame carries every schema), so 20 frames per subscription named 30-31
-  distinct intervals. Alone the test took 15-16 passes; beside the rest of
-  the test binary it took 23-27 and failed four runs of four. The test
-  asserts passes at most the number of distinct intervals the frames name,
-  which is the property: one pass per boundary, shared. With the TTL broken
-  on purpose (1 ms) it fails at 60 passes against 23 intervals.
+- Check 2: rezolus's test runs three subscriptions at 50 ms on the real
+  clock. Its first bound, passes per distinct interval, passed while hiding
+  a real defect: the agent's fetch read the instant after waiting for the
+  builder lock, so a subscriber queued behind a pass longer than the TTL
+  found it stale and sampled again, three passes at one `seq` (measured in
+  review). Subscriptions then skipped boundaries, which loosened the bound
+  enough to pass. The defect predates the route; rezolus's `rows_frames`
+  had the same line. The fix reads the instant on waking, before the lock,
+  and the test asserts one row timestamp per `seq` across the
+  subscriptions, which fails with the old line and passes with the new.
 - Check 5: `rezolus record` writes one `.dendro` from a fake agent serving the
   legacy names and one serving the new names.
 
