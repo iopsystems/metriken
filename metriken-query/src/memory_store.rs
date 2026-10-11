@@ -1070,8 +1070,8 @@ mod series_tests {
         b.insert_gauge_series("right", [("k", "1")], ts, vec![5, 5, 5], None)
             .unwrap();
         let union = crate::UnionMetricsSource::try_new(vec![
-            crate::UnionChild::from(&a),
-            crate::UnionChild::from(&b),
+            metriken_storage::UnionChild::from(&a),
+            metriken_storage::UnionChild::from(&b),
         ])
         .expect("disjoint names");
         assert_eq!(union.counter_names(), vec!["left".to_string()]);

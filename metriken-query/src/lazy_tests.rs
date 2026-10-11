@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::sync::Arc;
 
-use crate::*;
+use metriken_storage::{CompositionCatalog, CompositionSource, Labels};
+
 use crate::{MemoryStore, MetricsSource, ParquetReader, QueryError};
-use metriken_storage::lazy::*;
 
 const SEC: u64 = 1_000_000_000;
 

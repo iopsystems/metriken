@@ -15,7 +15,7 @@ use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::{DataSource, MetricsSource, QueryOptions};
 
-pub use metriken_storage::parquet::CompositionSource;
+pub(crate) use metriken_storage::parquet::CompositionSource;
 use metriken_storage::parquet::*;
 
 // ─── Public entry point ───────────────────────────────────────────────────────

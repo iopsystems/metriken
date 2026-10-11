@@ -35,10 +35,12 @@
 //!     .unwrap();
 //! ```
 
+#[cfg(feature = "archive")]
 mod archive;
 pub(crate) mod batch_rate;
 pub mod display;
-pub mod long;
+#[cfg(test)]
+mod long;
 pub(crate) mod memory_store;
 pub mod parquet;
 pub(crate) mod promql;
@@ -50,17 +52,11 @@ pub mod fixtures;
 #[cfg(test)]
 mod lazy_tests;
 
-// The column readers are `metriken-storage`'s. These paths are kept for one
-// release; import them from `metriken_storage` instead.
+// The column readers are `metriken-storage`'s.
 pub(crate) use metriken_storage::DataSource;
 pub(crate) use metriken_storage::{buffer_pool, histogram_stream, labels, memory, scan, types};
-pub use metriken_storage::{
-    is_internal_label, is_storage_key, BufferPool, BufferPoolStats, ColumnChunk, ColumnPosition,
-    ColumnRelabel, CompositionCatalog, CompositionSource, CounterColumnRef, CounterSample,
-    CounterStream, Handover, HistogramSnapshot, InMemorySegments, Labels, Run, SegmentBytes,
-    SegmentStore, UnionChild, UnionError, STORAGE_KEYS,
-};
 
+#[cfg(feature = "archive")]
 pub use archive::eval_timestamps_for;
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};

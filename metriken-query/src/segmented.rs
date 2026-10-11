@@ -9,12 +9,10 @@ use std::error::Error;
 use std::sync::Arc;
 
 use crate::promql::QueryEngine;
-use crate::{BufferPool, DataSource, MetricsSource, QueryError, QueryOptions, QueryResult};
+use crate::{DataSource, MetricsSource, QueryError, QueryOptions, QueryResult};
+use metriken_storage::BufferPool;
 
 use metriken_storage::segmented::*;
-pub use metriken_storage::segmented::{
-    ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore,
-};
 
 /// Reads an ordered list of parquet segments that together form one logical
 /// per-sampler table, and presents them as a single [`MetricsSource`] with a
@@ -2587,7 +2585,7 @@ mod tests {
         for (stream, series) in streams.into_iter().zip(whole.series) {
             assert_eq!(stream.labels, series.labels);
             assert_eq!(stream.windowed, series.windows.is_some());
-            let samples: Vec<crate::CounterSample> = stream.samples.collect();
+            let samples: Vec<metriken_storage::CounterSample> = stream.samples.collect();
             assert_eq!(
                 samples.iter().map(|s| (s.ts, s.value)).collect::<Vec<_>>(),
                 series
@@ -3267,8 +3265,8 @@ mod tests {
         )
         .unwrap();
         let union = crate::UnionMetricsSource::try_new(vec![
-            crate::UnionChild::from(&a),
-            crate::UnionChild::from(&b),
+            metriken_storage::UnionChild::from(&a),
+            metriken_storage::UnionChild::from(&b),
         ])
         .unwrap();
         let q = "sum(irate(cpu_cycles[1s])) / sum(irate(cpu_instructions[1s]))";

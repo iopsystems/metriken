@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use metriken_query::fixtures::FixtureBuilder;
-use metriken_query::{BufferPool, MetricsSource, ParquetReader, QueryResult};
+use metriken_query::{MetricsSource, ParquetReader, QueryResult};
+use metriken_storage::BufferPool;
 
 // ─── Counter behavior ────────────────────────────────────────────────────────
 

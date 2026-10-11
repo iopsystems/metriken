@@ -1,6 +1,6 @@
 [package]
 name = "metriken-query"
-version = "0.35.0"
+version = "0.36.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -17,7 +17,7 @@ arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
 lru = "0.12"
-metriken-storage = { version = "0.1.0", path = "../metriken-storage", default-features = false }
+metriken-storage = { version = "0.2.0", path = "../metriken-storage", default-features = false }
 metriken-model = { version = "0.1.1", path = "../metriken-model", optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
@@ -33,7 +33,10 @@ tempfile.workspace = true
 sysinfo = "0.32"
 
 [features]
-default = ["lz4", "ingest"]
+default = ["lz4", "ingest", "archive"]
+# `MetricsSource` for `metriken-storage`'s `ArchiveReader`, and
+# `eval_timestamps_for`. Off, nothing here compiles SQLite.
+archive = ["metriken-storage/archive"]
 ingest = ["dep:metriken-model", "metriken-storage/ingest"]
 lz4 = ["parquet/lz4", "metriken-storage/lz4"]
 fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
