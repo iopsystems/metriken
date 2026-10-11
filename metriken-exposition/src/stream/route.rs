@@ -475,6 +475,12 @@ struct LayoutState {
 impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
     /// Passes over `builder`, each reused for `floor` after it is built.
     /// `floor` is what a subscription reports as its update floor.
+    ///
+    /// Choose a floor well below the shortest interval served (rezolus uses
+    /// 10 ms under 1 s intervals). A pass is reused while a caller's clock is
+    /// within the floor of the build, so with an interval equal to the floor,
+    /// wake-time jitter can hand a subscriber the previous boundary's pass and
+    /// it sends an empty frame for that interval.
     pub fn new(builder: GroupBuilder<R, N>, floor: Duration) -> Self {
         Self {
             state: Mutex::new(PassState {
@@ -505,8 +511,8 @@ impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
     /// The pass for `layout` at `now`: the last one when `now` is within the
     /// floor of the `now` it was built for, on either side, otherwise a new
     /// one. Subscribers that wake at one boundary read slightly different
-    /// clocks, so a `now` just before the cached one shares the pass. `None` when a group
-    /// fails to encode, which is logged.
+    /// clocks, so a `now` just before the cached one shares the pass. `None`
+    /// when a group fails to encode, which is logged.
     pub fn pass(&self, layout: Layout, now: SystemTime) -> Option<RegistryPass> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let PassState {

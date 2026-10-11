@@ -844,8 +844,8 @@ fn build_wide<R: Router, N: MemberNames>(
                 // groups has already published its window above; its
                 // membership is registered, so both passes agree and this
                 // is not reached for one. A histogram group can reach it
-                // once, when its first increment lands between the two
-                // passes.
+                // once per member, when that member's first increment
+                // lands between the two passes.
                 Some(_) => {
                     cache.remove(&group_name);
                     continue;
