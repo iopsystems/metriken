@@ -1,6 +1,6 @@
 [package]
 name = "metriken-exposition"
-version = "0.21.5"
+version = "0.21.6"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",

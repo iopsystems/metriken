@@ -16,7 +16,7 @@ bytes = "1"
 dendro = { version = "0.3.4", default-features = false }
 foldhash = "0.2.0"
 lru = "0.12"
-metriken-exposition = { version = "0.21.5", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
+metriken-exposition = { version = "0.21.6", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 histogram.workspace = true
 metriken = { version = "0.11.3", path = "../metriken", optional = true }
