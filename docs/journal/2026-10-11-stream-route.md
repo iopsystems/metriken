@@ -14,8 +14,10 @@ below" means this entry's own order of work. Decided 2026-10-11:
 ## Goal
 
 A producer with a metriken registry serves `/metrics/stream` by mounting one
-helper on a route in its own HTTP server, with no frame code of its own and no
-SQLite in its build. The rezolus agent is the first user, cachecannon the first
+helper on a route in its own HTTP server, with no frame code of its own. The
+helper adds no SQLite to the producer's build. (A producer that also reads
+archives, such as cachecannon's viewer through metriken-query, still compiles
+SQLite for that.) The rezolus agent is the first user, cachecannon the first
 outside one.
 
 ## Today
@@ -85,7 +87,7 @@ the stream would compile SQLite, arrow and parquet.
 `hashed.rs` (about 900 lines), behind the default `parquet-conversion`
 feature, are what put arrow and parquet into exposition. Users: rezolus
 (`recording convert`, the recorder's parquet output), cachecannon
-(`src/admin/mod.rs:630`) and llm-perf (`src/snapshot.rs:84`).
+(`src/admin/mod.rs:630`) and llm-perf (`src/snapshot.rs:4`, `:91`).
 
 **`GroupBuilder` drops `HistogramGroup`.** `build_groups` says so
 (`group_builder.rs:437`); `Snapshotter` (V2) handles it (`snapshotter.rs:148`).
@@ -96,7 +98,9 @@ fails the plan's GO criterion for llm-perf.
 **The outside producers.** cachecannon (metriken 0.9, exposition 0.16) has an
 admin server on tokio with no framework (`src/admin/mod.rs:121-231`) that
 writes whole responses with `Content-Length`; serving a stream needs a response
-path that writes headers and then frames until the client closes. Its metrics have no
+path that writes headers and then frames until the client closes. It already
+depends on axum 0.8 for its viewer. Its `request_target` strips the query
+string, which a stream request needs. Its metrics have no
 acquisition groups, so under `DefaultRouter` they land in one windowless group.
 llm-perf (metriken 0.8 and exposition 0.14, both from git rev 98db358) serves
 `/metrics` with warp.
@@ -114,7 +118,7 @@ llm-perf (metriken 0.8 and exposition 0.14, both from git rev 98db358) serves
   variant breaks no match.
 - `replicate`'s `frame` and `wire` compile without `archive`; `Subscriber` and
   `ArchivePublisher` need it.
-- CI: the `reader-only` job and `scripts/check-wasm.sh`, which run
+- CI: the `reader-only` and `msrv` jobs and `scripts/check-wasm.sh`, which run
   `--no-default-features` today, switch to `--no-default-features --features
   archive`, and a new job builds and tests the wire alone with
   `--no-default-features`.
@@ -145,22 +149,34 @@ encoded groups' fields directly, `http/mod.rs:403-425`).
 The subscription does not fetch passes: the caller fetches each pass however
 its producer builds one (rezolus awaits a refresh; a plain registry builds
 synchronously) and hands it in. The subscription owns its state, so it can move
-into a `'static` body stream or a spawned task.
+into a `'static` body stream or a spawned task. Named `StreamSubscription`,
+since rezolus already has two types called `Subscription`.
 
 ```rust
 /// What a pass is stamped with: the arguments `FrameProducer::interval` takes,
 /// and the wall time the empty-frame rule compares.
 pub struct PassStamp { pub wall_ns: u64, pub ts: i64, pub wall_offset: i64 }
 
-/// `interval` and `layout` from a request's query string, checked against the
-/// producer's update floor. A refusal carries the HTTP status and message.
+/// One pass of a producer's groups, in one layout.
+pub trait Pass: Send + Sync + 'static {
+    type Row: StreamRow;
+    fn stamp(&self) -> PassStamp;
+    fn rows(&self) -> &[Self::Row];
+}
+// exposition implements it for `(PassStamp, Vec<R>)` and `Arc<P: Pass>`;
+// storage for `AgentRows`; rezolus for its `StreamRows`.
+
+/// `interval` and `layout` from a request's query string. Refuses a zero or
+/// malformed interval and an unknown layout; an interval below the update
+/// floor is accepted and gets empty frames, as rezolus does today. A refusal
+/// carries the HTTP status and message.
 pub struct StreamRequest { pub interval: Duration, pub layout: Layout }
 impl StreamRequest {
-    pub fn parse(query: &str, update_floor: Duration) -> Result<Self, Refusal>;
+    pub fn parse(query: &str) -> Result<Self, Refusal>;
 }
 
-pub struct Subscription { .. }
-impl Subscription {
+pub struct StreamSubscription { .. }
+impl StreamSubscription {
     pub fn new(request: StreamRequest, update_floor: Duration,
                labels: BTreeMap<String, String>,
                metadata: BTreeMap<String, String>) -> Self;
@@ -171,11 +187,15 @@ impl Subscription {
     /// The next multiple of the interval after `now`, counted from the Unix
     /// epoch.
     pub fn next_deadline(&self, now: SystemTime) -> SystemTime;
-    /// The frame for one pass: rows whose window moved since the last frame on
-    /// this subscription, or an empty frame when there is no pass or its stamp
-    /// has not advanced. `seq` comes from `now`; a skipped `seq` is logged.
-    pub fn frame_at<R: StreamRow>(&mut self, pass: Option<(&PassStamp, &[R])>,
-                                  now: SystemTime) -> Result<Bytes>;
+    /// The frame for one pass when its stamp advanced: rows whose window moved
+    /// since the last frame on this subscription, and every windowless row.
+    /// An empty frame when the stamp did not advance or `pass` is `None`.
+    /// `seq` comes from `now`, read on waking and before the pass was fetched;
+    /// a skipped `seq` is logged (exposition gains a `tracing` dependency).
+    pub fn frame_at<P: Pass>(&mut self, pass: Option<&P>, now: SystemTime)
+        -> Result<Bytes>;
+    /// `frame_at` with no pass, without naming a `Pass` type.
+    pub fn empty_frame_at(&mut self, now: SystemTime) -> Result<Bytes>;
 }
 
 /// Passes over a `GroupBuilder` for a producer with a plain registry: built and
@@ -188,12 +208,29 @@ impl<R: Router> RegistryPasses<R> {
 }
 ```
 
-Feature `stream-tokio` adds `Subscription::into_stream(self, fetch)`, an
-`impl Stream<Item = io::Result<Bytes>> + Send + 'static` that sleeps to each
-deadline and calls `fetch(layout, now)`, an async closure returning the pass.
-axum's `Body::from_stream` takes it. cachecannon's admin server, which is tokio
-without a framework, can use it or write `headers()`, `opening()` and then
-`frame_at` at each `next_deadline` to the socket itself.
+Feature `stream-tokio` adds:
+
+```rust
+impl StreamSubscription {
+    /// Sleeps to each deadline, reads `now`, awaits `fetch(now)` and yields
+    /// `frame_at(pass, now)`. `keep_alive` is dropped with the stream, which
+    /// is how a producer ties a registration (rezolus's `Subscribers` guard)
+    /// to the stream's lifetime.
+    pub fn into_stream<P, F, Fut>(self, fetch: F, keep_alive: impl Send + 'static)
+        -> impl Stream<Item = io::Result<Bytes>> + Send + 'static
+    where P: Pass, F: FnMut(SystemTime) -> Fut + Send + 'static,
+          Fut: Future<Output = Option<P>> + Send;
+}
+```
+
+`fetch` returns a `Send` future rather than being an async closure, because an
+`AsyncFnMut` bound cannot require its future to be `Send` on stable Rust, and
+axum's `Body::from_stream` needs a `Send` stream. The wide and long layouts
+have different row types, so a producer calls `into_stream` once per layout
+and turns each into its body. cachecannon's fetch is
+`move |now| { let p = passes.clone(); async move { p.pass(layout, now) } }`;
+its admin server can use `into_stream` or write the bytes from `opening`,
+`next_deadline` and `frame_at` to the socket itself.
 
 The timer and `seq` arithmetic (`src/agent/clock.rs`'s `until_next_aligned`,
 `interval_index`, `monotonic_interval_index`) move in as private functions.
@@ -245,7 +282,8 @@ changes its imports (rezolus at `src/main.rs:5`, `parquet_tools/convert.rs:11`,
   private `archive.rs`, `rez`, and the `lib.rs` re-exports of `Encoder`,
   `KeepMetrics`, `Catalog`, `DendroCatalog` and `ArchiveReader`. A producer
   that converts to parquet uses `default-features = false, features =
-  ["convert"]` and compiles no SQLite.
+  ["convert"]` and compiles no SQLite. The existing `rez` feature implies
+  `archive`.
 - `stream` becomes a re-export of `metriken_exposition::stream` for one release,
   and enables `metriken-exposition/stream`. `rez/wire.rs`'s `AgentRow` keeps its
   `StreamRow` impl here, since `AgentRow` is storage's type.
@@ -253,10 +291,17 @@ changes its imports (rezolus at `src/main.rs:5`, `parquet_tools/convert.rs:11`,
 Breaking, because the exposition types in storage's signatures move to
 exposition 0.22. metriken-query 0.36.0 follows for the dependency. It depends
 on storage with `default-features = false` and implements `MetricsSource` for
-`ArchiveReader` (`archive.rs:371`), so it enables `metriken-storage/archive`
-explicitly. It drops the re-exports of storage items it kept for one release in
-0.35.0, as decided in path step 2. metriken-archive and metriken-segment get no new release; they
-stay on storage 0.1, and their users move to `metriken_storage` paths.
+`ArchiveReader` (`metriken-query/src/archive.rs:371`), so it gets a feature
+`archive`, on by default, that enables `metriken-storage/archive` and covers
+`archive.rs` and `eval_timestamps_for`. A query user that reads only parquet
+can turn it off and compile no SQLite. Query drops the re-exports of storage
+items it kept for one release in 0.35.0, as decided in path step 2.
+
+metriken-archive and metriken-segment leave the workspace's `members` in this
+PR: as members on storage 0.1 they fail `cargo metadata` once storage is 0.2,
+and pointing them at crates.io storage 0.1 would bring a second `metriken-core`,
+which declares `links`. Their last releases (0.4.0, 0.2.0) stay on storage 0.1
+and get no new release; their users move to `metriken_storage` paths.
 
 There is no cycle: exposition depends on model and dendro; storage depends on
 exposition only under `stream`.
@@ -264,14 +309,14 @@ exposition only under `stream`.
 ### rezolus
 
 - The agent's handler parses a `StreamRequest`, keeps the V2 refusal (409),
-  registers with `Subscribers`, and returns
-  `Subscription::into_stream(fetch)` with `headers()`. `fetch` locks the
-  `SnapshotBuilder` and awaits `rows_at` or `stream_long_at` as today, so the
-  router, refresh, TTL, `external/main` and the pass cache shared with
-  `/metrics/rows` stay. The `Subscribers` guard moves into the body stream so
-  `/status` still counts it. The wide layout keeps storage's `AgentRow`, which
-  keeps its `StreamRow` impl in storage. `frames.rs`'s producer and
-  `rows_frames` go.
+  registers with `Subscribers`, and on each layout's arm returns
+  `into_stream(fetch, guard)` with `headers()`. `fetch` locks the
+  `SnapshotBuilder` and awaits `rows_at` (wide, `Arc<AgentRows>`) or
+  `stream_long_at` (long, `Arc<StreamRows>`) as today, so the router, refresh,
+  TTL, `external/main` and the pass cache shared with `/metrics/rows` stay.
+  `frames.rs`'s producer and `rows_frames` go.
+- `metriken-storage` is declared with `default-features = false` in rezolus's
+  workspace; the `rez` feature brings `archive` with it.
 - The recorder's `Subscription::connect` takes a `&[WireNames]`. It matches the
   `Content-Type` against each entry's `content_type` and reads that entry's
   headers. rezolus passes `WIRE_NAMES` and its own `REZOLUS_LEGACY_WIRE_NAMES`
@@ -293,7 +338,8 @@ old names was decided 2026-10-11 with this cost.
 
 cachecannon serves the stream after its own step 2 (metriken 0.11): a
 `RegistryPasses` over `DefaultRouter`, and a streaming response path in its
-admin server that writes the subscription's bytes until the write fails. Its PR is in its own repo.
+admin server that writes the subscription's bytes until the write fails. Its
+PR is in its own repo.
 
 llm-perf needs the `HistogramGroup` support above; serving the stream is its
 own step 4.
@@ -302,23 +348,28 @@ own step 4.
 
 GO for this step when all hold:
 
-1. **Frames unchanged.** A rezolus test feeds one recorded sequence of passes
-   (including a repeated pass, a window that does not advance and a missing
-   pass) through `rows_frames`' logic with storage 0.1's `FrameProducer` and
-   through `Subscription::frame_at`, in one process so the handshake's epoch
-   and anchor agree, before `rows_frames` is deleted. The opening and every
-   frame are byte-equal, wide and long. Only the HTTP headers' names change.
-2. **One build per pass.** With three subscribers at the same interval, the
-   agent runs one sampling pass (`SnapshotBuilder::samples()`) and one encode
-   per pass, as `two_subscriptions_ticking_together_share_one_pass`
-   (`snapshot.rs:3749`) checks today.
+1. **Frames unchanged.** Step 0 below makes `rows_frames`' per-pass body a
+   sync function from a pass (or none) and a wall time to a frame, with no
+   behaviour change. A rezolus test records that function's frames for one
+   sequence of passes (a repeated pass, a window that does not advance, a
+   missing pass, wide and long) into a committed fixture, using
+   `FrameProducer::for_source` (`stream.rs:388`) with a fixed uuid and anchor.
+   The same sequence through `StreamSubscription` built the same way (a test
+   constructor taking the uuid and anchor) gives byte-equal frames. Only the
+   HTTP headers' names change.
+2. **One build per pass.** A rezolus test runs three `into_stream`
+   subscriptions at one interval (50 ms, TTL at least the interval) against
+   one `SnapshotBuilder` for N ticks and asserts `samples()` is at most N. One
+   encode per pass holds by the `OnceLock`s on `rows_full` and `stream_long`
+   (`snapshot.rs:98-101`), which this change does not touch.
 3. **No SQLite.** `cargo tree -e normal` lists no rusqlite, arrow or parquet
    for `-p metriken-exposition --no-default-features --features stream`, and
    no rusqlite for `-p metriken-storage --no-default-features --features
    convert`.
 4. **Agent cost.** Agent utime+stime from `/proc/<pid>/stat` over 300 passes
    with one `record -o x.dendro` long subscriber, five alternating runs per
-   build on one Linux host, against rezolus at 9ac10de7. A build fails when its
+   build on one Linux host, against rezolus at 9ac10de7. Both builds are
+   recorded by the new recorder, which accepts both names. A build fails when its
    median is more than 5% worse and the ranges do not overlap, the storage
    scan's rule.
 5. **The recorder** records an agent serving the legacy names and one serving
@@ -333,12 +384,16 @@ Prometheus scrape and this entry records why.
 
 ## Order of work
 
+0. rezolus, on main: `rows_frames`' per-pass body becomes a sync function, and
+   check 1's fixture is recorded from it.
 1. dendro 0.4.0: the `archive` feature and the CI jobs. PR and release in
    dendro, since crates.io needs it before exposition publishes.
 2. metriken: exposition's `stream` with the helper, `HistogramGroup`, the
-   `MsgpackToParquet` move, storage 0.2.0 and query 0.36.0, in one PR. Before
-   the release, rezolus builds against the branch through `[patch.crates-io]`
-   and passes checks 1, 2, 5 and 6, as the storage scan did.
+   `MsgpackToParquet` move, storage 0.2.0 and query 0.36.0, and
+   metriken-archive and metriken-segment out of the workspace, in one PR.
+   metriken's tests pass checks 3 and 6. Before the release, rezolus builds
+   against the branch through `[patch.crates-io]` and passes checks 1, 2 and
+   5, as the storage scan did.
 3. metriken release, then the rezolus PR on it; check 4 runs here.
 4. cachecannon, in its repo, after its metriken 0.11 bump.
 
