@@ -74,3 +74,6 @@ stream = ["dep:metriken-exposition"]
 convert = []
 # Reading segments written with LZ4_RAW, the codec rezolus writes.
 lz4 = ["parquet/lz4"]
+
+[package.metadata.docs.rs]
+all-features = true

@@ -73,13 +73,24 @@ fn a_pass_is_shared_within_the_floor_and_rebuilt_after_it() {
     assert!(streams.contains(&"registry/pushed"), "{streams:?}");
 }
 
-/// A clock that went backwards past the last build is not inside the floor.
+/// A `now` slightly before the cached build, as when two subscribers wake at
+/// one boundary and the later reader takes the lock first, shares the pass; a
+/// `now` more than a floor before it gets a new one.
 #[test]
-fn a_pass_built_in_the_future_is_rebuilt() {
+fn a_clock_behind_the_build_shares_within_the_floor() {
     let passes = passes();
     let first = passes.pass(Layout::Wide, at(BASE)).unwrap();
-    let earlier = passes.pass(Layout::Wide, at(BASE - 1)).unwrap();
-    assert!(!Arc::ptr_eq(&first, &earlier));
+    let just_before = passes
+        .pass(Layout::Wide, at(BASE) - Duration::from_micros(1))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &just_before));
+    let far_before = passes
+        .pass(
+            Layout::Wide,
+            at(BASE) - passes.floor() - Duration::from_millis(1),
+        )
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &far_before));
 }
 
 /// Two passes, the second inside the floor: the second interval's frame is

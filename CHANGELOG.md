@@ -21,10 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrow or parquet. Feature `stream-tokio` adds
   `StreamSubscription::into_stream`. Design:
   `docs/journal/2026-10-11-stream-route.md`.
-- **Added:** `GroupBuilder` exposes `HistogramGroup`s: one member per index
-  the group's metadata lists and whose histogram loads, as `Snapshotter`
-  does. `build_stream` sends a group of histogram groups long;
-  `LongMember` has a `histograms` field.
+- **Changed (breaking):** `GroupBuilder` exposes `HistogramGroup`s: one
+  member per index the group's metadata lists and whose histogram loads, as
+  `Snapshotter` does. `build_groups` now returns those members for any
+  registry with a `HistogramGroup`, which changes the group's schema for an
+  existing producer. `build_stream` sends a group of histogram groups long.
+  `LongMember` has a `histograms` field, which breaks code that constructs
+  one.
 - **Removed:** `MsgpackToParquet`, `ParquetOptions`, `ParquetCompression`,
   `ParquetHistogramType`, `ParquetSchema` and `ParquetWriter`, and the
   `parquet` and `parquet-conversion` features. They are

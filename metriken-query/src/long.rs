@@ -1,5 +1,5 @@
-//! The long segment layout and the reader's occupant relabel
-//! ([`OccupantLabels`]), from `metriken-storage`.
+//! The long segment layout from `metriken-storage`, imported for this crate's
+//! tests.
 
 pub(crate) use metriken_storage::long::*;
 

@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SQLite.
 - `stream` is `metriken_exposition::stream` (metriken-exposition 0.22),
   re-exported at the same path for this release; import it from
-  `metriken_exposition` before the next. `StreamRow` has a `window` method,
-  which `AgentRow` implements.
+  `metriken_exposition` before the next. `StreamRow` has a required `window`
+  method, which `AgentRow` implements; this breaks every other implementor.
 
 ### Added
 

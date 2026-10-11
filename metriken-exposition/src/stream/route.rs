@@ -237,7 +237,7 @@ pub const WIRE_NAMES: WireNames = WireNames {
 /// The caller owns the timer and fetches each pass; this turns a pass (or
 /// its absence) and the wall time the subscription woke at into the bytes to
 /// send. Synchronous and free of I/O. With feature `stream-tokio`,
-/// [`into_stream`](Self::into_stream) runs the timer and the fetch.
+/// `into_stream` runs the timer and the fetch.
 pub struct StreamSubscription {
     request: StreamRequest,
     update_floor: Duration,
@@ -488,6 +488,7 @@ impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
     }
 
     /// Adds the groups `extra` returns to every pass, called once per build.
+    /// It is called with the pass lock held, so it must not call `pass`.
     pub fn with_extra(
         mut self,
         extra: impl Fn() -> Vec<ExtraGroup> + Send + Sync + 'static,
@@ -501,8 +502,10 @@ impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
         self.floor
     }
 
-    /// The pass for `layout` at `now`: the last one when it was built less
-    /// than the floor before `now`, otherwise a new one. `None` when a group
+    /// The pass for `layout` at `now`: the last one when `now` is within the
+    /// floor of the `now` it was built for, on either side, otherwise a new
+    /// one. Subscribers that wake at one boundary read slightly different
+    /// clocks, so a `now` just before the cached one shares the pass. `None` when a group
     /// fails to encode, which is logged.
     pub fn pass(&self, layout: Layout, now: SystemTime) -> Option<RegistryPass> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -516,7 +519,11 @@ impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
             Layout::Long => long,
         };
         if let Some((built, pass)) = &cached.last {
-            if now.duration_since(*built).is_ok_and(|age| age < self.floor) {
+            let fresh = match now.duration_since(*built) {
+                Ok(age) => age < self.floor,
+                Err(e) => e.duration() < self.floor,
+            };
+            if fresh {
                 return Some(Arc::clone(pass));
             }
         }

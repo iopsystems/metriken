@@ -50,3 +50,6 @@ stream = ["msgpack", "dep:dendro", "dep:bytes", "dep:humantime", "dep:tracing"]
 # `StreamSubscription::into_stream`, the subscription as a body stream on
 # tokio's timer.
 stream-tokio = ["stream", "dep:tokio", "dep:futures-core", "dep:futures-util"]
+
+[package.metadata.docs.rs]
+all-features = true

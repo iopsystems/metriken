@@ -16,7 +16,7 @@
 //! [`opening`](StreamSubscription::opening) and, at each
 //! [`next_deadline`](StreamSubscription::next_deadline), the
 //! [`frame_at`](StreamSubscription::frame_at) for the pass it fetched. With
-//! feature `stream-tokio`, [`StreamSubscription::into_stream`] does the
+//! feature `stream-tokio`, `StreamSubscription::into_stream` does the
 //! timing and fetching as a body stream. A producer whose metrics are a
 //! metriken registry fetches from [`RegistryPasses`]; one with its own pass
 //! cache implements [`Pass`] for its pass type.

@@ -429,8 +429,10 @@ differs from the design, or the design left a choice open:
   `new(builder, floor)`, and `with_extra(f)` adds the extra groups;
   `floor()` returns the floor to pass as a subscription's update floor.
   The cache is per layout and keyed on the `now` given to `pass`: a pass is
-  reused while `now` is less than the floor after the `now` it was built
-  for, and rebuilt when `now` is earlier than that. A pass is stamped with
+  reused while `now` is within the floor of the `now` it was built for, on
+  either side, so subscribers that read slightly different clocks at one
+  boundary share it (a `now` just before the cached one was rebuilt until
+  review). A pass is stamped with
   `Stamp::now()` when it is built. A group that fails to encode logs a
   warning, drops the cached pass and returns `None`.
 - `pass` returns `Option<RegistryPass>`, an alias for the design's
@@ -472,7 +474,7 @@ differs from the design, or the design left a choice open:
 - Query's module `long` became test-only, and its tests import the relabel
   from `metriken_storage`. Five rustdoc warnings in query (two links to
   dropped re-exports, three that predate this change) are fixed, so
-  `cargo doc -D warnings` passes for exposition, storage, query, model and
+  `cargo doc --all-features -D warnings` passes for exposition, storage, query, model and
   types. It still fails for metriken-core and metriken, unchanged from
   main.
 

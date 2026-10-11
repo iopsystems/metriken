@@ -840,10 +840,12 @@ fn build_wide<R: Router, N: MemberNames>(
                 }
                 // The first pass called a hit and this walk collected a
                 // different membership: evict and leave the group out of
-                // this build. A reader-guarded group has already
-                // published its window above; its membership is
-                // registered, so both passes agree and this is not
-                // reached for one.
+                // this build. A reader-guarded group of counter or gauge
+                // groups has already published its window above; its
+                // membership is registered, so both passes agree and this
+                // is not reached for one. A histogram group can reach it
+                // once, when its first increment lands between the two
+                // passes.
                 Some(_) => {
                     cache.remove(&group_name);
                     continue;

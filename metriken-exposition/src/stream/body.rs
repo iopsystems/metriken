@@ -15,7 +15,8 @@ impl StreamSubscription {
     /// Each interval it sleeps to the next deadline after `wall_now()`,
     /// reads `now` from `wall_now` again on waking, awaits `fetch(now)` and
     /// yields [`frame_at`](Self::frame_at)`(pass, now)`. An error is yielded
-    /// and ends the stream. `keep_alive` is dropped with the stream, which
+    /// and ends the stream. `keep_alive` is dropped when the stream ends or is
+    /// dropped, which
     /// is how a producer ties a registration to the subscription's
     /// lifetime. `wall_now` is `SystemTime::now` outside tests; a test that
     /// steps the wall clock injects its own, since `tokio::time::pause` does
