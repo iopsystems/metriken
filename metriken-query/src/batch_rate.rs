@@ -1028,7 +1028,7 @@ pub(crate) fn grid_rates(
                                 let bo = begin.and_then(|b| {
                                     (!arrow::array::Array::is_null(b, r)).then(|| b.value(r))
                                 });
-                                crate::parquet::resolve_window(
+                                metriken_storage::parquet::resolve_window(
                                     base,
                                     bo,
                                     get(width, r),

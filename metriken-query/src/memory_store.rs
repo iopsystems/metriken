@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use crate::histogram_stream::HistogramStream;
 use crate::labels::Labels;
 use crate::memory::Memory;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
-use crate::types::{Counter, Counters, Gauge, Gauges, Histogram, HistogramSnapshot};
+use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
 use crate::{DataSource, MetricsSource, QueryOptions};
+
+use metriken_storage::memory_store::*;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -18,12 +19,6 @@ use crate::{DataSource, MetricsSource, QueryOptions};
 #[derive(Clone)]
 pub struct MemoryStore {
     state: Arc<MemoryStoreInner>,
-}
-
-pub(crate) struct MemoryStoreInner {
-    pub(crate) memory: RwLock<Memory>,
-    pub(crate) metadata: RwLock<HashMap<String, String>>,
-    pub(crate) filename: RwLock<Option<String>>,
 }
 
 impl MemoryStore {
@@ -387,92 +382,6 @@ fn check_series(
     Ok(())
 }
 
-impl DataSource for MemoryStoreInner {
-    fn counters(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-    ) -> Option<Counters> {
-        // Nothing rounds a sample's timestamp, so `raw` is a no-op here.
-        self.memory
-            .read()
-            .unwrap()
-            .counters(name, filter, start_ns, end_ns)
-    }
-
-    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
-        self.memory
-            .read()
-            .unwrap()
-            .gauges(name, filter, start_ns, end_ns)
-    }
-
-    fn histogram_stream(
-        &self,
-        name: &str,
-        filter: &Labels,
-        start_ns: u64,
-        end_ns: u64,
-    ) -> Option<HistogramStream> {
-        self.memory
-            .read()
-            .unwrap()
-            .histogram_stream(name, filter, start_ns, end_ns)
-    }
-
-    fn interval(&self) -> f64 {
-        self.memory.read().unwrap().interval()
-    }
-
-    fn time_range(&self) -> Option<(u64, u64)> {
-        self.memory.read().unwrap().time_range()
-    }
-
-    fn counter_names(&self) -> Vec<String> {
-        self.memory.read().unwrap().counter_names()
-    }
-
-    fn gauge_names(&self) -> Vec<String> {
-        self.memory.read().unwrap().gauge_names()
-    }
-
-    fn histogram_names(&self) -> Vec<String> {
-        self.memory.read().unwrap().histogram_names()
-    }
-
-    fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.memory.read().unwrap().counter_labels(name)
-    }
-
-    fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.memory.read().unwrap().gauge_labels(name)
-    }
-
-    fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.memory.read().unwrap().histogram_labels(name)
-    }
-
-    fn file_metadata(&self) -> HashMap<String, String> {
-        self.metadata.read().unwrap().clone()
-    }
-
-    fn metadata_get(&self, key: &str) -> Option<String> {
-        self.metadata.read().unwrap().get(key).cloned()
-    }
-
-    fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
-        self.memory.read().unwrap().column_map()
-    }
-
-    fn sample_timestamps(&self) -> Vec<u64> {
-        self.memory.read().unwrap().sample_timestamps()
-    }
-}
-
-// ─── MetricsSource on MemoryStore ─────────────────────────────────────────────
-
 impl MetricsSource for MemoryStore {
     fn query_range_opts(
         &self,
@@ -580,7 +489,7 @@ impl MemoryStore {
     /// For histograms: a `HistogramSnapshot` is stored representing the
     /// cumulative (running) bucket counts. Quantile/rate computations are
     /// performed at query time against pairs of consecutive snapshots.
-    pub fn ingest_snapshot(&self, mut snapshot: metriken_exposition::Snapshot) {
+    pub fn ingest_snapshot(&self, mut snapshot: metriken_model::Snapshot) {
         use crate::memory::extract_name_labels;
 
         let raw_ts = snapshot
@@ -713,17 +622,17 @@ mod ingest_tests {
         counter_name: &str,
         value: u64,
         labels: &[(&str, &str)],
-    ) -> metriken_exposition::Snapshot {
+    ) -> metriken_model::Snapshot {
         let mut metadata: HashMap<String, String> = labels
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         metadata.insert("metric".to_string(), counter_name.to_string());
-        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
-            counters: vec![metriken_exposition::Counter::new(
+            counters: vec![metriken_model::Counter::new(
                 counter_name.to_string(),
                 value,
                 metadata,
@@ -753,13 +662,13 @@ mod ingest_tests {
         metadata.insert("op".to_string(), "read".to_string());
         let mut h = ::histogram::Histogram::new(7, 64).unwrap();
         h.increment(1_000).unwrap();
-        let snap = metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        let snap = metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
             counters: vec![],
             gauges: vec![],
-            histograms: vec![metriken_exposition::Histogram::new(
+            histograms: vec![metriken_model::Histogram::new(
                 "latency".to_string(),
                 h,
                 metadata,
@@ -819,15 +728,15 @@ mod ingest_tests {
         assert_eq!(labels.len(), 2);
     }
 
-    fn make_gauge_snap(ts: SystemTime, name: &str, value: i64) -> metriken_exposition::Snapshot {
+    fn make_gauge_snap(ts: SystemTime, name: &str, value: i64) -> metriken_model::Snapshot {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("metric".to_string(), name.to_string());
-        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
             counters: vec![],
-            gauges: vec![metriken_exposition::Gauge::new(
+            gauges: vec![metriken_model::Gauge::new(
                 name.to_string(),
                 value,
                 metadata,

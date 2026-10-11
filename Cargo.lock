@@ -997,19 +997,9 @@ dependencies = [
 
 [[package]]
 name = "metriken-archive"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
- "arrow",
- "bytes",
- "dendro",
- "histogram",
- "metriken",
- "metriken-exposition",
- "metriken-query",
- "metriken-segment",
- "parquet",
- "tempfile",
- "tracing",
+ "metriken-storage",
 ]
 
 [[package]]
@@ -1043,7 +1033,6 @@ dependencies = [
  "histogram",
  "metriken",
  "metriken-model",
- "metriken-segment",
  "metriken-types",
  "parquet",
  "rmp-serde",
@@ -1054,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "histogram",
  "metriken-types",
@@ -1073,8 +1062,8 @@ dependencies = [
  "foldhash 0.2.0",
  "histogram",
  "lru",
- "metriken-exposition",
- "metriken-segment",
+ "metriken-model",
+ "metriken-storage",
  "parquet",
  "promql-parser",
  "serde",
@@ -1088,19 +1077,36 @@ dependencies = [
 
 [[package]]
 name = "metriken-segment"
-version = "0.1.7"
+version = "0.2.0"
+dependencies = [
+ "metriken-storage",
+]
+
+[[package]]
+name = "metriken-storage"
+version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "dendro",
+ "foldhash 0.2.0",
  "histogram",
+ "lru",
  "metriken",
+ "metriken-exposition",
  "metriken-model",
+ "metriken-query",
  "metriken-types",
  "parquet",
  "rmp",
  "rmp-serde",
+ "rusqlite",
  "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -1670,6 +1676,16 @@ dependencies = [
  "ntapi",
  "rayon",
  "windows",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]

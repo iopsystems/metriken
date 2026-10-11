@@ -8,8 +8,9 @@ members = [
     "metriken-exposition",
     "metriken-archive",
     "metriken-query",
-    "metriken-model",
     "metriken-segment",
+    "metriken-model",
+    "metriken-storage",
     "metriken-types",
 ]
 

@@ -24,6 +24,7 @@
 //!   side of a binary op.
 //! * Parenthesised expressions are unwrapped.
 
+use super::histogram::HistogramOps;
 use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;

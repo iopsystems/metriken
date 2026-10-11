@@ -14,8 +14,10 @@
 //! - [`occupants`]: the occupant stream's rows, naming the occupants of a
 //!   long table.
 //! - [`convert`]: a group snapshot as a row.
+//! - [`cost`]: a row's cost against a writer's segment byte budget.
 
 pub mod convert;
+pub mod cost;
 pub mod occupants;
 pub mod schema;
 pub mod snapshot;

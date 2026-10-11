@@ -5,18 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## Unreleased: metriken-query 0.35.0
 
 ### Changed
 
-- Internal: the batched `rate`/`irate` path on a segmented reader is split
-  into a reader scan and an engine pass. Results are unchanged, apart from
-  the last-bit differences between runs that grouped queries over wide
-  tables already had.
+- The column readers are `metriken-storage`'s: the data-access trait and its
+  implementations, the long-table relabel, the buffer pool, labels, and the
+  row and stream types. This crate keeps the engine and the `MetricsSource`
+  wrappers (`ParquetReader`, `ParquetBuilder`, `SegmentedParquetReader`,
+  `UnionMetricsSource`, `MemoryStore`), and re-exports every moved public
+  item at its old path for this release; import them from
+  `metriken_storage` before the next.
+- `MetricsSource` for `metriken-storage`'s `ArchiveReader`, and routing a
+  query to the tables holding its metrics, are here (`archive`). The
+  cross-cadence evaluation timestamps are the function
+  `eval_timestamps_for(&ArchiveReader, ..)`, which was a method on
+  `ArchiveReader`.
+- `ingest` reads `metriken-model`'s `Snapshot`; no feature of this crate
+  pulls in the `metriken` registry.
+- The batched `rate`/`irate` path reads through `metriken-storage`'s
+  counter scan and computes here. Results are unchanged, apart from the
+  last-bit differences between runs that grouped queries over wide tables
+  already had.
 - Each chunk's decoded columns are freed before a grouped display query
-  feeds its groups, rather than after. On a 9.6-hour recording of a per-task
-  group stored long, the peak memory of `sum by (comm) (irate(...))` at
-  budget 500 falls from 382-409 MB to 333-345 MB.
+  feeds its groups, rather than after.
+
+### Added
+
+- `SegmentedParquetReader::from_source`, a reader over an already-open
+  segmented source.
 
 ## [0.34.7] - 2026-10-05
 

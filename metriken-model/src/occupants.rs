@@ -1,6 +1,6 @@
 //! The occupant stream's rows: which labels each occupant number of a long
 //! table stands for, as a writer stages them and a stream carries them. The
-//! stream's parquet encoding is storage's (`metriken-segment`'s `occupants`
+//! stream's parquet encoding is storage's (`metriken-storage`'s `occupants`
 //! module).
 
 use std::collections::BTreeMap;

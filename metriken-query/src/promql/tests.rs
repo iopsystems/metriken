@@ -2399,7 +2399,7 @@ fn test_label_values_via_query_engine() {
     // Wrap in a DataSource-backed QueryEngine and drive label_values
     // through a MemoryStoreInner, which has access to the DataSource methods.
     // Since MemoryStoreInner is pub(crate), construct it directly.
-    let inner = Arc::new(crate::memory_store::MemoryStoreInner {
+    let inner = Arc::new(metriken_storage::memory_store::MemoryStoreInner {
         memory: std::sync::RwLock::new(mem),
         metadata: std::sync::RwLock::new(std::collections::HashMap::new()),
         filename: std::sync::RwLock::new(None),
@@ -2434,20 +2434,15 @@ fn test_memory_store_label_values_ingest() {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    fn make_snap(
-        ts: SystemTime,
-        name: &str,
-        value: u64,
-        cpu: &str,
-    ) -> metriken_exposition::Snapshot {
+    fn make_snap(ts: SystemTime, name: &str, value: u64, cpu: &str) -> metriken_model::Snapshot {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("metric".to_string(), name.to_string());
         metadata.insert("cpu".to_string(), cpu.to_string());
-        metriken_exposition::Snapshot::V2(metriken_exposition::SnapshotV2 {
+        metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
             systemtime: ts,
             duration: Duration::from_secs(0),
             metadata: HashMap::new(),
-            counters: vec![metriken_exposition::Counter::new(
+            counters: vec![metriken_model::Counter::new(
                 name.to_string(),
                 value,
                 metadata,
@@ -2481,7 +2476,7 @@ fn test_memory_store_label_values_ingest() {
 
 /// Build a mixed-type Memory (counters + gauges + histograms) for testing the
 /// new MetricsSource default methods without the `ingest` feature.
-fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
+fn make_mixed_memory() -> Arc<metriken_storage::memory_store::MemoryStoreInner> {
     use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
     let mut mem = Memory::new(1000);
     let ts: Vec<u64> = vec![1_000_000_000_000, 2_000_000_000_000];
@@ -2537,7 +2532,7 @@ fn make_mixed_memory() -> Arc<crate::memory_store::MemoryStoreInner> {
         },
     );
 
-    Arc::new(crate::memory_store::MemoryStoreInner {
+    Arc::new(metriken_storage::memory_store::MemoryStoreInner {
         memory: std::sync::RwLock::new(mem),
         metadata: std::sync::RwLock::new(std::collections::HashMap::new()),
         filename: std::sync::RwLock::new(None),
