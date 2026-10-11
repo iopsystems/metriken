@@ -16,7 +16,8 @@
 
 use std::time::{Duration, Instant};
 
-use metriken_query::{BufferPool, MetricsSource};
+use metriken_query::MetricsSource;
+use metriken_storage::BufferPool;
 use metriken_storage::{ArchiveReader, DendroCatalog};
 
 fn open(path: &str, pool: &std::sync::Arc<BufferPool>) -> ArchiveReader {

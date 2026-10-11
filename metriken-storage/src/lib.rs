@@ -36,11 +36,17 @@
 //!   (feature `stream`): a producer's groups as dendro replication frames.
 //! - `rez` (feature `rez`): the `.rez` format.
 
+#[cfg(feature = "archive")]
 mod archive;
 pub mod buffer_pool;
 pub mod builder;
+#[cfg(feature = "archive")]
 pub mod catalog;
+#[cfg(feature = "convert")]
+pub mod convert;
+#[cfg(feature = "archive")]
 pub mod encoder;
+#[cfg(feature = "archive")]
 pub mod filter;
 pub mod format;
 pub mod histogram_stream;
@@ -50,9 +56,11 @@ pub mod long;
 pub mod long_table;
 pub mod memory;
 pub mod memory_store;
+#[cfg(feature = "archive")]
 mod names;
 pub mod occupants;
 pub mod parquet;
+#[cfg(feature = "archive")]
 pub mod reader;
 #[cfg(feature = "rez")]
 pub mod rez;
@@ -71,10 +79,15 @@ pub mod window;
 #[cfg(feature = "write")]
 pub mod writer;
 
+#[cfg(feature = "archive")]
 pub use archive::*;
+#[cfg(feature = "archive")]
 pub use catalog::{Catalog, DendroCatalog, SegmentIndex};
+#[cfg(feature = "archive")]
 pub use encoder::{Encoder, ENCODER_VERSION, READABLE_ENCODERS};
+#[cfg(feature = "archive")]
 pub use filter::KeepMetrics;
+#[cfg(feature = "archive")]
 pub use reader::{ArchiveReader, LabeledRecordings};
 #[cfg(feature = "stream")]
 pub use stream::FrameProducer;

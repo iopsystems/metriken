@@ -16,8 +16,9 @@ use metriken_exposition::group_builder::{
     Acquisition, GroupBuilder, GroupId, Membership, NoGuard, Route, Router, Stamp,
 };
 use metriken_exposition::Snapshot;
-use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_query::{MetricsSource, QueryResult};
 use metriken_storage::stream::{EncodedStreamGroup, FrameProducer, SchemaCache};
+use metriken_storage::BufferPool;
 use metriken_storage::{
     ArchiveReader, ArchiveWriter, DendroCatalog, SourceRecorder, StreamDecoder, WriterConfig,
 };
