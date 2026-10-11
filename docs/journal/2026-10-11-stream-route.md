@@ -501,8 +501,7 @@ Checks, run 2026-10-11:
   buckets equal to `load(idx)` under its labels, the writer stages the rows,
   and `ArchiveReader` lists one histogram series per member.
 
-Checks 2 and 5 need rezolus built against this branch; check 4 runs on the
-rezolus PR.
+Check 4 runs on the rezolus PR.
 
 Checks 2 and 5 ran in rezolus against this branch (rezolus branch
 `feat/stream-route-adopt`, path-patched), and check 1 there too:
