@@ -1,7 +1,7 @@
-//! The long segment layout and the reader's occupant relabel
-//! ([`OccupantLabels`]), from `metriken-storage`.
+//! The long segment layout from `metriken-storage`, imported for this crate's
+//! tests.
 
-pub use metriken_storage::long::*;
+pub(crate) use metriken_storage::long::*;
 
 /// The reader over long segments: every query a long table answers must
 /// equal what the wide table it replaces answers, when the wide columns
@@ -21,9 +21,10 @@ mod reader_tests {
     use parquet::file::properties::WriterProperties;
 
     use super::*;
-    use crate::segmented::{ColumnRelabel, InMemorySegments, Run, SegmentedParquetReader};
+    use crate::segmented::SegmentedParquetReader;
     use crate::MetricsSource;
-    use crate::{BufferPool, Labels};
+    use metriken_storage::segmented::{ColumnRelabel, InMemorySegments, Run};
+    use metriken_storage::{BufferPool, Labels};
 
     const GP: u8 = 2;
     const MVP: u8 = 8;

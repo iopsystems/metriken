@@ -197,6 +197,31 @@ impl crate::stream::StreamRow for AgentRow {
     fn payload(&self) -> &[u8] {
         &self.row
     }
+
+    fn window(&self) -> Option<crate::window::Window> {
+        self.window
+            .map(|(begin, end)| crate::window::Window::new(begin, end))
+    }
+}
+
+/// One pass of an agent's rows, for a stream subscription
+/// (`StreamSubscription::frame_at`): the pass's `wall_ns`, `ts` and
+/// `wall_offset`, and its rows.
+#[cfg(feature = "stream")]
+impl crate::stream::Pass for AgentRows {
+    type Row = AgentRow;
+
+    fn stamp(&self) -> crate::stream::PassStamp {
+        crate::stream::PassStamp {
+            wall_ns: self.wall_ns,
+            ts: self.ts,
+            wall_offset: self.wall_offset,
+        }
+    }
+
+    fn rows(&self) -> &[AgentRow] {
+        &self.rows
+    }
 }
 
 /// Encode one producer-side acquisition group as an [`AgentRow`].

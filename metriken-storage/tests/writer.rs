@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use dendro::seal::SealPolicy;
 use metriken_exposition::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
-use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_query::{MetricsSource, QueryResult};
+use metriken_storage::BufferPool;
 use metriken_storage::{
     ArchiveReader, ArchiveWriter, Catalog, DendroCatalog, SourceRecorder, WriterConfig,
 };

@@ -50,7 +50,7 @@ use crate::segmented::SegmentedParquetReader;
 use crate::{MetricsSource, QueryOptions};
 
 use metriken_storage::union::*;
-pub use metriken_storage::union::{UnionChild, UnionError};
+pub(crate) use metriken_storage::union::{UnionChild, UnionError};
 
 impl From<&ParquetReader> for UnionChild {
     fn from(reader: &ParquetReader) -> Self {

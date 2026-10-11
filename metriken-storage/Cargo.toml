@@ -1,6 +1,6 @@
 [package]
 name = "metriken-storage"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -16,10 +16,10 @@ exclude = ["tests/"]
 [dependencies]
 arrow.workspace = true
 bytes = "1"
-dendro = { version = "0.3.4", default-features = false }
+dendro = { version = "0.4.0", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
 lru = "0.12"
-metriken-exposition = { version = "0.21.6", path = "../metriken-exposition", default-features = false, features = ["segment", "msgpack"], optional = true }
+metriken-exposition = { version = "0.22.0", path = "../metriken-exposition", default-features = false, features = ["stream"], optional = true }
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 histogram.workspace = true
 metriken = { version = "0.11.3", path = "../metriken", optional = true }
@@ -45,12 +45,16 @@ serde_json.workspace = true
 tempfile.workspace = true
 metriken = { path = "../metriken" }
 metriken-exposition = { path = "../metriken-exposition" }
-dendro = { version = "0.3.4" }
+dendro = { version = "0.4.0" }
 
 [features]
-default = ["lz4"]
+default = ["lz4", "archive"]
+# The dendro archive: its catalog, `ArchiveReader`, the segment encoder and
+# the column filter. Off, nothing here compiles SQLite: the segment format,
+# the column readers and, with `convert`, the parquet conversion.
+archive = ["dep:dendro"]
 # The `.rez` archive format: reading it, and with `write` its writers.
-rez = ["dep:rusqlite", "dep:serde_json", "dep:tar", "dep:tempfile"]
+rez = ["archive", "dep:rusqlite", "dep:serde_json", "dep:tar", "dep:tempfile"]
 # Fixture builders other crates' tests use (the tar `.rez` writer).
 test-support = ["rez", "write"]
 # Loading `metriken-model` snapshots into an in-memory source.
@@ -61,10 +65,15 @@ ingest = []
 # build for wasm32.
 metriken = ["dep:metriken"]
 # The archive writer, over dendro's. Off, this crate is a reader.
-write = ["dendro/write"]
-# A producer's groups as dendro replication frames (`stream::FrameProducer`).
-# Separate from `write`: a producer serving a stream needs neither the
-# archive writer nor dendro's.
-stream = ["dep:metriken-exposition", "dep:metriken"]
+write = ["archive", "dendro/write"]
+# `metriken_exposition::stream` at `stream`, re-exported for one release,
+# and `StreamRow`/`Pass` for the `.rez` row wire's `AgentRow`/`AgentRows`.
+stream = ["dep:metriken-exposition"]
+# `MsgpackToParquet`: msgpack snapshots into a parquet file (`convert`).
+# Needs neither dendro nor the archive.
+convert = []
 # Reading segments written with LZ4_RAW, the codec rezolus writes.
 lz4 = ["parquet/lz4"]
+
+[package.metadata.docs.rs]
+all-features = true

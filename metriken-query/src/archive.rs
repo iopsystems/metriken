@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use metriken_storage::reader::{SamplerReader, TableReader};
-use metriken_storage::{table_sampler, ArchiveReader};
+use metriken_storage::{table_sampler, ArchiveReader, UnionChild, UnionError};
 
 use crate::{
     MetricsSource, QueryError, QueryOptions, QueryResult, RateMode, SegmentedParquetReader,
-    UnionChild, UnionError, UnionMetricsSource,
+    UnionMetricsSource,
 };
 
 /// The evaluation timestamps a composed query needs to stay faithful to

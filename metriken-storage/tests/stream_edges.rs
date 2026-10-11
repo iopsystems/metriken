@@ -10,10 +10,11 @@ use std::sync::Arc;
 use metriken_exposition::{
     GroupSchema as XSchema, GroupSnapshot, MetricDesc as XDesc, Snapshot, SnapshotV3,
 };
-use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_query::{MetricsSource, QueryResult};
 use metriken_storage::occupants::Occupant;
 use metriken_storage::schema::{GroupSchema, MetricDesc};
 use metriken_storage::wal::{LongOccupant, WalLongRow};
+use metriken_storage::BufferPool;
 use metriken_storage::{ArchiveReader, ArchiveWriter, DendroCatalog, StreamedGroup, WriterConfig};
 
 const S: u64 = 1_000_000_000;

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use metriken_query::fixtures::{FixtureBuilder, ParquetAugmentor};
-use metriken_query::{BufferPool, ParquetReader};
+use metriken_query::ParquetReader;
+use metriken_storage::BufferPool;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 fn rss_bytes() -> u64 {

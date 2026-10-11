@@ -12,9 +12,10 @@ use metriken::{metric, MetricEntry};
 use metriken_exposition::group_builder::{
     is_family, Acquisition, GroupBuilder, GroupId, Membership, NoGuard, Route, Router, Stamp,
 };
-use metriken_query::{BufferPool, MetricsSource, QueryResult};
+use metriken_query::{MetricsSource, QueryResult};
 use metriken_storage::stream::{encode_groups, FrameProducer, SchemaCache};
 use metriken_storage::wal::decode_wal_group_row;
+use metriken_storage::BufferPool;
 use metriken_storage::{ArchiveReader, DendroCatalog, Encoder};
 
 #[metric(name = "stream_requests")]

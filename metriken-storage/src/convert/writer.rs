@@ -10,8 +10,9 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
 
-use crate::hashed::HashedSnapshot;
-use crate::Snapshot;
+use metriken_model::Snapshot;
+
+use super::hashed::HashedSnapshot;
 
 /// The batch size (or maximum row group size) is the number of rows that
 /// the `ArrowWriter` caches in memory before attempting to write them to
@@ -448,10 +449,10 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use arrow::array::*;
-    use metriken::histogram::Histogram as H2Histogram;
+    use histogram::Histogram as H2Histogram;
+    use metriken_model::*;
 
-    use crate::*;
+    use super::*;
 
     #[allow(clippy::type_complexity)]
     fn build_metrics() -> (Vec<Vec<Counter>>, Vec<Vec<Gauge>>, Vec<Vec<Histogram>>) {

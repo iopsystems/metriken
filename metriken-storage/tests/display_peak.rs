@@ -12,7 +12,8 @@
 //! measured around the process (`/usr/bin/time -l` on macOS, `-v` on
 //! Linux).
 
-use metriken_query::{BufferPool, DisplayOptions, DisplayResult, MetricsSource, QueryOptions};
+use metriken_query::{DisplayOptions, DisplayResult, MetricsSource, QueryOptions};
+use metriken_storage::BufferPool;
 use metriken_storage::{ArchiveReader, DendroCatalog};
 
 #[test]

@@ -39,7 +39,7 @@ metriken-core  <──  metriken-derive
 - **metriken-core** — `Metric` trait, `Value` enum, `MetricEntry`, global `METRICS` distributed slice (linkme), dynamic metrics registry, type-based request/provide system. Uses `links = "metriken-core"` to enforce single version at compile time.
 - **metriken-derive** — Proc macro for `#[metric]` attribute. Generates `declare_metric_v1!` invocations and PHF static maps for metadata.
 - **metriken** — User-facing crate re-exporting everything. Defines metric types: `Counter` (AtomicU64), `Gauge` (AtomicI64), `AtomicHistogram` (OnceLock-backed), `RwLockHistogram`, `Lazy<T>`.
-- **metriken-exposition** — Snapshot building and serialization. Feature-gated formats: `json`, `msgpack`, `parquet`. Includes `Snapshotter` (builder for filtering metrics), `ParquetWriter`, and msgpack-to-parquet conversion.
+- **metriken-exposition** — Snapshot building and serialization. Feature-gated formats: `json`, `msgpack`. Includes `Snapshotter` (builder for filtering metrics), `GroupBuilder` (acquisition groups), and with `stream` the dendro replication frames and the `/metrics/stream` route helper (`stream-tokio` adds a tokio body stream). Msgpack-to-parquet conversion is `metriken-storage`'s `convert` feature.
 - **metriken-query** — PromQL query engine and in-memory TSDB loaded from parquet files. Feature-gated: `ingest` (from metriken-exposition), `lz4`, `http` (axum API routes). HTTP API is Prometheus-compatible (`/api/v1/query`, `/api/v1/query_range`, `/api/v1/labels`, etc.).
 
 ## Key Design Patterns
