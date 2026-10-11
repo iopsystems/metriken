@@ -348,9 +348,11 @@ fn rename_aside_if_present(partial: &Path) -> Result<(), String> {
     ))
 }
 
-/// Makes a rename or create in `path`'s directory durable. On Windows a
-/// directory cannot be opened as a file to sync it, and NTFS journals the
-/// rename itself, so this does nothing there.
+/// Makes a rename or create in `path`'s directory durable. Unix only:
+/// `File::open` cannot open a directory on Windows (that needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`), so this does nothing there. NTFS's
+/// metadata log keeps the rename atomic across a crash, but a rename made
+/// shortly before a power cut can still be rolled back.
 fn sync_parent_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
