@@ -185,7 +185,19 @@ impl EncodedLongGroup {
                     occupant: o.key,
                     counters: o.counters.clone(),
                     gauges: o.gauges.clone(),
-                    histograms: Vec::new(),
+                    histograms: o
+                        .histograms
+                        .iter()
+                        .map(|h| {
+                            h.as_ref().map(|h| {
+                                (
+                                    h.config().grouping_power(),
+                                    h.config().max_value_power(),
+                                    h.as_slice().to_vec(),
+                                )
+                            })
+                        })
+                        .collect(),
                 })
                 .collect(),
         };

@@ -41,13 +41,19 @@
 //!   slot space managed by [`metriken::group::SlotIdentity`] is, and what a
 //!   family ([`metriken::CounterFamily`], [`metriken::GaugeFamily`]) is.
 //!
+//! A histogram group ([`metriken::HistogramGroup`]) takes the same members
+//! under every membership: each index its metadata store lists whose
+//! histogram loads, as [`Snapshotter`](crate::Snapshotter) does. Each member
+//! carries the slot's metadata, `id`, and the group's `grouping_power` and
+//! `max_value_power`. It has no window of its own.
+//!
 //! # The long form
 //!
 //! [`GroupBuilder::build_stream`] emits a group whose metrics are all counter
-//! groups or gauge groups as a [`LongGroupSnapshot`]: the metrics as columns,
-//! and one [`LongMember`] per member slot, carrying the slot's labels and a
-//! key that names its occupant. Its columns change when the
-//! group's metrics do, and a slot's labels when its occupant does, so a
+//! groups, gauge groups or histogram groups as a [`LongGroupSnapshot`]: the
+//! metrics as columns, and one [`LongMember`] per member slot, carrying the
+//! slot's labels and a key that names its occupant. Its columns change when
+//! the group's metrics do, and a slot's labels when its occupant does, so a
 //! change of occupant does not rebuild the group's schema.
 
 use std::collections::hash_map::Entry;
@@ -433,8 +439,8 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
     /// Every routed group plus `extra`, sorted by name.
     ///
     /// A group nothing routed to is absent, not empty, and so is a group
-    /// whose only metrics have a value kind the builder does not expose
-    /// (`Value::HistogramGroup`, `Value::Other`).
+    /// with no members: one whose only metrics have a value kind the builder
+    /// does not expose (`Value::Other`), or read no member.
     pub fn build_groups(&mut self, extra: Vec<ExtraGroup>) -> Vec<GroupSnapshot> {
         // One registry guard for both passes, so both see the same dynamic
         // metrics. Registering or dropping a dynamic metric waits for it.
@@ -671,6 +677,30 @@ fn build_wide<R: Router, N: MemberNames>(
                         group.histogram_values.push(hv);
                     }
                 }
+                Value::HistogramGroup(g) => {
+                    group.walk_identity.histograms = fold_group_version(
+                        group.walk_identity.histograms,
+                        metric_id_u64,
+                        g.metadata_version(),
+                    );
+                    for &idx in histogram_members(&mut idx_scratch, g) {
+                        let Some(h) = g.load_histogram(idx) else {
+                            continue;
+                        };
+                        group.walk_identity.histograms = identity_fold(
+                            group.walk_identity.histograms,
+                            &(idx as u64).to_le_bytes(),
+                        );
+                        let mut member_md =
+                            member_metadata(&metadata, idx, &mut |f| g.with_metadata(idx, f));
+                        insert_histogram_config(&mut member_md, g.config());
+                        group.histogram_descs.push(MetricDesc {
+                            name: names.member(metric_id, metric, idx),
+                            metadata: member_md,
+                        });
+                        group.histogram_values.push(Some(h));
+                    }
+                }
                 _ => {}
             }
         } else {
@@ -712,6 +742,13 @@ fn build_wide<R: Router, N: MemberNames>(
                     let hv = h.load();
                     if registered || hv.is_some() {
                         group.histogram_values.push(hv);
+                    }
+                }
+                Value::HistogramGroup(g) => {
+                    for &idx in histogram_members(&mut idx_scratch, g) {
+                        if let Some(h) = g.load_histogram(idx) {
+                            group.histogram_values.push(Some(h));
+                        }
                     }
                 }
                 _ => {}
@@ -835,11 +872,12 @@ impl<R: Router, N: MemberNames> GroupBuilder<R, N> {
     /// Every routed group plus `extra`, sorted by name, with each slotted
     /// group in the long form.
     ///
-    /// A group is long when every metric routed to it is a counter group or
-    /// a gauge group and `extra` does not name it. Each member slot is an
-    /// occupant ([`LongMember`]) holding one value per metric: every walked
-    /// slot under registered membership, a slot with a value under
-    /// [`Membership::Present`]. Any
+    /// A group is long when every metric routed to it is a counter group, a
+    /// gauge group or a histogram group and `extra` does not name it. Each
+    /// member slot is an occupant ([`LongMember`]) holding one value per
+    /// metric: every walked slot under registered membership, a slot with a
+    /// value under [`Membership::Present`], and a histogram group's members
+    /// as the module docs describe them. Any
     /// other group is a [`GroupSnapshot`], built as
     /// [`build_groups`](Self::build_groups) builds it.
     ///
@@ -919,6 +957,7 @@ fn build_long<R: Router, N: MemberNames>(
                 identity: IDENTITY_FNV_OFFSET,
                 counter_metrics: Vec::new(),
                 gauge_metrics: Vec::new(),
+                histogram_metrics: Vec::new(),
                 versions: Vec::new(),
                 slots: Vec::new(),
                 slot_membership: false,
@@ -984,7 +1023,27 @@ fn build_long<R: Router, N: MemberNames>(
                 }
                 acc.mark_end();
             }
-            // `long_groups` admits only the two kinds above.
+            Value::HistogramGroup(g) => {
+                let column = acc.histogram_metrics.len();
+                acc.histogram_metrics.push((metric_id, metric));
+                acc.identity = identity_fold(acc.identity, b"h");
+                acc.identity = identity_fold(acc.identity, &(metric_id as u64).to_le_bytes());
+                let version = g.metadata_version();
+                let unchanged = acc.state.versions.get(&metric_id) == Some(&version);
+                acc.versions.push((metric_id, version));
+                for &idx in histogram_members(&mut idx_scratch, g) {
+                    let Some(h) = g.load_histogram(idx) else {
+                        continue;
+                    };
+                    let pos = acc.occupant(idx, unchanged, &mut |f| g.with_metadata(idx, f));
+                    let histograms = &mut acc.occupants[pos].histograms;
+                    if histograms.len() <= column {
+                        histograms.resize(column + 1, None);
+                    }
+                    histograms[column] = Some(h);
+                }
+            }
+            // `long_groups` admits only the three kinds above.
             _ => {}
         }
     }
@@ -1004,7 +1063,17 @@ fn build_long<R: Router, N: MemberNames>(
                     .iter()
                     .map(|(id, m)| column_desc(router, names, *id, m))
                     .collect(),
-                histograms: Vec::new(),
+                histograms: acc
+                    .histogram_metrics
+                    .iter()
+                    .map(|(id, m)| {
+                        let mut desc = column_desc(router, names, *id, m);
+                        if let Some(Value::HistogramGroup(g)) = m.value() {
+                            insert_histogram_config(&mut desc.metadata, g.config());
+                        }
+                        desc
+                    })
+                    .collect(),
             });
             acc.state.hash = columns.hash();
             acc.state.columns = columns;
@@ -1034,7 +1103,11 @@ fn build_long<R: Router, N: MemberNames>(
             WindowState::Stamped(first) => resolve_walk_window(first, router.window(key)),
             WindowState::Reader(guard) => guard.finish(),
         };
-        let widths = (acc.counter_metrics.len(), acc.gauge_metrics.len());
+        let widths = (
+            acc.counter_metrics.len(),
+            acc.gauge_metrics.len(),
+            acc.histogram_metrics.len(),
+        );
         let mut order: Vec<usize> = (0..acc.occupants.len()).collect();
         order.sort_unstable_by_key(|&i| acc.slots[i]);
         let mut occupants: Vec<Option<LongMember>> = acc.occupants.into_iter().map(Some).collect();
@@ -1044,6 +1117,7 @@ fn build_long<R: Router, N: MemberNames>(
                 let mut o = occupants[i].take().expect("each position is taken once");
                 o.counters.resize(widths.0, None);
                 o.gauges.resize(widths.1, None);
+                o.histograms.resize(widths.2, None);
                 o
             })
             .collect();
@@ -1060,8 +1134,8 @@ fn build_long<R: Router, N: MemberNames>(
 }
 
 /// The groups [`GroupBuilder::build_stream`] writes long: every metric routed
-/// to them is a counter group or a gauge group, and `extra` does not name
-/// them.
+/// to them is a counter group, a gauge group or a histogram group, and
+/// `extra` does not name them.
 fn long_groups<'a, R: Router>(
     router: &'a R,
     metrics: &'a metriken::Metrics,
@@ -1075,7 +1149,10 @@ fn long_groups<'a, R: Router>(
         let Some(route) = router.route(metric) else {
             continue;
         };
-        let slotted = matches!(value, Value::CounterGroup(_) | Value::GaugeGroup(_));
+        let slotted = matches!(
+            value,
+            Value::CounterGroup(_) | Value::GaugeGroup(_) | Value::HistogramGroup(_)
+        );
         let ok = eligible.entry(route.group).or_insert(true);
         *ok &= slotted;
     }
@@ -1089,7 +1166,8 @@ fn long_groups<'a, R: Router>(
 }
 
 /// A long group's column for one group metric: the metric's metadata, as a
-/// wide member carries it, without `id` or the slot's labels.
+/// wide member carries it, without `id` or the slot's labels. A histogram
+/// group's column also carries its histogram configuration.
 fn column_desc<R: Router, N: MemberNames>(
     router: &R,
     names: &N,
@@ -1126,8 +1204,9 @@ impl StreamGroup {
     }
 }
 
-/// A group of counter groups and gauge groups in the long form: one entry
-/// per occupant present, with the group's metrics as columns.
+/// A group of counter groups, gauge groups and histogram groups in the long
+/// form: one entry per occupant present, with the group's metrics as
+/// columns.
 #[derive(Clone, Debug)]
 pub struct LongGroupSnapshot {
     /// `"{namespace}/{name}"`, as [`GroupSnapshot::name`].
@@ -1135,9 +1214,10 @@ pub struct LongGroupSnapshot {
     pub window: Option<Window>,
     /// [`GroupSchema::hash`] of `columns`.
     pub columns_hash: (u64, u64),
-    /// One descriptor per counter-group and gauge-group metric, in registry
-    /// order: the metric's metadata, with no `id` and no slot labels. It has
-    /// no histograms.
+    /// One descriptor per counter-group, gauge-group and histogram-group
+    /// metric, in registry order within each kind: the metric's metadata,
+    /// with no `id` and no slot labels. A histogram column also carries
+    /// `grouping_power` and `max_value_power`.
     pub columns: Arc<GroupSchema>,
     /// The member slots' occupants, in slot order.
     pub occupants: Vec<LongMember>,
@@ -1167,6 +1247,8 @@ pub struct LongMember {
     pub counters: Vec<Option<u64>>,
     /// One per gauge column.
     pub gauges: Vec<Option<i64>>,
+    /// One per histogram column.
+    pub histograms: Vec<Option<histogram::Histogram>>,
 }
 
 /// What [`GroupBuilder::build_stream`] keeps per long group between builds.
@@ -1200,6 +1282,7 @@ struct LongAcc<'m, G> {
     identity: u128,
     counter_metrics: Vec<(usize, &'m MetricEntry)>,
     gauge_metrics: Vec<(usize, &'m MetricEntry)>,
+    histogram_metrics: Vec<(usize, &'m MetricEntry)>,
     /// This build's metadata version of each group metric.
     versions: Vec<(usize, u64)>,
     /// Per position in `occupants`, its slot.
@@ -1254,6 +1337,7 @@ impl<G: ReadGuard> LongAcc<'_, G> {
             labels: occupant.labels,
             counters: Vec::with_capacity(self.state.columns.counters.len()),
             gauges: Vec::with_capacity(self.state.columns.gauges.len()),
+            histograms: Vec::with_capacity(self.state.columns.histograms.len()),
         });
         pos
     }
@@ -1384,6 +1468,32 @@ fn member_metadata(
         metadata.insert("id".to_string(), idx.to_string());
         metadata
     })
+}
+
+/// The members of a histogram group: the indices its metadata store lists,
+/// sorted so an unchanged member set gives the same schema and identity from
+/// build to build. `scratch` is cleared first.
+fn histogram_members<'s>(
+    scratch: &'s mut Vec<usize>,
+    g: &dyn metriken::HistogramGroupMetric,
+) -> &'s [usize] {
+    scratch.clear();
+    g.for_each_metadata(&mut |idx, _| scratch.push(idx));
+    scratch.sort_unstable();
+    scratch
+}
+
+/// `grouping_power` and `max_value_power`, which a reader needs to decode a
+/// histogram's buckets.
+fn insert_histogram_config(metadata: &mut BTreeMap<String, String>, config: histogram::Config) {
+    metadata.insert(
+        "grouping_power".to_string(),
+        config.grouping_power().to_string(),
+    );
+    metadata.insert(
+        "max_value_power".to_string(),
+        config.max_value_power().to_string(),
+    );
 }
 
 /// The member indices of a group metric, in ascending order.
@@ -1611,6 +1721,16 @@ fn fold_group_identities<'a, R: Router>(
             }
             Value::Histogram(h) if registered || h.load().is_some() => {
                 accum.histograms = identity_fold(accum.histograms, &metric_id.to_le_bytes());
+            }
+            Value::HistogramGroup(g) => {
+                accum.histograms =
+                    fold_group_version(accum.histograms, metric_id, g.metadata_version());
+                for &idx in histogram_members(&mut idx_scratch, g) {
+                    if g.load_histogram(idx).is_some() {
+                        accum.histograms =
+                            identity_fold(accum.histograms, &(idx as u64).to_le_bytes());
+                    }
+                }
             }
             _ => {}
         }

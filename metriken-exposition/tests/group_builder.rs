@@ -656,10 +656,11 @@ static UNHANDLED_GROUP: TestGroup = TestGroup::new("unhandled_probe");
 static UNHANDLED_HISTOGRAM_GROUP: metriken::HistogramGroup =
     metriken::HistogramGroup::new(2, 7, 32);
 
-/// A group whose only routed metric is a value kind the builder does not
-/// expose is absent, not an empty group hashed and sent every build.
+/// A group whose only routed metric reads no member (a histogram group whose
+/// metadata lists no index) is absent, not an empty group hashed and sent
+/// every build.
 #[test]
-fn a_group_with_only_unhandled_value_metrics_is_not_emitted() {
+fn a_group_whose_metrics_read_no_member_is_not_emitted() {
     let _ = &UNHANDLED_HISTOGRAM_GROUP;
     let groups = build(&mut builder());
     assert!(!groups
