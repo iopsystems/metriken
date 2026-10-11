@@ -1,6 +1,8 @@
 # The stream route: any registry serves `/metrics/stream`
 
-**Status:** OPEN. Design 2026-10-11. This is path step 3 of
+**Status:** OPEN. Design 2026-10-11. Step 2 built 2026-10-11 on metriken
+branch `feat/stream-route` ("As built"); checks 1, 3 and 6 pass in metriken.
+Steps 3 and 4 and checks 2, 4 and 5 remain. This is path step 3 of
 [one recording stack](2026-10-08-one-recording-stack.md) (piece 1). "Step N
 below" means this entry's own order of work. Decided 2026-10-11:
 
@@ -112,7 +114,7 @@ llm-perf (metriken 0.8 and exposition 0.14, both from git rev 98db358) serves
 - `WalRow` and `SegmentMeta` move to a module with no SQLite dependency;
   `archive` re-exports them, so their paths do not change.
 - A feature `archive`, on by default, gates `archive`, `read`, `rewrite`,
-  `seal`, `segment`, `writer` and `replicate::publisher`, the `Error::Sqlite`
+  `segment`, `writer` and `replicate::publisher`, the `Error::Sqlite`
   variant and its helpers, and the rusqlite, arrow and parquet dependencies.
   `write` implies `archive`. `Error` is `#[non_exhaustive]`, so gating a
   variant breaks no match.
@@ -410,6 +412,95 @@ Prometheus scrape and this entry records why.
    5, as the storage scan did.
 3. metriken release, then the rezolus PR on it; check 4 runs here.
 4. cachecannon, in its repo, after its metriken 0.11 bump.
+
+## As built
+
+dendro 0.4.0 as merged (8cc03ee, 0.4.0-alpha.0, not yet released) leaves
+`seal` ungated, since it has no dependencies; the line above said
+otherwise. metriken depends on it as `0.4.0-alpha.0` through a workspace
+`[patch.crates-io]` to that commit, which goes before metriken's release.
+
+Step 2 is on metriken branch `feat/stream-route`, off c2b939c. Where it
+differs from the design, or the design left a choice open:
+
+- `RegistryPasses` has a second type parameter, `N: MemberNames =
+  Positional`, so it takes a `GroupBuilder` with either naming;
+  `RegistryPasses<R>` still names the design's type. It is built with
+  `new(builder, floor)`, and `with_extra(f)` adds the extra groups;
+  `floor()` returns the floor to pass as a subscription's update floor.
+  The cache is per layout and keyed on the `now` given to `pass`: a pass is
+  reused while `now` is less than the floor after the `now` it was built
+  for, and rebuilt when `now` is earlier than that. A pass is stamped with
+  `Stamp::now()` when it is built. A group that fails to encode logs a
+  warning, drops the cached pass and returns `None`.
+- `pass` returns `Option<RegistryPass>`, an alias for the design's
+  `Arc<(PassStamp, Vec<EncodedStreamGroup>)>`.
+- `opening`, `frame_at` and `empty_frame_at` return `std::io::Result<Bytes>`,
+  the item type of `into_stream`.
+- `StreamRequest::parse` refuses a parameter given twice with 400, as
+  axum's `Query` extractor did for rezolus's handler, and decodes `%XX` and
+  `+` in values. `StreamRequest` defaults to one second, wide.
+- `StreamRow::window` has no default, so an implementation cannot leave
+  every row windowless by omission.
+- `StreamSubscription::for_source(request, update_floor, uuid, anchor,
+  labels, metadata)` is the hidden constructor. `request()` returns the
+  request; `Layout` has `as_str` and `Display`; `Refusal` implements
+  `Error` and has public `status` and `message`.
+- `into_stream` reads `wall_now` before sleeping, to compute the deadline,
+  and again on waking for `seq`. Rezolus read `SystemTime::now` for the
+  sleep and the injected clock once; with `SystemTime::now` they are the
+  same.
+- New exposition dependencies: `bytes`, `humantime` and `tracing` under
+  `stream`; `tokio` (`time`), `futures-core` and `futures-util` under
+  `stream-tokio`. dendro is a dev-dependency with its default features, for
+  the test that applies frames into an archive; `cargo tree -e normal`
+  excludes it.
+- A histogram group's members ignore the router's `Membership`: each index
+  its metadata lists whose histogram loads, sorted. Each member carries the
+  metric's metadata, `id`, the slot's metadata, then `grouping_power` and
+  `max_value_power`, which win over a slot key of the same name.
+  `Snapshotter` adds no `id` and adds `description`; check 6 compares member
+  names, buckets and slot labels. The identity pass loads each member's
+  histogram to decide membership, so a build loads it twice. Histogram
+  groups have no window and do not call `ReadGuard::mark_end`. In the long
+  layout a histogram column's descriptor carries the configuration.
+- The exposition default features are `msgpack` and `segment`
+  (`parquet-conversion` enabled `msgpack`).
+- Storage's `stream` no longer enables `metriken`; nothing in it used the
+  registry. Storage's `stream` integration tests stay in storage and import
+  `metriken_storage::stream`, which tests the re-export.
+- Query's module `long` became test-only, and its tests import the relabel
+  from `metriken_storage`. Five rustdoc warnings in query (two links to
+  dropped re-exports, three that predate this change) are fixed, so
+  `cargo doc -D warnings` passes for exposition, storage, query, model and
+  types. It still fails for metriken-core and metriken, unchanged from
+  main.
+
+Checks, run 2026-10-11:
+
+- **1.** `metriken-exposition/tests/stream_frames.rs` reproduces
+  `tests/fixtures/stream-frames/{wide,long}.bin` (copied from rezolus
+  f55709b8; sha1 `19caeafe…` and `7d1a6cf8…`) byte for byte through
+  `StreamSubscription::for_source` with rezolus's uuid, anchor, labels and
+  metadata and its pass sequence. The wide passes hold `EncodedGroup`s
+  there; `metriken-storage/tests/stream_frames.rs` runs the wide sequence
+  with `Arc<AgentRows>` and matches too. Setting `advanced` to `true` in
+  `frame_at` fails both fixtures.
+- **3.** `cargo tree -e normal` lists no rusqlite, arrow or parquet for
+  `-p metriken-exposition --no-default-features --features stream` (and
+  `stream-tokio`), and no rusqlite or dendro for `-p metriken-storage
+  --no-default-features --features convert` or for `-p metriken-query
+  --no-default-features --features lz4,ingest`.
+- **6.** `metriken-exposition/tests/histogram_group.rs`: `build_groups` on a
+  registry with a `HistogramGroup` gives the members, slot labels and
+  buckets `Snapshotter` gives, and reuses the schema until a slot's
+  metadata changes. `metriken-storage/tests/stream_histogram.rs`:
+  `build_stream` sends it long, `StreamDecoder` decodes each member's
+  buckets equal to `load(idx)` under its labels, the writer stages the rows,
+  and `ArchiveReader` lists one histogram series per member.
+
+Checks 2 and 5 need rezolus built against this branch; check 4 runs on the
+rezolus PR.
 
 ## Left alone
 

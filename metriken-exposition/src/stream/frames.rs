@@ -41,9 +41,9 @@ pub trait StreamRow {
     /// The encoded [`WalGroupRow`] without its schema, or for a long row
     /// the encoded [`WalLongRow`] without its schema.
     fn payload(&self) -> &[u8];
-    /// The group's acquisition window. A [`StreamSubscription`] sends a row
-    /// whose window has an end it already sent for the stream only once,
-    /// and sends a row with no window on every pass that advanced.
+    /// The group's acquisition window. A [`StreamSubscription`] skips a row
+    /// whose window ends where the last window it sent on the stream ended,
+    /// and sends a row with no window with every pass that advanced.
     ///
     /// [`StreamSubscription`]: super::StreamSubscription
     fn window(&self) -> Option<Window>;

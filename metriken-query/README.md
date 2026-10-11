@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/metriken-query)](https://crates.io/crates/metriken-query)
 [![License](https://img.shields.io/crates/l/metriken-query)](LICENSE)
 
-PromQL query engine for parquet metric captures produced by [`metriken-exposition`](https://crates.io/crates/metriken-exposition). Supports both file-backed streaming reads (low memory) and in-memory ingestion (live mode).
+PromQL query engine for parquet metric captures (as written by [`metriken-storage`](https://crates.io/crates/metriken-storage)'s `convert`) and for dendro archives. Supports both file-backed streaming reads (low memory) and in-memory ingestion (live mode).
 
 ## Overview
 
@@ -154,7 +154,8 @@ For a 315 MB capture:
 metriken-query = "0.11"
 ```
 
-- `ingest` (on by default) — pulls in `metriken-exposition` and enables `MemoryStore::ingest_snapshot`. Read-only consumers (e.g. the rezolus WASM viewer) can disable it with `default-features = false` to drop the dependency.
+- `ingest` (on by default) — pulls in `metriken-model` and enables `MemoryStore::ingest_snapshot`. Read-only consumers (e.g. the rezolus WASM viewer) can disable it with `default-features = false` to drop the dependency.
+- `archive` (on by default) — `MetricsSource` for `metriken-storage`'s `ArchiveReader`, and `eval_timestamps_for`. Without it this crate compiles no SQLite.
 - `lz4` (on by default) — enables LZ4 decompression support for parquet files.
 - `fixtures` (off by default, test/bench-only) — exposes the `fixtures` module with `FixtureBuilder` and `ParquetAugmentor` for generating test parquets.
 

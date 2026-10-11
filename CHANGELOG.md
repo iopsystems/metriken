@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.22.0
+
+- **Added:** `stream` (feature `stream`): the frame producer and frame types
+  from `metriken-storage` (`FrameProducer`, `SchemaCache`, `StreamRow`,
+  `EncodedGroup`, `EncodedLongGroup`, `EncodedStreamGroup`,
+  `encode_groups`, `KeyedLabels`, `SOURCE`), `StreamRow::window`, and the
+  `/metrics/stream` route helper with no HTTP framework or runtime:
+  `StreamRequest`, `Refusal`, `Layout`, `StreamSubscription`, `Pass`,
+  `PassStamp`, `RegistryPasses` and the wire names `WIRE_NAMES`
+  (`application/vnd.metriken.replication.v1+dendro`, `x-metriken-*`).
+  `stream` builds dendro without its archive, so it compiles no SQLite,
+  arrow or parquet. Feature `stream-tokio` adds
+  `StreamSubscription::into_stream`. Design:
+  `docs/journal/2026-10-11-stream-route.md`.
+- **Added:** `GroupBuilder` exposes `HistogramGroup`s: one member per index
+  the group's metadata lists and whose histogram loads, as `Snapshotter`
+  does. `build_stream` sends a group of histogram groups long;
+  `LongMember` has a `histograms` field.
+- **Removed:** `MsgpackToParquet`, `ParquetOptions`, `ParquetCompression`,
+  `ParquetHistogramType`, `ParquetSchema` and `ParquetWriter`, and the
+  `parquet` and `parquet-conversion` features. They are
+  `metriken_storage::convert` (feature `convert`). The crate no longer
+  depends on arrow or parquet.
+- **Changed:** the default features are `msgpack` and `segment` (they were
+  `parquet-conversion` and `segment`; `parquet-conversion` enabled
+  `msgpack`).
+
+### metriken-storage 0.2.0, metriken-query 0.36.0
+
+- See each crate's CHANGELOG. metriken-archive and metriken-segment leave
+  the workspace; their last releases (0.4.0, 0.2.0) stay on
+  metriken-storage 0.1.
+
 ### metriken-model 0.1.1
 
 - **Added:** `cost`, a row's cost against a writer's segment byte budget:

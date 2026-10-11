@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased: metriken-query 0.36.0
+
+### Changed
+
+- Depends on metriken-storage 0.2.
+- `MetricsSource` for `ArchiveReader` and `eval_timestamps_for` are behind a
+  new default feature `archive`, which enables `metriken-storage/archive`.
+  Without it this crate compiles no SQLite.
+
+### Removed
+
+- The re-exports of metriken-storage items kept for 0.35.0: the module
+  `long`, `CompositionSource`, `CompositionCatalog`, `UnionChild`,
+  `UnionError`, `SegmentStore`, `SegmentBytes`, `InMemorySegments`,
+  `Handover`, `BufferPool`, `BufferPoolStats`, `ColumnRelabel`, `Run`,
+  `Labels`, `is_internal_label`, `is_storage_key`, `STORAGE_KEYS`,
+  `CounterSample`, `CounterStream`, `HistogramSnapshot`, `ColumnChunk`,
+  `CounterColumnRef` and `ColumnPosition`, at the crate root and under
+  `segmented`, `union` and `parquet`. Import them from `metriken_storage`.
+
 ## [0.35.0] - 2026-10-10
 
 ### Changed

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased: metriken-storage 0.2.0
+
+### Changed
+
+- dendro 0.4 is optional, behind a new default feature `archive`, which
+  gates the catalog (`Catalog`, `DendroCatalog`, `SegmentIndex`), the reader
+  (`ArchiveReader`, `LabeledRecordings`), the segment encoder (`Encoder`,
+  `ENCODER_VERSION`, `READABLE_ENCODERS`), the column filter
+  (`KeepMetrics`) and the shared archive items re-exported at the crate
+  root. `rez` and `write` imply it. A user with `default-features = false`
+  who reads archives adds `archive`. Without it the crate compiles no
+  SQLite.
+- `stream` is `metriken_exposition::stream` (metriken-exposition 0.22),
+  re-exported at the same path for this release; import it from
+  `metriken_exposition` before the next. `StreamRow` has a `window` method,
+  which `AgentRow` implements.
+
+### Added
+
+- `convert` (feature `convert`): `MsgpackToParquet`, `ParquetOptions`,
+  `ParquetCompression`, `ParquetHistogramType`, `ParquetSchema` and
+  `ParquetWriter`, from metriken-exposition. Needs neither dendro nor the
+  archive.
+- `Pass` for `rez::wire::AgentRows` (features `rez` and `stream`), so an
+  agent's rows pass is served by `StreamSubscription::frame_at`.
+
 ## [0.1.0] - 2026-10-10
 
 ### Changed
