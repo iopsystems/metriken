@@ -36,7 +36,7 @@ impl QueryEngine {
 
 /// The metric names a PromQL query references, without a data source.
 ///
-/// [`QueryEngine::columns`] answers a related question — which *physical*
+/// `QueryEngine::columns` answers a related question — which *physical*
 /// columns a query touches — but it needs the source's column map to expand a
 /// selector into its labelled series, which means the source must already be
 /// open. A caller routing a query *to* a source cannot have that yet.

@@ -1,5 +1,5 @@
 //! Display-mode query results: a richer, presentation-oriented response
-//! that a PromQL-compliant [`QueryResult`](crate::QueryResult) cannot express.
+//! that a PromQL-compliant [`QueryResult`] cannot express.
 //!
 //! A standard matrix response is a scalar per timestamp per series, so a
 //! decimated point cannot carry any distribution information about the
@@ -141,7 +141,7 @@ pub struct DisplaySeries {
     pub decimated: bool,
 }
 
-/// Display-mode result. Parallel to [`QueryResult`](crate::QueryResult),
+/// Display-mode result. Parallel to [`QueryResult`],
 /// which stays the analysis/PromQL-compliant shape. Only `Matrix` is
 /// decimated (into `Series`); heatmap/scalar/vector pass through unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]

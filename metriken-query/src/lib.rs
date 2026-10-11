@@ -19,7 +19,7 @@
 //! For multi-file (k-way merge) or per-file label injection, see
 //! [`ParquetBuilder`].
 //!
-//! An optional shared [`BufferPool`] caches decoded blocks across
+//! An optional shared [`BufferPool`](metriken_storage::BufferPool) caches decoded blocks across
 //! queries; attach it to any source with `.with_pool(...)`. The pool
 //! is process-wide and LRU-evicted by byte budget.
 //!
