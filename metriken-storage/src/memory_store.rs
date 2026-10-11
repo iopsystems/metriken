@@ -98,4 +98,4 @@ impl DataSource for MemoryStoreInner {
     }
 }
 
-// ─── MetricsSource on MemoryStore ─────────────────────────────────────────────
+// ─── The in-memory source ─────────────────────────────────────────────────────

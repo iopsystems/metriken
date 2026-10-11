@@ -49,7 +49,8 @@ use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::segmented::SegmentedParquetReader;
 use crate::{MetricsSource, QueryOptions};
 
-pub use metriken_storage::union::*;
+use metriken_storage::union::*;
+pub use metriken_storage::union::{UnionChild, UnionError};
 
 impl From<&ParquetReader> for UnionChild {
     fn from(reader: &ParquetReader) -> Self {

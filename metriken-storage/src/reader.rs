@@ -1,21 +1,18 @@
-//! [`ArchiveReader`]: an archive of parquet segments read as one
-//! `metriken_query::MetricsSource`, composed of one sub-source per table: a
-//! `ParquetReader` for a single-segment table, a `SegmentedParquetReader`
-//! for one sealed more than once. A table's live WAL tail is materialized
-//! as its newest segment (`crate::wal::materialize_wal_tail`).
-//!
-//! Moved from rezolus's `crates/rez` (`RezReader`), phase 3 of
-//! `docs/journal/2026-09-28-high-cardinality-stack.md`.
+//! [`ArchiveReader`]: an archive of parquet segments, one recording at a
+//! time, as one [`SegmentedSource`] per table, opened on first use. A table's
+//! live WAL tail is materialized as its newest segment
+//! (`crate::wal::materialize_wal_tail`). `metriken-query` implements
+//! `MetricsSource` for it and routes each query to the tables holding its
+//! metrics.
 //!
 //! **Same-timeline union.** An archive tables its acquisition GROUPS, not its
 //! samplers: `cpu_usage/percpu` and `cpu_usage/softirq` are two tables of
 //! one sampler, with disjoint metric sets. A query naming metrics from one
 //! table is answered by that table's own (lazy, footer-only) reader. A query
 //! naming metrics from several tables of the SAME sampler OF THE SAME source
-//! is answered by composing their readers into one
-//! `metriken_query::UnionMetricsSource` (through its checking `try_new`,
-//! so a producer bug that put one metric name in two tables is a loud
-//! error, not a silent first-wins). The union dispatches by metric name, with
+//! is answered by composing their sources into one union (through the
+//! checking [`UnionSource::try_new`](crate::union::UnionSource::try_new), so
+//! a producer bug that put one metric name in two tables is an error). The union dispatches by metric name, with
 //! no timestamp join: each metric keeps its acquisition window from its own
 //! table, and the engine aligns independently timestamped series on its
 //! evaluation grid as it always does. Routing groups by `(source, sampler)`,
@@ -538,10 +535,8 @@ impl TableReader {
     }
 }
 
-/// One opened per-table reader. A table is one or more parquet segments, so
-/// the backing source is either a plain `ParquetReader` (single segment) or a
-/// `SegmentedParquetReader` (many) — both are `MetricsSource`, and everything
-/// below this point treats them identically.
+/// One table of a recording: its probed name catalog and span, and its
+/// [`SegmentedSource`], opened on first use.
 ///
 /// `sampler` is the table's own key — `<sampler>/<group>` for a V3
 /// acquisition-group table, just `<sampler>` for a V2 (or V3 windowless)
@@ -745,14 +740,18 @@ impl SamplerReader {
                     None => None,
                 };
                 let opened = match self.keep.load(std::sync::atomic::Ordering::Relaxed) {
-                    true => SegmentedSource::open(
+                    true => SegmentedSource::open_after(
                         store,
                         pool,
                         relabel,
                         previous.as_ref().and_then(|p| p.handover.as_ref()),
-                        true,
                     ),
-                    false => SegmentedSource::open(store, pool, relabel, None, false),
+                    false => match relabel {
+                        Some(relabel) => {
+                            SegmentedSource::open_relabeled_with_pool(store, pool, relabel)
+                        }
+                        None => SegmentedSource::open_with_pool(store, pool),
+                    },
                 };
                 opened
                     .map(TableReader::Segmented)
@@ -772,9 +771,11 @@ impl SamplerReader {
         );
     }
 
-    /// The relabelling an indexed table opens with: its identity index
-    /// replayed into occupancy spans. `None` for a table the index does not
-    /// describe; `Some(Err(()))` when the index could not be read or
+    /// The relabelling a table opens with: a long table's occupant stream, or
+    /// an indexed table's identity index replayed into occupancy spans by the
+    /// reader's [`IndexRelabel`]. `None` for a table with neither, and for an
+    /// indexed table when the reader has no hook (logged); `Some(Err(()))`
+    /// when the stream or index could not be read or
     /// replayed, which is a failure to open the table, reported the same way
     /// a segment that would not parse is — never a silent fall-through to
     /// the plain path, which would file every reused slot's rows under its
@@ -807,7 +808,16 @@ impl SamplerReader {
         if !self.indexed {
             return None;
         }
-        let hook = self.index.as_ref()?;
+        let Some(hook) = self.index.as_ref() else {
+            // A table a 5.x `record --stream` `.rez` indexed, opened without
+            // a hook: its slot columns keep the labels each segment carries.
+            tracing::warn!(
+                "table {} has an identity index this reader does not read; reused slots \
+                 are not split by occupant",
+                self.sampler
+            );
+            return None;
+        };
         let first_row_ts = self.span.map(|(b, _)| b).unwrap_or(0);
         let relabel = self.segments.with_catalog(|db, source_id, table| {
             hook.relabel(db, source_id, table, first_row_ts)
@@ -827,7 +837,7 @@ impl SamplerReader {
     }
 }
 
-/// A `.rez` archive presented as one `MetricsSource`. Phase B: a single
+/// An archive's tables, one recording or several flattened. A single
 /// recording; every recording's tables are flattened into `tables`
 /// (multi-recording faceting is Phase C).
 pub struct ArchiveReader {

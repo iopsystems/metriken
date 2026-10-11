@@ -1,8 +1,10 @@
-//! SegmentedParquetReader: presents an ordered list of parquet byte blobs
-//! (segments of one logical table) as a single MetricsSource. Open is
-//! footer-only per segment; queries decode only the row groups they touch,
-//! spliced in segment order. Same-identity columns across segments are ONE
-//! series (unlike MultiParquetSource, which duplicates).
+//! [`SegmentedSource`]: an ordered list of parquet segments of one logical
+//! table as one [`DataSource`]. Open is footer-only per
+//! segment; reads decode only the row groups they touch, spliced in segment
+//! order. Same-identity columns across segments are one series (unlike
+//! [`MultiParquetSource`], which keeps
+//! each file's series apart). `metriken_query::SegmentedParquetReader`
+//! queries one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -805,7 +807,47 @@ impl Handover {
 }
 
 impl SegmentedSource {
-    pub fn open(
+    /// Open a table whose segments `store` supplies on demand. Reads every
+    /// segment's footer once and keeps what answers questions without the
+    /// bytes: which series exist, each segment's span and interval, the
+    /// histogram run index, the merged file metadata and the column map.
+    /// Opened segments are cached within `pool.max_bytes()`.
+    pub fn open_with_pool(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        Self::open(store, pool, None, None, false)
+    }
+
+    /// [`open_with_pool`](Self::open_with_pool) with a [`ColumnRelabel`]:
+    /// the identity indexes are built from what each column can present as,
+    /// and every read cuts its samples by occupant before splicing.
+    pub fn open_relabeled_with_pool(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+        relabel: Arc<dyn ColumnRelabel>,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        Self::open(store, pool, Some(relabel), None, false)
+    }
+
+    /// Open a table that is reopened as new rows arrive: the source saves the
+    /// state a later open can start from ([`handover`](Self::handover)), and
+    /// starts from `previous`, an earlier open's handover, when there is one.
+    /// The leading segments whose [`SegmentStore::key`] matches are not read
+    /// again. Reuse needs a relabel whose identities are fixed, or none, and
+    /// the earlier open had a relabel exactly when this one has. A handover
+    /// from another table, or a store whose keys repeat for different bytes,
+    /// gives wrong answers without an error.
+    pub fn open_after(
+        store: Arc<dyn SegmentStore>,
+        pool: Arc<BufferPool>,
+        relabel: Option<Arc<dyn ColumnRelabel>>,
+        previous: Option<&Handover>,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        Self::open(store, pool, relabel, previous, true)
+    }
+
+    fn open(
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
         relabel: Option<Arc<dyn ColumnRelabel>>,
@@ -813,7 +855,7 @@ impl SegmentedSource {
         keep: bool,
     ) -> Result<Arc<Self>, Box<dyn Error>> {
         if store.is_empty() {
-            return Err("SegmentedParquetReader requires at least one segment".into());
+            return Err("a segmented table requires at least one segment".into());
         }
 
         // The leading segments the store can name, whose bytes do not

@@ -1,45 +1,22 @@
-//! `metriken_query::UnionMetricsSource`: presents several readers with DISJOINT
-//! metric-name sets as one logical `metriken_query::MetricsSource` — e.g. one sampler's
-//! several acquisition-group tables, each holding a different subset of
-//! that sampler's metrics (rezolus's `.rez` V3 container tables
-//! `<sampler>/<group>`, not `<sampler>`, once a sampler is split).
+//! [`UnionSource`]: several sources with disjoint metric-name sets as one,
+//! such as one sampler's acquisition-group tables, each holding a different
+//! subset of the sampler's metrics. A per-name read goes to the one child
+//! that owns the name. `metriken_query::UnionMetricsSource` queries one.
 //!
-//! This is the opposite problem from `metriken_query::ParquetBuilder`'s multi-file
-//! union (`MultiParquetSource`): that type unions the SAME identity across
-//! files — the same metric, from several hosts/recordings — and
-//! deliberately keeps each file's series distinct (labeled/duplicated), not
-//! merged. `UnionMetricsSource` instead unions DIFFERENT identities into
-//! one namespace: a per-name accessor call dispatches to whichever single
-//! child owns that name, so `counters("cpu_cycles", ..)` and
-//! `counters("cpu_softirq", ..)` can each resolve from a different child
-//! transparently.
+//! This is the opposite of [`MultiParquetSource`](crate::parquet::MultiParquetSource),
+//! which composes the same identities from several files and keeps each
+//! file's series apart.
 //!
-//! **No timestamp splicing or join.** Each child keeps its own samples,
-//! windows, and cadence exactly as it already reports them. The PromQL
-//! engine already aligns two independently-timestamped series onto its
-//! evaluation grid whenever a query combines them — `a / b` between two
-//! metrics has never required them to share row timestamps, even within
-//! one physical table — so a query naming metrics from two different
-//! children needs nothing new here beyond routing each name to its owner.
-//! One consequence worth being explicit about: each metric's acquisition
-//! window still resolves from its OWN child (that child's own table-level
-//! or per-metric sidecar), so a `rate()` band is exactly as precise after
-//! union as it was before — there is no window fan-out or reconstruction
-//! step to lose fidelity in.
+//! There is no timestamp splicing or join. Each child keeps its own
+//! samples, windows and cadence; the engine aligns series from different
+//! children on its evaluation grid, and each metric's acquisition window
+//! comes from its own child.
 //!
-//! **Identity must be disjoint across children.** Which readers to compose
-//! is a decision the CALLER makes (e.g. rezolus grouping a sampler's group
-//! tables) — but which children end up in that decision can still trace
-//! back to untrusted wire bytes (rezolus derives its composition set from
-//! archive table schemas), so a name present in more than one child can be
-//! a real producer/archive bug reaching this type, not merely a
-//! caller-code bug. Two constructors, two policies:
-//! `metriken_query::UnionMetricsSource::new` trusts the caller and silently keeps the
-//! first child's series on a collision (see `build_index`; deterministic,
-//! never a panic); `metriken_query::UnionMetricsSource::try_new` checks first and returns
-//! [`UnionError::NonDisjoint`] instead of building anything. Prefer
-//! `try_new` whenever the composition set isn't hand-picked by code that
-//! can vouch for disjointness itself.
+//! Identity must be disjoint across children. The composition set can be
+//! derived from untrusted archive bytes, so the two constructors differ:
+//! [`UnionSource::new`] keeps the first child's series for a name present
+//! in more than one; [`UnionSource::try_new`] returns
+//! [`UnionError::NonDisjoint`] instead.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -51,16 +28,12 @@ use crate::types::{Counters, Gauges};
 use crate::util::union_names;
 use crate::DataSource;
 
-/// One child of a `metriken_query::UnionMetricsSource`.
+/// One child of a [`UnionSource`] (and of `metriken_query::UnionMetricsSource`).
 ///
-/// Only the two concrete reader types this crate provides are accepted —
-/// `MetricsSource` alone isn't enough, since composing at the union layer
-/// needs each child's raw [`DataSource`] handle, which is deliberately not
-/// part of the public `MetricsSource` surface (see
-/// `metriken_query::ParquetReader::data_source`/`metriken_query::SegmentedParquetReader::data_source`).
-/// Built via `From<&ParquetReader>`/`From<&SegmentedParquetReader>`, which
-/// borrow — an `Arc` clone under the hood — rather than consume, so the
-/// original reader stays usable on its own after contributing to a union.
+/// `metriken-query` builds one from its readers (`From<&ParquetReader>`,
+/// `From<&SegmentedParquetReader>`, `From<&MemoryStore>`), which borrow an
+/// `Arc` rather than consume the reader; [`from_source`](Self::from_source)
+/// takes any source.
 pub struct UnionChild(Arc<dyn DataSource>);
 
 impl UnionChild {
@@ -94,9 +67,8 @@ fn build_index(
     index
 }
 
-/// The dispatching [`DataSource`] the PromQL engine evaluates over: a
-/// per-metric-name lookup into whichever child owns it. See the module docs
-/// for the full contract.
+/// Several sources with disjoint metric names as one: each per-name read goes
+/// to the child that owns the name. See the module docs.
 pub struct UnionSource {
     children: Vec<Arc<dyn DataSource>>,
     counter_index: Index,
@@ -105,15 +77,14 @@ pub struct UnionSource {
 }
 
 impl UnionSource {
-    /// A union over `children`, trusting the caller's partitioning; see
-    /// `metriken_query::UnionMetricsSource::new`.
+    /// A union over `children`, trusting the caller's partitioning: a name
+    /// present in more than one child keeps its first child's series.
     pub fn new(children: Vec<UnionChild>) -> Self {
         Self::from_sources(children.into_iter().map(|c| c.0).collect())
     }
 
     /// A union over `children`, rejecting empty input or a metric name
-    /// (within one kind) present in more than one child; see
-    /// `metriken_query::UnionMetricsSource::try_new`.
+    /// (within one kind) present in more than one child.
     pub fn try_new(children: Vec<UnionChild>) -> Result<Self, UnionError> {
         if children.is_empty() {
             return Err(UnionError::Empty);
@@ -295,19 +266,16 @@ impl DataSource for UnionSource {
     }
 }
 
-/// Error from `metriken_query::UnionMetricsSource::try_new`.
+/// Error from [`UnionSource::try_new`] and `metriken_query::UnionMetricsSource::try_new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnionError {
     /// `children` was empty — there is nothing to dispatch to.
     Empty,
     /// The same metric name (within one kind — counter, gauge, or
     /// histogram) is present in more than one child. Disjoint identity
-    /// across children is a construction contract (see the module docs);
-    /// `metriken_query::UnionMetricsSource::new` tolerates a violation by silently
-    /// keeping the first child's series (see `build_index`),
-    /// `metriken_query::UnionMetricsSource::try_new` instead reports it so a
-    /// producer/archive bug that broke the caller's partitioning becomes a
-    /// loud error rather than a silently wrong answer.
+    /// across children is a construction contract (see the module docs):
+    /// [`UnionSource::new`] keeps the first child's series, and
+    /// [`UnionSource::try_new`] reports the names instead.
     NonDisjoint {
         /// Every duplicated name, sorted and deduplicated (a name counted
         /// once here even if it collides across more than two children, or

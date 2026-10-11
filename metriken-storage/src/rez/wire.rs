@@ -177,7 +177,7 @@ pub fn decode(bytes: &[u8]) -> Result<AgentRows, String> {
     rmp_serde::from_slice(bytes).map_err(|e| format!("failed to decode agent rows: {e}"))
 }
 
-/// An agent's row, read by metriken-archive's stream `FrameProducer`
+/// An agent's row, read by the stream's `FrameProducer` (feature `stream`)
 /// directly. The agent builds these once per pass for `/metrics/rows`, and
 /// its stream sends the same rows, so a stream frame costs no conversion.
 #[cfg(feature = "stream")]

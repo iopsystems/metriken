@@ -25,7 +25,7 @@
 //! recording recovered from a crash still reads as recovered. Each source gets
 //! a fresh dendro UUID: a `.rez` recording has no identity to carry over.
 //!
-//! `RezReader` reads the result through `crate::rez::rez::catalog` (`view`, `mcp` and
+//! `RezReader` reads the result through `crate::rez::catalog` (`view`, `mcp` and
 //! the static-site viewer); the `recording` tools do not yet. This is the
 //! migration path #1224 asks about, and the oracle for the dendro reader: a
 //! converted archive must answer every query the `.rez` did.

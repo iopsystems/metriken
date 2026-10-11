@@ -7,7 +7,7 @@ use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::types::{Counter, Gauge, Histogram, HistogramSnapshot};
 use crate::{DataSource, MetricsSource, QueryOptions};
 
-pub use metriken_storage::memory_store::*;
+use metriken_storage::memory_store::*;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 

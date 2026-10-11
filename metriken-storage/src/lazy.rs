@@ -96,7 +96,7 @@ impl LazySource {
     fn loaded(&self) -> Option<&Arc<dyn DataSource>> {
         self.loaded
             .get_or_init(|| match (self.loader)() {
-                Ok(source) => source.map(|s| s.0),
+                Ok(source) => source.map(CompositionSource::into_source),
                 Err(e) => {
                     tracing::warn!("lazy composition source failed to load, skipping it: {e}");
                     None
@@ -242,7 +242,7 @@ impl CompositionSource {
     where
         F: Fn() -> Result<Option<CompositionSource>, Box<dyn Error>> + Send + Sync + 'static,
     {
-        CompositionSource(Arc::new(LazySource {
+        CompositionSource::from_source(Arc::new(LazySource {
             catalog,
             loader: Box::new(loader),
             loaded: OnceLock::new(),

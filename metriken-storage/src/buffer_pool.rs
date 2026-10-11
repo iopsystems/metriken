@@ -8,9 +8,9 @@
 //!
 //! ```rust,ignore
 //! let pool = BufferPool::new(500 * 1024 * 1024); // 500 MB
-//! let reader = ParquetReader::open_with_pool(&path, Arc::clone(&pool))?;
-//! // Second reader shares the same pool
-//! let reader2 = ParquetReader::open_with_pool(&path2, Arc::clone(&pool))?;
+//! let a = SegmentedSource::open_with_pool(store_a, Arc::clone(&pool))?;
+//! // A second source shares the same pool
+//! let b = SegmentedSource::open_with_pool(store_b, Arc::clone(&pool))?;
 //! let stats = pool.stats();
 //! println!("hits={} misses={}", stats.hits, stats.misses);
 //! ```

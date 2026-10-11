@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- The column readers, from `metriken-query`: the data-access trait
+- The column readers, from `metriken-query`. `SegmentedSource` opens with
+  `open_with_pool`, `open_relabeled_with_pool` and `open_after`;
+  `UnionChild::from_source` and `CompositionSource::{from_source,
+  into_source}` build composition entries from any source. the data-access trait
   (`DataSource`) and its implementations for parquet files, segmented
   tables, unions, compositions and in-memory sources; the long-table
   relabel (`long::OccupantLabels`); the buffer pool; the counter scan
@@ -28,8 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The archive, from `metriken-archive`: the catalog (`Catalog`,
   `DendroCatalog`), `ArchiveReader`, and with feature `write` the writer
   (`ArchiveWriter`, `SourceRecorder`, `StreamDecoder`); with feature
-  `stream`, `FrameProducer`. `ArchiveReader` answers its names, labels, span
-  and interval from its probed catalog and finds the tables holding given
+  `stream`, `FrameProducer`. `ArchiveReader` answers its names, span and
+  interval from its probed catalog and its labels from the tables holding
+  the name and finds the tables holding given
   metric names (`owners_of`); routing a query, and `MetricsSource` for it,
   are `metriken-query`'s. The writer depends on `metriken-model`, not on
   `metriken-exposition` or the `metriken` registry.
@@ -38,8 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detection, opening an archive by content (`rez::open`), the v3 rewrite
   tooling and parquet ingest; with `write`, the v3 writer and the
   `.rez`-to-dendro conversion; with `test-support`, the tar writer for
-  fixtures. A 5.x `record --stream` `.rez`'s identity index is not read; its
-  slot columns carry the labels each segment was built with.
+  fixtures. A `record --stream` `.rez`'s identity index (rezolus 5.21.0 to
+  5.26.0) is not read, with a warning per indexed table; its slot columns
+  carry the labels each segment was built with.
 
 ## [0.1.7] - 2026-10-09
 

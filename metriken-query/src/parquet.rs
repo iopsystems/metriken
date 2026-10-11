@@ -15,7 +15,8 @@ use crate::labels::Labels;
 use crate::promql::{QueryEngine, QueryError, QueryResult};
 use crate::{DataSource, MetricsSource, QueryOptions};
 
-pub use metriken_storage::parquet::*;
+pub use metriken_storage::parquet::CompositionSource;
+use metriken_storage::parquet::*;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -557,8 +558,10 @@ impl ParquetBuilder {
         source: impl Into<CompositionSource>,
         extra: impl Into<Labels>,
     ) -> Self {
-        self.entries
-            .push(BuilderEntry::Source(source.into().0, extra.into()));
+        self.entries.push(BuilderEntry::Source(
+            source.into().into_source(),
+            extra.into(),
+        ));
         self
     }
 

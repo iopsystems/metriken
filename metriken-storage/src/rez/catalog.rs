@@ -1,8 +1,7 @@
-//! A `.rez` (v3, SQLite) as a metriken-archive [`Catalog`], and choosing
-//! between the containers an archive can be.
+//! A `.rez` (v3, SQLite) as a [`Catalog`], and choosing between the
+//! containers an archive can be.
 //!
-//! The trait and dendro's implementation are metriken-archive's
-//! (`crate::catalog`); a `.rez` recording is a source and a `.rez`
+//! The trait and dendro's implementation are in [`crate::catalog`]; a `.rez` recording is a source and a `.rez`
 //! table (a sampler, or `sampler/group`) is a table there. See
 //! `docs/journal/2026-09-28-dendro-reader.md`.
 

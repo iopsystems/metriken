@@ -684,8 +684,7 @@ impl PushEntries for TableBuilder {
 }
 pub use crate::wal::wal_group_row_approx_bytes;
 /// A group snapshot's and a decoded WAL group row's cost against the seal
-/// budget: metriken-exposition's and metriken-segment's, pinned to agree by
-/// a test in metriken-exposition.
+/// budget: `metriken_model::cost`'s, pinned to agree by a test there.
 #[cfg(feature = "write")]
 pub use metriken_model::cost::group_approx_bytes;
 

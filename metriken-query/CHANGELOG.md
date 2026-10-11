@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter scan and computes here. Results are unchanged, apart from the
   last-bit differences between runs that grouped queries over wide tables
   already had.
+- Each chunk's decoded columns are freed before a grouped display query
+  feeds its groups, rather than after.
+
+### Added
+
+- `SegmentedParquetReader::from_source`, a reader over an already-open
+  segmented source.
 
 ## [0.34.7] - 2026-10-05
 

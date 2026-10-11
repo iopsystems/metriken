@@ -93,11 +93,11 @@ the following change:
 - Opening a file's footer from bytes (`ParquetReader::open_bytes_with_pool`,
   which `ArchiveReader` uses to probe tables, `reader.rs:129`, `1423`,
   `1439`) becomes public on `FileSource`.
-- `UnionChild` and `CompositionSource` get public constructors from a
-  `Source` in storage, and query implements their `From<&wrapper>`
-  conversions (`src/union.rs:68-87`, `src/parquet.rs:593-611`).
-  `UnionSource::try_new` in storage holds the empty and duplicate-name checks
-  (`src/union.rs:333-398`), and `UnionMetricsSource::try_new` forwards to it.
+
+As built, the segment is a `MultiParquetSource` holding one `FileSource`,
+because the open path's helpers were already written over the file list it
+carries, and the probe is `MultiParquetSource::open_bytes_with_pool`. The three
+constructors are as above.
 
 The wrappers that stay in query hold storage sources, so each of those gets
 public constructors and accessors in storage:
@@ -361,8 +361,11 @@ graph; the rest were choices.
   tar fixture writer. The writers read `metriken-model` types, so no
   registry. `RezReader` and `LiveReader` stay in rezolus: they implement
   `MetricsSource`, which is `metriken-query`'s, so storage cannot. The
-  `caller_rows` identity index is dropped; a 5.x preview `record --stream`
-  `.rez` opens with slot columns labelled as each segment was built. A
+  `caller_rows` identity index is dropped: a `.rez` written by
+  `record --stream` (rezolus 5.21.0 to 5.26.0) opens with slot columns
+  labelled as each segment was built, and a warning per indexed table. Where
+  members carry their labels, which is what released agents wrote, reused
+  slots still split; an index-only archive would not. A
   `RezDb` split into read and write halves was considered and not done: the
   write half would have needed a hidden accessor to the connection, and the
   schema would have had two owners.
@@ -371,7 +374,7 @@ rezolus main with `metriken-archive` 0.4 and `metriken-segment` 0.2 builds
 against the branch and passes its tests after changing the four
 `eval_timestamps_for` calls to the free function. With `crates/rez` reduced
 to `RezReader`, `LiveReader` and re-exports of storage's `rez` modules, it
-builds, passes its tests (41 left in `rez`; 172 moved, the identity-index
+builds, passes its tests (41 left in `rez`; 174 moved, the identity-index
 ones removed) and builds for wasm32.
 
 The step 1 memory saving on the long table (about 45 MB) is not stable across
@@ -435,7 +438,7 @@ from one 9h37m56s rezolus recording (a `.rez`, converted with
   table is wide;
 - `long.dendro` and `wide.dendro`: that per-task table
   (`cpu_usage/cpu_usage_task`, 6,644 tasks) alone, rewritten long and wide by
-  `metriken-archive/tests/long_rewrite.rs`.
+  `metriken-storage/tests/long_rewrite.rs`.
 
 The queries are #241's. `display_peak.rs` opens the archive's first
 recording with a 16 MiB `BufferPool` and runs each through

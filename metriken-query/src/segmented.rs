@@ -11,20 +11,11 @@ use std::sync::Arc;
 use crate::promql::QueryEngine;
 use crate::{BufferPool, DataSource, MetricsSource, QueryError, QueryOptions, QueryResult};
 
-pub use metriken_storage::segmented::*;
+use metriken_storage::segmented::*;
+pub use metriken_storage::segmented::{
+    ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore,
+};
 
-/// Where a segmented table's bytes come from, fetched on demand.
-///
-/// A reader used to be handed every segment's bytes up front and keep them
-/// for its life, plus a parsed footer for each. On a long recording that is
-/// the whole table resident before a query has asked for anything: measured
-/// at 4.1 GB after building the dashboard of a 1.3 GB, ten-hour archive, of
-/// which the segment bytes were 1.27 GB and parsed footers most of the rest.
-/// With a store, open reads each segment once to build its catalog and
-/// identity indexes and then lets it go; a query fetches the segments its
-/// time range touches, through a bounded cache.
-///
-/// Segments are in logical (time) order, so `idx` is a position, not an id.
 /// Reads an ordered list of parquet segments that together form one logical
 /// per-sampler table, and presents them as a single [`MetricsSource`] with a
 /// unioned identity surface: the same `(name, labels)` pair appearing in
@@ -80,7 +71,9 @@ impl SegmentedParquetReader {
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open(store, pool, None, None, false)
+        Ok(Self::from_source(SegmentedSource::open_with_pool(
+            store, pool,
+        )?))
     }
 
     /// [`open_with_pool`](Self::open_with_pool) with a [`ColumnRelabel`]:
@@ -91,7 +84,9 @@ impl SegmentedParquetReader {
         pool: Arc<BufferPool>,
         relabel: Arc<dyn ColumnRelabel>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open(store, pool, Some(relabel), None, false)
+        Ok(Self::from_source(
+            SegmentedSource::open_relabeled_with_pool(store, pool, relabel)?,
+        ))
     }
 
     /// [`open_with_pool`](Self::open_with_pool) or, with a relabel,
@@ -118,7 +113,9 @@ impl SegmentedParquetReader {
         relabel: Option<Arc<dyn ColumnRelabel>>,
         previous: Option<&Handover>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open(store, pool, relabel, previous, true)
+        Ok(Self::from_source(SegmentedSource::open_after(
+            store, pool, relabel, previous,
+        )?))
     }
 
     /// What a reader opened after this one over the same table can start
@@ -131,18 +128,6 @@ impl SegmentedParquetReader {
     /// [`SegmentStore`].
     pub fn handover(&self) -> Option<Handover> {
         self.source.handover()
-    }
-
-    fn open(
-        store: Arc<dyn SegmentStore>,
-        pool: Arc<BufferPool>,
-        relabel: Option<Arc<dyn ColumnRelabel>>,
-        previous: Option<&Handover>,
-        keep: bool,
-    ) -> Result<Self, Box<dyn Error>> {
-        let source = SegmentedSource::open(store, pool, relabel, previous, keep)?;
-        let engine = QueryEngine::new(Arc::clone(&source) as Arc<dyn DataSource>);
-        Ok(Self { source, engine })
     }
 
     /// Number of segments backing this reader, gone ones included.

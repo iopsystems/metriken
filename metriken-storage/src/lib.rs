@@ -1,23 +1,40 @@
-//! The parquet segment format for metriken metrics.
+//! Storage for metriken recordings: the segment format, the column readers,
+//! and the archive containers, read and written. Queries over these are
+//! `metriken-query`'s, which implements `MetricsSource` for the readers here.
+//! Without `write`, `stream` or `rez` this builds for wasm32. See
+//! `docs/journal/2026-10-09-storage-scan.md`.
 //!
-//! What a segment's columns mean, written and read in one place, so a
-//! producer other than rezolus can write segments that `metriken-query`
-//! reads. No storage and no metrics registry: this builds for wasm32.
-//! See `docs/journal/2026-09-28-high-cardinality-stack.md`.
-//!
+//! The segment format:
 //! - [`table`]: the wide layout, a column per metric (or per metric and
-//!   slot); its parquet encoding and decoding.
-//! - [`builder`]: growing a wide table row by row.
-//! - [`format`](mod@format): the version every segment carries, and the check a reader
-//!   makes before interpreting one.
+//!   slot); its parquet encoding and decoding. [`builder`]: growing one row
+//!   by row.
+//! - [`long`]: the long layout, one row per (timestamp, occupant), and
+//!   [`long::OccupantLabels`], the relabel that puts an occupant's labels on
+//!   its series. [`long_table`]: building a long segment. [`occupants`]: the
+//!   stream that names each occupant.
+//! - [`format`](mod@format): the version every segment carries, and the check
+//!   a reader makes before interpreting one.
 //! - [`schema`] and [`window`]: a group's membership and a reading's
 //!   acquisition window, as segments store them.
-//! - [`wal`]: the write-ahead log's row format, and materializing a WAL
-//!   tail into a segment.
-//! - [`long`]: the long layout, one row per (timestamp, occupant).
-//! - [`long_table`]: building a long segment.
-//! - [`occupants`]: the stream that says which labels each occupant number
-//!   of a long table stands for.
+//! - [`wal`]: the write-ahead log's row format, and materializing a WAL tail
+//!   into a segment.
+//!
+//! Reading:
+//! - [`source`]: [`DataSource`], the trait the query engine reads through,
+//!   and [`scan`], the decoded columns its batched rate path consumes.
+//! - [`parquet`]: one or more parquet files as a source. [`segmented`]: a
+//!   table of many segments as one source, with the segment store and
+//!   relabel. [`union`]: sources with disjoint metric names as one.
+//!   [`lazy`]: a composition child opened on first use. [`memory_store`] and
+//!   [`memory`]: an in-memory source.
+//! - [`buffer_pool`]: the cache of decoded blocks readers share.
+//!
+//! Archives:
+//! - [`catalog`]: what a reader needs from a container, and dendro's
+//!   implementation. [`reader`]: [`ArchiveReader`], one source per table of a
+//!   recording. `writer` (feature `write`): [`ArchiveWriter`]. `stream`
+//!   (feature `stream`): a producer's groups as dendro replication frames.
+//! - `rez` (feature `rez`): the `.rez` format.
 
 mod archive;
 pub mod buffer_pool;

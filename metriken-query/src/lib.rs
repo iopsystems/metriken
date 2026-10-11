@@ -39,7 +39,7 @@ mod archive;
 pub(crate) mod batch_rate;
 pub mod display;
 pub mod long;
-pub mod memory_store;
+pub(crate) mod memory_store;
 pub mod parquet;
 pub(crate) mod promql;
 pub mod segmented;

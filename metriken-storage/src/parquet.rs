@@ -29,21 +29,21 @@ use crate::DataSource;
 
 /// An already-open source handed to `metriken_query::ParquetBuilder::source_labeled`.
 ///
-/// Opaque on purpose. The underlying [`DataSource`] trait returns the crate's
-/// internal row representations (`Counters`, `Gauges`, `HistogramStream`), so
-/// exposing the trait itself would make all of those public API and bind them
-/// to semver. This wrapper keeps composition open to callers while leaving the
-/// row types internal -- the same trade [`crate::UnionChild`] makes.
-///
-/// Built via `From<&ParquetReader>` / `From<&SegmentedParquetReader>`, which
-/// borrow (an `Arc` clone underneath) rather than consume, so the original
-/// reader stays usable after contributing to a composition.
-pub struct CompositionSource(pub Arc<dyn DataSource>);
+/// `metriken-query` builds one from its readers (`From<&ParquetReader>`,
+/// `From<&SegmentedParquetReader>`, `From<&MemoryStore>`), which borrow an
+/// `Arc` rather than consume the reader, and [`lazy`](Self::lazy) builds one
+/// that opens on first use.
+pub struct CompositionSource(Arc<dyn DataSource>);
 
 impl CompositionSource {
     /// A composition entry over `source`.
     pub fn from_source(source: Arc<dyn DataSource>) -> Self {
         CompositionSource(source)
+    }
+
+    /// The source this entry composes.
+    pub fn into_source(self) -> Arc<dyn DataSource> {
+        self.0
     }
 }
 

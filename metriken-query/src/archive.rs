@@ -16,11 +16,11 @@ use crate::{
 /// The evaluation timestamps a composed query needs to stay faithful to
 /// this recording's cadences, or `None` when it does not need any.
 ///
-/// Querying this reader directly applies the cross-cadence policy itself
-/// (see `query_range_opts`): when a query spans samplers recording at
+/// Querying an [`ArchiveReader`] through [`MetricsSource`] applies the
+/// cross-cadence policy itself: when a query spans samplers recording at
 /// different rates, the points are moved onto the SLOW table's own rows, so
 /// every point lands where both operands genuinely have data. A caller that
-/// instead composes [`composition_sources`](Self::composition_sources) into
+/// instead composes `ArchiveReader::composition_sources` into
 /// a labelled multi-source queries that composed reader, never this one, and
 /// so silently loses the policy — the composed reader falls back to the
 /// uniform grid and holds the slow operand's value forward between its real
