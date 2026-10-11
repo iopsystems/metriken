@@ -98,4 +98,4 @@ impl DataSource for MemoryStoreInner {
     }
 }
 
-// ─── The in-memory source ─────────────────────────────────────────────────────
+// ─── The in-memory source ───────────────────────────────────────────────

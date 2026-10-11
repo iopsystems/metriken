@@ -1,8 +1,8 @@
 //! Process-wide buffer pool for decoded parquet row groups.
 //!
 //! Follows the standard layered-cache pattern used by ClickHouse, DuckDB,
-//! PostgreSQL, and other columnar/OLAP systems. Multiple `ParquetReader`s
-//! constructed with the same pool share its budget and LRU.
+//! PostgreSQL, and other columnar/OLAP systems. Sources opened with the same
+//! pool share its budget and LRU.
 //!
 //! # Usage
 //!
@@ -51,7 +51,7 @@ pub fn content_source_id(bytes: &[u8]) -> u64 {
 /// A bounded LRU cache of decoded parquet row groups.
 ///
 /// Construct one per process (or per logical workload), share across many
-/// `ParquetReader`s via `Arc`. The pool tracks RAM usage and evicts the
+/// sources via `Arc`. The pool tracks RAM usage and evicts the
 /// least-recently-used entries when the byte budget is exceeded.
 pub struct BufferPool {
     inner: Mutex<BufferPoolInner>,

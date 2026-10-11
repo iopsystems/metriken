@@ -1,16 +1,16 @@
 //! The occupant stream: which labels each occupant number of a long table
 //! stands for.
 //!
-//! A [long](crate::long) table names its rows by occupant number only. The labels live
-//! in a parquet stream beside it, `<table>/occupants`: one row per occupant
-//! at the tick it is first seen, and one per live occupant at every
+//! A [long](crate::long) table names its rows by occupant number only. The
+//! labels live in a parquet stream beside it, `<table>/occupants`: one row per
+//! occupant at the tick it is first seen, and one per live occupant at every
 //! restatement, so retention never drops a live occupant's labels. See
-//! rezolus's `docs/journal/2026-09-25-dendro-archive-layout.md`, "The
-//! occupant stream".
+//! rezolus's `docs/journal/2026-09-25-dendro-archive-layout.md`, "The occupant
+//! stream".
 //!
 //! The stream's segment encoding. The WAL row (`Occupant`, `encode_wal_row`,
-//! `decode_wal_row`) is `metriken-model`'s, re-exported here. `metriken-query`'s `long::OccupantLabels` puts the
-//! labels on a long table's series.
+//! `decode_wal_row`) is `metriken-model`'s, re-exported here.
+//! [`crate::long::OccupantLabels`] puts the labels on a long table's series.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

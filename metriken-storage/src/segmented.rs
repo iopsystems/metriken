@@ -1,9 +1,8 @@
 //! [`SegmentedSource`]: an ordered list of parquet segments of one logical
-//! table as one [`DataSource`]. Open is footer-only per
-//! segment; reads decode only the row groups they touch, spliced in segment
-//! order. Same-identity columns across segments are one series (unlike
-//! [`MultiParquetSource`], which keeps
-//! each file's series apart). `metriken_query::SegmentedParquetReader`
+//! table as one [`DataSource`]. Open is footer-only per segment; reads decode
+//! only the row groups they touch, spliced in segment order. Same-identity
+//! columns across segments are one series (unlike [`MultiParquetSource`], which
+//! keeps each file's series apart). `metriken_query::SegmentedParquetReader`
 //! queries one.
 
 use std::collections::{BTreeMap, HashMap};
@@ -48,7 +47,7 @@ pub trait SegmentStore: Send + Sync {
     /// among this table's segments as the store presents them over time.
     /// `None` (the default) for a segment that can change under one id, such
     /// as one built from a live tail. A reader reopened with
-    /// `metriken_query::SegmentedParquetReader::open_after` reuses its predecessor's work
+    /// [`SegmentedSource::open_after`] reuses its predecessor's work
     /// for the leading segments whose ids match; only the segments before
     /// the first `None` are reused.
     fn key(&self, idx: usize) -> Option<u64> {
@@ -102,7 +101,7 @@ pub trait ColumnRelabel: Send + Sync {
     /// that same set for the columns of a segment with a
     /// [`SegmentStore::key`]. A reader then reads one occupant of a long
     /// column without relabelling it, and a reader reopened with
-    /// `metriken_query::SegmentedParquetReader::open_after` keeps its predecessor's
+    /// [`SegmentedSource::open_after`] keeps its predecessor's
     /// identities. Default: false.
     fn identities_are_fixed(&self) -> bool {
         false
@@ -121,7 +120,7 @@ pub trait ColumnRelabel: Send + Sync {
 pub type Run = (Labels, Range<usize>);
 
 /// A store over bytes already in memory: the tar archive, the tests, and
-/// any caller of the original `metriken_query::SegmentedParquetReader::open_bytes_with_pool`.
+/// any caller that already holds every segment's bytes.
 pub struct InMemorySegments(Vec<Bytes>);
 
 impl InMemorySegments {
@@ -257,7 +256,7 @@ impl IdentityMemo {
     }
 }
 
-/// What `metriken_query::SegmentedParquetReader`'s open builds from a table's segments:
+/// What [`SegmentedSource`]'s open builds from a table's segments:
 /// the identity indexes, catalog and column locations. Cloned so a reader
 /// reopened over the same table starts from the state its predecessor had
 /// after the segments both share.
@@ -763,7 +762,7 @@ struct Location {
 }
 
 /// What one reader of a table hands the next: see
-/// `metriken_query::SegmentedParquetReader::handover`.
+/// [`SegmentedSource::handover`].
 #[derive(Clone)]
 pub struct Handover {
     sealed: Sealed,

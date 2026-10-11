@@ -93,6 +93,12 @@ the following change:
 - Opening a file's footer from bytes (`ParquetReader::open_bytes_with_pool`,
   which `ArchiveReader` uses to probe tables, `reader.rs:129`, `1423`,
   `1439`) becomes public on `FileSource`.
+- `UnionChild` and `CompositionSource` get public constructors from a
+  `Source` in storage (`from_source`, and `CompositionSource::into_source`),
+  and query implements their `From<&wrapper>` conversions
+  (`src/union.rs:68-87`, `src/parquet.rs:593-611`). `UnionSource::try_new` in
+  storage holds the empty and duplicate-name checks (`src/union.rs:333-398`),
+  and `UnionMetricsSource::try_new` forwards to it.
 
 As built, the segment is a `MultiParquetSource` holding one `FileSource`,
 because the open path's helpers were already written over the file list it

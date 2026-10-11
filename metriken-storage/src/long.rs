@@ -186,7 +186,7 @@ impl ColumnRelabel for OccupantLabels {
     /// Returns true: an occupant's labels do not change, and each occupant
     /// column presents as one label set for all its samples. A segment
     /// naming an occupant the stream does not describe saves no state
-    /// (see `metriken_query::SegmentedParquetReader::handover`).
+    /// (see [`SegmentedSource::handover`](crate::segmented::SegmentedSource::handover)).
     fn identities_are_fixed(&self) -> bool {
         true
     }

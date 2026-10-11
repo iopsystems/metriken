@@ -1,9 +1,9 @@
 //! A `.rez` (v3, SQLite) as a [`Catalog`], and choosing between the
 //! containers an archive can be.
 //!
-//! The trait and dendro's implementation are in [`crate::catalog`]; a `.rez` recording is a source and a `.rez`
-//! table (a sampler, or `sampler/group`) is a table there. See
-//! `docs/journal/2026-09-28-dendro-reader.md`.
+//! The trait and dendro's implementation are in [`crate::catalog`]; a `.rez`
+//! recording is a source and a `.rez` table (a sampler, or `sampler/group`) is
+//! a table there. See `docs/journal/2026-09-28-dendro-reader.md`.
 
 use std::path::Path;
 use std::sync::Arc;

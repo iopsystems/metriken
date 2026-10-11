@@ -509,7 +509,7 @@ impl MultiParquetSource {
     ///
     /// First column wins for a given name, mirroring how
     /// `ParquetSource::histogram_stream` picks the config it decodes with.
-    /// Used by `metriken_query::SegmentedParquetReader` to reject segments whose
+    /// Used by [`SegmentedSource`](crate::segmented::SegmentedSource) to reject segments whose
     /// histogram configs disagree, which would otherwise splice into silently
     /// wrong bucket boundaries.
     pub fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
@@ -537,7 +537,7 @@ impl MultiParquetSource {
     /// groups columns purely by name and decodes every matching column
     /// under the first one's config, so two differently-configured columns
     /// for the same name within one file can never be decoded separately.
-    /// Used by `metriken_query::SegmentedParquetReader` to reject that case at
+    /// Used by [`SegmentedSource`](crate::segmented::SegmentedSource) to reject that case at
     /// open (a cross-*segment* difference is fine — that's handled by
     /// splitting into distinct runs, not rejected).
     pub fn histogram_config_variants(&self) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
@@ -564,7 +564,7 @@ impl MultiParquetSource {
     /// `(name, labels)` for every counter column, in RAW SCHEMA order —
     /// unlike [`counter_labels`](Self::counter_labels), this does not sort
     /// or dedupe. Footer-only: one pass over the schema, no row-group
-    /// decode. Used by `metriken_query::SegmentedParquetReader` to build an
+    /// decode. Used by [`SegmentedSource`](crate::segmented::SegmentedSource) to build an
     /// open-time identity index that preserves "first appearance across
     /// segments" splicing order without re-scanning the schema per metric
     /// name.
@@ -860,14 +860,8 @@ fn parse_sampling_interval(meta: &ArrowReaderMetadata) -> u64 {
         .unwrap_or(1000)
 }
 
-/// A single parquet file answering the `DataSource` contract directly.
-///
-/// Before this impl, `MultiParquetSource` reached into each file through free
-/// functions (`read_counters`) and inherent methods (`time_range_from_stats`,
-/// `read_file_metadata`), which is why it could only ever hold
-/// `Arc<ParquetSource>`. Going through the trait is what lets a composite hold
-/// heterogeneous children -- a segmented source among plain ones.
-/// One parquet file as a `DataSource`.
+/// One parquet file as a `DataSource`, so a composite can hold it beside
+/// other sources (a segmented source among plain files).
 ///
 /// A newtype rather than `impl DataSource for ParquetSource` because the
 /// inherent `ParquetSource::histogram_stream` takes `self: &Arc<Self>` (it

@@ -308,12 +308,10 @@ fn u64_col(a: &ArrayRef) -> &UInt64Array {
 
 /// Deserialize one table from parquet bytes.
 ///
-/// The production read path decodes most tables lazily via metriken-query's
-/// `ParquetReader` (`read_archive_bytes` → `RezReader`). This eager decoder
-/// was written to verify the write path independently, and is now also the
-/// decoder behind rezolus's `indexed` module: a table whose slots are described by
-/// the identity index is split by occupant before the query engine sees it,
-/// and that split needs every row in hand rather than a footer.
+/// The read path decodes tables lazily through the column readers
+/// ([`SegmentedSource`](crate::segmented::SegmentedSource) over each segment's
+/// footer). This eager decoder was written to verify the write path
+/// independently, and tools that rewrite a table use it.
 pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Error> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))?;
     crate::format::check(builder.metadata().file_metadata().key_value_metadata())?;

@@ -1,22 +1,23 @@
-//! [`ArchiveReader`]: an archive of parquet segments, one recording at a
-//! time, as one [`SegmentedSource`] per table, opened on first use. A table's
+//! [`ArchiveReader`]: an archive of parquet segments, one recording's tables
+//! (or several recordings' flattened), as one [`SegmentedSource`] per table,
+//! opened on first use. A table's
 //! live WAL tail is materialized as its newest segment
 //! (`crate::wal::materialize_wal_tail`). `metriken-query` implements
 //! `MetricsSource` for it and routes each query to the tables holding its
 //! metrics.
 //!
 //! **Same-timeline union.** An archive tables its acquisition GROUPS, not its
-//! samplers: `cpu_usage/percpu` and `cpu_usage/softirq` are two tables of
-//! one sampler, with disjoint metric sets. A query naming metrics from one
-//! table is answered by that table's own (lazy, footer-only) reader. A query
-//! naming metrics from several tables of the SAME sampler OF THE SAME source
-//! is answered by composing their sources into one union (through the
-//! checking [`UnionSource::try_new`](crate::union::UnionSource::try_new), so
-//! a producer bug that put one metric name in two tables is an error). The union dispatches by metric name, with
-//! no timestamp join: each metric keeps its acquisition window from its own
-//! table, and the engine aligns independently timestamped series on its
-//! evaluation grid as it always does. Routing groups by `(source, sampler)`,
-//! so tables of two different sources never union.
+//! samplers: `cpu_usage/percpu` and `cpu_usage/softirq` are two tables of one
+//! sampler, with disjoint metric sets. A query naming metrics from one table is
+//! answered by that table's own (lazy, footer-only) reader. A query naming
+//! metrics from several tables of the SAME sampler OF THE SAME source is
+//! answered by composing their sources into one union (through the checking
+//! [`UnionSource::try_new`](crate::union::UnionSource::try_new), so a producer
+//! bug that put one metric name in two tables is an error). The union
+//! dispatches by metric name, with no timestamp join: each metric keeps its
+//! acquisition window from its own table, and the engine aligns independently
+//! timestamped series on its evaluation grid as it always does. Routing groups
+//! by `(source, sampler)`, so tables of two different sources never union.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -777,9 +778,9 @@ impl SamplerReader {
     /// indexed table when the reader has no hook (logged); `Some(Err(()))`
     /// when the stream or index could not be read or
     /// replayed, which is a failure to open the table, reported the same way
-    /// a segment that would not parse is — never a silent fall-through to
-    /// the plain path, which would file every reused slot's rows under its
-    /// first occupant.
+    /// a segment that would not parse is. The one fall-through to the plain
+    /// path is an indexed table opened without a hook, which is logged and
+    /// reads with the labels its segments carry.
     ///
     /// The occupant-stream segments `previous` decoded are not decoded again.
     fn relabel(
@@ -812,8 +813,8 @@ impl SamplerReader {
             // A table a 5.x `record --stream` `.rez` indexed, opened without
             // a hook: its slot columns keep the labels each segment carries.
             tracing::warn!(
-                "table {} has an identity index this reader does not read; reused slots \
-                 are not split by occupant",
+                "table {} has an identity index this reader does not read; its slot columns \
+                 carry the labels each segment was built with",
                 self.sampler
             );
             return None;
@@ -837,9 +838,8 @@ impl SamplerReader {
     }
 }
 
-/// An archive's tables, one recording or several flattened. A single
-/// recording; every recording's tables are flattened into `tables`
-/// (multi-recording faceting is Phase C).
+/// An archive's tables: one recording's, or several recordings' flattened
+/// into `tables`.
 pub struct ArchiveReader {
     /// Shared so a lazy composition child can hold a table and open it on
     /// first use after this reader has handed it out.
@@ -1079,7 +1079,7 @@ impl ArchiveReader {
     ///
     /// A table's reader is still built on first query. When the matching
     /// table of `previous` saved state (see [`keep_handover`](Self::keep_handover)
-    /// and `SegmentedParquetReader::handover`), the new one reads only the
+    /// and [`SegmentedSource::handover`]), the new one reads only the
     /// segments sealed since, the live tail, and the occupant-stream
     /// segments not yet decoded, and takes over the segments `previous` had
     /// open when both readers use the same pool. A table whose relabel's
@@ -1383,10 +1383,11 @@ impl ArchiveReader {
                 // splices raw samples below PromQL evaluation so a `rate()`
                 // window straddling a seal boundary still computes on complete
                 // data. Both open footer-only against the shared pool.
-                // Probe ONE segment for the name catalog. A plain
-                // `ParquetReader` is footer-only and skips the four per-segment
-                // identity indexes `SegmentedParquetReader` builds, which is
-                // the bulk of what open used to cost.
+                // Probe ONE segment for the name catalog. A
+                // `MultiParquetSource` opened from bytes is footer-only and
+                // skips the four per-segment identity indexes
+                // `SegmentedSource` builds, which is the bulk of what open
+                // costs.
                 let probe = segments
                     .first()
                     .ok_or_else(|| format!("table {sampler} has no segments"))?;

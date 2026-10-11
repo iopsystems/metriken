@@ -696,11 +696,10 @@ pub use metriken_model::cost::group_approx_bytes;
 /// The manifest and filter unit stay the SAMPLER (the part before `/`), even
 /// though the underlying table key is finer-grained.
 ///
-/// Used by `rez_reader::RezReader` to group a sampler's tables for routing
-/// and same-timeline union (Stage 4 Part C): two group tables sharing a
-/// sampler answer a cross-group query together via a
-/// `metriken_query::UnionMetricsSource`; two DIFFERENT samplers still refuse
-/// a query spanning them.
+/// Used when routing a query (`ArchiveReader::owners_of` and
+/// `metriken-query`'s archive routing) to tell two group tables of one
+/// sampler, which a query can union, from the same sampler in two
+/// recordings, which it cannot.
 ///
 /// `parquet filter --samplers` uses this on a v3 archive to drop a sampler's
 /// group tables together — naming `cpu_usage` drops every `cpu_usage/<group>`

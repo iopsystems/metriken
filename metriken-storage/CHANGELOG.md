@@ -18,16 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- The column readers, from `metriken-query`. `SegmentedSource` opens with
-  `open_with_pool`, `open_relabeled_with_pool` and `open_after`;
-  `UnionChild::from_source` and `CompositionSource::{from_source,
-  into_source}` build composition entries from any source. the data-access trait
+- The column readers, from `metriken-query`: the data-access trait
   (`DataSource`) and its implementations for parquet files, segmented
   tables, unions, compositions and in-memory sources; the long-table
   relabel (`long::OccupantLabels`); the buffer pool; the counter scan
   (`DataSource::counter_scan`), which returns a counter's matched series and
   its segments' decoded columns a chunk at a time. Queries over them are
-  `metriken-query`'s, through its `MetricsSource` wrappers.
+  `metriken-query`'s, through its `MetricsSource` wrappers. `SegmentedSource`
+  opens with `open_with_pool`, `open_relabeled_with_pool` and `open_after`;
+  `UnionChild::from_source` and `CompositionSource::{from_source,
+  into_source}` build composition entries from any source. Methods on
+  `BufferPool`, `Labels`, `UnionChild` and `CompositionSource` that were
+  crate-private in `metriken-query` are public here, because the query
+  engine now calls them from another crate.
 - The archive, from `metriken-archive`: the catalog (`Catalog`,
   `DendroCatalog`), `ArchiveReader`, and with feature `write` the writer
   (`ArchiveWriter`, `SourceRecorder`, `StreamDecoder`); with feature

@@ -1,7 +1,7 @@
 //! Storage for metriken recordings: the segment format, the column readers,
 //! and the archive containers, read and written. Queries over these are
 //! `metriken-query`'s, which implements `MetricsSource` for the readers here.
-//! Without `write`, `stream` or `rez` this builds for wasm32. See
+//! Without `write`, `stream`, `rez` or `metriken` this builds for wasm32. See
 //! `docs/journal/2026-10-09-storage-scan.md`.
 //!
 //! The segment format:
@@ -32,7 +32,7 @@
 //! Archives:
 //! - [`catalog`]: what a reader needs from a container, and dendro's
 //!   implementation. [`reader`]: [`ArchiveReader`], one source per table of a
-//!   recording. `writer` (feature `write`): [`ArchiveWriter`]. `stream`
+//!   recording. `writer` (feature `write`): `ArchiveWriter`. `stream`
 //!   (feature `stream`): a producer's groups as dendro replication frames.
 //! - `rez` (feature `rez`): the `.rez` format.
 
