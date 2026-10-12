@@ -15,6 +15,7 @@
 //!   long table.
 //! - [`convert`]: a group snapshot as a row.
 //! - [`cost`]: a row's cost against a writer's segment byte budget.
+//! - [`wire`]: the names `/metrics/stream` is served under and its layouts.
 
 pub mod convert;
 pub mod cost;
@@ -22,6 +23,7 @@ pub mod occupants;
 pub mod schema;
 pub mod snapshot;
 pub mod wal;
+pub mod wire;
 
 pub use metriken_types::{Window, UID_LABEL};
 pub use schema::{GroupSchema, MetricDesc};

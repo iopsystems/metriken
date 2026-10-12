@@ -1,12 +1,12 @@
 [package]
 name = "metriken-model"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
 ]
 license = "Apache-2.0"
-description = "The metriken observation model: snapshots, group schemas and the rows a recording stores"
+description = "The metriken observation model: snapshots, group schemas, the rows a recording stores, and the stream's wire names"
 homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 

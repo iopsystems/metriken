@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use metriken_model::wire::{Layout, WIRE_NAMES};
 use tracing::warn;
 
 use super::clock;
@@ -54,35 +55,6 @@ impl<P: Pass> Pass for Arc<P> {
 
     fn rows(&self) -> &[P::Row] {
         (**self).rows()
-    }
-}
-
-/// How a subscription's groups are sent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Layout {
-    /// Every group as a `WalGroupRow`.
-    #[default]
-    Wide,
-    /// A group whose metrics are all counter groups, gauge groups or
-    /// histogram groups as a `WalLongRow` keyed by occupant, after the
-    /// occupants it introduces; any other group wide.
-    Long,
-}
-
-impl Layout {
-    /// `"wide"` or `"long"`: the value of the `layout` query parameter and
-    /// of the layout header.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Layout::Wide => "wide",
-            Layout::Long => "long",
-        }
-    }
-}
-
-impl fmt::Display for Layout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -209,27 +181,6 @@ fn percent_decode(s: &str) -> String {
     }
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
-
-/// The names a stream is served under: its `Content-Type` and its headers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WireNames {
-    pub content_type: &'static str,
-    /// How often a frame is sent: the request's interval.
-    pub frame_interval: &'static str,
-    /// How often a frame can carry anything new: the producer's freshness
-    /// floor.
-    pub update_floor: &'static str,
-    /// The layout served.
-    pub layout: &'static str,
-}
-
-/// The names a metriken producer serves.
-pub const WIRE_NAMES: WireNames = WireNames {
-    content_type: "application/vnd.metriken.replication.v1+dendro",
-    frame_interval: "x-metriken-frame-interval",
-    update_floor: "x-metriken-update-floor",
-    layout: "x-metriken-layout",
-};
 
 /// One subscription to a producer's stream: what it has been sent, and the
 /// rules for each interval's frame.

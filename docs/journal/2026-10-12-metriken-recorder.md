@@ -95,9 +95,10 @@ Prometheus client, detection, reconnect and refusal policy, multi-source
 orchestration, an epoch-aligned tick (exposition's is private), restart
 patches, a source for the process's own registry.
 
-**The wire types link the registry.** `WireNames`, `WIRE_NAMES` and `Layout`
-are in `metriken-exposition` (`src/stream/route.rs:62,215`), which depends on
-`metriken` unconditionally. A recorder importing them would link the
+**The wire types link the registry.** Before step 1, `WireNames`,
+`WIRE_NAMES` and `Layout` were in `metriken-exposition`
+(`src/stream/route.rs:62,215` at 753ca02), which depends on `metriken`
+unconditionally, so a recorder importing them would have linked the
 registry, against the plan's rule that only producers do.
 
 ## Design
@@ -439,7 +440,8 @@ wrong and this entry records why.
 
 1. **metriken: wire types in metriken-model.** `WireNames`, `WIRE_NAMES` and
    `Layout` to metriken-model, re-exported by exposition. A patch release of
-   model and exposition.
+   model and exposition. Done 2026-10-12 (`metriken_model::wire`; model
+   0.1.2, exposition 0.22.1, released with the recorder).
 2. **rezolus: `.dendro`-only writing, detection and handshake adoption in its
    own recorder,** as the plan's piece 2 says ("rezolus adds detection by
    stream to its own recorder first"). This removes the `.rez`, parquet and
