@@ -187,8 +187,8 @@ Four of these edges need explaining:
 `metriken-segment` and `metriken-archive` are retired. A 5.x `--stream` `.rez`
 (preview, unstable) still opens, with each slot column carrying the labels its
 segment was built with rather than split by occupant. `rezolus record` becomes
-the CLI over `metriken-recorder`, keeping `-- cmd` (`child.rs`) and the choice
-of output format. dendro is unchanged apart from making SQLite optional.
+the CLI over `metriken-recorder`, keeping `-- cmd` (`child.rs`); it writes
+`.dendro` only. dendro is unchanged apart from making SQLite optional.
 
 The formats are features of one storage crate rather than three crates
 (`metriken-dendro`, `metriken-rez`, `metriken-parquet`) because they share
@@ -358,8 +358,9 @@ stays on its own dependencies, decided 2026-10-12), systemslab, cachecannon
 and llm-perf move when they adopt it. For users of the `rezolus` binary the
 CLI, the files it writes and reads, and the wire stay the same, apart from the
 changes each step's entry names (the stream's metriken wire names in step 3;
-detection by stream, handshake identity, `.dendro`-only writing and the
-refusal of agents older than 5.21.0, in step 4); rezolus's own tests (including the compatibility fixtures in the
+detection by stream, handshake identity, `.dendro`-only writing in `record`
+and hindsight and the refusal of agents older than 5.21.0, in step 4; Save as
+Report's and the `recording` subcommands' writers, in the rezolus 6.0 entry); rezolus's own tests (including the compatibility fixtures in the
 rezolus entry) check that across each step. Library users (systemslab's `rez`
 and `dashboard` pins) change imports when they bump, or, where a step
 re-exports what it moves, in the release after.
