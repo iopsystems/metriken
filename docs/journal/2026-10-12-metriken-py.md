@@ -3,9 +3,10 @@
 **Status:** OPEN. Design 2026-10-12, not started. This is path step 6 of
 [one recording stack](2026-10-08-one-recording-stack.md) (piece 4, whose
 recommendation, bindings over `metriken-storage` and `metriken-query`, this
-entry takes). "Step N below" means this entry's own order of work. Nothing
-here is decided by the owner yet; the questions that need the owner are
-under "Open questions".
+entry takes). "Step N below" means this entry's own order of work. The
+owner decided the package name, versioning, histogram conversion and
+platforms on 2026-10-12; the design below follows those decisions, and the
+questions still open are under "Questions for the owner".
 
 ## Goal
 
@@ -28,9 +29,31 @@ metriken-query 0.36.0), rezolus upstream/main 15c77844.
 **What Python consumers read.** The plan names internal duckdb and polars
 notebooks, the h2histogram-py documentation and llm-sim's export. A search
 of the author's checkouts on 2026-10-12 found no notebook that imports
-duckdb or polars against rezolus data, and neither h2histogram-py nor llm-sim
-is checked out there, so what those three read is not known from source. Three
-other patterns were found, in private experiment repositories:
+duckdb or polars against rezolus data, and llm-sim is not checked out there,
+so what the notebooks and llm-sim read is not known from source.
+h2histogram-py is public (iopsystems/h2histogram-py, read at 1f494cb;
+published on PyPI as `h2histogram` 0.1.0, import `h2histogram`, pure Python,
+no required dependencies, `requires-python >= 3.9`):
+
+- **What it reads.** `h2histogram.arrow.read_histograms(source, name)` takes
+  a parquet path or a pyarrow `Table`/`RecordBatch`, finds the column
+  `"{name}:buckets"` (or the sparse `:bucket_indices`/`:bucket_counts`
+  pair), and returns one `Histogram` per row, built with
+  `Histogram.from_buckets(grouping_power, max_value_power, buckets)`. The
+  configuration comes from the field metadata keys `grouping_power` and
+  `max_value_power` (the same keys metriken-storage writes,
+  `long_table.rs:165`), else from the dense bucket count, else (3, 64). It
+  does not open a `.rez` or a `.dendro`.
+- **What its documentation does with the rows.** The README prints each row's
+  p99 and merges all rows into a recording total. A rezolus histogram row is
+  cumulative since the producer started (the `.rez` script below differences
+  consecutive rows for that reason, and the engine does the same,
+  `accumulate_delta_into` in `metriken-query/src/promql/streaming/histogram.rs:252`).
+  So a row's percentile is the since-start distribution, and the merge
+  counts early samples once per later row. Whether any caller of
+  h2histogram-py relies on that example was not checked.
+
+Three other patterns were found, in private experiment repositories:
 
 - **A script that reads a `.rez` v3 directly.** It opens the file with
   Python's `sqlite3`, reads `segments.bytes` for one table in `seq` order,
@@ -174,7 +197,8 @@ consumer's workflow end to end.
 
 Read-only. The bindings open a file and read it; they do not record, write,
 annotate or convert. A Python program that wants to record runs
-`rezolus record` or a producer that records itself (step 4).
+`rezolus record` or a producer that records itself (path step 4,
+[metriken-recorder](2026-10-12-metriken-recorder.md)).
 
 **Containers: `.dendro`, `.rez` (v2 tar and v3) and parquet, by content.**
 Recordings that exist today are parquet and `.rez`: systemslab artifacts
@@ -230,6 +254,18 @@ r.read_table(t, occupant_labels=True)  # long tables: the occupant's labels join
 
 metriken.histogram.bucket_bounds(grouping_power=3, max_value_power=64)
                                        # Arrow: index, lower, upper
+
+hs = r.histograms('syscall_latency{op="read"}', start=None, end=None, stride=None)
+hs.grouping_power, hs.max_value_power  # from the stream's histogram::Config
+hs.buckets                             # Arrow: timestamp, index list<u32>, count list<u64>
+                                       # per tick, per-bucket counts in that tick
+
+# with `pip install metriken[h2histogram]`
+hs.to_h2()                             # [(timestamp_ns, h2histogram.SparseHistogram), ...]
+hs.to_h2(dense=True)                   # ... h2histogram.Histogram instead
+metriken.h2.from_column(r.read_table(t), "269:buckets", delta=True)
+                                       # one stored column, row by row:
+                                       # [(timestamp_ns, SparseHistogram | None), ...]
 ```
 
 Every Arrow object implements the Arrow PyCapsule interface
@@ -280,20 +316,96 @@ at most 2,851. So:
   long-form result (`histogram_quantiles` gives one series per quantile).
   `QueryResult::HistogramHeatmap` maps to an Arrow table of (timestamp,
   bucket bound, count) from its `timestamps`, `bucket_bounds` and `data`.
-- No dependency on h2histogram-py. Whether its objects should be constructible
-  from a row is an open question.
+- **As h2histogram objects** (decided 2026-10-12: 0.1.0 converts, behind an
+  optional extra). Below.
+
+### Histograms as h2histogram objects
+
+h2histogram-py is an optional dependency: `pip install metriken[h2histogram]`
+adds `h2histogram` (the PyPI name; the repository is
+iopsystems/h2histogram-py). Without it, everything above works and
+`to_h2`/`metriken.h2` raise `ImportError` naming the extra. The bindings
+build no Python histogram type of their own.
+
+**Configuration mapping.** metriken's histograms are the `histogram`
+crate's (1.4.1 in metriken's lockfile). A stream carries a
+`histogram::Config` (`HistogramStreamMeta::config`,
+`metriken-storage/src/histogram_stream.rs:7`) and a stored column carries
+`grouping_power` and `max_value_power` in its field metadata. Both map
+one to one onto `h2histogram.Config.new(grouping_power, max_value_power)`,
+which enforces the crate's constraints (`max_value_power <= 64`,
+`grouping_power < max_value_power`) and produces the same bucket count (496
+for (3, 64)) and the same index-to-range arithmetic. A bucket index in an
+Arrow `index` list is the crate's index and is passed through unchanged.
+
+**Two conversions, for the two kinds of read:**
+
+1. **`r.histograms(selector, start, end, stride)`**, the per-tick histograms
+   the engine computes quantiles from. For each series matching the
+   selector the engine takes the per-bucket difference between consecutive
+   rows (saturating at zero, so a bucket that went down contributes
+   nothing), sums those differences across series per tick, or per stride
+   when one is given, and answers `histogram_quantiles` from the sum
+   (`quantiles_impl`, `histogram.rs:270`). `histogram_heatmap` does the same
+   accumulation in a second copy (`heatmap_impl`, `:685`), then subtracts
+   the lowest occupied bucket's index from every index and returns no
+   configuration, so its output cannot be passed to h2histogram as it is.
+   Step 4 below adds a public function to metriken-query that yields
+   `(timestamp_ns, index, count)` per tick from a `HistogramStream`, and
+   `quantiles_impl`, `heatmap_impl` and the bindings all call it. Then
+   check 8 below tests the conversion and h2histogram's arithmetic, and not
+   two copies of the accumulation. The function needs a metriken-query
+   release before the bindings can use it. The result is Arrow first
+   (`hs.buckets`); `hs.to_h2()` builds one
+   `h2histogram.SparseHistogram.from_parts(config, index, count)` per tick,
+   or with `dense=True` a `Histogram` via `to_dense()`. Sparse is the
+   default because every bucket becomes a Python `int`, and a stored row in
+   the 9.6 h recording averaged 0 to 315 non-zero buckets of 496, by
+   column; a tick's difference has no more non-zero buckets than the later
+   row.
+2. **`metriken.h2.from_column(batches, column, delta=True)`**, one stored
+   column from `read_table`. Each cell is a `List<UInt64>` of 496 counts
+   cumulative since the producer started. With `delta=True` (the default)
+   consecutive non-null cells are differenced per bucket, saturating at zero
+   as the engine does, and the first row and any row after a null give
+   `None`. `h2histogram.Histogram.subtract` is not used for this, because it
+   raises on a negative bucket, which a producer restart produces. With
+   `delta=False` each cell becomes the since-start histogram, which is what
+   h2histogram-py's own `read_histograms` returns. The differencing and the
+   non-zero scan run in Rust over the Arrow buffers; Python receives
+   `(index, count)` lists. A long table's histogram column is per occupant,
+   so `from_column` differences within an occupant, never across occupants.
+
+The conversion copies: an h2histogram object holds Python lists. A caller
+who wants zero-copy stays with `hs.buckets` or the stored column. The cost
+per tick is not measured.
+
+**Percentile conventions agree.** The engine's value for quantile q is the
+end of the bucket at rank `max(1, ceil(q * total))` over the cumulative
+counts, with the band `[start, end]` of that bucket
+(`apply_quantiles`, `histogram.rs:914`; rank in histogram 1.4.1
+`cumulative.rs:599`). h2histogram's `percentile(q)` returns a `Bucket` with
+inclusive `start`/`end`, at rank 1 for q = 0, `total` for q = 1, and
+`max(1, ceil(q * total))` otherwise (`_analytics.py:55`), which is the same
+bucket for totals up to 2^53. So the value from h2histogram is
+`bucket.end`, and the band is `(bucket.start, bucket.end)`.
 
 ### Binding technology
 
 PyO3 0.28 and maturin, a `cdylib` built as one abi3 wheel per platform (the
-prototype built `cp39-abi3`). wasm32 is not a target. Wheels:
+prototype built `cp39-abi3`). wasm32 is not a target. Four wheels (decided
+2026-10-12):
 
 - Linux x86_64 and aarch64, manylinux_2_28, built by `PyO3/maturin-action`
   (SQLite and zstd are C, compiled by `cc` in the manylinux container);
 - macOS arm64 and x86_64, deployment target 11.0 (the prototype linked
   SQLite and zstd objects built for the host's 26.4 SDK with warnings until
-  `MACOSX_DEPLOYMENT_TARGET=11.0` was set; CI sets it);
-- an sdist, which needs a Rust toolchain to install.
+  `MACOSX_DEPLOYMENT_TARGET=11.0` was set; CI sets it).
+
+Windows, musllinux and free-threaded CPython (3.13t, 3.14t, which abi3 does
+not cover) get no wheel in 0.1.0. The release also uploads an sdist, which
+needs a Rust toolchain to install; on a platform without a wheel, pip builds
+from it, and that build is not tested.
 
 `requires-python >= 3.10`: 3.9 has been end-of-life since October 2025.
 macOS's `/usr/bin/python3` is 3.9.6, so a user of the system Python
@@ -348,15 +460,22 @@ writer finalizes. The open-time cost of a large WAL tail is not measured.
 
 ### Packaging and publishing
 
-- **Name:** `metriken` on PyPI and as the import name. It was unclaimed on
-  2026-10-12 (as were `metriken-py` and `rezolus`; `dendro` is taken).
-- **Version:** its own semver, starting at 0.1.0, not tied to the crates'.
+- **Name** (decided 2026-10-12): `metriken` on PyPI and as the import name.
+  It was unclaimed on 2026-10-12 (as were `metriken-py` and `rezolus`;
+  `dendro` is taken). The Rust producer crate has the same name; the
+  package's description says it reads recordings and does not record.
+- **Extras:** `h2histogram` (adds `h2histogram`, for `to_h2` and
+  `metriken.h2`), `pyarrow` and `polars` (for `to_pyarrow`/`to_polars`).
+  The base install depends on nothing.
+- **Version** (decided 2026-10-12): its own semver, starting at 0.1.0, not
+  tied to the crates'.
   `metriken.build_info()` reports the `metriken-storage` and
   `metriken-query` versions it was built with. A change to the Python API is
   a minor version while 0.x. A storage or query release that changes what a
   recording reads as (a fix, a new container) is followed by a bindings
   release; one that does not, is not.
-- **Release:** a tag `metriken-py-vX.Y.Z` (this repository's tag form)
+- **Release:** a tag `metriken-py-vX.Y.Z` (this repository's tag form,
+  decided 2026-10-12)
   triggers a GitHub Actions workflow that builds the wheels and sdist,
   installs each wheel in a clean environment, runs the Python tests, and
   publishes with PyPI trusted publishing (no token in the repository).
@@ -367,7 +486,8 @@ writer finalizes. The open-time cost of a large WAL tail is not measured.
 ## GO / NO-GO
 
 GO for release 0.1.0 when all of these hold. Each runs in CI except 5 and 6,
-which run on one host and are recorded here.
+which run on one host and are recorded here, and 7, which runs in the
+release workflow on each wheel's platform.
 
 1. **Same values as the engine.** On rezolus's compatibility fixtures
    (rezolus 6.0 entry, "Compatibility": a tar `.rez`, a v3 `.rez`, a 5.25
@@ -404,13 +524,30 @@ which run on one host and are recorded here.
    the WAL tail the current script misses); GPU columns found by metric name
    and labels through `columns()` rather than by id, from a parquet and a
    `.dendro`; and a PromQL range query exported to a polars DataFrame and
-   queried by duckdb. If the owner supplies the notebooks, h2histogram-py
-   documentation and llm-sim export the plan names, each is reproduced the
-   same way.
-7. **Wheels install.** Each wheel installs into a clean virtual environment
-   on its platform with no Rust toolchain and no pyarrow, and `import
-   metriken; metriken.open(fixture)` works; the tests then run with pyarrow
-   and polars installed.
+   queried by duckdb. h2histogram-py's README example (per-row p99 and a
+   recording total) is reproduced from a `.dendro` through `hs.to_h2()`,
+   with per-tick histograms in place of since-start rows. If the owner
+   supplies the notebooks and the llm-sim export the plan names, each is
+   reproduced the same way.
+7. **Wheels install.** Each of the four wheels (manylinux_2_28 x86_64 and
+   aarch64, macOS arm64 and x86_64) installs into a clean virtual
+   environment on its platform with no Rust toolchain, no pyarrow and no
+   h2histogram, and `import metriken; metriken.open(fixture)` works; the
+   tests then run with the `pyarrow`, `polars` and `h2histogram` extras
+   installed.
+8. **Histograms round-trip through h2histogram.** For every histogram
+   metric in every fixture, `histogram_quantiles([0, 0.5, 0.9, 0.99, 0.999,
+   1], m)` from `query_range` and `[h.percentile(q) for each tick's h in
+   r.histograms(m).to_h2()]` agree within bucket error: at every timestamp,
+   h2histogram's bucket `(start, end)` equals the engine's band and its
+   `end` equals the engine's value. The same holds with a stride, with
+   `dense=True`, and for `from_column(..., delta=True)` on a single-series
+   column against the query with that series' labels. Equality of the
+   bucket is the test, not a tolerance of one bucket width, because both
+   sides use the same rank (see "Percentile conventions agree"); a
+   disagreement is a bug in the conversion. The fixtures include a series
+   whose producer restarted mid-recording, so the saturating difference is
+   exercised.
 
 NO-GO if 5 fails because of the binding itself (conversion, capsule export,
 GIL handling) and not because of the engine; then the cost and its mechanism
@@ -431,13 +568,17 @@ the plan's alternative, is priced instead.
 3. **Tables.** `metrics`, `tables`, `columns`, `read_table` with time range
    and WAL tail, `occupants`, the occupant join, `bucket_bounds`, `reopen`,
    the fork check. Check 2 runs here.
-4. **Fixtures and workflows.** Check 1 on rezolus's compatibility fixtures
-   once they are checked in (they are copied into `metriken-py/tests/`, so
-   this repository does not depend on rezolus's tree), check 6, check 5 on
-   the author's host.
-5. **Release.** The wheel matrix, trusted publishing, `metriken` 0.1.0 on
-   PyPI. Then the consumers move: the three patterns above, and whatever the
-   owner names under "Open questions".
+4. **Histograms.** The per-tick function in metriken-query, shared by
+   `quantiles_impl` and `heatmap_impl` (a metriken-query release), then
+   `r.histograms`, `to_h2`, `metriken.h2.from_column` and the
+   `h2histogram` extra. Check 8 runs here, on storage's archives.
+5. **Fixtures and workflows.** Checks 1 and 8 on rezolus's compatibility
+   fixtures once they are checked in (they are copied into
+   `metriken-py/tests/`, so this repository does not depend on rezolus's
+   tree), check 6, check 5 on the author's host.
+6. **Release.** The four-wheel matrix and sdist, trusted publishing,
+   `metriken` 0.1.0 on PyPI. Then the consumers move: the patterns above,
+   and whatever the owner names under "Questions for the owner".
 
 ## Callers
 
@@ -446,34 +587,43 @@ them, outside this repository:
 
 - the scripts under "Today" that read `.rez` segments through `sqlite3` or a
   rezolus parquet by column id, which break on a `.dendro` artifact;
-- the duckdb and polars notebooks, h2histogram-py's documentation and
-  llm-sim's export, which the plan names and which were not found on disk.
+- h2histogram-py's README, whose parquet example would read a `.dendro`
+  through the bindings and `to_h2` (a change in that repository, proposed
+  there after 0.1.0);
+- the duckdb and polars notebooks and llm-sim's export, which the plan names
+  and which were not found on disk.
 
 Scripts that query through `systemslab promql` stay as they are.
 
-## Open questions for the owner
+## Questions for the owner
 
-1. **Which notebooks, and where.** The plan names duckdb and polars
-   notebooks, h2histogram-py's documentation and llm-sim's export; none are
-   in the author's checkouts. Where are they, and which workflows must
-   check 6 reproduce?
+1. **Which notebooks, and where.** Open. The plan names duckdb and polars
+   notebooks and llm-sim's export; none are in the author's checkouts.
+   Where are they, and which workflows must check 6 reproduce?
+   (h2histogram-py's documentation was found; see "Today".)
 2. **h2histogram-py.** Should a histogram row convert to an h2histogram-py
    object (a dependency, or an optional extra), or is Arrow plus
-   `bucket_bounds` enough?
+   `bucket_bounds` enough? Decided 2026-10-12: 0.1.0 converts, behind the
+   optional extra `metriken[h2histogram]` ("Histograms as h2histogram
+   objects", check 8).
 3. **PyPI name.** `metriken` (proposed) is also the Rust producer library's
    name, and the Python package only reads. `metriken-py` or another name
-   avoids that.
+   avoids that. Decided 2026-10-12: `metriken`, import `metriken`.
 4. **Versioning.** Independent semver (proposed), or the same version as
    `metriken-query` so a user can tell which engine they have from the
-   package version?
+   package version? Decided 2026-10-12: independent semver, tagged
+   `metriken-py-vX.Y.Z`; `build_info()` names the engine.
 5. **Platforms.** Windows (the Rust crates' CI tests it), musllinux, and
    free-threaded CPython (3.13t, 3.14t, which abi3 does not cover): in 0.1.0
-   or later?
-6. **Gating on rezolus's fixtures.** Check 1 depends on fixtures rezolus has
-   not checked in yet. Release 0.1.0 on metriken-storage's own archives and
-   add rezolus's in 0.1.x, or wait?
-7. **PyPI ownership.** Trusted publishing needs the PyPI project created and
-   linked to this repository's workflow by an owner of both.
+   or later? Decided 2026-10-12: the four wheels only (manylinux_2_28
+   x86_64 and aarch64, macOS arm64 and x86_64); the others are not in
+   0.1.0.
+6. **Gating on rezolus's fixtures.** Open. Check 1 depends on fixtures
+   rezolus has not checked in yet. Release 0.1.0 on metriken-storage's own
+   archives and add rezolus's in 0.1.x, or wait?
+7. **PyPI ownership.** Open, owner action. Trusted publishing needs the
+   PyPI project `metriken` created and linked to this repository's release
+   workflow by an owner of both.
 
 ## Left alone
 
