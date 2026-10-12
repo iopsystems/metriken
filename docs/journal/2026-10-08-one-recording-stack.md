@@ -25,8 +25,9 @@ follow-ups listed in step 7. Decided
   export with one schema.
 
 Related entries opened the same day: rezolus
-`docs/journal/2026-10-08-6-0-release-readiness.md`, systemslab
-`docs/journal/2026-10-08-dendro-artifacts.md`, cachecannon and llm-perf
+`docs/journal/2026-10-08-6-0-release-readiness.md`, systemslab's journal
+entry on dendro artifacts (systemslab is a private repository), cachecannon
+and llm-perf
 `docs/journal/2026-10-08-dendro-recording.md`. This continues
 [a high-cardinality metrics stack](2026-09-28-high-cardinality-stack.md),
 which moved the segment format, the archive reader and writer, and the
@@ -122,7 +123,7 @@ Each crate and what it depends on:
 - `metriken-viewer`, in `iopsystems/metriken-viewer`: `metriken-dashboard`,
   `metriken-query`, `metriken-storage` (report saving), `metriken-recorder`
   (live mode), all by crates.io version.
-- `rezolus-dashboard`, in rezolus: `metriken-dashboard`.
+- `rezolus-dashboard`, in rezolus: `metriken-dashboard`, `metriken-query`.
 
 Four of these edges need explaining:
 
@@ -212,8 +213,9 @@ Decided 2026-10-12 (Q1 of the [viewer entry](2026-10-12-metriken-viewer.md)):
 and its `generate_section` takes a `&dyn MetricsSource` that must come from
 the caller's `metriken-query`. `metriken-viewer`, with its JS build and
 static assets, lives in `iopsystems/metriken-viewer` and depends on the
-metriken crates by version. This repository's CI gains only the
-`metriken-dashboard` wasm32 check. rezolus's sampler sections stay in rezolus
+metriken crates by version. This repository's CI gains the
+`metriken-dashboard` wasm32 check and a check that the display wire fixture
+is in that crate's package. rezolus's sampler sections stay in rezolus
 as `rezolus-dashboard`, published to crates.io (Q2).
 
 ## Pieces
@@ -320,12 +322,14 @@ Recommended: bindings.
 ### 5. One viewer
 
 `metriken-viewer` and `metriken-dashboard` replace rezolus's viewer crates and
-`cachecannon view`'s own dashboards. `rezolus view`, `cachecannon view` and
-systemslab mount the same library; systemslab, which today vendors rezolus's
-chart code at a rezolus revision and takes `dashboard` from a rezolus git tag,
-takes published crates and assets instead. The move happens once, before
-rezolus 6.0.0 is tagged (decided 2026-10-12; it was planned for after, because
-the viewer is the part of rezolus changing fastest). `cachecannon view` reads
+`cachecannon view`'s own dashboards. `rezolus view` and `cachecannon view`
+mount the same library. rezolus moves before 6.0.0 is tagged, and a
+cachecannon branch is on the released crates by then (decided 2026-10-12; it
+was planned for after, because the viewer is the part of rezolus changing
+fastest). systemslab, which today vendors rezolus's chart code at a rezolus
+revision and takes `dashboard` from a rezolus git tag, moves to
+`metriken-dashboard`, `rezolus-dashboard` and `metriken-viewer`'s assets
+after rezolus 6.0.0, in its own entry (viewer entry, Q9). `cachecannon view` reads
 `.dendro` before then through its metriken bump (cachecannon entry).
 
 ### 6. What stays

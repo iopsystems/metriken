@@ -258,7 +258,10 @@ When rezolus's `crates/rez` becomes storage's `rez` feature (step 5 below),
 `ArchiveReader` it wraps, so it moves into query behind a `rez` feature.
 `LiveReader` (`crates/rez/src/live.rs`) is used by rezolus's viewer
 (`src/viewer/follow.rs`, `live.rs`, `mod.rs`), so it moves from `crates/rez`
-into the rezolus binary with its implementation. `FileId` and `open_file`,
+into the rezolus binary with its implementation (superseded 2026-10-12: live
+mode moves into `metriken-viewer`, so `LiveReader` goes there, behind its
+`server` feature; see [metriken-viewer](2026-10-12-metriken-viewer.md),
+"Crates"). `FileId` and `open_file`,
 which `crates/rez/src/catalog.rs` uses to reopen and `LiveReader` uses to
 open, move to storage, and `FileId::of` becomes public.
 
