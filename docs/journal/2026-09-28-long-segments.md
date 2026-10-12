@@ -64,6 +64,9 @@ since a tick is many rows.
 **Writers** encode the occupant list with `encode_occupant_ranges`, exported
 beside the key constants, so the format is defined in one place.
 
+**A column lists its own occupants when it is sparse** (metriken-storage
+0.2.1; see "Per-column occupant lists" below).
+
 **Single-series reads use a row index.** A stream reads one series per
 segment (`read_counter_column`), and a query streaming every series of a
 long segment would otherwise scan every row once per series. Each source
@@ -129,6 +132,63 @@ default page size (at most 20,000 rows to a page). Times on an Apple M4 Max
 
 Before pruning, the quiet host's single series took 1.70 s long: it decoded
 all 76 million rows of the table to keep one thread's 34,678.
+
+## Per-column occupant lists (metriken-storage 0.2.1)
+
+The reader above crossed every metric column with every occupant in
+`metriken.occupants`, so a column listed occupants it has no value for. An
+llm-perf archive (one `llm-perf/main` long group, scalar counters beside
+labelled slots, 11 occupants) listed `turns` as 11 series, each with a
+slot's `id`, where a query returns 1. Queries were correct: a series with
+no samples drops out.
+
+`LongTableBuilder` now writes, for each metric column whose non-null rows
+cover fewer occupants than the segment holds, the file key-value entry
+`metriken.column_occupants.<column>` (`long::column_occupants_key`; the
+column's name in the segment, so `<metric>:buckets` for a histogram), in the
+same range encoding. A column with values for every occupant writes nothing.
+`expand_long` reads the column's list when present and the segment's list
+otherwise; a malformed column list falls back to the segment's with a
+warning. Open stays footer-only.
+
+**File metadata, not the column's field metadata.** Every reader through
+0.2.0 turns each field metadata key that is not in `STORAGE_KEYS` into a
+label. The list differs from segment to segment, so in field metadata it
+would give an old reader a new label on every long series and split each
+series at every segment boundary. Unknown file keys are ignored by those
+readers, so no `FORMAT_VERSION` change is needed.
+
+**Archives written before 0.2.1 keep the inflated listing.** Their segments
+carry no column lists and nothing recomputes them on read; rewriting the
+archive through the writer is the only way to get the exact listing.
+
+**Rewrites.** `KeepMetrics` (dendro's `project_segment_columns`) carries the
+file key-value metadata and keeps every row, so each surviving column's list
+stays correct; a dropped column's entry stays behind and is never read.
+dendro's compaction (`concat_parquet`) writes the merged segment with the
+caller's writer properties and none of the inputs' key-value metadata. That
+drops `metriken.layout` and `metriken.occupants` as well, so a compacted
+long segment already reads as a wide table (measured on the
+`tests/writer.rs` fixture on 0.2.0: `rate(cpu_time[3s])` returns 5 series
+after `compact_stream` where it returned 4 before); it predates this change
+and no caller here compacts long streams. A fix there must recompute or
+union the column lists along with the segment list, or drop both.
+
+**Measured footer cost.** Each archive's long segments re-encoded with the
+same writer properties, with and without the column lists:
+
+| archive | segments | columns, sparse | footer before / after | added, of segment bytes |
+|---|---|---|---|---|
+| llm-perf run, `llm-perf/main` | 11 | 386, 386 | 254,596 / 272,843 B | +18,247 B, 4.6% |
+| rezolus per-thread CPU (`cpu_usage/cpu_usage_task`) | 291 | 291, 0 | 4,968,084 / 4,968,084 B | 0 |
+
+The rezolus table has one metric column with a value for every occupant, so
+it writes no list. The llm-perf segments are small (36 KB each, 64% of it
+footer already) and every column is sparse, about 1.7 KB per segment. On
+the llm-perf archive with lists added, each counter lists what an `irate`
+query returns, except `requests`, which lists one series (`status=canceled`)
+the query does not return; I did not check whether it has fewer than two
+samples.
 
 ## Not in this change
 

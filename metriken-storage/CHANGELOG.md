@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased: metriken-storage 0.2.1
+
+### Fixed
+
+- A long segment's label listing (`counter_labels`, `gauge_labels`,
+  `histogram_labels`, and the series a footer-only open registers) named
+  every metric column once per occupant in the segment, including
+  occupants the column has no value for. A group mixing unslotted metrics
+  with slotted ones listed each unslotted metric once per slot, with the
+  slot's labels. Queries were not affected.
+
+### Added
+
+- `LongTableBuilder` writes, for each metric column that has values for
+  only some of the segment's occupants, the occupants it has, under the
+  file key-value key `long::column_occupants_key(column)`
+  (`metriken.column_occupants.<column>`), in the segment list's range
+  encoding. The reader lists those occupants for that column, and the
+  segment's list for a column without the key. Segments written before
+  this release have no keys and list as before. `long::COLUMN_OCCUPANTS_PREFIX`
+  and `long::column_occupants_key` are new.
+
 ## [0.2.0] - 2026-10-11
 
 ### Changed

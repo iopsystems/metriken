@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.2.1
+
+- See the crate's CHANGELOG: a long segment lists each metric column only
+  for the occupants it has values for.
+
 ### metriken-exposition 0.22.0
 
 - **Added:** `stream` (feature `stream`): the frame producer and frame types

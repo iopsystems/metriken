@@ -1131,3 +1131,108 @@ fn state_passes_through_a_reader_that_was_not_queried() {
     assert_eq!(answers(&after, 0), expected);
     assert_eq!(after_count.get(), fresh_count.get());
 }
+
+type LabelSets = BTreeSet<Vec<(String, String)>>;
+
+/// The label sets `labels` lists, without `__occupant__` and `__name__`.
+fn label_sets(labels: Vec<BTreeMap<String, String>>) -> LabelSets {
+    labels
+        .into_iter()
+        .map(|l| {
+            l.into_iter()
+                .filter(|(k, _)| k != "__occupant__" && k != "__name__")
+                .collect()
+        })
+        .collect()
+}
+
+/// The label sets of the series `query` returns with at least one sample.
+fn answered(reader: &ArchiveReader, query: &str) -> LabelSets {
+    let (series, _) = answer(reader, query, 0).unwrap();
+    series
+        .into_iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(l, _)| l.into_iter().filter(|(k, _)| k != "__name__").collect())
+        .collect()
+}
+
+/// Each metric of the long table lists the series a query of it returns,
+/// and no occupant it has no value for. `threads/tasks` mixes a slotted
+/// member set (`cpu_time`, `syscalls`, `latency`) with an unslotted gauge
+/// (`threads_total`, the occupant of slot `""`) over five-row segments, so
+/// every column is sparse over the segment's occupants. The engine answers
+/// a histogram query aggregated, so `latency` is checked against the same
+/// recording written wide, where each slot is its own column.
+fn listings_match_queries(reader: &ArchiveReader, wide: &ArchiveReader) {
+    let total = label_sets(reader.gauge_labels("threads_total"));
+    assert_eq!(total, answered(reader, "threads_total"));
+    assert_eq!(total.len(), 1, "one unslotted member: {total:?}");
+    for (metric, query) in [
+        ("cpu_time", "irate(cpu_time[3s])"),
+        ("syscalls", "irate(syscalls[3s])"),
+    ] {
+        let listed = label_sets(reader.counter_labels(metric));
+        assert_eq!(listed, answered(reader, query), "{metric}");
+        assert!(
+            listed.iter().all(|l| l.iter().any(|(k, _)| k == "comm")),
+            "{metric}: a series without a slot's labels: {listed:?}"
+        );
+    }
+    // `syscalls` is one column per op, each with every slot: 4 occupants
+    // held the three slots, times two ops.
+    assert_eq!(label_sets(reader.counter_labels("syscalls")).len(), 8);
+    let latency = label_sets(reader.histogram_labels("latency"));
+    assert_eq!(latency, label_sets(wide.histogram_labels("latency")));
+    assert_eq!(latency.len(), 4);
+}
+
+/// A long table lists only the occupants each column has values for:
+/// sealed, from the live tail, and after a copy trimmed to some metrics.
+#[test]
+fn a_long_table_lists_only_the_series_it_has() {
+    use dendro::archive::{Archive, ArchiveMut};
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    use metriken_storage::writer::Encoder;
+    use metriken_storage::{default_compression, segment_props, KeepMetrics};
+
+    let dir = tempfile::tempdir().unwrap();
+    let wide = dir.path().join("wide.dendro");
+    record(&wide, false, true, None);
+    let wide = open(&wide);
+    let sealed = dir.path().join("sealed.dendro");
+    record(&sealed, true, true, None);
+    listings_match_queries(&open(&sealed), &wide);
+
+    let live = dir.path().join("live.dendro");
+    record(&live, true, false, None);
+    listings_match_queries(&open(&live), &wide);
+
+    // A projection keeps every row, so each kept column's list holds.
+    let src = Archive::open(&sealed).unwrap();
+    let mut names = Vec::new();
+    for s in src.read_sources().unwrap() {
+        names.extend(src.all_streams(s.id).unwrap());
+    }
+    let metrics: BTreeSet<String> = ["threads_total", "latency"]
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
+    let keep = KeepMetrics::new(&metrics);
+    let spec = CopySpec {
+        keep_columns: Some(&keep),
+        writer_props: Some(segment_props(default_compression())),
+        ..CopySpec::everything()
+    };
+    let encoder = Encoder::for_streams(names.iter().map(String::as_str));
+    let trimmed = dir.path().join("trimmed.dendro");
+    let mut dst = ArchiveMut::create(&trimmed).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
+        .unwrap();
+    drop(dst);
+    let reader = open(&trimmed);
+    let total = label_sets(reader.gauge_labels("threads_total"));
+    assert_eq!(total, answered(&reader, "threads_total"));
+    assert_eq!(total.len(), 1);
+    let latency = label_sets(reader.histogram_labels("latency"));
+    assert_eq!(latency, label_sets(wide.histogram_labels("latency")));
+}

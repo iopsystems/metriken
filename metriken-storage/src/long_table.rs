@@ -12,7 +12,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
 
 use crate::long::{
-    encode_occupant_ranges, LAYOUT_KEY, LAYOUT_LONG, OCCUPANTS_KEY, OCCUPANT_COLUMN,
+    column_occupants_key, encode_occupant_ranges, LAYOUT_KEY, LAYOUT_LONG, OCCUPANTS_KEY,
+    OCCUPANT_COLUMN,
 };
 use crate::schema::{GroupSchema, MetricDesc};
 use crate::table::{
@@ -41,6 +42,23 @@ impl LongColumn {
             LongValues::Counter(v) => v.resize(to, None),
             LongValues::Gauge(v) => v.resize(to, None),
             LongValues::Histogram(v) => v.resize(to, None),
+        }
+    }
+
+    /// Whether row `i` holds a value.
+    fn has_value(&self, i: usize) -> bool {
+        match &self.values {
+            LongValues::Counter(v) => v[i].is_some(),
+            LongValues::Gauge(v) => v[i].is_some(),
+            LongValues::Histogram(v) => v[i].is_some(),
+        }
+    }
+
+    /// The column's name in the segment: a histogram's is `<name>:buckets`.
+    fn field_name(&self) -> String {
+        match &self.values {
+            LongValues::Histogram(_) => format!("{}:buckets", self.name),
+            _ => self.name.clone(),
         }
     }
 }
@@ -235,12 +253,8 @@ impl LongTableBuilder {
                     }
                     let arr = b.finish();
                     fields.push(
-                        Field::new(
-                            format!("{}:buckets", col.name),
-                            arr.data_type().clone(),
-                            true,
-                        )
-                        .with_metadata(col.metadata.clone()),
+                        Field::new(col.field_name(), arr.data_type().clone(), true)
+                            .with_metadata(col.metadata.clone()),
                     );
                     arrays.push(Arc::new(arr));
                 }
@@ -248,13 +262,26 @@ impl LongTableBuilder {
         }
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
-        let kv = vec![
+        let all = encode_occupant_ranges(self.occupants.iter().copied());
+        let mut kv = vec![
             KeyValue::new(LAYOUT_KEY.to_string(), LAYOUT_LONG.to_string()),
-            KeyValue::new(
-                OCCUPANTS_KEY.to_string(),
-                encode_occupant_ranges(self.occupants.iter().copied()),
-            ),
+            KeyValue::new(OCCUPANTS_KEY.to_string(), all.clone()),
         ];
+        // A column that has values for only some of the segment's occupants
+        // says which, so a listing does not name a series with no samples.
+        // A column with values for every occupant says nothing: the reader
+        // falls back to the segment's list, which is the same set.
+        for name in &self.order {
+            let col = &self.columns[name];
+            let has = encode_occupant_ranges(
+                (0..rows)
+                    .filter(|&i| col.has_value(i))
+                    .map(|i| self.occupants[i]),
+            );
+            if has != all {
+                kv.push(KeyValue::new(column_occupants_key(&col.field_name()), has));
+            }
+        }
         let props = crate::format::stamped(
             props
                 .into_builder()
@@ -396,6 +423,111 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(occs, vec![3, 0]);
+    }
+
+    /// A segment whose gauge has values for even occupants only, and whose
+    /// histogram has none at all for occupant 1, over two ticks.
+    fn sparse() -> Vec<u8> {
+        let mut b = LongTableBuilder::new();
+        let mut odd = occ(1, 7);
+        odd.histograms = vec![None];
+        b.push_tick(10, 0, None, &schema(), &[occ(0, 1), odd.clone(), occ(2, 2)]);
+        b.push_tick(20, 0, None, &schema(), &[occ(0, 3), odd, occ(4, 4)]);
+        b.finish(true).unwrap()
+    }
+
+    /// `bytes` re-encoded with the file key-value metadata `edit` leaves.
+    fn with_kv(bytes: &[u8], edit: impl Fn(&mut Vec<KeyValue>)) -> Vec<u8> {
+        let b =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        let mut kv: Vec<KeyValue> = b
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .filter(|e| e.key != "ARROW:schema")
+            .cloned()
+            .collect();
+        edit(&mut kv);
+        let schema = b.schema().clone();
+        let props = segment_writer_props()
+            .into_builder()
+            .set_key_value_metadata(Some(kv))
+            .build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        for batch in b.build().unwrap() {
+            w.write(&batch.unwrap()).unwrap();
+        }
+        w.close().unwrap();
+        buf
+    }
+
+    /// The occupants each metric lists, from a footer-only open.
+    fn listed(bytes: Vec<u8>) -> [Vec<String>; 3] {
+        use crate::parquet::{FileSource, ParquetSource};
+        use crate::source::DataSource;
+        let src = FileSource(ParquetSource::open_bytes(bytes.into()).unwrap());
+        let occ = |sets: Vec<std::collections::BTreeMap<String, String>>| -> Vec<String> {
+            sets.iter()
+                .map(|l| l[crate::long::OCCUPANT_LABEL].clone())
+                .collect()
+        };
+        [
+            occ(src.counter_labels("cpu")),
+            occ(src.gauge_labels("depth")),
+            occ(src.histogram_labels("lat")),
+        ]
+    }
+
+    /// A column with values for only some of the segment's occupants lists
+    /// them in the footer, and the listing names exactly those; a column
+    /// with values for every occupant writes no list.
+    #[test]
+    fn a_sparse_column_lists_only_the_occupants_it_has() {
+        let bytes = sparse();
+        let (_, kv) = read(&bytes);
+        assert_eq!(kv[OCCUPANTS_KEY], "0-2,4");
+        assert!(!kv.contains_key(&column_occupants_key("7")));
+        assert_eq!(kv[&column_occupants_key("8")], "0,2,4");
+        assert_eq!(kv[&column_occupants_key("9:buckets")], "0,2,4");
+        let [cpu, depth, lat] = listed(bytes);
+        assert_eq!(cpu, ["0", "1", "2", "4"]);
+        assert_eq!(depth, ["0", "2", "4"]);
+        assert_eq!(lat, ["0", "2", "4"]);
+    }
+
+    /// A segment written before the per-column lists existed lists every
+    /// column once per occupant in the segment's list, as it always did.
+    #[test]
+    fn a_segment_without_column_lists_lists_every_occupant() {
+        let old = with_kv(&sparse(), |kv| {
+            kv.retain(|e| !e.key.starts_with(crate::long::COLUMN_OCCUPANTS_PREFIX))
+        });
+        let [cpu, depth, lat] = listed(old);
+        for got in [cpu, depth, lat] {
+            assert_eq!(got, ["0", "1", "2", "4"]);
+        }
+    }
+
+    /// A malformed column list falls back to the segment's, and an empty
+    /// one lists nothing for that column.
+    #[test]
+    fn a_malformed_column_list_lists_the_segments_occupants() {
+        let edited = with_kv(&sparse(), |kv| {
+            for e in kv.iter_mut() {
+                if e.key == column_occupants_key("8") {
+                    e.value = Some("4-2".to_string());
+                }
+                if e.key == column_occupants_key("9:buckets") {
+                    e.value = Some(String::new());
+                }
+            }
+        });
+        let [_, depth, lat] = listed(edited);
+        assert_eq!(depth, ["0", "1", "2", "4"]);
+        assert!(lat.is_empty(), "{lat:?}");
     }
 
     /// A tail materialized from WAL rows is the segment a builder fed the
