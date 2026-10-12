@@ -1,8 +1,9 @@
 # One recording stack for every metriken producer
 
 **Status:** OPEN. Plan opened 2026-10-08. Path steps 1 to 3 built and
-released by 2026-10-11 (metriken-model; metriken-storage and metriken-query;
-the stream route, open for llm-perf). Decided 2026-10-08:
+released by 2026-10-12 (metriken-model; metriken-storage and metriken-query;
+the stream route, served by the rezolus agent, cachecannon and llm-perf).
+Step 4 (`metriken-recorder`) is next.
 
 - recording, exposition and viewing converge on one stack, and per-project
   recorders and viewer implementations are retired as their projects move;

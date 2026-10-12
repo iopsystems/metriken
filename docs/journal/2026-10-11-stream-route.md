@@ -1,16 +1,18 @@
 # The stream route: any registry serves `/metrics/stream`
 
-**Status:** OPEN for llm-perf. dendro 0.4.0 (dendro#31, #32),
+**Status:** CLOSED 2026-10-12, GO. dendro 0.4.0 (dendro#31, #32),
 metriken-exposition 0.22.0, metriken-storage 0.2.0 and metriken-query 0.36.0
 (#253, #254) released 2026-10-11; the rezolus agent serves the stream through
 the helper (rezolus#1435) and cachecannon does (cachecannon#205 on main,
 cachecannon#206 on its 0.0.x line). cachecannon's network library ringline had
 to move to metriken 0.11 first, since a build holds one metriken-core:
 ringline-rs/ringline#649 on main, and 0.6.10 from release/0.6.x (ringline#651,
-#652). All six checks pass ("As built"). The plan's GO for piece 1 also needs
-llm-perf, which serves the stream in its own step 4. This is path step 3 of
-[one recording stack](2026-10-08-one-recording-stack.md) (piece 1). "Step N
-below" means this entry's own order of work. Decided 2026-10-11:
+#652). All six checks pass ("As built"). llm-perf serves it too (llm-perf#188,
+#189), which meets the plan's GO for piece 1: the rezolus agent, cachecannon
+and llm-perf serve the stream through the helper with no frame code of their
+own. This is path step 3 of [one recording
+stack](2026-10-08-one-recording-stack.md) (piece 1). "Step N below" means this
+entry's own order of work. Decided 2026-10-11:
 
 - the wire takes neutral names (`application/vnd.metriken.replication.v1+dendro`,
   `x-metriken-*`). A producer serves only those. A consumer is built with the
@@ -553,6 +555,24 @@ released crates.
   legacy names and one serving the new names.
 
 ## Follow-ups
+
+From llm-perf's adoption (llm-perf#189):
+
+- A windowless group is sent whole every pass, and a histogram member as its
+  full bucket array: llm-perf's 29 histograms (grouping power 7, 7,424
+  buckets each) cost about 190 KB per frame per subscriber at 1 s, whatever
+  the load, and its `.dendro` grows about 450 KB per minute (the parquet of
+  the same run, 57 KB). Sending only members that changed since the last
+  frame on a subscription, or sparse buckets, would fix it here.
+- llm-perf's `llm-perf/main` group mixes plain metrics with labelled counter
+  families, so exposition sends it wide whatever layout is asked for (long
+  needs every metric in the group to be a group). rezolus's writer stores
+  it as a long table whose columns are sparse over its occupants, which
+  listed series that do not exist until metriken-storage 0.2.1 (#256).
+- dendro's compaction (`concat_parquet`) drops segments' key-value
+  metadata, so a compacted long segment reads as wide
+  (`metriken-storage/tests/writer.rs::a_compacted_long_stream_answers_as_before`,
+  ignored until dendro is fixed). Nothing compacts long streams today.
 
 From cachecannon's adoption (cachecannon#205):
 
