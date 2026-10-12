@@ -398,7 +398,7 @@ re-exports what it moves, in the release after.
    in the handshake (the recorder adopts handshake metadata since step 4),
    and the viewer reads `service_queries` from a source's metadata.
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
-   `.dendro` by default.
+   `.dendro` by default. Design and gate: [metriken-py](2026-10-12-metriken-py.md).
 7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
    6.0.0 (decided 2026-10-12: 6.0.0 is released after every open step and
    these follow-ups, so its wire, formats and CLI ship complete: stream frame
