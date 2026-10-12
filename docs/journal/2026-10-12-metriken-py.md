@@ -401,7 +401,9 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    nothing), sums those differences across series per tick, or per stride
    when one is given, and answers `histogram_quantiles` from the sum
    (`quantiles_impl`, `histogram.rs:270`). `histogram_heatmap` does the same
-   accumulation in a second copy (`heatmap_impl`, `:685`), then subtracts
+   accumulation in a second copy (`heatmap_impl`, `:685`), and `reduce`
+   (`:435`; grouped quantiles, count, sum and mean) in a third. The heatmap
+   then subtracts
    the lowest occupied bucket's index from every index and returns no
    configuration, so its output cannot be passed to h2histogram as it is.
    Step 4 below adds a public function to metriken-query that takes
@@ -414,7 +416,8 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    (`DataSource::histogram_stream`, public through
    `ArchiveReader::owners_of`, `SamplerReader::reader()` and
    `TableReader::source()`) but would reimplement the accumulation, which
-   check 8 must test one copy of. The two copies disagree with a stride.
+   check 8 must test one copy of. `heatmap_impl` disagrees with the other
+   two when a stride is given.
    After a stride with no counts, `flush_accum` clears the accumulator and
    returns false. `quantiles_impl` moves `stride_last_emit` to that tick
    anyway (`histogram.rs:352-369`), so its next point is a full stride
@@ -518,8 +521,8 @@ this entry's step 4: `flush_accum` keeps the running count as `u64`,
 `apply_quantiles` and the reduce path read it through
 `CumulativeROHistogramRef`, and `heatmap_impl` differences the `u64`
 buffer. No public type changes. It adds a test with a tick of 5e9
-observations, the case above. As of 2026-10-12 it is a local branch, not
-merged or released. Check 8 is exact equality only against 0.36.1 or
+observations, the case above. As of 2026-10-12 it is merged
+(iopsystems/metriken#261) and not yet released. Check 8 is exact equality only against 0.36.1 or
 later.
 
 ### Binding technology
@@ -903,7 +906,8 @@ aarch64 under manylinux_2_28; then the Python reader against dendro's
    that removes the u32::MAX cap (described under "Histograms as
    h2histogram objects"). In metriken-query, a later 0.36.x release: the
    per-tick function, shared by `quantiles_impl` and `heatmap_impl`, with
-   `quantiles_impl`'s stride rule, and the test that a strided
+   `quantiles_impl`'s stride rule (which `reduce` already follows), and the
+   test that a strided
    `histogram_heatmap` emits at `histogram_quantiles`' timestamps after an
    empty stride. Then
    `r.histograms`, `to_h2`, `metriken.h2.from_column` and the `h2histogram`

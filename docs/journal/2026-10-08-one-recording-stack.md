@@ -419,4 +419,5 @@ re-exports what it moves, in the release after.
    `histogram_heatmap` are wrong for any tick or stride whose total exceeds
    2^32 (reproduced 2026-10-12; [metriken-py](2026-10-12-metriken-py.md),
    "Histograms as h2histogram objects"). metriken-query 0.36.1 keeps the
-   counts as `u64`; as of 2026-10-12 it is a local branch, not released.
+   counts as `u64`; as of 2026-10-12 it is merged (#261) and not yet
+   released.
