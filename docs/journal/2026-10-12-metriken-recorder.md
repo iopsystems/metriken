@@ -154,13 +154,15 @@ endpoint. An endpoint whose path is `/` or `/metrics/stream`:
 1. Connect to `/metrics/stream`. A handshake in an accepted content type means
    streamed (`Detected::Streamed`, with the open subscription and handshake,
    handed to `start`).
-2. Otherwise (404, 409, a foreign content type) ask the caller's probe hook.
-   A 5xx or a handshake timeout is `Pending`, retried each tick, as today
-   (`ConnectError::Unreachable`, `mod.rs:999-1006`).
-   rezolus's hook identifies a rezolus agent by `/status`, else the `/`
-   banner (agents before 5.16.0), else a `/metrics/binary` body that decodes
-   as a `Snapshot`, and refuses one (`Verdict::Refuse`), naming its version
-   and pointing at a 5.x recorder.
+2. Otherwise (404, 409, a foreign content type, a 5xx, a handshake timeout)
+   ask the caller's probe hook, passing the stream route's answer. rezolus's
+   hook identifies a rezolus agent by `/status`, else the `/` banner, which
+   every agent serves (`mod.rs:441-447`). For an agent it returns `Pending`
+   on a 5xx or a handshake timeout, retried each tick as today
+   (`ConnectError::Unreachable`, `mod.rs:999-1006`), and otherwise refuses it
+   (`Verdict::Refuse`), naming its version, quoting the route's answer and
+   pointing at a 5.x recorder. For anything else it returns `Scrape`.
+   `NoProbe` always scrapes.
 3. Otherwise scrape `/metrics` as Prometheus (`Detected::Scraped`).
 
 A refused endpoint at startup makes rezolus exit 1 before the archive is
@@ -168,8 +170,9 @@ opened, naming the agent, as today (`mod.rs:2431-2468`). An unreachable
 endpoint is `Pending` and detected on each tick until it answers; one that
 turns out to be an agent that cannot stream after the run has started is
 refused mid-run, as `refuse_mid_run` does today. A streamed source whose
-reconnect is refused is `Refused` without asking the hook, so it is never
-switched to a scrape mid-recording (`mod.rs:1137-1143`). The hook is told
+reconnect is refused is `Refused` and never switched to a scrape
+mid-recording (`mod.rs:1137-1143`); the hook is called with `At::Reconnect`
+for the reason text only and its verdict is ignored. The hook is told
 whether it is asked at startup, on late activation or on a reconnect, so it
 can word each refusal as today (`RefusedAt`, `mod.rs:904-925`). The stream
 route is pull-based, so a subscription opened by `detect` and read later by
@@ -186,9 +189,13 @@ probe hook's (rezolus's: `host` from the agent's `/systeminfo`, as
 `rez::build_labels` does today, `mod.rs:1543`), the handshake's. `source`, in
 order: the user's, the handshake's `source` label, `"rezolus"` when the probe
 hook identifies a rezolus agent, the name inferred from the URL. Labels are
-fixed when the source is added to the archive, so `start` awaits the hook's
-first `enrich` for each streamed endpoint before adding it, bounded by
-`timeout`; after that, only the handshake's labels are used.
+fixed when the source is added to the archive, so `start` runs the first
+`enrich` of every streamed endpoint concurrently, each bounded by `timeout`,
+before adding the sources. On a timeout, `Retry` or an epoch mismatch the
+source is added with the user's and the handshake's labels, and a warning
+names the hook's labels it lacks (rezolus: `host`). A late activation runs
+`enrich` off the tick and adds the source on the first tick after it returns
+or times out, so no other source's commit waits on it.
 
 Metadata, highest first: the user's `--metadata`; keys the recorder writes
 (`sampling_interval_ms`, `producer_epoch`, `producer_epochs`); the probe
@@ -196,10 +203,10 @@ hook's; the handshake's. A reconnect's handshake carries the new process's
 metadata, so restart patching applies it, and a producer that puts its
 identity in the handshake needs no refetch hook. The hook's `enrich(url,
 epoch)` runs after the handshake, which reverses today's order (`/status`
-before the stream opens, `open_stream`'s doc, `mod.rs:727`), so it never sets
-the epoch or anchor, and a reply whose epoch differs from the handshake's uuid
-is discarded, as `fetch_restarted_agent` does. The rezolus agent sends labels
-`{source}` and empty metadata today; its hook keeps fetching `/status`,
+before the stream opens, `open_stream`'s doc, `mod.rs:729-732`), so it never
+sets the epoch or anchor, and a reply whose epoch differs from the handshake's
+uuid is discarded, as `fetch_restarted_agent` does. The rezolus agent sends
+labels `{source}` and empty metadata today; its hook keeps fetching `/status`,
 `/systeminfo` and `/metrics/descriptions` until it puts those in its
 handshake. Piece 3's template (`service_queries` in the handshake metadata)
 then reaches the archive with no recorder change.
@@ -247,11 +254,19 @@ it waits, then:
 - `Stop::Now`, for a producer recording itself after its last pass
   (`LocalSource::pass` is called once more first).
 
+`finish` also takes a cancellation token: cancelling it (rezolus: a second
+ctrl-c, as `shutdown.notified()` ends today's wait, `mod.rs:3318-3320`) ends
+the `AfterExit` wait or the `Grace` sleep and goes on to the steps below.
 It then stages every frame already received, writes any pending restart
 without further retries, finalizes each source and joins the writer, which is
 the order today's shutdown follows after its last pass (`drain_stream_events`,
-then `apply_restarts(.., last = true)`, `mod.rs:3350-3365`). Dropping a
-`Recorder` stops its tasks and leaves the archive unfinalized on disk.
+then `apply_restarts(.., last = true)`, `mod.rs:3351-3367`). When no source
+staged a pass, `finish` discards the archive instead of finalizing it and
+says so in `Summary`, as today's run does (`mod.rs:3391-3409`; rezolus exits
+1, or warns that the command exited before any metrics were recorded).
+`Summary` carries each source's final state, transport and `passes_total`.
+Dropping a `Recorder` stops its tasks and leaves the archive unfinalized on
+disk.
 
 A caller that ignores events drops the receiver. The channel is bounded.
 `Active`, `Refused` and `Failed` are never dropped (the recorder awaits their
@@ -306,7 +321,7 @@ pub enum Enrich {
 }
 #[async_trait]
 pub trait Probe: Send + Sync {
-    async fn not_streamable(&self, url: &Url, at: At) -> Verdict;
+    async fn not_streamable(&self, url: &Url, at: At, answer: &str) -> Verdict;
     // `epoch`: the handshake's uuid. A reply whose epoch differs is
     // discarded; Retry asks again next tick.
     async fn enrich(&self, url: &Url, epoch: Option<&str>) -> Enrich;
@@ -331,7 +346,7 @@ impl Recorder {
         -> Result<(Self, Vec<SourceId>, mpsc::Receiver<Event>), StartError>;
     pub async fn patch_metadata(&self, source: SourceId, patch: BTreeMap<String, String>)
         -> Result<()>;
-    pub async fn finish(self, stop: Stop) -> Result<Summary>;
+    pub async fn finish(self, stop: Stop, cancel: CancellationToken) -> Result<Summary>;
     pub fn discard(self);
 }
 ```
@@ -392,8 +407,14 @@ Callers that ask `record` for parquet or `.rez` are refused by 6.x and must
 ask for `.dendro` before they run it: llm-perf's server metrics with an
 `output` not ending in `.dendro` (`src/server_metrics.rs:22,46-53`), and
 systemslab's runner, which asks a rezolus from 5.19 for `-o x.rez`
-(`crates/runner/src/metrics.rs:276-300`). Each change lands before rezolus
-6.0.0 (systemslab's in its 6.0 branch, iopsystems/systemslab#6371).
+(`crates/runner/src/metrics.rs:238-260`, `MIN_REZ_VERSION` :376); and
+rezolus's own: `docker/rezolus-capture` and `scripts/rezolus-capture`
+(parquet, then `parquet combine`), `labels/specs/*.toml` (`-o .rez`, and a
+comment that any agent version serves), `data/test_fixtures/compare-demo.sh`
+and the CI smoke in `.github/workflows/cargo.yml:330-346`. rezolus's own move
+to `.dendro` in step 2. Each other change lands before rezolus 6.0.0;
+systemslab's runner change is not yet written (iopsystems/systemslab#6371
+covers reading `.dendro`).
 
 NO-GO if the library cannot drive rezolus's three modes without depending on
 rezolus agent types (`AgentStatus`, sampler status); then the probe hook is
@@ -404,15 +425,15 @@ wrong and this entry records why.
 1. **metriken: wire types in metriken-model.** `WireNames`, `WIRE_NAMES` and
    `Layout` to metriken-model, re-exported by exposition. A patch release of
    model and exposition.
-2. **rezolus: `.dendro`-only writing, detection and handshake adoption in
-   its own recorder,** as the plan's piece 2 says ("rezolus adds detection by
+2. **rezolus: `.dendro`-only writing, detection and handshake adoption in its
+   own recorder,** as the plan's piece 2 says ("rezolus adds detection by
    stream to its own recorder first"). This removes the `.rez`, parquet and
    raw writers from `record` and hindsight (the live viewer already writes
-   `.dendro` only), and the old-agent refusal replaces decision 1. Checks 3 and 4 run here. hindsight and the
-   live viewer are not restructured here; they move once, onto the library,
-   in step 4. The other writers of `.rez` and parquet (Save as Report,
-   `recording` subcommands) are the rezolus 6.0 entry's to remove, before
-   6.0.0.
+   `.dendro` only), and the old-agent refusal replaces decision 1. Checks 3
+   and 4 run here. hindsight and the live viewer are not restructured here;
+   they move once, onto the library, in step 4. The other writers of `.rez`
+   and parquet (Save as Report, `recording` subcommands) are the rezolus 6.0
+   entry's to remove, before 6.0.0.
 3. **metriken: `metriken-recorder`** from that code, with rezolus's
    `record_lifecycle` scenarios rewritten as library tests (the fake agent,
    the fake exporter, legacy and metriken names, restart metadata, refusals).
@@ -430,4 +451,4 @@ wrong and this entry records why.
   histograms sent whole every pass (stream-route entry, Follow-ups).
 - Scraping `/metrics/binary` into a `.dendro` (possible: `stage` takes V1 to
   V3). A producer serving msgpack but not the stream, other than a rezolus
-  agent (refused), is scraped as Prometheus.
+  agent (refused), is scraped as Prometheus at `/metrics`.

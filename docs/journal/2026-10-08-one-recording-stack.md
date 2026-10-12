@@ -247,9 +247,8 @@ Prometheus endpoint by scrape, and the calling process's own registry.
   the same library rather than its own writer.
 
 A source whose `/metrics/stream` handshake opens is streamed, rezolus agent or
-not. A rezolus agent that predates the stream identifies itself on `/status`,
-its `/` banner (before 5.16.0) or a `/metrics/binary` body that decodes as a
-`Snapshot`, and is refused, with a pointer to a 5.x recorder (decided
+not. A rezolus agent that predates the stream identifies itself on `/status` or
+its `/` banner, and is refused, with a pointer to a 5.x recorder (decided
 2026-10-12, replacing decision 1 of the rezolus entry). Any other
 source is scraped (rules in the [recorder
 entry](2026-10-12-metriken-recorder.md), Detection). Today `record` streams
