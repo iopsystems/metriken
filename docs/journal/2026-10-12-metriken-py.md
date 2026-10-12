@@ -414,10 +414,25 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    (`DataSource::histogram_stream`, public through
    `ArchiveReader::owners_of`, `SamplerReader::reader()` and
    `TableReader::source()`) but would reimplement the accumulation, which
-   check 8 must test one copy of. The function is additive, so it ships in a
-   0.36.x release after 0.36.1; the existing histogram tests in
-   metriken-query guard the refactor of `quantiles_impl` and `heatmap_impl`
-   onto it. Then check 8
+   check 8 must test one copy of. The two copies disagree with a stride.
+   After a stride with no counts, `flush_accum` clears the accumulator and
+   returns false. `quantiles_impl` moves `stride_last_emit` to that tick
+   anyway (`histogram.rs:352-369`), so its next point is a full stride
+   later. `heatmap_impl` moves it only when `flush_accum` returns true
+   (`:799-822`), so it emits at the next tick with any counts, a point
+   covering less than a stride, and its strides restart from there. The
+   shared function takes `quantiles_impl`'s rule, which changes
+   `histogram_heatmap` with a stride after an empty stride; that is a
+   behaviour change. It still ships in a 0.36.x release after 0.36.1: no
+   public type changes, the change makes a heatmap and the quantiles of the
+   same selector and stride emit at the same timestamps, and rezolus's
+   dashboards call `histogram_heatmap` without a stride
+   (`crates/dashboard/src/service_extension.rs:319`, `:423` at 15c77844),
+   so they see no change. The changelog entry lists it under fixes and says
+   which timestamps move. That release adds a test of `histogram_heatmap`
+   with a stride over a series with an empty stride, asserting that its
+   timestamps equal `histogram_quantiles`'; the existing histogram tests in
+   metriken-query guard the rest of the refactor. Then check 8
    below tests the conversion and h2histogram's arithmetic, and not two
    copies of the accumulation. The result is Arrow first
    (`hs.buckets`), with one row per tick (or stride) that has at least one
@@ -573,8 +588,22 @@ crates.io.
   connection behind its own `Mutex`, opened on that table's first
   `read_table` and kept by the recording, so `read_table` on two tables
   runs in parallel and on one table serializes. For an archive opened from
-  bytes, `read_table` on every table shares one connection behind one
-  `Mutex`, as the engine's tables do.
+  bytes, the engine's shared `Arc<Mutex<Box<dyn Catalog>>>` is private: the
+  public `ArchiveReader::from_catalog(db: Box<dyn Catalog>, reopen, pool,
+  index)` wraps the catalog it is given in that `Mutex` itself
+  (`reader.rs:1189-1196`). The bindings therefore open the catalog
+  themselves (`DendroCatalog::open_bytes` or `RezDb::open_bytes`, chosen by
+  `Container::recognizes_bytes`, as `open_recordings_from_bytes` does), hold
+  it in their own `Arc<Mutex<…>>`, and pass `from_catalog` a small `Catalog`
+  that locks that `Mutex` and delegates each method. The engine and
+  `read_table` then share one connection and one copy of the bytes, and
+  `read_table` on every table serializes with the engine's fetches, as the
+  engine's tables already do with each other. A second `open_bytes` for
+  `read_table` would avoid the delegating type but hold a second in-memory
+  copy of the archive, as large as the file, for as long as the recording
+  is open. Locks are always taken in one order (the engine's, then the
+  bindings'; `read_table` takes only the bindings'), so the two cannot
+  deadlock.
 - After `fork`, a SQLite connection opened in the parent must not be used in
   the child. Python's `multiprocessing` forks by default on Linux before
   3.14. A recording remembers the pid that opened it, and a call from another
@@ -621,14 +650,32 @@ fixed from then on (`SamplerReader::reader()` builds them once, in a
 `OnceLock`, through `DbSegmentStore::build`, `reader.rs:311-341`). Rows
 written later are not seen. `read_table` keeps its own view per table by
 the same rule: on a table's first `read_table` it reads `segment_meta` and
-`live_wal` in one call on its connection, and every later `read_table` of
-that table reuses that list and that tail. The engine's view of a table
-and `read_table`'s are taken at different moments, so on a file being
-written a query and a `read_table` of the same table can differ by the
-rows written in between. `r.reopen()` returns a new view, using
+`live_wal` inside one SQLite read snapshot, and every later `read_table` of
+that table reuses that list and that tail. Two separate statements lose
+rows: a seal that commits between them is missing from the `segment_meta`
+read, and the watermark it installed hides its rows from the `live_wal`
+read (dendro 0.4.0 `read.rs:376-381`; dendro's own readers use
+`Archive::read_snapshot`). The `Catalog` trait has no read transaction,
+and `DendroCatalog::segment_meta` and `live_wal` are separate statements
+(`catalog.rs:207-247`). So either the trait gains a method that runs a
+closure inside one snapshot, or the bindings hold the concrete catalog and
+call its snapshot: `DendroCatalog`'s `Archive` is a public field with
+`read_snapshot`, and `RezDb` has its own (`rez_sqlite.rs:878`). The
+engine's view of a table and `read_table`'s are taken at different
+moments, so on a file being written a query and a `read_table` of the same
+table can differ by the rows written in between. `columns()` reads the
+field metadata of the segments in `read_table`'s view, so it is fixed with
+that view. It cannot use the engine's per-table metadata: that is the
+private `SamplerReader::metric_metadata` (`reader.rs:669`), keyed by metric
+rather than by column. That function builds a new segment store on every
+call (`SegmentSource::store`, `reader.rs:382-408`), so the public
+`ArchiveReader::metric_metadata` built on it is read at each call and is
+not fixed at the table's first query; if `metrics()` takes units from it,
+the same holds for `metrics()`. `r.reopen()` returns a new view, using
 `ArchiveReader::keep_handover` and `reuse_from` so segments already read
-are not read again, as rezolus's `crates/rez/src/live.rs` does. `r.complete` is false until the writer finalizes. The open-time cost
-of a large WAL tail is not measured.
+are not read again, as rezolus's `crates/rez/src/live.rs` does.
+`r.complete` is false until the writer finalizes. The open-time cost of a
+large WAL tail is not measured.
 
 A held view can lose rows. The view lists a table's segments when the table
 is first read and fetches their bytes later, so a segment that hindsight's
@@ -652,20 +699,55 @@ run. It can still return more than was listed: the merged segment holds the
 whole run where the list expected only the run's first segment, and the
 run's later numbers then read as missing although their rows arrived. A
 restarted number can return a segment sealed from WAL rows that the view's
-materialized tail already holds, and those rows are returned twice. The
-engine has the same exposure: its `DbSegmentStore::bytes` fetches by the
-listed number and does not compare what comes back with the listed
+materialized tail already holds, and those rows are returned twice.
+
+The engine has the same exposure: its `DbSegmentStore::bytes` fetches by
+the listed number and does not compare what comes back with the listed
 `segment_key`, and nothing in `splice_histogram_streams` drops overlapping
-rows; that is from reading the code, not reproduced. Whether a table read by
-two queries, one before a merge and one after, can combine a cached decode
-of a segment with the merged segment's copy of the same rows was not
-checked. `read_table` checks each fetched segment's row count and first and
-last timestamp, from the decoded rows, against the `segment_meta` it listed
-(the inputs of `segment_key`), and raises an error saying to `reopen()` when
-they differ. The engine's exposure is a metriken-storage issue, outside the
-bindings. Nothing in metriken origin/main outside a test, or in rezolus
-15c77844, calls dendro's compaction on a file being recorded; rezolus's
-hindsight snapshot compacts its copy.
+rows. Whether a table read by two queries, one before a merge and one
+after, can combine a cached decode of a segment with the merged segment's
+copy of the same rows was not checked. The engine can also drop a
+concurrent seal's rows: `DbSegmentStore::build` calls `segment_meta` and
+then `live_wal` as separate statements (`reader.rs:311-341`), the race
+dendro documents above. Both are from reading the code, not reproduced.
+Both are metriken-storage bugs, independent of the bindings, and are
+tracked in the plan entry's step 7 follow-ups
+([one recording stack](2026-10-08-one-recording-stack.md)).
+
+`read_table` checks each fetched segment against the `segment_meta` it
+listed. Those `rows`, `first_ts` and `last_ts` describe the WAL rows the
+seal consumed, not the segment's parquet rows: metriken-storage's encoder
+records the WAL row count and the first and last WAL row's timestamps
+(`encoder.rs:117-119`, `:146-149`), and the seal hands it the stream's
+live WAL ordered by timestamp (dendro 0.4.0 `archive/sqlite.rs:1540`). A
+long segment has one parquet row per occupant per tick, and an occupant
+stream one per occupant decoded from each WAL row. An acquisition group's
+wide segment skips WAL rows that have no schema anchor
+(`wal.rs:314-370`), and a long one skips those and rows with no occupants
+(`:425-429`). A long segment written with `sort_long` is sorted by
+(occupant, timestamp), so its first parquet row is not its earliest. The
+check therefore uses the minimum and maximum
+timestamp over the decoded rows: both must lie in `[first_ts, last_ts]`,
+and they equal those bounds unless a leading or trailing WAL row was
+skipped. For a wide table the parquet row count must also be at most
+`rows`. It equals `rows` when no row was skipped, but a segment does not
+record whether one was, so equality is not required. Long tables and
+occupant streams are checked on timestamps only. A failed check raises an
+error saying to `reopen()`.
+
+The check catches every merge dendro's compaction makes. A merged segment
+would pass only if all its rows lay inside the first listed segment's
+span. `compact_stream` merges at least two adjacent segments (dendro 0.4.0
+`rewrite.rs:161`), and a seal encodes only rows later than the stream's
+newest sealed row (`LIVE_WAL_PREDICATE`, `archive/sqlite.rs:465`), so a
+stream's segments do not overlap in time and the merged segment's latest
+row is later than the listed `last_ts`. A restarted number is caught the
+same way, because the new segment's rows are later than the evicted
+segments the view listed. A segment replaced by one with the same rows
+over the same span would pass and return those rows; dendro's compaction
+leaves a run of one alone. This is from reading the code, not tested.
+Nothing in metriken origin/main outside a test, or in rezolus 15c77844,
+calls dendro's compaction.
 
 ### Packaging and publishing
 
@@ -724,8 +806,7 @@ release workflow on each wheel's platform.
    `[lo, hi]` only beside the First and Last lines, with `{:.6}`, so the
    bands compared are those two points', after rounding to six decimals;
    the bands at every other point are compared only against Rust in (a)
-   and (b). This
-   is the plan's criterion 4.
+   and (b). This is the plan's criterion 4.
 2. **Tables complete.** For every table of every fixture, the rows from
    `read_table` equal what the container holds: for a `.dendro` and a `.rez`
    v3, the sealed segments from the `Catalog` plus the WAL tail from
@@ -795,10 +876,11 @@ release workflow on each wheel's platform.
    mid-recording, so the saturating difference is exercised; a column with a
    null cell and a segment without the column, so the difference across a
    gap is; and a tick whose total exceeds 2^32, so a cap like 0.36.0's fails
-   the check. Step 4 builds these fixtures.
+   the check. Step 4 builds these fixtures. Check 8 on rezolus's fixtures
+   is gated as 1(b) is.
 
-If 5 fails, 0.1.0 waits: the difference and its mechanism are recorded
-here first.
+If 5 fails, 0.1.0 waits until 5 passes: the difference and its mechanism
+are recorded here first.
 NO-GO for bindings as a whole if the extension cannot be built for Linux
 aarch64 under manylinux_2_28; then the Python reader against dendro's
 `FORMAT.md`, the plan's alternative, is priced instead.
@@ -820,7 +902,10 @@ aarch64 under manylinux_2_28; then the Python reader against dendro's
 4. **Histograms.** Needs metriken-query 0.36.1, the separate patch release
    that removes the u32::MAX cap (described under "Histograms as
    h2histogram objects"). In metriken-query, a later 0.36.x release: the
-   per-tick function, shared by `quantiles_impl` and `heatmap_impl`. Then
+   per-tick function, shared by `quantiles_impl` and `heatmap_impl`, with
+   `quantiles_impl`'s stride rule, and the test that a strided
+   `histogram_heatmap` emits at `histogram_quantiles`' timestamps after an
+   empty stride. Then
    `r.histograms`, `to_h2`, `metriken.h2.from_column` and the `h2histogram`
    extra. Step 4 builds check 8's fixtures: a series whose producer
    restarted mid-recording, a column with a null cell, a wide table where
