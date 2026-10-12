@@ -120,7 +120,8 @@ fn parse(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("occupant number {s:?} is not an integer"))
 }
 
-/// One segment's file metadata, as [`merge_segment_metadata`] reads it.
+/// One segment's file metadata, as [`SegmentMetadataMerge`] and
+/// [`merge_segment_metadata`] read it.
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentMetadata<'a> {
     /// The segment's file key-value metadata, without Arrow's schema entry
@@ -137,9 +138,28 @@ pub struct SegmentMetadata<'a> {
 /// The file key-value metadata of the segment that concatenating `inputs`
 /// in order produces, or `None` when they cannot be merged.
 ///
-/// For a compaction's metadata merge: a long segment's occupant lists change
-/// whenever the population does, and merging only segments with identical
-/// metadata leaves a long stream nearly as it was sealed.
+/// [`SegmentMetadataMerge`] over the inputs: the same rule, for a caller
+/// that has every input at once. See there for the rule.
+pub fn merge_segment_metadata(
+    inputs: &[SegmentMetadata<'_>],
+) -> Option<Vec<parquet::file::metadata::KeyValue>> {
+    let (first, rest) = inputs.split_first()?;
+    let mut merge = SegmentMetadataMerge::start(first)?;
+    rest.iter()
+        .all(|next| merge.extend(next))
+        .then(|| merge.finish())
+}
+
+/// The file key-value metadata of a run of segments being concatenated, built
+/// one segment at a time: [`start`](Self::start) with the first,
+/// [`extend`](Self::extend) with each next one, [`finish`](Self::finish) for
+/// the merged segment's metadata. For a compaction's metadata merge: a long
+/// segment's occupant lists change whenever the population does, and merging
+/// only segments with identical metadata leaves a long stream nearly as it
+/// was sealed.
+///
+/// Each segment's lists are decoded once, when it is added, and the run keeps
+/// them decoded, so a run costs time linear in its segments' metadata.
 ///
 /// Long segments merge exactly by union. The merged [`OCCUPANTS_KEY`] is the
 /// union of the inputs' lists. A column's list ([`column_occupants_key`]) is
@@ -147,102 +167,174 @@ pub struct SegmentMetadata<'a> {
 /// list for the column or, without one, its segment list; it is omitted
 /// when that union is the merged segment list, as the writer omits it.
 /// Every other key, [`LAYOUT_KEY`] and the format version among them, must
-/// have the same value in every input.
+/// have the same value in every input. The merged metadata has the first
+/// input's keys in its order, with the merged segment list in place of its
+/// own and the column lists after them.
 ///
-/// Segments that are not all long merge only when their metadata is
-/// identical, entry for entry. `None` as well for a long segment with no
-/// segment list, a list that does not decode within its segment's rows, or a
-/// key given twice; this never panics on a malformed list.
-pub fn merge_segment_metadata(
-    inputs: &[SegmentMetadata<'_>],
-) -> Option<Vec<parquet::file::metadata::KeyValue>> {
-    use parquet::file::metadata::KeyValue;
+/// A run whose first segment is not long takes only segments whose metadata
+/// is identical to it, entry for entry, and a long run takes no segment that
+/// is not long. A long segment with no segment list, a list that does not
+/// decode within its segment's rows, or a key given twice is refused; this
+/// never panics on a malformed list.
+#[derive(Debug, Clone)]
+pub struct SegmentMetadataMerge(Merge);
 
-    let first = inputs.first()?;
-    let long = |kv: &[KeyValue]| {
-        kv.iter()
-            .any(|e| e.key == LAYOUT_KEY && e.value.as_deref() == Some(LAYOUT_LONG))
-    };
-    if !inputs.iter().all(|i| long(i.key_value)) {
-        return inputs
-            .iter()
-            .all(|i| i.key_value == first.key_value)
-            .then(|| first.key_value.to_vec());
-    }
+#[derive(Debug, Clone)]
+enum Merge {
+    /// The first segment is not long: its metadata, which every other
+    /// segment must repeat.
+    Identical(Vec<parquet::file::metadata::KeyValue>),
+    Long(LongMerge),
+}
 
-    // Each input's segment list, its column lists, and the rest of its
-    // keys, which must agree.
-    let mut all: BTreeSet<u64> = BTreeSet::new();
-    let mut per_input = Vec::new();
-    let mut rest: Option<BTreeMap<&str, Option<&str>>> = None;
-    for input in inputs {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        let mut occupants = None;
-        let mut columns = HashMap::new();
-        let mut others = BTreeMap::new();
-        for e in input.key_value {
-            if !seen.insert(e.key.as_str()) {
-                return None;
-            }
-            if e.key == OCCUPANTS_KEY {
-                occupants = Some(decode_occupant_ranges(e.value.as_deref()?, input.rows).ok()?);
-            } else if let Some(column) = e.key.strip_prefix(COLUMN_OCCUPANTS_PREFIX) {
-                let list = decode_occupant_ranges(e.value.as_deref()?, input.rows).ok()?;
-                columns.insert(column, list);
-            } else {
-                others.insert(e.key.as_str(), e.value.as_deref());
-            }
-        }
-        match &rest {
-            None => rest = Some(others),
-            Some(r) if *r == others => {}
-            Some(_) => return None,
-        }
-        let occupants = occupants?;
-        all.extend(&occupants);
-        per_input.push((occupants, columns));
-    }
-    let all_encoded = encode_occupant_ranges(all.iter().copied());
+#[derive(Debug, Clone)]
+struct LongMerge {
+    /// The first segment's metadata, for the order of the merged keys.
+    first: Vec<parquet::file::metadata::KeyValue>,
+    /// The keys other than the occupant lists, which every segment must
+    /// have with the same values.
+    rest: BTreeMap<String, Option<String>>,
+    /// The union of the segment lists.
+    occupants: BTreeSet<u64>,
+    /// Each column, in the order it first appears, with the union of the
+    /// occupants it has values for.
+    columns: Vec<(String, BTreeSet<u64>)>,
+    /// Where each column is in `columns`.
+    column_index: HashMap<String, usize>,
+}
 
-    // The merged segment's columns, in the order they first appear.
-    let mut order: Vec<&str> = Vec::new();
-    for input in inputs {
-        for f in input.fields.iter() {
-            if !order.contains(&f.name().as_str()) {
-                order.push(f.name());
-            }
+/// One long segment's metadata, decoded: its segment list, its column lists,
+/// and its other keys.
+struct LongSegment<'a> {
+    occupants: Vec<u64>,
+    columns: HashMap<&'a str, Vec<u64>>,
+    rest: BTreeMap<String, Option<String>>,
+}
+
+fn is_long(kv: &[parquet::file::metadata::KeyValue]) -> bool {
+    kv.iter()
+        .any(|e| e.key == LAYOUT_KEY && e.value.as_deref() == Some(LAYOUT_LONG))
+}
+
+/// Decode a long segment's metadata, or `None` for a segment that a long run
+/// cannot take: no segment list, a list that does not decode within the
+/// segment's rows, or a key given twice.
+fn decode_long<'a>(input: &SegmentMetadata<'a>) -> Option<LongSegment<'a>> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut occupants = None;
+    let mut columns = HashMap::new();
+    let mut rest = BTreeMap::new();
+    for e in input.key_value {
+        if !seen.insert(e.key.as_str()) {
+            return None;
         }
-    }
-    let mut column_keys = Vec::new();
-    for column in order {
-        let mut has: BTreeSet<u64> = BTreeSet::new();
-        for (input, (occupants, columns)) in inputs.iter().zip(&per_input) {
-            if input.fields.find(column).is_some() {
-                has.extend(columns.get(column).unwrap_or(occupants));
-            }
-        }
-        let encoded = encode_occupant_ranges(has);
-        if encoded != all_encoded {
-            column_keys.push(KeyValue::new(column_occupants_key(column), encoded));
+        if e.key == OCCUPANTS_KEY {
+            occupants = Some(decode_occupant_ranges(e.value.as_deref()?, input.rows).ok()?);
+        } else if let Some(column) = e.key.strip_prefix(COLUMN_OCCUPANTS_PREFIX) {
+            let list = decode_occupant_ranges(e.value.as_deref()?, input.rows).ok()?;
+            columns.insert(column, list);
+        } else {
+            rest.insert(e.key.clone(), e.value.clone());
         }
     }
+    Some(LongSegment {
+        occupants: occupants?,
+        columns,
+        rest,
+    })
+}
 
-    // The first input's keys in its order, with the merged segment list in
-    // place of its own and the column lists after them.
-    let mut out: Vec<KeyValue> = first
-        .key_value
-        .iter()
-        .filter(|e| !e.key.starts_with(COLUMN_OCCUPANTS_PREFIX))
-        .map(|e| {
-            if e.key == OCCUPANTS_KEY {
-                KeyValue::new(OCCUPANTS_KEY.to_string(), all_encoded.clone())
-            } else {
-                e.clone()
+impl LongMerge {
+    /// Add a decoded segment: its segment list to the union, and to each
+    /// column it has, its list for the column or its segment list.
+    fn add(&mut self, fields: &arrow::datatypes::Fields, segment: LongSegment<'_>) {
+        for f in fields.iter() {
+            let i = match self.column_index.get(f.name()) {
+                Some(i) => *i,
+                None => {
+                    self.column_index
+                        .insert(f.name().clone(), self.columns.len());
+                    self.columns.push((f.name().clone(), BTreeSet::new()));
+                    self.columns.len() - 1
+                }
+            };
+            let list = segment
+                .columns
+                .get(f.name().as_str())
+                .unwrap_or(&segment.occupants);
+            self.columns[i].1.extend(list);
+        }
+        self.occupants.extend(segment.occupants);
+    }
+}
+
+impl SegmentMetadataMerge {
+    /// Begin a run at `first`, or `None` for a long segment that cannot be
+    /// merged (see the type's documentation).
+    pub fn start(first: &SegmentMetadata<'_>) -> Option<Self> {
+        if !is_long(first.key_value) {
+            return Some(Self(Merge::Identical(first.key_value.to_vec())));
+        }
+        let segment = decode_long(first)?;
+        let mut long = LongMerge {
+            first: first.key_value.to_vec(),
+            rest: segment.rest.clone(),
+            occupants: BTreeSet::new(),
+            columns: Vec::new(),
+            column_index: HashMap::new(),
+        };
+        long.add(first.fields, segment);
+        Some(Self(Merge::Long(long)))
+    }
+
+    /// Add `next` to the run and return `true`, or return `false` and leave
+    /// the run as it was when `next` cannot be merged into it.
+    pub fn extend(&mut self, next: &SegmentMetadata<'_>) -> bool {
+        match &mut self.0 {
+            Merge::Identical(first) => next.key_value == first.as_slice(),
+            Merge::Long(long) => {
+                if !is_long(next.key_value) {
+                    return false;
+                }
+                match decode_long(next) {
+                    Some(segment) if segment.rest == long.rest => {
+                        long.add(next.fields, segment);
+                        true
+                    }
+                    _ => false,
+                }
             }
-        })
-        .collect();
-    out.extend(column_keys);
-    Some(out)
+        }
+    }
+
+    /// The merged segment's file key-value metadata.
+    pub fn finish(self) -> Vec<parquet::file::metadata::KeyValue> {
+        use parquet::file::metadata::KeyValue;
+
+        let long = match self.0 {
+            Merge::Identical(first) => return first,
+            Merge::Long(long) => long,
+        };
+        let all = encode_occupant_ranges(long.occupants);
+        let column_keys = long.columns.into_iter().filter_map(|(column, has)| {
+            let encoded = encode_occupant_ranges(has);
+            (encoded != all).then(|| KeyValue::new(column_occupants_key(&column), encoded))
+        });
+        let mut out: Vec<KeyValue> = long
+            .first
+            .into_iter()
+            .filter(|e| !e.key.starts_with(COLUMN_OCCUPANTS_PREFIX))
+            .map(|e| {
+                if e.key == OCCUPANTS_KEY {
+                    KeyValue::new(OCCUPANTS_KEY.to_string(), all.clone())
+                } else {
+                    e
+                }
+            })
+            .collect();
+        out.extend(column_keys);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +473,52 @@ mod tests {
             assert_eq!(merge(&[(&one, &f, 9), (&one, &f, 9)]).unwrap(), pairs(&one));
             let two = kv(&[("metriken.format", "1"), ("k", "w")]);
             assert_eq!(merge(&[(&one, &f, 9), (&two, &f, 9)]), None);
+        }
+
+        /// A refused segment leaves the run as it was: finishing it gives
+        /// what the segments before the refusal give, and the run can still
+        /// take a segment that merges.
+        #[test]
+        fn a_refused_segment_leaves_the_run_unchanged() {
+            let f = fields(&["timestamp", "occupant", "a", "b"]);
+            let one = long("0-2", &[("b", "0")]);
+            let two = long("1-3", &[("a", "1-2")]);
+            for bad in [
+                long("5-6", &[("a", "x")]),
+                kv(&[("metriken.format", "1")]),
+                [long("5-6", &[]), kv(&[("x", "y")])].concat(),
+            ] {
+                let segment = |kv| SegmentMetadata {
+                    key_value: kv,
+                    fields: &f,
+                    rows: 9,
+                };
+                let mut run = SegmentMetadataMerge::start(&segment(&one)).unwrap();
+                assert!(!run.extend(&segment(&bad)), "{bad:?}");
+                assert_eq!(pairs(&run.clone().finish()), pairs(&one), "{bad:?}");
+                assert!(run.extend(&segment(&two)));
+                assert_eq!(
+                    Some(pairs(&run.finish())),
+                    merge(&[(&one, &f, 9), (&two, &f, 9)]),
+                    "{bad:?}"
+                );
+            }
+        }
+
+        /// A column first seen in a later segment contributes from the
+        /// segments that have it only, and its list follows those of the
+        /// columns seen earlier.
+        #[test]
+        fn a_column_first_seen_later_contributes_from_there() {
+            let ab = fields(&["timestamp", "occupant", "a", "b"]);
+            let abc = fields(&["timestamp", "occupant", "a", "b", "c"]);
+            let one = long("0-1", &[("b", "0")]);
+            let two = long("2-3", &[]);
+            let three = long("4", &[("b", "4"), ("c", "4")]);
+            assert_eq!(
+                merge(&[(&one, &ab, 9), (&two, &abc, 9), (&three, &abc, 9)]).unwrap(),
+                pairs(&long("0-4", &[("b", "0,2-4"), ("c", "2-4")]))
+            );
         }
 
         #[test]

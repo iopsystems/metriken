@@ -1123,34 +1123,51 @@ fn a_compacted_long_stream_answers_as_before() {
     assert_eq!(answers(&after, 0), expected);
 }
 
-/// Compacting a long stream with [`merge_segment_metadata`] merges across
+/// Compacting a long stream with [`SegmentMetadataMerge`] merges across
 /// the segments' occupant-list changes, which the default rule stops at, and
 /// the merged stream answers and lists as before.
 ///
 /// Compiled only with `--cfg dendro_compact_with`: it needs dendro's
-/// `compact_stream_with`, which no released dendro has. Run it against a
-/// dendro that does, through a `[patch.crates-io]`, with
+/// `compact_stream_with` and `MetadataMerge`, which no released dendro has.
+/// Run it against a dendro that does, through a `[patch.crates-io]`, with
 /// `RUSTFLAGS="--cfg dendro_compact_with" cargo test -p metriken-storage
 /// --test writer`, and drop the cfg when the dependency moves to that
 /// release.
 ///
-/// [`merge_segment_metadata`]: metriken_storage::long::merge_segment_metadata
+/// [`SegmentMetadataMerge`]: metriken_storage::long::SegmentMetadataMerge
 #[cfg(dendro_compact_with)]
 #[test]
 fn a_long_stream_compacted_by_union_answers_as_before() {
-    use metriken_storage::long::{merge_segment_metadata, SegmentMetadata};
+    use dendro::rewrite::{MergeInput, MetadataMerge};
+    use metriken_storage::long::{SegmentMetadata, SegmentMetadataMerge};
 
-    let union = |inputs: &[dendro::rewrite::MergeInput<'_>]| {
-        let inputs: Vec<SegmentMetadata<'_>> = inputs
-            .iter()
-            .map(|i| SegmentMetadata {
-                key_value: i.key_value,
-                fields: i.fields,
-                rows: i.rows,
-            })
-            .collect();
-        merge_segment_metadata(&inputs)
-    };
+    /// dendro's merge, as [`SegmentMetadataMerge`].
+    struct Union;
+
+    fn metadata<'a>(i: &MergeInput<'a>) -> SegmentMetadata<'a> {
+        SegmentMetadata {
+            key_value: i.key_value,
+            fields: i.fields,
+            rows: i.rows,
+        }
+    }
+
+    impl MetadataMerge for Union {
+        type Run = SegmentMetadataMerge;
+
+        fn start(&self, first: &MergeInput<'_>) -> Option<SegmentMetadataMerge> {
+            SegmentMetadataMerge::start(&metadata(first))
+        }
+
+        fn extend(&self, run: &mut SegmentMetadataMerge, next: &MergeInput<'_>) -> bool {
+            run.extend(&metadata(next))
+        }
+
+        fn finish(&self, run: SegmentMetadataMerge) -> Vec<parquet::file::metadata::KeyValue> {
+            run.finish()
+        }
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let wide = dir.path().join("wide.dendro");
     record(&wide, false, true, None);
@@ -1178,7 +1195,7 @@ fn a_long_stream_compacted_by_union_answers_as_before() {
             let spec = dendro::rewrite::CompactSpec::to_rows(100);
             for stream in tables {
                 if by_union {
-                    dendro::rewrite::compact_stream_with(&mut db, id, &stream, &spec, &union)
+                    dendro::rewrite::compact_stream_with(&mut db, id, &stream, &spec, &Union)
                 } else {
                     dendro::rewrite::compact_stream(&mut db, id, &stream, &spec)
                 }

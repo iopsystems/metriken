@@ -9,13 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `long::merge_segment_metadata` and `long::SegmentMetadata`: the file
-  key-value metadata of the segment that concatenating several segments
-  produces, or `None` when they cannot be merged. Long segments merge by
-  union of their segment and column occupant lists; any other key must
-  agree. Segments that are not all long merge only when their metadata is
-  identical. For a compaction's metadata merge, so that a long stream
-  merges across occupant-list changes.
+- `long::SegmentMetadataMerge`, `long::merge_segment_metadata` and
+  `long::SegmentMetadata`: the file key-value metadata of the segment that
+  concatenating several segments produces. `SegmentMetadataMerge` builds it
+  one segment at a time (`start`, `extend`, which refuses a segment that
+  cannot be merged and leaves the run as it was, and `finish`), decoding
+  each segment's lists once, so a run costs time linear in its metadata;
+  `merge_segment_metadata` applies it to a slice and returns `None` when
+  the segments cannot be merged. Long segments merge by union of their
+  segment and column occupant lists; any other key must agree. Segments
+  that are not all long merge only when their metadata is identical. For a
+  compaction's metadata merge (dendro's `rewrite::MetadataMerge`), so that
+  a long stream merges across occupant-list changes.
 
 ## [0.2.1] - 2026-10-12
 
