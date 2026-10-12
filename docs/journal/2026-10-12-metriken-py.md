@@ -726,8 +726,8 @@ wide segment skips WAL rows that have no schema anchor
 (`wal.rs:314-370`), and a long one skips those and rows with no occupants
 (`:425-429`). A long segment written with `sort_long` is sorted by
 (occupant, timestamp), so its first parquet row is not its earliest. The
-check therefore uses the minimum and maximum
-timestamp over the decoded rows: both must lie in `[first_ts, last_ts]`,
+check therefore uses the minimum and maximum timestamp over the decoded
+rows: both must lie in `[first_ts, last_ts]`,
 and they equal those bounds unless a leading or trailing WAL row was
 skipped. For a wide table the parquet row count must also be at most
 `rows`. It equals `rows` when no row was skipped, but a segment does not
