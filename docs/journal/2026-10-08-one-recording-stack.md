@@ -349,17 +349,17 @@ recorder supports.
 
 ## Path
 
-Each step is a release of the crates it touches; rezolus (its 6.x line;
-5.x stays on its own dependencies, decided 2026-10-12), systemslab,
-cachecannon and llm-perf move when they adopt it. For users of the
-`rezolus` binary the CLI, the files it writes and reads, and the wire stay
-the same, apart from the changes each step's entry names (the stream's
-metriken wire names in step 3; detection by stream, handshake identity and
-the rezolus entry's decision 1, which writes a defaulted run with an agent
-that cannot stream to `.rez`, in step 4); rezolus's own tests (including the compatibility fixtures in the
-rezolus entry) check that across each step. Library users (systemslab's
-`rez` and `dashboard` pins) change imports when they bump, or, where a
-step re-exports what it moves, in the release after.
+Each step is a release of the crates it touches; rezolus (its 6.x line; 5.x
+stays on its own dependencies, decided 2026-10-12), systemslab, cachecannon
+and llm-perf move when they adopt it. For users of the `rezolus` binary the
+CLI, the files it writes and reads, and the wire stay the same, apart from the
+changes each step's entry names (the stream's metriken wire names in step 3;
+detection by stream, handshake identity and the rezolus entry's decision 1,
+which writes a defaulted run with an agent that cannot stream to `.rez`, in
+step 4); rezolus's own tests (including the compatibility fixtures in the
+rezolus entry) check that across each step. Library users (systemslab's `rez`
+and `dashboard` pins) change imports when they bump, or, where a step
+re-exports what it moves, in the release after.
 
 1. **`metriken-types` and `metriken-model`.** Move `Window` from
    `metriken-core` and `UID_LABEL` from `metriken` into `metriken-types` (a

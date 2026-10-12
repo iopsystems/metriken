@@ -16,7 +16,8 @@ below" means this entry's own order of work. Decided 2026-10-12:
   cannot stream", which stays a rezolus behaviour (the rezolus 6.0 entry's
   decision 1).
 - rezolus 6.0.0 is released after every open step of the plan (4 to 7) and
-  its follow-ups; the plan's "after rezolus 6.0.0" for step 7 no longer holds.
+  its follow-ups (the plan's step 7 said "after rezolus 6.0.0" until
+  2026-10-12).
 
 ## Goal
 
@@ -147,50 +148,46 @@ depend on `metriken` or `metriken-exposition`.
 
 ### Detection
 
-Detection runs before the archive is opened: `detect(endpoints, probe)`
-returns each endpoint's transport, and the caller chooses the sink from the
-result, since decision 1 makes a defaulted run's output depend on every
-endpoint. For `.dendro` output, an endpoint whose path is `/` or
+Detection runs before the archive is opened, because decision 1 makes a
+defaulted run's output depend on every endpoint. `detect` takes the
+subscription settings and a mode (`DetectConfig { mode, interval, timeout,
+layout, wire_names }`, so the caller's legacy names reach the connection) and
+returns a `Detected` per endpoint.
+
+**`Mode::Stream`, for `.dendro` output.** An endpoint whose path is `/` or
 `/metrics/stream`:
 
 1. Connect to `/metrics/stream`. A handshake in an accepted content type means
-   streamed; the opened subscription is kept, not reconnected.
+   streamed (`Detected::Streamed`, with the open subscription and handshake,
+   handed to `start`).
 2. Otherwise (404, 409, a foreign content type) ask the caller's probe hook.
    rezolus's hook identifies a rezolus agent by `/status`, else the `/`
    banner (agents before 5.16.0), else a `/metrics/binary` body that decodes
-   as a `Snapshot`. An agent that cannot stream gets decision 1: the run
-   writes `.rez` when the output was defaulted, and an explicit `-o x.dendro`
-   refuses it.
-3. Otherwise scrape `/metrics` as Prometheus.
+   as a `Snapshot`, and answers `Unstreamable` for one.
+3. Otherwise scrape `/metrics` as Prometheus (`Detected::Scraped`).
 
-`detect` takes the subscription settings (`DetectConfig { interval,
-timeout, layout, wire_names }`, so the caller's legacy names reach the
-connection) and returns a `Detected` per endpoint: `Streamed` (with its open
-subscription and handshake, handed to `start`), `Stream` (stream it, with
-the connection opened by `start` with `cfg.layout`), `Scraped`
-(Prometheus), `Polled` (a caller's polled source), `Unstreamable { reason }`
-(a rezolus agent that cannot stream), or `Pending`. The caller maps
-`Unstreamable` to decision 1. In a defaulted run it switches the output to
-`.rez` and re-plans for that sink: `Unstreamable` endpoints become `Polled`
-`/metrics/binary` sources, and `Streamed` endpoints are passed as `Stream`,
-reconnected wide by `start` and staged into `.rez` through `stage_streamed`
-and the wide snapshot (`wide_snapshot` takes wide groups only, so the
-long-layout subscription from `detect` is dropped), as hindsight's `.rez`
-buffer does (`buffer.rs:213`). An explicit `-o x.rez` follows the same rule
-for a producer that serves only the stream. For an explicit `-o x.dendro`
-the caller removes the `Unstreamable` endpoint and reports it; `start` does
-not accept one.
+**`Mode::Scrape`, for `.rez`, parquet and raw output.** Today's rule, kept: an
+endpoint whose `/metrics/binary` decodes as a `Snapshot` is polled through
+the probe hook's `PolledSource` (`Verdict::Poll`), and any other endpoint is
+scraped as Prometheus at `/metrics`. A producer that serves only the stream
+is scraped as Prometheus in these outputs, as today.
 
-An unreachable endpoint is `Pending` and detected on each tick until it
-answers; one that turns out to be an agent that cannot stream after the run
-has started is refused mid-run, as `refuse_mid_run` does today. The stream
-route is pull-based, so a subscription opened by `detect` and read later by
-`start` costs at most a `Gap`. An endpoint with any other path is scraped at
-that URL (llm-perf's `server_metrics_url`). `--endpoint url,protocol=` keeps
-`msgpack` (streamed into a `.dendro`, scraped otherwise) and `prometheus`, and
-gains `stream`. `.rez`, parquet and raw output keep scraping
-`/metrics/binary`, through a polled source in rezolus. A producer then needs
-`/metrics/binary` only for those outputs and older recorders.
+The caller maps `Unstreamable` to decision 1. A defaulted run switches its
+output to `.rez` and runs `detect` again in `Mode::Scrape` (the subscriptions
+from the first pass are dropped). An explicit `-o x.dendro` with an
+`Unstreamable` endpoint exits 1 before the archive is opened, naming the
+agent, as today (`mod.rs:2431-2468`).
+
+An unreachable endpoint is `Pending` and detected on each tick in the run's
+mode until it answers. In `Mode::Stream`, one that turns out to be an agent
+that cannot stream is refused mid-run, as `refuse_mid_run` does today; in
+`Mode::Scrape` it is polled. The stream route is pull-based, so a
+subscription opened by `detect` and read later by `start` costs at most a
+`Gap`. An endpoint with any other path is scraped at that URL (llm-perf's
+`server_metrics_url`). `--endpoint url,protocol=` keeps `msgpack` (streamed
+into a `.dendro`, polled otherwise) and `prometheus`, and gains `stream`. A
+producer then needs `/metrics/binary` only for `.rez`, parquet and raw output
+and for older recorders.
 
 ### Source identity
 
@@ -227,31 +224,41 @@ buffer by path (`buffer::dump`, `buffer.rs:511`, `:574`), as today, so
 `Recorder` has no accessor for its sink.
 
 Events go to the caller, which decides exit codes and logging: `Active {
-source, transport }`, `Pending`, `Dropped`, `Reconnected`, `Gap`, `Refused`,
-`Failed { error }` (the sink failed; the recorder stops ticking and closes
-the channel, as a writer failure ends `record` and hindsight today), `Frame
-{ source, seq, stamp: Option<Stamp> }` for every frame including empty ones,
-with `seq` the recorder's per-source frame count, monotonic across
-reconnects, and `Committed { source, passes_total, first_ts, ts, wall_ns }`
-after each commit, cumulative so a dropped event loses nothing (`ts` is the
-newest pass staged). `record`'s `-- cmd` end barrier waits for each source
-whose `Active` transport is a stream to send a `Frame`, empty or not, at or
-after the child's exit (`mod.rs:3273-3305`); hindsight's pass count and
+source, transport: ActiveTransport }`, `Pending`, `Dropped`, `Reconnected`,
+`Gap`, `Refused`, `Failed { error }` (the sink failed; the recorder stops
+ticking and closes the channel, as a writer failure ends `record` and
+hindsight today), `Frame { source, seq, stamp: Option<Stamp> }` for every
+frame including empty ones, emitted after the frame is staged, with `seq`
+the recorder's per-source frame count, monotonic across reconnects, and
+`Committed { source, passes_total, first_ts, ts, wall_ns }` after each
+commit, cumulative so a dropped event loses nothing (`ts` is the newest pass
+staged). `record`'s `-- cmd` end barrier waits for each source whose
+`Active` transport is a stream to send a `Frame`, empty or not, at or after
+the child's exit (`mod.rs:3273-3305`); hindsight's pass count and
 `at_retention_bound` (newest minus `first_ts`) and the live viewer's reader
 refresh are built on `Committed`.
 
-`finish(self, grace: Duration)` waits `grace`, takes one more pass of every
-local, scraped and polled source, then finalizes each source and joins the
-writer. `record` passes zero after the `-- cmd` barrier, and the shorter of
-one interval and 2 s on other stops when a source streams, which is what
-today's stop paths do (`mod.rs:3276-3280`, the sleep at :3348); a producer
-recording itself passes zero, so its last sample is taken after its last
-request.
+`finish(self, grace: Duration, final_pass: bool)` waits `grace`, stages every
+frame already received, takes one more pass of every local, scraped and
+polled source when `final_pass` is set, writes any pending restart without
+further retries, then finalizes each source and joins the writer, which is
+the order today's shutdown follows (`drain_stream_events`, then
+`apply_restarts(.., last = true)`, `mod.rs:3350-3365`). `record` passes zero
+grace after the `-- cmd` barrier, and the shorter of one interval and 2 s on
+other stops when a source streams (`mod.rs:3276-3280`, the sleep at :3349);
+it sets `final_pass` only when the wrapped command exited and the exit did
+not land during the pass just taken (`mod.rs:2740-2757`), so `--duration`
+and ctrl-c stops take no extra scrape. A producer recording itself passes
+zero grace and `final_pass`, so its last sample is taken after its last
+request. Dropping a `Recorder` stops its tasks and leaves the archive
+unfinalized on disk.
 
-A caller that does not want events drops the receiver. The channel is
-bounded; when it is full, an event is dropped and counted, and the next
-delivered event is `Lagged { dropped }`, so the tick never waits on the
-caller. `start` returns the `SourceId` of each detected endpoint and local
+A caller that ignores events drops the receiver. The channel is bounded.
+`Active`, `Refused` and `Failed` are never dropped (the recorder awaits their
+send); `Frame`, `Gap` and `Committed` are dropped when it is full and counted,
+and the next delivered event is `Lagged { dropped }`. `Summary` also carries
+each source's final state and transport, so exit codes do not depend on
+events. `start` returns the `SourceId` of each detected endpoint and local
 source, which `patch_metadata` and the events use; `patch_metadata` is
 `async` and returns once the patch has reached the writer, and `DendroSink`
 follows it with `sync` (storage's `update_metadata` logs and skips a patch
@@ -267,14 +274,13 @@ and new; `version` goes into each `producer_epochs` entry). After three
 ### Sinks
 
 A `Sink` trait (`add_source`, `stage(source, &Snapshot, Stamp, body:
-Option<&Bytes>)`, `stage_streamed`, `commit`,
-`patch_metadata`, `maybe_seal`, `evict_before`, `sync`, `finalize`,
-`discard`) with `DendroSink::create(path, WriterConfig)` over
-`ArchiveWriter` in the library; the writer configuration belongs to the
-sink, not the recorder. `--separate` uses one `Recorder`: rezolus's parquet
-and raw sinks keep a spool per `add_source` and write a file per source at
-`finalize`. rezolus implements `.rez`, parquet and
-raw against it.
+Option<&Bytes>)`, `stage_streamed`, `commit`, `patch_metadata`, `maybe_seal`,
+`evict_before`, `sync`, `finalize`, `discard`) with `DendroSink::create(path,
+WriterConfig)` over `ArchiveWriter` in the library; the writer configuration
+belongs to the sink, not the recorder. `--separate` uses one `Recorder`:
+rezolus's parquet and raw sinks keep a spool per `add_source` and write a file
+per source at `finalize`. rezolus implements `.rez`, parquet and raw against
+it.
 
 ### API sketch
 
@@ -299,7 +305,10 @@ pub struct Polled { pub snapshot: metriken_model::Snapshot, pub stamp: Stamp,
 pub trait PolledSource: Send {
     async fn poll(&mut self) -> Result<Option<Polled>>;
 }
-pub enum Verdict { Scrape, Unstreamable { reason: String }, Refuse { reason: String }, Pending }
+pub enum Verdict { Scrape, Poll(Box<dyn PolledSource>), Unstreamable { reason: String },
+                   Refuse { reason: String }, Pending }
+pub enum Mode { Stream, Scrape }
+pub enum ActiveTransport { Stream, Prometheus, Polled }
 pub enum Enrich { Metadata { epoch: Option<String>, metadata: BTreeMap<String, String> }, Retry }
 #[async_trait]
 pub trait Probe: Send + Sync {
@@ -313,13 +322,12 @@ pub struct NoProbe; // Scrape, nothing to enrich: for producers recording themse
 
 pub enum Detected {
     Streamed { spec: EndpointSpec, subscription: Subscription, handshake: Handshake },
-    Stream { spec: EndpointSpec },
     Scraped { spec: EndpointSpec },
     Polled { spec: EndpointSpec },
     Unstreamable { spec: EndpointSpec, reason: String },
     Pending { spec: EndpointSpec },
 }
-pub struct DetectConfig { pub interval: Duration, pub timeout: Duration,
+pub struct DetectConfig { pub mode: Mode, pub interval: Duration, pub timeout: Duration,
                           pub layout: Layout, pub wire_names: Vec<WireNames> }
 pub async fn detect(client: &Client, cfg: &DetectConfig, endpoints: Vec<EndpointSpec>,
     probe: &dyn Probe) -> Vec<Detected>;
@@ -330,7 +338,7 @@ impl<S: Sink> Recorder<S> {
         -> Result<(Self, Vec<SourceId>, mpsc::Receiver<Event>), StartError>;
     pub async fn patch_metadata(&self, source: SourceId, patch: BTreeMap<String, String>)
         -> Result<()>;
-    pub async fn finish(self, grace: Duration) -> Result<Summary>;
+    pub async fn finish(self, grace: Duration, final_pass: bool) -> Result<Summary>;
     pub fn discard(self);
 }
 ```
@@ -364,9 +372,9 @@ GO when all hold:
 3. **Detection by stream.** A producer serving `/metrics/stream` and no
    `/metrics/binary` is streamed; a Prometheus endpoint is scraped; a rezolus
    agent older than 5.21 gets decision 1, both branches: a defaulted run
-   writes `.rez` (with a stream-only producer in it staged through
-   `stage_streamed`), and an explicit `-o x.dendro` refuses that agent. Each
-   in a recorder test. `record -o x.raw` writes the agent's bodies byte for
+   writes `.rez` (re-detected in `Mode::Scrape`), and an explicit `-o
+   x.dendro` exits 1 before writing anything. A late old agent in a `.rez`
+   run is polled. Each in a recorder test. `record -o x.raw` writes the agent's bodies byte for
    byte, as before.
 4. **Handshake identity.** `rezolus record --url` on cachecannon writes
    `source=cachecannon` and its `version`.
