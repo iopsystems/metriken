@@ -43,19 +43,19 @@ fn env_point_is_constructible_by_a_downstream() {
 /// Histogram functions over a tick that holds more than `u32::MAX`
 /// observations, through `MemoryStore::query_range`.
 ///
-/// The streaming path once summed each tick's deltas into a `u32`
-/// cumulative clipped at `u32::MAX`: 5e9 observations counted as
-/// 4,294,967,295, and every quantile whose rank lay above the clip landed in
-/// the last bucket below it. The series here puts 4e9 observations in bucket
-/// 100 and 1e9 in bucket 200, so rank 0.85 · 5e9 = 4.25e9 is in bucket 200
-/// only when the cumulative is not clipped.
+/// The series puts 5e9 observations in bucket 100 and 1e9 in bucket 200, so
+/// one bucket's count, and the tick's total, are both above `u32::MAX`. Rank
+/// 0.85 · 6e9 = 5.1e9 is in bucket 200. A cumulative clipped at `u32::MAX`
+/// also clips the total, so the rank is taken against 4,294,967,295 and lands
+/// in bucket 100; a per-bucket clip changes the sum band and the heatmap
+/// cells.
 #[test]
 fn histogram_functions_count_ticks_above_u32_max() {
     use metriken_query::{MemoryStore, QueryResult};
     use metriken_storage::HistogramSnapshot;
 
     const S: u64 = 1_000_000_000;
-    const LOW: u64 = 4_000_000_000;
+    const LOW: u64 = 5_000_000_000;
     const HIGH: u64 = 1_000_000_000;
 
     let config = histogram::Config::new(3, 64).unwrap();
@@ -135,8 +135,8 @@ fn histogram_functions_count_ticks_above_u32_max() {
     assert_eq!(cells, vec![HIGH as f64, LOW as f64]);
     assert_eq!(result.max_value, LOW as f64);
 
-    // Two ticks of 2.5e9 each, below `u32::MAX` apiece; a 2s stride sums
-    // them into one 5e9 cumulative.
+    // Two ticks of 3e9 each, below `u32::MAX` apiece; a 2s stride sums them
+    // into one 6e9 cumulative.
     let store = store_with(2);
     let q = matrix(store.query_range("histogram_quantiles([0.85], lat, 2)", 1000.0, 1002.0, 1.0));
     assert_eq!(q[0].values, vec![(1002.0, hi200)]);
