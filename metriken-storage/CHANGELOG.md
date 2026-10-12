@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `long::merge_segment_metadata` and `long::SegmentMetadata`: the file
+  key-value metadata of the segment that concatenating several segments
+  produces, or `None` when they cannot be merged. Long segments merge by
+  union of their segment and column occupant lists; any other key must
+  agree. Segments that are not all long merge only when their metadata is
+  identical. For a compaction's metadata merge, so that a long stream
+  merges across occupant-list changes.
+
 ## [0.2.1] - 2026-10-12
 
 ### Fixed

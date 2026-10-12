@@ -1123,6 +1123,84 @@ fn a_compacted_long_stream_answers_as_before() {
     assert_eq!(answers(&after, 0), expected);
 }
 
+/// Compacting a long stream with [`merge_segment_metadata`] merges across
+/// the segments' occupant-list changes, which the default rule stops at, and
+/// the merged stream answers and lists as before.
+///
+/// Compiled only with `--cfg dendro_compact_with`: it needs dendro's
+/// `compact_stream_with`, which no released dendro has. Run it against a
+/// dendro that does, through a `[patch.crates-io]`, with
+/// `RUSTFLAGS="--cfg dendro_compact_with" cargo test -p metriken-storage
+/// --test writer`, and drop the cfg when the dependency moves to that
+/// release.
+///
+/// [`merge_segment_metadata`]: metriken_storage::long::merge_segment_metadata
+#[cfg(dendro_compact_with)]
+#[test]
+fn a_long_stream_compacted_by_union_answers_as_before() {
+    use metriken_storage::long::{merge_segment_metadata, SegmentMetadata};
+
+    let union = |inputs: &[dendro::rewrite::MergeInput<'_>]| {
+        let inputs: Vec<SegmentMetadata<'_>> = inputs
+            .iter()
+            .map(|i| SegmentMetadata {
+                key_value: i.key_value,
+                fields: i.fields,
+                rows: i.rows,
+            })
+            .collect();
+        merge_segment_metadata(&inputs)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let wide = dir.path().join("wide.dendro");
+    record(&wide, false, true, None);
+    let wide = open(&wide);
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let mut tasks = Vec::new();
+    for by_union in [false, true] {
+        let path = dir.path().join(format!("compact-{by_union}.dendro"));
+        record(&path, true, true, None);
+        let (before, _) = open_counting(&path, &pool);
+        let expected = answers(&before, 0);
+        drop(before);
+        let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
+        let segments = |path: &Path| {
+            dendro::archive::Archive::open(path)
+                .unwrap()
+                .read_segment_meta(id, "threads/tasks")
+                .unwrap()
+                .len()
+        };
+        let sealed = segments(&path);
+        {
+            let tables = streams(&path);
+            let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+            let spec = dendro::rewrite::CompactSpec::to_rows(100);
+            for stream in tables {
+                if by_union {
+                    dendro::rewrite::compact_stream_with(&mut db, id, &stream, &spec, &union)
+                } else {
+                    dendro::rewrite::compact_stream(&mut db, id, &stream, &spec)
+                }
+                .unwrap();
+            }
+        }
+        let (after, _) = open_counting(&path, &pool);
+        assert_eq!(answers(&after, 0), expected, "union: {by_union}");
+        listings_match_queries(&after, &wide);
+        tasks.push((sealed, segments(&path)));
+    }
+    eprintln!(
+        "threads/tasks segments (sealed, compacted): stop {:?}, union {:?}",
+        tasks[0], tasks[1]
+    );
+    assert_eq!(tasks[0].0, tasks[1].0);
+    assert!(
+        tasks[1].1 < tasks[0].1,
+        "the union merge leaves fewer segments: {tasks:?}"
+    );
+}
+
 /// A reader whose tables were not queried passes on the state it was given,
 /// and a first reader without `keep_handover` saves none.
 #[test]

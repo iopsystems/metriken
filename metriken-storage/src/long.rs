@@ -120,6 +120,131 @@ fn parse(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("occupant number {s:?} is not an integer"))
 }
 
+/// One segment's file metadata, as [`merge_segment_metadata`] reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentMetadata<'a> {
+    /// The segment's file key-value metadata, without Arrow's schema entry
+    /// (`ARROW:schema`).
+    pub key_value: &'a [parquet::file::metadata::KeyValue],
+    /// The segment's columns. A column in none of a segment's fields
+    /// contributes no occupants for that segment, whatever its lists say.
+    pub fields: &'a arrow::datatypes::Fields,
+    /// The rows in the segment, the bound on how many occupants its lists
+    /// may name, as when reading it.
+    pub rows: u64,
+}
+
+/// The file key-value metadata of the segment that concatenating `inputs`
+/// in order produces, or `None` when they cannot be merged.
+///
+/// For a compaction's metadata merge: a long segment's occupant lists change
+/// whenever the population does, and merging only segments with identical
+/// metadata leaves a long stream nearly as it was sealed.
+///
+/// Long segments merge exactly by union. The merged [`OCCUPANTS_KEY`] is the
+/// union of the inputs' lists. A column's list ([`column_occupants_key`]) is
+/// the union over the inputs that have the column, each contributing its own
+/// list for the column or, without one, its segment list; it is omitted
+/// when that union is the merged segment list, as the writer omits it.
+/// Every other key, [`LAYOUT_KEY`] and the format version among them, must
+/// have the same value in every input.
+///
+/// Segments that are not all long merge only when their metadata is
+/// identical, entry for entry. `None` as well for a long segment with no
+/// segment list, a list that does not decode within its segment's rows, or a
+/// key given twice; this never panics on a malformed list.
+pub fn merge_segment_metadata(
+    inputs: &[SegmentMetadata<'_>],
+) -> Option<Vec<parquet::file::metadata::KeyValue>> {
+    use parquet::file::metadata::KeyValue;
+
+    let first = inputs.first()?;
+    let long = |kv: &[KeyValue]| {
+        kv.iter()
+            .any(|e| e.key == LAYOUT_KEY && e.value.as_deref() == Some(LAYOUT_LONG))
+    };
+    if !inputs.iter().all(|i| long(i.key_value)) {
+        return inputs
+            .iter()
+            .all(|i| i.key_value == first.key_value)
+            .then(|| first.key_value.to_vec());
+    }
+
+    // Each input's segment list, its column lists, and the rest of its
+    // keys, which must agree.
+    let mut all: BTreeSet<u64> = BTreeSet::new();
+    let mut per_input = Vec::new();
+    let mut rest: Option<BTreeMap<&str, Option<&str>>> = None;
+    for input in inputs {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut occupants = None;
+        let mut columns = HashMap::new();
+        let mut others = BTreeMap::new();
+        for e in input.key_value {
+            if !seen.insert(e.key.as_str()) {
+                return None;
+            }
+            if e.key == OCCUPANTS_KEY {
+                occupants = Some(decode_occupant_ranges(e.value.as_deref()?, input.rows).ok()?);
+            } else if let Some(column) = e.key.strip_prefix(COLUMN_OCCUPANTS_PREFIX) {
+                let list = decode_occupant_ranges(e.value.as_deref()?, input.rows).ok()?;
+                columns.insert(column, list);
+            } else {
+                others.insert(e.key.as_str(), e.value.as_deref());
+            }
+        }
+        match &rest {
+            None => rest = Some(others),
+            Some(r) if *r == others => {}
+            Some(_) => return None,
+        }
+        let occupants = occupants?;
+        all.extend(&occupants);
+        per_input.push((occupants, columns));
+    }
+    let all_encoded = encode_occupant_ranges(all.iter().copied());
+
+    // The merged segment's columns, in the order they first appear.
+    let mut order: Vec<&str> = Vec::new();
+    for input in inputs {
+        for f in input.fields.iter() {
+            if !order.contains(&f.name().as_str()) {
+                order.push(f.name());
+            }
+        }
+    }
+    let mut column_keys = Vec::new();
+    for column in order {
+        let mut has: BTreeSet<u64> = BTreeSet::new();
+        for (input, (occupants, columns)) in inputs.iter().zip(&per_input) {
+            if input.fields.find(column).is_some() {
+                has.extend(columns.get(column).unwrap_or(occupants));
+            }
+        }
+        let encoded = encode_occupant_ranges(has);
+        if encoded != all_encoded {
+            column_keys.push(KeyValue::new(column_occupants_key(column), encoded));
+        }
+    }
+
+    // The first input's keys in its order, with the merged segment list in
+    // place of its own and the column lists after them.
+    let mut out: Vec<KeyValue> = first
+        .key_value
+        .iter()
+        .filter(|e| !e.key.starts_with(COLUMN_OCCUPANTS_PREFIX))
+        .map(|e| {
+            if e.key == OCCUPANTS_KEY {
+                KeyValue::new(OCCUPANTS_KEY.to_string(), all_encoded.clone())
+            } else {
+                e.clone()
+            }
+        })
+        .collect();
+    out.extend(column_keys);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +271,140 @@ mod tests {
         assert!(decode_occupant_ranges("x", 10).is_err());
         assert!(decode_occupant_ranges("0-9", 9).is_err());
         assert_eq!(decode_occupant_ranges("0-9", 10).unwrap().len(), 10);
+    }
+    mod merge {
+        use super::super::*;
+        use arrow::datatypes::{DataType, Field, Fields};
+        use parquet::file::metadata::KeyValue;
+
+        fn fields(names: &[&str]) -> Fields {
+            names
+                .iter()
+                .map(|n| Field::new(*n, DataType::UInt64, true))
+                .collect()
+        }
+
+        fn kv(pairs: &[(&str, &str)]) -> Vec<KeyValue> {
+            pairs
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                .collect()
+        }
+
+        fn long(occupants: &str, columns: &[(&str, &str)]) -> Vec<KeyValue> {
+            let mut out = kv(&[
+                (LAYOUT_KEY, LAYOUT_LONG),
+                (OCCUPANTS_KEY, occupants),
+                ("metriken.format", "1"),
+            ]);
+            for (c, l) in columns {
+                out.push(KeyValue::new(column_occupants_key(c), l.to_string()));
+            }
+            out
+        }
+
+        fn merge(inputs: &[(&[KeyValue], &Fields, u64)]) -> Option<Vec<(String, String)>> {
+            let inputs: Vec<SegmentMetadata<'_>> = inputs
+                .iter()
+                .map(|(key_value, fields, rows)| SegmentMetadata {
+                    key_value,
+                    fields,
+                    rows: *rows,
+                })
+                .collect();
+            merge_segment_metadata(&inputs).map(|kv| {
+                kv.into_iter()
+                    .map(|e| (e.key, e.value.unwrap_or_default()))
+                    .collect()
+            })
+        }
+
+        fn pairs(kv: &[KeyValue]) -> Vec<(String, String)> {
+            kv.iter()
+                .map(|e| (e.key.clone(), e.value.clone().unwrap_or_default()))
+                .collect()
+        }
+
+        /// The population churns between segments: the segment lists union,
+        /// a column without a list contributes its segment's, and a column
+        /// list that comes to equal the merged segment list is dropped.
+        #[test]
+        fn churn_merges_by_union() {
+            let f = fields(&["timestamp", "occupant", "a", "b"]);
+            // `a` has every occupant of the first segment, `b` only 0.
+            let one = long("0-2", &[("b", "0")]);
+            // `a` has 1 and 2, `b` every occupant of the second segment.
+            let two = long("1-3", &[("a", "1-2")]);
+            let merged = merge(&[(&one, &f, 9), (&two, &f, 9)]).unwrap();
+            let mut want = long("0-3", &[("a", "0-2")]);
+            want.retain(|e| !e.key.ends_with(".b"));
+            assert_eq!(merged, pairs(&want));
+        }
+
+        /// A column a segment lacks contributes nothing for that segment;
+        /// one it has without a list contributes the segment's list.
+        #[test]
+        fn an_absent_key_expands_and_an_absent_column_does_not() {
+            let with_c = fields(&["timestamp", "occupant", "c"]);
+            let without_c = fields(&["timestamp", "occupant"]);
+            let one = long("0-2", &[]);
+            let two = long("3-4", &[]);
+            assert_eq!(
+                merge(&[(&one, &with_c, 9), (&two, &without_c, 9)]).unwrap(),
+                pairs(&long("0-4", &[("c", "0-2")]))
+            );
+            assert_eq!(
+                merge(&[(&one, &with_c, 9), (&two, &with_c, 9)]).unwrap(),
+                pairs(&long("0-4", &[])),
+                "both have `c` for every occupant, so it needs no list"
+            );
+        }
+
+        #[test]
+        fn a_differing_key_refuses_the_merge() {
+            let f = fields(&["timestamp", "occupant", "a"]);
+            let one = long("0-2", &[]);
+            let mut newer = long("0-2", &[]);
+            newer[2].value = Some("2".to_string());
+            assert_eq!(merge(&[(&one, &f, 9), (&newer, &f, 9)]), None);
+            let mut unknown = long("0-2", &[]);
+            unknown.push(KeyValue::new("x".to_string(), "y".to_string()));
+            assert_eq!(merge(&[(&one, &f, 9), (&unknown, &f, 9)]), None);
+            let wide = kv(&[("metriken.format", "1")]);
+            assert_eq!(merge(&[(&one, &f, 9), (&wide, &f, 9)]), None);
+        }
+
+        #[test]
+        fn segments_not_long_merge_only_when_identical() {
+            let f = fields(&["timestamp", "a"]);
+            let one = kv(&[("metriken.format", "1"), ("k", "v")]);
+            assert_eq!(merge(&[(&one, &f, 9), (&one, &f, 9)]).unwrap(), pairs(&one));
+            let two = kv(&[("metriken.format", "1"), ("k", "w")]);
+            assert_eq!(merge(&[(&one, &f, 9), (&two, &f, 9)]), None);
+        }
+
+        #[test]
+        fn a_malformed_list_refuses_the_merge() {
+            let f = fields(&["timestamp", "occupant", "a"]);
+            let good = long("0-2", &[]);
+            for bad in [
+                long("2-0", &[]),
+                long("0-2", &[("a", "x")]),
+                // More occupants than the segment has rows.
+                long("0-20", &[]),
+                long("0-2", &[("a", "0-20")]),
+                // No segment list at all.
+                kv(&[(LAYOUT_KEY, LAYOUT_LONG), ("metriken.format", "1")]),
+                // A key given twice.
+                [long("0-2", &[]), kv(&[(OCCUPANTS_KEY, "0")])].concat(),
+            ] {
+                assert_eq!(merge(&[(&good, &f, 9), (&bad, &f, 9)]), None, "{bad:?}");
+                assert_eq!(merge(&[(&bad, &f, 9), (&good, &f, 9)]), None, "{bad:?}");
+            }
+            let mut none = long("0-2", &[]);
+            none[1].value = None;
+            assert_eq!(merge(&[(&none, &f, 9)]), None);
+        }
     }
 }
 

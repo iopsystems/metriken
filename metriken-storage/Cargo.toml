@@ -75,5 +75,11 @@ convert = []
 # Reading segments written with LZ4_RAW, the codec rezolus writes.
 lz4 = ["parquet/lz4"]
 
+# `dendro_compact_with` compiles a test that needs dendro's
+# `rewrite::compact_stream_with`, which no released dendro has yet; see
+# `a_long_stream_compacted_by_union_answers_as_before` in tests/writer.rs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dendro_compact_with)"] }
+
 [package.metadata.docs.rs]
 all-features = true
