@@ -402,7 +402,7 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    when one is given, and answers `histogram_quantiles` from the sum
    (`quantiles_impl`, `histogram.rs:270`). `histogram_heatmap` does the same
    accumulation in a second copy (`heatmap_impl`, `:685`), and `reduce`
-   (`:435`; grouped quantiles, count, sum and mean) in a third. The heatmap
+   (`:435`; count, sum and mean, grouped) in a third. The heatmap
    then subtracts
    the lowest occupied bucket's index from every index and returns no
    configuration, so its output cannot be passed to h2histogram as it is.
@@ -428,10 +428,14 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    `histogram_heatmap` with a stride after an empty stride; that is a
    behaviour change. It still ships in a 0.36.x release after 0.36.1: no
    public type changes, the change makes a heatmap and the quantiles of the
-   same selector and stride emit at the same timestamps, and rezolus's
-   dashboards call `histogram_heatmap` without a stride
-   (`crates/dashboard/src/service_extension.rs:319`, `:423` at 15c77844),
-   so they see no change. The changelog entry lists it under fixes and says
+   same selector and stride emit at the same timestamps, and a point that
+   covers less than a stride is the defect being removed. rezolus's viewer
+   requests a strided `histogram_heatmap` whenever the range has more ticks
+   than its pixel budget (`src/viewer/assets/lib/data.js:1396-1402` at
+   15c77844), so its zoomed-out heatmaps move to `histogram_quantiles`'
+   timestamps after an empty stride, matching the quantile charts beside
+   them. cachecannon (metriken-query 0.9) and systemslab (0.30.0) do not
+   take 0.36.x. The changelog entry lists it under fixes and says
    which timestamps move. That release adds a test of `histogram_heatmap`
    with a stride over a series with an empty stride, asserting that its
    timestamps equal `histogram_quantiles`'; the existing histogram tests in
@@ -606,7 +610,9 @@ crates.io.
   copy of the archive, as large as the file, for as long as the recording
   is open. Locks are always taken in one order (the engine's, then the
   bindings'; `read_table` takes only the bindings'), so the two cannot
-  deadlock.
+  deadlock. Calls release the GIL before taking either lock and do not
+  reacquire it while holding one, so the GIL cannot form a cycle with
+  them.
 - After `fork`, a SQLite connection opened in the parent must not be used in
   the child. Python's `multiprocessing` forks by default on Linux before
   3.14. A recording remembers the pid that opened it, and a call from another
@@ -673,8 +679,8 @@ private `SamplerReader::metric_metadata` (`reader.rs:669`), keyed by metric
 rather than by column. That function builds a new segment store on every
 call (`SegmentSource::store`, `reader.rs:382-408`), so the public
 `ArchiveReader::metric_metadata` built on it is read at each call and is
-not fixed at the table's first query; if `metrics()` takes units from it,
-the same holds for `metrics()`. `r.reopen()` returns a new view, using
+not fixed at the table's first query. `metrics()` takes units from
+`ArchiveReader::metric_metadata`, so they are read at each call. `r.reopen()` returns a new view, using
 `ArchiveReader::keep_handover` and `reuse_from` so segments already read
 are not read again, as rezolus's `crates/rez/src/live.rs` does.
 `r.complete` is false until the writer finalizes. The open-time cost of a
@@ -713,13 +719,16 @@ copy of the same rows was not checked. The engine can also drop a
 concurrent seal's rows: `DbSegmentStore::build` calls `segment_meta` and
 then `live_wal` as separate statements (`reader.rs:311-341`), the race
 dendro documents above. Both are from reading the code, not reproduced.
-Both are metriken-storage bugs, independent of the bindings, and are
+Both are metriken-storage bugs, independent of the bindings, and both are
 tracked in the plan entry's step 7 follow-ups
 ([one recording stack](2026-10-08-one-recording-stack.md)).
 
 `read_table` checks each fetched segment against the `segment_meta` it
 listed. Those `rows`, `first_ts` and `last_ts` describe the WAL rows the
-seal consumed, not the segment's parquet rows: metriken-storage's encoder
+seal consumed, not the segment's parquet rows (except for a segment that
+dendro 0.4.0's compaction produced, whose `rows` is its parquet row count;
+dendro 0.4.1 writes the WAL count, and the wide check's "≤ rows" holds for
+either): metriken-storage's encoder
 records the WAL row count and the first and last WAL row's timestamps
 (`encoder.rs:117-119`, `:146-149`), and the seal hands it the stream's
 live WAL ordered by timestamp (dendro 0.4.0 `archive/sqlite.rs:1540`). A

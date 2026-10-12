@@ -405,12 +405,15 @@ re-exports what it moves, in the release after.
    size, sending only changed histogram members or sparse buckets; dendro's
    compaction keeping long-layout metadata; whether the route helper refuses
    an interval below its floor; the histogram query path; the storage scan's
-   gaps, each kept only if measured a clear win; and a fix to
-   metriken-storage's `DbSegmentStore::build`, which reads `segment_meta`
-   and `live_wal` as two statements outside one read snapshot and so loses
-   the rows of a seal that commits between them, found from the code and
-   not reproduced ([metriken-py](2026-10-12-metriken-py.md), "A file still
-   being written")). The histogram query path
+   gaps, each kept only if measured a clear win). Two metriken-storage
+   correctness fixes are also in scope, both found from the code and not
+   reproduced ([metriken-py](2026-10-12-metriken-py.md), "A file still
+   being written"): `DbSegmentStore::build` reads `segment_meta` and
+   `live_wal` as two statements outside one read snapshot, so it loses the
+   rows of a seal that commits between them; and `DbSegmentStore::bytes`
+   does not compare the `segment_key` it listed, while
+   `splice_histogram_streams` drops no overlapping rows, so a segment merged
+   by a compaction between listing and fetch can repeat rows. The histogram query path
    had a correctness bug, fixed in a separate patch release: in
    metriken-query 0.36.0, `flush_accum` caps running bucket counts at
    u32::MAX in a `u32` buffer; the quantile and reduce paths read it as
