@@ -1,0 +1,607 @@
+# metriken-dashboard and metriken-viewer: one viewer for every metriken producer
+
+**Status:** OPEN. Design 2026-10-12; nothing built. This is path step 7 of
+[one recording stack](2026-10-08-one-recording-stack.md) (piece 5). "Step N
+below" means this entry's own order of work. The owner asked to decide step
+7's scope before work begins, so the questions that set it are listed under
+"Scope questions for the owner", each with a recommendation. The design below
+assumes the recommendations; an answer that differs changes the sections it
+names.
+
+## Goal
+
+The plan's GO criterion 5: `cachecannon view` and `rezolus view` show the same
+dashboard for the same archive, both served by `metriken-viewer`. rezolus
+mounts the library for `rezolus view` and builds its static site viewer from
+it; cachecannon mounts it in place of its own viewer. rezolus 6.0.0 is
+released after this step (rezolus 6.0 entry, decision 7).
+
+## Today
+
+Sources: metriken origin/main d2bf74d, rezolus upstream/main 15c77844
+(6.0.0-alpha.46), cachecannon main 74056cbb, llm-perf main edf0f20a,
+systemslab main 3329ebd1. Line counts are total / production (before the
+first `#[cfg(test)]` module).
+
+### rezolus
+
+| Path | Lines | What |
+|---|---|---|
+| `crates/dashboard/src/` generic parts: `plot.rs`, `service_extension.rs`, `metric_catalog.rs`, `display_wire.rs`, `events.rs`, `capture_alias.rs`, `source_kind.rs`, `lib.rs`, `dashboard/{mod,service,category,query_explorer}.rs` | 4,817 / 2,757 | the `View`/`Group`/`Plot` model, `ServiceExtension` and `TemplateRegistry`, KPI checks, the metric catalog, the display wire format, events, capture aliases, source classification, the section context and the template-driven and simple-capture sections |
+| `crates/dashboard/src/dashboard/` rezolus sections: `overview`, `exceptions`, `cpu`, `gpu`, `hw_sensors`, `memory`, `network`, `scheduler`, `syscall`, `softirq`, `blockio`, `filesystem`, `ext4`, `xfs`, `cgroups`, `rezolus` | 4,665 / 3,791 | Rust generators for rezolus's own samplers, listed in `SECTION_META` (`dashboard/mod.rs:27`). Several read the recording to decide what to draw (`gpu.rs` enumerates `(vendor, id)` pairs). |
+| `crates/dashboard/templates/` | 11 files, 52,964 bytes | `ServiceExtension` JSON for cachecannon, llm-perf, vllm (3), sglang (4), valkey, inference-library (a category), embedded with `include_dir!` |
+| `crates/dashboard/src/main.rs` | 88 | dumps every section's JSON |
+| `src/viewer/` (not `tui/`) | 8,091 / about 5,320 | the axum server. `mod.rs` (2,042 / 1,343) is the clap command, `Config`, the file, A/B, `.rez` and live startup modes and recording selection; `routes.rs` (1,168 / 704) the router and embedded assets; `actions.rs` (1,039 / 966) upload, URL load, attach and detach, connect, reset, save; `state.rs` (457 / 436); `metadata.rs` (525 / 504) section regeneration and `service_extensions_from_metadata`; `follow.rs` (978 / 494) following an archive whose writer is running; `live.rs` (732 / 377); `capture_registry.rs` (334 / 224); `ab_extract.rs` (250 / 122); `proxy_allow.rs` (176 / 83); `report_save*.rs` (390 / 68) |
+| `src/viewer/tui/` | 2,258 / about 1,520 | `view --tui`, ratatui |
+| `crates/viewer/` | 1,767 / 1,374, plus `build.sh` | the WASM viewer: `Viewer` and `WasmCaptureRegistry` behind `#[wasm_bindgen]`, its own template detection (`detect_and_validate_service_exts`, `lib.rs:576`) and Save as Report |
+| `crates/report-save/` | 1,464 / 748 | Save as Report builders shared by both backends |
+| `crates/rez/src/{reader,live}.rs` | 3,965 / about 450 | `RezReader`, a 157-line wrapper over metriken-storage's `ArchiveReader` implementing `MetricsSource`, and `LiveReader`, which reopens it as the writer appends |
+| `src/viewer/assets/` | 66 files, 2.1 MB | the frontend: 20,417 lines of JS and 4,377 of CSS, plus `echarts.min.js` (1,024,740 bytes), `mithril.js` and `lit/` vendored. 634 KB as a gzip -9 tarball |
+| `site/viewer/` | `index.html` 34, `lib/script.js` 607, `lib/viewer_api.js` 187; 74 symlinks; `templates/` symlinks and a generated `manifest.json`; `data/` 15 demo files (parquet), 55 MB | the static viewer on GitHub Pages. `script.js` and `viewer_api.js` are hand-kept copies of the server's (the `viewer-parity` skill); everything else in `lib/` links into `src/viewer/assets/lib/` |
+| `tests/*.mjs` | 57 files, 5,564 lines | the JS suite, `node --test tests/*.mjs`; four `wasm_viewer_*` files drive the built bundle, one (`wasm_viewer_rez_archive`) runs `cargo` to build a fixture, `display_wire_fixture` reads a fixture written by `cargo test -p dashboard`, `viewer_link_parity` pins `src/mcp/link.rs` to `url_state.js` |
+| `tests/viewer_smoke.sh`, `tests/display_synthetic.sh` | | server end to end; the second starts a viewer for the 7 `VIEWER_URL` tests in `display_synthetic.test.mjs` |
+| CI | | `cargo.yml` job `wasm-viewer` (wasm32 check of `rez` without `write`, `build.sh`, the JS suite, template symlinks, binaryen structure check); `pages.yml` (builds the bundle, `cp -rL site`, deploys); `release.yml` `build-viewer-static` (the `rezolus-viewer-<tag>.tar.gz` bundle); `viewer-symlinks.yml` |
+
+Coupling from `src/viewer` to the rest of the binary, by reference count:
+`crate::recorder::*` 40 (`.rez` writers and seal policy, mostly in test
+fixtures; `stream` and two constants in `live.rs`), `crate::mcp::*` 25 (`RecordingSelector` and
+its helpers, for `--baseline`/`--experiment`), `crate::parquet_metadata` keys
+20 (`KEY_REPORT`, `KEY_SELECTION`, `KEY_EVENTS`, `AbContainers`, ...),
+`crate::rez_reader` 11, `crate::dendro_copy` 10, `crate::hindsight` 7
+(the buffer writer and its metadata, in `live.rs`, `actions.rs`, `follow.rs`), `crate::parquet_tools::combine` 1.
+
+Change rate since 2026-07-14, out of 331 rezolus commits: 80 touch the
+viewer (`src/viewer`, `crates/viewer`, `crates/dashboard`, assets); 35 touch
+`src/viewer/assets`, 17 of them also touching Rust in the viewer or dashboard.
+19 touch the rezolus sections, and all 19 also touch `src/agent/samplers` (a
+sampler and its section land in one commit, for example d610218d, 696aa241,
+d18caaee).
+
+**Templates.** The server resolves a recording's dashboard by
+`service_extensions_from_metadata` (`src/viewer/metadata.rs:258`):
+`service_queries` in the metadata first, then `per_source_metadata`, then the
+built-in registry by source name. The WASM viewer's
+`detect_and_validate_service_exts` (`crates/viewer/src/lib.rs:576`) consults
+the registry by source name only, so a template embedded by
+`recording annotate --queries` is shown by `rezolus view` and not by the
+static site. That is the parity gap step 5 has to close in both shells.
+
+**Assets.** Release builds embed `src/viewer/assets` with `include_dir!`
+(`routes.rs:39`) and serve them with an ETag and `no-cache`
+(`asset_response`). `developer-mode` serves them with `ServeDir` from
+`src/viewer/assets` relative to the working directory, reads templates from
+disk, and reloads the page on change (`notify` plus `tower-livereload`,
+`mod.rs:1313`). The page assumes it is mounted at `/`: `index.html` sets
+`<base href="/">` and the JS requests `/api/v1/...` and `/data/...` by
+absolute path.
+
+**Live mode.** `live.rs` runs its own loop over `recorder::stream`
+(`Subscription::connect`, `pump`) into a temporary dendro archive through
+hindsight's buffer writer, and reads it through `rez::live::LiveReader`.
+`actions::fetch_agent_info` parses the agent's `/` banner and `/systeminfo`.
+Path step 4 rewrites this onto `metriken-recorder` (recorder entry, "What
+stays in rezolus"; GO 1 there).
+
+### Consumers
+
+**cachecannon** (`src/viewer/`, 1,151 lines of Rust; 5,869 lines of assets).
+Its own axum server on one tokio worker, routes `/`, `/about`, `/data/{path}`,
+`/lib/{*path}`, and five `/api/v1` routes in `api.rs` (162), written there because
+metriken-query 0.36 has no HTTP layer;
+`labels` and `label/{name}/values` return fixed lists. Its own `View`/`Plot`
+types (`plot.rs`, 197) and Rust sections (452): Overview, Throughput,
+Latency, Cache, Connections, and Server Metrics / Client Metrics (CPU,
+memory, network, runqueue latency) from rezolus parquets given with
+`--server`/`--client`. Parquet only (metriken-query 0.36 without `archive`),
+no live mode, no compare, no upload, no report. The frontend is a subset of
+an early-2026 copy of rezolus's (15 files against 66; `mithril.js` and
+`echarts.min.js` identical, the rest 300 to 500 changed lines per file from
+the nearest rezolus revision). From reading the code, not run: every
+`/api/v1` query is bound to the benchmark parquet (`api::routes(state.source
+.clone())`), so the Server and Client sections query a file that does not
+hold their metrics. Its admin server, which serves `/metrics/stream`, is
+hand-written on tokio, not axum. Its plan (cachecannon
+`docs/journal/2026-10-08-dendro-recording.md`) has `view` read `.dendro`
+(step 5), move `cachecannon.json` into cachecannon (step 6), and mount
+`metriken-viewer` "after rezolus 6.0.0".
+
+**llm-perf** has no viewer. Its dashboard is rezolus's `llm-perf.json`
+template, matched on `source=llm-perf`; its plan's step 6 moves the template
+into llm-perf and the archive.
+
+**systemslab** takes `dashboard` and `rez` (without `write`) from rezolus git
+tag v5.22.1, wraps `dashboard::dashboard::{build_dashboard_context,
+generate_section}` in `systemslab-dashboard` (1,760 lines, with its own
+`rpc-perf.json`), and has its own Svelte UI. It vendors 25 of rezolus's chart
+modules (6,224 lines, `svelte-ui/src/lib/charts/rezolus-next/upstream/`)
+with `pnpm sync:charts`, which runs `git show <rev>:<path>` against a rezolus
+checkout at the pinned tag, rewrites `../data.js` imports to a 194-line shim,
+and excludes the compare code. An older hand-kept copy (11 files, 2,357
+lines) is still imported by some components.
+
+### Measured on 15c77844
+
+On an Apple M-series laptop (macOS), one build each.
+
+- **WASM bundle** (`./crates/viewer/build.sh`, wasm-pack 0.14, opt-level `s`):
+  `wasm_viewer_bg.wasm` 6,557,109 bytes, 2,214,679 gzip -9, 1,569,364
+  brotli; `wasm_viewer.js` 42,354 bytes. The build took 1 min 38 s from a
+  cold target directory. The bundle from 2026-09-22 in the main checkout was
+  6,112,775 bytes.
+- **JS suite** (`node --test tests/*.mjs`, node 22.18, bundle built): 397
+  tests, 389 pass, 0 fail, 8 skipped (7 need `VIEWER_URL`, 1 is
+  compare-mode only), 23.5 s.
+- **Dashboard load on the 9.6 h recording** (`metrics-9.6h.dendro`,
+  1.28 GB), `rezolus view` release build, the storage scan's Playwright
+  harness (`~/rezolus-bench/harness/dash.js`) loading 12 sections and
+  scrolling each until 5 s pass with no request, three runs:
+
+  | run | first `/api/v1/sections` | peak footprint | summed section span | summed `query_range` wall | requests |
+  |---|---|---|---|---|---|
+  | 1 | 0.6 s | 2,288 MB | 14.4 s | 136.6 s over 344 | 352, one 404 (`/selection`, no saved selection) |
+  | 2 | 0.1 s | 2,518 MB | 15.0 s | 145.9 s over 344 | same |
+  | 3 | 0.1 s | 2,383 MB | 18.5 s | 203.7 s over 344 | same |
+
+  Run 3's span is 23% above run 1's with the same build, so a single run
+  cannot show a 5% change. The storage scan's runs on the same file (9 to 10
+  October, `~/rezolus-bench/gate-dash.txt`) gave 13.4 to 14.1 s spans and
+  2,238 to 2,523 MB peaks. The first column is launch to the first answer
+  from `/api/v1/sections`, polled every 0.1 s; run 1 includes a cold page
+  cache. The script that produced the table wraps `dash.js` as
+  `~/rezolus-bench/run-dash.sh` does and adds that column; it is not
+  committed, and is committed with the GO harness (Order of work, step 1).
+
+## Scope questions for the owner
+
+Each question has options, a recommendation and the evidence for it. The
+design below follows the recommendations.
+
+### Q1. Which repository holds the two crates?
+
+The plan left this open ("Structure", last paragraph).
+
+- **(a) This repository.** A query-engine change and the viewer change that
+  needs it can be one PR. Cost: this repository's CI (`cargo.yml`: nextest,
+  doctests, `cargo hack` powerset, rustfmt, clippy on Ubuntu, macOS and
+  Windows) gains wasm-pack, a wasm32 clang, binaryen, node and 57 JS test
+  files, and its history gains the viewer's change rate (80 of 331 rezolus
+  commits since 2026-07-14).
+- **(b) A new repository, `iopsystems/metriken-viewer`**, holding both crates
+  and the assets, depending on metriken crates by version. Cost: a change that
+  spans the engine and the viewer is two PRs and a release in between, as it
+  is today between metriken and rezolus.
+- **(c) metriken-dashboard here, metriken-viewer in its own repository.**
+  `display_wire.rs` (dashboard) is pinned to the JS decoder by a shared
+  fixture (`tests/fixtures/display_wire_mixed.json`, written by
+  `cargo test -p dashboard`, read by `display_wire_fixture.test.mjs`), so
+  this split puts one format's two halves in two repositories.
+
+Recommendation: (b). Everything the viewer adds to a build (assets, JS tests,
+wasm toolchain) is in the new repository, metriken's CI and release PRs are
+unchanged, and the display wire fixture stays in one repository. In the 30
+days to 15c77844, `crates/dashboard/src` saw 24 commits and
+`src/viewer/assets` 21; I did not count how many of those also needed a
+metriken change in the same window.
+
+### Q2. Where do rezolus's sampler sections live?
+
+The 15 sampler sections in `SECTION_META` plus Overview (4,665 / 3,791 lines) describe
+rezolus's samplers. cachecannon wants them too: its Server and Client
+sections redraw CPU, memory, network and runqueue from rezolus recordings.
+
+- **(a) In metriken-dashboard** (a `rezolus` module or feature). GO 5 is
+  then direct, since every mount has the same sections. Cost: a sampler and
+  its section land in one rezolus commit today (19 of 19 section commits
+  since 2026-07-14 also touch `src/agent/samplers`); under (a) each new
+  sampler waits for a metriken-dashboard release, and metriken carries
+  knowledge of rezolus's metric names.
+- **(b) In rezolus, as a crate `rezolus-dashboard`** that implements a
+  section-provider trait from metriken-dashboard. A sampler and its section
+  stay one commit. cachecannon and systemslab, to show system sections, depend
+  on `rezolus-dashboard`. rezolus publishes nothing to crates.io today
+  (`publish = false` in every manifest); systemslab already takes rezolus
+  crates by git tag. A crates.io-published consumer cannot take a git
+  dependency, so (b) means publishing `rezolus-dashboard` if cachecannon
+  publishes.
+- **(c) As JSON templates** carried in the archive like any producer's. The
+  `ServiceExtension` format cannot express what the generators do from the
+  data (`gpu.rs` enumerates devices, `cpu.rs`, `blockio.rs` and others test
+  for metrics before drawing), so (c) is a rewrite of the format and the
+  sections.
+
+Recommendation: (b), published to crates.io from rezolus's release workflow.
+It keeps the coupling that exists today (sampler and section together) and
+removes none of what cachecannon can show. GO 5 then reads: both commands
+mount `metriken-viewer` with the same providers (`rezolus-dashboard` and the
+archive's templates).
+
+### Q3. Does metriken-viewer publish a WASM bundle, or does each application build one?
+
+Under Q2 (b) the static site needs rezolus's sections compiled into the
+bundle, so the bundle rezolus serves cannot be built by the library alone.
+
+- **(a) The library ships the WASM side as a Rust module** (feature `wasm`)
+  whose `#[wasm_bindgen]` exports reach the final `cdylib`, plus a build
+  script. Each application has a small `cdylib` crate that registers its
+  providers and templates in its start function (rezolus's `crates/viewer`
+  shrinks to that). rezolus builds its own bundle for `site/` and the release
+  tarball, as today.
+- **(b) The library also publishes a generic bundle** (template and
+  simple-capture sections only) as a release asset, for a consumer with no
+  Rust section provider. No consumer needs one today: cachecannon has no
+  static site and systemslab has its own UI.
+
+Recommendation: (a) only. (b) can be added when a consumer asks for it.
+`#[wasm_bindgen(start)]` may appear once per final binary, so the library
+must not declare one (rezolus's `crates/viewer/src/lib.rs:23` does today).
+
+### Q4. Does live mode move into the library?
+
+- **(a) Yes, behind a feature `live`**, over `metriken-recorder` (one streamed
+  source, no retention, a reader refresh on each `Committed` event), with the
+  application's `Probe` from the recorder entry supplying identity. rezolus's
+  banner parsing (`actions::fetch_agent_info`) becomes its probe's `enrich`.
+  `follow.rs` (494 production lines) shares the reader refresh and moves too.
+- **(b) No.** The library exposes a hook to install a live source; rezolus
+  keeps `connect`, `reset` and the session.
+
+Recommendation: (a). After step 4 nothing in live mode is specific to a
+rezolus agent except what the probe already isolates, and the plan's crate
+graph already lists `metriken-recorder` under `metriken-viewer` for this.
+cachecannon gains a live view of its own stream at no cost.
+
+### Q5. Does the static site stay in rezolus?
+
+`site/` is rezolus.com: the landing page (919 lines), `docs/` (7 pages) and
+`/viewer/`.
+
+- **(a) Stays.** `site/viewer/` is built from the library's assets and
+  rezolus's bundle (Q3 a). The 74 symlinks, `sync-viewer-symlinks` and
+  `viewer-symlinks.yml` go: `build.sh` writes the assets out of the crate
+  (`metriken_viewer::assets::write_to(dir)`, run by a small binary or xtask)
+  into an ignored `site/viewer/lib/`. The two hand-kept copies,
+  `site/viewer/lib/script.js` and `viewer_api.js`, move into the library as
+  the WASM shell's assets.
+- **(b) The viewer page moves to the library's repository**, published to its
+  own GitHub Pages. It would then need rezolus's sections (Q2), which the
+  library's repository does not have.
+
+Recommendation: (a).
+
+### Q6. Does step 7 wait for the Save as Report and template work, or move code that is about to change?
+
+In 6.x Save as Report writes `.dendro` only (rezolus 6.0 entry, decision 5;
+"Removing the `.rez`, parquet and raw writers"). Of `crates/report-save`'s 748
+production lines, `save_single_parquet`, `save_combined_ab_tarball`,
+`build_rez_report_from_rez`, `build_rez_report_from_parquets`,
+`parquet_rows_in` and `rewrite_parquet_bytes` are to be removed or replaced;
+`build_dendro_report` stays. Two paths the replacement needs do not exist:
+parquet to `.dendro`, and `.rez` to `.dendro` in a wasm32 build (whether
+metriken-storage's conversion builds without `write` is not checked). Path
+step 4 rewrites `live.rs`; step 5 changes how both shells find templates.
+
+- **(a) Move after** step 4, step 5 and the rezolus 6.0 entry's Save as Report
+  change have landed in rezolus, so the library starts with the 6.x shape.
+- **(b) Move first**, and make those changes in the library.
+
+Recommendation: (a). Under (b) each of those changes is written once in
+rezolus's tree (where its tests run) and again in the library, or written in
+the library before rezolus can use it.
+
+### Q7. Where do the built-in templates live after step 5?
+
+After step 5 a new archive carries its producer's template. Older
+recordings (parquet, 5.x `.rez`, archives recorded before a producer sent
+its template) only match the built-in registry by source name. vllm, sglang
+and valkey are scraped Prometheus servers with no metriken producer to own
+their templates; the recorder takes them per endpoint
+(`--endpoint url,template=<file>`).
+
+- **(a) The library has no built-in templates.** An application passes a
+  `TemplateRegistry` as the fallback. rezolus keeps its 11 files (for old
+  recordings and for `record --endpoint url,template=vllm`); cachecannon and
+  llm-perf keep theirs in their repositories (their step 6).
+- **(b) metriken-dashboard embeds all 11.** Each template edit then needs a
+  metriken-dashboard release, which piece 3 exists to remove.
+
+Recommendation: (a).
+
+### Q8. Do the TUI and MCP stay in rezolus?
+
+`view --tui` (2,258 lines, ratatui) reads the section model; MCP
+(`src/mcp`) reads archives through metriken-query and formats viewer links
+(`src/mcp/link.rs`, pinned to `url_state.js` by
+`tests/viewer_link_parity.test.mjs`).
+
+Recommendation: both stay. The TUI becomes a consumer of metriken-dashboard's
+model; it is not part of GO 5. The viewer link format moves into the library
+as a Rust function (`metriken_viewer::link`) beside `url_state.js`, with the
+parity test, so MCP calls it instead of keeping a copy.
+
+### Q9. Which consumers move inside step 7?
+
+- rezolus: required (it is the source of the code, and 6.0.0 waits for it).
+- cachecannon: the plan's GO 5 names `cachecannon view`; cachecannon's own
+  plan says "after rezolus 6.0.0".
+- systemslab: piece 5 says it mounts the same library. Its UI is Svelte; it
+  uses the dashboard model and vendored chart modules, not the server or the
+  page.
+
+Recommendation: step 7 closes when rezolus is on the released crates and a
+cachecannon branch passes GO 5; cachecannon merges and releases on its own
+schedule, so rezolus 6.0.0 does not wait for a cachecannon release.
+systemslab moves its `dashboard` pin to `metriken-dashboard` and its chart
+sync to `metriken-viewer`'s tag in its own entry
+(`docs/journal/2026-10-08-dendro-artifacts.md`), after rezolus 6.0.0, as its
+reader PR already does.
+
+### Q10. Is a non-root mount in scope?
+
+The page requires `/` (`<base href="/">`, absolute `/api/v1` paths). cachecannon
+and rezolus mount at `/`. Recommendation: out of scope; recorded under "Left
+alone".
+
+## Design
+
+### Crates
+
+Following Q1 (b), both in `iopsystems/metriken-viewer`, 0.x versions.
+
+**`metriken-dashboard`.** Depends on metriken-query and metriken-storage
+(reader features only), serde, serde_json. No `metriken`, no threads; builds
+for wasm32. Holds:
+
+- the model (`plot.rs`: `View`, `Group`, `Plot`, `PlotOpts`, `Unit`), the
+  display wire format, events, the metric catalog, capture aliases;
+- `ServiceExtension`, `CategoryExtension`, `Kpi`, `Check`, and
+  `TemplateRegistry` without an embedded set (`embedded()` and
+  `from_embedded` go; `load(dir)`, `from_templates` and `insert_template`
+  stay);
+- `service_extensions_from_metadata`, moved from rezolus's
+  `src/viewer/metadata.rs` (step 5 moves it into the dashboard crate first,
+  so both shells call it);
+- source classification (`source_kind.rs`), with the rezolus fingerprint
+  (`REZOLUS_SELF_ANCHORS`, `source == "rezolus"`) moved behind the provider
+  trait below, so the library does not name rezolus;
+- the section context and the template, category, simple-capture and query
+  explorer sections;
+- a provider trait for sections an application generates in Rust:
+
+```rust
+pub trait SectionProvider: Send + Sync {
+    /// Whether this provider's sections apply to a source, from its name,
+    /// metadata and metric names (rezolus: `source == "rezolus"`,
+    /// `sampler_status`, or a self-sampler metric).
+    fn claims(&self, source: &SourceInfo<'_>) -> bool;
+    /// Navigation entries, in order, for a recording one of whose sources
+    /// this provider claims.
+    fn sections(&self) -> Vec<Section>;
+    fn generate(&self, data: &dyn MetricsSource, route: &str, nav: Vec<Section>)
+        -> Option<View>;
+    /// The overview, when this provider supplies one.
+    fn overview(&self, data: &dyn MetricsSource, nav: Vec<Section>,
+        throughput_query: Option<&str>) -> Option<View> { None }
+}
+pub struct Dashboards { providers: Vec<Arc<dyn SectionProvider>>, templates: TemplateRegistry }
+```
+
+`build_dashboard_context` and `generate_section` take a `&Dashboards`
+instead of reading `SECTION_META`. Today's `SourceEntry { is_rezolus }`
+becomes the provider that claimed the source. rezolus's sections become
+`rezolus-dashboard`'s implementation (Q2). Names and shapes are settled in
+step 1 below, against rezolus's and cachecannon's callers.
+
+**`metriken-viewer`.** Depends on metriken-dashboard, metriken-query,
+metriken-storage (reader, and `write` for report saving off wasm32), and
+behind features:
+
+- `server` (default): axum, tower-http, tokio, include_dir. The router, the
+  state, file / A/B / upload / URL load / follow modes, Save as Report, the
+  embedded assets.
+- `live`: metriken-recorder with `http` (Q4).
+- `dev`: serving assets from a directory and `tower-livereload` plus
+  `notify` for page reload.
+- `wasm`: wasm-bindgen; the `Viewer` and `WasmCaptureRegistry` exports, and
+  no `server`. Builds for wasm32 with no `metriken`, `metriken-core` or
+  `linkme`, and no `std::thread::spawn` on any reachable path (the reader's
+  sequential wasm arm stays).
+
+It absorbs `RezReader` and `LiveReader` from rezolus's `crates/rez`
+(about 450 production lines), the `parquet_metadata` keys the viewer reads
+(report, selection, events, A/B markers), and `crates/report-save` reduced to
+the `.dendro` builders (Q6).
+
+### Server API
+
+```rust
+pub struct ViewerConfig {
+    pub dashboards: Dashboards,
+    pub assets: Assets,               // Assets::Embedded, or Assets::Dir(path) with `dev`
+    pub brand: Brand,                 // page title, /about text, version string
+    pub proxy_allow: Allowlist,       // `--proxy-allow`
+    pub query_concurrency: usize,
+    pub cache_bytes: usize,
+    pub upload_limit: usize,          // today 50 MiB
+    #[cfg(feature = "live")]
+    pub live: Option<LiveConfig>,     // client, Probe, interval; None hides /connect
+}
+pub enum Input {
+    Empty,                                  // upload-only
+    File { path: PathBuf, follow: bool },   // parquet, .rez, .dendro; follows a running writer
+    Recordings { baseline: Recording, experiment: Option<Recording> }, // after the caller's selection
+    #[cfg(feature = "live")]
+    Live(Url),
+}
+pub struct Viewer { .. }
+impl Viewer {
+    pub async fn open(cfg: ViewerConfig, input: Input) -> Result<Self, OpenError>;
+    pub fn recordings(path: &Path) -> Result<Vec<(Labels, Recording)>, OpenError>;
+    pub fn router(&self) -> axum::Router;  // mount at "/"
+    pub fn notices(&self) -> &[String];    // what the server logs today
+    pub async fn shutdown(self);           // finish live sessions, remove live directories
+}
+```
+
+`rezolus view` keeps its clap command, `--baseline`/`--experiment` selection
+(over `RecordingSelector` from `src/mcp`), `--templates`, the browser open
+and `REZOLUS_NO_OPEN`, `--tui`, signal handling, and its probe; it calls
+`Viewer::recordings`, selects, and passes `Input::Recordings`. The global
+state that `live.rs` keeps for a `process::exit` in the Ctrl-C handler
+(`LIVE_DIRS`, `LIVE_THREADS`) becomes `Viewer::shutdown`; the library calls
+no `process::exit`.
+
+rezolus's `developer-mode` feature becomes `Assets::Dir` pointing at the
+library checkout named by an environment variable, with `dev` enabled, so
+editing a JS file in the library checkout reloads `rezolus view` without a
+rebuild, as editing `src/viewer/assets` does today.
+
+### Assets
+
+The frontend lives in `metriken-viewer/assets/` and is embedded with
+`include_dir!`. The package stays under crates.io's 10 MB limit (2.1 MB of
+assets today). `index.html` takes the title from `Brand`. Branding in the JS
+(about 60 occurrences of "rezolus": the `rezolus-theme` localStorage key,
+`rezolus_report_` file name prefixes, `RezolusChart`) is renamed where a user
+sees it and kept where renaming would lose saved state (the theme key) or
+change file names users script against; each kept name is listed in step 1's
+commit.
+
+`metriken_viewer::assets::write_to(dir)` writes the embedded assets out, for
+static builds (Q5). systemslab's `sync:charts` reads the same files from the
+library's tag instead of a rezolus revision.
+
+### WASM bundle
+
+The library's `wasm` feature holds the exports; it declares no
+`#[wasm_bindgen(start)]`. An application's `cdylib` (rezolus's
+`crates/viewer`, about 30 lines) calls `metriken_viewer::wasm::install(
+Dashboards)` from its own start function. The library ships `build.sh`
+(wasm-pack, opt-level `s`, the Homebrew LLVM lookup, the binaryen structure
+check from rezolus's `cargo.yml`) taking the application crate's path and
+an output directory. The templates manifest that `build.sh` writes today
+comes from the application's template directory.
+
+### Report saving
+
+In 6.x Save as Report writes `.dendro` only. The library keeps
+`build_dendro_report` (a dendro source sealed into a copy) and whichever
+conversions the rezolus 6.0 entry builds (parquet to `.dendro`; `.rez` to
+`.dendro`, on wasm32 only if it builds there). A source it cannot convert in
+the browser offers no save, with a message pointing at `rezolus view`.
+
+### Templates
+
+A recording's dashboard comes from, in order: `service_queries` in the
+source's metadata (archive) or file metadata (parquet), then
+`per_source_metadata`, then the application's fallback registry by source
+name, then the section providers that claim the source, then a
+simple-capture section. One function in metriken-dashboard implements this
+order for both shells. After step 5 a cachecannon or llm-perf archive shows
+its dashboard in `rezolus view` with no rezolus template, and the fallback
+only serves recordings older than that.
+
+### What stays in rezolus
+
+`rezolus-dashboard` (the sampler sections and the rezolus fingerprint), the 11
+fallback templates, the `view` CLI (selection, `--templates`, browser open,
+`--tui`), the probe for live mode, the TUI, MCP, `site/` (landing, docs, the
+viewer page built from the library), `rezolus-viewer-<tag>.tar.gz` in the
+release workflow, and the `viewer-smoke` and `viewer-render` skills pointed at
+`rezolus view`. `crates/rez`, `crates/report-save` and `crates/dashboard` are
+deleted (`crates/rez`'s re-exports are replaced by imports from
+metriken-storage). The `viewer-parity` skill moves to the library's
+repository, rewritten for one crate.
+
+### cachecannon
+
+`cachecannon view` builds a `Viewer` with `Dashboards { providers:
+[rezolus-dashboard], templates: [cachecannon.json] }` and serves its
+`router()` on the axum server it already runs. Its `src/viewer/` (1,151
+lines) and its 5,869 lines of assets are deleted. Its Rust sections are
+replaced by its template; a plot the template cannot express is a
+cachecannon `SectionProvider`. `--server` and `--client` parquets become the
+experiment slot or a combined archive; that choice is cachecannon's.
+
+## GO / NO-GO
+
+GO when all hold:
+
+1. **One dashboard.** For one `.dendro` holding a rezolus agent and a
+   cachecannon run, `/api/v1/sections` and every `/data/<section>.json`
+   from `cachecannon view` and `rezolus view` are byte-identical, with
+   cachecannon's dashboard from the archive's template (plan GO 5).
+2. **Shell parity.** A native test in metriken-viewer builds the server state
+   and the WASM `Viewer` (the crate is `rlib` as well as `cdylib`, as
+   rezolus's `crates/viewer` is today) from the same fixtures (a rezolus
+   recording, a recording with a template, a simple capture, a two-recording
+   archive) and asserts `sections`, every section, `metrics`, `systeminfo`,
+   `file_metadata` and `metadata` are byte-identical. No such test exists
+   today; the skill describes it and the suite has one-sided tests.
+3. **Tests carried over.** rezolus's viewer tests (Rust, `node --test`,
+   `viewer_smoke.sh`) pass after rezolus moves onto the crates, and the JS
+   suite in the library runs 397 tests or more with none skipped other than
+   the 8 skipped today. A test whose expectation changes is named in its
+   commit.
+4. **Bundle size.** rezolus's `wasm_viewer_bg.wasm`, built by the library's
+   `build.sh`, is no more than 5% above the size at the commit before step 1
+   (6,557,109 bytes at 15c77844, to be re-measured there).
+5. **Page load.** On `metrics-9.6h.dendro`, five alternating runs of
+   `rezolus view` before and after, with the harness above: the build fails
+   when the median summed section span, summed `query_range` wall or peak
+   footprint is more than 5% worse and the ranges do not overlap (the
+   storage scan's rule). The 23% spread between runs above is why one run is
+   not enough.
+6. **No registry in the browser.** `cargo tree -p metriken-viewer
+   --no-default-features --features wasm --target wasm32-unknown-unknown -e
+   normal` lists no `metriken`, `metriken-core` or `linkme`, and
+   `cargo check` of that configuration is a CI step.
+7. **Developer mode.** With `Assets::Dir`, an edit to a file under the
+   library's `assets/` is served on the next reload without a rebuild.
+
+NO-GO if the section-provider trait cannot carry rezolus's sections without
+metriken-dashboard naming rezolus metrics, or if the WASM exports cannot be
+registered from an application crate. Then this entry records why, and the
+fallback is Q2 (a) for the sections or a bundle built in the library's
+repository.
+
+## Order of work
+
+0. **Prerequisites, in rezolus and metriken.** Path step 4 (live viewer on
+   `metriken-recorder`) and step 5 (templates from the archive, with
+   `service_extensions_from_metadata` in the dashboard crate and called by
+   both shells, closing the WASM gap above) are released and rezolus is on
+   them. The rezolus 6.0 entry's Save as Report change has landed (Q6).
+1. **Split inside rezolus.** With every test still in one tree: the provider
+   trait in `crates/dashboard`, rezolus's sections moved to a new
+   `crates/rezolus-dashboard`, `src/viewer` (minus the CLI and TUI) moved to
+   a library crate `crates/viewer-server` with the API above, the assets
+   moved into that crate, the WASM exports moved behind a feature with
+   `crates/viewer` reduced to the registering `cdylib`, `RezReader` and
+   `LiveReader` moved next to them. The shell-parity test (GO 2) and the
+   harness for GO 5 are written here, and GO 2 to GO 7 pass here. This is a
+   rezolus PR series and changes no behaviour.
+2. **New repository.** Copy `crates/dashboard` and `crates/viewer-server`
+   (with assets, JS tests, `build.sh`, the parity skill) to
+   `iopsystems/metriken-viewer` as `metriken-dashboard` and
+   `metriken-viewer`; whether to carry their history with `git filter-repo`
+   is decided then. CI there: nextest, clippy, rustfmt, the wasm32 checks,
+   `node --test`. rezolus builds against the branch through
+   `[patch.crates-io]` and passes GO 3 before the 0.1.0 releases.
+3. **rezolus on the released crates.** The in-tree copies are deleted, the
+   site build uses `assets::write_to`, the symlinks and their CI check go,
+   and `rezolus-dashboard` is published from the release workflow (Q2).
+4. **cachecannon branch** on the released crates (GO 1). It reads `.dendro`
+   by then (its step 5). Merged on cachecannon's schedule (Q9).
+5. **systemslab** in its own entry, after rezolus 6.0.0 (Q9).
+
+## Left alone
+
+- Mounting the page under a path other than `/` (Q10).
+- A generic WASM bundle published by the library (Q3 b).
+- Moving the TUI into a library.
+- The cachecannon defect noted under "Consumers" (`--server` and `--client`
+  sections queried against the benchmark parquet) is not reproduced; it goes
+  away when cachecannon mounts the library, and is to be reported to
+  cachecannon if it is confirmed before then.
+- The dashboard load numbers are from a laptop; the GO 5 runs use one host
+  for both builds, which is all the rule needs.

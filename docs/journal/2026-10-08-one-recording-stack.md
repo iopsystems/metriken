@@ -205,7 +205,9 @@ and the frame format is dendro's (`replicate::Frame`) carrying
 
 Open: whether `metriken-dashboard` and `metriken-viewer` live in this
 repository or a repository of their own; the viewer brings a JS build and
-static assets.
+static assets. Put to the owner as Q1 of the [viewer
+entry](2026-10-12-metriken-viewer.md), with a recommendation for a
+repository of their own.
 
 ## Pieces
 
@@ -405,4 +407,6 @@ re-exports what it moves, in the release after.
    size, sending only changed histogram members or sparse buckets; dendro's
    compaction keeping long-layout metadata; whether the route helper refuses
    an interval below its floor; the histogram query path; the storage scan's
-   gaps, each kept only if measured a clear win).
+   gaps, each kept only if measured a clear win). Design, gate and the
+   scope questions for the owner: [metriken-dashboard and
+   metriken-viewer](2026-10-12-metriken-viewer.md).
