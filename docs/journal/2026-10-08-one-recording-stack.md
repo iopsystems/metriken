@@ -243,14 +243,15 @@ Prometheus endpoint by scrape, and the calling process's own registry.
 - cachecannon records itself in process (cachecannon/cachecannon#176) through
   the same library rather than its own writer.
 
-A source whose `/metrics/stream` handshake opens is streamed, rezolus agent
-or not. A rezolus agent that predates the stream identifies itself on
-`/status` (or its `/` banner, before 5.16.0) and is covered by decision 1 of
-the rezolus entry. Any other source is scraped (rules in the
-[recorder entry](2026-10-12-metriken-recorder.md), Detection). Today `record` streams only a source it takes for a
-rezolus agent from `/metrics/binary`; rezolus adds detection by stream to its
-own recorder first (rezolus entry, "Endpoint detection"), and step 4 of the
-path moves that code.
+A source whose `/metrics/stream` handshake opens is streamed, rezolus agent or
+not. A rezolus agent that predates the stream identifies itself on `/status`,
+its `/` banner (before 5.16.0) or a `/metrics/binary` body that decodes as a
+`Snapshot`, and is covered by decision 1 of the rezolus entry. Any other
+source is scraped (rules in the [recorder
+entry](2026-10-12-metriken-recorder.md), Detection). Today `record` streams
+only a source it takes for a rezolus agent from `/metrics/binary`; rezolus
+adds detection by stream to its own recorder first (rezolus entry, "Endpoint
+detection"), and step 4 of the path moves that code.
 
 ### 3. Templates travel in the archive
 
