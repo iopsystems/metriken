@@ -4,7 +4,10 @@
 released by 2026-10-11 (metriken-model; metriken-storage and metriken-query;
 the stream route). The rezolus agent, cachecannon and llm-perf (on main
 since 2026-10-12) serve the stream. Step 4 (`metriken-recorder`) is next.
-Decided 2026-10-08:
+Decided 2026-10-12: rezolus's 5.x line stays on its own dependencies and
+recorder; `metriken-recorder` writes `.dendro` only; rezolus 6.0.0 is
+released after steps 4 to 7 and the follow-ups listed in step 7. Decided
+2026-10-08:
 
 - recording, exposition and viewing converge on one stack, and per-project
   recorders and viewer implementations are retired as their projects move;
@@ -240,7 +243,8 @@ Prometheus endpoint by scrape, and the calling process's own registry.
 
 A source whose `/metrics/stream` handshake opens is streamed, rezolus agent
 or not. A rezolus agent that predates the stream identifies itself on
-`/status` and is covered by decision 1 of the rezolus entry. Any other source
+`/status` (or its `/` banner, before 5.16.0) and is covered by decision 1 of
+the rezolus entry. Any other source
 is scraped at `/metrics`. Today `record` streams only a source it takes for a
 rezolus agent from `/metrics/binary`; rezolus adds detection by stream to its
 own recorder first (rezolus entry, "Endpoint detection"), and step 4 of the
@@ -303,10 +307,10 @@ Recommended: bindings.
 `cachecannon view`'s own dashboards. `rezolus view`, `cachecannon view` and
 systemslab mount the same library; systemslab, which today vendors rezolus's
 chart code at a rezolus revision and takes `dashboard` from a rezolus git tag,
-takes published crates and assets instead. The move happens once, after
-rezolus 6.0.0 is tagged, because the viewer is the part of rezolus changing
-fastest. `cachecannon view` reads `.dendro` before then through its metriken
-bump (cachecannon entry).
+takes published crates and assets instead. The move happens once, before
+rezolus 6.0.0 is tagged (decided 2026-10-12; it was planned for after, because
+the viewer is the part of rezolus changing fastest). `cachecannon view` reads
+`.dendro` before then through its metriken bump (cachecannon entry).
 
 ### 6. What stays
 
@@ -346,8 +350,9 @@ Each step is a release of the crates it touches; rezolus (its 6.x line;
 cachecannon and llm-perf move when they adopt it. For users of the
 `rezolus` binary the CLI, the files it writes and reads, and the wire stay
 the same, apart from the changes each step's entry names (the stream's
-metriken wire names in step 3; detection by stream and handshake identity
-in step 4); rezolus's own tests (including the compatibility fixtures in the
+metriken wire names in step 3; detection by stream, handshake identity and
+the rezolus entry's decision 1, which writes a defaulted run with an agent
+that cannot stream to `.rez`, in step 4); rezolus's own tests (including the compatibility fixtures in the
 rezolus entry) check that across each step. Library users (systemslab's
 `rez` and `dashboard` pins) change imports when they bump, or, where a
 step re-exports what it moves, in the release after.
@@ -389,4 +394,8 @@ step re-exports what it moves, in the release after.
    `.dendro` by default.
 7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
    6.0.0 (decided 2026-10-12: 6.0.0 is released after every open step and
-   follow-up, so its wire, formats and CLI ship complete).
+   these follow-ups, so its wire, formats and CLI ship complete: stream frame
+   size, sending only changed histogram members or sparse buckets; dendro's
+   compaction keeping long-layout metadata; whether the route helper refuses
+   an interval below its floor; the histogram query path; the storage scan's
+   gaps, each kept only if measured a clear win).
