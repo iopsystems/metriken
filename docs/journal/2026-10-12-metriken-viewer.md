@@ -176,12 +176,32 @@ The plan left this open ("Structure", last paragraph).
   `cargo test -p dashboard`, read by `display_wire_fixture.test.mjs`), so
   this split puts one format's two halves in two repositories.
 
-Recommendation: (b). Everything the viewer adds to a build (assets, JS tests,
-wasm toolchain) is in the new repository, metriken's CI and release PRs are
-unchanged, and the display wire fixture stays in one repository. In the 30
-days to 15c77844, `crates/dashboard/src` saw 24 commits and
-`src/viewer/assets` 21; I did not count how many of those also needed a
-metriken change in the same window.
+Decided 2026-10-12: (c). The draft recommended (b); the owner chose (c) on
+this evidence:
+
+- metriken-dashboard has consumers that never load the viewer. systemslab
+  depends on rezolus's `dashboard` crate and calls
+  `dashboard::generate_section` over a `&dyn MetricsSource` with its own
+  frontend (systemslab `Cargo.toml:93-100`); rezolus reads its KPI types in
+  `src/parquet_metadata.rs`, `src/parquet_tools/check.rs` and
+  `src/parquet_tools/combine.rs`, outside `src/viewer`.
+- `generate_section` takes `&dyn MetricsSource`, so dashboard must resolve the
+  same metriken-query as its caller or the trait object does not type-check
+  (systemslab `Cargo.toml:93-98`). In this workspace the two are released
+  together; in another repository every metriken-query release needs a
+  dashboard release before a consumer can move.
+- Since 2026-07-14, 13 of the 37 commits to `crates/dashboard` also touched
+  `src/viewer/assets` or `crates/viewer`. Under (c) each such change is two
+  PRs: a dashboard release, then the viewer. 21 of the 37 touched
+  `src/agent/samplers`; those are sampler sections, which stay in rezolus
+  (Q2), so they are not part of this cost.
+
+The display wire fixture keeps the format's two halves checked across the
+repositories: metriken-dashboard writes `display_wire_mixed.json` in its
+tests and ships it in the crate package, and metriken-viewer's
+`display_wire_fixture.test.mjs` reads it from the resolved dependency's
+source directory, so a dashboard release that changes the format fails the
+viewer's JS tests until the decoder follows.
 
 ### Q2. Where do rezolus's sampler sections live?
 
@@ -345,7 +365,8 @@ alone".
 
 ### Crates
 
-Following Q1 (b), both in `iopsystems/metriken-viewer`, 0.x versions.
+Following Q1 (c): `metriken-dashboard` in this repository, released with
+metriken-query; `metriken-viewer` in `iopsystems/metriken-viewer`. Both 0.x.
 
 **`metriken-dashboard`.** Depends on metriken-query and metriken-storage
 (reader features only), serde, serde_json. No `metriken`, no threads; builds
@@ -580,12 +601,14 @@ repository.
    `LiveReader` moved next to them. The shell-parity test (GO 2) and the
    harness for GO 5 are written here, and GO 2 to GO 7 pass here. This is a
    rezolus PR series and changes no behaviour.
-2. **New repository.** Copy `crates/dashboard` and `crates/viewer-server`
-   (with assets, JS tests, `build.sh`, the parity skill) to
-   `iopsystems/metriken-viewer` as `metriken-dashboard` and
-   `metriken-viewer`; whether to carry their history with `git filter-repo`
-   is decided then. CI there: nextest, clippy, rustfmt, the wasm32 checks,
-   `node --test`. rezolus builds against the branch through
+2. **New crates.** Copy `crates/dashboard` into this repository as
+   `metriken-dashboard` (released with metriken-query, with the display wire
+   fixture in its package), and `crates/viewer-server` (with assets, JS tests,
+   `build.sh`, the parity skill) to `iopsystems/metriken-viewer` as
+   `metriken-viewer`; whether to carry history with `git filter-repo` is
+   decided then. CI in the viewer repository: nextest, clippy, rustfmt, the
+   wasm32 checks, `node --test`; this repository's CI gains only the
+   `metriken-dashboard` wasm32 check. rezolus builds against the branch through
    `[patch.crates-io]` and passes GO 3 before the 0.1.0 releases.
 3. **rezolus on the released crates.** The in-tree copies are deleted, the
    site build uses `assets::write_to`, the symlinks and their CI check go,
