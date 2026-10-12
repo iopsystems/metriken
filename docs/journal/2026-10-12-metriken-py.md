@@ -92,17 +92,25 @@ labels, metadata, `time_range`. Raw access differs by container:
 
 - **`.dendro` and `.rez` v3** are catalogs, opened lazily: the `Catalog`
   trait (`metriken-storage/src/catalog.rs`) gives `sources`, `tables`,
-  `segment_meta`, `segment_bytes` and `live_wal`, and
-  `wal::materialize_wal_tail` turns a WAL tail into a segment. A long
-  table's occupant stream is the table `<table>/occupants`;
-  `long::OccupantLabels` maps an occupant number to its labels, and an
-  occupant never changes labels (`long.rs:163`).
+  `segment_meta`, `segment_bytes` and `live_wal`. A long table's occupant
+  stream is the table `<table>/occupants`; `long::OccupantLabels` maps an
+  occupant number to its labels, and an occupant never changes labels
+  (`long.rs:163`). A WAL tail is decoded by one of three functions, chosen
+  by what the table is (`reader.rs`, `live_tail` at `:295-308` and the
+  occupant read at `:452-453`): a wide table's tail by
+  `wal::materialize_wal_tail`, a long table's (one that has a
+  `<t>/occupants` table) by `wal::materialize_long_wal_tail`, and an
+  occupant stream's rows by `occupants::decode_wal_row`.
 - **A tar `.rez`** (v1/v2) is read eagerly into an `InMemorySource`
   (`rez/open.rs:4-6`, `archive.rs:54`): per recording, `(table, segments
   oldest first)` as parquet bytes. It has no WAL and no long tables
   (`reader.rs:414`).
-- **A parquet file** is opened by `metriken_query::ParquetReader`. It is one
-  wide table: no segments, no WAL, no occupants.
+- **A parquet file** is opened by `metriken_query::ParquetReader` for
+  queries. It is one wide table: no segments, no WAL, no occupants.
+  `ParquetReader` exposes no row groups or record batches
+  (`metriken-query/src/parquet.rs:30-292`), so the bindings read a parquet
+  file's rows with the parquet crate's `ParquetRecordBatchReaderBuilder`
+  and take its row-group count from the file's parquet metadata.
 
 **Query results are not Arrow.** `QueryResult::Matrix` holds `MatrixSample`s:
 labels as a `HashMap<String, String>`, `values: Vec<(f64, f64)>` with the
@@ -141,16 +149,16 @@ table's WAL tail, batches dropped after counting:
 | 3 | 7.05 s | 0.36 s | 6.42 s | 232 MB |
 
 1,665,118 rows. Decoded Arrow (`get_array_memory_size`) is 9,684 MB from
-1,272 MB on disk; holding every batch instead of dropping it peaked at
-8,539 MB RSS. Histograms are most of it: the five largest tables are
-histogram tables (2,206 MB for `syscall_latency`). Each histogram cell is a
-`List<UInt64>` of 496 cumulative buckets (grouping power 3, max value power
-64, from the field metadata); in one mid-recording segment the rows
-averaged 0 to 315 non-zero buckets, by histogram column. A full read of
-`long.dendro` (the long table's 76,446,307 rows and its occupant stream)
-took 1.53 s in one run, and its occupant stream held 264,286 rows. A
-Python consumer that reads whole tables gets these sizes; the API reads one
-table, and a time range, at a time.
+1,272 MB on disk; holding every batch instead of dropping it peaked at 8,539
+MB RSS. Histograms are most of it: the five largest tables are histogram
+tables (2,206 MB for `syscall_latency`). Each histogram cell is a
+`List<UInt64>` of 496 per-bucket counts, each cumulative since the producer
+started (grouping power 3, max value power 64, from the field metadata); in
+one mid-recording segment the rows averaged 0 to 315 non-zero buckets, by
+histogram column. A full read of `long.dendro` (the long table's 76,446,307
+rows and its occupant stream) took 1.53 s in one run, and its occupant
+stream held 264,286 rows. A Python consumer that reads whole tables gets
+these sizes; the API reads one table, and a time range, at a time.
 
 **Queries, in Rust, against `rezolus mcp query`.** Full range, step 1 s, one
 process per run, three runs (open is 17 ms):
@@ -341,18 +349,19 @@ container:
 
 | container | `tables()` | `read_table(t)` | `occupants(t)` |
 |---|---|---|---|
-| `.dendro`, `.rez` v3 | the `Catalog`'s tables for the recording, occupant streams included | sealed segments in sequence order, then the WAL tail through `materialize_wal_tail` | the table `<t>/occupants`, one row per occupant |
+| `.dendro`, `.rez` v3 | the `Catalog`'s tables for the recording, occupant streams included | sealed segments in sequence order, then the WAL tail through `materialize_wal_tail` (wide) or `materialize_long_wal_tail` (long) | the table `<t>/occupants`, sealed segments and WAL rows (`occupants::decode_wal_row`), one row per occupant |
 | tar `.rez` | the `InMemorySource`'s table names | its segments, oldest first; no WAL tail | `ValueError`: a tar `.rez` has no long tables |
-| parquet | one table, `parquet`, layout wide | the file's row groups, as `ParquetReader` reads them | `ValueError`: a parquet file has no long tables |
+| parquet | one table, `parquet`, layout wide | the file's row groups, through the parquet crate's `ParquetRecordBatchReaderBuilder` | `ValueError`: a parquet file has no long tables |
 
 Segment and span counts in `tables()` come from `segment_meta` for a
-catalog, from the segment list for a tar `.rez`, and are the row-group
-count for a parquet.
+catalog and from the segment list for a tar `.rez`. For a parquet file the
+segment count is the row-group count from the file's parquet metadata.
 
 ### Histograms
 
-- **In table rows:** the stored `List<UInt64>` of cumulative bucket counts,
-  zero-copy, with `grouping_power` and `max_value_power` in the column map.
+- **In table rows:** the stored `List<UInt64>` of per-bucket counts, each
+  cumulative since the producer started, zero-copy, with `grouping_power`
+  and `max_value_power` in the column map.
   `bucket_bounds` computes each bucket's bounds with the `histogram` crate,
   so no consumer reimplements the H2 index arithmetic, as the `.rez` script
   above does. Differencing consecutive rows is the caller's, in polars or
@@ -399,16 +408,24 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    `(source, selector, start, end, stride)`, the selector as a PromQL
    selector string, and yields `(timestamp_ns, index, count)` per tick;
    `quantiles_impl`, `heatmap_impl` and the bindings all use its per-tick
-   accumulation. It takes a string and a source because the pieces a
-   caller would otherwise assemble are not public: the selector parser is
-   `QueryEngine::parse_metric_selector`, a private method
-   (`promql/mod.rs:591`), and `histogram_stream` is re-exported
-   `pub(crate)` (`lib.rs:57`). The function is additive, so it ships in a
-   0.36.x release; the existing histogram tests in metriken-query guard the
-   refactor of `quantiles_impl` and `heatmap_impl` onto it. Then check 8
+   accumulation. The selector parser (`QueryEngine::parse_metric_selector`,
+   private, `promql/mod.rs:591`) and the per-tick accumulation are
+   metriken-query's; a caller could fetch the stream from metriken-storage
+   (`DataSource::histogram_stream`, public through
+   `ArchiveReader::owners_of`, `SamplerReader::reader()` and
+   `TableReader::source()`) but would reimplement the accumulation, which
+   check 8 must test one copy of. The function is additive, so it ships in a
+   0.36.x release after 0.36.1; the existing histogram tests in
+   metriken-query guard the refactor of `quantiles_impl` and `heatmap_impl`
+   onto it. Then check 8
    below tests the conversion and h2histogram's arithmetic, and not two
    copies of the accumulation. The result is Arrow first
-   (`hs.buckets`); `hs.to_h2()` builds one
+   (`hs.buckets`), with one row per tick (or stride) that has at least one
+   non-zero bucket after the difference, the same ticks at which the engine
+   emits a point: `flush_accum` returns false for an empty tick and the
+   engine emits nothing for it. A tick with no difference has no row, so
+   `hs.buckets` and `to_h2()` never contain an empty histogram.
+   `hs.to_h2()` builds one
    `h2histogram.SparseHistogram.from_parts(config, index, count)` per tick,
    or with `dense=True` a `Histogram` via `to_dense()`. Sparse is the
    default because every bucket becomes a Python `int`, and a stored row in
@@ -435,6 +452,16 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    non-zero scan run in Rust over the Arrow buffers; Python receives
    `(index, count)` lists. A long table's histogram column is per occupant,
    so `from_column` differences within an occupant, never across occupants.
+   A batch whose schema lacks the column (a wide table's segments do not
+   share one schema) is read as a null cell in each of its rows: each gives
+   `None`, and the next non-null cell is differenced from the last non-null
+   cell before the batch. The engine does the same: a segment without the
+   metric contributes no rows to the spliced histogram stream
+   (`segmented.rs:1604-1609`), so `prev_per_series` (`histogram.rs:298`)
+   carries across it. A column whose `grouping_power` or `max_value_power`
+   changes between batches raises `ValueError`; the engine splits such a
+   metric into runs labelled `__run__`, and a selector without `__run__`
+   reads the first run only (`segmented.rs:1612-1637`).
 
 The conversion copies: an h2histogram object holds Python lists. A caller
 who wants zero-copy stays with `hs.buckets` or the stored column. The cost
@@ -447,28 +474,38 @@ counts, with the band `[start, end]` of that bucket
 `cumulative.rs:599`). h2histogram's `percentile(q)` returns a `Bucket` with
 inclusive `start`/`end`, at rank 1 for q = 0, `total` for q = 1, and
 `max(1, ceil(q * total))` otherwise (`_analytics.py:55`), which is the same
-bucket for totals up to 2^53, once the engine stops capping counts at
-u32::MAX (step 4). So the value from h2histogram is `bucket.end`, and the
-band is `(bucket.start, bucket.end)`.
+bucket for totals up to 2^53, from metriken-query 0.36.1 on, which stops
+capping counts at u32::MAX (below). So the value from h2histogram is
+`bucket.end`, and the band is `(bucket.start, bucket.end)`.
 
-**The engine caps counts at u32::MAX today.** `flush_accum`
-(`histogram.rs:893-912`) clips each running cumulative count to u32::MAX,
-and `apply_quantiles` (`:914-936`), the reduce path behind
-`histogram_count`, `histogram_sum` and `histogram_mean` (`:435`) and
-`heatmap_impl` (`:685`) read the result as a `CumulativeROHistogram32Ref`.
-Any tick or stride whose summed count exceeds 2^32 gets the wrong answer,
-from Python or not. Reproduced on 2026-10-12 against metriken-query at
-d2bf74d (a scratch binary over `MemoryStore`): one series, an empty row
-then a row with 4e9 observations in bucket 100 and 1e9 in bucket 200,
-config (3, 64). `histogram_quantiles([0.85], ...)` returns the band
-[24576, 26623] (bucket 100) where the counts give [134217728, 150994943]
-(bucket 200); `histogram_count` returns 4,294,967,295 for 5e9; the heatmap
-gives bucket 200 a count of 294,967,295 for 1e9. The same counts through
-histogram 1.4.1's u64 `CumulativeROHistogramRef` (`cumulative.rs:644-652`)
-give bucket 200. Step 4's metriken-query release switches `flush_accum`,
-`apply_quantiles`, the reduce path and `heatmap_impl` to the u64 type and
-adds a test with a tick total above 2^32. Check 8 is exact equality only
-against that release.
+**metriken-query 0.36.0 caps counts at u32::MAX.** `flush_accum`
+(`histogram.rs:893-912`) clips each running cumulative count to u32::MAX
+in a `u32` scratch buffer, and three paths read that buffer:
+`apply_quantiles` builds a `CumulativeROHistogram32Ref` from it (`:923`);
+the reduce path behind `histogram_count`, `histogram_sum` and
+`histogram_mean` does the same (`reduce`, `:493`, `:533`, `:557`, `:571`);
+and `heatmap_impl` builds no histogram type, but differences consecutive
+entries of the clipped `u32` buffer to get each bucket's count (its
+`emit_tick` closure, `:720-746`). Any tick or stride whose summed count
+exceeds 2^32 gets the wrong answer, from Python or not. Reproduced on
+2026-10-12 against metriken-query at d2bf74d (a scratch binary over
+`MemoryStore`): one series, an empty row then a row with 4e9 observations
+in bucket 100 and 1e9 in bucket 200, config (3, 64).
+`histogram_quantiles([0.85], ...)` returns the band [24576, 26623] (bucket
+100) where the counts give [134217728, 150994943] (bucket 200);
+`histogram_count` returns 4,294,967,295 for 5e9; the heatmap gives bucket
+200 a count of 294,967,295 for 1e9. The same counts through histogram
+1.4.1's u64 `CumulativeROHistogramRef` (`cumulative.rs:644-652`) give
+bucket 200.
+
+The fix is a separate patch release, metriken-query 0.36.1, not part of
+this entry's step 4: `flush_accum` keeps the running count as `u64`,
+`apply_quantiles` and the reduce path read it through
+`CumulativeROHistogramRef`, and `heatmap_impl` differences the `u64`
+buffer. No public type changes. It adds a test with a tick of 5e9
+observations, the case above. As of 2026-10-12 it is a local branch, not
+merged or released. Check 8 is exact equality only against 0.36.1 or
+later.
 
 ### Binding technology
 
@@ -530,15 +567,26 @@ crates.io.
   from bytes shares one `Mutex` across all its tables
   (`DbHandle::Shared`, `reader.rs:1195`), so its fetches serialize. Not
   measured; the measurement above used two separate opens.
+- `read_table` cannot use the engine's connection: the per-table store
+  that holds it (`DbSegmentStore`) is private. It follows the same rule
+  with its own connections. For a file, each table gets its own catalog
+  connection behind its own `Mutex`, opened on that table's first
+  `read_table` and kept by the recording, so `read_table` on two tables
+  runs in parallel and on one table serializes. For an archive opened from
+  bytes, `read_table` on every table shares one connection behind one
+  `Mutex`, as the engine's tables do.
 - After `fork`, a SQLite connection opened in the parent must not be used in
   the child. Python's `multiprocessing` forks by default on Linux before
   3.14. A recording remembers the pid that opened it, and a call from another
-  pid raises an error saying to open the file in the child. Drop in another
-  pid leaks the reader: it takes no lock, because a per-table `Mutex` held
-  by another parent thread at the fork stays locked in the child, and it
-  closes no connection. Recordings are not picklable (`__reduce__` raises
-  `TypeError` saying to pass the path), so `multiprocessing` workers open
-  the file by path.
+  pid raises an error saying to open the file in the child. The check is on
+  every object that holds a reference to a reader or a connection, not only
+  the recording: a `read_table` iterator, a view returned by `reopen()`, a
+  histogram result if it reads lazily. Each checks the pid when called and
+  when dropped. Drop in another pid leaks what the object holds: it takes
+  no lock, because a per-table `Mutex` held by another parent thread at the
+  fork stays locked in the child, and it closes no connection. Recordings
+  are not picklable (`__reduce__` raises `TypeError` saying to pass the
+  path), so `multiprocessing` workers open the file by path.
 - Arrow buffers handed to Python are owned by Rust allocations released when
   the last Python reference goes; they outlive the recording object.
 
@@ -566,16 +614,24 @@ the bindings have it open.
 
 ### A file still being written
 
-A recording opened while a recorder or hindsight writes it is a fixed view:
-the WAL tail is materialized into a segment at open, and later rows are not
-seen (the same as `ArchiveReader` everywhere). `r.reopen()` returns a new
-view, using `ArchiveReader::keep_handover` and `reuse_from` so segments
-already read are not read again, as rezolus's `crates/rez/src/live.rs`
-does. `r.complete` is false until the writer finalizes. The open-time cost
+A recording opened while a recorder or hindsight writes it is a fixed view.
+A recording's table list and spans are read at open. Each table's segment
+list and WAL tail are read the first time that table is queried, and are
+fixed from then on (`SamplerReader::reader()` builds them once, in a
+`OnceLock`, through `DbSegmentStore::build`, `reader.rs:311-341`). Rows
+written later are not seen. `read_table` keeps its own view per table by
+the same rule: on a table's first `read_table` it reads `segment_meta` and
+`live_wal` in one call on its connection, and every later `read_table` of
+that table reuses that list and that tail. The engine's view of a table
+and `read_table`'s are taken at different moments, so on a file being
+written a query and a `read_table` of the same table can differ by the
+rows written in between. `r.reopen()` returns a new view, using
+`ArchiveReader::keep_handover` and `reuse_from` so segments already read
+are not read again, as rezolus's `crates/rez/src/live.rs` does. `r.complete` is false until the writer finalizes. The open-time cost
 of a large WAL tail is not measured.
 
-A held view can lose rows. The view lists each table's segments at open
-and fetches their bytes when read, so a segment that hindsight's
+A held view can lose rows. The view lists a table's segments when the table
+is first read and fetches their bytes later, so a segment that hindsight's
 retention deletes in between is gone. Queries already handle this: an
 occupant stream skips a missing segment (`reader.rs:431-446`), and a table
 with no segments and no tail left is reported as absent with a warning
@@ -583,6 +639,33 @@ with no segments and no tail left is reported as absent with a warning
 bytes are gone, and the iterator's `missing_segments` count, read after it
 is exhausted, says how many were skipped, so a caller can tell a short read
 from a short table.
+
+A held view can also read the wrong rows, and `missing_segments` does not
+show it. A sequence number in the view's list can name different bytes by
+the time they are fetched: dendro's compaction gives a merged segment the
+sequence number of the first segment it replaced (`compact_stream`, dendro
+0.4.0 `rewrite.rs:196`, and the comment on `segment_key`,
+`reader.rs:276-283`), and numbering restarts for a stream whose segments
+were all evicted. In a single pass in sequence order a merge cannot repeat
+rows already read, because the merged segment keeps the lowest number of its
+run. It can still return more than was listed: the merged segment holds the
+whole run where the list expected only the run's first segment, and the
+run's later numbers then read as missing although their rows arrived. A
+restarted number can return a segment sealed from WAL rows that the view's
+materialized tail already holds, and those rows are returned twice. The
+engine has the same exposure: its `DbSegmentStore::bytes` fetches by the
+listed number and does not compare what comes back with the listed
+`segment_key`, and nothing in `splice_histogram_streams` drops overlapping
+rows; that is from reading the code, not reproduced. Whether a table read by
+two queries, one before a merge and one after, can combine a cached decode
+of a segment with the merged segment's copy of the same rows was not
+checked. `read_table` checks each fetched segment's row count and first and
+last timestamp, from the decoded rows, against the `segment_meta` it listed
+(the inputs of `segment_key`), and raises an error saying to `reopen()` when
+they differ. The engine's exposure is a metriken-storage issue, outside the
+bindings. Nothing in metriken origin/main outside a test, or in rezolus
+15c77844, calls dendro's compaction on a file being recorded; rezolus's
+hindsight snapshot compacts its copy.
 
 ### Packaging and publishing
 
@@ -631,22 +714,29 @@ release workflow on each wheel's platform.
    `MetricsSource::query_range_opts` called from Rust on the same commit,
    for the golden queries. (a) gates 0.1.0. (b) gates 0.1.0 if the owner
    answers question 6 "wait", and gates the first 0.1.x after the fixtures
-   are checked in otherwise; until question 6 is answered, (b) gates
-   0.1.0. Against `rezolus mcp query` of a rezolus release built on the
-   same metriken-query version: that command prints a summary per series
-   (`src/mcp/mod.rs:1024`), so the comparison is per series, of the point
-   count, the first and last timestamp and value, and the minimum and
-   maximum, all exact (it prints f64 with `{}`, which round-trips), and the
-   bands after rounding to six decimals (it prints them with `{:.6}`). This
+   are checked in otherwise; until question 6 is answered, (b) gates 0.1.0.
+   Against `rezolus mcp query` of a rezolus release built on the same
+   metriken-query version: that command prints a summary per series
+   (`format_query_result`, `src/mcp/mod.rs:1024` at 15c77844), so the
+   comparison is per series, of the point count, the first and last
+   timestamp and value, and the minimum and maximum, all exact (it prints
+   f64 with `{}`, which round-trips). It prints a series' `intervals`
+   `[lo, hi]` only beside the First and Last lines, with `{:.6}`, so the
+   bands compared are those two points', after rounding to six decimals;
+   the bands at every other point are compared only against Rust in (a)
+   and (b). This
    is the plan's criterion 4.
 2. **Tables complete.** For every table of every fixture, the rows from
-   `read_table` equal what the container holds: for a `.dendro` and a
-   `.rez` v3, the sealed segments from the `Catalog` plus the WAL tail from
-   `materialize_wal_tail`; for a tar `.rez`, the `InMemorySource`'s
-   segments; for a parquet, the rows `pyarrow.parquet.read_table` gives for
-   the file. `read_table(t, occupant_labels=True)` on a long table gives
-   each row the labels `OccupantLabels` gives its occupant, and
-   `occupants(t)` on a tar `.rez` or a parquet raises the documented error.
+   `read_table` equal what the container holds: for a `.dendro` and a `.rez`
+   v3, the sealed segments from the `Catalog` plus the WAL tail from
+   `materialize_wal_tail` for a wide table or `materialize_long_wal_tail`
+   for a long one, and for an occupant stream its segments plus its WAL rows
+   through `occupants::decode_wal_row`; for a tar `.rez`, the
+   `InMemorySource`'s segments; for a parquet, the rows
+   `pyarrow.parquet.read_table` gives for the file. `read_table(t,
+   occupant_labels=True)` on a long table gives each row the labels
+   `OccupantLabels` gives its occupant, and `occupants(t)` on a tar `.rez`
+   or a parquet raises the documented error.
 3. **Zero copy.** In CI, reading a table into pyarrow grows
    `pyarrow.total_allocated_bytes()` by 0, and `polars.from_arrow(table,
    rechunk=False)` on that pyarrow `Table`, for a one-batch result, keeps
@@ -685,27 +775,30 @@ release workflow on each wheel's platform.
    CPython 3.10 and 3.14 (the oldest supported and the newest, since one
    abi3 wheel serves both); the tests then run with the `pyarrow`,
    `polars` and `h2histogram` extras installed.
-8. **Histograms round-trip through h2histogram.** Against the metriken-query
-   release from step 4, which no longer caps counts at u32::MAX. For every
-   histogram metric in every fixture, `histogram_quantiles([0, 0.5, 0.9,
-   0.99, 0.999, 1], m)` from `query_range` and `[h.percentile(q) for each
-   tick's h in r.histograms(m).to_h2()]` agree within bucket error: at
-   every timestamp, h2histogram's bucket `(start, end)` equals the engine's
-   band and `float(bucket.end)` equals the engine's value (the engine's
-   values are f64, which rounds a bucket end above 2^53). The same holds
-   with a stride, with `dense=True`, and for `from_column(..., delta=True)`
-   on a single-series column against the query with that series' labels,
-   where a timestamp with no engine point matches a `None` or an empty
-   histogram. Equality of the bucket is the test, not a tolerance of one
-   bucket width, because both sides use the same rank (see "Percentile
-   conventions agree"); a disagreement is a bug in the conversion. The
-   fixtures include a series whose producer restarted mid-recording, so
-   the saturating difference is exercised, a column with a null cell, so
-   the difference across a gap is, and a tick whose total exceeds 2^32.
+8. **Histograms round-trip through h2histogram.** Against metriken-query
+   0.36.1 or later (the u32::MAX cap fixed) with step 4's per-tick function.
+   For every histogram metric in every fixture, `histogram_quantiles([0,
+   0.5, 0.9, 0.99, 0.999, 1], m)` from `query_range` and `[h.percentile(q)
+   for each tick's h in r.histograms(m).to_h2()]` agree within bucket error:
+   at every timestamp, h2histogram's bucket `(start, end)` equals the
+   engine's band and `float(bucket.end)` equals the engine's value (the
+   engine's values are f64, which rounds a bucket end above 2^53). The same
+   holds with a stride and with `dense=True`, and the two sides have the
+   same timestamps (`hs.buckets` has a row exactly where the engine has a
+   point). For `from_column(..., delta=True)` on a single-series column
+   against the query with that series' labels, a row whose timestamp has no
+   engine point must be `None` or an empty histogram, and every other row
+   must match the engine's point. Equality of the bucket is the test, not a
+   tolerance of one bucket width, because both sides use the same rank (see
+   "Percentile conventions agree"); a disagreement is a bug in the
+   conversion. The fixtures include a series whose producer restarted
+   mid-recording, so the saturating difference is exercised; a column with a
+   null cell and a segment without the column, so the difference across a
+   gap is; and a tick whose total exceeds 2^32, so a cap like 0.36.0's fails
+   the check. Step 4 builds these fixtures.
 
-NO-GO if 5 fails because of the binding itself (conversion, capsule export,
-GIL handling) and not because of the engine. That blocks the release: the
-cost and its mechanism are recorded here, and 0.1.0 waits until 5 passes.
+If 5 fails, 0.1.0 waits: the difference and its mechanism are recorded
+here first.
 NO-GO for bindings as a whole if the extension cannot be built for Linux
 aarch64 under manylinux_2_28; then the Python reader against dendro's
 `FORMAT.md`, the plan's alternative, is priced instead.
@@ -719,18 +812,22 @@ aarch64 under manylinux_2_28; then the Python reader against dendro's
 2. **Queries.** `query_range` and `query` with rate mode and rate span
    (`QueryOptions`); the cross-cadence policy comes with `ArchiveReader`'s
    `MetricsSource` and needs nothing here; histogram results;
-   `to_polars`. Checks 1(a) and 3 run here.
+   `to_polars`. Check 1(a) runs here.
 3. **Tables.** `metrics`, `tables`, `columns`, `read_table` with time range
    and WAL tail, `occupants`, the occupant join, `bucket_bounds`, `reopen`,
-   the fork check. Check 2 runs here.
-4. **Histograms.** In metriken-query, one 0.36.x release: the per-tick
-   function, shared by `quantiles_impl` and `heatmap_impl`; and the switch
-   of `flush_accum`, `apply_quantiles`, the reduce path and `heatmap_impl`
-   from `CumulativeROHistogram32Ref` to the u64 `CumulativeROHistogramRef`,
-   with a test whose tick total exceeds 2^32 (the cap described under
-   "Percentile conventions agree"). Then `r.histograms`, `to_h2`,
-   `metriken.h2.from_column` and the `h2histogram` extra. Check 8 runs
-   here, on storage's archives.
+   the fork check. Checks 2 and 3 run here (3 reads a table through
+   `read_table`).
+4. **Histograms.** Needs metriken-query 0.36.1, the separate patch release
+   that removes the u32::MAX cap (described under "Histograms as
+   h2histogram objects"). In metriken-query, a later 0.36.x release: the
+   per-tick function, shared by `quantiles_impl` and `heatmap_impl`. Then
+   `r.histograms`, `to_h2`, `metriken.h2.from_column` and the `h2histogram`
+   extra. Step 4 builds check 8's fixtures: a series whose producer
+   restarted mid-recording, a column with a null cell, a wide table where
+   one segment lacks the column, and a tick whose total exceeds 2^32. They
+   are written by a Rust test helper in `metriken-py/` through
+   metriken-storage's writer. Check 8 runs here, on
+   those fixtures and storage's archives.
 5. **Fixtures and workflows.** Checks 1(b) and 8 on rezolus's
    compatibility fixtures once they are checked in (they are copied into
    `metriken-py/tests/`, so this repository does not depend on rezolus's

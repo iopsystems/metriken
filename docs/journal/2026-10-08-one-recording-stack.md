@@ -406,10 +406,12 @@ re-exports what it moves, in the release after.
    compaction keeping long-layout metadata; whether the route helper refuses
    an interval below its floor; the histogram query path; the storage scan's
    gaps, each kept only if measured a clear win). The histogram query path
-   has a correctness bug to fix whatever else is decided: metriken-query's
-   `flush_accum` caps running bucket counts at u32::MAX and the quantile,
-   reduce and heatmap code reads them as `CumulativeROHistogram32Ref`, so
+   had a correctness bug, fixed in a separate patch release: in
+   metriken-query 0.36.0, `flush_accum` caps running bucket counts at
+   u32::MAX in a `u32` buffer; the quantile and reduce paths read it as
+   `CumulativeROHistogram32Ref` and the heatmap differences it directly, so
    `histogram_quantiles`, `histogram_count`/`_sum`/`_mean` and
    `histogram_heatmap` are wrong for any tick or stride whose total exceeds
    2^32 (reproduced 2026-10-12; [metriken-py](2026-10-12-metriken-py.md),
-   "Percentile conventions agree", which fixes it in its step 4).
+   "Histograms as h2histogram objects"). metriken-query 0.36.1 keeps the
+   counts as `u64`; as of 2026-10-12 it is a local branch, not released.
