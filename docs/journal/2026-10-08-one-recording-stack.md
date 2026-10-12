@@ -117,9 +117,12 @@ Each crate and what it depends on:
 - `metriken-recorder`: `metriken-storage`, `metriken-model`,
   `metriken-types`, dendro (feature `registry`: `metriken-exposition`, which
   links `metriken`, for a producer recording its own registry).
-- `metriken-dashboard`: `metriken-query`.
-- `metriken-viewer`: `metriken-dashboard`, `metriken-query`,
-  `metriken-storage` (report saving), `metriken-recorder` (live mode).
+- `metriken-dashboard`: `metriken-query`, `metriken-storage` (reader
+  features only).
+- `metriken-viewer`, in `iopsystems/metriken-viewer`: `metriken-dashboard`,
+  `metriken-query`, `metriken-storage` (report saving), `metriken-recorder`
+  (live mode), all by crates.io version.
+- `rezolus-dashboard`, in rezolus: `metriken-dashboard`.
 
 Four of these edges need explaining:
 
@@ -180,8 +183,8 @@ Four of these edges need explaining:
 | `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`, `MemoryStoreInner`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` forwards to storage's, where `MemoryStore`'s snapshot loading reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
 | `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.dendro` output (6.x writes no other container). Serves rezolus's 6.x line; 5.x keeps its own recorder (decided 2026-10-12). | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
-| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, and templates read from source metadata. | rezolus `crates/dashboard` |
-| `metriken-viewer` | The viewer as a library: a server router to mount, the chart and UI assets, the WASM bundle, report saving. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
+| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, templates read from source metadata, and a section-provider trait for sections an application generates in Rust. Released with `metriken-query`. | rezolus `crates/dashboard` without its sampler sections (those become `rezolus-dashboard`, published from rezolus) |
+| `metriken-viewer` (in `iopsystems/metriken-viewer`, not this repository) | The viewer as a library: a server router to mount, the chart and UI assets, the WASM exports and the script an application builds its own bundle with, report saving, live mode over `metriken-recorder`. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
 | `metriken-py` (later) | Python bindings over storage and query (piece 4). | new |
 
 `metriken-segment` and `metriken-archive` are retired. A 5.x `--stream` `.rez`
@@ -203,11 +206,15 @@ The stream has no crate of its own. Its producer half is in
 and the frame format is dendro's (`replicate::Frame`) carrying
 `metriken-model` rows.
 
-Open: whether `metriken-dashboard` and `metriken-viewer` live in this
-repository or a repository of their own; the viewer brings a JS build and
-static assets. Put to the owner as Q1 of the [viewer
-entry](2026-10-12-metriken-viewer.md), with a recommendation for a
-repository of their own.
+Decided 2026-10-12 (Q1 of the [viewer entry](2026-10-12-metriken-viewer.md)):
+`metriken-dashboard` lives in this repository and is released with
+`metriken-query`, because systemslab and rezolus use it without the viewer
+and its `generate_section` takes a `&dyn MetricsSource` that must come from
+the caller's `metriken-query`. `metriken-viewer`, with its JS build and
+static assets, lives in `iopsystems/metriken-viewer` and depends on the
+metriken crates by version. This repository's CI gains only the
+`metriken-dashboard` wasm32 check. rezolus's sampler sections stay in rezolus
+as `rezolus-dashboard`, published to crates.io (Q2).
 
 ## Pieces
 
@@ -407,6 +414,8 @@ re-exports what it moves, in the release after.
    size, sending only changed histogram members or sparse buckets; dendro's
    compaction keeping long-layout metadata; whether the route helper refuses
    an interval below its floor; the histogram query path; the storage scan's
-   gaps, each kept only if measured a clear win). Design, gate and the
-   scope questions for the owner: [metriken-dashboard and
+   gaps, each kept only if measured a clear win). The step closes when
+   rezolus is on the released crates and a cachecannon branch passes the
+   viewer entry's GO 1; systemslab moves after rezolus 6.0.0. Design, gate
+   and the scope decisions (2026-10-12): [metriken-dashboard and
    metriken-viewer](2026-10-12-metriken-viewer.md).
