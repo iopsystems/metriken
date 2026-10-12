@@ -123,6 +123,7 @@ fn parse(s: &str) -> Result<u64, String> {
 /// One segment's file metadata, as [`SegmentMetadataMerge`] and
 /// [`merge_segment_metadata`] read it.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SegmentMetadata<'a> {
     /// The segment's file key-value metadata, without Arrow's schema entry
     /// (`ARROW:schema`).
@@ -133,6 +134,22 @@ pub struct SegmentMetadata<'a> {
     /// The rows in the segment, the bound on how many occupants its lists
     /// may name, as when reading it.
     pub rows: u64,
+}
+
+impl<'a> SegmentMetadata<'a> {
+    /// One segment's file metadata: its key-value entries without
+    /// `ARROW:schema`, its columns, and its parquet row count.
+    pub fn new(
+        key_value: &'a [parquet::file::metadata::KeyValue],
+        fields: &'a arrow::datatypes::Fields,
+        rows: u64,
+    ) -> Self {
+        SegmentMetadata {
+            key_value,
+            fields,
+            rows,
+        }
+    }
 }
 
 /// The file key-value metadata of the segment that concatenating `inputs`
@@ -171,9 +188,9 @@ pub fn merge_segment_metadata(
 /// input's keys in its order, with the merged segment list in place of its
 /// own and the column lists after them.
 ///
-/// A run whose first segment is not long takes only segments whose metadata
-/// is identical to it, entry for entry, and a long run takes no segment that
-/// is not long. A long segment with no segment list, a list that does not
+/// A run whose first segment is not long takes only segments with the same
+/// entries as it, in any order, and is written with the first's order; a
+/// long run takes no segment that is not long. A long segment with no segment list, a list that does not
 /// decode within its segment's rows, or a key given twice is refused; this
 /// never panics on a malformed list.
 #[derive(Debug, Clone)]
@@ -181,9 +198,12 @@ pub struct SegmentMetadataMerge(Merge);
 
 #[derive(Debug, Clone)]
 enum Merge {
-    /// The first segment is not long: its metadata, which every other
-    /// segment must repeat.
-    Identical(Vec<parquet::file::metadata::KeyValue>),
+    /// The first segment is not long: its metadata in file order, and
+    /// sorted, the entries every other segment must repeat in some order.
+    Identical {
+        first: Vec<parquet::file::metadata::KeyValue>,
+        sorted: Vec<parquet::file::metadata::KeyValue>,
+    },
     Long(LongMerge),
 }
 
@@ -209,6 +229,14 @@ struct LongSegment<'a> {
     occupants: Vec<u64>,
     columns: HashMap<&'a str, Vec<u64>>,
     rest: BTreeMap<String, Option<String>>,
+}
+
+/// `kv` sorted by key, then value, so two lists of the same entries compare
+/// equal whatever their order.
+fn sorted(kv: &[parquet::file::metadata::KeyValue]) -> Vec<parquet::file::metadata::KeyValue> {
+    let mut kv = kv.to_vec();
+    kv.sort_by(|a, b| (&a.key, &a.value).cmp(&(&b.key, &b.value)));
+    kv
 }
 
 fn is_long(kv: &[parquet::file::metadata::KeyValue]) -> bool {
@@ -273,7 +301,10 @@ impl SegmentMetadataMerge {
     /// merged (see the type's documentation).
     pub fn start(first: &SegmentMetadata<'_>) -> Option<Self> {
         if !is_long(first.key_value) {
-            return Some(Self(Merge::Identical(first.key_value.to_vec())));
+            return Some(Self(Merge::Identical {
+                first: first.key_value.to_vec(),
+                sorted: sorted(first.key_value),
+            }));
         }
         let segment = decode_long(first)?;
         let mut long = LongMerge {
@@ -291,7 +322,9 @@ impl SegmentMetadataMerge {
     /// the run as it was when `next` cannot be merged into it.
     pub fn extend(&mut self, next: &SegmentMetadata<'_>) -> bool {
         match &mut self.0 {
-            Merge::Identical(first) => next.key_value == first.as_slice(),
+            Merge::Identical { sorted: s, .. } => {
+                next.key_value.len() == s.len() && sorted(next.key_value) == *s
+            }
             Merge::Long(long) => {
                 if !is_long(next.key_value) {
                     return false;
@@ -312,7 +345,7 @@ impl SegmentMetadataMerge {
         use parquet::file::metadata::KeyValue;
 
         let long = match self.0 {
-            Merge::Identical(first) => return first,
+            Merge::Identical { first, .. } => return first,
             Merge::Long(long) => long,
         };
         let all = encode_occupant_ranges(long.occupants);
@@ -473,6 +506,26 @@ mod tests {
             assert_eq!(merge(&[(&one, &f, 9), (&one, &f, 9)]).unwrap(), pairs(&one));
             let two = kv(&[("metriken.format", "1"), ("k", "w")]);
             assert_eq!(merge(&[(&one, &f, 9), (&two, &f, 9)]), None);
+            let more = kv(&[("metriken.format", "1"), ("k", "v"), ("k2", "v")]);
+            assert_eq!(merge(&[(&one, &f, 9), (&more, &f, 9)]), None);
+            assert_eq!(merge(&[(&more, &f, 9), (&one, &f, 9)]), None);
+        }
+
+        /// Order is not part of the comparison: the same entries in another
+        /// order merge, and the merged segment has the first's order.
+        #[test]
+        fn segments_not_long_merge_in_any_order() {
+            let f = fields(&["timestamp", "a"]);
+            let one = kv(&[("metriken.format", "1"), ("k", "v")]);
+            let reordered = kv(&[("k", "v"), ("metriken.format", "1")]);
+            assert_eq!(
+                merge(&[(&one, &f, 9), (&reordered, &f, 9)]).unwrap(),
+                pairs(&one)
+            );
+            assert_eq!(
+                merge(&[(&reordered, &f, 9), (&one, &f, 9)]).unwrap(),
+                pairs(&reordered)
+            );
         }
 
         /// A refused segment leaves the run as it was: finishing it gives

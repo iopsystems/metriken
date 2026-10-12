@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `merge_segment_metadata` applies it to a slice and returns `None` when
   the segments cannot be merged. Long segments merge by union of their
   segment and column occupant lists; any other key must agree. Segments
-  that are not all long merge only when their metadata is identical. For a
+  that are not all long merge only when they have the same entries, in any
+  order, and the merged segment has the first's order. `SegmentMetadata`
+  is `#[non_exhaustive]`; build one with `SegmentMetadata::new`. For a
   compaction's metadata merge (dendro's `rewrite::MetadataMerge`), so that
   a long stream merges across occupant-list changes.
 

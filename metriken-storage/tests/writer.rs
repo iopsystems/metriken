@@ -1091,12 +1091,15 @@ fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
     assert_eq!(answers(&after, 0), answers(&fresh, 0));
 }
 
-/// Compacting a long stream must not change what it answers. Ignored until
-/// dendro's compaction carries the segments' key-value metadata: today the
-/// merged segment loses `metriken.layout` and `metriken.occupants` and reads
-/// as a wide table, with one more series than before.
+/// Compacting a long stream must not change what it answers. Ignored while
+/// the dependency is dendro 0.4.0, whose compaction does not carry the
+/// segments' key-value metadata: the merged segment loses `metriken.layout`
+/// and `metriken.occupants` and reads as a wide table, with one more series
+/// than before. It passes against dendro 0.4.1 (through a
+/// `[patch.crates-io]` until that is released); remove the `ignore` when the
+/// dependency moves to it.
 #[test]
-#[ignore = "dendro's concat_parquet drops long-layout metadata"]
+#[ignore = "dendro 0.4.0's compaction drops long-layout metadata; passes against dendro 0.4.1"]
 fn a_compacted_long_stream_answers_as_before() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compact-long.dendro");
@@ -1145,11 +1148,7 @@ fn a_long_stream_compacted_by_union_answers_as_before() {
     struct Union;
 
     fn metadata<'a>(i: &MergeInput<'a>) -> SegmentMetadata<'a> {
-        SegmentMetadata {
-            key_value: i.key_value,
-            fields: i.fields,
-            rows: i.rows,
-        }
+        SegmentMetadata::new(i.key_value, i.fields, i.rows)
     }
 
     impl MetadataMerge for Union {
