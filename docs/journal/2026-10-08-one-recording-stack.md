@@ -171,7 +171,7 @@ Four of these edges need explaining:
 | `metriken-exposition` | The producer side: registry to model (the snapshotter and group builder), Prometheus text, msgpack, and the stream route behind feature `stream` (piece 1). The only crate here that depends on `metriken`. | itself; `metriken-archive`'s `stream` module |
 | `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`, `MemoryStoreInner`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` forwards to storage's, where `MemoryStore`'s snapshot loading reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
-| `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.rez` output for agents that cannot stream. Serves both rezolus release lines; 5.x's preview `record --stream -o .rez` is dropped when 5.x adopts it. | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
+| `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.dendro` output (rezolus keeps `.rez`, parquet and raw behind the library's sink trait, and `.rez` for agents that cannot stream). Serves rezolus's 6.x line; 5.x keeps its own recorder (decided 2026-10-12). | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
 | `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, and templates read from source metadata. | rezolus `crates/dashboard` |
 | `metriken-viewer` | The viewer as a library: a server router to mount, the chart and UI assets, the WASM bundle, report saving. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
 | `metriken-py` (later) | Python bindings over storage and query (piece 4). | new |
@@ -341,11 +341,13 @@ recorder supports.
 
 ## Path
 
-Each step is a release of the crates it touches; rezolus (its 5.x and 6.x
-lines), systemslab, cachecannon and llm-perf move when they adopt it. For
-users of the `rezolus` binary the CLI, the files it writes and reads, and the
-wire stay the same, apart from 5.x's preview `record --stream -o .rez`, which
-is dropped; rezolus's own tests (including the compatibility fixtures in the
+Each step is a release of the crates it touches; rezolus (its 6.x line;
+5.x stays on its own dependencies, decided 2026-10-12), systemslab,
+cachecannon and llm-perf move when they adopt it. For users of the
+`rezolus` binary the CLI, the files it writes and reads, and the wire stay
+the same, apart from the changes each step's entry names (the stream's
+metriken wire names in step 3; detection by stream and handshake identity
+in step 4); rezolus's own tests (including the compatibility fixtures in the
 rezolus entry) check that across each step. Library users (systemslab's
 `rez` and `dashboard` pins) change imports when they bump, or, where a
 step re-exports what it moves, in the release after.
@@ -376,12 +378,15 @@ step re-exports what it moves, in the release after.
    `HistogramGroup` for llm-perf. The wire takes neutral names. Design and
    gate: [the stream route](2026-10-11-stream-route.md).
 4. **`metriken-recorder`** from rezolus's recorder (piece 2), with detection
-   by stream. rezolus's `record`, `hindsight` and live viewer use it from both
-   release lines; then llm-perf records in process.
+   by stream. rezolus's `record`, `hindsight` and live viewer use it on the
+   6.x line only (decided 2026-10-12: 5.x keeps its own recorder); then
+   llm-perf records in process. Design and gate:
+   [metriken-recorder](2026-10-12-metriken-recorder.md).
 5. **Templates in the archive** (piece 3): the route helper puts the template
    in the handshake, the recorder keeps handshake metadata, and the viewer
    reads `service_queries` from a source's metadata.
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
    `.dendro` by default.
-7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), after rezolus
-   6.0.0, because the viewer is the part of rezolus changing fastest.
+7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
+   6.0.0 (decided 2026-10-12: 6.0.0 is released after every open step and
+   follow-up, so its wire, formats and CLI ship complete).
