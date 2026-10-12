@@ -4,7 +4,13 @@
 released by 2026-10-11 (metriken-model; metriken-storage and metriken-query;
 the stream route). The rezolus agent, cachecannon and llm-perf (on main
 since 2026-10-12) serve the stream. Step 4 (`metriken-recorder`) is next.
-Decided 2026-10-08:
+Decided 2026-10-12: rezolus's 5.x line stays on its own dependencies and
+recorder; rezolus 6.x writes `.dendro` only (`.rez`, parquet and raw output
+are removed; reading them stays), so `metriken-recorder` writes `.dendro` only
+and an agent older than 5.21.0 is refused by 6.x, replacing the rezolus
+entry's decision 1; rezolus 6.0.0 is released after steps 4 to 7 and the
+follow-ups listed in step 7. Decided
+2026-10-08:
 
 - recording, exposition and viewing converge on one stack, and per-project
   recorders and viewer implementations are retired as their projects move;
@@ -108,7 +114,9 @@ Each crate and what it depends on:
   references, so a producer using only the `parquet` feature (parquet at exit)
   does not compile SQLite.
 - `metriken-query`: `metriken-storage`, `metriken-model`.
-- `metriken-recorder`: `metriken-storage`, `metriken-model`, dendro.
+- `metriken-recorder`: `metriken-storage`, `metriken-model`,
+  `metriken-types`, dendro (feature `registry`: `metriken-exposition`, which
+  links `metriken`, for a producer recording its own registry).
 - `metriken-dashboard`: `metriken-query`.
 - `metriken-viewer`: `metriken-dashboard`, `metriken-query`,
   `metriken-storage` (report saving), `metriken-recorder` (live mode).
@@ -171,7 +179,7 @@ Four of these edges need explaining:
 | `metriken-exposition` | The producer side: registry to model (the snapshotter and group builder), Prometheus text, msgpack, and the stream route behind feature `stream` (piece 1). The only crate here that depends on `metriken`. | itself; `metriken-archive`'s `stream` module |
 | `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`, `MemoryStoreInner`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` forwards to storage's, where `MemoryStore`'s snapshot loading reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
-| `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.rez` output for agents that cannot stream. Serves both rezolus release lines; 5.x's preview `record --stream -o .rez` is dropped when 5.x adopts it. | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
+| `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.dendro` output (6.x writes no other container). Serves rezolus's 6.x line; 5.x keeps its own recorder (decided 2026-10-12). | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
 | `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, and templates read from source metadata. | rezolus `crates/dashboard` |
 | `metriken-viewer` | The viewer as a library: a server router to mount, the chart and UI assets, the WASM bundle, report saving. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
 | `metriken-py` (later) | Python bindings over storage and query (piece 4). | new |
@@ -179,8 +187,8 @@ Four of these edges need explaining:
 `metriken-segment` and `metriken-archive` are retired. A 5.x `--stream` `.rez`
 (preview, unstable) still opens, with each slot column carrying the labels its
 segment was built with rather than split by occupant. `rezolus record` becomes
-the CLI over `metriken-recorder`, keeping `-- cmd` (`child.rs`) and the choice
-of output format. dendro is unchanged apart from making SQLite optional.
+the CLI over `metriken-recorder`, keeping `-- cmd` (`child.rs`); it writes
+`.dendro` only. dendro is unchanged apart from making SQLite optional.
 
 The formats are features of one storage crate rather than three crates
 (`metriken-dendro`, `metriken-rez`, `metriken-parquet`) because they share
@@ -238,13 +246,15 @@ Prometheus endpoint by scrape, and the calling process's own registry.
 - cachecannon records itself in process (cachecannon/cachecannon#176) through
   the same library rather than its own writer.
 
-A source whose `/metrics/stream` handshake opens is streamed, rezolus agent
-or not. A rezolus agent that predates the stream identifies itself on
-`/status` and is covered by decision 1 of the rezolus entry. Any other source
-is scraped at `/metrics`. Today `record` streams only a source it takes for a
-rezolus agent from `/metrics/binary`; rezolus adds detection by stream to its
-own recorder first (rezolus entry, "Endpoint detection"), and step 4 of the
-path moves that code.
+A source whose `/metrics/stream` handshake opens is streamed, rezolus agent or
+not. A rezolus agent that predates the stream identifies itself on `/status` or
+its `/` banner, and is refused, with a pointer to a 5.x recorder (decided
+2026-10-12, replacing decision 1 of the rezolus entry). Any other
+source is scraped (rules in the [recorder
+entry](2026-10-12-metriken-recorder.md), Detection). Today `record` streams
+only a source it takes for a rezolus agent from `/metrics/binary`; rezolus
+adds detection by stream to its own recorder first (rezolus entry, "Endpoint
+detection"), and step 4 of the path moves that code.
 
 ### 3. Templates travel in the archive
 
@@ -261,7 +271,8 @@ change to one needs a rezolus release.
   anchor (`adopt_source`, `src/recorder/mod.rs`) and reads metadata from the
   agent's `/status`, `/systeminfo` and `/metrics/descriptions`. The recorder
   therefore has to copy handshake metadata into the source's metadata,
-  including on a reconnect. No dendro change is needed.
+  including on a reconnect; it does so from step 4 (recorder entry, Source
+  identity). No dendro change is needed.
 - The key is `service_queries`, which `rezolus recording annotate --queries`
   already writes into a `.rez` or `.dendro` source's metadata and
   `rezolus recording check` already reads. Templates are the same
@@ -303,10 +314,10 @@ Recommended: bindings.
 `cachecannon view`'s own dashboards. `rezolus view`, `cachecannon view` and
 systemslab mount the same library; systemslab, which today vendors rezolus's
 chart code at a rezolus revision and takes `dashboard` from a rezolus git tag,
-takes published crates and assets instead. The move happens once, after
-rezolus 6.0.0 is tagged, because the viewer is the part of rezolus changing
-fastest. `cachecannon view` reads `.dendro` before then through its metriken
-bump (cachecannon entry).
+takes published crates and assets instead. The move happens once, before
+rezolus 6.0.0 is tagged (decided 2026-10-12; it was planned for after, because
+the viewer is the part of rezolus changing fastest). `cachecannon view` reads
+`.dendro` before then through its metriken bump (cachecannon entry).
 
 ### 6. What stays
 
@@ -341,14 +352,17 @@ recorder supports.
 
 ## Path
 
-Each step is a release of the crates it touches; rezolus (its 5.x and 6.x
-lines), systemslab, cachecannon and llm-perf move when they adopt it. For
-users of the `rezolus` binary the CLI, the files it writes and reads, and the
-wire stay the same, apart from 5.x's preview `record --stream -o .rez`, which
-is dropped; rezolus's own tests (including the compatibility fixtures in the
-rezolus entry) check that across each step. Library users (systemslab's
-`rez` and `dashboard` pins) change imports when they bump, or, where a
-step re-exports what it moves, in the release after.
+Each step is a release of the crates it touches; rezolus (its 6.x line; 5.x
+stays on its own dependencies, decided 2026-10-12), systemslab, cachecannon
+and llm-perf move when they adopt it. For users of the `rezolus` binary the
+CLI, the files it writes and reads, and the wire stay the same, apart from the
+changes each step's entry names (the stream's metriken wire names in step 3;
+detection by stream, handshake identity, `.dendro`-only writing in `record`
+and hindsight and the refusal of agents older than 5.21.0, in step 4; Save as
+Report's and the `recording` subcommands' writers, in the rezolus 6.0 entry); rezolus's own tests (including the compatibility fixtures in the
+rezolus entry) check that across each step. Library users (systemslab's `rez`
+and `dashboard` pins) change imports when they bump, or, where a step
+re-exports what it moves, in the release after.
 
 1. **`metriken-types` and `metriken-model`.** Move `Window` from
    `metriken-core` and `UID_LABEL` from `metriken` into `metriken-types` (a
@@ -376,12 +390,19 @@ step re-exports what it moves, in the release after.
    `HistogramGroup` for llm-perf. The wire takes neutral names. Design and
    gate: [the stream route](2026-10-11-stream-route.md).
 4. **`metriken-recorder`** from rezolus's recorder (piece 2), with detection
-   by stream. rezolus's `record`, `hindsight` and live viewer use it from both
-   release lines; then llm-perf records in process.
+   by stream. rezolus's `record`, `hindsight` and live viewer use it on the
+   6.x line only (decided 2026-10-12: 5.x keeps its own recorder); then
+   llm-perf records in process. Design and gate:
+   [metriken-recorder](2026-10-12-metriken-recorder.md).
 5. **Templates in the archive** (piece 3): the route helper puts the template
-   in the handshake, the recorder keeps handshake metadata, and the viewer
-   reads `service_queries` from a source's metadata.
+   in the handshake (the recorder adopts handshake metadata since step 4),
+   and the viewer reads `service_queries` from a source's metadata.
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
    `.dendro` by default.
-7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), after rezolus
-   6.0.0, because the viewer is the part of rezolus changing fastest.
+7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
+   6.0.0 (decided 2026-10-12: 6.0.0 is released after every open step and
+   these follow-ups, so its wire, formats and CLI ship complete: stream frame
+   size, sending only changed histogram members or sparse buckets; dendro's
+   compaction keeping long-layout metadata; whether the route helper refuses
+   an interval below its floor; the histogram query path; the storage scan's
+   gaps, each kept only if measured a clear win).
