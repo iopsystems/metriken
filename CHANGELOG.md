@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-model 0.1.2
+
+- **Added:** `wire`, the names `/metrics/stream` is served under and its
+  layouts: `WireNames`, `WIRE_NAMES` and `Layout`, from
+  `metriken-exposition`, so a consumer that decodes the stream shares the
+  producer's names without depending on the registry. Plan:
+  `docs/journal/2026-10-12-metriken-recorder.md`, order of work step 1.
+
+### metriken-exposition 0.22.1
+
+- **Changed:** `stream::{WireNames, WIRE_NAMES, Layout}` are
+  `metriken_model::wire`'s, re-exported at the same paths with the same
+  derives and methods. `metriken-model` 0.1.2 is required.
+
 ### metriken-storage 0.2.1
 
 - See the crate's CHANGELOG: a long segment lists each metric column only

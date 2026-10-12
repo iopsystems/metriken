@@ -91,7 +91,9 @@ pub use frames::{
     encode_groups, EncodedGroup, EncodedLongGroup, EncodedStreamGroup, FrameProducer, KeyedLabels,
     SchemaCache, StreamRow, SOURCE,
 };
+// The wire names and layouts are `metriken-model`'s, so a consumer can share
+// them without the registry; re-exported here for producers.
+pub use metriken_model::wire::{Layout, WireNames, WIRE_NAMES};
 pub use route::{
-    Layout, Pass, PassStamp, Refusal, RegistryPass, RegistryPasses, StreamRequest,
-    StreamSubscription, WireNames, WIRE_NAMES,
+    Pass, PassStamp, Refusal, RegistryPass, RegistryPasses, StreamRequest, StreamSubscription,
 };
