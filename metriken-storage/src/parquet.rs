@@ -1762,14 +1762,23 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
 }
 
 /// A long segment's column descriptions: each metric column once per
-/// occupant the footer lists, labelled with [`crate::long::OCCUPANT_LABEL`].
-/// A malformed list leaves the segment with no series, reported once.
+/// occupant it has values for, labelled with [`crate::long::OCCUPANT_LABEL`].
+///
+/// The occupants are the column's own list
+/// ([`crate::long::column_occupants_key`]) when the footer has one, else the
+/// segment's ([`crate::long::OCCUPANTS_KEY`]): a column with values for
+/// every occupant has no list, and neither does any column of a segment
+/// written before the per-column list existed. A malformed segment list
+/// leaves the segment with no series; a malformed column list falls back to
+/// the segment's. Each malformed list is reported with a warning.
 fn expand_long(pf: &ParquetSource, descs: Vec<ColDesc>) -> Vec<ColDesc> {
     let rows = pf.meta.metadata().file_metadata().num_rows().max(0) as u64;
-    let list = pf
-        .read_file_metadata_value(crate::long::OCCUPANTS_KEY)
+    let kv = pf.read_file_metadata();
+    let list = kv
+        .get(crate::long::OCCUPANTS_KEY)
+        .map(String::as_str)
         .unwrap_or_default();
-    let occupants = match crate::long::decode_occupant_ranges(&list, rows) {
+    let occupants = match crate::long::decode_occupant_ranges(list, rows) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(source_id = pf.id, error = %e, "long segment has a malformed occupant list; it presents no series");
@@ -1778,7 +1787,16 @@ fn expand_long(pf: &ParquetSource, descs: Vec<ColDesc>) -> Vec<ColDesc> {
     };
     let mut out = Vec::with_capacity(descs.len() * occupants.len());
     for desc in descs {
-        for &occ in &occupants {
+        let own = kv
+            .get(&crate::long::column_occupants_key(&desc.column_name))
+            .and_then(|l| match crate::long::decode_occupant_ranges(l, rows) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    tracing::warn!(source_id = pf.id, column = %desc.column_name, error = %e, "long segment column has a malformed occupant list; listing the segment's");
+                    None
+                }
+            });
+        for &occ in own.as_deref().unwrap_or(&occupants) {
             let mut d = desc.clone();
             d.labels
                 .inner

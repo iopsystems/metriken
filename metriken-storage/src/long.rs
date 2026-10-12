@@ -8,6 +8,13 @@
 //! and lists the occupants the segment holds under [`OCCUPANTS_KEY`], encoded
 //! with [`encode_occupant_ranges`]. The reader presents each metric column and
 //! occupant as one series labelled [`OCCUPANT_LABEL`].
+//!
+//! A metric column that has values for only some of those occupants lists
+//! the ones it has under [`column_occupants_key`], in the same encoding, and
+//! the reader presents only those. A column without the key has values for
+//! every occupant the segment lists, or was written before the key existed
+//! (metriken-storage 0.2.0 and earlier); either way the reader presents it
+//! once per occupant in [`OCCUPANTS_KEY`].
 
 /// File key-value metadata key naming the segment layout.
 pub const LAYOUT_KEY: &str = "metriken.layout";
@@ -17,6 +24,22 @@ pub const LAYOUT_LONG: &str = "long";
 
 /// File key-value metadata key listing a long segment's occupants.
 pub const OCCUPANTS_KEY: &str = "metriken.occupants";
+
+/// Prefix of the file key-value metadata key listing the occupants one
+/// metric column has values for; see [`column_occupants_key`].
+pub const COLUMN_OCCUPANTS_PREFIX: &str = "metriken.column_occupants.";
+
+/// File key-value metadata key listing the occupants the column named
+/// `column` (its name in the segment, `<metric>:buckets` for a histogram)
+/// has a non-null value for, encoded with [`encode_occupant_ranges`].
+///
+/// File metadata rather than the column's field metadata: a reader before
+/// this key existed turns every field metadata key it does not know into a
+/// label, and the list differs between segments, so it would split each
+/// series at every segment boundary. Unknown file keys are ignored.
+pub fn column_occupants_key(column: &str) -> String {
+    format!("{COLUMN_OCCUPANTS_PREFIX}{column}")
+}
 
 /// The column holding each row's occupant number.
 pub const OCCUPANT_COLUMN: &str = "occupant";
