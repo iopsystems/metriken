@@ -111,7 +111,9 @@ Each crate and what it depends on:
   references, so a producer using only the `parquet` feature (parquet at exit)
   does not compile SQLite.
 - `metriken-query`: `metriken-storage`, `metriken-model`.
-- `metriken-recorder`: `metriken-storage`, `metriken-model`, dendro.
+- `metriken-recorder`: `metriken-storage`, `metriken-model`,
+  `metriken-types`, dendro (feature `registry`: `metriken-exposition`, which
+  links `metriken`, for a producer recording its own registry).
 - `metriken-dashboard`: `metriken-query`.
 - `metriken-viewer`: `metriken-dashboard`, `metriken-query`,
   `metriken-storage` (report saving), `metriken-recorder` (live mode).
@@ -244,8 +246,8 @@ Prometheus endpoint by scrape, and the calling process's own registry.
 A source whose `/metrics/stream` handshake opens is streamed, rezolus agent
 or not. A rezolus agent that predates the stream identifies itself on
 `/status` (or its `/` banner, before 5.16.0) and is covered by decision 1 of
-the rezolus entry. Any other source
-is scraped at `/metrics`. Today `record` streams only a source it takes for a
+the rezolus entry. Any other source is scraped (rules in the
+[recorder entry](2026-10-12-metriken-recorder.md), Detection). Today `record` streams only a source it takes for a
 rezolus agent from `/metrics/binary`; rezolus adds detection by stream to its
 own recorder first (rezolus entry, "Endpoint detection"), and step 4 of the
 path moves that code.
@@ -265,7 +267,8 @@ change to one needs a rezolus release.
   anchor (`adopt_source`, `src/recorder/mod.rs`) and reads metadata from the
   agent's `/status`, `/systeminfo` and `/metrics/descriptions`. The recorder
   therefore has to copy handshake metadata into the source's metadata,
-  including on a reconnect. No dendro change is needed.
+  including on a reconnect; it does so from step 4 (recorder entry, Source
+  identity). No dendro change is needed.
 - The key is `service_queries`, which `rezolus recording annotate --queries`
   already writes into a `.rez` or `.dendro` source's metadata and
   `rezolus recording check` already reads. Templates are the same
@@ -388,8 +391,8 @@ step re-exports what it moves, in the release after.
    llm-perf records in process. Design and gate:
    [metriken-recorder](2026-10-12-metriken-recorder.md).
 5. **Templates in the archive** (piece 3): the route helper puts the template
-   in the handshake, the recorder keeps handshake metadata, and the viewer
-   reads `service_queries` from a source's metadata.
+   in the handshake (the recorder adopts handshake metadata since step 4),
+   and the viewer reads `service_queries` from a source's metadata.
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
    `.dendro` by default.
 7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
