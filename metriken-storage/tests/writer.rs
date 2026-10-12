@@ -1091,6 +1091,38 @@ fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
     assert_eq!(answers(&after, 0), answers(&fresh, 0));
 }
 
+/// Compacting a long stream must not change what it answers. Ignored until
+/// dendro's compaction carries the segments' key-value metadata: today the
+/// merged segment loses `metriken.layout` and `metriken.occupants` and reads
+/// as a wide table, with one more series than before.
+#[test]
+#[ignore = "dendro's concat_parquet drops long-layout metadata"]
+fn a_compacted_long_stream_answers_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact-long.dendro");
+    record(&path, true, true, None);
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let (before, _) = open_counting(&path, &pool);
+    let expected = answers(&before, 0);
+    drop(before);
+    {
+        let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
+        let tables = streams(&path);
+        let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+        for stream in tables {
+            dendro::rewrite::compact_stream(
+                &mut db,
+                id,
+                &stream,
+                &dendro::rewrite::CompactSpec::to_rows(10),
+            )
+            .unwrap();
+        }
+    }
+    let (after, _) = open_counting(&path, &pool);
+    assert_eq!(answers(&after, 0), expected);
+}
+
 /// A reader whose tables were not queried passes on the state it was given,
 /// and a first reader without `keep_handover` saves none.
 #[test]

@@ -1770,7 +1770,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
 /// every occupant has no list, and neither does any column of a segment
 /// written before the per-column list existed. A malformed segment list
 /// leaves the segment with no series; a malformed column list falls back to
-/// the segment's. Each is reported once.
+/// the segment's. Each malformed list is reported with a warning.
 fn expand_long(pf: &ParquetSource, descs: Vec<ColDesc>) -> Vec<ColDesc> {
     let rows = pf.meta.metadata().file_metadata().num_rows().max(0) as u64;
     let kv = pf.read_file_metadata();

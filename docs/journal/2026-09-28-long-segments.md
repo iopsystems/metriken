@@ -151,7 +151,7 @@ same range encoding. A column with values for every occupant writes nothing.
 otherwise; a malformed column list falls back to the segment's with a
 warning. Open stays footer-only.
 
-**File metadata, not the column's field metadata.** Every reader through
+**The list is file metadata.** Every reader through
 0.2.0 turns each field metadata key that is not in `STORAGE_KEYS` into a
 label. The list differs from segment to segment, so in field metadata it
 would give an old reader a new label on every long series and split each
@@ -170,14 +170,21 @@ caller's writer properties and none of the inputs' key-value metadata. That
 drops `metriken.layout` and `metriken.occupants` as well, so a compacted
 long segment already reads as a wide table (measured on the
 `tests/writer.rs` fixture on 0.2.0: `rate(cpu_time[3s])` returns 5 series
-after `compact_stream` where it returned 4 before); it predates this change
-and no caller here compacts long streams. A fix there must recompute or
-union the column lists along with the segment list, or drop both.
+after `compact_stream` where it returned 4 before; the extra series is the
+long table read as wide, with no slot labels). It predates this change.
+`tests/writer.rs::a_compacted_segment_is_not_taken_for_the_one_it_replaced`
+compacts long streams but compares two readers of the compacted archive, so
+it does not detect it; `a_compacted_long_stream_answers_as_before`, ignored
+until dendro is fixed, compares answers before and after compaction and
+fails today. rezolus does not compact (hindsight evicts whole segments and
+its dumps copy them). A fix in dendro must carry the key-value metadata when
+every input in a run agrees, and stop the run where it changes; the column
+lists then have to be unioned or dropped along with the segment list.
 
 **Measured footer cost.** Each archive's long segments re-encoded with the
 same writer properties, with and without the column lists:
 
-| archive | segments | columns, sparse | footer before / after | added, of segment bytes |
+| archive | segments | column×segment pairs, sparse | footer before / after | added, of segment bytes |
 |---|---|---|---|---|
 | llm-perf run, `llm-perf/main` | 11 | 386, 386 | 254,596 / 272,843 B | +18,247 B, 4.6% |
 | rezolus per-thread CPU (`cpu_usage/cpu_usage_task`) | 291 | 291, 0 | 4,968,084 / 4,968,084 B | 0 |
@@ -186,9 +193,16 @@ The rezolus table has one metric column with a value for every occupant, so
 it writes no list. The llm-perf segments are small (36 KB each, 64% of it
 footer already) and every column is sparse, about 1.7 KB per segment. On
 the llm-perf archive with lists added, each counter lists what an `irate`
-query returns, except `requests`, which lists one series (`status=canceled`)
-the query does not return; I did not check whether it has fewer than two
-samples.
+query returns, except `requests{status="canceled"}`, which has one sample,
+in the last segment; `rate` and `irate` need two.
+
+**Bound.** A column list costs about one more byte than the occupant id's
+digits for each run boundary, so a contiguous list is short and a fragmented
+one is not. A synthetic segment with 4096 occupants and 64 counters, each
+column holding every other occupant, grew its footer from 19,541 to 641,740
+bytes (file 102 KB to 708 KB); open went from 0.70 to 0.87 ms. The common
+shape, plain metrics on one occupant and each family on its own contiguous
+range, stays short. Writing the complement when it is shorter is not done.
 
 ## Not in this change
 
