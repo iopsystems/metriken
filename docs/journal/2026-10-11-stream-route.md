@@ -364,7 +364,7 @@ admin server that writes the subscription's bytes until the write fails. Its
 PR is in its own repo.
 
 llm-perf needs the `HistogramGroup` support above; serving the stream is its
-own step 4.
+own step 4 (done: llm-perf#188, #189, merged 2026-10-12).
 
 ## GO / NO-GO
 
@@ -559,20 +559,24 @@ released crates.
 From llm-perf's adoption (llm-perf#189):
 
 - A windowless group is sent whole every pass, and a histogram member as its
-  full bucket array: llm-perf's 29 histograms (grouping power 7, 7,424
-  buckets each) cost about 190 KB per frame per subscriber at 1 s, whatever
-  the load, and its `.dendro` grows about 450 KB per minute (the parquet of
+  full bucket array. llm-perf declares 29 histograms (5 plain, 24 group
+  slots; grouping power 7, 7,424 buckets each); a frame measured 193 to
+  196 KB per subscriber at 1 s, whatever the load, and its `.dendro` grows about 450 KB per minute (the parquet of
   the same run, 57 KB). Sending only members that changed since the last
   frame on a subscription, or sparse buckets, would fix it here.
-- llm-perf's `llm-perf/main` group mixes plain metrics with labelled counter
-  families, so exposition sends it wide whatever layout is asked for (long
-  needs every metric in the group to be a group). rezolus's writer stores
-  it as a long table whose columns are sparse over its occupants, which
-  listed series that do not exist until metriken-storage 0.2.1 (#256).
+- llm-perf's `llm-perf/main` group mixes plain counters, gauges and
+  histograms with counter and histogram groups, so exposition sends it wide
+  whatever layout is asked for (long needs every metric routed to the group
+  to be a counter, gauge or histogram group). rezolus's writer stores it as
+  a long table whose columns are sparse over its occupants. Listings on it
+  invented series (`turns` 11 times with an `id` label) until
+  metriken-storage 0.2.1 (#256); archives written before 0.2.1 still list
+  them.
 - dendro's compaction (`concat_parquet`) drops segments' key-value
   metadata, so a compacted long segment reads as wide
   (`metriken-storage/tests/writer.rs::a_compacted_long_stream_answers_as_before`,
-  ignored until dendro is fixed). Nothing compacts long streams today.
+  ignored until dendro is fixed). Neither metriken-storage nor rezolus calls
+  dendro's compaction.
 
 From cachecannon's adoption (cachecannon#205):
 
