@@ -2,7 +2,9 @@
 
 **Status:** OPEN. Plan opened 2026-10-08. Path steps 1 to 3 built and
 released by 2026-10-11 (metriken-model; metriken-storage and metriken-query;
-the stream route, open for llm-perf). Decided 2026-10-08:
+the stream route). The rezolus agent, cachecannon and llm-perf (on main
+since 2026-10-12) serve the stream. Step 4 (`metriken-recorder`) is next.
+Decided 2026-10-08:
 
 - recording, exposition and viewing converge on one stack, and per-project
   recorders and viewer implementations are retired as their projects move;
