@@ -45,10 +45,9 @@ use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 /// # This answers for ONE recording
 ///
 /// The timestamps are absolute, so they describe this recording's timeline
-/// and no other. A query reading tables of several recordings gets `None`:
-/// such a query either evaluates each series on its own, which the uniform
-/// grid answers at any cadence, or combines series across recordings,
-/// which this reader refuses ([`MetricsSource`] on [`ArchiveReader`]).
+/// and no other, and a query reading tables of several recordings gets
+/// `None`. Querying an [`ArchiveReader`] through [`MetricsSource`] evaluates
+/// such a query once per recording, each with its own timestamps.
 pub fn eval_timestamps_for(
     reader: &ArchiveReader,
     query: &str,
@@ -64,7 +63,9 @@ pub fn eval_timestamps_for(
 /// it and the labels each recording's series carry.
 struct Plan<'a> {
     owners: Vec<&'a SamplerReader>,
-    labels: SeriesLabels,
+    labels: &'a SeriesLabels,
+    /// The metric names the query references.
+    referenced: Vec<String>,
 }
 
 impl<'a> Plan<'a> {
@@ -76,45 +77,44 @@ impl<'a> Plan<'a> {
     /// `columns` (which expands selectors through the source's column map)
     /// cannot.
     ///
-    /// A table is also left out when no selector naming one of its metrics
-    /// can match its recording's labels (`x{source="vllm"}` leaves out the
-    /// other recordings), so a label-selected query reads one recording:
-    /// it opens no other recording's tables, keeps that recording's
-    /// cross-cadence alignment, and is not refused as combining recordings.
-    /// Other label matchers are not consulted: a table holding the metric
-    /// with no matching series answers with an empty result, which is
-    /// correct, and skipping it here would route on data the catalog does
-    /// not carry. When every table holding a referenced metric is left out,
-    /// the first recording's are kept, so the query answers empty rather
-    /// than as naming no metric.
+    /// A recording is also left out when no selector naming one of its
+    /// metrics can match its labels (`x{source="vllm"}` leaves out the other
+    /// recordings), so a label-selected query reads one recording: it opens
+    /// no other recording's tables, keeps that recording's cross-cadence
+    /// alignment, and is not refused as merging recordings. A recording is
+    /// kept or left out whole: one kept for `h` in `g{source="a"} / h` keeps
+    /// its `g` too, so it answers that query empty rather than as lacking
+    /// `g`. Other label matchers are not consulted: a table holding the
+    /// metric with no matching series answers with an empty result, which
+    /// is correct, and skipping it here would route on data the catalog
+    /// does not carry. When every recording is left out, the first one's
+    /// tables are kept, so the query answers empty rather than as naming no
+    /// metric.
     fn new(reader: &'a ArchiveReader, query: &str) -> Result<Self, QueryError> {
         let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();
         let all = reader.owners_of(&referenced);
         let selectors = crate::promql::selectors(query)?;
         let labels = reader.series_labels();
-        let pruned: Vec<&SamplerReader> = all
-            .iter()
-            .copied()
-            .filter(|t| {
-                let extra = labels.of(t);
-                selectors.iter().any(|(names, filter)| {
-                    names.iter().any(|n| t.holds(n)) && translate_filter(extra, filter).is_some()
-                })
-            })
-            .collect();
-        let owners = if !pruned.is_empty() {
-            pruned
-        } else {
-            match all.first() {
-                Some(first) => all
-                    .iter()
-                    .copied()
-                    .filter(|t| t.same_recording(first))
-                    .collect(),
-                None => all,
+        let mut passing: Vec<&SamplerReader> = Vec::new();
+        for t in &all {
+            let extra = labels.of(t);
+            let pass = selectors.iter().any(|(names, filter)| {
+                names.iter().any(|n| t.holds(n)) && translate_filter(extra, filter).is_some()
+            });
+            if pass && !passing.iter().any(|r| r.same_recording(t)) {
+                passing.push(t);
             }
+        }
+        let keep = |t: &&SamplerReader| match passing.is_empty() {
+            false => passing.iter().any(|r| r.same_recording(t)),
+            true => all.first().is_some_and(|first| first.same_recording(t)),
         };
-        Ok(Self { owners, labels })
+        let owners = all.iter().copied().filter(keep).collect();
+        Ok(Self {
+            owners,
+            labels,
+            referenced,
+        })
     }
 
     /// The owning tables grouped by recording, in first-table order.
@@ -290,9 +290,35 @@ fn route<'a>(plan: &Plan<'a>, query: &str) -> Result<Vec<Part<'a>>, QueryError> 
             "query references no metric present in this .rez: {query}"
         )));
     }
-    let recordings = plan.recordings();
+    let mut recordings = plan.recordings();
     if recordings.len() > 1 {
-        refuse_histograms_across_recordings(&recordings, &plan.labels, query)?;
+        // A recording lacking a metric the query names answers nothing
+        // (`g / h` on a host with no `h`), as Prometheus answers a pair with
+        // no match; alone it is "metric not found", which would fail the
+        // whole query for every other recording.
+        let holds_all = |tables: &Vec<&SamplerReader>| {
+            plan.referenced
+                .iter()
+                .all(|n| tables.iter().any(|t| t.holds(n)))
+        };
+        let complete: Vec<Vec<&SamplerReader>> = recordings
+            .iter()
+            .filter(|r| holds_all(r))
+            .cloned()
+            .collect();
+        if complete.is_empty() {
+            let which = recording_selectors(&recordings, plan.labels);
+            return Err(QueryError::ParseError(format!(
+                "query {query} names metrics that no one recording holds all of ({}); a \
+                 query is answered within each recording, and series of different \
+                 recordings are not combined yet",
+                which.join(", ")
+            )));
+        }
+        recordings = complete;
+    }
+    if recordings.len() > 1 {
+        refuse_histograms_across_recordings(&recordings, plan.labels, query)?;
         refuse_combining_across_recordings(plan, &recordings, query)?;
     }
     let mut parts = Vec::new();
@@ -408,27 +434,45 @@ fn refuse_combining_across_recordings(
     recordings: &[Vec<&SamplerReader>],
     query: &str,
 ) -> Result<(), QueryError> {
+    let reachable: Vec<&SamplerReader> = recordings.iter().map(|r| r[0]).collect();
     for (selectors, keeps) in crate::promql::combination_sites(query)? {
-        let reached = recordings_selected(plan, &selectors);
+        let reached: Vec<&SamplerReader> = recordings_selected(plan, &selectors)
+            .into_iter()
+            .filter(|t| reachable.iter().any(|r| r.same_recording(t)))
+            .collect();
         if reached.len() < 2 {
             continue;
         }
-        let differing = differing_keys(plan, &reached);
-        let dropped: Vec<&String> = differing.iter().filter(|k| !keeps.keeps(k)).collect();
-        if dropped.is_empty() {
+        // Safe when the reached recordings stay apart on the labels kept.
+        let kept: Vec<BTreeMap<&String, &String>> = reached
+            .iter()
+            .map(|t| {
+                plan.labels
+                    .of(t)
+                    .inner
+                    .iter()
+                    .filter(|(k, _)| keeps.keeps(k))
+                    .collect()
+            })
+            .collect();
+        let distinct = kept
+            .iter()
+            .enumerate()
+            .all(|(i, a)| kept[i + 1..].iter().all(|b| a != b));
+        if distinct {
             continue;
         }
-        let which = recording_selectors(recordings, &plan.labels);
-        let keys: Vec<&str> = dropped.iter().map(|k| k.as_str()).collect();
+        let differing = differing_keys(plan, &reached);
+        let which = recording_selectors(recordings, plan.labels);
         return Err(QueryError::ParseError(format!(
-            "query {query} merges series from {} recordings ({}): it drops the label(s) \
-             {} that tell them apart, and series of different recordings are not \
-             combined yet. Keep them (e.g. sum by ({}) (...)), or select one recording \
-             with a label matcher (e.g. {})",
+            "query {query} merges series from {} recordings ({}): the labels it keeps do \
+             not tell them apart, and series of different recordings are not combined \
+             yet. Keep {} (e.g. sum by ({}) (...)), or select one recording with a label \
+             matcher (e.g. {})",
             recordings.len(),
             which.join(", "),
-            keys.join(", "),
-            keys.join(", "),
+            differing.join(", "),
+            differing.join(", "),
             which[0],
         )));
     }
@@ -1497,5 +1541,101 @@ mod tests {
             .unwrap();
         w.close().unwrap();
         buf
+    }
+
+    fn host(
+        source: &'static str,
+        host: &'static str,
+        tables: Vec<(&str, Vec<u8>)>,
+    ) -> InMemorySource {
+        recording(&[("source", source), ("host", host)], tables)
+    }
+
+    fn gauge(name: &str, v: u64) -> Vec<u8> {
+        explicit_table(name, "gauge", &gauge_rows(1, 40, 1, v))
+    }
+
+    /// A matcher on one operand narrows that operand; the other recording
+    /// is kept whole and answers empty, not "metric not found".
+    #[test]
+    fn a_matcher_on_one_operand_keeps_recordings_whole() {
+        let rec = |source: &'static str, g: u64, h: u64| {
+            recording(
+                &[("source", source)],
+                vec![("tg", gauge("g", g)), ("th", gauge("h", h))],
+            )
+        };
+        let reader = archive(vec![rec("a", 10, 2), rec("b", 100, 4)]);
+        for q in [
+            r#"g{source="a"} / h"#,
+            r#"h / g{source="a"}"#,
+            r#"sum by (source) (g{source="a"}) / sum by (source) (h)"#,
+        ] {
+            let got =
+                values(&reader, q, RateMode::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(got.len(), 1, "{q}: {got:?}");
+        }
+    }
+
+    /// A recording lacking an operand answers nothing for the query, as a
+    /// pair with no match does; the others answer. When no one recording
+    /// holds every metric named, the error says so.
+    #[test]
+    fn a_recording_lacking_an_operand_is_left_out() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("tg", gauge("g", 10)), ("th", gauge("h", 2))],
+            ),
+            recording(&[("source", "b")], vec![("tg", gauge("g", 100))]),
+        ]);
+        let got = values(&reader, "g / h", RateMode::default()).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].iter().all(|(_, v)| *v == 5.0), "{got:?}");
+        assert_eq!(values(&reader, "g", RateMode::default()).unwrap().len(), 2);
+
+        let split = archive(vec![
+            recording(&[("source", "a")], vec![("t", gauge("x", 10))]),
+            recording(&[("source", "b")], vec![("t", gauge("y", 2))]),
+        ]);
+        let err = values(&split, "x / y", RateMode::default()).unwrap_err();
+        assert!(err.contains("no one recording holds all"), "{err}");
+    }
+
+    /// Recordings that differ in more than one label: a combination is
+    /// answered when the labels it keeps still tell them apart, and the
+    /// refusal names every label that does.
+    #[test]
+    fn keeping_any_label_that_tells_recordings_apart_is_enough() {
+        let reader = archive(vec![
+            host("agent", "web-01", vec![("t", gauge("g", 10))]),
+            host("svc", "db-01", vec![("t", gauge("g", 100))]),
+        ]);
+        for q in [
+            "sum by (source) (g)",
+            "sum by (host) (g)",
+            "sum without (source) (g)",
+        ] {
+            assert_eq!(
+                values(&reader, q, RateMode::default())
+                    .unwrap_or_else(|e| panic!("{q}: {e}"))
+                    .len(),
+                2,
+                "{q}"
+            );
+        }
+        let err = values(&reader, "sum(g)", RateMode::default()).unwrap_err();
+        assert!(err.contains("sum by (host, source)"), "{err}");
+        // One recording without `host`: `by (source)` still tells them apart.
+        let partial = archive(vec![
+            host("agent", "web-01", vec![("t", gauge("g", 10))]),
+            recording(&[("source", "svc")], vec![("t", gauge("g", 100))]),
+        ]);
+        assert_eq!(
+            values(&partial, "sum by (source) (g)", RateMode::default())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

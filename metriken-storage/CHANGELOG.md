@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reader::SeriesLabels`): the labels each recording's series carry,
   with `__recording__` (the recording's catalog index) added for recordings
   whose label sets are identical, found among every recording of the reader
-  whether it has tables or not.
+  whether it has tables or not. Worked out once per reader and returned by
+  reference.
 
 ### Fixed
 

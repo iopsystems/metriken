@@ -20,13 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pairs within each recording. A single recording's series carry its
   labels too. A series that already carries one of the keys keeps its own
   value under `exported_<key>`; recordings with identical label sets get
-  `__recording__` (their catalog index) so their series stay apart. A table
-  whose recording's labels no selector of the query can match is left out
-  first. `columns` resolves through the same labels.
+  `__recording__` (their catalog index) so their series stay apart. A
+  recording whose labels no selector of the query can match is left out
+  first, and one lacking a metric the query names contributes nothing (as
+  a pair with no match), so one host without a sampler does not fail a
+  ratio for the others; when no one recording holds every metric named, the
+  error says so. `columns` resolves through the same labels.
 - A query whose result would merge series of different recordings is
-  refused, naming the recordings and the labels to keep: an aggregation
-  that drops a label telling them apart (`sum(x)`, `sum by (cpu) (x)`), or
-  an operator whose `on`/`ignoring` drops one. Answering it means
+  refused, naming the recordings and the labels to keep: an aggregation, or
+  an operator's `on`/`ignoring`, whose kept labels no longer tell the
+  recordings it reaches apart (`sum(x)`, `sum by (cpu) (x)`; `sum by
+  (source)` is answered when `source` differs, also if `host` differs too). Answering it means
   evaluating across recordings, and the engine assumes a metric's series
   share one table's rows: across recordings a raw-mode `sum` alternated
   between them, a grid `sum` read one alone at the range edges and at

@@ -785,13 +785,22 @@ metriken-query, unreleased):
   came from one engine seeing two recordings is gone: per-series queries,
   `sum by (source)`, and plain operators (which pair within a recording)
   are answered as each recording would answer alone, and a kind clash is
-  that recording's error. Refused, because the per-recording results would
-  have to merge: an aggregation that drops a label whose value differs
-  between the recordings it reaches (`sum(x)`, `sum by (cpu) (x)`, `sum by
-  (source)` over twins), an operator whose `on`/`ignoring` drops one, and a
-  histogram from several recordings (`promql::combination_sites` with the
-  labels each site keeps, `refuse_combining_across_recordings`,
-  `refuse_histograms_across_recordings`). A matcher on a label only some
+  that recording's error. A recording lacking a metric the query names is
+  left out (`g / h` on a host with no `h` answers for the others, as a
+  Prometheus pair with no match does); when no one recording holds every
+  metric named (`x` only in a, `y` only in b, `x / y`), the error says so.
+  Refused, because the per-recording results would have to merge: an
+  aggregation, or an operator's `on`/`ignoring`, whose kept labels no
+  longer tell the recordings it reaches apart (`sum(x)`, `sum by (cpu)
+  (x)`, `sum by (source)` over twins), and a histogram from several
+  recordings (`promql::combination_sites` with the labels each site keeps,
+  `refuse_combining_across_recordings`,
+  `refuse_histograms_across_recordings`). The seventh review found the
+  first rule (refuse when any differing label is dropped) refused `sum by
+  (source)` on an agent-and-service archive whose `host` also differs, and
+  its message suggested `sum by (host)`, which was refused in turn; the
+  rule now asks whether the kept labels still tell the recordings apart,
+  and the message names every differing label. A matcher on a label only some
   recordings carry (`g{host="h1"}` where one recording has no `host`)
   counts the others as reached, so `sum(g{host="h1"})` is refused although
   it reads one recording; this over-refuses and answers nothing wrong. The
@@ -799,9 +808,18 @@ metriken-query, unreleased):
   in binary-operator matching, no broadcast across recordings, alignment
   across recordings (onto the slow recording's rows where they cover the
   others), per-series staleness, and trimmed range edges.
-- Each query works out its owning tables and the recordings' labels once
-  (`Plan`), shared by routing, the refusals, the cross-cadence timestamps
-  and `columns`.
+- Each query works out its owning tables once (`Plan`), shared by routing,
+  the refusals, the cross-cadence timestamps and `columns`; the recordings'
+  labels are worked out once per reader (`ArchiveReader::series_labels`,
+  cached, keyed by a map). A reviewer measured the uncached version at
+  1.23 ms per call with 400 recordings.
+- `Plan::new` leaves out a recording (whole: all its owning tables) when
+  no selector naming one of its metrics can match its labels; leaving out
+  single tables (the first version) left a recording with `h` and without
+  `g` for `g{source="a"} / h`, which failed as "metric not found". With
+  incomplete recordings now left out of evaluation, a test cannot tell the
+  two apart (the per-table mutation survives); whole recordings stay,
+  since that is what pruning means. Before that change:
 - `Plan::new` leaves out a table when no selector naming one of its
   metrics can match its recording's labels (`translate_filter` against
   `series_labels`); when that leaves none, the first recording's tables
@@ -838,7 +856,8 @@ metriken-query, unreleased):
   cross-cadence from one recording only; a partly overlapping recording
   read at full resolution; which combinations are answered and refused in
   both modes, twins included; each recording's own interval; a name of
-  two kinds) and metriken-storage
+  two kinds; a matcher on one operand; a recording lacking an operand;
+  recordings that differ in several labels) and metriken-storage
   `labeled::tests`. Seen red: no
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
   the clashing value dropped, cross-cadence across recordings, the merge
@@ -846,7 +865,8 @@ metriken-query, unreleased):
   chained prefix, no histogram refusal, catalog indices kept when
   flattened twins repeat one, twins only among recordings with tables, no
   refusal of merging combinations, every cross-recording combination
-  refused, the slow recording read at a 1 s interval.
+  refused, the slow recording read at a 1 s interval, incomplete recordings
+  kept, refusal whenever a differing label is dropped.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
@@ -867,7 +887,8 @@ metriken-query, unreleased):
 - The engine's binary operators would pair series across recordings
   (`rate(x[3s]) / rate(y[3s])` with `x` only in `source=a` and `y` only in
   `source=b` returned one series labelled `source=a`, where Prometheus
-  returns nothing); such a query is refused above.
+  returns nothing); evaluated per recording, neither recording holds both,
+  and the query is an error saying so.
 - What this changes for rezolus, on the release: series of every archive
   carry `source` and `host` (and `__recording__`, `exported_<key>` where
   they apply), and the cross-recording refusal its tests assert is gone.

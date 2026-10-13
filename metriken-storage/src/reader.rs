@@ -902,6 +902,9 @@ pub struct ArchiveReader {
     /// recording's `__recording__` does not come and go as a twin gains or
     /// loses tables.
     members: Vec<(Arc<BTreeMap<String, String>>, usize)>,
+    /// [`series_labels`](Self::series_labels), worked out on first use:
+    /// `members` is fixed once the reader is built.
+    series_labels: std::sync::OnceLock<SeriesLabels>,
 }
 
 /// One `ArchiveReader` per recording, paired with that recording's label set.
@@ -1208,6 +1211,7 @@ impl ArchiveReader {
             complete,
             recordings,
             members,
+            series_labels: std::sync::OnceLock::new(),
         }
     }
 
@@ -1386,6 +1390,7 @@ impl ArchiveReader {
                     complete: rec.complete,
                     recordings: 1,
                     members: vec![(recording_labels, recording)],
+                    series_labels: std::sync::OnceLock::new(),
                 },
             ));
         }
@@ -1495,6 +1500,7 @@ impl ArchiveReader {
             complete,
             recordings: recording_count,
             members,
+            series_labels: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1590,29 +1596,28 @@ impl ArchiveReader {
     /// not change when a live archive is reopened. Recordings of readers
     /// joined by [`flatten`](Self::flatten) can share an index; a group of
     /// twins in which two do is numbered by position instead.
-    pub fn series_labels(&self) -> SeriesLabels {
-        let members = &self.members;
-        let by_recording = members
-            .iter()
-            .enumerate()
-            .map(|(position, (labels, index))| {
-                let twins: Vec<(usize, usize)> = members
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (other, _))| other.as_ref() == labels.as_ref())
-                    .map(|(p, (_, i))| (p, *i))
-                    .collect();
+    pub fn series_labels(&self) -> &SeriesLabels {
+        self.series_labels.get_or_init(|| {
+            // Recordings by label set, so twins are found in one pass.
+            let mut twins: HashMap<&BTreeMap<String, String>, Vec<usize>> = HashMap::new();
+            for (position, (labels, _)) in self.members.iter().enumerate() {
+                twins.entry(labels.as_ref()).or_default().push(position);
+            }
+            let mut by_recording = HashMap::with_capacity(self.members.len());
+            for (position, (labels, index)) in self.members.iter().enumerate() {
                 let mut extra = Labels {
                     inner: labels.as_ref().clone(),
                 };
-                if twins.len() > 1 {
+                let group = &twins[labels.as_ref()];
+                if group.len() > 1 {
                     // Catalog indices, unless two twins share one (readers
                     // of different archives joined by `flatten`): then the
                     // whole group is numbered by position, so no two collide.
-                    let mut indices: Vec<usize> = twins.iter().map(|(_, i)| *i).collect();
+                    let mut indices: Vec<usize> =
+                        group.iter().map(|p| self.members[*p].1).collect();
                     indices.sort_unstable();
                     indices.dedup();
-                    let value = if indices.len() == twins.len() {
+                    let value = if indices.len() == group.len() {
                         *index
                     } else {
                         position
@@ -1622,10 +1627,10 @@ impl ArchiveReader {
                         value.to_string(),
                     );
                 }
-                (Arc::as_ptr(labels) as usize, extra)
-            })
-            .collect();
-        SeriesLabels { by_recording }
+                by_recording.insert(Arc::as_ptr(labels) as usize, extra);
+            }
+            SeriesLabels { by_recording }
+        })
     }
 
     /// The union of the tables' probed spans, in nanoseconds. From the
@@ -1678,7 +1683,7 @@ fn union_sorted(iters: impl Iterator<Item = Vec<String>>) -> Vec<String> {
 pub struct SeriesLabels {
     /// Keyed by the address of the recording's shared label map, which
     /// identifies the recording (see `SamplerReader::recording_labels`).
-    by_recording: Vec<(usize, Labels)>,
+    by_recording: HashMap<usize, Labels>,
 }
 
 impl SeriesLabels {
@@ -1687,9 +1692,7 @@ impl SeriesLabels {
         static EMPTY: std::sync::OnceLock<Labels> = std::sync::OnceLock::new();
         let ptr = Arc::as_ptr(&table.recording_labels) as usize;
         self.by_recording
-            .iter()
-            .find(|(p, _)| *p == ptr)
-            .map(|(_, l)| l)
+            .get(&ptr)
             .unwrap_or_else(|| EMPTY.get_or_init(Labels::default))
     }
 }
