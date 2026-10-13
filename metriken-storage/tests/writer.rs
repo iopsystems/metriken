@@ -1091,12 +1091,12 @@ fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
     assert_eq!(answers(&after, 0), answers(&fresh, 0));
 }
 
-/// Compacting a long stream must not change what it answers. Ignored until
-/// dendro's compaction carries the segments' key-value metadata: today the
-/// merged segment loses `metriken.layout` and `metriken.occupants` and reads
-/// as a wide table, with one more series than before.
+/// Compacting a long stream with dendro's default merge does not change what
+/// it answers, its interval, or its catalog row counts. dendro (0.4.1 and
+/// later) carries the segments' key-value metadata into the merged segment,
+/// so it stays long; before that it lost `metriken.layout` and
+/// `metriken.occupants` and read as a wide table.
 #[test]
-#[ignore = "dendro's concat_parquet drops long-layout metadata"]
 fn a_compacted_long_stream_answers_as_before() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compact-long.dendro");
@@ -1104,7 +1104,9 @@ fn a_compacted_long_stream_answers_as_before() {
     let pool = BufferPool::new(64 * 1024 * 1024);
     let (before, _) = open_counting(&path, &pool);
     let expected = answers(&before, 0);
+    let interval = before.interval();
     drop(before);
+    let rows = catalog_rows(&path);
     {
         let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
         let tables = streams(&path);
@@ -1121,6 +1123,96 @@ fn a_compacted_long_stream_answers_as_before() {
     }
     let (after, _) = open_counting(&path, &pool);
     assert_eq!(answers(&after, 0), expected);
+    assert_eq!(after.interval(), interval);
+    assert_eq!(catalog_rows(&path), rows, "catalog rows count WAL rows");
+}
+
+/// Each stream's catalog rows, summed over its segments: the WAL rows it
+/// covers, which compaction must not change.
+fn catalog_rows(path: &Path) -> BTreeMap<String, u64> {
+    let db = dendro::archive::Archive::open(path).unwrap();
+    let mut out = BTreeMap::new();
+    for source in db.read_sources().unwrap() {
+        for stream in db.all_streams(source.id).unwrap() {
+            let rows = db
+                .read_segment_meta(source.id, &stream)
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.rows)
+                .sum();
+            out.insert(format!("{}/{stream}", source.id), rows);
+        }
+    }
+    out
+}
+
+/// Compacting a long stream with [`OccupantUnion`] merges across the
+/// segments' occupant-list changes, which the default merge stops at, and
+/// the merged stream answers and lists as before.
+///
+/// [`OccupantUnion`]: metriken_storage::long::OccupantUnion
+#[test]
+fn a_long_stream_compacted_by_union_answers_as_before() {
+    use metriken_storage::long::OccupantUnion;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wide = dir.path().join("wide.dendro");
+    record(&wide, false, true, None);
+    let wide = open(&wide);
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let mut tasks = Vec::new();
+    for by_union in [false, true] {
+        let path = dir.path().join(format!("compact-{by_union}.dendro"));
+        record(&path, true, true, None);
+        let (before, _) = open_counting(&path, &pool);
+        let expected = answers(&before, 0);
+        let interval = before.interval();
+        drop(before);
+        let rows = catalog_rows(&path);
+        let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
+        let segments = |path: &Path| {
+            dendro::archive::Archive::open(path)
+                .unwrap()
+                .read_segment_meta(id, "threads/tasks")
+                .unwrap()
+                .len()
+        };
+        let sealed = segments(&path);
+        {
+            let tables = streams(&path);
+            let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+            let spec = dendro::rewrite::CompactSpec::to_rows(100);
+            for stream in tables {
+                if by_union {
+                    dendro::rewrite::compact_stream_with(
+                        &mut db,
+                        id,
+                        &stream,
+                        &spec,
+                        &OccupantUnion,
+                    )
+                } else {
+                    dendro::rewrite::compact_stream(&mut db, id, &stream, &spec)
+                }
+                .unwrap();
+            }
+        }
+        let (after, _) = open_counting(&path, &pool);
+        assert_eq!(answers(&after, 0), expected, "union: {by_union}");
+        assert_eq!(after.interval(), interval, "union: {by_union}");
+        assert_eq!(catalog_rows(&path), rows, "union: {by_union}");
+        listings_match_queries(&after, &wide);
+        tasks.push((sealed, segments(&path)));
+    }
+    eprintln!(
+        "threads/tasks segments (sealed, compacted): stop {:?}, union {:?}",
+        tasks[0], tasks[1]
+    );
+    assert_eq!(tasks[0].0, tasks[1].0);
+    assert!(
+        tasks[1].1 < tasks[0].1,
+        "the union merge leaves fewer segments: {tasks:?}"
+    );
 }
 
 /// A reader whose tables were not queried passes on the state it was given,
