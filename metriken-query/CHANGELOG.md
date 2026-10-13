@@ -30,7 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused, naming the recordings and the labels to keep: an aggregation, or
   an operator's `on`/`ignoring`, whose kept labels no longer tell the
   recordings it reaches apart (`sum(x)`, `sum by (cpu) (x)`; `sum by
-  (source)` is answered when `source` differs, also if `host` differs too). Answering it means
+  (source)` is answered when `source` differs, also if `host` differs too).
+  Two recordings are told apart by a kept label both carry with different
+  values (a recording lacking a label may carry it on its series), and
+  `without`/`ignoring` keep no internal label, so they do not keep twins
+  apart. An operator whose sides read different recordings is answered
+  when such a label is kept by its matching and by every aggregation on
+  both sides (`g{source="a"} / h`), and refused otherwise
+  (`sum(x{source="a"}) - sum(x{source="b"})`, which per recording would be
+  empty). As a last check, a result in which series of two recordings share
+  a label set is refused. Answering it means
   evaluating across recordings, and the engine assumes a metric's series
   share one table's rows: across recordings a raw-mode `sum` alternated
   between them, a grid `sum` read one alone at the range edges and at

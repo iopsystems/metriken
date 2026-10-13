@@ -800,7 +800,21 @@ metriken-query, unreleased):
   (source)` on an agent-and-service archive whose `host` also differs, and
   its message suggested `sum by (host)`, which was refused in turn; the
   rule now asks whether the kept labels still tell the recordings apart,
-  and the message names every differing label. A matcher on a label only some
+  and the message names every differing label. The eighth review found
+  three wrong answers that rule let through, each fixed: an operator
+  between aggregates of different recordings
+  (`count(x{source="a"}) + count(x{source="b"})`) came back empty, since
+  each recording held one side, so an operator whose sides read different
+  recordings is answered only when a label telling them apart survives its
+  matching and every aggregation on both sides (`Site::keeps_across`);
+  `without` kept twins "apart" by `__recording__`, which the engine drops
+  under `without` and `ignoring`, so those keep no internal label; and a
+  recording lacking `host` while its series carry `host` collided with one
+  that has it, so two recordings count as apart only on a label both
+  carry. A last check refuses any result in which series of two
+  recordings share a label set (`refuse_shared_label_sets`); with it in
+  place, the "both carry" mutation survives, since the check catches the
+  same case. A matcher on a label only some
   recordings carry (`g{host="h1"}` where one recording has no `host`)
   counts the others as reached, so `sum(g{host="h1"})` is refused although
   it reads one recording; this over-refuses and answers nothing wrong. The
@@ -866,7 +880,8 @@ metriken-query, unreleased):
   flattened twins repeat one, twins only among recordings with tables, no
   refusal of merging combinations, every cross-recording combination
   refused, the slow recording read at a 1 s interval, incomplete recordings
-  kept, refusal whenever a differing label is dropped.
+  kept, refusal whenever a differing label is dropped, side groupings
+  ignored, `without` keeping internal labels, no shared-label-set check.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9

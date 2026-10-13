@@ -78,6 +78,7 @@ pub(crate) type Selector = (HashSet<String>, Labels);
 
 /// Which labels of the series it combines a combination keeps apart: an
 /// aggregation's grouping, or a binary operator's matching.
+#[derive(Clone)]
 pub(crate) enum Keeps {
     /// Every label: a binary operator with no `on`/`ignoring`.
     All,
@@ -88,12 +89,15 @@ pub(crate) enum Keeps {
 }
 
 impl Keeps {
-    /// Whether series that differ in `key` stay apart.
+    /// Whether series that differ in `key` stay apart. `without` and
+    /// `ignoring` drop internal labels (`__recording__`) along with the
+    /// listed ones, as the engine does (`streaming/aggregate.rs`,
+    /// `streaming/binary.rs`).
     pub(crate) fn keeps(&self, key: &str) -> bool {
         match self {
             Keeps::All => true,
             Keeps::Only(keys) => keys.contains(key),
-            Keeps::AllBut(keys) => !keys.contains(key),
+            Keeps::AllBut(keys) => !keys.contains(key) && !crate::labels::is_internal_label(key),
         }
     }
 
@@ -107,12 +111,63 @@ impl Keeps {
     }
 }
 
-/// Every place `query` combines series: an aggregation (the selectors of
-/// its operand) and a binary operator with a selector on both sides (the
-/// selectors of both), each with the labels it keeps apart. For a reader
-/// that evaluates a query once per recording and must know where the
-/// result would merge series of different recordings.
-pub(crate) fn combination_sites(query: &str) -> Result<Vec<(Vec<Selector>, Keeps)>, QueryError> {
+/// A place where a query combines series.
+pub(crate) struct Site {
+    /// The selectors of an aggregation's operand, or of an operator's left
+    /// side.
+    pub(crate) lhs: Vec<Selector>,
+    /// The selectors of an operator's right side; `None` for an aggregation.
+    pub(crate) rhs: Option<Vec<Selector>>,
+    /// The labels the site keeps apart.
+    pub(crate) keeps: Keeps,
+    /// For an operator: the groupings of every aggregation on either side.
+    /// A side's series carry a label only if each of its aggregations keeps
+    /// it.
+    pub(crate) side_groupings: Vec<Keeps>,
+}
+
+impl Site {
+    /// Whether an operator's sides still carry `key` where they meet, and
+    /// its matching keeps it.
+    pub(crate) fn keeps_across(&self, key: &str) -> bool {
+        self.keeps.keeps(key) && self.side_groupings.iter().all(|g| g.keeps(key))
+    }
+}
+
+fn groupings(expr: &Expr, out: &mut Vec<Keeps>) {
+    match expr {
+        Expr::Aggregate(agg) => {
+            out.push(Keeps::of(
+                agg.modifier.as_ref(),
+                Keeps::Only(HashSet::new()),
+            ));
+            groupings(&agg.expr, out);
+        }
+        Expr::Binary(b) => {
+            groupings(&b.lhs, out);
+            groupings(&b.rhs, out);
+        }
+        Expr::Unary(u) => groupings(&u.expr, out),
+        Expr::Paren(p) => groupings(&p.expr, out),
+        Expr::Call(call) => {
+            for a in &call.args.args {
+                groupings(a, out);
+            }
+        }
+        Expr::Subquery(s) => groupings(&s.expr, out),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
+/// Every place `query` combines series: an aggregation and a binary
+/// operator with a selector on both sides, each with the labels it keeps
+/// apart. For a reader that evaluates a query once per recording and must
+/// know where the result would merge series of different recordings.
+pub(crate) fn combination_sites(query: &str) -> Result<Vec<Site>, QueryError> {
     let stripped = strip_rezolus_wrapper(query)?;
     let expr = parser::parse(stripped)
         .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
@@ -127,20 +182,34 @@ fn selectors_of(expr: &Expr) -> Vec<Selector> {
     out
 }
 
-fn walk_combinations(expr: &Expr, out: &mut Vec<(Vec<Selector>, Keeps)>) {
+fn walk_combinations(expr: &Expr, out: &mut Vec<Site>) {
     match expr {
         Expr::Aggregate(agg) => {
             // No grouping keeps nothing apart: `sum(x)` is one series.
             let keeps = Keeps::of(agg.modifier.as_ref(), Keeps::Only(HashSet::new()));
-            out.push((selectors_of(&agg.expr), keeps));
+            out.push(Site {
+                lhs: selectors_of(&agg.expr),
+                rhs: None,
+                keeps,
+                side_groupings: Vec::new(),
+            });
             walk_combinations(&agg.expr, out);
         }
         Expr::Binary(b) => {
-            let (mut lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
+            let (lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
             if !lhs.is_empty() && !rhs.is_empty() {
-                lhs.extend(rhs);
                 let matching = b.modifier.as_ref().and_then(|m| m.matching.as_ref());
-                out.push((lhs, Keeps::of(matching, Keeps::All)));
+                out.push(Site {
+                    lhs,
+                    rhs: Some(rhs),
+                    keeps: Keeps::of(matching, Keeps::All),
+                    side_groupings: {
+                        let mut g = Vec::new();
+                        groupings(&b.lhs, &mut g);
+                        groupings(&b.rhs, &mut g);
+                        g
+                    },
+                });
             }
             walk_combinations(&b.lhs, out);
             walk_combinations(&b.rhs, out);

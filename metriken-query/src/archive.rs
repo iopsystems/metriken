@@ -343,8 +343,39 @@ fn route<'a>(plan: &Plan<'a>, query: &str) -> Result<Vec<Part<'a>>, QueryError> 
     Ok(parts)
 }
 
+/// Refuse results whose series from different recordings share a label
+/// set: they could not be told apart, and a reader would take two
+/// recordings' series for one. The refusals before evaluation are meant to
+/// prevent this; this is what holds if one of them misses a case.
+fn refuse_shared_label_sets<'r>(
+    parts: impl Iterator<Item = Vec<&'r HashMap<String, String>>>,
+) -> Result<(), QueryError> {
+    let mut seen: HashMap<Vec<(&String, &String)>, usize> = HashMap::new();
+    for (part, metrics) in parts.enumerate() {
+        for metric in metrics {
+            let mut key: Vec<(&String, &String)> = metric.iter().collect();
+            key.sort();
+            if let Some(other) = seen.insert(key, part) {
+                if other != part {
+                    return Err(QueryError::ParseError(format!(
+                        "series of different recordings come back with the same labels \
+                         ({metric:?}), so they cannot be told apart; select one recording \
+                         with a label matcher"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The recordings' results as one: their series, concatenated.
 fn concatenate(results: Vec<QueryResult>) -> Result<QueryResult, QueryError> {
+    refuse_shared_label_sets(results.iter().map(|r| match r {
+        QueryResult::Matrix { result } => result.iter().map(|m| &m.metric).collect(),
+        QueryResult::Vector { result } => result.iter().map(|m| &m.metric).collect(),
+        _ => Vec::new(),
+    }))?;
     let mut results = results.into_iter();
     let first = results
         .next()
@@ -371,6 +402,11 @@ fn concatenate_display(
     results: Vec<crate::DisplayResult>,
 ) -> Result<crate::DisplayResult, QueryError> {
     use crate::DisplayResult;
+    refuse_shared_label_sets(results.iter().map(|r| match r {
+        DisplayResult::Series { result, .. } => result.iter().map(|m| &m.metric).collect(),
+        DisplayResult::Vector { result } => result.iter().map(|m| &m.metric).collect(),
+        _ => Vec::new(),
+    }))?;
     let mut results = results.into_iter();
     let first = results
         .next()
@@ -435,45 +471,88 @@ fn refuse_combining_across_recordings(
     query: &str,
 ) -> Result<(), QueryError> {
     let reachable: Vec<&SamplerReader> = recordings.iter().map(|r| r[0]).collect();
-    for (selectors, keeps) in crate::promql::combination_sites(query)? {
-        let reached: Vec<&SamplerReader> = recordings_selected(plan, &selectors)
+    let reach = |selectors: &[crate::promql::Selector]| -> Vec<&SamplerReader> {
+        recordings_selected(plan, selectors)
             .into_iter()
             .filter(|t| reachable.iter().any(|r| r.same_recording(t)))
-            .collect();
+            .collect()
+    };
+    let which = || recording_selectors(recordings, plan.labels);
+    for site in crate::promql::combination_sites(query)? {
+        let lhs = reach(&site.lhs);
+        let reached = match &site.rhs {
+            None => lhs,
+            Some(rhs) => {
+                // Evaluated per recording, an operator pairs its sides
+                // within a recording. That is the query's own answer when
+                // its sides read the same recordings (checked below like
+                // any site), or when they read different ones but a label
+                // that tells every left recording from every right one is
+                // kept by the matching and by every aggregation on both
+                // sides: then no pair crosses recordings
+                // (`g{source="a"} / h`, `sum by (source) (..) / sum by
+                // (source) (..)`). An aggregation that drops it
+                // (`count(x{source="a"}) + count(x{source="b"})` pairs `{}`
+                // with `{}`) leaves each recording with one side, and the
+                // answer would be empty.
+                let rhs = reach(rhs);
+                let same = lhs.len() == rhs.len()
+                    && lhs.iter().all(|l| rhs.iter().any(|r| r.same_recording(l)));
+                if !same {
+                    let kept_apart = |a: &SamplerReader, b: &SamplerReader| {
+                        a.same_recording(b) || {
+                            let (a, b) = (plan.labels.of(a), plan.labels.of(b));
+                            a.inner.iter().any(|(k, v)| {
+                                site.keeps_across(k) && b.inner.get(k).is_some_and(|w| w != v)
+                            })
+                        }
+                    };
+                    let apart = lhs.iter().all(|l| rhs.iter().all(|r| kept_apart(l, r)));
+                    if !apart {
+                        return Err(QueryError::ParseError(format!(
+                            "query {query} applies an operator between series of different \
+                             recordings ({}); series of different recordings are not \
+                             combined yet. Select one recording with a label matcher (e.g. \
+                             {})",
+                            which().join(", "),
+                            which()[0],
+                        )));
+                    }
+                    continue;
+                }
+                lhs
+            }
+        };
         if reached.len() < 2 {
             continue;
         }
-        // Safe when the reached recordings stay apart on the labels kept.
-        let kept: Vec<BTreeMap<&String, &String>> = reached
-            .iter()
-            .map(|t| {
-                plan.labels
-                    .of(t)
-                    .inner
-                    .iter()
-                    .filter(|(k, _)| keeps.keeps(k))
-                    .collect()
-            })
-            .collect();
-        let distinct = kept
+        // Safe when every two reached recordings keep a label both carry,
+        // with different values: a label one recording lacks can be on its
+        // series instead.
+        let apart = |a: &SamplerReader, b: &SamplerReader| {
+            let (a, b) = (plan.labels.of(a), plan.labels.of(b));
+            a.inner
+                .iter()
+                .any(|(k, v)| site.keeps_across(k) && b.inner.get(k).is_some_and(|w| w != v))
+        };
+        let distinct = reached
             .iter()
             .enumerate()
-            .all(|(i, a)| kept[i + 1..].iter().all(|b| a != b));
+            .all(|(i, a)| reached[i + 1..].iter().all(|b| apart(a, b)));
         if distinct {
             continue;
         }
         let differing = differing_keys(plan, &reached);
-        let which = recording_selectors(recordings, plan.labels);
         return Err(QueryError::ParseError(format!(
             "query {query} merges series from {} recordings ({}): the labels it keeps do \
              not tell them apart, and series of different recordings are not combined \
              yet. Keep {} (e.g. sum by ({}) (...)), or select one recording with a label \
              matcher (e.g. {})",
             recordings.len(),
-            which.join(", "),
+            which().join(", "),
             differing.join(", "),
             differing.join(", "),
-            which[0],
+            which()[0],
         )));
     }
     Ok(())
@@ -1637,5 +1716,89 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// Operands that aggregate away the recording labels cannot be paired
+    /// per recording: refused, not answered empty.
+    #[test]
+    fn an_operator_between_aggregates_of_different_recordings_is_refused() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("t", counter_table("c", &[(&[], 1)], 10))],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("t", counter_table("c", &[(&[], 2)], 10))],
+            ),
+        ]);
+        let err = reader
+            .query_range_opts(
+                r#"count(rate(c{source="a"}[3s])) + count(rate(c{source="b"}[3s]))"#,
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("operator between series of different recordings"),
+            "{err}"
+        );
+    }
+
+    /// `without` drops internal labels, so it cannot keep twins apart.
+    #[test]
+    fn without_does_not_keep_twins_apart() {
+        let twin = |v| {
+            recording(
+                &[("source", "s")],
+                vec![("t", counter_table("c", &[(&[("cpu", "0")], v)], 10))],
+            )
+        };
+        let reader = archive(vec![twin(1), twin(2)]);
+        let err = reader
+            .query_range_opts(
+                "sum without (cpu) (rate(c[3s]))",
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merges series from 2 recordings"), "{err}");
+        assert_eq!(
+            series(&reader, "sum by (__recording__) (rate(c[3s]))").len(),
+            2
+        );
+    }
+
+    /// A recording without a label can carry it on its series; two
+    /// recordings whose series end up with one label set are refused, not
+    /// returned as two indistinguishable series.
+    #[test]
+    fn a_label_one_recording_lacks_does_not_tell_it_apart() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "s"), ("host", "x")],
+                vec![("t", counter_table("c", &[(&[], 1)], 10))],
+            ),
+            recording(
+                &[("source", "s")],
+                vec![("t", counter_table("c", &[(&[("host", "x")], 2)], 10))],
+            ),
+        ]);
+        for q in ["rate(c[3s])", "sum by (host) (rate(c[3s]))"] {
+            let err = reader
+                .query_range_opts(q, 1.0, 10.0, 1.0, &QueryOptions::default())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("same labels") || err.contains("merges series"),
+                "{q}: {err}"
+            );
+        }
     }
 }
