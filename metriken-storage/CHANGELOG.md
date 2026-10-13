@@ -62,9 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window of `max_age` or longer (hindsight's 15 m default) is unaffected.
   When a window is just under `max_age`, every stream of a source is sealed
   in the same eviction, so their seals align from then on. A seal that
-  dendro defers after its retries, followed by an eviction, can still cut
-  an anchor; closing that needs dendro to skip evicting a stream whose seal
-  deferred.
+  dendro defers after its retries is retried by dendro 0.4.2 at the start
+  of the next eviction, and a stream it still cannot seal is left out of
+  that eviction, so a deferred seal does not let retention cut an anchor
+  either.
 - The WAL decoders (`materialize_wal_tail`, `materialize_long_wal_tail`)
   resolve a schema-less row against the schema its hash names, wherever in
   the tail it was stated, rather than only the last schema stated. A tail
