@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.36.1
+
+- **Fixed:** the histogram functions (`histogram_quantile(s)`,
+  `histogram_count`, `histogram_sum`, `histogram_mean`,
+  `histogram_heatmap`) clipped a tick's or stride's cumulative count at
+  `u32::MAX`, so above 4,294,967,295 observations quantiles came back low
+  and count, sum, mean and heatmap cells were wrong. See the crate's
+  CHANGELOG.
+
 ### metriken-model 0.1.2
 
 - **Added:** `wire`, the names `/metrics/stream` is served under and its

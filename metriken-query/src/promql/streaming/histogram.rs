@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use ::histogram::{Config, CumulativeROHistogram32Ref, Quantile, QuantilesResult};
+use ::histogram::{Config, CumulativeROHistogramRef, Quantile, QuantilesResult};
 
 use crate::histogram_stream::{HistogramRow, HistogramStream};
 use crate::labels::Labels;
@@ -220,7 +220,7 @@ fn total_count(snap: &HistogramSnapshot) -> u64 {
 /// the true sum lies within `[Σ count·start, Σ count·end]`. The nominal sum
 /// (`total_count · mean`, where `mean` uses bucket midpoints) sits inside this
 /// band by construction. Returns `(lo, hi)`.
-fn bucket_weighted_sum(r: &CumulativeROHistogram32Ref<'_>) -> (f64, f64) {
+fn bucket_weighted_sum(r: &CumulativeROHistogramRef<'_>) -> (f64, f64) {
     let mut lo = 0.0f64;
     let mut hi = 0.0f64;
     for bucket in r.iter() {
@@ -299,7 +299,7 @@ fn quantiles_impl(
     let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut scratch_idx: Vec<u32> = Vec::new();
-    let mut scratch_cnt: Vec<u32> = Vec::new();
+    let mut scratch_cnt: Vec<u64> = Vec::new();
     let mut stride_last_emit: Option<u64> = None;
     let mut stride_end_time: u64 = 0;
     let mut current_t: Option<u64> = None;
@@ -441,7 +441,7 @@ fn reduce(
     metric_name: &str,
     // Returns (nominal value, optional value-uncertainty band from bucket
     // resolution). sum/mean carry a band; count is exact (None).
-    reducer: impl Fn(&CumulativeROHistogram32Ref<'_>) -> Option<(f64, Option<(f64, f64)>)>,
+    reducer: impl Fn(&CumulativeROHistogramRef<'_>) -> Option<(f64, Option<(f64, f64)>)>,
 ) -> Vec<MatrixSample> {
     let HistogramStream { meta, rows } = stream;
     let config = meta.config;
@@ -468,7 +468,7 @@ fn reduce(
     let mut accum_per_group: Vec<BTreeMap<u32, u64>> =
         (0..g_count).map(|_| BTreeMap::new()).collect();
     let mut scratch_idx: Vec<u32> = Vec::new();
-    let mut scratch_cnt: Vec<u32> = Vec::new();
+    let mut scratch_cnt: Vec<u64> = Vec::new();
     let mut stride_last_emit: Option<u64> = None;
     let mut stride_end_time: u64 = 0;
     let mut current_t: Option<u64> = None;
@@ -490,7 +490,7 @@ fn reduce(
                     for g in 0..g_count {
                         if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt)
                         {
-                            let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                            let r = CumulativeROHistogramRef::from_parts_unchecked(
                                 config,
                                 &scratch_idx,
                                 &scratch_cnt,
@@ -530,7 +530,7 @@ fn reduce(
                                 &mut scratch_idx,
                                 &mut scratch_cnt,
                             ) {
-                                let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                                let r = CumulativeROHistogramRef::from_parts_unchecked(
                                     config,
                                     &scratch_idx,
                                     &scratch_cnt,
@@ -554,7 +554,7 @@ fn reduce(
         if stride_ns.is_some() {
             for g in 0..g_count {
                 if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
-                    let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                    let r = CumulativeROHistogramRef::from_parts_unchecked(
                         config,
                         &scratch_idx,
                         &scratch_cnt,
@@ -568,7 +568,7 @@ fn reduce(
         } else {
             for g in 0..g_count {
                 if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
-                    let r = CumulativeROHistogram32Ref::from_parts_unchecked(
+                    let r = CumulativeROHistogramRef::from_parts_unchecked(
                         config,
                         &scratch_idx,
                         &scratch_cnt,
@@ -708,7 +708,7 @@ fn heatmap_impl(
     let mut stride_last_emit: Option<u64> = None;
     let mut stride_end_time: u64 = 0;
     let mut scratch_idx: Vec<u32> = Vec::new();
-    let mut scratch_cnt: Vec<u32> = Vec::new();
+    let mut scratch_cnt: Vec<u64> = Vec::new();
 
     let mut timestamps: Vec<f64> = Vec::new();
     let mut data: Vec<(usize, usize, f64)> = Vec::new();
@@ -719,7 +719,7 @@ fn heatmap_impl(
 
     let emit_tick = |t_ns: u64,
                      idx: &[u32],
-                     cnt: &[u32],
+                     cnt: &[u64],
                      timestamps: &mut Vec<f64>,
                      data: &mut Vec<(usize, usize, f64)>,
                      min_value: &mut f64,
@@ -728,7 +728,7 @@ fn heatmap_impl(
                      max_bucket_idx: &mut usize| {
         let time_idx = timestamps.len();
         timestamps.push(t_ns as f64 / 1e9);
-        let mut prev = 0u32;
+        let mut prev = 0u64;
         for k in 0..idx.len() {
             let cumu = cnt[k];
             let individual = cumu - prev;
@@ -890,10 +890,14 @@ fn heatmap_impl(
 
 /// Flush `accum` into scratch buffers as a running cumulative. Clears `accum`.
 /// Returns `false` if the result is empty.
+///
+/// The cumulative is `u64`: one tick or stride summed over several series
+/// can exceed `u32::MAX` observations, and a `u32` cumulative would have to
+/// clip it, which moves every quantile above the clip point down.
 fn flush_accum(
     accum: &mut BTreeMap<u32, u64>,
     scratch_idx: &mut Vec<u32>,
-    scratch_cnt: &mut Vec<u32>,
+    scratch_cnt: &mut Vec<u64>,
 ) -> bool {
     scratch_idx.clear();
     scratch_cnt.clear();
@@ -903,9 +907,8 @@ fn flush_accum(
             continue;
         }
         running = running.saturating_add(*c);
-        let clipped = running.min(u32::MAX as u64) as u32;
         scratch_idx.push(*idx);
-        scratch_cnt.push(clipped);
+        scratch_cnt.push(running);
     }
     accum.clear();
     !scratch_idx.is_empty()
@@ -914,13 +917,13 @@ fn flush_accum(
 fn apply_quantiles(
     config: Config,
     idx: &[u32],
-    cnt: &[u32],
+    cnt: &[u64],
     quantile_floats: &[f64],
     keys: &[(usize, f64, Quantile)],
     t_ns: u64,
     out: &mut [Vec<QuantileRow>],
 ) {
-    let r = CumulativeROHistogram32Ref::from_parts_unchecked(config, idx, cnt);
+    let r = CumulativeROHistogramRef::from_parts_unchecked(config, idx, cnt);
     let q_result: Result<Option<QuantilesResult>, _> = r.quantiles(quantile_floats);
     if let Ok(Some(qr)) = q_result {
         let t_sec = t_ns as f64 / 1e9;

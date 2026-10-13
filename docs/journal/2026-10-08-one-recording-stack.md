@@ -411,15 +411,32 @@ re-exports what it moves, in the release after.
    in the handshake (the recorder adopts handshake metadata since step 4),
    and the viewer reads `service_queries` from a source's metadata.
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
-   `.dendro` by default.
+   `.dendro` by default. Design and gate: [metriken-py](2026-10-12-metriken-py.md).
 7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
    6.0.0 (decided 2026-10-12: 6.0.0 is released after every open step and
    these follow-ups, so its wire, formats and CLI ship complete: stream frame
    size, sending only changed histogram members or sparse buckets; dendro's
    compaction keeping long-layout metadata; whether the route helper refuses
    an interval below its floor; the histogram query path; the storage scan's
-   gaps, each kept only if measured a clear win). The step closes when
-   rezolus is on the released crates and a cachecannon branch passes the
-   viewer entry's GO 1; systemslab moves after rezolus 6.0.0. Design, gate
-   and the scope decisions (2026-10-12): [metriken-dashboard and
-   metriken-viewer](2026-10-12-metriken-viewer.md).
+   gaps, each kept only if measured a clear win). Two metriken-storage
+   correctness fixes are also in scope, both found from the code and not
+   reproduced ([metriken-py](2026-10-12-metriken-py.md), "A file still
+   being written"): `DbSegmentStore::build` reads `segment_meta` and
+   `live_wal` as two statements outside one read snapshot, so it loses the
+   rows of a seal that commits between them; and `DbSegmentStore::bytes`
+   does not compare the `segment_key` it listed, while
+   `splice_histogram_streams` drops no overlapping rows, so a segment merged
+   by a compaction between listing and fetch can repeat rows. The histogram query path
+   had a correctness bug, fixed in a separate patch release: in
+   metriken-query 0.36.0, `flush_accum` caps running bucket counts at
+   u32::MAX in a `u32` buffer; the quantile and reduce paths read it as
+   `CumulativeROHistogram32Ref` and the heatmap differences it directly, so
+   `histogram_quantiles`, `histogram_count`/`_sum`/`_mean` and
+   `histogram_heatmap` are wrong for any tick or stride whose total exceeds
+   2^32 (reproduced 2026-10-12; [metriken-py](2026-10-12-metriken-py.md),
+   "Histograms as h2histogram objects"). metriken-query 0.36.1 keeps the
+   counts as `u64`; as of 2026-10-12 it is merged (#261) and not yet
+   released. The step closes when rezolus is on the released crates and a
+   cachecannon branch passes the viewer entry's GO 1; systemslab moves after
+   rezolus 6.0.0. Design, gate and the scope decisions (2026-10-12):
+   [metriken-dashboard and metriken-viewer](2026-10-12-metriken-viewer.md).
