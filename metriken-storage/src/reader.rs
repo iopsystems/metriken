@@ -545,14 +545,16 @@ impl TableReader {
 /// it; this field is never split eagerly because most tables (every V2
 /// table, and any V3 sampler with only one group) don't need it to be.
 ///
-/// `recording` is the index (within `from_recordings`'s input) of the
-/// recording this table belongs to — carried so `route()` can tell "two
-/// group tables of one sampler in one recording" (union) apart from "the
-/// same sampler's table in two DIFFERENT recordings" (still a refusal; see
-/// the module docs). An index rather than the recording's `dir` string:
-/// `dir` is a display name derived from labels (`recording_dir_slug`), not a
-/// guaranteed-unique identity — two recordings with the same labels are
-/// entirely legal and would collide on `dir`.
+/// `recording` is the index of the recording this table belongs to, in its
+/// catalog (or in `from_in_memory`'s input). It is what `__recording__`
+/// carries for recordings with identical label sets. Which recording a table
+/// belongs to, for grouping a query's tables, is decided by
+/// `recording_labels` instead: the index repeats across readers joined by
+/// [`ArchiveReader::flatten`]. An index rather than the recording's `dir`
+/// string: `dir` is a display name derived from labels
+/// (`recording_dir_slug`), not a guaranteed-unique identity — two
+/// recordings with the same labels are entirely legal and would collide on
+/// `dir`.
 pub struct SamplerReader {
     recording: usize,
     /// The labels of the recording this table belongs to, one allocation per
@@ -628,6 +630,11 @@ impl SamplerReader {
     /// The index of the recording this table belongs to.
     pub fn recording(&self) -> usize {
         self.recording
+    }
+
+    /// Whether this table holds metric `name`, of any kind.
+    pub fn holds(&self, name: &str) -> bool {
+        self.names.holds(name)
     }
 
     /// The labels of the recording this table belongs to, as the catalog
@@ -1162,10 +1169,12 @@ impl ArchiveReader {
     /// multi-source archive. Its metadata is the first reader's, and it is
     /// complete when every reader is.
     ///
-    /// Flattening several recordings gives every table name several
-    /// owners, so routing refuses a query that names one, and
-    /// [`composition_sources`](Self::composition_sources) refuses outright.
-    /// Prefer one reader per source.
+    /// Flattening several recordings gives a table name several owners,
+    /// one per recording: a query naming it is answered from every
+    /// recording, each recording's series under its labels
+    /// ([`series_labels`](Self::series_labels)).
+    /// [`composition_sources`](Self::composition_sources) refuses a
+    /// flattened reader.
     pub fn flatten(readers: Vec<ArchiveReader>, filename: Option<String>) -> Self {
         let mut tables = Vec::new();
         let mut metadata = BTreeMap::new();
@@ -1558,34 +1567,40 @@ impl ArchiveReader {
     /// The labels each recording's series carry: the recording's labels, and
     /// for recordings whose label sets are identical,
     /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
-    /// recording's position among this reader's recordings (first table
-    /// order), so their series stay apart.
+    /// recording's index in its catalog, so their series stay apart. The
+    /// index does not change when a live archive is reopened. Recordings of
+    /// readers joined by [`flatten`](Self::flatten) can share an index; two
+    /// of those with identical labels are numbered by position instead.
     pub fn series_labels(&self) -> SeriesLabels {
-        let mut recordings: Vec<&Arc<BTreeMap<String, String>>> = Vec::new();
+        // (identity, catalog index, labels), one per recording, in table order.
+        let mut recordings: Vec<(&Arc<BTreeMap<String, String>>, usize)> = Vec::new();
         for t in &self.tables {
             if !recordings
                 .iter()
-                .any(|r| Arc::ptr_eq(r, &t.recording_labels))
+                .any(|(r, _)| Arc::ptr_eq(r, &t.recording_labels))
             {
-                recordings.push(&t.recording_labels);
+                recordings.push((&t.recording_labels, t.recording));
             }
         }
         let by_recording = recordings
             .iter()
             .enumerate()
-            .map(|(i, labels)| {
-                let shared = recordings
+            .map(|(position, (labels, index))| {
+                let twins: Vec<usize> = recordings
                     .iter()
-                    .filter(|other| other.as_ref() == labels.as_ref())
-                    .count()
-                    > 1;
+                    .filter(|(other, _)| other.as_ref() == labels.as_ref())
+                    .map(|(_, i)| *i)
+                    .collect();
                 let mut extra = Labels {
                     inner: labels.as_ref().clone(),
                 };
-                if shared {
-                    extra
-                        .inner
-                        .insert(crate::labeled::RECORDING_LABEL.to_string(), i.to_string());
+                if twins.len() > 1 {
+                    let unique = twins.iter().filter(|i| *i == index).count() == 1;
+                    let value = if unique { *index } else { position };
+                    extra.inner.insert(
+                        crate::labeled::RECORDING_LABEL.to_string(),
+                        value.to_string(),
+                    );
                 }
                 (Arc::as_ptr(labels) as usize, extra)
             })

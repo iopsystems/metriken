@@ -59,6 +59,48 @@ pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
     Ok(out)
 }
 
+/// Each selector of a query: the metric names it can select (one, or none
+/// for a selector with no name) and its label matchers as a filter
+/// (`extract_filter_labels`). Like [`referenced_metrics`], needs no source;
+/// a reader uses it to leave out tables whose fixed labels no selector can
+/// match.
+pub(crate) fn selectors(query: &str) -> Result<Vec<(HashSet<String>, Labels)>, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let mut out = Vec::new();
+    walk_selectors(&expr, &mut out);
+    Ok(out)
+}
+
+/// Mirror of [`walk_names`], collecting each selector whole.
+fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
+    match expr {
+        Expr::Aggregate(agg) => walk_selectors(&agg.expr, out),
+        Expr::Unary(u) => walk_selectors(&u.expr, out),
+        Expr::Binary(b) => {
+            walk_selectors(&b.lhs, out);
+            walk_selectors(&b.rhs, out);
+        }
+        Expr::Paren(p) => walk_selectors(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_selectors(arg, out);
+            }
+        }
+        Expr::VectorSelector(sel) => out.push(selector(sel)),
+        Expr::MatrixSelector(sel) => out.push(selector(&sel.vs)),
+        Expr::Subquery(s) => walk_selectors(&s.expr, out),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
+fn selector(sel: &parser::VectorSelector) -> (HashSet<String>, Labels) {
+    let mut names = HashSet::new();
+    collect_selector_names(sel, &mut names);
+    (names, extract_filter_labels(&sel.matchers.matchers))
+}
+
 /// Mirror of [`walk`] that collects selector names instead of columns. Kept
 /// beside it deliberately: the two must stay in step as the expression grammar
 /// grows, and a missed arm here silently narrows routing rather than failing

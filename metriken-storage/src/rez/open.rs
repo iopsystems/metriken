@@ -16,8 +16,9 @@ use crate::rez::wal::materialize_wal_tail;
 use crate::{ArchiveReader, BufferPool, InMemorySource, LabeledRecordings};
 
 /// Open the archive at `path`, flattening every recording into one reader.
-/// A query over it that names one sampler in two recordings is refused by
-/// the router, so prefer [`open_recordings`].
+/// A query over it is answered from every recording holding the metrics it
+/// names, each recording's series under its labels; [`open_recordings`]
+/// gives one reader per recording instead.
 pub fn open_with_pool(
     path: &Path,
     pool: Arc<BufferPool>,

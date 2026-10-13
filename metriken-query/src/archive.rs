@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use metriken_storage::labeled::LabeledSource;
+use metriken_storage::labeled::{translate_filter, LabeledSource};
 use metriken_storage::parquet::MultiParquetSource;
 use metriken_storage::reader::{SamplerReader, TableReader};
 use metriken_storage::union::UnionSource;
@@ -69,15 +69,34 @@ pub fn eval_timestamps_for(
 /// need a source, which is exactly why routing can use it and `columns`
 /// (which expands selectors through the source's column map) cannot.
 ///
-/// Label matchers are not consulted: a table holding the metric with no
-/// matching series answers with an empty result, which is correct, and
-/// skipping it here would route on data the catalog does not carry.
+/// A table is also left out when no selector naming one of its metrics can
+/// match its recording's labels (`x{source="vllm"}` leaves out the other
+/// recordings), so a label-selected query neither opens them nor loses the
+/// cross-cadence alignment of the one recording it reads. Other label
+/// matchers are not consulted: a table holding the metric with no matching
+/// series answers with an empty result, which is correct, and skipping it
+/// here would route on data the catalog does not carry. When every table
+/// holding a referenced metric is left out, they are all kept, so the query
+/// answers empty rather than as naming no metric.
 fn owners<'a>(
     reader: &'a ArchiveReader,
     query: &str,
 ) -> Result<Vec<&'a SamplerReader>, QueryError> {
     let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();
-    Ok(reader.owners_of(&referenced))
+    let all = reader.owners_of(&referenced);
+    let selectors = crate::promql::selectors(query)?;
+    let labels = reader.series_labels();
+    let pruned: Vec<&SamplerReader> = all
+        .iter()
+        .copied()
+        .filter(|t| {
+            let extra = labels.of(t);
+            selectors.iter().any(|(names, filter)| {
+                names.iter().any(|n| t.holds(n)) && translate_filter(extra, filter).is_some()
+            })
+        })
+        .collect();
+    Ok(if pruned.is_empty() { all } else { pruned })
 }
 
 /// The engine that answers a query: over the tables that hold a metric it
@@ -639,7 +658,7 @@ mod tests {
     }
 
     /// A series' own label under a recording key keeps its value under
-    /// `exported_<key>`, unless it equals the recording's.
+    /// `exported_<key>`, equal values included, so the two series stay apart.
     #[test]
     fn a_clashing_series_label_moves_to_exported() {
         let reader = archive(vec![recording(
@@ -648,7 +667,11 @@ mod tests {
                 "prometheus/scrape",
                 counter_table(
                     "requests",
-                    &[(&[("host", "backend-1")], 1), (&[("host", "lb")], 2)],
+                    &[
+                        (&[("host", "backend-1")], 1),
+                        (&[("host", "lb")], 2),
+                        (&[], 4),
+                    ],
                     10,
                 ),
             )],
@@ -661,18 +684,22 @@ mod tests {
                     labels(&[(&exported, "backend-1"), ("host", "lb"), ("source", "svc")]),
                     1.0
                 ),
-                (labels(&[("host", "lb"), ("source", "svc")]), 2.0),
+                (
+                    labels(&[(&exported, "lb"), ("host", "lb"), ("source", "svc")]),
+                    2.0
+                ),
+                (labels(&[("host", "lb"), ("source", "svc")]), 4.0),
             ]
         );
         assert_eq!(
             series(&reader, r#"rate(requests{exported_host="backend-1"}[3s])"#).len(),
             1
         );
-        // The series whose own host equals the recording's has no
-        // exported_host, so a negative matcher keeps it.
+        // The series without its own host has no exported_host, so a
+        // negative matcher keeps it.
         assert_eq!(
-            series(&reader, r#"rate(requests{exported_host!="backend-1"}[3s])"#),
-            [(labels(&[("host", "lb"), ("source", "svc")]), 2.0)]
+            series(&reader, r#"rate(requests{exported_host!="backend-1"}[3s])"#).len(),
+            2
         );
         assert!(series(&reader, r#"rate(requests{host="backend-1"}[3s])"#).is_empty());
     }
@@ -794,5 +821,128 @@ mod tests {
         assert!(
             eval_timestamps_for(&two, "fast_ops + slow_ops", 1.0, RateMode::default()).is_none()
         );
+    }
+
+    /// `__recording__` is the recording's catalog index, also with a
+    /// recording that has no tables before them.
+    #[test]
+    fn the_recording_label_is_the_catalog_index() {
+        let reader = archive(vec![
+            recording(&[("source", "empty")], vec![]),
+            recording(
+                &[("source", "rezolus")],
+                vec![("cpu_usage", counter_table("ops", &[(&[], 2)], 10))],
+            ),
+            recording(
+                &[("source", "rezolus")],
+                vec![("cpu_usage", counter_table("ops", &[(&[], 3)], 10))],
+            ),
+        ]);
+        let got: Vec<String> = series(&reader, "rate(ops[3s])")
+            .into_iter()
+            .map(|(l, _)| l[RECORDING_LABEL].clone())
+            .collect();
+        assert_eq!(got, ["1", "2"]);
+    }
+
+    /// A counter table with rows 10 s apart.
+    fn sparse_counter(name: &str) -> Vec<u8> {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        let mut meta = HashMap::new();
+        meta.insert("metric".to_string(), name.to_string());
+        meta.insert("metric_type".to_string(), "counter".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new(name, DataType::UInt64, true).with_metadata(meta),
+        ]));
+        let ts: Vec<u64> = (0..5).map(|i| (i * 10 + 1) * S).collect();
+        let vals: Vec<u64> = (0..5).collect();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        w.write(
+            &RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(ts)) as ArrayRef,
+                    Arc::new(UInt64Array::from(vals)) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        w.close().unwrap();
+        buf
+    }
+
+    /// A label-selected query reads one recording, so it keeps that
+    /// recording's cross-cadence alignment.
+    #[test]
+    fn a_label_selected_query_keeps_its_recordings_alignment() {
+        let rec = |source: &'static str| {
+            recording(
+                &[("source", source)],
+                vec![
+                    ("fast", counter_table("fast_ops", &[(&[], 1)], 50)),
+                    ("slow", sparse_counter("slow_ops")),
+                ],
+            )
+        };
+        let reader = archive(vec![rec("a"), rec("b")]);
+        let at = |q: &str| eval_timestamps_for(&reader, q, 1.0, RateMode::default());
+        assert!(at("fast_ops + slow_ops").is_none());
+        assert!(at(r#"fast_ops{source="a"} + slow_ops{source="a"}"#).is_some());
+        // A selector that matches no recording still answers, empty.
+        assert!(series(&reader, r#"rate(fast_ops{source="c"}[3s])"#).is_empty());
+    }
+
+    /// Two recordings recording one histogram under different bucket
+    /// configurations: an unqualified query answers from the first
+    /// recording's configuration, and a matcher reaches the other. Before,
+    /// the merge decoded the second under the first's configuration (and a
+    /// debug build panicked).
+    #[test]
+    fn histograms_of_different_configurations_are_not_mixed() {
+        use crate::segmented::tests::segment_histogram;
+        let rows = |n: usize| -> Vec<(u64, Vec<u64>)> {
+            (1..=10u64)
+                .map(|t| {
+                    let mut b = vec![0u64; n];
+                    b[n / 2] = t * 10;
+                    (t * S, b)
+                })
+                .collect()
+        };
+        let a = histogram::Config::new(3, 10).unwrap().total_buckets();
+        let b = histogram::Config::new(7, 20).unwrap().total_buckets();
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("lat", segment_histogram("lat", 3, 10, &rows(a)))],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("lat", segment_histogram("lat", 7, 20, &rows(b)))],
+            ),
+        ]);
+        // `histogram_quantiles` sums the selected series, so the answer is
+        // compared by value: unqualified, it is recording a's alone.
+        let p50 = |query: &str| -> Vec<(f64, f64)> {
+            let QueryResult::Matrix { result } = reader
+                .query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default())
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+            else {
+                panic!("{query}: not a matrix");
+            };
+            assert_eq!(result.len(), 1, "{query}");
+            result[0].values.clone()
+        };
+        let all = p50("histogram_quantiles([0.5], lat)");
+        let only_a = p50(r#"histogram_quantiles([0.5], lat{source="a"})"#);
+        let only_b = p50(r#"histogram_quantiles([0.5], lat{source="b"})"#);
+        assert_eq!(all, only_a);
+        assert_ne!(only_a, only_b);
     }
 }

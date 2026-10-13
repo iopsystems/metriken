@@ -19,12 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sum by (source) (...)` compares them. A single recording's series carry
   its labels too. A series that already carries one of the keys keeps its
   own value under `exported_<key>`; recordings with identical label sets
-  get `__recording__` (their position) so their series stay apart. Within
-  a recording, a metric name two samplers share is still refused.
-  `columns` resolves through the same labels.
+  get `__recording__` (their catalog index) so their series stay apart.
+  Within a recording, a metric name two samplers share is still refused.
+  `columns` resolves through the same labels. A table whose recording's
+  labels no selector of the query can match is left out before routing, so
+  `x{source="vllm"}` opens only that recording's tables. A histogram that
+  two recordings record under different bucket configurations is answered,
+  unqualified, from the first recording's configuration, with a warning; a
+  label matcher selects the other. Joined recordings take the per-series
+  rate path (`MultiParquetSource` has no column scan).
 - The cross-cadence evaluation timestamps are applied only when every
-  table a query names is in one recording; a query over several stays on
-  the uniform grid, since recordings do not share row instants.
+  table a query reads is in one recording (after the label pruning above);
+  a query over several stays on the uniform grid, since recordings do not
+  share row instants.
 
 ## [0.36.1] - 2026-10-12
 

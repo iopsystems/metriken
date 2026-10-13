@@ -326,7 +326,7 @@ impl MetricsSource for SegmentedParquetReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::labels::Labels;
     use bytes::Bytes;
@@ -516,7 +516,7 @@ mod tests {
     /// Histogram variant of [`segment`]: one `List<UInt64>` bucket column
     /// carrying the histogram config in field metadata. `rows` is
     /// `(ts, buckets)`; every row must have `config.total_buckets()` entries.
-    fn segment_histogram(
+    pub(crate) fn segment_histogram(
         name: &str,
         grouping_power: u8,
         max_value_power: u8,

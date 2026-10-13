@@ -11,14 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `labeled::LabeledSource`, a `DataSource` whose series carry extra labels,
   delegating every read path (the column scan included). A series' own value
-  of an added key moves to `exported_<key>`, as Prometheus does for a
-  scraped target with `honor_labels: false`; a filter on `<key>` matches the
-  added value and one on `exported_<key>` the series' own. `add_labels`,
-  `translate_filter`, `EXPORTED_PREFIX` and `RECORDING_LABEL`
+  of an added key moves to `exported_<key>` (also when equal, and one prefix
+  further when `exported_<key>` is taken), as Prometheus does for a scraped
+  target with `honor_labels: false`; a filter on `<key>` matches the added
+  value and one on `exported_<key>` the series' own. `add_labels`,
+  `translate_filter`, `keeps`, `EXPORTED_PREFIX` and `RECORDING_LABEL`
   (`__recording__`) are public with it.
-- `SamplerReader::recording_labels` and `same_recording`, and
+- `SamplerReader::recording_labels`, `same_recording` and `holds`, and
   `ArchiveReader::series_labels`: the labels each recording's series carry,
-  with `__recording__` added for recordings whose label sets are identical.
+  with `__recording__` (the recording's catalog index) added for recordings
+  whose label sets are identical.
+
+### Fixed
+
+- `HistogramStream::merge` decoded every stream under the first stream's
+  bucket configuration, checked only by a `debug_assert!`, so a release build
+  read a differently configured stream's buckets as other buckets. It now
+  leaves out streams of another configuration with a warning (a label
+  matcher reaches them), as a table split into `__run__`s does, and finds
+  each series' merged index by hash rather than a linear search.
 
 ### Changed
 

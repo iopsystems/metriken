@@ -9,9 +9,12 @@
 //!
 //! A series that already carries one of the added keys keeps its own value
 //! under `exported_<key>`, as Prometheus does for a scraped target's labels
-//! that collide with the target labels it adds (`honor_labels: false`). A
-//! filter naming `<key>` matches the added value, and one naming
-//! `exported_<key>` matches the series' own.
+//! that collide with the target labels it adds (`honor_labels: false`): also
+//! when the two values are equal, so two series that differ only in whether
+//! they carried the key stay apart, and with a further `exported_` prefix
+//! when the series also carries `exported_<key>`. A filter naming `<key>`
+//! matches the added value, and one naming `exported_<key>` matches the
+//! series' own.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -25,19 +28,25 @@ use crate::{parquet, scan};
 /// The prefix a series' own value of an added key moves under.
 pub const EXPORTED_PREFIX: &str = "exported_";
 
-/// The label added, with the recording's position in the archive, to the
+/// The label added, with the recording's index in its catalog, to the
 /// series of recordings whose label sets are identical, so their series stay
 /// apart. Internal under the `__` rule ([`crate::is_internal_label`]).
 pub const RECORDING_LABEL: &str = "__recording__";
 
 /// `labels` with `extra` added: a key the series already carries keeps its
-/// own value under `exported_<key>`.
+/// own value under `exported_<key>` (see the module docs).
 pub fn add_labels(labels: &mut Labels, extra: &Labels) {
     for (k, v) in &extra.inner {
-        if let Some(own) = labels.inner.insert(k.clone(), v.clone()) {
-            if own != *v {
-                labels.inner.insert(format!("{EXPORTED_PREFIX}{k}"), own);
-            }
+        let Some(own) = labels.inner.insert(k.clone(), v.clone()) else {
+            continue;
+        };
+        // Move `own` to `exported_<k>`, and whatever was there one prefix
+        // further, as far as the chain goes.
+        let mut moving = own;
+        let mut key = format!("{EXPORTED_PREFIX}{k}");
+        while let Some(displaced) = labels.inner.insert(key.clone(), moving) {
+            moving = displaced;
+            key = format!("{EXPORTED_PREFIX}{key}");
         }
     }
 }
@@ -55,9 +64,9 @@ pub fn add_labels_map(labels: &mut BTreeMap<String, String>, extra: &Labels) {
 /// fails it, so the source has no matching series.
 ///
 /// A matcher on an added key is decided here against the added value and
-/// removed. A matcher on `exported_<key>` for an added key is removed too:
-/// whether a series carries `exported_<key>` depends on its own `<key>` and
-/// the added value together, so it is decided on the relabelled series
+/// removed. A matcher on `exported_<key>` (any number of prefixes) for an
+/// added key is removed too: what a series carries there depends on its own
+/// labels after the move, so it is decided on the relabelled series
 /// ([`keeps`]), and the source returns a superset.
 pub fn translate_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
     if extra.inner.is_empty() {
@@ -79,10 +88,17 @@ pub fn translate_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
     Some(out)
 }
 
-/// Whether `key` is `exported_<k>` for a key `extra` adds.
+/// Whether `key` is `exported_<k>`, with any number of prefixes, for a key
+/// `extra` adds: a key [`add_labels`] may have moved values into.
 fn is_exported_of(key: &str, extra: &Labels) -> bool {
-    key.strip_prefix(EXPORTED_PREFIX)
-        .is_some_and(|own| extra.inner.contains_key(own))
+    let mut rest = key;
+    while let Some(stripped) = rest.strip_prefix(EXPORTED_PREFIX) {
+        if extra.inner.contains_key(stripped) {
+            return true;
+        }
+        rest = stripped;
+    }
+    false
 }
 
 /// Whether a relabelled series satisfies `filter`'s matchers on
@@ -378,9 +394,26 @@ mod tests {
                 ("source", "svc")
             ])
         );
+        // Equal values move too, so this series stays apart from one that
+        // carried no host.
         let mut same = labels(&[("host", "lb")]);
         add_labels(&mut same, &extra);
-        assert_eq!(same, labels(&[("host", "lb"), ("source", "svc")]));
+        assert_eq!(
+            same,
+            labels(&[("exported_host", "lb"), ("host", "lb"), ("source", "svc")])
+        );
+        // A series' own `exported_host` moves one prefix further.
+        let mut chained = labels(&[("host", "a"), ("exported_host", "x")]);
+        add_labels(&mut chained, &extra);
+        assert_eq!(
+            chained,
+            labels(&[
+                ("exported_exported_host", "x"),
+                ("exported_host", "a"),
+                ("host", "lb"),
+                ("source", "svc")
+            ])
+        );
     }
 
     #[test]
@@ -539,7 +572,7 @@ mod tests {
         let c = s.counters("c", &Labels::default(), 0, 9).unwrap();
         assert_eq!(
             hosts(c.series.into_iter().map(|c| c.labels)),
-            [Some("backend-1".to_string()), None]
+            [Some("backend-1".to_string()), Some("lb".to_string())]
         );
         let scan = s.counter_scan("c", &Labels::default(), 0, 9).unwrap();
         assert!(scan
@@ -558,19 +591,25 @@ mod tests {
                     ("source", "svc")
                 ])
                 .inner,
-                labels(&[("host", "lb"), ("source", "svc")]).inner,
+                labels(&[("exported_host", "lb"), ("host", "lb"), ("source", "svc")]).inner,
             ]
         );
     }
 
-    /// `exported_host!="backend-1"` keeps the series whose own host equals
-    /// the added one: it has no `exported_host`.
+    /// `exported_` matchers are decided on the relabelled series.
     #[test]
     fn exported_matchers_are_decided_on_the_relabelled_series() {
         let s = labeled();
         let not_backend = labels(&[("exported_host", "!backend-1")]);
         let c = s.counters("c", &not_backend, 0, 9).unwrap();
-        assert_eq!(hosts(c.series.into_iter().map(|c| c.labels)), [None]);
+        assert_eq!(
+            hosts(c.series.into_iter().map(|c| c.labels)),
+            [Some("lb".to_string())]
+        );
+        // A deeper prefix is decided on the relabelled series too.
+        assert!(s
+            .counters("c", &labels(&[("exported_exported_host", "x")]), 0, 9)
+            .is_none());
 
         let backend = labels(&[("exported_host", "backend-1")]);
         let c = s.counters("c", &backend, 0, 9).unwrap();

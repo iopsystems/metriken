@@ -687,13 +687,16 @@ Open sub-questions:
    Prometheus series with `host` or `source`): replace, as
    `MultiParquetSource` does in a release build, refuse, or rename one.
    Decided 2026-10-13: the recording's value wins and the series' own moves
-   to `exported_<key>`, as Prometheus does with `honor_labels: false`.
+   to `exported_<key>`, as Prometheus does with `honor_labels: false`: also
+   when the values are equal, and one prefix further when the series has
+   `exported_<key>` too.
 4. Two recordings with identical label sets (two endpoints that infer the
    same `source` and `host`): refuse, or add a reserved label
    (`__recording__`, under the `__` rule of rezolus `docs/labels.md`) to keep
    their series apart.
    Decided 2026-10-13: `__recording__`, added only to recordings whose
-   label set another recording shares.
+   label set another recording shares, carrying the recording's catalog
+   index (stable across a live reopen).
 5. Recordings of different runs. `recording combine a.rez b.rez -o ab.rez`,
    rezolus's documented A/B form, does not set `arm` (no non-test `"arm"`
    under `src/parquet_tools/`), so under the rule above its output opens
@@ -721,7 +724,7 @@ Open sub-questions:
 
 #### Series labels, as built (2026-10-13)
 
-metriken branch `feat/dashboard-templates` (metriken-storage and
+metriken branch `feat/recording-series-labels` (metriken-storage and
 metriken-query, unreleased):
 
 - `SamplerReader` holds its recording's labels in an `Arc` shared by the
@@ -732,7 +735,9 @@ metriken-query, unreleased):
 - metriken-storage `labeled::LabeledSource` wraps a `DataSource`: every
   returned series (counters, counter streams, the counter scan, gauges,
   histogram streams, label listings, `column_map`) gets the labels, with a
-  clashing key's own value under `exported_<key>`. A filter on an added
+  clashing key's own value under `exported_<key>` (equal values too, so a
+  series with the key and one without stay apart; a taken
+  `exported_<key>` moves one prefix further). A filter on an added
   key is decided against the added value and stripped; one on
   `exported_<key>` is decided on the relabelled series (a scan declines
   then, and a histogram drops the rows), because whether a series has
@@ -743,6 +748,19 @@ metriken-query, unreleased):
   `LabeledSource`, and joins several recordings through
   `MultiParquetSource`. `columns` resolves through the same wrapper. The
   cross-recording refusal is gone.
+- `owners()` leaves out a table when no selector naming one of its
+  metrics can match its recording's labels (`translate_filter` against
+  `series_labels`), keeping them all when that leaves none, so
+  `x{source="a"}` neither opens recording b's tables nor loses recording
+  a's cross-cadence alignment.
+- `HistogramStream::merge`, which `MultiParquetSource` uses to join
+  recordings, decoded every stream under the first stream's bucket
+  configuration (a `debug_assert!` only). Two recordings of `lat` at
+  grouping power 3 and 7 panicked a debug build and, in release, read the
+  second recording's buckets as other buckets. It now leaves out streams of
+  another configuration with a warning, as a table's `__run__`s are split:
+  unqualified, `lat` answers from the first recording; `lat{source="b"}`
+  reaches the other. Found in review.
 - The filter's regex form is literals and alternations
   (`labels::match_pattern`), so `source=~"a|b"` works and `source=~"a.*"`
   matches nothing, as for any label.
@@ -752,7 +770,9 @@ metriken-query, unreleased):
   sets; the shared-name refusal; `columns`; cross-cadence from one
   recording only) and metriken-storage `labeled::tests`. Seen red: no
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
-  the clashing value dropped, cross-cadence across recordings.
+  the clashing value dropped, cross-cadence across recordings, the merge
+  mixing configurations, no owner pruning, `__recording__` by position, no
+  chained prefix.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
@@ -764,10 +784,31 @@ metriken-query, unreleased):
   identical between the builds for three queries; `sum(irate(cpu_usage[5m]))`
   differs from run to run within each build (its last digits), so it was not
   compared. No cost above the run-to-run spread was seen; a multi-recording
-  archive was not measured.
+  archive was not measured. Rerun after the review fixes (owner pruning
+  parses the query's selectors once more per query): in the rounds the
+  host left quiet (two of three per build), medians 39.4 and 40.4 ms
+  against 40.6 and 44.4 ms, 24.2 and 24.4 ms against 24.3 and 24.9 ms,
+  396.6 and 399.8 ms against 400.1 and 401.9 ms for the same three
+  queries.
+- Joined recordings take the per-series rate path: `MultiParquetSource`
+  does not implement `counter_scan`, so a query reading two recordings
+  skips `batch_rates`. Not measured.
+- The engine's binary operators pair series across recordings now that
+  such a query is answered: `rate(x[3s]) / rate(y[3s])` with `x` only in
+  `source=a` and `y` only in `source=b` returns one series labelled
+  `source=a` (a reviewer ran it), where Prometheus returns nothing because
+  the label sets differ. This is the engine's vector matching, not this
+  change; it was unreachable while the query was refused.
 - What this changes for rezolus, on the release: series of every archive
   carry `source` and `host` (and `__recording__`, `exported_<key>` where
   they apply), and the cross-recording refusal its tests assert is gone.
+  The viewer names a series by its first visible label in sorted order
+  (`src/viewer/assets/lib/labels.js`, `firstVisibleLabelValue`) and keys
+  the `multi` chart style by it, so with `host` added a per-CPU chart's
+  series would all be named, and keyed, by the host. The viewer has to
+  treat recording labels as it treats a constant label (leave them out of
+  a series' name when every series of the chart shares them) before it
+  moves to this release.
   The combined view (`init_file_mode_rez`, the WASM `Viewer::new`) and
   `rezolus mcp`'s default (sub-question 7) are rezolus work on this release.
 
