@@ -1385,11 +1385,75 @@ async fn after_exit_takes_one_more_scrape() {
         )
         .await
         .unwrap();
+    // On the wall clock, as `exit` is: a row's `ts` is on the recorder's
+    // monotonic timeline, which can drift from `SystemTime` by more than the
+    // gap between the exit and the extra scrape (0.585 ms over 1.3 s on a
+    // macOS CI runner).
     let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
-    let last = r.last_ts.expect("rows");
+    let last = r.last_wall.expect("rows");
     assert!(
         last >= exit,
         "the last scrape ({last}) is after the exit ({exit})"
+    );
+}
+
+/// An exit that lands while a tick's scrape is in flight still gets a pass
+/// that starts after it: the scrape in flight was stamped before the exit,
+/// and its body may have been read before the exit too.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_exit_during_a_scrape_takes_one_more() {
+    let exporter = serve(Behaviour {
+        delay: Duration::from_millis(400),
+        ..exporter("up_total")
+    })
+    .await;
+    let mut url = exporter.url.clone();
+    url.set_path("/metrics");
+    let detected = vec![Detected::Scraped {
+        spec: named(&exporter.url, "svc"),
+        url,
+    }];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inflight.dendro");
+    let (recorder, _ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, Duration::from_secs(1)),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    // 100 ms past the second whole wall second from now: a tick (aligned to
+    // whole seconds) began 100 ms ago and its scrape answers 300 ms from now.
+    let now = wall();
+    let at = (now / 1_000_000_000 + 2) * 1_000_000_000 + 100_000_000;
+    tokio::time::sleep(Duration::from_nanos(at - now)).await;
+    let exit = wall();
+    recorder
+        .finish(
+            Stop::AfterExit {
+                wall_ns: exit,
+                bound: Duration::from_secs(1),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
+    // The path under test was reached: a scrape started less than the
+    // exporter's 400 ms delay before the exit, so it was in flight at the
+    // exit. A tick that fired late, after the exit, fails here rather than
+    // passing without the in-flight case.
+    assert!(
+        r.walls.iter().any(|&w| w < exit && exit - w < 400_000_000),
+        "a scrape was in flight at the exit ({exit}): {:?}",
+        r.walls
+    );
+    let last = r.last_wall.expect("rows");
+    assert!(
+        last >= exit,
+        "the last scrape ({last}) started after the exit ({exit})"
     );
 }
 

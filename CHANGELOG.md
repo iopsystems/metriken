@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-recorder
+### metriken-recorder 0.1.1
 
+- **Fixed:** `Stop::AfterExit` skipped the extra pass of local and scraped
+  sources when the exit landed while a tick's pass was running. That pass is
+  stamped at its start, before the exit, so the recording could end before
+  the exit. The extra pass is now skipped only when the last pass started at
+  or after the exit, the same rule as a streamed source's frame stamped at or
+  after the exit.
 - **Fixed:** streamed passes that queued while a tick or a commit was
   running were committed together and sealed as one segment, past the seal
   policy's `max_rows`. A commit took every queued pass and ran one seal check
