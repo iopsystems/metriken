@@ -92,6 +92,16 @@ impl<'a> Plan<'a> {
     /// tables are kept, so the query answers empty rather than as naming no
     /// metric.
     fn new(reader: &'a ArchiveReader, query: &str) -> Result<Self, QueryError> {
+        // The filter keeps one matcher per label; with recording labels,
+        // excluding several sources is an ordinary query, so a repeat is
+        // refused rather than half applied.
+        if let Some(label) = crate::promql::repeated_matcher(query)? {
+            return Err(QueryError::ParseError(format!(
+                "query {query} matches label {label} more than once in one selector, and \
+                 only one matcher per label is applied; combine them in one regex, e.g. \
+                 {label}!~\"a|b\""
+            )));
+        }
         let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();
         let all = reader.owners_of(&referenced);
         let selectors = crate::promql::selectors(query)?;
@@ -779,8 +789,10 @@ impl MetricsSource for ArchiveReader {
         let parts = route(&plan, expr)?;
         // One instant for every recording: each engine's own default would
         // be its recording's last row, not the archive's.
+        // (Only for an archive of several recordings: alone, a recording's
+        // default is what it always was.)
         let time = time.or_else(|| {
-            (parts.len() > 1)
+            (self.recording_count() > 1)
                 .then(|| ArchiveReader::time_range_ns(self).map(|(_, end)| end as f64 / 1e9))
                 .flatten()
         });
@@ -1842,5 +1854,56 @@ mod tests {
         };
         let times: Vec<f64> = result.iter().map(|s| s.value.0).collect();
         assert!(times.windows(2).all(|w| w[0] == w[1]), "{times:?}");
+    }
+
+    /// The default instant is the archive's end whether or not a matcher
+    /// narrows the query to one recording, so a series does not appear or
+    /// vanish with the matcher.
+    #[test]
+    fn the_default_instant_does_not_depend_on_the_matcher() {
+        let reader = archive(vec![
+            recording(&[("source", "a")], vec![("t", gauge("g", 100))]),
+            recording(
+                &[("source", "b")],
+                vec![("t", explicit_table("g", "gauge", &gauge_rows(1, 10, 1, 7)))],
+            ),
+        ]);
+        let at = |q: &str| -> Vec<(String, f64)> {
+            let QueryResult::Vector { result } = reader.query(q, None).unwrap() else {
+                panic!("not a vector");
+            };
+            result
+                .iter()
+                .map(|s| (s.metric["source"].clone(), s.value.0))
+                .collect()
+        };
+        // At the archive's end (40 s), recording b (last row at 10 s) is not
+        // answered, with or without a matcher narrowing to it.
+        assert_eq!(at("g"), [("a".to_string(), 40.0)]);
+        assert!(at(r#"g{source="b"}"#).is_empty());
+    }
+
+    /// A selector matching one label twice is refused: only one matcher per
+    /// label is applied, so `source!="a",source!="b"` let a through.
+    #[test]
+    fn a_label_matched_twice_in_one_selector_is_refused() {
+        let reader = archive(vec![
+            recording(&[("source", "a")], vec![("t", gauge("g", 1))]),
+            recording(&[("source", "b")], vec![("t", gauge("g", 2))]),
+            recording(&[("source", "c")], vec![("t", gauge("g", 3))]),
+        ]);
+        let err = values(
+            &reader,
+            r#"g{source!="a",source!="b"}"#,
+            RateMode::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains(r#"source!~"a|b""#), "{err}");
+        assert_eq!(
+            values(&reader, r#"g{source!~"a|b"}"#, RateMode::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RECORDING_LABEL`
   (`__recording__`) are public with it.
 - `SamplerReader::recording_labels`, `same_recording`, `holds` and
-  `holds_histogram`, and `ArchiveReader::series_labels` (a
-  `reader::SeriesLabels`): the labels each recording's series carry,
+  `holds_histogram`, `ArchiveReader::recording_count`, and
+  `ArchiveReader::series_labels` (a `reader::SeriesLabels`): the labels each recording's series carry,
   with `__recording__` (the recording's catalog index) added for recordings
   whose label sets are identical, found among every recording of the reader
   whether it has tables or not. Worked out once per reader and returned by

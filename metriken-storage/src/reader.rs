@@ -1588,6 +1588,11 @@ impl ArchiveReader {
             .collect()
     }
 
+    /// How many recordings this reader holds, tables or not.
+    pub fn recording_count(&self) -> usize {
+        self.members.len()
+    }
+
     /// The labels each recording's series carry: the recording's labels, and
     /// for recordings whose label sets are identical,
     /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the

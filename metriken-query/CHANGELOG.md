@@ -25,8 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first, and one lacking a metric the query names that the archive holds
   elsewhere contributes nothing (as a pair with no match), so one host
   without a sampler does not fail a ratio for the others; when no recording
-  is left, the answer is empty. An instant query without a time reads every
-  recording at the archive's end. Within a recording the engine's own
+  is left, the answer is empty (also for a query the engine would reject,
+  such as `x or y`, whose error is then not reached). On an archive of
+  several recordings, an instant query without a time reads at the
+  archive's end, whether or not a matcher narrows it to one recording. A
+  selector that matches one label twice (`{source!="a", source!="b"}`) is
+  refused: the filter applies one matcher per label and dropped the other;
+  `source!~"a|b"` answers. Within a recording the engine's own
   operator rules apply unchanged, including pairing a single right-hand
   series with every left-hand one (`rate(c) / sum by (source) (rate(c))` is
   each series' share of its recording's total, where Prometheus would

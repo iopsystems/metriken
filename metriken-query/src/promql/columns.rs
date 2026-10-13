@@ -252,6 +252,46 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
     }
 }
 
+/// A label a selector of `query` matches more than once
+/// (`{source!="a", source!="b"}`): the filter holds one matcher per label,
+/// so all but one would be dropped silently.
+pub(crate) fn repeated_matcher(query: &str) -> Result<Option<String>, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let mut found = None;
+    walk_vector_selectors(&expr, &mut |sel| {
+        let mut seen = HashSet::new();
+        for m in &sel.matchers.matchers {
+            if m.name != "__name__" && !seen.insert(m.name.clone()) && found.is_none() {
+                found = Some(m.name.clone());
+            }
+        }
+    });
+    Ok(found)
+}
+
+fn walk_vector_selectors(expr: &Expr, f: &mut dyn FnMut(&parser::VectorSelector)) {
+    match expr {
+        Expr::Aggregate(agg) => walk_vector_selectors(&agg.expr, f),
+        Expr::Unary(u) => walk_vector_selectors(&u.expr, f),
+        Expr::Binary(b) => {
+            walk_vector_selectors(&b.lhs, f);
+            walk_vector_selectors(&b.rhs, f);
+        }
+        Expr::Paren(p) => walk_vector_selectors(&p.expr, f),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_vector_selectors(arg, f);
+            }
+        }
+        Expr::VectorSelector(sel) => f(sel),
+        Expr::MatrixSelector(sel) => f(&sel.vs),
+        Expr::Subquery(s) => walk_vector_selectors(&s.expr, f),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
 fn selector(sel: &parser::VectorSelector) -> (HashSet<String>, Labels) {
     let mut names = HashSet::new();
     collect_selector_names(sel, &mut names);

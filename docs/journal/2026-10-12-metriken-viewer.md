@@ -789,9 +789,20 @@ metriken-query, unreleased):
   left out (`g / h` on a host with no `h` answers for the others, as a
   Prometheus pair with no match does); when no recording is left (`x` only
   in a, `y` only in b, `x / y`; or a matcher keeping only the recording
-  lacking `x`), the answer is empty, as in Prometheus. An instant query
-  without a time reads every recording at the archive's end (the ninth
-  review found each recording read at its own last row). Within a recording
+  lacking `x`), the answer is empty, as in Prometheus; a query the engine
+  would reject (`x or y`) is then empty too rather than an error. On an
+  archive of several recordings, an instant query without a time reads at
+  the archive's end, narrowed by a matcher or not (the ninth and tenth
+  reviews found each recording read at its own last row, then the default
+  changing with the matcher). A selector matching one label twice is
+  refused: `extract_filter_labels` keeps one matcher per label, so
+  `{source!="a", source!="b"}` let `a` through, a pre-existing engine
+  limit that recording labels make an ordinary query hit.
+- The tenth review ran 39 query patterns five ways (range at two steps,
+  instant with and without a time, display) on two real single-recording
+  rezolus archives against upstream main and this branch: with the
+  recording labels removed, the outputs are identical (last-digit float
+  differences that upstream shows between its own runs aside). Within a recording
   the engine's operator rules apply unchanged, including its pairing of a
   single right-hand series with every left-hand one.
   Refused, because the per-recording results would have to merge: an
@@ -887,7 +898,8 @@ metriken-query, unreleased):
   refused, the slow recording read at a 1 s interval, incomplete recordings
   kept, refusal whenever a differing label is dropped, side groupings
   ignored, `without` keeping internal labels, no shared-label-set check,
-  each recording's own default instant.
+  each recording's own default instant, the default instant only for
+  several parts, no repeated-matcher refusal.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
@@ -911,8 +923,12 @@ metriken-query, unreleased):
   returns nothing); evaluated per recording, neither recording holds both,
   and the answer is empty.
 - What this changes for rezolus, on the release: series of every archive
-  carry `source` and `host` (and `__recording__`, `exported_<key>` where
-  they apply), and the cross-recording refusal its tests assert is gone.
+  carry `source` and `host` (and `__recording__` where it applies), and
+  the cross-recording refusal its tests assert is gone. Every rezolus
+  series also gains `exported_source="rezolus"`: rezolus's columns already
+  carry `source`, which the recording's `source` now replaces (seen on
+  three real archives, e.g. `blockio_bytes` with `endpoint,
+  exported_source, host, op, sampler, source`).
   The viewer names a series by its first visible label in sorted order
   (`src/viewer/assets/lib/labels.js`, `firstVisibleLabelValue`) and keys
   the `multi` chart style by it, so with `host` added a per-CPU chart's
