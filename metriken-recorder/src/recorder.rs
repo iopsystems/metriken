@@ -159,9 +159,12 @@ pub enum SourceState {
 #[non_exhaustive]
 pub enum Stop {
     /// A wrapped command exited at `wall_ns`. One more pass of every local
-    /// and scraped source, unless the exit landed during the pass just
-    /// taken, then a wait of up to `bound` for each streamed source's frame
-    /// stamped at or after `wall_ns`.
+    /// and scraped source, unless the last pass started at or after
+    /// `wall_ns`, then a wait of up to `bound` for each streamed source's
+    /// frame stamped at or after `wall_ns`. A local or scraped source whose
+    /// pass succeeds ends on a row stamped at or after `wall_ns` on this
+    /// host's wall clock: the row's `ts` plus its wall offset, not `ts`
+    /// alone, which is on a monotonic timeline that can drift from it.
     AfterExit { wall_ns: u64, bound: Duration },
     /// Wait `duration` for frames in flight, with no extra pass.
     Grace(Duration),
@@ -1069,8 +1072,9 @@ struct Driver {
     stream_rx: mpsc::Receiver<(usize, StreamEventOf)>,
     anchor_wall_ns: u64,
     anchor_mono: Instant,
-    /// When the last pass started and ended, on this host's wall clock.
-    last_pass: Option<(u64, u64)>,
+    /// The wall clock the last pass's rows are stamped with: when it
+    /// started, on this host.
+    last_pass: Option<u64>,
     failed: Option<String>,
     /// Each added recording's label set, for the identical-labels warning.
     seen_labels: BTreeMap<BTreeMap<String, String>, String>,
@@ -1243,7 +1247,7 @@ impl Driver {
             Some(e) => self.fail(e).await,
             None => self.commit(true).await,
         }
-        self.last_pass = Some((wall, wall_now_ns()));
+        self.last_pass = Some(wall);
     }
 
     /// The archive failed: report it, stop ticking, and leave what is on
@@ -1586,7 +1590,10 @@ impl Driver {
         let (wall, ts, wall_offset) = self.stamp_now();
         match stop {
             Stop::AfterExit { wall_ns, bound } => {
-                let sampled = self.last_pass.is_some_and(|(_, end)| wall_ns <= end);
+                // A pass stamped before the exit does not count, even when
+                // the exit landed while it ran: its row would end before
+                // the exit, and its body may have been read before it too.
+                let sampled = self.last_pass.is_some_and(|start| start >= wall_ns);
                 if !sampled {
                     #[cfg(feature = "http")]
                     if let Err(e) = self.scrape_all(wall, ts, wall_offset).await {

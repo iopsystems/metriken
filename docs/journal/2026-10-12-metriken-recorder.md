@@ -254,12 +254,18 @@ refresh are built on `Committed`.
 it waits, then:
 
 - `Stop::AfterExit { wall_ns, bound }`, for `record`'s `-- cmd`: takes one
-  more pass of every local and scraped source at once, unless the exit
-  landed during the pass just taken (the recorder tracks pass times, as
-  `scraped_last_pass` does today, `mod.rs:2740-2757`), then waits, up to
+  more pass of every local and scraped source at once, unless the last pass
+  started at or after the exit, then waits, up to
   `bound`, for each streamed source's frame, empty or not, stamped at or
   after `wall_ns` (`mod.rs:3273-3305`). The barrier is inside the library,
   so it does not depend on events reaching the caller.
+  Corrected in metriken-recorder 0.1.1: 0.1.0 also skipped the pass when the
+  exit landed during the pass just taken, as `scraped_last_pass` does today
+  (`mod.rs:2740-2757`). That pass is stamped at its start, before the exit,
+  so the recording ended before `run_end`, which the streamed barrier
+  (a frame stamped at or after the exit) does not allow. The comparison is on
+  the wall clock: a row's `ts` is on the anchored monotonic timeline, and its
+  wall clock is `ts` plus the stored wall offset.
 - `Stop::Grace(duration)`, for `--duration`, ctrl-c and every other stop:
   waits `duration` (`record` passes the shorter of one interval and 2 s when
   a source streams, as `mod.rs:3281-3285` does) and takes no extra pass.

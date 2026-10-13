@@ -393,6 +393,39 @@ pub struct Recording {
     pub complete: bool,
     pub first_ts: Option<u64>,
     pub last_ts: Option<u64>,
+    /// The wall clock the newest row in `table` was read at: its `ts` plus
+    /// its stored wall offset. `ts` is on the recorder's anchored monotonic
+    /// timeline, so only this is comparable with a `SystemTime` reading.
+    pub last_wall: Option<u64>,
+}
+
+/// `ts + wall_offset` of the newest row of `table`, sealed or in the WAL.
+fn last_row_wall(
+    catalog: &metriken_storage::DendroCatalog,
+    source_id: i64,
+    table: &str,
+) -> Option<u64> {
+    use metriken_storage::Catalog;
+    let mut rows: Vec<(u64, i64)> = Vec::new();
+    for (seq, _) in catalog.segment_meta(source_id, table).unwrap() {
+        let bytes = catalog
+            .segment_bytes(source_id, table, seq)
+            .unwrap()
+            .unwrap();
+        let t = metriken_storage::table::read_table_parquet(table.to_string(), bytes).unwrap();
+        assert_eq!(
+            t.timestamps.len(),
+            t.wall_offsets.len(),
+            "a wall offset per row"
+        );
+        rows.extend(t.timestamps.into_iter().zip(t.wall_offsets));
+    }
+    for r in catalog.live_wal(source_id, table).unwrap() {
+        rows.push((r.ts, r.wall_offset));
+    }
+    rows.into_iter()
+        .max_by_key(|&(ts, _)| ts)
+        .map(|(ts, offset)| (ts as i64 + offset) as u64)
 }
 
 /// Every recording in the archive at `path`, keyed by `source`, with its
@@ -413,6 +446,7 @@ pub fn recordings(path: &Path, table: &str) -> BTreeMap<String, Recording> {
                 .flatten()
                 .min();
             let last = sealed.last_ts.max(live.last_ts);
+            let last_wall = last_row_wall(&catalog, s.id, table);
             let labels: BTreeMap<String, String> = s.labels.clone().into_iter().collect();
             let name = labels.get("source").cloned().unwrap_or_default();
             (
@@ -424,6 +458,7 @@ pub fn recordings(path: &Path, table: &str) -> BTreeMap<String, Recording> {
                     complete: s.complete,
                     first_ts: first,
                     last_ts: last,
+                    last_wall,
                 },
             )
         })
