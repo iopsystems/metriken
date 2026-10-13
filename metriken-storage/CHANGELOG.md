@@ -44,6 +44,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archives written this way read correctly with older readers. In a split
   seal, `encode_after` looks the part's schema up by hash, which also
   anchors WAL rows a 0.2.2 writer left.
+- `SourceRecorder::evict_before` lost every row of an open segment once
+  the cutoff passed the segment's first row, which predates the seal cap.
+  Retention deletes unsealed WAL rows by timestamp, and the open segment's
+  first row is the one that carries a group's schema or a sampler cell's
+  metadata, so the rows after it read back as nothing, live and once
+  sealed (a group of 20 ticks evicted at tick 5 after tick 10 kept none of
+  its 15 rows from tick 5). This happens whenever the retention window is
+  shorter than the seal policy's `max_age` (300 s by default): a short
+  hindsight lookback or a recorder `retain`. `evict_before` now first
+  seals each stream whose open segment started before the cutoff, so its
+  rows stay in a segment, which retention drops once its last row is past
+  the cutoff. Such a window therefore also bounds segment age, and up to
+  about twice the window is kept where it used to be cut at the window.
+- The WAL decoders (`materialize_wal_tail`, `materialize_long_wal_tail`)
+  resolve a schema-less row against the schema its hash names, wherever in
+  the tail it was stated, rather than only the last schema stated. A tail
+  a 0.2.2 writer left for a group whose schema went A, B, A now reads in
+  full, live, sealed or copied.
+- Restating the schema on every change of hash has a cost for a group
+  whose schema changes every tick, such as a scraped target with a series
+  that is present on alternate scrapes: each row then carries its whole
+  schema. The review measured the WAL of such a Prometheus-shaped group
+  at about 28 to 32 times its size with a steady schema over 60 ticks
+  (50 series: 21.5 KB to 600.8 KB; 500 series: 0.19 MB to 6.06 MB). The
+  seal's byte estimate (`metriken_model::cost::group_approx_bytes`) counts
+  values and not schema bytes, so `max_bytes` does not react to this;
+  only the row and age caps bound how much accumulates before a seal.
+- `Staged` documents that every staged pass must be committed: staging
+  advances per-stream state (the schema a segment carries, dedup keys,
+  occupant numbering, seal accounts) before the rows land.
 - dendro 0.4.2 is required.
 
 ## [0.2.2] - 2026-10-12

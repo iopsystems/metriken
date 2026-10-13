@@ -300,7 +300,9 @@ pub struct RecorderConfig {
     /// The wire names a stream is accepted under.
     pub wire_names: Vec<WireNames>,
     /// Keep only this much of each source, measured back from its newest
-    /// row; `None` keeps everything.
+    /// row; `None` keeps everything. Retention drops whole segments, and a
+    /// segment whose first row falls behind the window is sealed then, so
+    /// up to about twice this much is kept.
     pub retain: Option<Duration>,
     /// The event channel's capacity.
     pub events: usize,

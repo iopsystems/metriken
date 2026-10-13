@@ -288,8 +288,9 @@ pub fn materialize_wal_tail_with(
 /// Encode a V3 acquisition-group's live WAL rows as one parquet segment —
 /// `None` when there is no tail (including a tail every row of which had to
 /// be skipped — see below). See [`WalGroupRow`] for why a decode walk needs
-/// no external schema cache: it carries the current schema forward across
-/// rows, normally requiring a `schema: Some` row before the first row that
+/// no external schema cache: it keeps every schema the tail states, by
+/// hash, and decodes a row against the schema its hash names, normally
+/// requiring a `schema: Some` row of that hash before the first row that
 /// needs it (an invariant `StreamRecorderV3::ingest_v3` upholds by always
 /// anchoring a group's very first WAL row) — "normally" because retention
 /// can delete that anchor out from under a still-live span (see below).
@@ -305,11 +306,10 @@ pub fn materialize_wal_tail_with(
 /// unreadable over a retention/seal-cadence interaction, not a corrupt
 /// input. V1/V2 has no equivalent failure mode here (a column simply
 /// rebuilds with whatever metadata its own surviving WAL span re-anchors),
-/// so V3 matches that degrade-not-die posture: an un-anchored row — no
-/// current anchor, or a hash that does not match the current one (the same
-/// symptom a multi-anchor eviction gap would produce) — is skipped with a
-/// rate-limited warning rather than erroring, and materialization resumes
-/// from the next row that DOES carry a resolvable schema. A tail with no
+/// so V3 matches that degrade-not-die posture: an un-anchored row — one
+/// whose hash no earlier row in the tail stated a schema for — is skipped
+/// with a rate-limited warning rather than erroring, and materialization
+/// resumes from the next row that DOES carry a resolvable schema. A tail with no
 /// resolvable row at all yields `None`, the same as an empty tail.
 fn materialize_group_wal_tail(
     table_key: &str,
@@ -320,7 +320,12 @@ fn materialize_group_wal_tail(
         return Ok(None);
     }
     let mut builder = GroupTableBuilder::new(table_key.to_string());
-    let mut current: Option<((u64, u64), crate::schema::GroupSchema)> = None;
+    // Every schema stated so far, by hash. A row without one decodes
+    // against the schema its hash names, wherever in the tail that was
+    // stated: metriken-storage 0.2.2 stated each hash once per segment, so a
+    // group whose schema went A, B, A has a second run of A rows whose
+    // schema is not the last one stated.
+    let mut known: HashMap<(u64, u64), crate::schema::GroupSchema> = HashMap::new();
     let mut warned_unanchored = false;
     // The ts of the first row actually pushed — `None` until then. This is
     // what makes a catalog `SegmentMeta::first_ts` correct even when a
@@ -329,31 +334,27 @@ fn materialize_group_wal_tail(
     let mut first_ts: Option<u64> = None;
     for row in rows {
         let decoded = decode_wal_group_row(row.row())?;
-        let schema = match decoded.schema {
-            Some(s) => {
-                current = Some((decoded.schema_hash, s));
-                &current.as_ref().unwrap().1
-            }
-            None => match &current {
-                Some((hash, s)) if *hash == decoded.schema_hash => s,
-                _ => {
-                    // No schema anchored yet, or the last anchor's hash does
-                    // not match this row's — either way there is nothing to
-                    // decode this row's values against. Skip it (and update
-                    // no state), warning once per materialization so a
-                    // retention-driven gap is visible without spamming.
-                    if !warned_unanchored {
-                        warn!(
-                            "group {table_key} WAL tail row at ts={} has no matching schema \
+        if let Some(s) = decoded.schema {
+            known.insert(decoded.schema_hash, s);
+        }
+        let schema = match known.get(&decoded.schema_hash) {
+            Some(s) => s,
+            None => {
+                // No schema with this row's hash stated in the tail:
+                // there is nothing to decode its values against. Skip
+                // it, warning once per materialization so a
+                // retention-driven gap is visible without spamming.
+                if !warned_unanchored {
+                    warn!(
+                        "group {table_key} WAL tail row at ts={} has no matching schema \
                              anchor (likely evicted by retention); skipping until the next \
                              anchored row (warned once)",
-                            row.ts()
-                        );
-                        warned_unanchored = true;
-                    }
-                    continue;
+                        row.ts()
+                    );
+                    warned_unanchored = true;
                 }
-            },
+                continue;
+            }
         };
         let window = decoded.window.map(|(begin, end)| Window::new(begin, end));
         builder.push_row(
@@ -403,17 +404,18 @@ pub fn materialize_long_wal_tail_with(
     props: WriterProperties,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     let mut builder = crate::long_table::LongTableBuilder::new();
-    let mut current: Option<((u64, u64), crate::schema::GroupSchema)> = None;
+    // By hash, as in `materialize_group_wal_tail`.
+    let mut known: HashMap<(u64, u64), crate::schema::GroupSchema> = HashMap::new();
     let mut warned = false;
     let mut first_ts: Option<u64> = None;
     for row in rows {
         let decoded = decode_wal_long_row(row.row())?;
         if let Some(s) = decoded.schema {
-            current = Some((decoded.schema_hash, s));
+            known.insert(decoded.schema_hash, s);
         }
-        let schema = match &current {
-            Some((hash, s)) if *hash == decoded.schema_hash => s,
-            _ => {
+        let schema = match known.get(&decoded.schema_hash) {
+            Some(s) => s,
+            None => {
                 if !warned {
                     warn!(
                         "long table {table_key} WAL row at ts={} has no matching schema anchor; \
@@ -531,6 +533,59 @@ mod schema_rows_tests {
             .map(|r| r.0)
             .collect();
         assert_eq!(kept, vec![1]);
+    }
+
+    /// A tail as metriken-storage 0.2.2 wrote a group whose schema went A,
+    /// B, A: each hash's schema stated once, so the second run of A rows
+    /// follows B's schema. Every row decodes, wide and long, because a row
+    /// is resolved by its hash rather than against the last schema stated.
+    #[test]
+    fn a_schema_stated_before_the_last_one_still_decodes_its_rows() {
+        let (a, b) = ((1, 1), (2, 2));
+        let wide = |ts: u64, hash: (u64, u64), s: Option<GroupSchema>| {
+            let row = WalGroupRow {
+                schema_hash: hash,
+                schema: s,
+                window: Some((ts, ts + 1)),
+                counters: vec![Some(ts)],
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+            };
+            Row(ts, encode_wal_group_row(&row).unwrap())
+        };
+        let rows = vec![
+            wide(1, a, Some(schema(&["a"]))),
+            wide(2, b, Some(schema(&["b"]))),
+            wide(3, a, None),
+            wide(4, a, None),
+        ];
+        let tail = materialize_wal_tail("s/g", &rows).unwrap().unwrap();
+        assert_eq!((tail.rows, tail.first_ts), (4, 1));
+
+        let long = |ts: u64, hash: (u64, u64), s: Option<GroupSchema>| {
+            let row = WalLongRow {
+                schema_hash: hash,
+                schema: s,
+                window: None,
+                occupants: vec![LongOccupant {
+                    occupant: 0,
+                    counters: vec![Some(ts)],
+                    gauges: Vec::new(),
+                    histograms: Vec::new(),
+                }],
+            };
+            Row(ts, encode_wal_long_row(&row).unwrap())
+        };
+        let rows = vec![
+            long(1, a, Some(schema(&["a"]))),
+            long(2, b, Some(schema(&["b"]))),
+            long(3, a, None),
+            long(4, a, None),
+        ];
+        let tail = materialize_long_wal_tail("s/g", &rows, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((tail.rows, tail.first_ts), (4, 1));
     }
 
     /// A table of cells keeps each row whose names differ from the row

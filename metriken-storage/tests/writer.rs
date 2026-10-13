@@ -1644,3 +1644,148 @@ fn intermittent_series_keep_every_sample() {
         m
     });
 }
+
+/// Record `ticks` snapshots of `snap` one pass per commit with segments
+/// that never fill (`max_rows` 1000), evicting everything before tick
+/// `cutoff` after tick `at`, as hindsight with a retention window shorter
+/// than the seal policy's `max_age` does. `None` records without eviction.
+fn record_evicting(
+    path: &Path,
+    long_groups: bool,
+    evict: Option<(u64, u64)>,
+    finalize: bool,
+    ticks: u64,
+    snap: &dyn Fn(u64) -> Snapshot,
+) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 1000,
+            ..SealPolicy::default()
+        },
+        restate_every_ns: 6 * S,
+        long_groups,
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    for t in 0..ticks {
+        let staged = source.stage(&snap(t), BASE + t * S, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+        if let Some((at, cutoff)) = evict {
+            if t == at {
+                source.evict_before(BASE + cutoff * S).unwrap();
+            }
+        }
+    }
+    if finalize {
+        source.finalize((BASE + (ticks - 1) * S, 0)).unwrap();
+    } else {
+        source.sync().unwrap();
+        std::mem::forget(source);
+    }
+    writer.join().unwrap();
+}
+
+/// Values `metric` reads back from tick `from` to tick `ticks - 1`.
+fn samples_from(reader: &ArchiveReader, metric: &str, from: u64, ticks: u64) -> usize {
+    let (start, end) = (
+        (BASE + from * S) as f64 / 1e9,
+        (BASE + (ticks - 1) * S) as f64 / 1e9,
+    );
+    let QueryResult::Matrix { result } = reader.query_range(metric, start, end, 1.0).unwrap()
+    else {
+        panic!("{metric}: not a matrix");
+    };
+    let values: BTreeSet<String> = result
+        .iter()
+        .flat_map(|m| m.values.iter().map(|(_, v)| v.to_string()))
+        .collect();
+    values.len()
+}
+
+/// Retention that cuts into an open segment, below the row carrying the
+/// group's schema, keeps every row at or after the cutoff: read live and
+/// after finalize. The cutoff used to delete the anchor, and the open
+/// segment's later rows were skipped as unanchored when read or sealed.
+fn eviction_keeps_rows_after_the_cutoff(finalize: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("evicted.dendro");
+    let snap = |t: u64| members_snapshot(t, &["x", "y"]);
+    record_evicting(&path, false, Some((10, 5)), finalize, 20, &snap);
+    let reader = open(&path);
+    for m in ["x", "y"] {
+        assert_eq!(samples_from(&reader, m, 5, 20), 15, "{m}");
+    }
+}
+
+#[test]
+fn eviction_keeps_rows_after_the_cutoff_live() {
+    eviction_keeps_rows_after_the_cutoff(false);
+}
+
+#[test]
+fn eviction_keeps_rows_after_the_cutoff_finalized() {
+    eviction_keeps_rows_after_the_cutoff(true);
+}
+
+/// The same for long and wide tables of the slotted fixture, and a V2
+/// sampler table whose cells carry their labels on first mention: after
+/// an eviction into the open segment, every query answers from tick 8 as
+/// a recording that evicted nothing.
+#[test]
+fn eviction_into_an_open_segment_answers_as_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    for long in [false, true] {
+        let (evicted, kept) = (
+            dir.path().join(format!("evicted-{long}.dendro")),
+            dir.path().join(format!("kept-{long}.dendro")),
+        );
+        record_evicting(&evicted, long, Some((10, 5)), true, TICKS, &snapshot);
+        record_evicting(&kept, long, None, true, TICKS, &snapshot);
+        let (evicted, kept) = (open(&evicted), open(&kept));
+        for q in QUERIES {
+            let (a, b) = (answer(&evicted, q, 8), answer(&kept, q, 8));
+            assert!(
+                a.as_ref().is_ok_and(|(a, _)| !a.is_empty()),
+                "{long} {q}: {a:?}"
+            );
+            assert_eq!(a, b, "long={long} {q}");
+        }
+    }
+
+    use metriken_exposition::{Counter, SnapshotV2};
+    let v2 = |t: u64| {
+        let ts = BASE + t * S;
+        let meta = |op: &str| -> HashMap<String, String> {
+            [("metric", "ops"), ("sampler", "fake"), ("op", op)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        Snapshot::V2(SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::ZERO,
+            metadata: HashMap::new(),
+            counters: vec![
+                Counter::new("0".into(), t * 10, meta("read")),
+                Counter::new("1".into(), t * 20, meta("write")),
+            ],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        })
+    };
+    let (evicted, kept) = (
+        dir.path().join("evicted-v2.dendro"),
+        dir.path().join("kept-v2.dendro"),
+    );
+    record_evicting(&evicted, false, Some((10, 5)), true, 20, &v2);
+    record_evicting(&kept, false, None, true, 20, &v2);
+    let q = "sum by (op) (rate(ops[2s]))";
+    let a = answer(&open(&evicted), q, 8);
+    assert_eq!(a.as_ref().map(|a| a.0.len()).ok(), Some(2), "{a:?}");
+    assert_eq!(a, answer(&open(&kept), q, 8));
+}

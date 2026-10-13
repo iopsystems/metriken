@@ -967,8 +967,13 @@ async fn retention_evicts_rows_older_than_the_window() {
         "evicted: {} rows of {passes} passes",
         r.rows
     );
+    // A segment is sealed when its first row falls behind the window and
+    // dropped once its last row does, so up to two windows are kept.
     let span = r.last_ts.unwrap() - r.first_ts.unwrap();
-    assert!(span <= 600_000_000, "kept about 400 ms: {span} ns");
+    assert!(
+        span <= 1_000_000_000,
+        "kept at most about 800 ms: {span} ns"
+    );
 }
 
 /// A tick that overruns its interval (here a scrape that takes 1 s at a

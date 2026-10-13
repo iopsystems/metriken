@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go does. The writer stated each schema once per segment and the WAL
   decoder uses the last schema stated; the writer now states a schema
   whenever it changes from the previous row's. Predates the seal cap.
+  A group whose schema changes every tick then carries its schema on
+  every row: its WAL grows roughly 30 times (50 series: 21.5 KB to
+  600.8 KB over 60 ticks), and `max_bytes` does not see it, since the
+  byte estimate excludes schema bytes. The WAL decoders now resolve a row
+  by its schema hash, so tails a 0.2.2 writer left read in full.
+- **Fixed:** `evict_before` deleted the first row of an open segment, the
+  one carrying the schema or labels, when the retention window was
+  shorter than the seal policy's `max_age`, and every later row of that
+  segment was lost. Streams whose open segment started before the cutoff
+  are now sealed first, and segments are dropped whole, so `retain` now
+  keeps up to about twice its window. Predates the seal cap.
 
 ### metriken-recorder 0.1.1
 

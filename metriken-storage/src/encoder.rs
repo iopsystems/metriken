@@ -146,8 +146,10 @@ impl SegmentEncoder for Encoder {
         // so leaving it live would not let a later seal decode it, and a
         // skipped row in the middle of the run, reported, is a hole dendro
         // refuses as an encoder contract violation, which stops the writer.
-        // The writer anchors every change of schema, so this only happens
-        // when retention evicted an anchor.
+        // The writer states the schema on every change of hash and seals
+        // a stream before retention can cut its open segment's first row,
+        // so this needs a tail whose anchor was lost some other way: one a
+        // 0.2.2 writer left after retention cut into it.
         // The names fingerprint, so a reader probes one footer per distinct
         // set of metric names rather than only the table's first.
         Ok(tail.map(|t| Segment {
