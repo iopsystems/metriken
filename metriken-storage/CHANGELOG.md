@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `SourceRecorder::maybe_seal` could write a segment with more rows than
+  the seal policy's `max_rows`. The account counts rows as they are staged
+  and the seal check runs once per commit, so a commit holding several
+  passes of a source (frames that queued while a slow seal ran) left more
+  than `max_rows` live rows, and dendro's seal put them all in one
+  segment. `maybe_seal` and `finalize` now seal with dendro 0.4.2's
+  `SourceWriter::seal_capped` and the policy's `max_rows`, which splits
+  such a backlog into consecutive segments of at most `max_rows` rows.
+  The byte cap and the age bound are unchanged: they decide when a stream
+  seals, not where a split falls. If a part cannot be encoded on its own,
+  dendro logs a warning and seals that stream's rows as one segment.
+  A split costs one encode per `max_rows` rows. At production caps (900
+  rows) a backlog past the cap is rare, but with a small `max_rows` under
+  sustained CPU overload the extra encodes put the recording behind wall
+  clock: 3.4 to 4.5 s behind in rezolus's 2-row hindsight test fixture
+  with one busy loop per core, against 0.1 to 0.4 s with uncapped seals.
+- `Encoder` implements dendro's `SegmentEncoder::encode_after` for the
+  parts of a split seal after the first. The writer puts a group's schema,
+  a long table's columns and a sampler cell's metadata only on the first
+  row since the last seal that needs them, so a part that starts after
+  that row is anchored from the rows before it: the schema is put on its
+  first row when the hashes match, and a metric's first cell in the part
+  gets the metadata it last carried. Without it the part's group and long
+  rows were skipped as unanchored and its cells read back without labels.
+- Rows were lost when a group's schema returned to an earlier one within a
+  segment (A, B, A), which predates the seal cap. The writer stated each
+  schema hash once per segment, and 0.2.2's WAL decoder resolved a row
+  against the last schema stated, so the rows of the second run of A were
+  skipped as unanchored, in a sealed segment and in a live tail. A
+  Prometheus-style group whose series come and go between scrapes does this
+  routinely. The writer now states a schema whenever a row's hash differs
+  from the previous row's, for wide and long groups. The WAL row format is
+  unchanged, and the first row of each run in an A, B, A sequence states its
+  schema, so 0.2.2's decoder also reads what this writer produces. In a
+  split seal, `encode_after` looks the part's schema up by hash, which also
+  anchors WAL rows a 0.2.2 writer left.
+- `SourceRecorder::evict_before` lost every row of an open segment once
+  the cutoff passed the segment's first row, which predates the seal cap.
+  Retention deletes unsealed WAL rows by timestamp, and the open segment's
+  first row is the one that carries a group's schema or a sampler cell's
+  metadata, so the rows after it read back as nothing, live and once
+  sealed (a group of 20 ticks evicted at tick 5 after tick 10 kept none of
+  its 15 rows from tick 5). This happens whenever the retention window is
+  shorter than the seal policy's `max_age` (300 s by default): a short
+  hindsight lookback or a recorder `retain`. `evict_before` now first
+  seals each stream whose open segment started before the cutoff, so its
+  rows stay in a segment, which retention drops once its last row is past
+  the cutoff. Such a window therefore also bounds segment age: up to
+  `window + min(window, max_age)` is kept (about twice the window when it
+  is shorter than `max_age`). Before, the WAL rows were cut at the window
+  and segments straddling it were kept whole but held nothing readable. A
+  window of `max_age` or longer (hindsight's 15 m default) is unaffected.
+  When a window is just under `max_age`, every stream of a source is sealed
+  in the same eviction, so their seals align from then on. A seal that
+  dendro defers after its retries is retried by dendro 0.4.2 at the start
+  of the next eviction, and a stream it still cannot seal is left out of
+  that eviction, so a deferred seal does not let retention cut an anchor
+  either, unless the retried seal then fails with an error that is not
+  retryable (an encoder error, for one): dendro logs it and evicts that
+  stream's live rows. `evict_before` makes two dendro eviction passes
+  (data streams, then occupant streams) after its seal, so while a seal
+  stays blocked by a lock it can wait for up to three retry schedules.
+- The WAL decoders (`materialize_wal_tail`, `materialize_long_wal_tail`)
+  resolve a schema-less row against the schema its hash names, wherever in
+  the tail it was stated, rather than only the last schema stated. A tail
+  a 0.2.2 writer left for a group whose schema went A, B, A now reads in
+  full, live, sealed or copied.
+- Restating the schema on every change of hash has a cost for a group
+  whose schema changes every tick, such as a scraped target with a series
+  that is present on alternate scrapes: each row then carries its whole
+  schema. The review measured the WAL of such a Prometheus-shaped group
+  at about 28 to 32 times its size with a steady schema over 60 ticks
+  (50 series: 21.5 KB to 600.8 KB; 500 series: 0.19 MB to 6.06 MB). The
+  seal's byte estimate (`metriken_model::cost::group_approx_bytes`) counts
+  values and not schema bytes, so `max_bytes` does not react to this;
+  only the row and age caps bound how much accumulates before a seal.
+- `Staged` documents that every staged pass must be committed: staging
+  advances per-stream state (the schema a segment carries, dedup keys,
+  occupant numbering, seal accounts) before the rows land.
+- dendro 0.4.2 is required.
+
 ## [0.2.2] - 2026-10-12
 
 ### Added

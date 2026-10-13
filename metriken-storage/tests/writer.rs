@@ -1360,3 +1360,432 @@ fn a_long_table_lists_only_the_series_it_has() {
     let latency = label_sets(reader.histogram_labels("latency"));
     assert_eq!(latency, label_sets(wide.histogram_labels("latency")));
 }
+
+/// Record `ticks` snapshots of `snap`, committing `backlog` passes at a time
+/// and checking the seal after each commit, as a recorder does when frames
+/// queued behind a slow seal. `max_rows` is the seal policy's.
+fn record_in_backlogs(
+    path: &Path,
+    long_groups: bool,
+    max_rows: usize,
+    backlog: u64,
+    ticks: u64,
+    snap: &dyn Fn(u64) -> Snapshot,
+) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows,
+            ..SealPolicy::default()
+        },
+        restate_every_ns: 6 * S,
+        long_groups,
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    let mut t = 0;
+    while t < ticks {
+        let staged = (t..ticks.min(t + backlog))
+            .map(|t| source.stage(&snap(t), BASE + t * S, 0).unwrap())
+            .collect();
+        writer.commit(staged).unwrap();
+        source.maybe_seal().unwrap();
+        t += backlog;
+    }
+    source.finalize((BASE + (ticks - 1) * S, 0)).unwrap();
+    writer.join().unwrap();
+}
+
+/// Each stream's segment row counts, in `seq` order.
+fn segment_rows(path: &Path) -> BTreeMap<String, Vec<u64>> {
+    let db = dendro::archive::Archive::open(path).unwrap();
+    let mut out = BTreeMap::new();
+    for source in db.read_sources().unwrap() {
+        for stream in db.all_streams(source.id).unwrap() {
+            let rows = db
+                .read_segment_meta(source.id, &stream)
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.rows)
+                .collect();
+            out.insert(stream, rows);
+        }
+    }
+    out
+}
+
+/// Committing three passes per seal check at a cap of two rows writes no
+/// segment past the cap, and the archive answers as one committed a pass
+/// at a time. A part of a split seal starts after the row that carried
+/// the group's schema (or the long table's columns); without the encoder
+/// anchoring it from the rows before, its rows would be skipped.
+fn backlog_seals_within_the_cap(long_groups: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (split, single) = (
+        dir.path().join("split.dendro"),
+        dir.path().join("single.dendro"),
+    );
+    record_in_backlogs(&split, long_groups, 2, 3, TICKS, &snapshot);
+    record_in_backlogs(&single, long_groups, 2, 1, TICKS, &snapshot);
+    let rows = segment_rows(&split);
+    for (stream, segments) in &rows {
+        assert!(
+            segments.iter().all(|r| *r <= 2),
+            "{stream}: a segment past the cap: {segments:?}"
+        );
+    }
+    let group = rows["threads/tasks"].clone();
+    assert_eq!(
+        group.iter().sum::<u64>(),
+        TICKS - 1,
+        "tick 3 has no members"
+    );
+    assert!(
+        group.windows(2).any(|w| w == [2, 1]),
+        "a three-pass backlog was split: {group:?}"
+    );
+    let (split, single) = (open(&split), open(&single));
+    for q in QUERIES {
+        let (a, b) = (answer(&split, q, 0), answer(&single, q, 0));
+        assert!(a.as_ref().is_ok_and(|(a, _)| !a.is_empty()), "{q}: {a:?}");
+        assert_eq!(a, b, "{q}");
+    }
+}
+
+#[test]
+fn a_wide_backlog_seals_within_the_row_cap() {
+    backlog_seals_within_the_cap(false);
+}
+
+#[test]
+fn a_long_backlog_seals_within_the_row_cap() {
+    backlog_seals_within_the_cap(true);
+}
+
+/// [`backlog_seals_within_the_cap`] for a V2 sampler table, whose cells
+/// carry their metadata only the first time a metric appears in a segment:
+/// a later part of a split seal must still read back with its labels.
+#[test]
+fn a_v2_backlog_seals_within_the_row_cap_with_its_labels() {
+    use metriken_exposition::{Counter, Gauge, SnapshotV2};
+
+    let meta = |metric: &str, op: &str| -> HashMap<String, String> {
+        [("metric", metric), ("sampler", "fake"), ("op", op)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let v2 = |t: u64| {
+        let ts = BASE + t * S;
+        let w = Some(metriken::Window::new(ts - S / 2, ts));
+        Snapshot::V2(SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::ZERO,
+            metadata: HashMap::new(),
+            counters: vec![
+                Counter::new("0".into(), t * 10, meta("ops", "read")).with_window(w),
+                Counter::new("1".into(), t * 20, meta("ops", "write")).with_window(w),
+            ],
+            gauges: vec![Gauge::new("2".into(), t as i64, meta("free", "none")).with_window(w)],
+            histograms: Vec::new(),
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (split, single) = (
+        dir.path().join("split.dendro"),
+        dir.path().join("single.dendro"),
+    );
+    record_in_backlogs(&split, false, 2, 3, 12, &v2);
+    record_in_backlogs(&single, false, 2, 1, 12, &v2);
+    let rows = segment_rows(&split);
+    assert!(rows["fake"].iter().all(|r| *r <= 2), "{rows:?}");
+    assert!(rows["fake"].windows(2).any(|w| w == [2, 1]), "{rows:?}");
+    let (split, single) = (open(&split), open(&single));
+    for q in ["sum by (op) (rate(ops[2s]))", "free"] {
+        let (a, b) = (answer(&split, q, 0), answer(&single, q, 0));
+        assert_eq!(a, b, "{q}");
+    }
+    let by_op = answer(&split, "sum by (op) (rate(ops[2s]))", 0).unwrap().0;
+    let ops: Vec<_> = by_op.iter().map(|(l, _)| l.clone()).collect();
+    assert_eq!(
+        ops,
+        [
+            vec![("op".to_string(), "read".to_string())],
+            vec![("op".to_string(), "write".to_string())]
+        ]
+    );
+}
+
+/// A group named `flip/g` whose members at tick `t` are `members(t)`, each
+/// a gauge of its own metric with a value unique to the member and tick.
+fn members_snapshot(t: u64, members: &[&str]) -> Snapshot {
+    let ts = BASE + t * S;
+    let mut schema = GroupSchema::default();
+    let mut gauges = Vec::new();
+    for (i, m) in members.iter().enumerate() {
+        // Named by the metric, so a member keeps its column whichever
+        // members are present beside it.
+        schema.gauges.push(MetricDesc {
+            name: m.to_string(),
+            metadata: [("metric", *m), ("sampler", "flip")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        });
+        gauges.push(Some((t * 1000 + i as u64) as i64));
+    }
+    Snapshot::V3(SnapshotV3 {
+        systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+        duration: Duration::from_millis(1),
+        metadata: HashMap::new(),
+        groups: vec![GroupSnapshot {
+            name: "flip/g".to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(Arc::new(schema)),
+            window: Some(metriken::Window::new(ts - S / 2, ts)),
+            counters: Vec::new(),
+            gauges,
+            histograms: Vec::new(),
+        }],
+    })
+}
+
+/// How many distinct values `metric` reads back over `ticks` ticks: one
+/// per tick the member was present, since every value is unique.
+fn samples(reader: &ArchiveReader, metric: &str, ticks: u64) -> usize {
+    let (start, end) = (BASE as f64 / 1e9, (BASE + (ticks - 1) * S) as f64 / 1e9);
+    let QueryResult::Matrix { result } = reader.query_range(metric, start, end, 1.0).unwrap()
+    else {
+        panic!("{metric}: not a matrix");
+    };
+    let values: BTreeSet<String> = result
+        .iter()
+        .flat_map(|m| m.values.iter().map(|(_, v)| v.to_string()))
+        .collect();
+    values.len()
+}
+
+/// A group whose schema returns to an earlier one within a segment keeps
+/// every sample, sealed whole or split at a cap of 2, and answers as one
+/// pass per commit does. The writer used to state a schema once per hash
+/// per segment, and the WAL decoder resolves a row against the last schema
+/// stated, so the second run of rows under an earlier schema was skipped.
+fn flip_back_keeps_every_sample(members: fn(u64) -> Vec<&'static str>) {
+    const TICKS: u64 = 12;
+    let snap = move |t: u64| members_snapshot(t, &members(t));
+    let metrics: BTreeSet<&str> = (0..TICKS).flat_map(members).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let reference = dir.path().join("reference.dendro");
+    record_in_backlogs(&reference, false, 2, 1, TICKS, &snap);
+    let reference = open(&reference);
+    for (cap, backlog) in [(100, 1), (100, 6), (2, 6), (2, 3)] {
+        let path = dir.path().join(format!("{cap}-{backlog}.dendro"));
+        record_in_backlogs(&path, false, cap, backlog, TICKS, &snap);
+        let rows = &segment_rows(&path)["flip/g"];
+        assert_eq!(rows.iter().sum::<u64>(), TICKS, "{cap}/{backlog}: {rows:?}");
+        assert!(
+            rows.iter().all(|r| *r as usize <= cap),
+            "{cap}/{backlog}: a segment past the cap: {rows:?}"
+        );
+        let reader = open(&path);
+        for m in &metrics {
+            let present = (0..TICKS).filter(|t| members(*t).contains(m)).count();
+            assert_eq!(
+                samples(&reader, m, TICKS),
+                present,
+                "{cap}/{backlog}: {m} lost samples ({rows:?})"
+            );
+            assert_eq!(
+                answer(&reader, m, 0),
+                answer(&reference, m, 0),
+                "{cap}/{backlog}: {m}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_schema_that_alternates_keeps_every_sample() {
+    flip_back_keeps_every_sample(|t| {
+        if t % 2 == 0 {
+            vec!["x", "y"]
+        } else {
+            vec!["x"]
+        }
+    });
+}
+
+#[test]
+fn a_schema_that_returns_after_two_ticks_keeps_every_sample() {
+    flip_back_keeps_every_sample(|t| {
+        if (t / 2) % 2 == 0 {
+            vec!["x", "y"]
+        } else {
+            vec!["x"]
+        }
+    });
+}
+
+/// A scrape-shaped group: series that come and go between scrapes, so the
+/// group's schema changes most ticks and revisits earlier member sets.
+#[test]
+fn intermittent_series_keep_every_sample() {
+    flip_back_keeps_every_sample(|t| {
+        let mut m = vec!["up"];
+        if t % 3 != 1 {
+            m.push("requests");
+        }
+        if t % 4 == 0 {
+            m.push("errors");
+        }
+        m
+    });
+}
+
+/// Record `ticks` snapshots of `snap` one pass per commit with segments
+/// that never fill (`max_rows` 1000), evicting everything before tick
+/// `cutoff` after tick `at`, as hindsight with a retention window shorter
+/// than the seal policy's `max_age` does. `None` records without eviction.
+fn record_evicting(
+    path: &Path,
+    long_groups: bool,
+    evict: Option<(u64, u64)>,
+    finalize: bool,
+    ticks: u64,
+    snap: &dyn Fn(u64) -> Snapshot,
+) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 1000,
+            ..SealPolicy::default()
+        },
+        restate_every_ns: 6 * S,
+        long_groups,
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    for t in 0..ticks {
+        let staged = source.stage(&snap(t), BASE + t * S, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+        if let Some((at, cutoff)) = evict {
+            if t == at {
+                source.evict_before(BASE + cutoff * S).unwrap();
+            }
+        }
+    }
+    if finalize {
+        source.finalize((BASE + (ticks - 1) * S, 0)).unwrap();
+    } else {
+        source.sync().unwrap();
+        std::mem::forget(source);
+    }
+    writer.join().unwrap();
+}
+
+/// Values `metric` reads back from tick `from` to tick `ticks - 1`.
+fn samples_from(reader: &ArchiveReader, metric: &str, from: u64, ticks: u64) -> usize {
+    let (start, end) = (
+        (BASE + from * S) as f64 / 1e9,
+        (BASE + (ticks - 1) * S) as f64 / 1e9,
+    );
+    let QueryResult::Matrix { result } = reader.query_range(metric, start, end, 1.0).unwrap()
+    else {
+        panic!("{metric}: not a matrix");
+    };
+    let values: BTreeSet<String> = result
+        .iter()
+        .flat_map(|m| m.values.iter().map(|(_, v)| v.to_string()))
+        .collect();
+    values.len()
+}
+
+/// Retention that cuts into an open segment, below the row carrying the
+/// group's schema, keeps every row at or after the cutoff: read live and
+/// after finalize. The cutoff used to delete the anchor, and the open
+/// segment's later rows were skipped as unanchored when read or sealed.
+fn eviction_keeps_rows_after_the_cutoff(finalize: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("evicted.dendro");
+    let snap = |t: u64| members_snapshot(t, &["x", "y"]);
+    record_evicting(&path, false, Some((10, 5)), finalize, 20, &snap);
+    let reader = open(&path);
+    for m in ["x", "y"] {
+        assert_eq!(samples_from(&reader, m, 5, 20), 15, "{m}");
+    }
+}
+
+#[test]
+fn eviction_keeps_rows_after_the_cutoff_live() {
+    eviction_keeps_rows_after_the_cutoff(false);
+}
+
+#[test]
+fn eviction_keeps_rows_after_the_cutoff_finalized() {
+    eviction_keeps_rows_after_the_cutoff(true);
+}
+
+/// The same for long and wide tables of the slotted fixture, and a V2
+/// sampler table whose cells carry their labels on first mention: after
+/// an eviction into the open segment, every query answers from tick 8 as
+/// a recording that evicted nothing.
+#[test]
+fn eviction_into_an_open_segment_answers_as_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    for long in [false, true] {
+        let (evicted, kept) = (
+            dir.path().join(format!("evicted-{long}.dendro")),
+            dir.path().join(format!("kept-{long}.dendro")),
+        );
+        record_evicting(&evicted, long, Some((10, 5)), true, TICKS, &snapshot);
+        record_evicting(&kept, long, None, true, TICKS, &snapshot);
+        let (evicted, kept) = (open(&evicted), open(&kept));
+        for q in QUERIES {
+            let (a, b) = (answer(&evicted, q, 8), answer(&kept, q, 8));
+            assert!(
+                a.as_ref().is_ok_and(|(a, _)| !a.is_empty()),
+                "{long} {q}: {a:?}"
+            );
+            assert_eq!(a, b, "long={long} {q}");
+        }
+    }
+
+    use metriken_exposition::{Counter, SnapshotV2};
+    let v2 = |t: u64| {
+        let ts = BASE + t * S;
+        let meta = |op: &str| -> HashMap<String, String> {
+            [("metric", "ops"), ("sampler", "fake"), ("op", op)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        Snapshot::V2(SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::ZERO,
+            metadata: HashMap::new(),
+            counters: vec![
+                Counter::new("0".into(), t * 10, meta("read")),
+                Counter::new("1".into(), t * 20, meta("write")),
+            ],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        })
+    };
+    let (evicted, kept) = (
+        dir.path().join("evicted-v2.dendro"),
+        dir.path().join("kept-v2.dendro"),
+    );
+    record_evicting(&evicted, false, Some((10, 5)), true, 20, &v2);
+    record_evicting(&kept, false, None, true, 20, &v2);
+    let q = "sum by (op) (rate(ops[2s]))";
+    let a = answer(&open(&evicted), q, 8);
+    assert_eq!(a.as_ref().map(|a| a.0.len()).ok(), Some(2), "{a:?}");
+    assert_eq!(a, answer(&open(&kept), q, 8));
+}

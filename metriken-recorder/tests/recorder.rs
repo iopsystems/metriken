@@ -956,7 +956,10 @@ async fn retention_evicts_rows_older_than_the_window() {
         .await
         .unwrap();
     let (passes, first_ts, newest) = last.expect("Committed events");
-    assert!(passes >= 15, "{passes}");
+    // About 20 passes at 100 ms. A slow runner takes fewer (13 on one
+    // Windows CI run); the eviction checks below are by time, so they
+    // need only enough passes that more were taken than are kept.
+    assert!(passes >= 10, "{passes}");
     assert!(
         newest - first_ts >= 1_400_000_000,
         "first_ts is the first ever"
@@ -967,8 +970,13 @@ async fn retention_evicts_rows_older_than_the_window() {
         "evicted: {} rows of {passes} passes",
         r.rows
     );
+    // A segment is sealed when its first row falls behind the window and
+    // dropped once its last row does, so up to two windows are kept.
     let span = r.last_ts.unwrap() - r.first_ts.unwrap();
-    assert!(span <= 600_000_000, "kept about 400 ms: {span} ns");
+    assert!(
+        span <= 1_000_000_000,
+        "kept at most about 800 ms: {span} ns"
+    );
 }
 
 /// A tick that overruns its interval (here a scrape that takes 1 s at a
@@ -1063,6 +1071,78 @@ impl LocalSource for Tiny {
             },
         ))
     }
+}
+
+/// A local source whose pass takes `delay`, holding up the tick it is taken
+/// on.
+struct Slow {
+    inner: Tiny,
+    delay: Duration,
+}
+
+impl LocalSource for Slow {
+    fn identity(&self) -> SourceIdentity {
+        self.inner.identity()
+    }
+
+    fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
+        std::thread::sleep(self.delay);
+        self.inner.pass()
+    }
+}
+
+/// Streamed frames that queue up while a tick is busy are committed one per
+/// commit, each followed by a seal check, so no segment holds more rows
+/// than the seal policy's cap. A local source that takes 350 ms per pass at
+/// a 100 ms interval holds every tick up for about three frames, which the
+/// tick then drains together. Committed as one, they sealed as one segment
+/// of four or more rows against a cap of two.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_frames_seal_within_the_row_cap() {
+    let producer = serve(stream_only(&[("source", "producer")], &[])).await;
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&producer.url)],
+        &NoProbe,
+    )
+    .await;
+    let slow: Box<dyn LocalSource> = Box::new(Slow {
+        inner: Tiny { name: "slow" },
+        delay: Duration::from_millis(350),
+    });
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        vec![slow],
+        |cfg| {
+            cfg.writer.seal.max_rows = 2;
+        },
+        Duration::from_millis(2500),
+        Stop::Grace(Duration::ZERO),
+    )
+    .await;
+    run.summary.expect("finished");
+
+    let archive = dendro::archive::Archive::open(&run.path).unwrap();
+    let source = archive
+        .read_sources()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.meta.labels.get("source").map(String::as_str) == Some("producer"))
+        .expect("the producer's recording");
+    let rows: Vec<u64> = archive
+        .read_segments(source.id, "fake/ops")
+        .unwrap()
+        .iter()
+        .map(|s| s.meta.rows)
+        .collect();
+    // Enough frames to have queued behind the slow ticks at all.
+    assert!(rows.iter().sum::<u64>() >= 12, "{rows:?}");
+    assert!(
+        rows.iter().all(|&r| r <= 2),
+        "a segment past the row cap of 2: {rows:?}"
+    );
 }
 
 /// A caller that keeps the receiver and never reads it does not stall the

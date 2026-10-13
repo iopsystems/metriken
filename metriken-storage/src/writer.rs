@@ -85,6 +85,14 @@ pub struct ArchiveWriter {
 
 /// One tick's rows for one source, as [`SourceRecorder::stage`] produced
 /// them, for [`ArchiveWriter::commit`].
+///
+/// Commit every `Staged`, in the order staged. Staging advances the
+/// source's per-stream state as if the rows had landed: which schema and
+/// metadata the open segment already carries, the dedup key, the occupant
+/// numbering and the seal accounts. Later rows rely on these rows, so
+/// dropping one leaves later rows without the schema or labels it carried.
+/// Undoing that on drop would mean snapshotting every stream's state per
+/// pass; no caller drops one, so it is a rule rather than a recovery.
 pub struct Staged {
     source_id: i64,
     rows: Vec<DWalRow>,
@@ -271,6 +279,7 @@ impl ArchiveWriter {
             groups: HashMap::new(),
             samplers: HashMap::new(),
             accounts: HashMap::new(),
+            opened: HashMap::new(),
         })
     }
 
@@ -541,9 +550,16 @@ struct GroupState {
     /// row, and a reader tells them apart by the occupant stream.
     long: Option<bool>,
     layouts: VecDeque<((u64, u64), Arc<Layout>)>,
-    /// Whether this segment's WAL already carries the schema of the given
-    /// hash (wide: the group's; long: the metric columns').
-    anchored: HashSet<(u64, u64)>,
+    /// The schema hash of the last row this segment's WAL holds for the
+    /// group (wide: the group's; long: the metric columns'), `None` after a
+    /// seal. A row carries its schema when its hash differs from this.
+    ///
+    /// The last row's hash, not every hash the segment has carried: until
+    /// 0.2.3 the WAL decoder resolved a row with no schema against the last
+    /// schema it read, so a group whose schema went A, B, A had its second
+    /// run of A rows skipped by a reader that old. Stating A again keeps
+    /// such archives readable by it.
+    anchored: Option<(u64, u64)>,
     /// Long only: the metric columns.
     columns: LongColumns,
     /// Long only: occupant number by identity (`__uid__`, or the labels).
@@ -679,11 +695,38 @@ pub struct SourceRecorder {
     config: Arc<WriterConfig>,
     groups: HashMap<String, GroupState>,
     accounts: HashMap<String, SegmentAccount>,
+    /// Per stream, the timestamp of the first row of its open segment: the
+    /// row that carries the group's schema or the cells' metadata. Absent
+    /// when the open segment is empty.
+    opened: HashMap<String, i64>,
 }
 
 impl SourceRecorder {
     pub fn source_id(&self) -> i64 {
         self.writer.source_id()
+    }
+
+    /// Account one staged row of `stream` to its open segment.
+    fn add_row(&mut self, stream: &str, bytes: usize, ts: u64) {
+        self.account(stream).add_row(bytes, ts as i64);
+        if !self.opened.contains_key(stream) {
+            self.opened.insert(stream.to_string(), ts as i64);
+        }
+    }
+
+    /// Forget what the open segments of `batch` carried, as they are handed
+    /// to the writer to seal: the next row of each starts a segment and
+    /// states its schema or metadata again.
+    fn sealing(&mut self, batch: &[String]) {
+        for stream in batch {
+            if let Some(state) = self.groups.get_mut(stream) {
+                state.anchored = None;
+            }
+            if let Some(state) = self.samplers.get_mut(stream) {
+                state.described.clear();
+            }
+            self.opened.remove(stream);
+        }
     }
 
     fn account(&mut self, stream: &str) -> &mut SegmentAccount {
@@ -1060,7 +1103,7 @@ impl SourceRecorder {
                 wall_offset,
                 row: wal::encode_wal_row(&cells)?,
             });
-            self.account(&sampler).add_row(bytes, ts as i64);
+            self.add_row(&sampler, bytes, ts);
         }
         Ok(())
     }
@@ -1109,7 +1152,7 @@ impl SourceRecorder {
         let window = g.window.map(|w| (w.begin_ns, w.end_ns));
         match layout.as_ref() {
             Layout::Wide(schema) => {
-                let anchor = state.anchored.insert(g.schema_hash);
+                let anchor = state.anchored.replace(g.schema_hash) != Some(g.schema_hash);
                 let row = metriken_model::convert::wal_group_row(
                     g,
                     anchor.then(|| schema.as_ref().clone()),
@@ -1121,7 +1164,7 @@ impl SourceRecorder {
                     wall_offset,
                     row: wal::encode_wal_group_row(&row)?,
                 });
-                self.account(&g.name).add_row(bytes, ts as i64);
+                self.add_row(&g.name, bytes, ts);
             }
             Layout::Long(l) => {
                 let mut present = Vec::new();
@@ -1216,7 +1259,7 @@ impl SourceRecorder {
             return Ok(());
         }
         let hash = state.columns.hash;
-        let anchor = state.anchored.insert(hash);
+        let anchor = state.anchored.replace(hash) != Some(hash);
         let row = WalLongRow {
             schema_hash: hash,
             schema: anchor.then(|| state.columns.schema.clone()),
@@ -1262,14 +1305,21 @@ impl SourceRecorder {
                 wall_offset,
                 row: occupants::encode_wal_row(&labels_rows),
             });
-            self.account(&stream).add_row(n * 64, ts as i64);
+            self.add_row(&stream, n * 64, ts);
         }
-        self.account(name).add_row(bytes, ts as i64);
+        self.add_row(name, bytes, ts);
         Ok(())
     }
 
     /// Seal every stream whose open segment is due. Call once per tick,
     /// after [`ArchiveWriter::commit`].
+    ///
+    /// When several passes were committed since the last check (frames
+    /// that queued behind a slow seal), a stream past the policy's
+    /// `max_rows` is sealed as several segments of at most `max_rows` rows
+    /// each. One exception: if a part of the split cannot be encoded on its
+    /// own (dendro's check that the parts cover every row fails), dendro
+    /// logs a warning and seals the stream's rows as one segment.
     pub fn maybe_seal(&mut self) -> Result<(), Error> {
         let now = Instant::now();
         let policy = &self.config.seal;
@@ -1280,18 +1330,13 @@ impl SourceRecorder {
                 batch.push(stream.clone());
             }
         }
-        for stream in &batch {
-            if let Some(state) = self.groups.get_mut(stream) {
-                state.anchored.clear();
-            }
-            if let Some(state) = self.samplers.get_mut(stream) {
-                state.described.clear();
-            }
-        }
+        self.sealing(&batch);
         if batch.is_empty() {
             return Ok(());
         }
-        self.writer.seal(batch).map_err(boxed)
+        self.writer
+            .seal_capped(batch, self.config.seal.max_rows)
+            .map_err(boxed)
     }
 
     /// Merge `patch` into this source's metadata while it records: a key in
@@ -1316,7 +1361,38 @@ impl SourceRecorder {
     /// Drop everything older than `cutoff_ns`. Occupant streams keep one
     /// restatement period more, so a row just inside the cutoff can still
     /// find its occupant's labels.
+    ///
+    /// A stream whose open segment started before the cutoff is sealed
+    /// first. Retention deletes unsealed rows by timestamp, and the first
+    /// row of an open segment is the one carrying the group's schema or the
+    /// cells' metadata: deleting it would leave the segment's later rows
+    /// with nothing to decode against, and they would be dropped when it
+    /// sealed. Sealed, the rows stay together in a segment that retention
+    /// keeps until its last row is older than the cutoff. A retention
+    /// window shorter than the seal policy's `max_age` therefore also
+    /// bounds segment age, and up to about twice the window is kept: a
+    /// segment sealed when its first row fell behind holds nearly a window
+    /// of rows, all kept until the last of them falls behind too.
     pub fn evict_before(&mut self, cutoff_ns: u64) -> Result<(), Error> {
+        let now = Instant::now();
+        let mut batch: Vec<String> = self
+            .opened
+            .iter()
+            .filter(|(s, first)| **first < cutoff_ns as i64 && occupants::table_of(s).is_none())
+            .map(|(s, _)| s.clone())
+            .collect();
+        batch.sort();
+        for stream in &batch {
+            if let Some(account) = self.accounts.get_mut(stream) {
+                account.rotate(&self.config.seal, now);
+            }
+        }
+        self.sealing(&batch);
+        if !batch.is_empty() {
+            self.writer
+                .seal_capped(batch, self.config.seal.max_rows)
+                .map_err(boxed)?;
+        }
         self.writer
             .evict_streams_before(
                 cutoff_ns as i64,
@@ -1338,7 +1414,9 @@ impl SourceRecorder {
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {
         let batch: Vec<String> = self.accounts.keys().cloned().collect();
         if !batch.is_empty() {
-            self.writer.seal(batch).map_err(boxed)?;
+            self.writer
+                .seal_capped(batch, self.config.seal.max_rows)
+                .map_err(boxed)?;
         }
         self.writer.finalize((last.0 as i64, last.1)).map_err(boxed)
     }
