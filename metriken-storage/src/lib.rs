@@ -56,6 +56,7 @@ pub mod encoder;
 pub mod filter;
 pub mod format;
 pub mod histogram_stream;
+pub mod labeled;
 pub mod labels;
 pub mod lazy;
 pub mod long;

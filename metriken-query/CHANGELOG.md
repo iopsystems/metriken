@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** an archive's series carry their recording's labels
+  (`source`, `host`, any `record --label`), and a query over an archive
+  with several recordings is answered from all of them instead of being
+  refused as cross-recording. `ArchiveReader`'s `route` groups the tables
+  a query names by recording, wraps each recording's source in
+  metriken-storage's `LabeledSource`, and joins the recordings side by
+  side, so `rate(x{source="vllm"}[1m])` selects one producer of a run and
+  `sum by (source) (...)` compares them. A single recording's series carry
+  its labels too. A series that already carries one of the keys keeps its
+  own value under `exported_<key>`; recordings with identical label sets
+  get `__recording__` (their position) so their series stay apart. Within
+  a recording, a metric name two samplers share is still refused.
+  `columns` resolves through the same labels.
+- The cross-cadence evaluation timestamps are applied only when every
+  table a query names is in one recording; a query over several stays on
+  the uniform grid, since recordings do not share row instants.
+
 ## [0.36.1] - 2026-10-12
 
 ### Fixed

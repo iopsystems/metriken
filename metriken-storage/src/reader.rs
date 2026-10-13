@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use crate::parquet::MultiParquetSource;
 use crate::segmented::SegmentedSource;
-use crate::{BufferPool, CompositionSource, DataSource, UnionChild};
+use crate::{BufferPool, CompositionSource, DataSource, Labels, UnionChild};
 
 use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
@@ -555,6 +555,11 @@ impl TableReader {
 /// entirely legal and would collide on `dir`.
 pub struct SamplerReader {
     recording: usize,
+    /// The labels of the recording this table belongs to, one allocation per
+    /// recording, so tables of one recording share it: the pointer identifies
+    /// the recording, also across readers [`ArchiveReader::flatten`] joined,
+    /// whose `recording` numbers can repeat.
+    recording_labels: Arc<BTreeMap<String, String>>,
     sampler: String,
     /// Every metric name this table holds, probed from ONE segment's footer at
     /// open. A table's segments share a schema — `schema_hash` is what asserts
@@ -623,6 +628,17 @@ impl SamplerReader {
     /// The index of the recording this table belongs to.
     pub fn recording(&self) -> usize {
         self.recording
+    }
+
+    /// The labels of the recording this table belongs to, as the catalog
+    /// holds them.
+    pub fn recording_labels(&self) -> &BTreeMap<String, String> {
+        &self.recording_labels
+    }
+
+    /// Whether `other` is a table of the same recording.
+    pub fn same_recording(&self, other: &SamplerReader) -> bool {
+        Arc::ptr_eq(&self.recording_labels, &other.recording_labels)
     }
 
     /// The table's key: `<sampler>/<group>` or `<sampler>`.
@@ -1295,6 +1311,7 @@ impl ArchiveReader {
             // Phase two: parse the footers. One probe per table, independent.
             let probed: Vec<Result<ProbedTable, String>> = probe_tables(&pending);
 
+            let recording_labels = Arc::new(rec.labels.clone());
             let mut tables = Vec::new();
             for probe in probed {
                 let (sampler, names, probed_interval, span) = probe?;
@@ -1306,6 +1323,7 @@ impl ArchiveReader {
                     .unwrap_or(probed_interval);
                 tables.push(Arc::new(SamplerReader {
                     recording,
+                    recording_labels: Arc::clone(&recording_labels),
                     sampler: sampler.clone(),
                     names,
                     span,
@@ -1368,6 +1386,7 @@ impl ArchiveReader {
         let mut complete = true;
         for (recording, rec) in recordings.into_iter().enumerate() {
             complete &= rec.complete;
+            let recording_labels = Arc::new(rec.labels.clone());
             if !rec.complete {
                 tracing::warn!(
                     "recording {} was not cleanly finalized; it was recovered up to its \
@@ -1425,6 +1444,7 @@ impl ArchiveReader {
 
                 tables.push(Arc::new(SamplerReader {
                     recording,
+                    recording_labels: Arc::clone(&recording_labels),
                     sampler,
                     names,
                     span,
@@ -1491,34 +1511,86 @@ impl ArchiveReader {
         )
     }
 
-    /// The label sets of counter `name`, from every table holding it.
+    /// The label sets of counter `name`, from every table holding it, each
+    /// with its recording's labels ([`series_labels`](Self::series_labels)).
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.tables
-            .iter()
-            .filter(|t| t.names.counters.contains(name))
-            .filter_map(|t| t.reader())
-            .flat_map(|r| r.source().counter_labels(name))
-            .collect()
+        self.labeled_listing(
+            |t| t.names.counters.contains(name),
+            |r| r.source().counter_labels(name),
+        )
     }
 
-    /// The label sets of gauge `name`, from every table holding it.
+    /// The label sets of gauge `name`, as [`counter_labels`](Self::counter_labels).
     pub fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing(
+            |t| t.names.gauges.contains(name),
+            |r| r.source().gauge_labels(name),
+        )
+    }
+
+    /// The label sets of histogram `name`, as [`counter_labels`](Self::counter_labels).
+    pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing(
+            |t| t.names.histograms.contains(name),
+            |r| r.source().histogram_labels(name),
+        )
+    }
+
+    fn labeled_listing(
+        &self,
+        holds: impl Fn(&SamplerReader) -> bool,
+        list: impl Fn(&TableReader) -> Vec<BTreeMap<String, String>>,
+    ) -> Vec<BTreeMap<String, String>> {
+        let extras = self.series_labels();
         self.tables
             .iter()
-            .filter(|t| t.names.gauges.contains(name))
-            .filter_map(|t| t.reader())
-            .flat_map(|r| r.source().gauge_labels(name))
+            .filter(|t| holds(t))
+            .filter_map(|t| t.reader().map(|r| (extras.of(t), list(r))))
+            .flat_map(|(extra, sets)| {
+                sets.into_iter().map(move |mut set| {
+                    crate::labeled::add_labels_map(&mut set, extra);
+                    set
+                })
+            })
             .collect()
     }
 
-    /// The label sets of histogram `name`, from every table holding it.
-    pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.tables
+    /// The labels each recording's series carry: the recording's labels, and
+    /// for recordings whose label sets are identical,
+    /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
+    /// recording's position among this reader's recordings (first table
+    /// order), so their series stay apart.
+    pub fn series_labels(&self) -> SeriesLabels {
+        let mut recordings: Vec<&Arc<BTreeMap<String, String>>> = Vec::new();
+        for t in &self.tables {
+            if !recordings
+                .iter()
+                .any(|r| Arc::ptr_eq(r, &t.recording_labels))
+            {
+                recordings.push(&t.recording_labels);
+            }
+        }
+        let by_recording = recordings
             .iter()
-            .filter(|t| t.names.histograms.contains(name))
-            .filter_map(|t| t.reader())
-            .flat_map(|r| r.source().histogram_labels(name))
-            .collect()
+            .enumerate()
+            .map(|(i, labels)| {
+                let shared = recordings
+                    .iter()
+                    .filter(|other| other.as_ref() == labels.as_ref())
+                    .count()
+                    > 1;
+                let mut extra = Labels {
+                    inner: labels.as_ref().clone(),
+                };
+                if shared {
+                    extra
+                        .inner
+                        .insert(crate::labeled::RECORDING_LABEL.to_string(), i.to_string());
+                }
+                (Arc::as_ptr(labels) as usize, extra)
+            })
+            .collect();
+        SeriesLabels { by_recording }
     }
 
     /// The union of the tables' probed spans, in nanoseconds. From the
@@ -1564,6 +1636,27 @@ fn union_sorted(iters: impl Iterator<Item = Vec<String>>) -> Vec<String> {
         set.extend(v);
     }
     set.into_iter().collect()
+}
+
+/// The labels each recording's series carry, from
+/// [`ArchiveReader::series_labels`].
+pub struct SeriesLabels {
+    /// Keyed by the address of the recording's shared label map, which
+    /// identifies the recording (see `SamplerReader::recording_labels`).
+    by_recording: Vec<(usize, Labels)>,
+}
+
+impl SeriesLabels {
+    /// The labels the series of `table`'s recording carry.
+    pub fn of(&self, table: &SamplerReader) -> &Labels {
+        static EMPTY: std::sync::OnceLock<Labels> = std::sync::OnceLock::new();
+        let ptr = Arc::as_ptr(&table.recording_labels) as usize;
+        self.by_recording
+            .iter()
+            .find(|(p, _)| *p == ptr)
+            .map(|(_, l)| l)
+            .unwrap_or_else(|| EMPTY.get_or_init(Labels::default))
+    }
 }
 
 #[cfg(test)]

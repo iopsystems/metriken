@@ -678,15 +678,22 @@ Open sub-questions:
    recordings instead of refusing them (keeps per-query table selection and
    both refusals; new code). The cost of either on a large multi-recording
    archive is not measured; the 9.6 h archive has one recording.
+   Decided 2026-10-13: `route()`. Built; see "Series labels, as built"
+   below.
 2. Which recording labels become series labels: all of them, or a fixed set
    (`source`, `host`). Whether `arm`, which selects A/B, is also one.
+   Decided 2026-10-13: all of them, `arm` included.
 3. A recording label whose key a series already carries (a scraped
    Prometheus series with `host` or `source`): replace, as
    `MultiParquetSource` does in a release build, refuse, or rename one.
+   Decided 2026-10-13: the recording's value wins and the series' own moves
+   to `exported_<key>`, as Prometheus does with `honor_labels: false`.
 4. Two recordings with identical label sets (two endpoints that infer the
    same `source` and `host`): refuse, or add a reserved label
    (`__recording__`, under the `__` rule of rezolus `docs/labels.md`) to keep
    their series apart.
+   Decided 2026-10-13: `__recording__`, added only to recordings whose
+   label set another recording shares.
 5. Recordings of different runs. `recording combine a.rez b.rez -o ab.rez`,
    rezolus's documented A/B form, does not set `arm` (no non-test `"arm"`
    under `src/parquet_tools/`), so under the rule above its output opens
@@ -695,6 +702,8 @@ Open sub-questions:
    time ranges overlap.
 6. The cross-cadence evaluation timestamps in a combined view, where each
    recording has its own row times.
+   Built 2026-10-13: applied only when every table a query names is in one
+   recording; a query over several stays on the uniform grid.
 7. Whether `rezolus mcp`, which refuses a multi-recording archive without
    `--recording` today, reads the combined source by default.
 8. (Added 2026-10-12 with Q12.) How a template instance's queries are
@@ -709,6 +718,58 @@ Open sub-questions:
    `MetricsSource` (`time_range()` comes from the rows), so an instance
    needs either its own recording's values or the combined reader's. Which
    one is open.
+
+#### Series labels, as built (2026-10-13)
+
+metriken branch `feat/dashboard-templates` (metriken-storage and
+metriken-query, unreleased):
+
+- `SamplerReader` holds its recording's labels in an `Arc` shared by the
+  recording's tables; `same_recording` compares the pointers, so recordings
+  of readers joined by `ArchiveReader::flatten`, whose `recording` numbers
+  repeat, stay distinct. `ArchiveReader::series_labels` gives each
+  recording its labels plus `__recording__` when its label set is shared.
+- metriken-storage `labeled::LabeledSource` wraps a `DataSource`: every
+  returned series (counters, counter streams, the counter scan, gauges,
+  histogram streams, label listings, `column_map`) gets the labels, with a
+  clashing key's own value under `exported_<key>`. A filter on an added
+  key is decided against the added value and stripped; one on
+  `exported_<key>` is decided on the relabelled series (a scan declines
+  then, and a histogram drops the rows), because whether a series has
+  `exported_<key>` depends on both values.
+- metriken-query `route()` groups the tables a query names by recording,
+  builds each recording's source as before (the table, or a `try_new`
+  union that still refuses a name two samplers share), wraps it in
+  `LabeledSource`, and joins several recordings through
+  `MultiParquetSource`. `columns` resolves through the same wrapper. The
+  cross-recording refusal is gone.
+- The filter's regex form is literals and alternations
+  (`labels::match_pattern`), so `source=~"a|b"` works and `source=~"a.*"`
+  matches nothing, as for any label.
+- Tests: metriken-query `archive::tests` (one recording carries its
+  labels; two recordings queried together, by `source=`, `!=`, `=~`,
+  `sum`, `sum by`; the `exported_` rename and its matchers; identical label
+  sets; the shared-name refusal; `columns`; cross-cadence from one
+  recording only) and metriken-storage `labeled::tests`. Seen red: no
+  wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
+  the clashing value dropped, cross-cadence across recordings.
+- Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
+  at a 500-point budget, five runs per query, three alternating rounds of
+  upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
+  to 41.2 ms for `sum by (id) (irate(cpu_usage[5m])) / 1e9`, 24.6 to 24.7
+  and 24.5 to 26.6 ms for `irate(cpu_usage[5m])`, 391.8 to 396.1 and 400.3
+  to 417.7 ms for `histogram_quantiles([0.5, 0.99],
+  scheduler_runqueue_latency)` (one base round, run while the host was
+  loaded, is left out: 2 to 5 times slower on every query). Results are
+  identical between the builds for three queries; `sum(irate(cpu_usage[5m]))`
+  differs from run to run within each build (its last digits), so it was not
+  compared. No cost above the run-to-run spread was seen; a multi-recording
+  archive was not measured.
+- What this changes for rezolus, on the release: series of every archive
+  carry `source` and `host` (and `__recording__`, `exported_<key>` where
+  they apply), and the cross-recording refusal its tests assert is gone.
+  The combined view (`init_file_mode_rez`, the WASM `Viewer::new`) and
+  `rezolus mcp`'s default (sub-question 7) are rezolus work on this release.
 
 ### Q12. How do templates travel, and do rezolus's sections become templates?
 
