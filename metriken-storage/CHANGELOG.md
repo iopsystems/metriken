@@ -33,17 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first row when the hashes match, and a metric's first cell in the part
   gets the metadata it last carried. Without it the part's group and long
   rows were skipped as unanchored and its cells read back without labels.
-- Rows were lost when a group's schema returned to an earlier one within
-  a segment (A, B, A), which predates the seal cap. The writer stated each
+- Rows were lost when a group's schema returned to an earlier one within a
+  segment (A, B, A), which predates the seal cap. The writer stated each
   schema hash once per segment, and 0.2.2's WAL decoder resolved a row
-  against the last schema stated, so the rows of the second run of A were skipped
-  as unanchored, in a sealed segment and in a live tail. A Prometheus-style
-  group whose series come and go between scrapes does this routinely. The
-  writer now states a schema whenever a row's hash differs from the
-  previous row's, for wide and long groups. The WAL row format is
-  unchanged, and every row of an A, B, A run now states its schema, so
-  0.2.2's decoder also reads what this writer produces. In a split
-  seal, `encode_after` looks the part's schema up by hash, which also
+  against the last schema stated, so the rows of the second run of A were
+  skipped as unanchored, in a sealed segment and in a live tail. A
+  Prometheus-style group whose series come and go between scrapes does this
+  routinely. The writer now states a schema whenever a row's hash differs
+  from the previous row's, for wide and long groups. The WAL row format is
+  unchanged, and the first row of each run in an A, B, A sequence states its
+  schema, so 0.2.2's decoder also reads what this writer produces. In a
+  split seal, `encode_after` looks the part's schema up by hash, which also
   anchors WAL rows a 0.2.2 writer left.
 - `SourceRecorder::evict_before` lost every row of an open segment once
   the cutoff passed the segment's first row, which predates the seal cap.
