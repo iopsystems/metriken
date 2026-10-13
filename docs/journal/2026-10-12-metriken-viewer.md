@@ -5,7 +5,10 @@
 below" means this entry's own order of work. The owner decided step 7's
 scope on 2026-10-12, before work begins; the questions, their options and
 the decisions are under "Scope decisions", and the design below follows
-them.
+them. Three later decisions the same day are recorded there too: how
+`rezolus-dashboard` is released (Q2), how an archive holding several
+recordings from one run opens (Q11), and how templates travel, with
+rezolus's own sections as templates to be evaluated (Q12).
 
 ## Goal
 
@@ -258,21 +261,22 @@ sections redraw CPU, memory, network and runqueue from rezolus recordings.
   `ServiceExtension` format cannot express what the generators do from the
   data (`gpu.rs` enumerates devices, `cpu.rs`, `blockio.rs` and others test
   for metrics before drawing), so (c) is a rewrite of the format and the
-  sections.
+  sections. (Q12 makes this a direction to evaluate.)
 
 Recommendation: (b), published to crates.io from rezolus's release workflow.
 It keeps the coupling that exists today (sampler and section together).
 (Corrected 2026-10-12: the draft said (b) "removes none of what cachecannon
 can show". It does not by itself keep cachecannon's separate Server and
-Client sections; see "Design gap: two rezolus sources in one archive" under
-"cachecannon".) GO 5 then reads: both commands
-mount `metriken-viewer` with the same providers (`rezolus-dashboard` and the
-archive's templates).
+Client sections; Q11 decides how they are kept.) GO 5 then reads: both
+commands mount `metriken-viewer` with the same providers
+(`rezolus-dashboard` and the archive's templates).
 
 Decided 2026-10-12: (b). `rezolus-dashboard` is a crate in rezolus,
 published to crates.io from rezolus's release workflow. Being published, it
 depends only on crates.io crates (`metriken-dashboard`, `metriken-query`),
-not on rezolus's unpublished `crates/rez` or on the binary.
+not on rezolus's unpublished `crates/rez` or on the binary. Q12 records a
+direction under evaluation that would replace the crate with templates the
+agent sends; until that evaluation reports, the design follows (b).
 
 Consequence of Q1 (c) with Q2 (b): `rezolus-dashboard` is published only
 when rezolus's release workflow runs, which is on a `v*` tag
@@ -287,20 +291,26 @@ requirement on a prerelease also accepts later alphas, which may break, and
 6.0.0. `iopsystems/rezolus` has no 6.0.0-alpha tag today (its newest tag
 is v5.27.0), so step 3 cuts one.
 
-**For the owner: should `rezolus-dashboard` be released independently of
-rezolus, with its own version, tag and workflow?** Recommendation: yes, with
-a 0.x version of its own, a `rezolus-dashboard-v*` tag, and a workflow that
-only runs `cargo publish -p rezolus-dashboard`. Evidence: `release.yml` on a
-`v*` tag builds and signs the deb and rpm packages for every distribution
-it lists, so a rezolus release costs far more than the crate needs; without
-an independent release, every metriken-query change to `MetricsSource`
-leaves cachecannon and systemslab waiting on a rezolus release cut for
-that reason only; and before 6.0.0 it forces the prerelease pin above. The
-cost is one more version line in rezolus and a rule for when it is bumped
-(any change under `crates/rezolus-dashboard`). A sampler and its section
-still land in one rezolus commit; the section reaches other applications
-at the next `rezolus-dashboard` tag instead of the next rezolus tag. Not
-decided; until it is, the design assumes the release workflow.
+Asked of the owner on 2026-10-12: should `rezolus-dashboard` be released
+independently of rezolus, with its own 0.x version, a `rezolus-dashboard-v*`
+tag and a workflow that only runs `cargo publish -p rezolus-dashboard`? The
+case for it was that `release.yml` on a `v*` tag builds and signs the deb and
+rpm packages for every distribution it lists, so a release cut only to move
+the crate costs far more than the crate needs.
+
+Decided 2026-10-12: no. `rezolus-dashboard` is released from rezolus's own
+release workflow, with rezolus's version, because a section changes with its
+sampler (19 of 19 section commits since 2026-07-14 also touch
+`src/agent/samplers`, "Today"), and one version line keeps a
+section and its sampler released together. The consequences above stand and
+are accepted:
+
+- a metriken-query release that changes `MetricsSource` reaches cachecannon
+  and systemslab only after metriken-dashboard, metriken-viewer and a rezolus
+  release;
+- a cachecannon branch before rezolus 6.0.0 pins a prerelease,
+  `rezolus-dashboard = "=6.0.0-alpha.N"`, and step 3 of the order of work
+  cuts the first 6.0.0-alpha tag.
 
 ### Q3. Does metriken-viewer publish a WASM bundle, or does each application build one?
 
@@ -469,6 +479,166 @@ alone".
 
 Decided 2026-10-12: out of scope.
 
+### Q11. How does an archive of several recordings from one run open?
+
+One `record` run with several endpoints writes one archive with a recording
+per endpoint: `record --endpoint agent --endpoint svc`, rezolus-capture, and
+cachecannon and llm-perf once they record the server under test and
+themselves in process (plan piece 2). Today, at rezolus upstream/main
+50075985:
+
+- `rezolus view` maps a multi-recording archive onto the baseline and
+  experiment slots and shows any further recordings as more captures
+  (`init_file_mode_rez`, `src/viewer/mod.rs`). The WASM
+  viewer's `Viewer::new` refuses one, and its `attach` opens one as a
+  comparison (`crates/viewer/src/lib.rs`).
+- A `.dendro` series carries no `source` label. A recording's labels
+  (`source`, `host`, `record --label`) are in the manifest, and
+  `open_recordings` returns them beside each recording's reader. Templates
+  select by `source` (`vllm.json` has 35 `source="vllm"` matchers), so they
+  match nothing. 5.x `recording combine` wrote one parquet with `source` in
+  every column's metadata (`src/parquet_tools/combine.rs`), which the
+  templates matched. rezolus `docs/backlog.md` lists this as "Multi-source
+  single-run recordings open as A/B; templates don't match `.dendro`
+  series", blocking 6.0.0, with the viewer fix left to the owner.
+- Opened flattened (`open_with_pool`), a query naming one sampler in two
+  recordings is refused by `route()` (metriken-query `src/archive.rs:100`)
+  as cross-recording.
+
+Decided 2026-10-12: such an archive opens as one combined view. Recording
+labels are usable as series labels, so a template's `{source="vllm"}`
+matches that recording's series. A/B (baseline and experiment) is shown only
+on request: `--baseline`/`--experiment`, or recordings that carry an `arm`
+label. Per-host sections follow from this: with two rezolus sources,
+rezolus's sections render once per source (per-source provider scope,
+"Crates"). This decides the design gap this entry recorded under
+"cachecannon" (its option (a)).
+
+What metriken origin/main (ab81e2a) has to build on:
+
+- `ArchiveReader::composition_sources` (metriken-storage `src/reader.rs:948`)
+  returns one recording's tables as lazy composition sources, and
+  `ParquetBuilder::source_labeled` (metriken-query `src/parquet.rs:556`)
+  merges a source into a multi-source reader with extra labels on every
+  series. Composing each recording from `open_recordings` under its labels
+  gives a combined reader with no new code. rezolus uses this only in tests
+  (`crates/rez/src/reader.rs`,
+  `composition_sources_merge_recordings_under_distinct_labels`).
+- That multi-source reader (`MultiParquetSource`, metriken-storage
+  `src/parquet.rs`) strips the added keys from the filter it passes to each
+  member and then inserts them into each returned series. A member series
+  that already carries one of the keys trips a `debug_assert!`; in a release
+  build the added value replaces the series' own.
+- The composed reader does not apply two things `route()` applies within one
+  recording: the cross-cadence evaluation timestamps (`eval_timestamps_for`
+  in `archive.rs`, documented as answering for one recording and passed by
+  the caller), and the refusal of a query over a metric name two samplers
+  share (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`; the
+  `composition_sources` docs, "Composition tolerates name-sharing that
+  `route` refuses").
+- `composition_sources` refuses a flattened multi-recording reader. Its docs
+  note that two recordings may carry identical label sets (the recorder only
+  warns), and that composing those under their own labels merges their
+  series.
+- `__run__` (metriken-storage `src/segmented.rs:398`, `:1241`) is a label the
+  reader adds, and reserves, to split one table's histogram series by
+  configuration run. It is a precedent for a label the reader adds; it does
+  not identify a recording.
+
+Design consequences:
+
+- The labels are added in metriken-query or metriken-storage, not in the
+  viewer, so `rezolus mcp`, `recording check` and metriken-py see the series
+  the dashboard sees. Which of the two is sub-question 1.
+- The viewer decides from the recording labels and the command line: A/B
+  when `--baseline`/`--experiment` is given or the recordings carry `arm`,
+  combined otherwise. One function in metriken-dashboard makes this
+  decision for both shells (GO 2). A single recording is the combined case
+  with one member, so its series carry its labels too, and a template
+  selecting `source="cachecannon"` matches a cachecannon archive of one
+  recording.
+- `rezolus view`: `init_file_mode_rez` opens the combined source by default
+  and calls `resolve_ab_slots` only in the A/B case. Follow mode finds each
+  recording again by its label set and already refuses duplicate label sets,
+  which sub-question 4 affects.
+- The WASM viewer: `Viewer::new` opens a multi-recording archive as one
+  combined source instead of refusing it, and `attach` fills two slots only
+  under the A/B rule.
+- Section providers take the claimed source in `sections` and `generate`,
+  and every query a provider builds is restricted to that source's series by
+  its recording labels. That changes the 15 sampler sections and Overview.
+  With one claimed source the nav is as today; with two, each set of entries
+  is named by `SourceEntry.name` (host).
+- cachecannon's `--server` and `--client` parquets become recordings of one
+  archive, and its Server and Client sections are rezolus's sections, once
+  per host.
+- This is rezolus work before step 7 moves code (Q6): the combined view, the
+  A/B rule and the series labels land with path step 5, which is where
+  templates first have to match. Per-source provider scope changes the
+  provider trait, which exists only from step 1 below.
+
+Open sub-questions:
+
+1. Where the labels are added: by composing in metriken-query
+   (`composition_sources` and `source_labeled`, which exist, with the
+   differences from `route()` above), or by `route()` in metriken-query's
+   `archive.rs` adding each recording's labels to its series and joining
+   recordings instead of refusing them (keeps per-query table selection and
+   both refusals; new code). The cost of either on a large multi-recording
+   archive is not measured; the 9.6 h archive has one recording.
+2. Which recording labels become series labels: all of them, or a fixed set
+   (`source`, `host`). Whether `arm`, which selects A/B, is also one.
+3. A recording label whose key a series already carries (a scraped
+   Prometheus series with `host` or `source`): replace, as
+   `MultiParquetSource` does in a release build, refuse, or rename one.
+4. Two recordings with identical label sets (two endpoints that infer the
+   same `source` and `host`): refuse, or add a reserved label
+   (`__recording__`, under the `__` rule of rezolus `docs/labels.md`) to keep
+   their series apart.
+5. Recordings of different runs. `recording combine a.rez b.rez -o ab.rez`,
+   rezolus's documented A/B form, does not set `arm` (no non-test `"arm"`
+   under `src/parquet_tools/`), so under the rule above its output opens
+   combined, with two runs at different wall-clock times on one axis. Either
+   `combine` stamps `arm`, or the rule also asks whether the recordings'
+   time ranges overlap.
+6. The cross-cadence evaluation timestamps in a combined view, where each
+   recording has its own row times.
+7. Whether `rezolus mcp`, which refuses a multi-recording archive without
+   `--recording` today, reads the combined source by default.
+
+### Q12. How do templates travel, and do rezolus's sections become templates?
+
+Decided 2026-10-12: a producer's template travels in its stream, in the
+handshake's metadata or in a frame sent after the handshake (path step 5),
+and the viewer reads it from the source's metadata in the archive. dendro
+0.4.0's `Frame` has `Handshake`, `Index`, `Rows`, `Segment` and
+`ClockOffset`, and no variant that changes a source's metadata after the
+handshake, so the second form needs a dendro change; the handshake form
+needs none (plan piece 3). Which form step 5 uses is open.
+
+Direction to evaluate (decided 2026-10-12; a separate evaluation is
+starting): express rezolus's sampler sections as templates too, sent by the
+agent in its stream like any producer's. `rezolus-dashboard` would then be
+data in the archive, and no viewer would depend on a rezolus crate. If the
+evaluation succeeds, it changes these decisions:
+
+- Q2: no `rezolus-dashboard` crate, so the Q2 consequence goes (a
+  metriken-query change would no longer wait for a rezolus release), and
+  cachecannon pins no rezolus prerelease.
+- Q3: the bundle no longer needs rezolus's sections compiled in, so a generic
+  bundle (Q3 (b)) would serve rezolus's static site.
+- Q7: the fallback for recordings older than the agent's templates still
+  needs rezolus's sections from somewhere; the evaluation says where.
+
+The known obstacle is that some sections contain logic the `ServiceExtension`
+format cannot express (Q2 (c)). rezolus `crates/dashboard/src/plot.rs:53`,
+`blockio_device_latency_metric`, picks `blockio_device_latency` or the
+pre-rename `blockio_latency` by which exists; `plot.rs:78`,
+`has_host_traffic_counters`, decides whether a plot appears; `gpu.rs`
+enumerates `(vendor, id)` pairs. The template format may need conditionals
+(a plot or query chosen by which metric exists) and repetition over label
+values. Until the evaluation reports, the design below follows Q2 (b).
+
 ## Design
 
 ### Crates
@@ -476,11 +646,12 @@ Decided 2026-10-12: out of scope.
 Following Q1 (c): `metriken-dashboard` in this repository, released with
 metriken-query; `metriken-viewer` in `iopsystems/metriken-viewer`, depending
 on the metriken crates by crates.io version; `rezolus-dashboard` in rezolus
-(Q2). All 0.x. An application resolves one metriken-query for all three, so
-a metriken-query release that changes `MetricsSource` reaches an application
-only after `metriken-viewer` and `rezolus-dashboard` have released against
-it, and `rezolus-dashboard` releases only with rezolus (Q2, the consequence
-and the question for the owner there).
+(Q2). metriken-dashboard and metriken-viewer are 0.x; `rezolus-dashboard`
+takes rezolus's version. An application resolves one metriken-query for all
+three, so a metriken-query release that changes `MetricsSource` reaches an
+application only after `metriken-viewer` and `rezolus-dashboard` have
+released against it, and `rezolus-dashboard` releases only with rezolus
+(decided, Q2).
 
 **`metriken-dashboard`.** Depends on metriken-query and metriken-storage
 (reader features only), serde, serde_json. No `metriken`, no threads; builds
@@ -515,21 +686,27 @@ pub trait SectionProvider: Send + Sync {
     /// metadata and metric names (rezolus: `source == "rezolus"`,
     /// `sampler_status`, or a self-sampler metric).
     fn claims(&self, source: &SourceInfo<'_>) -> bool;
-    /// Navigation entries, in order, for a recording one of whose sources
-    /// this provider claims.
-    fn sections(&self) -> Vec<Section>;
-    fn generate(&self, data: &dyn MetricsSource, route: &str, nav: Vec<Section>)
-        -> Option<View>;
+    /// Navigation entries, in order, for one source this provider claims.
+    /// Called once per claimed source (Q11).
+    fn sections(&self, source: &SourceScope<'_>) -> Vec<Section>;
+    /// Every query built here is restricted to `source`'s series by its
+    /// recording labels (`SourceScope::matchers`).
+    fn generate(&self, data: &dyn MetricsSource, source: &SourceScope<'_>,
+        route: &str, nav: Vec<Section>) -> Option<View>;
     /// The overview, when this provider supplies one.
-    fn overview(&self, data: &dyn MetricsSource, nav: Vec<Section>,
-        throughput_query: Option<&str>) -> Option<View> { None }
+    fn overview(&self, data: &dyn MetricsSource, source: &SourceScope<'_>,
+        nav: Vec<Section>, throughput_query: Option<&str>) -> Option<View> { None }
 }
 pub struct Dashboards { providers: Vec<Arc<dyn SectionProvider>>, templates: TemplateRegistry }
 ```
 
 `build_dashboard_context` and `generate_section` take a `&Dashboards`
 instead of reading `SECTION_META`. Today's `SourceEntry { is_rezolus }`
-becomes the provider that claimed the source. rezolus's sections become
+becomes the provider that claimed the source. Providers are scoped per
+source (decided, Q11): `SourceScope` names the source and the matchers that
+select its series, a provider claiming two sources yields one set of nav
+entries per source, named by `SourceEntry.name` (host), and with one claimed
+source the nav is as today. rezolus's sections become
 `rezolus-dashboard`'s implementation (Q2). Names and shapes are settled in
 step 1 below, against rezolus's and cachecannon's callers.
 
@@ -676,6 +853,12 @@ the browser offers no save, with a message pointing at `rezolus view`.
 
 ### Templates
 
+A producer's template reaches the archive through its stream, in the
+handshake or in a frame after it (Q12), and the viewer reads it from the
+source's metadata. A multi-recording archive from one run opens as one
+combined view whose series carry their recording's labels, so a template's
+`source` matchers select its producer's series (Q11).
+
 A recording's dashboard comes from, in order: `service_queries` in the
 source's metadata (archive) or file metadata (parquet), then
 `per_source_metadata`, then the application's fallback registry by source
@@ -708,56 +891,39 @@ metriken-storage). The `viewer-parity` skill moves to
 lines of Rust in 11 files) and its assets (5,902 lines of JS and CSS, 5,922
 with `index.html`) are deleted. Its Rust sections are
 replaced by its template; a plot the template cannot express is a
-cachecannon `SectionProvider`. `--server` and `--client` parquets become the
-experiment slot or a combined archive; that choice is cachecannon's.
+cachecannon `SectionProvider`. `--server` and `--client` parquets become
+recordings of one archive with the benchmark, which opens as one combined
+view (Q11).
 
-**Design gap, for the owner: two rezolus sources in one archive.** Today
+Two rezolus sources in one archive (decided 2026-10-12, Q11). Today
 `cachecannon view --server s.parquet --client c.parquet` draws a Server
 Metrics and a Client Metrics section (CPU, memory, network, runqueue
-latency), one per host. A combined archive holding cachecannon and two
-rezolus agents gets neither under this design. `build_dashboard_context`
-already lists each source as a `SourceEntry` with a resolved name
-(`source_kind.rs:140`), but it shows the built-in sections once if any
-source is rezolus (`dashboard/mod.rs:106`), and their queries carry no
-source selector, so each chart combines both hosts' series. The provider
-trait above keeps that: `claims` is per source, `sections` and `generate`
-are not. Using the experiment slot for the second host (option below)
-renders the client as an A/B overlay of the server, which is a different
-comparison. Options:
-
-- **(a) Per-source provider scope.** `generate` and `sections` take the
-  claimed source, and a provider that claims two sources yields one set of
-  nav entries per source, named by `SourceEntry.name` (host), with every
-  query restricted to that source's series. This needs a label or matcher
-  that selects one source's series in a multi-source `.dendro`; I do not
-  know whether metriken-storage exposes one to PromQL (the `__run__` label
-  it adds, `segmented.rs:398`, separates histogram configuration runs, not
-  sources), and step 1 checks. It also means every rezolus section's
-  queries take a selector, which touches the 15 sampler sections.
-- **(b) A cachecannon `SectionProvider`** that redraws Server and Client
-  sections with host-scoped queries, as cachecannon's Rust does today.
-  It duplicates rezolus sections in cachecannon and needs the same
-  per-source matcher as (a).
-- **(c) Accept one set of rezolus sections over both hosts**, each chart
-  combining both hosts' series as it does today. Smallest change; loses
-  the per-host sections cachecannon has today.
-
-Recommendation: (a), decided in step 1 because it changes the provider
-trait's signatures, and GO 1's fixture gains a second rezolus agent so the
-two-host case is tested. It is the only option that gives every
-application with several hosts in one archive (rezolus `record --endpoint a
---endpoint b`, a fleet recording) per-host sections, not just cachecannon.
-If the per-source matcher does not exist and cannot be added to
-metriken-storage without a format change, (c) for 6.0.0 and (a) after.
+latency), one per host. Before the decision, the provider trait showed the
+rezolus sections once over both hosts: `build_dashboard_context` lists each
+source as a `SourceEntry` with a resolved name (`source_kind.rs:140`) but
+shows the built-in sections once if any source is rezolus
+(`dashboard/mod.rs:106`), and their queries carry no source matcher. The
+options were per-source provider scope, a cachecannon `SectionProvider`
+redrawing Server and Client sections, or one set of sections over both
+hosts. The experiment slot was not an option for the client, because it
+renders the client as an A/B overlay of the server. Per-source scope was
+chosen: rezolus's sections render once per rezolus source, restricted by
+that recording's labels, which also gives `record --endpoint a --endpoint b`
+and fleet recordings per-host sections. GO 1's fixture holds two rezolus
+agents so this is tested.
 
 ## GO / NO-GO
 
 GO when all hold:
 
-1. **One dashboard.** For one `.dendro` holding a rezolus agent and a
-   cachecannon run, `/api/v1/sections` and every `/data/<section>.json`
-   from `cachecannon view` and `rezolus view` are byte-identical, with
-   cachecannon's dashboard from the archive's template (plan GO 5).
+1. **One dashboard.** For one `.dendro` from one run holding two rezolus
+   agents (server and client hosts) and a cachecannon run,
+   `/api/v1/sections` and every `/data/<section>.json` from `cachecannon
+   view` and `rezolus view` are byte-identical (plan GO 5). Both open it as
+   one combined view, not A/B; cachecannon's dashboard comes from the
+   archive's template, its `source` matchers select the cachecannon
+   recording's series, and rezolus's sections appear once per agent, each
+   querying only that agent's series (Q11).
 2. **Shell parity.** A native test builds the server state and the WASM
    `Viewer` (the crate is `rlib` as well as `cdylib`, as rezolus's
    `crates/viewer` is today) from the same fixtures and asserts `sections`,
@@ -766,8 +932,9 @@ GO when all hold:
    `test-support`) that takes a `Dashboards`, because the rezolus sections
    are not in that repository: metriken-viewer's CI runs it with templates
    only (a recording with a template, a simple capture, a two-recording
-   archive), and rezolus's CI runs it with `rezolus-dashboard` on a rezolus
-   recording. No such test exists today; the skill describes it and the
+   archive from one run opened combined, and a two-recording archive whose
+   recordings carry `arm`, opened A/B), and rezolus's CI runs it with
+   `rezolus-dashboard` on a rezolus recording. No such test exists today; the skill describes it and the
    suite has one-sided tests.
 3. **Tests carried over.** rezolus's viewer tests (Rust, `node --test`,
    `viewer_smoke.sh`) pass after rezolus moves onto the crates, and the JS
@@ -814,7 +981,10 @@ fallback is Q2 (a) for the sections or a bundle built in
    `metriken-recorder`) and path step 5 (templates from the archive, with
    `service_extensions_from_metadata` in the dashboard crate and called by
    both shells, closing the WASM gap above) are released and rezolus is on
-   them. The rezolus 6.0 entry's Save as Report change has landed (Q6).
+   them. Path step 5 includes Q11's combined view in rezolus's tree: a
+   one-run multi-recording archive opens combined in both shells, recording
+   labels are series labels, and A/B is shown only on request. The rezolus
+   6.0 entry's Save as Report change has landed (Q6).
 1. **Split inside rezolus.** With every test still in one tree: the provider
    trait in `crates/dashboard`, rezolus's sections moved to a new
    `crates/rezolus-dashboard`, `src/viewer` (minus the CLI and TUI) moved to
@@ -830,9 +1000,9 @@ fallback is Q2 (a) for the sections or a bundle built in
    - how a provider places library sections in its nav order, since the
      query explorer sits between Exceptions and CPU in `SECTION_META` and
      appears only for rezolus sources ("Crates");
-   - whether providers are scoped per source, which decides the
-     cachecannon Server/Client gap ("cachecannon"), with a second rezolus
-     agent added to GO 1's fixture;
+   - the signatures of per-source provider scope (decided, Q11):
+     `SourceScope`, its matchers, and how the 15 sampler sections and
+     Overview take them, with a second rezolus agent in GO 1's fixture;
    - `build.sh` writing nothing next to itself and being run as
      `bash <path>/build.sh`, the path taken from the `manifest_path` that
      `cargo metadata` reports for the crate ("WASM bundle"), so it already
@@ -842,8 +1012,9 @@ fallback is Q2 (a) for the sections or a bundle built in
    At this step GO 2, GO 4, GO 5 and GO 6 (for `crates/dashboard` and
    rezolus's `cdylib`) pass in rezolus, and GO 3 and GO 7 pass in their
    one-tree form: every test still in rezolus, and `Assets::Dir` pointed at
-   `crates/viewer-server/assets`. This is a rezolus PR series and changes no
-   behaviour.
+   `crates/viewer-server/assets`. This is a rezolus PR series. It changes
+   no behaviour except that an archive with two rezolus sources shows
+   rezolus's sections once per source (Q11).
 2. **New crates.** Copy `crates/dashboard` into this repository as
    `metriken-dashboard` (released with metriken-query, with the display wire
    fixture in `metriken-dashboard/fixtures/` and a CI check that `cargo
@@ -861,8 +1032,8 @@ fallback is Q2 (a) for the sections or a bundle built in
    site build uses `assets::write_to`, the 62 `site/viewer/lib/` symlinks
    and their CI check go, the 11 `site/viewer/templates/` symlinks are
    re-pointed at `crates/rezolus-dashboard/templates/`, and
-   `rezolus-dashboard` is published from the release workflow (Q2), or from
-   its own if the owner decides so. GO 2 to GO 6 are re-run on the released
+   `rezolus-dashboard` is published from rezolus's release workflow (Q2).
+   GO 2 to GO 6 are re-run on the released
    crates. Before 6.0.0 the publish needs a rezolus prerelease tag
    (6.0.0-alpha.N), which this step cuts.
 4. **cachecannon branch** on the released crates (GO 1). It reads `.dendro`

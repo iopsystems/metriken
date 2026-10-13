@@ -216,7 +216,13 @@ static assets, lives in `iopsystems/metriken-viewer` and depends on the
 metriken crates by version. This repository's CI gains the
 `metriken-dashboard` wasm32 check and a check that the display wire fixture
 is in that crate's package. rezolus's sampler sections stay in rezolus
-as `rezolus-dashboard`, published to crates.io (Q2).
+as `rezolus-dashboard`, published to crates.io from rezolus's own release
+workflow with rezolus's version (Q2; decided 2026-10-12, because a section
+changes with its sampler). A metriken-query change to `MetricsSource`
+therefore reaches cachecannon and systemslab after a rezolus release, and a
+cachecannon branch before rezolus 6.0.0 pins a 6.0.0-alpha. Whether
+rezolus's sections can instead be templates the agent sends, so that no
+viewer depends on a rezolus crate, is being evaluated (viewer entry, Q12).
 
 ## Pieces
 
@@ -275,15 +281,18 @@ vllm, sglang and valkey live in rezolus (`crates/dashboard/templates/`), so a
 change to one needs a rezolus release.
 
 - A producer that serves the stream passes its template to the route helper,
-  which puts it in the handshake's `metadata`. dendro carries that map
-  verbatim (`Frame::Handshake`), and dendro's own `Subscriber` stores it as the
-  source's metadata. rezolus's recorder does not use that subscriber
+  which sends it in the handshake's `metadata` or in a frame after the
+  handshake (decided 2026-10-12, viewer entry Q12; which of the two is
+  open). dendro carries the handshake map verbatim (`Frame::Handshake`), and
+  dendro's own `Subscriber` stores it as the source's metadata. dendro
+  0.4.0 has no frame that changes a source's metadata after the handshake,
+  so the second form needs a dendro change. rezolus's recorder does not use that subscriber
   (`src/recorder/stream.rs`): it keeps only the handshake's uuid and clock
   anchor (`adopt_source`, `src/recorder/mod.rs`) and reads metadata from the
   agent's `/status`, `/systeminfo` and `/metrics/descriptions`. The recorder
   therefore has to copy handshake metadata into the source's metadata,
   including on a reconnect; it does so from step 4 (recorder entry, Source
-  identity). No dendro change is needed.
+  identity). The handshake form needs no dendro change.
 - The key is `service_queries`, which `rezolus recording annotate --queries`
   already writes into a `.rez` or `.dendro` source's metadata and
   `rezolus recording check` already reads. Templates are the same
@@ -298,6 +307,16 @@ change to one needs a rezolus release.
   WASM viewer's `crates/viewer/src/lib.rs`), and that is what changes.
   Parquet recordings carry `service_queries` in their file metadata, and that
   path stays.
+- Templates select series by `source` (`{source="vllm"}`), a label a
+  `.dendro` series does not carry: a recording's labels are in the manifest.
+  Decided 2026-10-12 (viewer entry, Q11): an archive holding several
+  recordings from one run opens as one combined view, with recording labels
+  usable as series labels, and A/B only on request (`--baseline` and
+  `--experiment`, or recordings carrying an `arm` label). Where the labels
+  are added (metriken-query's composition or its `route()`), and the other
+  open sub-questions, are in Q11. rezolus's backlog item "Multi-source
+  single-run recordings open as A/B; templates don't match `.dendro`
+  series", which blocks 6.0.0, is closed by this.
 
 ### 4. Readers for other languages
 
@@ -350,9 +369,11 @@ GO for each piece when:
    with its tests passing, and one llm-perf run records the server under test
    and llm-perf into one `.dendro` in process, with llm-perf's latencies as
    native histograms.
-3. **Templates:** `rezolus view` on an archive holding an agent and a
-   producer shows the producer's dashboard, for the producer's recording, from
-   the template in the archive, with no template for it in the viewer.
+3. **Templates:** `rezolus view` on an archive from one run holding an
+   agent and a producer opens one combined view and shows the producer's
+   dashboard from the template in the archive, with no template for it in
+   the viewer, and the template's `source` matchers select the producer's
+   series.
 4. **Python bindings:** the bindings return the same values as
    `rezolus mcp query` on rezolus's compatibility fixtures (rezolus entry).
 5. **One viewer:** `cachecannon view` and `rezolus view` show the same
@@ -407,9 +428,12 @@ re-exports what it moves, in the release after.
    6.x line only (decided 2026-10-12: 5.x keeps its own recorder); then
    llm-perf records in process. Design and gate:
    [metriken-recorder](2026-10-12-metriken-recorder.md).
-5. **Templates in the archive** (piece 3): the route helper puts the template
-   in the handshake (the recorder adopts handshake metadata since step 4),
-   and the viewer reads `service_queries` from a source's metadata.
+5. **Templates in the archive** (piece 3): the route helper sends the
+   template in the handshake or a frame after it (the recorder adopts
+   handshake metadata since step 4), and the viewer reads `service_queries`
+   from a source's metadata. A multi-recording archive from one run opens as
+   one combined view, with recording labels as series labels and A/B only
+   on request (viewer entry, Q11).
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
    `.dendro` by default. Design and gate: [metriken-py](2026-10-12-metriken-py.md).
 7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
