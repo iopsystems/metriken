@@ -165,18 +165,19 @@ archive through the writer is the only way to get the exact listing.
 **Rewrites.** `KeepMetrics` (dendro's `project_segment_columns`) carries the
 file key-value metadata and keeps every row, so each surviving column's list
 stays correct; a dropped column's entry stays behind and is never read.
-dendro's compaction (`concat_parquet`) writes the merged segment with the
+dendro 0.4.0's compaction (`concat_parquet`) wrote the merged segment with the
 caller's writer properties and none of the inputs' key-value metadata. That
-drops `metriken.layout` and `metriken.occupants` as well, so a compacted
-long segment already reads as a wide table (measured on the
+dropped `metriken.layout` and `metriken.occupants` as well, so a compacted
+long segment read as a wide table (measured on the
 `tests/writer.rs` fixture on 0.2.0: `rate(cpu_time[3s])` returns 5 series
 after `compact_stream` where it returned 4 before; the extra series is the
 long table read as wide, with no slot labels). It predates this change.
 `tests/writer.rs::a_compacted_segment_is_not_taken_for_the_one_it_replaced`
 compacts long streams but compares two readers of the compacted archive, so
 it does not detect it; `a_compacted_long_stream_answers_as_before` compares
-answers before and after compaction, and failed then. rezolus does not compact (hindsight evicts whole segments and
-its dumps copy them). A fix in dendro must carry the key-value metadata when
+answers before and after compaction, and failed against dendro 0.4.0.
+rezolus does not compact (hindsight evicts whole segments and its dumps copy
+them). A fix in dendro must carry the key-value metadata when
 every input in a run agrees, and stop the run where it changes; the column
 lists then have to be unioned or dropped along with the segment list.
 dendro 0.4.1 does the first: its default merge carries the metadata of a run
