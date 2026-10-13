@@ -10,52 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** an archive's series carry their recording's labels
-  (`source`, `host`, any `record --label`), and a query over an archive
-  with several recordings is answered from all of them instead of being
-  refused as cross-recording. `ArchiveReader`'s `route` groups the tables
-  a query names by recording, wraps each recording's source in
-  metriken-storage's `LabeledSource`, and joins the recordings side by
-  side, so `rate(x{source="vllm"}[1m])` selects one producer of a run and
-  `sum by (source) (...)` compares them. A single recording's series carry
-  its labels too. A series that already carries one of the keys keeps its
-  own value under `exported_<key>`; recordings with identical label sets
-  get `__recording__` (their catalog index) so their series stay apart.
-  Within a recording, a metric name two samplers share is still refused.
-  `columns` resolves through the same labels. A table whose recording's
-  labels no selector of the query can match is left out before routing, so
-  `x{source="vllm"}` opens only that recording's tables. A query that
-  reads one histogram from several recordings is refused, naming them: the
-  histogram functions pool each row of the series they select, and two
-  recordings' rows fall at different times, so the answer alternated
-  between recordings row by row; a label matcher selecting one recording
-  answers. Joined recordings take the per-series rate path
-  (`MultiParquetSource` has no column scan).
-- The cross-cadence evaluation timestamps apply across recordings of one
-  run to a query that combines their series (see below), when the slow
-  recording's rows cover every other recording's span to within one of its
-  gaps; each sampler is keyed by its recording. A 1 s producer beside a 10 s
-  one in one archive reads `sum(g)` at the 10 s rows, where on the grid the
-  slow gauge had a fresh row only every tenth point. A query that combines
-  nothing (`g`, `rate(x[1m])` per series) stays on the grid at full
-  resolution, and so do recordings that only partly overlap or are of
-  different runs.
-- A query combines series of different recordings when it aggregates
-  series of more than one, applies an operator with `on`, `ignoring` or a
-  group modifier across more than one, or applies a plain operator whose
-  two sides come from different sets of recordings. A plain operator whose
-  sides come from the same recordings pairs within each (`g / h` is a ratio
-  per recording, since every series carries its recording's labels).
-- In `RateMode::Raw`, a query that combines series of different recordings
-  is refused: Raw reads each series at its own rows, and two recordings'
-  rows fall at different instants, so `sum(g)` over two recordings half an
-  interval apart alternated between them. One recording selected by label,
-  or a grid mode, answers.
-- At the edges of a range, a combination across recordings on the grid
-  reads only the recordings that have a row there: before the later
-  recording's first row, and at the last point when its next row lies past
-  the range, a `sum` holds the other recording alone. With different
-  cadences and a slow recording that does not cover the others, a `sum` on
-  the grid reads the slow one only at its rows. Not changed here.
+  (`source`, `host`, any `record --label`), and a query naming a metric that
+  several recordings of an archive hold is answered from all of them
+  instead of being refused as cross-recording: `rate(x[1m])` returns each
+  recording's series, and `x{source="vllm"}` selects one. A single
+  recording's series carry its labels too. A series that already carries
+  one of the keys keeps its own value under `exported_<key>`; recordings
+  with identical label sets get `__recording__` (their catalog index) so
+  their series stay apart. A table whose recording's labels no selector of
+  the query can match is left out before routing, so a query narrowed to
+  one recording reads only it. `columns` resolves through the same labels.
+- A query that combines series of different recordings is refused, naming
+  the recordings and a matcher that selects one: an aggregation, or an
+  operator with a selector on both sides, whose selectors reach more than
+  one recording. The engine assumes a metric's series share one table's
+  rows, and across recordings it answered wrong: two recordings' rows fall
+  at different instants and cadences (a raw-mode `sum` alternated between
+  them, and a grid `sum` read one alone at the range edges); binary
+  operators match on visible labels only, so twin recordings paired one's
+  `g` with the other's `h`; and a lone unmatched series on one side was
+  paired across recordings. A query reading one histogram from several
+  recordings is refused for the same reason. Within a recording, a metric
+  name two samplers share is still refused, and the cross-cadence
+  timestamps still apply.
 
 ## [0.36.1] - 2026-10-12
 

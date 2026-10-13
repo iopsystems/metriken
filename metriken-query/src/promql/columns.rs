@@ -76,23 +76,11 @@ pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
 /// A selector: the metric names it can select and its matchers as a filter.
 pub(crate) type Selector = (HashSet<String>, Labels);
 
-/// A place where a query combines series.
-pub(crate) enum Combination {
-    /// An aggregation over the series its operand selects.
-    All(Vec<Selector>),
-    /// A binary operator with a selector on both sides. `matched` is set
-    /// when it pairs by fewer labels than all of them (`on`, `ignoring`) or
-    /// many to one (`group_left`, `group_right`).
-    Pair {
-        lhs: Vec<Selector>,
-        rhs: Vec<Selector>,
-        matched: bool,
-    },
-}
-
-/// Every place `query` combines series, for a reader that has to know which
-/// of them span more than one of its recordings.
-pub(crate) fn combinations(query: &str) -> Result<Vec<Combination>, QueryError> {
+/// The selectors of every place `query` combines series: an aggregation
+/// (the selectors of its operand) and a binary operator with a selector on
+/// both sides (the selectors of both). For a reader that has to know which
+/// of them reach more than one of its recordings.
+pub(crate) fn combination_sites(query: &str) -> Result<Vec<Vec<Selector>>, QueryError> {
     let stripped = strip_rezolus_wrapper(query)?;
     let expr = parser::parse(stripped)
         .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
@@ -107,24 +95,17 @@ fn selectors_of(expr: &Expr) -> Vec<Selector> {
     out
 }
 
-fn walk_combinations(expr: &Expr, out: &mut Vec<Combination>) {
+fn walk_combinations(expr: &Expr, out: &mut Vec<Vec<Selector>>) {
     match expr {
         Expr::Aggregate(agg) => {
-            out.push(Combination::All(selectors_of(&agg.expr)));
+            out.push(selectors_of(&agg.expr));
             walk_combinations(&agg.expr, out);
         }
         Expr::Binary(b) => {
-            let (lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
+            let (mut lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
             if !lhs.is_empty() && !rhs.is_empty() {
-                let matched = b.modifier.as_ref().is_some_and(|m| {
-                    m.matching.is_some()
-                        || matches!(
-                            m.card,
-                            parser::VectorMatchCardinality::ManyToOne(_)
-                                | parser::VectorMatchCardinality::OneToMany(_)
-                        )
-                });
-                out.push(Combination::Pair { lhs, rhs, matched });
+                lhs.extend(rhs);
+                out.push(lhs);
             }
             walk_combinations(&b.lhs, out);
             walk_combinations(&b.rhs, out);

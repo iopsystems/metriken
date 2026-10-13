@@ -637,11 +637,6 @@ impl SamplerReader {
         self.names.holds(name)
     }
 
-    /// The table's row-time span in nanoseconds, from the catalog probe.
-    pub fn span(&self) -> Option<(u64, u64)> {
-        self.span
-    }
-
     /// Whether this table holds histogram `name`.
     pub fn holds_histogram(&self, name: &str) -> bool {
         self.names.histograms.contains(name)

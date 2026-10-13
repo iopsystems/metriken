@@ -10,10 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### metriken-storage, metriken-query (not yet released)
 
 - **Breaking:** an archive's series carry their recording's labels, and a
-  query over several recordings of an archive is answered from all of them
-  instead of being refused. A series' own value of a recording key moves to
-  `exported_<key>`; recordings with identical label sets are told apart by
-  `__recording__`. This is path step 5's series-label piece
+  query naming a metric several recordings hold returns each recording's
+  series instead of being refused. A series' own value of a recording key
+  moves to `exported_<key>`; recordings with identical label sets are told
+  apart by `__recording__`. A query that combines series of different
+  recordings (an aggregation, or an operator with selectors on both sides)
+  is refused until the engine can align and match across recordings. This
+  is path step 5's series-label piece
   (`docs/journal/2026-10-12-metriken-viewer.md`, Q11). See the crates'
   CHANGELOGs.
 

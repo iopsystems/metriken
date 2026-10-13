@@ -708,12 +708,10 @@ Open sub-questions:
    time ranges overlap.
 6. The cross-cadence evaluation timestamps in a combined view, where each
    recording has its own row times.
-   Built 2026-10-13: applied across recordings whose time ranges overlap
-   (recordings of one run share a wall clock), each sampler keyed by its
-   recording; recordings that do not overlap stay on the uniform grid. In
-   `RateMode::Raw`, which reads each series at its own rows by contract, a
-   query combining series across recordings is refused. See "Series labels,
-   as built".
+   Decided 2026-10-13 (after five reviews): the timestamps answer for one
+   recording, and a query that combines series of different recordings is
+   refused until the engine aligns and matches across recordings. See
+   "Series labels, as built".
 7. Whether `rezolus mcp`, which refuses a multi-recording archive without
    `--recording` today, reads the combined source by default.
 8. (Added 2026-10-12 with Q12.) How a template instance's queries are
@@ -755,45 +753,47 @@ metriken-query, unreleased):
   `LabeledSource`, and joins several recordings through
   `MultiParquetSource`. `columns` resolves through the same wrapper. The
   cross-recording refusal is gone.
-- Alignment across recordings (decided 2026-10-13, after a review found
-  aggregations across recordings wrong). The engine already aligned two
-  ways: the grid evaluates every series at `start + k·step` with windowed
-  rates, which handles recordings at one cadence and any phase; and the
-  cross-cadence timestamps move a query onto the slow sampler's rows. The
-  second was first applied within one recording only, which left
-  different cadences across recordings on the grid: with a 1 s and a 10 s
-  recording, `sum(g)` read 110 at the slow one's rows and 10 between.
-  Applying it to every query over overlapping recordings (the next
-  attempt) was wrong too, as the following review showed: a recording
-  starting halfway through cut every other series to the slow rows inside
-  its span and dropped them outside it (`g` over 40 s kept 2 of 40 points),
-  and even a query combining nothing was drawn at the slow resolution. As
-  built: across recordings the timestamps apply only to a query that
-  combines series of different recordings (`combines_across_recordings`,
-  from `promql::combinations`), and only when the slow recording's rows
-  cover every other recording's span to within one of its gaps. A query
-  combines across recordings when it aggregates series of more than one,
-  applies an operator with `on`, `ignoring` or a group modifier across more
-  than one, or applies a plain operator whose sides come from different
-  sets of recordings; a plain operator whose sides come from the same
-  recordings pairs within each (`g / h`), and one whose sides differ is
-  paired across them by the engine, which pairs a side of one series with
-  every series of the other. What the engine had no answer for across
-  recordings, because a metric's series always shared one table's rows:
-  combining in `RateMode::Raw` (`sum(g)` alternated 10, 100, 10, 100 for
-  recordings half an interval apart), now refused by the same rule;
-  histogram functions, refused above; the range edges on the grid, where
-  a `sum` reads only the recordings that have a row (the first point
-  before the later recording's first row, and the last point when its next
-  row lies past the range, read low); and different cadences where the
-  slow recording does not cover the others, which stay on the grid and
-  read the slow one only at its rows. Those last two are left as they are;
-  trimming a combining query's range to the span every recording covers
-  would address both. A stricter rule refusing every aggregation across
-  recordings was considered and not taken: the grid answers
-  `sum by (source)` correctly apart from those cases. `scalar()` and
-  `absent()` reduce across series but are not supported by the engine; if
-  they become so, `combinations` needs a case for them.
+- Combining across recordings (decided 2026-10-13: refused in this
+  change; answering it is a separate engine change). The engine assumes a
+  metric's series share one table's rows, and each review of this branch
+  found another way that assumption fails across recordings, each seen on
+  a test archive:
+  - Rows fall at different instants: in `RateMode::Raw`, `sum(g)` over two
+    recordings half an interval apart alternated 10, 100, 10, 100 where it
+    should read 110; on the grid, a `sum` at the range edges read only the
+    recording that had a row there.
+  - Cadences differ: with a 1 s and a 10 s recording, a grid `sum(g)` read
+    110 only at the slow rows and 10 between. Applying the cross-cadence
+    timestamps across recordings fixed that case and broke others: a slow
+    recording starting halfway cut a fast recording's series to 2 of 40
+    points, and the check had to use the slow table's rows, not the
+    recording's span.
+  - Matching: binary operators match on visible labels only
+    (`streaming/binary.rs`, `match_key`), so twin recordings, told apart by
+    the internal `__recording__`, paired one's `g` with the other's `h`
+    and dropped the second ratio; and a lone unmatched series on the right
+    is paired with every unmatched series on the left whatever its
+    recording, so with ragged label sets (different CPU counts per host)
+    `rate(g) / rate(h)` divided recording a's `g` by recording b's `h`.
+  - Histogram functions pool each row of the series they select, so a
+    histogram from two recordings alternated between them.
+  So a query whose aggregations, or whose operators with a selector on
+  both sides, reach more than one recording is refused, naming the
+  recordings and a matcher (`promql::combination_sites`,
+  `refuse_combining_across_recordings`); so is a histogram read from more
+  than one. Each series on its own (`rate(x[1m])`) is answered across
+  recordings, and a query narrowed to one recording by a matcher is
+  answered whole, with its cross-cadence alignment: what a template
+  instance per source needs (sub-question 8). The engine change that would
+  answer combinations: recording identity in binary-operator matching, no
+  broadcast across recordings, alignment per recording (or onto the slow
+  recording's rows where they cover the others), and trimmed range edges.
+  A rule that answered `sum by (source)` and per-recording `g / h` was
+  built and reviewed twice before this; it failed on the matching cases
+  above.
+- Each query works out its owning tables and the recordings' labels once
+  (`Plan`), shared by routing, the refusals, the cross-cadence timestamps
+  and `columns`.
 - `owners()` leaves out a table when no selector naming one of its
   metrics can match its recording's labels (`translate_filter` against
   `series_labels`); when that leaves none, the first recording's tables
@@ -824,19 +824,16 @@ metriken-query, unreleased):
 - Tests: metriken-query `archive::tests` (one recording carries its
   labels; two recordings queried together, by `source=`, `!=`, `=~`,
   `sum`, `sum by`; the `exported_` rename and its matchers; identical label
-  sets; the shared-name refusal; `columns`; cross-cadence across
-  recordings of one run and not of two; `sum` across a 1 s and a 10 s
-  recording; a partly overlapping recording; only combining queries moving
-  onto slow rows; which operators Raw refuses) and metriken-storage
+  sets; the shared-name refusal; `columns`; cross-cadence from one
+  recording only; a partly overlapping recording read at full resolution;
+  combining refused in both modes, twins included) and metriken-storage
   `labeled::tests`. Seen red: no
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
   the clashing value dropped, cross-cadence across recordings, the merge
   mixing configurations, no owner pruning, `__recording__` by position, no
   chained prefix, no histogram refusal, catalog indices kept when
   flattened twins repeat one, twins only among recordings with tables, no
-  cross-cadence across recordings, no overlap check, no Raw refusal, no
-  coverage check, every operator across recordings counted as combining,
-  non-combining queries moved onto slow rows.
+  combining refusal, binary operators not counted as combining.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
@@ -855,14 +852,12 @@ metriken-query, unreleased):
   396.6 and 399.8 ms against 400.1 and 401.9 ms for the same three
   queries.
 - Joined recordings take the per-series rate path: `MultiParquetSource`
-  does not implement `counter_scan`, so a query reading two recordings
-  skips `batch_rates`. Not measured.
-- The engine's binary operators pair series across recordings now that
-  such a query is answered: `rate(x[3s]) / rate(y[3s])` with `x` only in
-  `source=a` and `y` only in `source=b` returns one series labelled
-  `source=a` (a reviewer ran it), where Prometheus returns nothing because
-  the label sets differ. This is the engine's vector matching, not this
-  change; it was unreachable while the query was refused.
+  does not implement `counter_scan`, so a per-series query reading two
+  recordings skips `batch_rates`. Not measured.
+- The engine's binary operators would pair series across recordings
+  (`rate(x[3s]) / rate(y[3s])` with `x` only in `source=a` and `y` only in
+  `source=b` returned one series labelled `source=a`, where Prometheus
+  returns nothing); such a query is refused above.
 - What this changes for rezolus, on the release: series of every archive
   carry `source` and `host` (and `__recording__`, `exported_<key>` where
   they apply), and the cross-recording refusal its tests assert is gone.
