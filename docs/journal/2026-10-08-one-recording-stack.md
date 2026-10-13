@@ -299,27 +299,29 @@ change to one needs a rezolus release.
   dendro carries the handshake map verbatim (`Frame::Handshake`), and
   dendro's own `Subscriber` stores it as the source's metadata. dendro
   0.4.0 has no frame that changes a source's metadata after the handshake,
-  so sending it after the handshake would need a dendro change. rezolus's recorder does not use that subscriber
-  (`src/recorder/stream.rs`): it keeps only the handshake's uuid and clock
-  anchor (`adopt_source`, `src/recorder/mod.rs`) and reads metadata from the
-  agent's `/status`, `/systeminfo` and `/metrics/descriptions`. The recorder
-  therefore has to copy handshake metadata into the source's metadata,
-  including on a reconnect; it does so from step 4 (recorder entry, Source
-  identity). The handshake form needs no dendro change.
+  so sending it after the handshake would need a dendro change; the
+  handshake form needs none. rezolus's recorder adopts handshake metadata
+  since 50075985 (#1447), below the user's, the recorder's and the hook's
+  keys.
 - The key is `service_queries`, which `rezolus recording annotate --queries`
   already writes into a `.rez` or `.dendro` source's metadata and
   `rezolus recording check` already reads. Templates are the same
   `ServiceExtension` JSON.
-- The rezolus agent also sends `dashboard` alongside `service_queries`: its
-  sampler sections as a section template (schema 1, a document separate
-  from `ServiceExtension`, with conditions on the metric catalog), which
-  `metriken-dashboard` expands (viewer entry, Q12). The full template is
-  estimated at about 17 KB gzipped. A viewer that expands schema N is
-  released before any agent sends N, because the stream has no negotiation.
-- The viewer looks up a source's dashboard in this order: the source's
-  `dashboard` key, its `service_queries`, `per_source_metadata`, the
-  application's fallback registry by each entry's `match` predicate, then a
-  simple-capture section (viewer entry, "Templates").
+- The rezolus agent sends a second key, `dashboard`: its sampler sections
+  as a section template (schema 1, a document separate from
+  `ServiceExtension`, with conditions on the metric catalog), which
+  `metriken-dashboard` expands (viewer entry, Q12). The agent sends no
+  `service_queries` today. The full template is estimated at 60 to 95 KB
+  minified (about 17 KB gzipped); a rezolus source's metadata grows to
+  about 110 KB, since handshake metadata is a `BTreeMap<String, String>`
+  and dendro stores `sources.metadata` as uncompressed JSON
+  (`insert_source_sql`, dendro `src/archive/sqlite.rs`). A viewer that
+  expands schema N is released before any agent sends N, because the
+  stream has no negotiation.
+- `dashboard` and `service_queries` are independent: a source's section
+  template and its KPI sections both render; the fallback registry is
+  consulted for each only when the source lacks it (viewer entry,
+  "Templates").
 - A program recording itself writes its template into its own source's
   metadata.
 - A scraped Prometheus endpoint has no handshake. The recorder takes a
@@ -455,11 +457,11 @@ re-exports what it moves, in the release after.
 5. **Templates in the archive** (piece 3): the route helper sends the
    template in the handshake (the recorder adopts handshake metadata since
    step 4), and the viewer reads `service_queries` from a source's
-   metadata. The rezolus agent sends `dashboard` alongside
-   `service_queries`; this step defines the section-template document
-   (schema 1) and the expander, and the viewer's lookup order (viewer entry,
-   Q12 and "Templates"). The first agent release that sends a template is
-   not released before a viewer that expands it. A multi-recording archive from one run opens as
+   metadata. Path step 5 reserves the `dashboard` key and adds it to the
+   lookup order. Step 1 of the viewer entry defines schema 1, builds the
+   expander, converts the sections and makes the agent send them; the
+   first agent release that sends a template is not released before a
+   viewer that expands it (viewer entry, Q12 and "Templates"). A multi-recording archive from one run opens as
    one combined view, with recording labels as series labels and A/B only
    on request (viewer entry, Q11).
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets

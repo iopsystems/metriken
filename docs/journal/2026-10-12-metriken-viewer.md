@@ -245,7 +245,7 @@ package, and metriken-storage's manifest already excludes `tests/`
 
 ### Q2. Where do rezolus's sampler sections live?
 
-The 15 sampler sections in `SECTION_META` plus Overview (4,665 / 3,791 lines) describe
+The 15 `SECTION_META` entries other than the Query Explorer, plus Overview (4,665 / 3,791 lines), describe
 rezolus's samplers. cachecannon wants them too: its Server and Client
 sections redraw CPU, memory, network and runqueue from rezolus recordings.
 
@@ -479,9 +479,10 @@ library, and gets rezolus's sections today from the built-ins that
 `build_dashboard_context(.., &[])` shows ("Crates"). Both go: systemslab
 registers the rezolus template and the `ServiceExtension` files it uses
 from rezolus, and keeps inserting its own templates over them, as it does
-today. How systemslab obtains the files from a rezolus tag (a git dependency
-on a small rezolus crate that embeds the directory, or a copy taken at the
-tag as `sync:charts` takes chart modules) is for its own entry (Q9).
+today. How a consumer outside rezolus obtains the files from a rezolus tag
+is decided in step 1 of the order of work, with the template directory,
+because cachecannon needs it at step 4, before rezolus 6.0.0; the
+candidates and a recommendation are recorded there.
 
 ### Q8. Do the TUI and MCP stay in rezolus?
 
@@ -630,8 +631,10 @@ Design consequences:
 - cachecannon's `--server` and `--client` parquets become recordings of one
   archive, and its Server and Client sections are rezolus's sections, once
   per host.
-- This is rezolus work before step 7 moves code (Q6): the combined view, the
-  A/B rule and the series labels land with path step 5, which is where
+- This lands before step 7 moves code (Q6), in rezolus and in metriken: the
+  series labels need a metriken-query or metriken-storage release (wherever
+  sub-question 1 puts them), and the combined view and the A/B rule are
+  rezolus work on that release. Both land with path step 5, which is where
   templates first have to match. Per-source instantiation of the rezolus
   template needs the converted sections, which exist from step 1 below.
 
@@ -669,6 +672,12 @@ Open sub-questions:
    viewer-supplied selector (as it names `${throughput}` and the cgroup
    placeholder). The rezolus template's queries carry no `source` matcher
    today, because the Rust generators wrote none.
+9. (Added 2026-10-12.) Which header a template instance's `View` carries in
+   a combined view. `View::new` (rezolus `crates/dashboard/src/plot.rs:103`)
+   fills `interval`, `source`, `version` and the start and end time from the
+   `MetricsSource` (`time_range()` comes from the rows), so an instance
+   needs either its own recording's values or the combined reader's. Which
+   one is open.
 
 ### Q12. How do templates travel, and do rezolus's sections become templates?
 
@@ -712,12 +721,14 @@ from the code, measured, or estimated.
 
 - **What the sections decide from** (read from the code). The 17 generators
   (the 16 entries of `SECTION_META`, the query explorer among them, and
-  Overview) decide what to draw from the metric catalog only: `has_counter`,
+  Overview) decide what to draw from the metric catalog only (the query
+  explorer draws nothing; it is an 8-line empty `View`): `has_counter`,
   `counter_labels` and `gauge_labels`, `label_values`, `has_metric`,
   `metric_unique_label_count`. None reads a sample value, so a template
   expanded against the catalog can make the same choices.
 - **Prototype** (measured). CPU, GPU and BlockIO were converted, 1,446 of the
-  3,799 production lines of the sections. A 200-line Python expander
+  3,799 production lines of the 17 generators (the 3,791 of the 16 sections
+  counted under Q2, plus the query explorer's 8). A 200-line Python expander
   reproduced the Rust generators' JSON byte-identical in all 12 comparisons:
   3 sections, each against four catalogs (all metrics, one of each, a
   pre-rename legacy catalog, empty). Three deliberate template mutations
@@ -731,8 +742,12 @@ from the code, measured, or estimated.
     expresses `blockio_device_latency_metric`);
   - viewer parameters, such as `${throughput}`;
   - metadata pass-through and computed `selectors` (`gpu_selector`);
-  - `{"builtin": "query" | "overview"}` to place a library section in the
-    template's order (the query explorer between Exceptions and CPU);
+  - `{"builtin": "query"}` to place the query explorer, a library section,
+    in the template's order between Exceptions and CPU. The evaluation also
+    listed `"overview"`; it is dropped, because Overview is a rezolus
+    section to convert (`overview.rs` queries `cpu_usage` and
+    `network_bytes`, calls `has_host_traffic_counters`, and is what
+    `${throughput}` exists for);
   - `split` (an aggregate and its companion, `first`/`alone`);
   - `repeat {var, in}` (over label values, as `gpu.rs` iterates devices);
   - plot macros: `histogram_summary`, and presets `latency` and `pct`;
@@ -775,9 +790,11 @@ from the code, measured, or estimated.
      `crates/dashboard` (order of work, step 1).
    - The agent embeds the template and sends it under a `dashboard` key in
      the handshake's metadata.
-   - All 17 sections are converted, and each is checked byte-identical
-     against the Rust generators' output on fixture catalogs before the
-     Rust generators are deleted (GO 8).
+   - The 16 sections (Overview and the 15 other `SECTION_META` entries; the
+     query explorer is placed by `{"builtin": "query"}`, not converted) are
+     converted, and each is checked byte-identical against the Rust
+     generator's output on fixture catalogs before the Rust generators are
+     deleted (GO 8).
    - A recording without a template falls back to the rezolus template in
      the viewer's registry, matched by `source == "rezolus"`, a
      `sampler_status` key, or a metric in `REZOLUS_SELF_ANCHORS` (Q7).
@@ -825,8 +842,11 @@ for wasm32. Holds:
   stay). The registry holds section templates as well as `ServiceExtension`
   files, each section template with its `match` predicate (Q7);
 - the section-template document (schema 1) and its expander (Q12): it
-  takes a template, the metric catalog of one source and the viewer
-  parameters, evaluates `when` and `let` against the catalog, expands
+  takes a template, the metric catalog of one source, the viewer parameters,
+  and the source itself (or a header taken from it), because `View::new`
+  (`plot.rs:103`) fills `interval`, `source`, `version` and the time range
+  from the `MetricsSource`; which header an instance gets in a combined view
+  is open (Q11, sub-question 9). It evaluates `when` and `let` against the catalog, expands
   `repeat`, `split` and the plot macros, places `builtin` sections, omits
   groups and subgroups left empty, and returns the same `View` the Rust
   generators return today. It rejects a template with an unknown schema,
@@ -882,9 +902,9 @@ recording's sources, and the rezolus template is chosen by the source's
 The query explorer is a library section, but today it is a rezolus nav
 entry: it sits in `SECTION_META` between Exceptions and CPU, so it appears
 only when a rezolus source is present. The template places it with
-`{"builtin": "query"}` between its Exceptions and CPU entries, and the
-overview with `{"builtin": "overview"}` (Q12), so the library appends
-nothing after a template's sections. (Before Q12 this was an open choice
+`{"builtin": "query"}` between its Exceptions and CPU entries (Q12), so
+the library appends nothing after a template's sections. Overview is not a
+builtin; it is one of the converted rezolus sections. (Before Q12 this was an open choice
 for step 1, for example a `Section::library("query")` entry.)
 
 **`metriken-viewer`.** Depends, by crates.io version, on
@@ -1015,26 +1035,34 @@ the browser offers no save, with a message pointing at `rezolus view`.
 A producer's template reaches the archive through its stream, in the
 handshake's metadata (Q12), and the viewer reads it from the source's
 metadata. A `ServiceExtension` travels under `service_queries`; a section
-template travels under `dashboard`, which the rezolus agent sends alongside
-`service_queries` (path step 5). A multi-recording archive from one run
+template travels under `dashboard`, which the rezolus agent sends from step
+1 below (path step 5 reserves the key). The agent sends no
+`service_queries` today (no occurrence under rezolus `src/agent` at
+50075985); a producer such as cachecannon sends its `ServiceExtension`
+there. A multi-recording archive from one run
 opens as one combined view whose series carry their recording's labels, so
 a template's `source` matchers select its producer's series (Q11).
 
-A source's dashboard comes from, in order:
+`dashboard` and `service_queries` are independent: a source's section
+template and its KPI sections both render; the fallback registry is
+consulted for each only when the source lacks it. This keeps today's
+behaviour, where a rezolus recording annotated with `recording annotate
+--queries` shows the built-in sections and its service sections
+(`build_dashboard_context`, `dashboard/mod.rs`: `show_builtins` and the
+service sections are decided separately). For each source:
 
-1. the source's `dashboard` key (a section template);
-2. its `service_queries`, in the source's metadata (archive) or file
-   metadata (parquet);
-3. `per_source_metadata`;
-4. the application's fallback registry, by each entry's `match` predicate
-   over the source (source name for a `ServiceExtension`; the rezolus
-   template's predicate, Q7);
-5. a simple-capture section.
+- section template: the source's `dashboard` key, else the fallback
+  registry's section template whose `match` predicate selects the source
+  (the rezolus template's predicate, Q7);
+- KPI sections: `service_queries` in the source's metadata (archive) or file
+  metadata (parquet), else `per_source_metadata`, else the registry's
+  `ServiceExtension` by source name;
+- a source with neither gets a simple-capture section.
 
-One function in metriken-dashboard implements this order for both shells.
-With the precedence flag set (`Dashboards::prefer_registry`, from a viewer
-flag like `rezolus view --templates`), the registry is consulted before the
-archive's keys (Q12, decision 2). A template whose schema, predicate or node
+One function in metriken-dashboard implements this for both shells. With
+the precedence flag set (`Dashboards::prefer_registry`, from a viewer flag
+like `rezolus view --templates`), the registry is consulted before the
+archive's keys for each part (Q12, decision 2). A template whose schema, predicate or node
 the viewer does not know is rejected whole, the registry entry for that
 source is used, and a notice says so. After path step 5 a cachecannon or
 llm-perf archive shows its dashboard in `rezolus view` with no rezolus
@@ -1072,7 +1100,8 @@ holds `cachecannon.json` and the rezolus template, and serves its
 `router()` on the axum server it already runs. A rezolus recording made by
 an agent that sends its template needs no registry entry; the rezolus
 template in cachecannon's registry serves older rezolus recordings, and it
-is obtained from rezolus the way systemslab obtains it (Q7). Its
+is obtained from rezolus by the mechanism step 1 of the order of work
+decides. Its
 `src/viewer/` (1,098 lines of Rust in 11 files) and its assets (5,902 lines
 of JS and CSS, 5,922 with `index.html`) are deleted. Its Rust sections are
 replaced by its template. There is no Rust provider to fall back on (Q12),
@@ -1146,6 +1175,14 @@ GO when all hold:
    overlap). If the five baseline runs at step 1 are as tight as the storage
    scan's gate runs (13.4 to 13.8 s), the detectable size is smaller; the
    step 1 commit records the measured ranges and the size they allow.
+   Peak footprint is not a measure of the data the viewer holds on this
+   host: the storage scan's gate failed it at +8.7% with no overlap while
+   `heap -s` showed the same live heap in both builds (its "Gate result";
+   the owner granted an exception without changing the gate). So each run
+   also records live heap after the load (`heap -s`), and a footprint
+   failure with live heap equal to within 1 MB is reported with both
+   numbers and put to the owner rather than read as a regression; a live
+   heap more than 5% larger fails on its own.
 6. **No registry in the browser.** For wasm32-unknown-unknown, `cargo tree
    -e normal` lists no `metriken`, `metriken-core` or `linkme`, and `cargo
    check` of the same configuration is a CI step, in each of two
@@ -1157,12 +1194,17 @@ GO when all hold:
 7. **Developer mode.** With `Assets::Dir`, an edit to a file under a
    `metriken-viewer` checkout's `assets/` is served by `rezolus view` on the
    next reload without a rebuild.
-8. **Sections as templates** (Q12). Each of the 17 rezolus sections,
-   expanded from the rezolus template by metriken-dashboard's expander, is
+8. **Sections as templates** (Q12). Each of the 16 converted rezolus
+   sections (Overview and the 15 other `SECTION_META` entries), expanded
+   from the rezolus template by metriken-dashboard's expander, is
    byte-identical to the Rust generator's JSON on every fixture catalog (at
    least all metrics, one of each, a pre-rename legacy catalog, and empty,
    as in the evaluation), and a mutated template fails the comparison. This
-   holds before the Rust generators are deleted.
+   holds before the Rust generators are deleted, and the generators' JSON
+   is committed as golden fixtures so the template's output stays pinned
+   after they are. GO 8 compares the expansion before source restriction is
+   applied. Restriction is checked separately, by GO 1 and a test that
+   every selector in an instance carries the source's matchers.
 
 NO-GO if any section cannot be made identical to its Rust output on the
 fixture catalogs, or if the WASM exports cannot be registered from an
@@ -1178,22 +1220,23 @@ metriken-dashboard naming rezolus metrics, with Q2 (a) as the fallback.)
    `metriken-recorder`) and path step 5 (templates from the archive, with
    `service_extensions_from_metadata` in the dashboard crate and called by
    both shells, closing the WASM gap above) are released and rezolus is on
-   them. Path step 5 includes Q11's combined view in rezolus's tree: a
-   one-run multi-recording archive opens combined in both shells, recording
-   labels are series labels, and A/B is shown only on request. Path step 5
-   also defines the section-template document (schema 1) and the
-   expander's behaviour, and adds the `dashboard` handshake key, which the
-   agent sends alongside `service_queries`, to the lookup order (Q12,
-   "Templates"). The agent's template is the converted sections of step 1,
-   so the first agent release that sends one is the release that carries
-   them, and it is not released before a viewer that expands it. The rezolus
-   6.0 entry's Save as Report change has landed (Q6).
+   them. Path step 5 includes Q11's combined view: a metriken-query or
+   metriken-storage release that adds recording labels to series (Q11,
+   sub-question 1), and on it, in rezolus's tree, a one-run multi-recording
+   archive opening combined in both shells, with A/B shown only on request.
+   Path step 5 reserves the `dashboard` key and adds it to the lookup order.
+   Step 1 below defines schema 1, builds the expander,
+   converts the sections and makes the agent send them. The rezolus 6.0
+   entry's Save as Report change has landed (Q6).
 1. **Split inside rezolus.** With every test still in one tree: the
-   expander built in `crates/dashboard`; the 17 sections converted into the
-   rezolus template with the comparison harness (GO 8), which runs each
-   section's Rust generator and the expander on the fixture catalogs and
-   compares the JSON; the Rust generators deleted once GO 8 passes; the
-   agent embedding the template and sending it under `dashboard`; the
+   section-template document (schema 1) defined and the expander built in
+   `crates/dashboard`; the 16 sections converted into the rezolus template
+   with the comparison harness (GO 8), which runs each section's Rust
+   generator and the expander on the fixture catalogs and compares the
+   JSON; the generators' JSON committed as golden fixtures, then the Rust
+   generators deleted once GO 8 passes; the agent embedding the template
+   and sending it under `dashboard`, in a release that also carries a
+   viewer that expands it; the
    fallback registry with the rezolus template's `match` predicate (Q7);
    `src/viewer` (minus the CLI and TUI) moved to
    a library crate `crates/viewer-server` with the API above, the assets
@@ -1209,7 +1252,18 @@ metriken-dashboard naming rezolus metrics, with Q2 (a) as the fallback.)
      instance's queries are restricted to one source's series (Q11,
      sub-question 8), with a second rezolus agent in GO 1's fixture;
    - the directory in rezolus's tree that holds the template and the 11
-     `ServiceExtension` files (Q7);
+     `ServiceExtension` files (Q7), and how a consumer outside rezolus
+     (cachecannon at step 4, systemslab after 6.0.0) obtains the rezolus
+     template for its fallback registry. Candidates: the template file
+     published as an asset of each rezolus release, fetched by the
+     consumer; or the file vendored by each consumer at a pinned rezolus
+     tag, with a CI check that the copy matches the tag, as systemslab's
+     `sync:charts` does for chart modules. Recommended, for the owner to
+     decide: vendoring at a pinned tag with the sync check, because a
+     consumer published to crates.io (cachecannon, if it publishes) must
+     carry the file in its package, a build that fetches a release asset
+     needs the network, and systemslab already syncs chart modules this
+     way;
    - `build.sh` writing nothing next to itself and being run as
      `bash <path>/build.sh`, the path taken from the `manifest_path` that
      `cargo metadata` reports for the crate ("WASM bundle"), so it already
@@ -1245,9 +1299,11 @@ metriken-dashboard naming rezolus metrics, with Q2 (a) as the fallback.)
    `rezolus-dashboard` from rezolus's release workflow and cut a
    6.0.0-alpha tag for it.)
 4. **cachecannon branch** on the released crates (GO 1). It reads `.dendro`
-   by then (its step 5). It depends on no rezolus crate; rezolus's sections
+   and sends its template in its handshake by then (its steps 5 and 6). It
+   depends on no rezolus crate; rezolus's sections
    come from the template in the archive, or from the rezolus template in
-   cachecannon's registry for older recordings ("cachecannon"). Merged on
+   cachecannon's registry for older recordings, obtained as step 1 decides
+   ("cachecannon"). Merged on
    cachecannon's schedule (Q9); a later metriken-query release reaches it
    after metriken-dashboard and metriken-viewer release against it.
 5. **systemslab** in its own entry, after rezolus 6.0.0 (Q9).
