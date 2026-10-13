@@ -9,7 +9,9 @@ recorder; rezolus 6.x writes `.dendro` only (`.rez`, parquet and raw output
 are removed; reading them stays), so `metriken-recorder` writes `.dendro` only
 and an agent older than 5.21.0 is refused by 6.x, replacing the rezolus
 entry's decision 1; rezolus 6.0.0 is released after steps 4 to 7 and the
-follow-ups listed in step 7. Decided
+follow-ups listed in step 7; rezolus's sampler sections become a section
+template the agent sends in its handshake, expanded by `metriken-dashboard`,
+replacing the planned `rezolus-dashboard` crate (viewer entry, Q12). Decided
 2026-10-08:
 
 - recording, exposition and viewing converge on one stack, and per-project
@@ -25,8 +27,9 @@ follow-ups listed in step 7. Decided
   export with one schema.
 
 Related entries opened the same day: rezolus
-`docs/journal/2026-10-08-6-0-release-readiness.md`, systemslab
-`docs/journal/2026-10-08-dendro-artifacts.md`, cachecannon and llm-perf
+`docs/journal/2026-10-08-6-0-release-readiness.md`, systemslab's journal
+entry on dendro artifacts (systemslab is a private repository), cachecannon
+and llm-perf
 `docs/journal/2026-10-08-dendro-recording.md`. This continues
 [a high-cardinality metrics stack](2026-09-28-high-cardinality-stack.md),
 which moved the segment format, the archive reader and writer, and the
@@ -117,9 +120,16 @@ Each crate and what it depends on:
 - `metriken-recorder`: `metriken-storage`, `metriken-model`,
   `metriken-types`, dendro (feature `registry`: `metriken-exposition`, which
   links `metriken`, for a producer recording its own registry).
-- `metriken-dashboard`: `metriken-query`.
-- `metriken-viewer`: `metriken-dashboard`, `metriken-query`,
-  `metriken-storage` (report saving), `metriken-recorder` (live mode).
+- `metriken-dashboard`: `metriken-query`, `metriken-storage` (reader
+  features only).
+- `metriken-viewer`, in `iopsystems/metriken-viewer`: `metriken-dashboard`,
+  `metriken-query`, `metriken-storage` (report saving), `metriken-recorder`
+  (live mode), all by crates.io version.
+
+rezolus's sampler sections are not a crate: they are a section template the
+rezolus agent sends in its handshake, expanded by `metriken-dashboard`
+(decided 2026-10-12, viewer entry Q12; this list named a `rezolus-dashboard`
+crate until then).
 
 Four of these edges need explaining:
 
@@ -180,8 +190,8 @@ Four of these edges need explaining:
 | `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`, `MemoryStoreInner`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` forwards to storage's, where `MemoryStore`'s snapshot loading reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
 | `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.dendro` output (6.x writes no other container). Serves rezolus's 6.x line; 5.x keeps its own recorder (decided 2026-10-12). | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
-| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, and templates read from source metadata. | rezolus `crates/dashboard` |
-| `metriken-viewer` | The viewer as a library: a server router to mount, the chart and UI assets, the WASM bundle, report saving. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
+| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, templates read from source metadata, and the expander for section templates (schema 1: conditions on the metric catalog, repetition over label values). Released with `metriken-query`. | rezolus `crates/dashboard` without its sampler sections, which become the rezolus section template that the agent sends (viewer entry, Q12); `crates/dashboard` itself stays in rezolus, unpublished, until systemslab has moved |
+| `metriken-viewer` (in `iopsystems/metriken-viewer`, not this repository) | The viewer as a library: a server router to mount, the chart and UI assets, the WASM exports and the script an application builds its own bundle with, report saving, live mode over `metriken-recorder`. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
 | `metriken-py` (later) | Python bindings over storage and query (piece 4). | new |
 
 `metriken-segment` and `metriken-archive` are retired. A 5.x `--stream` `.rez`
@@ -203,9 +213,33 @@ The stream has no crate of its own. Its producer half is in
 and the frame format is dendro's (`replicate::Frame`) carrying
 `metriken-model` rows.
 
-Open: whether `metriken-dashboard` and `metriken-viewer` live in this
-repository or a repository of their own; the viewer brings a JS build and
-static assets.
+Decided 2026-10-12 (Q1 of the [viewer entry](2026-10-12-metriken-viewer.md)):
+`metriken-dashboard` lives in this repository and is released with
+`metriken-query`, because systemslab and rezolus use it without the viewer
+and its `generate_section` takes a `&dyn MetricsSource` that must come from
+the caller's `metriken-query`. `metriken-viewer`, with its JS build and
+static assets, lives in `iopsystems/metriken-viewer` and depends on the
+metriken crates by version. This repository's CI gains the
+`metriken-dashboard` wasm32 check and a check that the display wire fixture
+is in that crate's package. rezolus's sampler sections stay in rezolus as
+a section template the agent embeds and sends under a `dashboard` key in
+its handshake (viewer entry, Q12; decided 2026-10-12 after an evaluation
+the owner accepted). This supersedes the earlier decision of the same day
+(Q2) that they become a `rezolus-dashboard` crate published from rezolus's
+release workflow: there is no such crate and no section-provider trait, a
+metriken-query change to `MetricsSource` reaches cachecannon and systemslab
+after metriken-dashboard and metriken-viewer release with no rezolus
+release in between, and cachecannon pins no rezolus prerelease. A sampler
+and its section still land in one rezolus commit. Recordings with no
+template fall back to the rezolus template in the viewer's registry, and an
+archive's template renders by default, the registry only on request (a
+viewer flag such as `rezolus view --templates`). rezolus's
+`crates/dashboard` stays as an unpublished transitional crate with its Rust
+generators until systemslab, its only dependent outside rezolus (by git
+tag), has moved to templates: rezolus 6.0.0 ships it with the API systemslab uses unchanged, rezolus CI
+compares the template's expansion with the generators while both exist,
+and the generators are deleted in a 6.x release after systemslab's entry
+lands (decided 2026-10-12, viewer entry Q2).
 
 ## Pieces
 
@@ -264,19 +298,36 @@ vllm, sglang and valkey live in rezolus (`crates/dashboard/templates/`), so a
 change to one needs a rezolus release.
 
 - A producer that serves the stream passes its template to the route helper,
-  which puts it in the handshake's `metadata`. dendro carries that map
-  verbatim (`Frame::Handshake`), and dendro's own `Subscriber` stores it as the
-  source's metadata. rezolus's recorder does not use that subscriber
-  (`src/recorder/stream.rs`): it keeps only the handshake's uuid and clock
-  anchor (`adopt_source`, `src/recorder/mod.rs`) and reads metadata from the
-  agent's `/status`, `/systeminfo` and `/metrics/descriptions`. The recorder
-  therefore has to copy handshake metadata into the source's metadata,
-  including on a reconnect; it does so from step 4 (recorder entry, Source
-  identity). No dendro change is needed.
+  which sends it in the handshake's `metadata` (decided 2026-10-12, viewer
+  entry Q12: a frame after the handshake was the other option, and the
+  evaluation there settled on the handshake, since the template is sent
+  once per subscription and no dendro frame updates a source's metadata).
+  dendro carries the handshake map verbatim (`Frame::Handshake`), and
+  dendro's own `Subscriber` stores it as the source's metadata. dendro
+  0.4.0 has no frame that changes a source's metadata after the handshake,
+  so sending it after the handshake would need a dendro change; the
+  handshake form needs none. rezolus's recorder adopts handshake metadata
+  since 50075985 (#1447), below the user's, the recorder's and the hook's
+  keys.
 - The key is `service_queries`, which `rezolus recording annotate --queries`
   already writes into a `.rez` or `.dendro` source's metadata and
   `rezolus recording check` already reads. Templates are the same
   `ServiceExtension` JSON.
+- The rezolus agent sends a second key, `dashboard`: its sampler sections
+  as a section template (schema 1, a document separate from
+  `ServiceExtension`, with conditions on the metric catalog), which
+  `metriken-dashboard` expands (viewer entry, Q12). The agent sends no
+  `service_queries` today. The full template is estimated at 60 to 95 KB
+  minified (about 17 KB gzipped); a rezolus source's metadata grows to
+  about 110 KB, since handshake metadata is a `BTreeMap<String, String>`
+  and dendro stores `sources.metadata` as uncompressed JSON
+  (`insert_source_sql`, dendro `src/archive/sqlite.rs`). A viewer that
+  expands schema N is released before any agent sends N, because the
+  stream has no negotiation.
+- `dashboard` and `service_queries` are independent: a source's section
+  template and its KPI sections both render; the fallback registry is
+  consulted for each only when the source lacks it (viewer entry,
+  "Templates").
 - A program recording itself writes its template into its own source's
   metadata.
 - A scraped Prometheus endpoint has no handshake. The recorder takes a
@@ -287,6 +338,16 @@ change to one needs a rezolus release.
   WASM viewer's `crates/viewer/src/lib.rs`), and that is what changes.
   Parquet recordings carry `service_queries` in their file metadata, and that
   path stays.
+- Templates select series by `source` (`{source="vllm"}`), a label a
+  `.dendro` series does not carry: a recording's labels are in the manifest.
+  Decided 2026-10-12 (viewer entry, Q11): an archive holding several
+  recordings from one run opens as one combined view, with recording labels
+  usable as series labels, and A/B only on request (`--baseline` and
+  `--experiment`, or recordings carrying an `arm` label). Where the labels
+  are added (metriken-query's composition or its `route()`), and the other
+  open sub-questions, are in Q11. rezolus's backlog item "Multi-source
+  single-run recordings open as A/B; templates don't match `.dendro`
+  series", which blocks 6.0.0, is closed by this.
 
 ### 4. Readers for other languages
 
@@ -311,12 +372,15 @@ Recommended: bindings.
 ### 5. One viewer
 
 `metriken-viewer` and `metriken-dashboard` replace rezolus's viewer crates and
-`cachecannon view`'s own dashboards. `rezolus view`, `cachecannon view` and
-systemslab mount the same library; systemslab, which today vendors rezolus's
-chart code at a rezolus revision and takes `dashboard` from a rezolus git tag,
-takes published crates and assets instead. The move happens once, before
-rezolus 6.0.0 is tagged (decided 2026-10-12; it was planned for after, because
-the viewer is the part of rezolus changing fastest). `cachecannon view` reads
+`cachecannon view`'s own dashboards. `rezolus view` and `cachecannon view`
+mount the same library. rezolus moves before 6.0.0 is tagged, and a
+cachecannon branch is on the released crates by then (decided 2026-10-12; it
+was planned for after, because the viewer is the part of rezolus changing
+fastest). systemslab, which today vendors rezolus's chart code at a rezolus
+revision and takes `dashboard` from a rezolus git tag, moves to
+`metriken-dashboard` and `metriken-viewer`'s assets, with the rezolus
+template registered in its registry (viewer entry, Q7), after rezolus 6.0.0,
+in its own entry (viewer entry, Q9). `cachecannon view` reads
 `.dendro` before then through its metriken bump (cachecannon entry).
 
 ### 6. What stays
@@ -337,9 +401,11 @@ GO for each piece when:
    with its tests passing, and one llm-perf run records the server under test
    and llm-perf into one `.dendro` in process, with llm-perf's latencies as
    native histograms.
-3. **Templates:** `rezolus view` on an archive holding an agent and a
-   producer shows the producer's dashboard, for the producer's recording, from
-   the template in the archive, with no template for it in the viewer.
+3. **Templates:** `rezolus view` on an archive from one run holding an
+   agent and a producer opens one combined view and shows the producer's
+   dashboard from the template in the archive, with no template for it in
+   the viewer, and the template's `source` matchers select the producer's
+   series.
 4. **Python bindings:** the bindings return the same values as
    `rezolus mcp query` on rezolus's compatibility fixtures (rezolus entry).
 5. **One viewer:** `cachecannon view` and `rezolus view` show the same
@@ -394,9 +460,16 @@ re-exports what it moves, in the release after.
    6.x line only (decided 2026-10-12: 5.x keeps its own recorder); then
    llm-perf records in process. Design and gate:
    [metriken-recorder](2026-10-12-metriken-recorder.md).
-5. **Templates in the archive** (piece 3): the route helper puts the template
-   in the handshake (the recorder adopts handshake metadata since step 4),
-   and the viewer reads `service_queries` from a source's metadata.
+5. **Templates in the archive** (piece 3): the route helper sends the
+   template in the handshake (the recorder adopts handshake metadata since
+   step 4), and the viewer reads `service_queries` from a source's
+   metadata. Path step 5 reserves the `dashboard` key and adds it to the
+   lookup order. Step 1 of the viewer entry defines schema 1, builds the
+   expander, converts the sections and makes the agent send them; the
+   first agent release that sends a template is not released before a
+   viewer that expands it (viewer entry, Q12 and "Templates"). A multi-recording archive from one run opens as
+   one combined view, with recording labels as series labels and A/B only
+   on request (viewer entry, Q11).
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
    `.dendro` by default. Design and gate: [metriken-py](2026-10-12-metriken-py.md).
 7. **`metriken-dashboard` and `metriken-viewer`** (piece 5), before rezolus
@@ -423,4 +496,9 @@ re-exports what it moves, in the release after.
    2^32 (reproduced 2026-10-12; [metriken-py](2026-10-12-metriken-py.md),
    "Histograms as h2histogram objects"). metriken-query 0.36.1 keeps the
    counts as `u64`; as of 2026-10-12 it is merged (#261) and not yet
-   released.
+   released. The step closes when rezolus is on the released crates and a
+   cachecannon branch passes the viewer entry's GO 1; systemslab moves after
+   rezolus 6.0.0. The Rust section generators are not deleted in this
+   step: rezolus's `crates/dashboard` keeps them until systemslab has moved,
+   and a later 6.x release deletes them. Design, gate and the scope decisions (2026-10-12):
+   [metriken-dashboard and metriken-viewer](2026-10-12-metriken-viewer.md).
