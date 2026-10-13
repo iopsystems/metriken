@@ -1288,16 +1288,9 @@ impl Driver {
         }
     }
 
-    /// Commit the staged rows as one transaction, run every source's seal
-    /// check, apply retention, and report each source that committed. The
-    /// staged rows hold at most one pass per source: staging a second
-    /// streamed pass commits the first.
+    /// Commit the tick's staged rows as one transaction, run every source's
+    /// seal check, apply retention, and report each source that committed.
     async fn commit(&mut self, maintain: bool) {
-        // Already failed and reported: the archive is gone, and a second
-        // `fail` would report it twice.
-        if self.failed.is_some() {
-            return;
-        }
         let retain = self.settings.retain;
         let cutoffs: Vec<(usize, u64)> = match retain {
             Some(retain) if maintain => self
@@ -1989,19 +1982,6 @@ impl Driver {
                 }
                 let mut stamp = None;
                 for pass in passes {
-                    // One pass per source per commit. The seal check runs
-                    // once per commit and seals every row the stream has in
-                    // the WAL, so a second pass staged before it would go
-                    // into the same segment, past the policy's row cap. That
-                    // happens whenever passes queue: frames that arrived
-                    // while a commit or a tick's scrape was running, drained
-                    // together on the next tick, or a relay's batched frame.
-                    if self.slots[i].committed_this_tick {
-                        self.commit(true).await;
-                        if self.failed.is_some() {
-                            return Ok(());
-                        }
-                    }
                     let groups = {
                         let Kind::Endpoint(ep) = &mut self.slots[i].kind else {
                             return Ok(());
