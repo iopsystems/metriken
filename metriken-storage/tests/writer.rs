@@ -1091,15 +1091,12 @@ fn a_compacted_segment_is_not_taken_for_the_one_it_replaced() {
     assert_eq!(answers(&after, 0), answers(&fresh, 0));
 }
 
-/// Compacting a long stream must not change what it answers. Ignored while
-/// the dependency is dendro 0.4.0, whose compaction does not carry the
-/// segments' key-value metadata: the merged segment loses `metriken.layout`
-/// and `metriken.occupants` and reads as a wide table, with one more series
-/// than before. It passes against dendro 0.4.1 (through a
-/// `[patch.crates-io]` until that is released); remove the `ignore` when the
-/// dependency moves to it.
+/// Compacting a long stream with dendro's default merge does not change what
+/// it answers, its interval, or its catalog row counts. dendro (0.4.1 and
+/// later) carries the segments' key-value metadata into the merged segment,
+/// so it stays long; before that it lost `metriken.layout` and
+/// `metriken.occupants` and read as a wide table.
 #[test]
-#[ignore = "dendro 0.4.0's compaction drops long-layout metadata; passes against dendro 0.4.1"]
 fn a_compacted_long_stream_answers_as_before() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compact-long.dendro");
@@ -1149,46 +1146,14 @@ fn catalog_rows(path: &Path) -> BTreeMap<String, u64> {
     out
 }
 
-/// Compacting a long stream with [`SegmentMetadataMerge`] merges across
-/// the segments' occupant-list changes, which the default rule stops at, and
+/// Compacting a long stream with [`OccupantUnion`] merges across the
+/// segments' occupant-list changes, which the default merge stops at, and
 /// the merged stream answers and lists as before.
 ///
-/// Compiled only with `--cfg dendro_compact_with`: it needs dendro's
-/// `compact_stream_with` and `MetadataMerge`, which no released dendro has.
-/// Run it against a dendro that does, through a `[patch.crates-io]`, with
-/// `RUSTFLAGS="--cfg dendro_compact_with" cargo test -p metriken-storage
-/// --test writer`, and drop the cfg when the dependency moves to that
-/// release.
-///
-/// [`SegmentMetadataMerge`]: metriken_storage::long::SegmentMetadataMerge
-#[cfg(dendro_compact_with)]
+/// [`OccupantUnion`]: metriken_storage::long::OccupantUnion
 #[test]
 fn a_long_stream_compacted_by_union_answers_as_before() {
-    use dendro::rewrite::{MergeInput, MetadataMerge};
-    use metriken_storage::long::{SegmentMetadata, SegmentMetadataMerge};
-
-    /// dendro's merge, as [`SegmentMetadataMerge`].
-    struct Union;
-
-    fn metadata<'a>(i: &MergeInput<'a>) -> SegmentMetadata<'a> {
-        SegmentMetadata::new(i.key_value, i.fields, i.rows)
-    }
-
-    impl MetadataMerge for Union {
-        type Run = SegmentMetadataMerge;
-
-        fn start(&self, first: &MergeInput<'_>) -> Option<SegmentMetadataMerge> {
-            SegmentMetadataMerge::start(&metadata(first))
-        }
-
-        fn extend(&self, run: &mut SegmentMetadataMerge, next: &MergeInput<'_>) -> bool {
-            run.extend(&metadata(next))
-        }
-
-        fn finish(&self, run: SegmentMetadataMerge) -> Vec<parquet::file::metadata::KeyValue> {
-            run.finish()
-        }
-    }
+    use metriken_storage::long::OccupantUnion;
 
     let dir = tempfile::tempdir().unwrap();
     let wide = dir.path().join("wide.dendro");
@@ -1219,7 +1184,13 @@ fn a_long_stream_compacted_by_union_answers_as_before() {
             let spec = dendro::rewrite::CompactSpec::to_rows(100);
             for stream in tables {
                 if by_union {
-                    dendro::rewrite::compact_stream_with(&mut db, id, &stream, &spec, &Union)
+                    dendro::rewrite::compact_stream_with(
+                        &mut db,
+                        id,
+                        &stream,
+                        &spec,
+                        &OccupantUnion,
+                    )
                 } else {
                     dendro::rewrite::compact_stream(&mut db, id, &stream, &spec)
                 }

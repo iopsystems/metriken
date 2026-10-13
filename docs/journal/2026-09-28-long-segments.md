@@ -174,12 +174,17 @@ after `compact_stream` where it returned 4 before; the extra series is the
 long table read as wide, with no slot labels). It predates this change.
 `tests/writer.rs::a_compacted_segment_is_not_taken_for_the_one_it_replaced`
 compacts long streams but compares two readers of the compacted archive, so
-it does not detect it; `a_compacted_long_stream_answers_as_before`, ignored
-until dendro is fixed, compares answers before and after compaction and
-fails today. rezolus does not compact (hindsight evicts whole segments and
+it does not detect it; `a_compacted_long_stream_answers_as_before` compares
+answers before and after compaction, and failed then. rezolus does not compact (hindsight evicts whole segments and
 its dumps copy them). A fix in dendro must carry the key-value metadata when
 every input in a run agrees, and stop the run where it changes; the column
 lists then have to be unioned or dropped along with the segment list.
+dendro 0.4.1 does the first: its default merge carries the metadata of a run
+whose inputs agree and stops the run where they differ, and
+`compact_stream_with` takes a caller's merge. metriken-storage 0.2.2 requires
+it, runs `a_compacted_long_stream_answers_as_before` unignored, and adds
+`long::OccupantUnion`, which unions the segment and column lists so a run
+continues across occupant-list changes.
 
 **Measured footer cost.** Each archive's long segments re-encoded with the
 same writer properties, with and without the column lists:

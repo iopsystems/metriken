@@ -1,6 +1,6 @@
 [package]
 name = "metriken-storage"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -16,7 +16,7 @@ exclude = ["tests/"]
 [dependencies]
 arrow.workspace = true
 bytes = "1"
-dendro = { version = "0.4.0", default-features = false, features = ["archive"], optional = true }
+dendro = { version = "0.4.1", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
 lru = "0.12"
 metriken-exposition = { version = "0.22.0", path = "../metriken-exposition", default-features = false, features = ["stream"], optional = true }
@@ -45,7 +45,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 metriken = { path = "../metriken" }
 metriken-exposition = { path = "../metriken-exposition" }
-dendro = { version = "0.4.0" }
+dendro = { version = "0.4.1" }
 
 [features]
 default = ["lz4", "archive"]
@@ -74,12 +74,6 @@ stream = ["dep:metriken-exposition"]
 convert = []
 # Reading segments written with LZ4_RAW, the codec rezolus writes.
 lz4 = ["parquet/lz4"]
-
-# `dendro_compact_with` compiles a test that needs dendro's
-# `rewrite::compact_stream_with`, which no released dendro has yet; see
-# `a_long_stream_compacted_by_union_answers_as_before` in tests/writer.rs.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dendro_compact_with)"] }
 
 [package.metadata.docs.rs]
 all-features = true

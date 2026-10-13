@@ -173,7 +173,8 @@ pub fn merge_segment_metadata(
 /// the merged segment's metadata. For a compaction's metadata merge: a long
 /// segment's occupant lists change whenever the population does, and merging
 /// only segments with identical metadata leaves a long stream nearly as it
-/// was sealed.
+/// was sealed. With the `archive` feature, `OccupantUnion` is this merge as
+/// dendro's `rewrite::MetadataMerge`.
 ///
 /// Each segment's lists are decoded once, when it is added, and the run keeps
 /// them decoded, so a run costs time linear in its segments' metadata.
@@ -367,6 +368,59 @@ impl SegmentMetadataMerge {
             .collect();
         out.extend(column_keys);
         out
+    }
+}
+
+/// dendro's compaction metadata merge for long segments: [`SegmentMetadataMerge`]
+/// as a [`dendro::rewrite::MetadataMerge`], for
+/// [`dendro::rewrite::compact_stream_with`].
+///
+/// [`dendro::rewrite::compact_stream`] merges only segments with identical
+/// key-value metadata, so on a long stream a run ends wherever the occupant
+/// lists change. With this merge a run continues across those changes and
+/// the merged segment lists the union of its inputs' occupants; segments
+/// that are not long merge under the identical-metadata rule, as before. See
+/// [`SegmentMetadataMerge`] for the rule.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use std::path::Path;
+///
+/// use dendro::archive::ArchiveMut;
+/// use dendro::rewrite::{compact_stream_with, CompactSpec};
+/// use metriken_storage::long::OccupantUnion;
+///
+/// let mut db = ArchiveMut::open(Path::new("recording.dendro"))?;
+/// let spec = CompactSpec::to_rows(1000);
+/// compact_stream_with(&mut db, 1, "threads/tasks", &spec, &OccupantUnion)?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "archive")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OccupantUnion;
+
+#[cfg(feature = "archive")]
+impl OccupantUnion {
+    fn metadata<'a>(input: &dendro::rewrite::MergeInput<'a>) -> SegmentMetadata<'a> {
+        SegmentMetadata::new(input.key_value, input.fields, input.rows)
+    }
+}
+
+#[cfg(feature = "archive")]
+impl dendro::rewrite::MetadataMerge for OccupantUnion {
+    type Run = SegmentMetadataMerge;
+
+    fn start(&self, first: &dendro::rewrite::MergeInput<'_>) -> Option<Self::Run> {
+        SegmentMetadataMerge::start(&Self::metadata(first))
+    }
+
+    fn extend(&self, run: &mut Self::Run, next: &dendro::rewrite::MergeInput<'_>) -> bool {
+        run.extend(&Self::metadata(next))
+    }
+
+    fn finish(&self, run: Self::Run) -> Vec<parquet::file::metadata::KeyValue> {
+        run.finish()
     }
 }
 

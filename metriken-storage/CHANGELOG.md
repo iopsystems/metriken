@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-12
+
 ### Added
 
 - `long::SegmentMetadataMerge`, `long::merge_segment_metadata` and
@@ -21,8 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that are not all long merge only when they have the same entries, in any
   order, and the merged segment has the first's order. `SegmentMetadata`
   is `#[non_exhaustive]`; build one with `SegmentMetadata::new`. For a
-  compaction's metadata merge (dendro's `rewrite::MetadataMerge`), so that
-  a long stream merges across occupant-list changes.
+  compaction's metadata merge, so that a long stream merges across
+  occupant-list changes.
+- `long::OccupantUnion` (feature `archive`): `SegmentMetadataMerge` as
+  dendro's `rewrite::MetadataMerge`, for `rewrite::compact_stream_with`.
+
+### Changed
+
+- dendro 0.4.1 is required. Its compaction carries the segments' key-value
+  metadata, so a long stream compacted with `compact_stream` stays long;
+  with 0.4.0 the merged segment lost `metriken.layout` and
+  `metriken.occupants` and read as a wide table.
 
 ## [0.2.1] - 2026-10-12
 
