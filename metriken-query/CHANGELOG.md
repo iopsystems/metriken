@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.1] - 2026-10-12
+
+### Fixed
+
+- `histogram_quantile`, `histogram_quantiles`, `histogram_count`,
+  `histogram_sum`, `histogram_mean` and `histogram_heatmap` summed each
+  tick's (or stride's) per-bucket deltas into a `u32` cumulative that was
+  clipped at `u32::MAX` (4,294,967,295). The total was clipped too, so each
+  quantile's rank was taken against at most 4,294,967,295 observations and
+  buckets above the one where the cumulative reached `u32::MAX` were never
+  returned; quantiles came back low. The count was reported as
+  4,294,967,295, and sum, mean and the heatmap's cells used the clipped
+  counts. The cumulative is now `u64`. On a 9.6-hour, 16-series recording
+  query time showed no measurable change end to end (run-to-run spread 5-9%)
+  and results were identical, since no tick there reached the clip.
+
 ## [0.36.0] - 2026-10-11
 
 ### Changed
