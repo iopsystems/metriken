@@ -956,7 +956,10 @@ async fn retention_evicts_rows_older_than_the_window() {
         .await
         .unwrap();
     let (passes, first_ts, newest) = last.expect("Committed events");
-    assert!(passes >= 15, "{passes}");
+    // About 20 passes at 100 ms. A slow runner takes fewer (13 on one
+    // Windows CI run); the eviction checks below are by time, so they
+    // need only enough passes that more were taken than are kept.
+    assert!(passes >= 10, "{passes}");
     assert!(
         newest - first_ts >= 1_400_000_000,
         "first_ts is the first ever"

@@ -151,7 +151,9 @@ impl SegmentEncoder for Encoder {
         // (dendro retries a deferred seal before it evicts and leaves out a
         // stream it still cannot seal), so this needs a tail whose anchor
         // was lost some other way: one a 0.2.2 writer left after retention
-        // cut into it.
+        // cut into it, or a deferred seal whose retry before an eviction
+        // failed with an error that is not retryable, after which dendro
+        // evicts the stream's live rows.
         // The names fingerprint, so a reader probes one footer per distinct
         // set of metric names rather than only the table's first.
         Ok(tail.map(|t| Segment {
