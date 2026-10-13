@@ -73,6 +73,39 @@ pub(crate) fn selectors(query: &str) -> Result<Vec<(HashSet<String>, Labels)>, Q
     Ok(out)
 }
 
+/// Whether a query combines series: an aggregation, or a binary operator
+/// with a selector on both sides. A query that does not evaluates each
+/// series on its own (`rate(x[1m])`, `x * 8`).
+pub(crate) fn combines_series(query: &str) -> Result<bool, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    Ok(combines(&expr))
+}
+
+fn combines(expr: &Expr) -> bool {
+    let selects = |e: &Expr| {
+        let mut names = Vec::new();
+        walk_selectors(e, &mut names);
+        !names.is_empty()
+    };
+    match expr {
+        Expr::Aggregate(_) => true,
+        Expr::Binary(b) => {
+            (selects(&b.lhs) && selects(&b.rhs)) || combines(&b.lhs) || combines(&b.rhs)
+        }
+        Expr::Unary(u) => combines(&u.expr),
+        Expr::Paren(p) => combines(&p.expr),
+        Expr::Call(call) => call.args.args.iter().any(|a| combines(a)),
+        Expr::Subquery(s) => combines(&s.expr),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => false,
+    }
+}
+
 /// Mirror of [`walk_names`], collecting each selector whole.
 fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
     match expr {

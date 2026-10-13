@@ -708,8 +708,12 @@ Open sub-questions:
    time ranges overlap.
 6. The cross-cadence evaluation timestamps in a combined view, where each
    recording has its own row times.
-   Built 2026-10-13: applied only when every table a query names is in one
-   recording; a query over several stays on the uniform grid.
+   Built 2026-10-13: applied across recordings whose time ranges overlap
+   (recordings of one run share a wall clock), each sampler keyed by its
+   recording; recordings that do not overlap stay on the uniform grid. In
+   `RateMode::Raw`, which reads each series at its own rows by contract, a
+   query combining series across recordings is refused. See "Series labels,
+   as built".
 7. Whether `rezolus mcp`, which refuses a multi-recording archive without
    `--recording` today, reads the combined source by default.
 8. (Added 2026-10-12 with Q12.) How a template instance's queries are
@@ -751,9 +755,30 @@ metriken-query, unreleased):
   `LabeledSource`, and joins several recordings through
   `MultiParquetSource`. `columns` resolves through the same wrapper. The
   cross-recording refusal is gone.
+- Alignment across recordings (decided 2026-10-13, after a review found
+  aggregations across recordings wrong). The engine already aligned two
+  ways: the grid evaluates every series at `start + k·step` with windowed
+  rates, which handles recordings at one cadence and any phase; and the
+  cross-cadence timestamps move a query onto the slow sampler's rows. The
+  second was first applied within one recording only, which left
+  different cadences across recordings on the grid: with a 1 s and a 10 s
+  recording, `sum(g)` read 110 at the slow one's rows and 10 between. It
+  now applies across recordings whose time ranges overlap. What the engine
+  had no answer for across recordings, because a metric's series always
+  shared one table's rows: combining in `RateMode::Raw` (`sum(g)`
+  alternated 10, 100, 10, 100 for recordings half an interval apart), now
+  refused; histogram functions, refused above; and the range edges, where
+  a `sum` reads only the recordings that have a row (the first point
+  before the later recording's first row, and the last point when its next
+  row lies past the range, read low). The edges are left as they are; a
+  combining query could trim its range to the span every recording covers.
+  A stricter rule refusing every aggregation across recordings was
+  considered and not taken: the grid answers `sum by (source)` correctly
+  apart from the edges.
 - `owners()` leaves out a table when no selector naming one of its
   metrics can match its recording's labels (`translate_filter` against
-  `series_labels`), keeping them all when that leaves none, so
+  `series_labels`); when that leaves none, the first recording's tables
+  answer, empty, so
   `x{source="a"}` neither opens recording b's tables nor loses recording
   a's cross-cadence alignment.
 - `HistogramStream::merge`, which `MultiParquetSource` uses to join
@@ -780,13 +805,15 @@ metriken-query, unreleased):
 - Tests: metriken-query `archive::tests` (one recording carries its
   labels; two recordings queried together, by `source=`, `!=`, `=~`,
   `sum`, `sum by`; the `exported_` rename and its matchers; identical label
-  sets; the shared-name refusal; `columns`; cross-cadence from one
-  recording only) and metriken-storage `labeled::tests`. Seen red: no
+  sets; the shared-name refusal; `columns`; cross-cadence across
+  recordings of one run and not of two; `sum` across a 1 s and a 10 s
+  recording; Raw refusal) and metriken-storage `labeled::tests`. Seen red: no
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
   the clashing value dropped, cross-cadence across recordings, the merge
   mixing configurations, no owner pruning, `__recording__` by position, no
   chained prefix, no histogram refusal, catalog indices kept when
-  flattened twins repeat one, twins only among recordings with tables.
+  flattened twins repeat one, twins only among recordings with tables, no
+  cross-cadence across recordings, no overlap check, no Raw refusal.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9

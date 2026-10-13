@@ -30,10 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between recordings row by row; a label matcher selecting one recording
   answers. Joined recordings take the per-series rate path
   (`MultiParquetSource` has no column scan).
-- The cross-cadence evaluation timestamps are applied only when every
-  table a query reads is in one recording (after the label pruning above);
-  a query over several stays on the uniform grid, since recordings do not
-  share row instants.
+- The cross-cadence evaluation timestamps apply across recordings whose
+  time ranges overlap (recordings of one run share a wall clock), with each sampler keyed
+  by its recording; recordings that do not overlap (two runs) stay on the
+  uniform grid. A 1 s producer beside a 10 s one in one archive reads
+  `sum(g)` at the 10 s rows, where on the grid the slow gauge had a fresh
+  row only every tenth point.
+- In `RateMode::Raw`, a query combining series of several recordings (an
+  aggregation, or an operator with a selector on both sides) is refused:
+  Raw reads each series at its own rows, and two recordings' rows fall at
+  different instants, so `sum(g)` over two recordings half an interval
+  apart alternated between them. A single series per recording, one
+  recording selected by label, or a grid mode answers.
+- At the edges of a range, a combination across recordings reads only the
+  recordings that have a row there: before the later recording's first row,
+  and at the last point where its next row lies past the range, a `sum`
+  holds the other recording alone. Not changed here.
 
 ## [0.36.1] - 2026-10-12
 
