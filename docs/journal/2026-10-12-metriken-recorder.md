@@ -436,7 +436,7 @@ through `[patch.crates-io]` (not committed).
   jumped to. `Event::Restarted { source, epoch, version }` is new: rezolus
   logs "now records the agent restart" from it, and its tests wait for that
   line. Only `Frame`, `Gap` and `Committed` are dropped when the channel is
-  full; every other event is awaited.
+  full; every other event is queued (see "Changed after review").
 - `Summary { sources: Vec<SourceSummary>, discarded }`. A `SourceSummary`
   has the endpoint, the recording's name, `SourceState { Pending,
   Activating, Active, Refused }`, the transport, `passes_total`, and the
@@ -467,11 +467,91 @@ through `[patch.crates-io]` (not committed).
   then waited behind every later tick. Commands that arrive during a tick
   are now taken after it. The test is
   `a_tick_that_overruns_its_interval_does_not_hold_off_finish`.
-- The identical-labels warning compares label sets only. rezolus's second
-  warning, for label sets that differ only in case and so seal in lockstep
-  (`seal_policy::staggers_identically`, a `rez` function), is not carried.
+- The identical-labels warning first compared label sets only, dropping
+  rezolus's second warning for label sets that differ only in ASCII case
+  (`seal_policy::staggers_identically`, a `rez` function), which dendro's
+  seal stagger keys on. It is restored in the crate (`label_collision`).
 - The library's log lines say "producer" where rezolus's said "agent".
   rezolus prints its own lines for the events its tests read.
+
+### Changed after review
+
+An adversarial review of the crate and the rezolus branch found these; each
+change has a test, and each test was seen to fail with the fix reverted.
+
+- The driver no longer awaits the event channel. `Emitter::must` awaited
+  `send`, so a caller that kept the receiver without reading stalled the
+  driver at the next must-deliver event, and `finish` and `patch_metadata`
+  never returned (repros: `events = 1` with two local sources; `events = 8`
+  filled by `Committed`, then a late `Active`). Must-deliver events are now
+  queued in the recorder and flushed with `try_send` on every emit and every
+  tick; `Dropped` and `Reconnected` are counted in `Lagged` past 1,024
+  queued events, since a flapping producer emits them without limit. Events
+  still queued at the end are sent from a spawned task until the receiver is
+  dropped. Tests: `an_unread_receiver_does_not_hold_off_finish`,
+  `a_full_channel_then_an_activation_does_not_hold_off_finish` (both time
+  out on the awaiting emitter).
+- `patch_metadata` refuses `producer_epoch` and `producer_epochs` with the
+  new `Error::Reserved`, as `start` does, and returns `Error::Source` for a
+  source refused before it was added, instead of `Ok` with nothing written.
+- `pump` drops a connection silent for `interval + timeout`. It used
+  `timeout` alone, capped at 10 s by `default_timeout`, so every stream with
+  an interval over 10 s was dropped between two frames.
+- `LocalSource::pass` runs on `spawn_blocking`, every local source's pass in
+  one call, so a slow snapshot does not hold a runtime worker; the tick still
+  waits for it. The crate docs and README say the runtime needs its time
+  driver, and with `http` its IO driver.
+- `RecorderConfig::commit_streams_on_arrival` (default off) stages and
+  commits each streamed frame as it arrives, as rezolus's hindsight did
+  before it moved onto the crate; see "Hindsight dump lag" below. rezolus's
+  hindsight turns it on.
+- API before 0.1.0 is published:
+  - `#[non_exhaustive]` on the enums that will grow (`StreamAnswer`,
+    `Transport`, `Verdict`, `At`, `Enrich`, `ActiveTransport`,
+    `SourceState`, `Stop`, `Event`, `Error`, `StartError`) and on the structs
+    with public fields (`EndpointSpec`, `DetectConfig`, `RecorderConfig`,
+    `PumpConfig`, `SourceIdentity`, `SourceSummary`, `Summary`, `Handshake`,
+    `Applied`, `StreamPass`, `Refusal`). The configs and `SourceIdentity`
+    gain constructors and `with_*` builders (`EndpointSpec::with_transport`,
+    `with_label`, `with_metadata`; `PumpConfig::new`;
+    `SourceIdentity::new`, `with_epoch`); fields stay public and settable
+    after construction, as in metriken-model and metriken-query.
+  - Left exhaustive: `Detected` and `StreamEvent`, because a caller acts on
+    each variant and a new one should fail its match rather than fall
+    through a wildcard; `Stamp` and `restart::Restart`, which callers build;
+    `SourceId`, a newtype.
+  - dendro's `WalRow` and `Frame`, which appear in `Applied::rows`,
+    `StreamPass::rows`, `FrameDecoder::push` and `StreamSubscriber::apply`,
+    are re-exported at the crate root.
+  - `Handshake::clock_anchor_wall_ns` is `u64`, like
+    `SourceIdentity::clock_anchor_wall_ns` and `Stamp::ts`; dendro's signed
+    field maps a negative anchor to 0, which already meant "none".
+  - The crate has a README.
+
+### Hindsight dump lag
+
+Measured 2026-10-12 on macOS, one unprivileged agent at 1 s, three release
+hindsight builds subscribed to it at once with a 10 min lookback:
+upstream/main (rezolus 50075985, which committed each frame on arrival),
+the branch committing on the tick, and the branch with
+`commit_streams_on_arrival`. Ten `POST /dump/file` per build at a random
+phase within the interval; lag is the request's wall time minus the dump's
+last row.
+
+| build | lag minus phase, each of 10 trials | median lag |
+|---|---|---|
+| upstream/main | 1000 ms | 1484 ms |
+| commit on tick | 2000 ms | 2245 ms |
+| commit on arrival | 1000 ms | 1519 ms |
+
+The agent's frames arrive 3 ms after each boundary, just after the aligned
+tick, so on the tick a frame waits one interval. Polling each buffer's
+newest WAL row every 20 ms showed the same: visible 2 to 26 ms after its
+stamp on arrival and on upstream/main, 1001 to 1020 ms on the tick.
+
+The 1000 ms the on-arrival builds share is in the dump, not the commit. In a
+first run, upstream/main's lag minus phase was 0 ms; I do not know what
+moved it between runs. The difference between builds was 1000 ms in both.
 
 ## GO / NO-GO
 
