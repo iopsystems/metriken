@@ -1369,6 +1369,15 @@ async fn after_exit_during_a_scrape_takes_one_more() {
         .await
         .unwrap();
     let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
+    // The path under test was reached: a scrape started less than the
+    // exporter's 400 ms delay before the exit, so it was in flight at the
+    // exit. A tick that fired late, after the exit, fails here rather than
+    // passing without the in-flight case.
+    assert!(
+        r.walls.iter().any(|&w| w < exit && exit - w < 400_000_000),
+        "a scrape was in flight at the exit ({exit}): {:?}",
+        r.walls
+    );
     let last = r.last_wall.expect("rows");
     assert!(
         last >= exit,

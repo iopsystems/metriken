@@ -1407,8 +1407,10 @@ dependencies = [
 name = "metriken-recorder"
 version = "0.1.1"
 dependencies = [
+ "arrow",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "dendro",
  "futures-util",
@@ -1419,6 +1421,7 @@ dependencies = [
  "metriken-model",
  "metriken-storage",
  "metriken-types",
+ "parquet",
  "prometheus-parse",
  "reqwest",
  "serde_json",

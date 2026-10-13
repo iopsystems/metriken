@@ -161,10 +161,13 @@ pub enum Stop {
     /// A wrapped command exited at `wall_ns`. One more pass of every local
     /// and scraped source, unless the last pass started at or after
     /// `wall_ns`, then a wait of up to `bound` for each streamed source's
-    /// frame stamped at or after `wall_ns`. A local or scraped source whose
-    /// pass succeeds ends on a row stamped at or after `wall_ns` on this
-    /// host's wall clock: the row's `ts` plus its wall offset, not `ts`
-    /// alone, which is on a monotonic timeline that can drift from it.
+    /// frame stamped at or after `wall_ns`. The skip is decided once for
+    /// all sources, so a local or scraped source ends on a row stamped at or
+    /// after `wall_ns` only when its own last pass succeeded: one whose
+    /// scrape failed or timed out on that pass ends on its previous row.
+    /// Stamped means on this host's wall clock, the row's `ts` plus its wall
+    /// offset, not `ts` alone, which is on a monotonic timeline that can
+    /// drift from it.
     AfterExit { wall_ns: u64, bound: Duration },
     /// Wait `duration` for frames in flight, with no extra pass.
     Grace(Duration),

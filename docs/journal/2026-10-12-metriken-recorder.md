@@ -265,7 +265,25 @@ it waits, then:
   so the recording ended before `run_end`, which the streamed barrier
   (a frame stamped at or after the exit) does not allow. The comparison is on
   the wall clock: a row's `ts` is on the anchored monotonic timeline, and its
-  wall clock is `ts` plus the stored wall offset.
+  wall clock is `ts` plus the stored wall offset. The skip is one decision
+  for all sources (one `last_pass`), so a source whose scrape failed or
+  timed out on the last pass ends on its previous row, before the exit.
+  `finish` can take the scrape timeout (the extra scrape) plus `bound` (the
+  streamed wait) before it finalizes.
+
+  The wall-clock guarantee does not by itself put `run_end` before the last
+  row on screen. rezolus stamps `run_start`/`run_end` on its own anchored
+  monotonic timeline (`src/recorder/mod.rs`,
+  `anchored_at(clock_anchor_wall_ns, clock_anchor_mono.elapsed())`). On the
+  adoption branch (`feat/record-over-metriken-recorder`) that anchor is
+  taken after `Recorder::start` returns, while the library's local and
+  scraped rows use the anchor taken in `launch` (`metriken-recorder/src/recorder.rs:460`), and
+  streamed rows use the agent's own anchor. The viewer places events by their
+  timestamp and rows by `ts`, so the two timelines differ by the gap between
+  the anchors plus the drift of each monotonic clock from the wall clock.
+  Follow-up: a `Recorder` method that returns a `Stamp` on the rows'
+  timeline, so a caller stamps its run events on the same timeline as the
+  local and scraped rows.
 - `Stop::Grace(duration)`, for `--duration`, ctrl-c and every other stop:
   waits `duration` (`record` passes the shorter of one interval and 2 s when
   a source streams, as `mod.rs:3281-3285` does) and takes no extra pass.
