@@ -393,6 +393,63 @@ pub struct Recording {
     pub complete: bool,
     pub first_ts: Option<u64>,
     pub last_ts: Option<u64>,
+    /// The wall clock each row in `table` was read at, oldest first: its
+    /// `ts` plus its stored wall offset. `ts` is on the recorder's anchored
+    /// monotonic timeline, so only these are comparable with a `SystemTime`
+    /// reading.
+    pub walls: Vec<u64>,
+    /// The last of `walls`.
+    pub last_wall: Option<u64>,
+}
+
+/// `ts + wall_offset` of every row of `table`, sealed or in the WAL, oldest
+/// first. The segment columns are read directly rather than through
+/// `read_table_parquet`, which reads a null offset in a partly-null column
+/// as 0 (a wall clock equal to `ts`); a null here fails the test.
+fn row_walls(catalog: &metriken_storage::DendroCatalog, source_id: i64, table: &str) -> Vec<u64> {
+    use arrow::array::{Array, Int64Array, UInt64Array};
+    use metriken_storage::Catalog;
+    let mut rows: Vec<(u64, i64)> = Vec::new();
+    for (seq, _) in catalog.segment_meta(source_id, table).unwrap() {
+        let bytes = catalog
+            .segment_bytes(source_id, table, seq)
+            .unwrap()
+            .unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let column = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("segment {seq} has no `{name}` column"))
+                    .clone()
+            };
+            let ts = column("timestamp");
+            let ts = ts.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let offsets = column(":wall_offset");
+            let offsets = offsets.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(ts.null_count(), 0, "segment {seq}: a null timestamp");
+            assert_eq!(offsets.null_count(), 0, "segment {seq}: a null wall offset");
+            rows.extend(
+                ts.values()
+                    .iter()
+                    .copied()
+                    .zip(offsets.values().iter().copied()),
+            );
+        }
+    }
+    for r in catalog.live_wal(source_id, table).unwrap() {
+        rows.push((r.ts, r.wall_offset));
+    }
+    rows.sort_by_key(|&(ts, _)| ts);
+    rows.into_iter()
+        .map(|(ts, offset)| (ts as i64 + offset) as u64)
+        .collect()
 }
 
 /// Every recording in the archive at `path`, keyed by `source`, with its
@@ -413,6 +470,8 @@ pub fn recordings(path: &Path, table: &str) -> BTreeMap<String, Recording> {
                 .flatten()
                 .min();
             let last = sealed.last_ts.max(live.last_ts);
+            let walls = row_walls(&catalog, s.id, table);
+            let last_wall = walls.last().copied();
             let labels: BTreeMap<String, String> = s.labels.clone().into_iter().collect();
             let name = labels.get("source").cloned().unwrap_or_default();
             (
@@ -424,6 +483,8 @@ pub fn recordings(path: &Path, table: &str) -> BTreeMap<String, Recording> {
                     complete: s.complete,
                     first_ts: first,
                     last_ts: last,
+                    walls,
+                    last_wall,
                 },
             )
         })
