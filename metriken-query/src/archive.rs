@@ -92,14 +92,15 @@ impl<'a> Plan<'a> {
     /// tables are kept, so the query answers empty rather than as naming no
     /// metric.
     fn new(reader: &'a ArchiveReader, query: &str) -> Result<Self, QueryError> {
-        // The filter keeps one matcher per label; with recording labels,
-        // excluding several sources is an ordinary query, so a repeat is
-        // refused rather than half applied.
+        // The filter keeps one matcher per label (the last); with recording
+        // labels, excluding several sources is an ordinary query, so a
+        // repeat is refused rather than half applied, for every label.
         if let Some(label) = crate::promql::repeated_matcher(query)? {
             return Err(QueryError::ParseError(format!(
                 "query {query} matches label {label} more than once in one selector, and \
-                 only one matcher per label is applied; combine them in one regex, e.g. \
-                 {label}!~\"a|b\""
+                 only one matcher per label is applied; use one matcher per label (to \
+                 exclude several values, {label}!~\"a|b\"; regex matchers take literal \
+                 alternatives only)"
             )));
         }
         let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();

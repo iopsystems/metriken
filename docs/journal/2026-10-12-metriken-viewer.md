@@ -795,9 +795,14 @@ metriken-query, unreleased):
   the archive's end, narrowed by a matcher or not (the ninth and tenth
   reviews found each recording read at its own last row, then the default
   changing with the matcher). A selector matching one label twice is
-  refused: `extract_filter_labels` keeps one matcher per label, so
-  `{source!="a", source!="b"}` let `a` through, a pre-existing engine
-  limit that recording labels make an ordinary query hit.
+  refused, for any label and on any archive read through `ArchiveReader`
+  (single-recording ones included): `extract_filter_labels` keeps one
+  matcher per label (the last), so `{source!="a", source!="b"}` let `a`
+  through, a pre-existing engine limit that recording labels make an
+  ordinary query hit. Upstream answered `{id=~"1.*", id!="10"}` as
+  `id!="10"`, silently; the eleventh review found no rezolus dashboard,
+  template or MCP query that repeats a label. A parquet file read through
+  `ParquetReader` keeps the silent last-wins.
 - The tenth review ran 39 query patterns five ways (range at two steps,
   instant with and without a time, display) on two real single-recording
   rezolus archives against upstream main and this branch: with the

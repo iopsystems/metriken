@@ -29,9 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such as `x or y`, whose error is then not reached). On an archive of
   several recordings, an instant query without a time reads at the
   archive's end, whether or not a matcher narrows it to one recording. A
-  selector that matches one label twice (`{source!="a", source!="b"}`) is
-  refused: the filter applies one matcher per label and dropped the other;
-  `source!~"a|b"` answers. Within a recording the engine's own
+  selector that matches one label twice is refused, for any label and on
+  any archive, single-recording ones included: the filter applies one
+  matcher per label (the last), so `{source!="a", source!="b"}` let `a`
+  through and `{id=~"1.*", id!="10"}` silently became `id!="10"`;
+  `source!~"a|b"` answers the first. A parquet file read through
+  `ParquetReader` still applies the last matcher silently. Within a recording the engine's own
   operator rules apply unchanged, including pairing a single right-hand
   series with every left-hand one (`rate(c) / sum by (source) (rate(c))` is
   each series' share of its recording's total, where Prometheus would
