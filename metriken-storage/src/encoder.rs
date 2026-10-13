@@ -154,4 +154,140 @@ impl SegmentEncoder for Encoder {
     fn version(&self) -> Option<&str> {
         Some(ENCODER_VERSION)
     }
+
+    /// A part of a split seal (dendro's `seal_capped`), after `before`.
+    ///
+    /// The writer puts a group's schema, a long table's columns and a
+    /// sampler cell's metadata only on the first row since the last seal
+    /// that needs them, so a part that starts after that row would decode
+    /// with no schema (its rows skipped) or with columns that lost their
+    /// labels. The part is anchored as the writer would have anchored it
+    /// had it sealed there, from what `before` carried, and then encoded.
+    fn encode_after(&self, stream: &str, before: &[DWalRow], rows: &[DWalRow]) -> EncodeResult {
+        // An occupant stream's rows each carry their own labels.
+        if occupants::table_of(stream).is_some() {
+            return self.encode(stream, rows);
+        }
+        let long = self
+            .long
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(stream);
+        let anchored = if long {
+            anchor_long(before, rows)
+        } else if wal::is_group_table_key(stream) {
+            anchor_group(before, rows)
+        } else {
+            anchor_cells(before, rows)
+        }
+        .map_err(boxed)?;
+        match anchored {
+            Some(rows) => self.encode(stream, &rows),
+            None => self.encode(stream, rows),
+        }
+    }
+}
+
+/// `rows` with a copy of `first` in place of the first row.
+fn replace_first(rows: &[DWalRow], first: Vec<u8>) -> Vec<DWalRow> {
+    let mut out = rows.to_vec();
+    out[0].row = first;
+    out
+}
+
+/// A schema and its hash, as a group or long row carries them.
+type Anchor = ((u64, u64), crate::schema::GroupSchema);
+
+/// The schema in force after `before`: the last one a row carried. A
+/// group's and a long table's materialization both take the schema of the
+/// last row that carried one, so this is the one `rows[0]` would decode
+/// against had it been sealed with `before`.
+fn last_schema<T>(
+    before: &[DWalRow],
+    decode: impl Fn(&[u8]) -> Result<T, String>,
+    schema: impl Fn(T) -> Option<Anchor>,
+) -> Result<Option<Anchor>, String> {
+    for r in before.iter().rev() {
+        if let Some(found) = schema(decode(&r.row)?) {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// A group part whose first row has no schema, given the schema in force
+/// when its hash matches. `None` when nothing needs changing.
+fn anchor_group(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalRow>>, String> {
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let head = wal::decode_wal_group_row(&first.row)?;
+    if head.schema.is_some() {
+        return Ok(None);
+    }
+    let found = last_schema(before, wal::decode_wal_group_row, |r| {
+        r.schema.map(|s| (r.schema_hash, s))
+    })?;
+    match found {
+        Some((hash, schema)) if hash == head.schema_hash => Ok(Some(replace_first(
+            rows,
+            wal::encode_wal_group_row_with_schema(&first.row, &schema)?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// [`anchor_group`] for a long table's rows.
+fn anchor_long(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalRow>>, String> {
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let mut head = wal::decode_wal_long_row(&first.row)?;
+    if head.schema.is_some() {
+        return Ok(None);
+    }
+    let found = last_schema(before, wal::decode_wal_long_row, |r| {
+        r.schema.map(|s| (r.schema_hash, s))
+    })?;
+    match found {
+        Some((hash, schema)) if hash == head.schema_hash => {
+            head.schema = Some(schema);
+            Ok(Some(replace_first(rows, wal::encode_wal_long_row(&head)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A sampler table's part, with each cell that is the first of its metric
+/// in the part given the metadata the metric last carried in `before`, when
+/// it carries none. `None` when nothing needs changing.
+fn anchor_cells(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalRow>>, String> {
+    let mut latest: std::collections::HashMap<String, std::collections::BTreeMap<String, String>> =
+        std::collections::HashMap::new();
+    for r in before {
+        for cell in wal::decode_wal_row(&r.row)? {
+            if let Some(m) = cell.metadata {
+                latest.insert(cell.name, m);
+            }
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Option<Vec<DWalRow>> = None;
+    for (i, r) in rows.iter().enumerate() {
+        let mut cells = wal::decode_wal_row(&r.row)?;
+        let mut changed = false;
+        for cell in &mut cells {
+            if !seen.insert(cell.name.clone()) || cell.metadata.is_some() {
+                continue;
+            }
+            if let Some(m) = latest.get(&cell.name) {
+                cell.metadata = Some(m.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            out.get_or_insert_with(|| rows.to_vec())[i].row = wal::encode_wal_row(&cells)?;
+        }
+    }
+    Ok(out)
 }

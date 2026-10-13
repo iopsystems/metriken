@@ -1270,6 +1270,11 @@ impl SourceRecorder {
 
     /// Seal every stream whose open segment is due. Call once per tick,
     /// after [`ArchiveWriter::commit`].
+    ///
+    /// No segment holds more than the policy's `max_rows` rows. When
+    /// several passes were committed since the last check (frames that
+    /// queued behind a slow seal), a stream past the cap is sealed as
+    /// several segments of at most `max_rows` rows each.
     pub fn maybe_seal(&mut self) -> Result<(), Error> {
         let now = Instant::now();
         let policy = &self.config.seal;
@@ -1291,7 +1296,9 @@ impl SourceRecorder {
         if batch.is_empty() {
             return Ok(());
         }
-        self.writer.seal(batch).map_err(boxed)
+        self.writer
+            .seal_capped(batch, policy.max_rows)
+            .map_err(boxed)
     }
 
     /// Merge `patch` into this source's metadata while it records: a key in
@@ -1338,7 +1345,9 @@ impl SourceRecorder {
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {
         let batch: Vec<String> = self.accounts.keys().cloned().collect();
         if !batch.is_empty() {
-            self.writer.seal(batch).map_err(boxed)?;
+            self.writer
+                .seal_capped(batch, self.config.seal.max_rows)
+                .map_err(boxed)?;
         }
         self.writer.finalize((last.0 as i64, last.1)).map_err(boxed)
     }

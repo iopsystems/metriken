@@ -1360,3 +1360,161 @@ fn a_long_table_lists_only_the_series_it_has() {
     let latency = label_sets(reader.histogram_labels("latency"));
     assert_eq!(latency, label_sets(wide.histogram_labels("latency")));
 }
+
+/// Record `ticks` snapshots of `snap`, committing `backlog` passes at a time
+/// and checking the seal after each commit, as a recorder does when frames
+/// queued behind a slow seal. `max_rows` is the seal policy's.
+fn record_in_backlogs(
+    path: &Path,
+    long_groups: bool,
+    max_rows: usize,
+    backlog: u64,
+    ticks: u64,
+    snap: &dyn Fn(u64) -> Snapshot,
+) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows,
+            ..SealPolicy::default()
+        },
+        restate_every_ns: 6 * S,
+        long_groups,
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let labels = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    let mut t = 0;
+    while t < ticks {
+        let staged = (t..ticks.min(t + backlog))
+            .map(|t| source.stage(&snap(t), BASE + t * S, 0).unwrap())
+            .collect();
+        writer.commit(staged).unwrap();
+        source.maybe_seal().unwrap();
+        t += backlog;
+    }
+    source.finalize((BASE + (ticks - 1) * S, 0)).unwrap();
+    writer.join().unwrap();
+}
+
+/// Each stream's segment row counts, in `seq` order.
+fn segment_rows(path: &Path) -> BTreeMap<String, Vec<u64>> {
+    let db = dendro::archive::Archive::open(path).unwrap();
+    let mut out = BTreeMap::new();
+    for source in db.read_sources().unwrap() {
+        for stream in db.all_streams(source.id).unwrap() {
+            let rows = db
+                .read_segment_meta(source.id, &stream)
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.rows)
+                .collect();
+            out.insert(stream, rows);
+        }
+    }
+    out
+}
+
+/// Committing three passes per seal check at a cap of two rows writes no
+/// segment past the cap, and the archive answers as one committed a pass
+/// at a time. A part of a split seal starts after the row that carried
+/// the group's schema (or the long table's columns); without the encoder
+/// anchoring it from the rows before, its rows would be skipped.
+fn backlog_seals_within_the_cap(long_groups: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (split, single) = (
+        dir.path().join("split.dendro"),
+        dir.path().join("single.dendro"),
+    );
+    record_in_backlogs(&split, long_groups, 2, 3, TICKS, &snapshot);
+    record_in_backlogs(&single, long_groups, 2, 1, TICKS, &snapshot);
+    let rows = segment_rows(&split);
+    for (stream, segments) in &rows {
+        assert!(
+            segments.iter().all(|r| *r <= 2),
+            "{stream}: a segment past the cap: {segments:?}"
+        );
+    }
+    let group = rows["threads/tasks"].clone();
+    assert_eq!(
+        group.iter().sum::<u64>(),
+        TICKS - 1,
+        "tick 3 has no members"
+    );
+    assert!(
+        group.windows(2).any(|w| w == [2, 1]),
+        "a three-pass backlog was split: {group:?}"
+    );
+    let (split, single) = (open(&split), open(&single));
+    for q in QUERIES {
+        let (a, b) = (answer(&split, q, 0), answer(&single, q, 0));
+        assert!(a.as_ref().is_ok_and(|(a, _)| !a.is_empty()), "{q}: {a:?}");
+        assert_eq!(a, b, "{q}");
+    }
+}
+
+#[test]
+fn a_wide_backlog_seals_within_the_row_cap() {
+    backlog_seals_within_the_cap(false);
+}
+
+#[test]
+fn a_long_backlog_seals_within_the_row_cap() {
+    backlog_seals_within_the_cap(true);
+}
+
+/// [`backlog_seals_within_the_cap`] for a V2 sampler table, whose cells
+/// carry their metadata only the first time a metric appears in a segment:
+/// a later part of a split seal must still read back with its labels.
+#[test]
+fn a_v2_backlog_seals_within_the_row_cap_with_its_labels() {
+    use metriken_exposition::{Counter, Gauge, SnapshotV2};
+
+    let meta = |metric: &str, op: &str| -> HashMap<String, String> {
+        [("metric", metric), ("sampler", "fake"), ("op", op)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let v2 = |t: u64| {
+        let ts = BASE + t * S;
+        let w = Some(metriken::Window::new(ts - S / 2, ts));
+        Snapshot::V2(SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::ZERO,
+            metadata: HashMap::new(),
+            counters: vec![
+                Counter::new("0".into(), t * 10, meta("ops", "read")).with_window(w),
+                Counter::new("1".into(), t * 20, meta("ops", "write")).with_window(w),
+            ],
+            gauges: vec![Gauge::new("2".into(), t as i64, meta("free", "none")).with_window(w)],
+            histograms: Vec::new(),
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (split, single) = (
+        dir.path().join("split.dendro"),
+        dir.path().join("single.dendro"),
+    );
+    record_in_backlogs(&split, false, 2, 3, 12, &v2);
+    record_in_backlogs(&single, false, 2, 1, 12, &v2);
+    let rows = segment_rows(&split);
+    assert!(rows["fake"].iter().all(|r| *r <= 2), "{rows:?}");
+    assert!(rows["fake"].windows(2).any(|w| w == [2, 1]), "{rows:?}");
+    let (split, single) = (open(&split), open(&single));
+    for q in ["sum by (op) (rate(ops[2s]))", "free"] {
+        let (a, b) = (answer(&split, q, 0), answer(&single, q, 0));
+        assert_eq!(a, b, "{q}");
+    }
+    let by_op = answer(&split, "sum by (op) (rate(ops[2s]))", 0).unwrap().0;
+    let ops: Vec<_> = by_op.iter().map(|(l, _)| l.clone()).collect();
+    assert_eq!(
+        ops,
+        [
+            vec![("op".to_string(), "read".to_string())],
+            vec![("op".to_string(), "write".to_string())]
+        ]
+    );
+}

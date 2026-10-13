@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.2.3
+
+- **Fixed:** `SourceRecorder::maybe_seal` wrote a segment past the seal
+  policy's `max_rows` when several passes were committed between two seal
+  checks, because dendro's seal took every live row of a stream into one
+  segment. It now seals through dendro 0.4.2's `seal_capped` with the
+  policy's `max_rows` (so does `finalize`), which splits a backlog into
+  segments of at most that many rows, and the encoder implements
+  `encode_after`, so a part that starts after the row carrying a group's
+  schema, a long table's columns or a cell's metadata is anchored from the
+  rows before it. dendro 0.4.2 is required. See the crate's CHANGELOG.
+
 ### metriken-recorder 0.1.1
 
 - **Fixed:** `Stop::AfterExit` skipped the extra pass of local and scraped
@@ -16,15 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or after the exit, the same rule as a streamed source's frame stamped at or
   after the exit.
 - **Fixed:** streamed passes that queued while a tick or a commit was
-  running were committed together and sealed as one segment, past the seal
-  policy's `max_rows`. A commit took every queued pass and ran one seal check
-  after it, and the seal takes every live row of the stream. With 2-row
-  segments at 10 Hz, a commit that waited ~350 ms on a seal let three or four
-  frames queue, and the next tick (which outranks an arriving frame) sealed
-  them as one 3- or 4-row segment. `commit_streams_on_arrival` did not help,
-  since the tick drained the queue first. A source's second pass now commits
-  the first before it is staged, so each commit holds at most one pass per
-  source and is followed by its own seal check.
+  running were sealed as one segment past the seal policy's `max_rows`.
+  A commit takes every queued pass and runs one seal check after it, and
+  dendro's seal put every live row of a stream into one segment: with
+  2-row segments at 10 Hz, a commit that waited ~350 ms on a seal let three
+  or four frames queue, and they were sealed as one 3- or 4-row segment.
+  dendro 0.4.2 splits such a backlog into segments of at most `max_rows`
+  rows (`seal_capped`), and metriken-storage 0.2.3 seals through it; this
+  release requires metriken-storage 0.2.3, which requires dendro 0.4.2.
+  The recorder still commits queued passes together.
 
 ### metriken-recorder 0.1.0
 

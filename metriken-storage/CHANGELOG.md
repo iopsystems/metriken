@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `SourceRecorder::maybe_seal` could write a segment with more rows than
+  the seal policy's `max_rows`. The account counts rows as they are staged
+  and the seal check runs once per commit, so a commit holding several
+  passes of a source (frames that queued while a slow seal ran) left more
+  than `max_rows` live rows, and dendro's seal put them all in one
+  segment. `maybe_seal` and `finalize` now seal with dendro 0.4.2's
+  `SourceWriter::seal_capped` and the policy's `max_rows`, which splits
+  such a backlog into consecutive segments of at most `max_rows` rows.
+  The byte cap and the age bound are unchanged: they decide when a stream
+  seals, not where a split falls.
+- `Encoder` implements dendro's `SegmentEncoder::encode_after` for the
+  parts of a split seal after the first. The writer puts a group's schema,
+  a long table's columns and a sampler cell's metadata only on the first
+  row since the last seal that needs them, so a part that starts after
+  that row is anchored from the rows before it: the schema is put on its
+  first row when the hashes match, and a metric's first cell in the part
+  gets the metadata it last carried. Without it the part's group and long
+  rows were skipped as unanchored and its cells read back without labels.
+- dendro 0.4.2 is required.
+
 ## [0.2.2] - 2026-10-12
 
 ### Added
