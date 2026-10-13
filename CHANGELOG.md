@@ -17,7 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segments of at most that many rows, and the encoder implements
   `encode_after`, so a part that starts after the row carrying a group's
   schema, a long table's columns or a cell's metadata is anchored from the
-  rows before it. dendro 0.4.2 is required. See the crate's CHANGELOG.
+  rows before it. dendro 0.4.2 is required. A split costs one encode per
+  `max_rows` rows, so with a small cap under sustained CPU overload a
+  recording falls seconds behind wall clock (3.4 to 4.5 s in rezolus's
+  2-row hindsight fixture, against 0.1 to 0.4 s uncapped); at production
+  caps a split is rare. See the crate's CHANGELOG.
+- **Fixed:** rows were lost when a group's schema returned to an earlier
+  one within a segment (A, B, A), as a scraped group whose series come and
+  go does. The writer stated each schema once per segment and the WAL
+  decoder uses the last schema stated; the writer now states a schema
+  whenever it changes from the previous row's. Predates the seal cap.
 
 ### metriken-recorder 0.1.1
 

@@ -140,6 +140,14 @@ impl SegmentEncoder for Encoder {
         .map_err(boxed)?;
         // dendro counts the WAL rows a segment consumes; a long segment has
         // one parquet row per occupant, so `t.rows` is not that count.
+        //
+        // Every row given is claimed, including a row skipped for want of a
+        // schema anchor. Such a row has no schema in the WAL and never will,
+        // so leaving it live would not let a later seal decode it, and a
+        // skipped row in the middle of the run, reported, is a hole dendro
+        // refuses as an encoder contract violation, which stops the writer.
+        // The writer anchors every change of schema, so this only happens
+        // when retention evicted an anchor.
         // The names fingerprint, so a reader probes one footer per distinct
         // set of metric names rather than only the table's first.
         Ok(tail.map(|t| Segment {
@@ -198,25 +206,33 @@ fn replace_first(rows: &[DWalRow], first: Vec<u8>) -> Vec<DWalRow> {
 /// A schema and its hash, as a group or long row carries them.
 type Anchor = ((u64, u64), crate::schema::GroupSchema);
 
-/// The schema in force after `before`: the last one a row carried. A
-/// group's and a long table's materialization both take the schema of the
-/// last row that carried one, so this is the one `rows[0]` would decode
-/// against had it been sealed with `before`.
-fn last_schema<T>(
+/// The schema with hash `hash` that a row in `before` last carried.
+///
+/// The writer states a schema whenever a row's hash differs from the row
+/// before it, so for a row it wrote this is the last schema in `before`,
+/// the one the WAL decoder would use. Searching by hash rather than taking
+/// the last one also anchors rows written before that rule (metriken-storage
+/// 0.2.2 stated each hash once per segment), whose schema can be an earlier
+/// one.
+fn schema_for<T>(
     before: &[DWalRow],
+    hash: (u64, u64),
     decode: impl Fn(&[u8]) -> Result<T, String>,
     schema: impl Fn(T) -> Option<Anchor>,
-) -> Result<Option<Anchor>, String> {
+) -> Result<Option<crate::schema::GroupSchema>, String> {
     for r in before.iter().rev() {
-        if let Some(found) = schema(decode(&r.row)?) {
-            return Ok(Some(found));
+        if let Some((h, s)) = schema(decode(&r.row)?) {
+            if h == hash {
+                return Ok(Some(s));
+            }
         }
     }
     Ok(None)
 }
 
-/// A group part whose first row has no schema, given the schema in force
-/// when its hash matches. `None` when nothing needs changing.
+/// A group part whose first row has no schema, given the schema of its
+/// hash from `before`. `None` when nothing needs changing or `before`
+/// holds no such schema.
 fn anchor_group(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalRow>>, String> {
     let Some(first) = rows.first() else {
         return Ok(None);
@@ -225,15 +241,15 @@ fn anchor_group(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalR
     if head.schema.is_some() {
         return Ok(None);
     }
-    let found = last_schema(before, wal::decode_wal_group_row, |r| {
+    let found = schema_for(before, head.schema_hash, wal::decode_wal_group_row, |r| {
         r.schema.map(|s| (r.schema_hash, s))
     })?;
     match found {
-        Some((hash, schema)) if hash == head.schema_hash => Ok(Some(replace_first(
+        Some(schema) => Ok(Some(replace_first(
             rows,
             wal::encode_wal_group_row_with_schema(&first.row, &schema)?,
         ))),
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -246,15 +262,15 @@ fn anchor_long(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalRo
     if head.schema.is_some() {
         return Ok(None);
     }
-    let found = last_schema(before, wal::decode_wal_long_row, |r| {
+    let found = schema_for(before, head.schema_hash, wal::decode_wal_long_row, |r| {
         r.schema.map(|s| (r.schema_hash, s))
     })?;
     match found {
-        Some((hash, schema)) if hash == head.schema_hash => {
+        Some(schema) => {
             head.schema = Some(schema);
             Ok(Some(replace_first(rows, wal::encode_wal_long_row(&head)?)))
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -290,4 +306,82 @@ fn anchor_cells(before: &[DWalRow], rows: &[DWalRow]) -> Result<Option<Vec<DWalR
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod encode_after_tests {
+    use super::*;
+    use crate::schema::{GroupSchema, MetricDesc};
+    use crate::wal::WalGroupRow;
+
+    fn schema(names: &[&str]) -> GroupSchema {
+        GroupSchema {
+            counters: names
+                .iter()
+                .map(|n| MetricDesc {
+                    name: n.to_string(),
+                    metadata: [("metric".to_string(), n.to_string())].into(),
+                })
+                .collect(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        }
+    }
+
+    fn row(ts: i64, hash: u64, schema: Option<GroupSchema>, n: usize) -> DWalRow {
+        DWalRow {
+            stream: "s/g".to_string(),
+            ts,
+            wall_offset: 0,
+            row: wal::encode_wal_group_row(&WalGroupRow {
+                schema_hash: (hash, hash),
+                schema,
+                window: Some((ts as u64, ts as u64 + 1)),
+                counters: vec![Some(ts as u64); n],
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+            })
+            .unwrap(),
+        }
+    }
+
+    /// The columns of a segment's parquet bytes and its row count.
+    fn shape(segment: &Segment) -> (Vec<String>, i64) {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let reader = SerializedFileReader::new(bytes::Bytes::from(segment.bytes.clone())).unwrap();
+        let meta = reader.metadata().file_metadata();
+        let names = meta
+            .schema_descr()
+            .columns()
+            .iter()
+            .map(|c| c.path().string())
+            .filter(|n| n == "a" || n == "b")
+            .collect();
+        (names, meta.num_rows())
+    }
+
+    /// A part whose first row's schema was stated before another one: the
+    /// WAL of a group whose schema went A, B, A as a 0.2.2 writer wrote it,
+    /// stating A once. The part is anchored with A, found by its hash, not
+    /// with B, the last schema stated.
+    #[test]
+    fn a_part_is_anchored_with_the_schema_of_its_hash() {
+        let before = vec![
+            row(1, 1, Some(schema(&["a"])), 1),
+            // Same arity as A, so anchoring with it would decode A's value
+            // as column `b` rather than fail.
+            row(2, 2, Some(schema(&["b"])), 1),
+            row(3, 1, None, 1),
+        ];
+        let part = vec![row(4, 1, None, 1), row(5, 1, None, 1)];
+        let encoder = Encoder::for_streams(["s/g"]);
+        let segment = encoder
+            .encode_after("s/g", &before, &part)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shape(&segment), (vec!["a".to_string()], 2));
+        // With nothing before it, the part has no anchor and decodes to
+        // nothing: the rows the anchoring recovered.
+        assert!(encoder.encode("s/g", &part).unwrap().is_none());
+    }
 }

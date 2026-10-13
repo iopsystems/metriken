@@ -1518,3 +1518,129 @@ fn a_v2_backlog_seals_within_the_row_cap_with_its_labels() {
         ]
     );
 }
+
+/// A group named `flip/g` whose members at tick `t` are `members(t)`, each
+/// a gauge of its own metric with a value unique to the member and tick.
+fn members_snapshot(t: u64, members: &[&str]) -> Snapshot {
+    let ts = BASE + t * S;
+    let mut schema = GroupSchema::default();
+    let mut gauges = Vec::new();
+    for (i, m) in members.iter().enumerate() {
+        // Named by the metric, so a member keeps its column whichever
+        // members are present beside it.
+        schema.gauges.push(MetricDesc {
+            name: m.to_string(),
+            metadata: [("metric", *m), ("sampler", "flip")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        });
+        gauges.push(Some((t * 1000 + i as u64) as i64));
+    }
+    Snapshot::V3(SnapshotV3 {
+        systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+        duration: Duration::from_millis(1),
+        metadata: HashMap::new(),
+        groups: vec![GroupSnapshot {
+            name: "flip/g".to_string(),
+            schema_hash: schema.hash(),
+            schema: Some(Arc::new(schema)),
+            window: Some(metriken::Window::new(ts - S / 2, ts)),
+            counters: Vec::new(),
+            gauges,
+            histograms: Vec::new(),
+        }],
+    })
+}
+
+/// How many distinct values `metric` reads back over `ticks` ticks: one
+/// per tick the member was present, since every value is unique.
+fn samples(reader: &ArchiveReader, metric: &str, ticks: u64) -> usize {
+    let (start, end) = (BASE as f64 / 1e9, (BASE + (ticks - 1) * S) as f64 / 1e9);
+    let QueryResult::Matrix { result } = reader.query_range(metric, start, end, 1.0).unwrap()
+    else {
+        panic!("{metric}: not a matrix");
+    };
+    let values: BTreeSet<String> = result
+        .iter()
+        .flat_map(|m| m.values.iter().map(|(_, v)| v.to_string()))
+        .collect();
+    values.len()
+}
+
+/// A group whose schema returns to an earlier one within a segment keeps
+/// every sample, sealed whole or split at a cap of 2, and answers as one
+/// pass per commit does. The writer used to state a schema once per hash
+/// per segment, and the WAL decoder resolves a row against the last schema
+/// stated, so the second run of rows under an earlier schema was skipped.
+fn flip_back_keeps_every_sample(members: fn(u64) -> Vec<&'static str>) {
+    const TICKS: u64 = 12;
+    let snap = move |t: u64| members_snapshot(t, &members(t));
+    let metrics: BTreeSet<&str> = (0..TICKS).flat_map(members).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let reference = dir.path().join("reference.dendro");
+    record_in_backlogs(&reference, false, 2, 1, TICKS, &snap);
+    let reference = open(&reference);
+    for (cap, backlog) in [(100, 1), (100, 6), (2, 6), (2, 3)] {
+        let path = dir.path().join(format!("{cap}-{backlog}.dendro"));
+        record_in_backlogs(&path, false, cap, backlog, TICKS, &snap);
+        let rows = &segment_rows(&path)["flip/g"];
+        assert_eq!(rows.iter().sum::<u64>(), TICKS, "{cap}/{backlog}: {rows:?}");
+        assert!(
+            rows.iter().all(|r| *r as usize <= cap),
+            "{cap}/{backlog}: a segment past the cap: {rows:?}"
+        );
+        let reader = open(&path);
+        for m in &metrics {
+            let present = (0..TICKS).filter(|t| members(*t).contains(m)).count();
+            assert_eq!(
+                samples(&reader, m, TICKS),
+                present,
+                "{cap}/{backlog}: {m} lost samples ({rows:?})"
+            );
+            assert_eq!(
+                answer(&reader, m, 0),
+                answer(&reference, m, 0),
+                "{cap}/{backlog}: {m}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_schema_that_alternates_keeps_every_sample() {
+    flip_back_keeps_every_sample(|t| {
+        if t % 2 == 0 {
+            vec!["x", "y"]
+        } else {
+            vec!["x"]
+        }
+    });
+}
+
+#[test]
+fn a_schema_that_returns_after_two_ticks_keeps_every_sample() {
+    flip_back_keeps_every_sample(|t| {
+        if (t / 2) % 2 == 0 {
+            vec!["x", "y"]
+        } else {
+            vec!["x"]
+        }
+    });
+}
+
+/// A scrape-shaped group: series that come and go between scrapes, so the
+/// group's schema changes most ticks and revisits earlier member sets.
+#[test]
+fn intermittent_series_keep_every_sample() {
+    flip_back_keeps_every_sample(|t| {
+        let mut m = vec!["up"];
+        if t % 3 != 1 {
+            m.push("requests");
+        }
+        if t % 4 == 0 {
+            m.push("errors");
+        }
+        m
+    });
+}

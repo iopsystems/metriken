@@ -18,7 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SourceWriter::seal_capped` and the policy's `max_rows`, which splits
   such a backlog into consecutive segments of at most `max_rows` rows.
   The byte cap and the age bound are unchanged: they decide when a stream
-  seals, not where a split falls.
+  seals, not where a split falls. If a part cannot be encoded on its own,
+  dendro logs a warning and seals that stream's rows as one segment.
+  A split costs one encode per `max_rows` rows. At production caps (900
+  rows) a backlog past the cap is rare, but with a small `max_rows` under
+  sustained CPU overload the extra encodes put the recording behind wall
+  clock: 3.4 to 4.5 s behind in rezolus's 2-row hindsight test fixture
+  with one busy loop per core, against 0.1 to 0.4 s with uncapped seals.
 - `Encoder` implements dendro's `SegmentEncoder::encode_after` for the
   parts of a split seal after the first. The writer puts a group's schema,
   a long table's columns and a sampler cell's metadata only on the first
@@ -27,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first row when the hashes match, and a metric's first cell in the part
   gets the metadata it last carried. Without it the part's group and long
   rows were skipped as unanchored and its cells read back without labels.
+- Rows were lost when a group's schema returned to an earlier one within
+  a segment (A, B, A), which predates the seal cap. The writer stated each
+  schema hash once per segment, and the WAL decoder resolves a row against
+  the last schema stated, so the rows of the second run of A were skipped
+  as unanchored, in a sealed segment and in a live tail. A Prometheus-style
+  group whose series come and go between scrapes does this routinely. The
+  writer now states a schema whenever a row's hash differs from the
+  previous row's, for wide and long groups; the decoder is unchanged, so
+  archives written this way read correctly with older readers. In a split
+  seal, `encode_after` looks the part's schema up by hash, which also
+  anchors WAL rows a 0.2.2 writer left.
 - dendro 0.4.2 is required.
 
 ## [0.2.2] - 2026-10-12

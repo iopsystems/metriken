@@ -541,9 +541,15 @@ struct GroupState {
     /// row, and a reader tells them apart by the occupant stream.
     long: Option<bool>,
     layouts: VecDeque<((u64, u64), Arc<Layout>)>,
-    /// Whether this segment's WAL already carries the schema of the given
-    /// hash (wide: the group's; long: the metric columns').
-    anchored: HashSet<(u64, u64)>,
+    /// The schema hash of the last row this segment's WAL holds for the
+    /// group (wide: the group's; long: the metric columns'), `None` after a
+    /// seal. A row carries its schema when its hash differs from this.
+    ///
+    /// The last row's hash, not every hash the segment has carried: the WAL
+    /// decoder resolves a row with no schema against the last schema it
+    /// read, so a group whose schema went A, B, A must state A again or its
+    /// second run of A rows is skipped as unanchored.
+    anchored: Option<(u64, u64)>,
     /// Long only: the metric columns.
     columns: LongColumns,
     /// Long only: occupant number by identity (`__uid__`, or the labels).
@@ -1109,7 +1115,7 @@ impl SourceRecorder {
         let window = g.window.map(|w| (w.begin_ns, w.end_ns));
         match layout.as_ref() {
             Layout::Wide(schema) => {
-                let anchor = state.anchored.insert(g.schema_hash);
+                let anchor = state.anchored.replace(g.schema_hash) != Some(g.schema_hash);
                 let row = metriken_model::convert::wal_group_row(
                     g,
                     anchor.then(|| schema.as_ref().clone()),
@@ -1216,7 +1222,7 @@ impl SourceRecorder {
             return Ok(());
         }
         let hash = state.columns.hash;
-        let anchor = state.anchored.insert(hash);
+        let anchor = state.anchored.replace(hash) != Some(hash);
         let row = WalLongRow {
             schema_hash: hash,
             schema: anchor.then(|| state.columns.schema.clone()),
@@ -1271,10 +1277,12 @@ impl SourceRecorder {
     /// Seal every stream whose open segment is due. Call once per tick,
     /// after [`ArchiveWriter::commit`].
     ///
-    /// No segment holds more than the policy's `max_rows` rows. When
-    /// several passes were committed since the last check (frames that
-    /// queued behind a slow seal), a stream past the cap is sealed as
-    /// several segments of at most `max_rows` rows each.
+    /// When several passes were committed since the last check (frames
+    /// that queued behind a slow seal), a stream past the policy's
+    /// `max_rows` is sealed as several segments of at most `max_rows` rows
+    /// each. One exception: if a part of the split cannot be encoded on its
+    /// own (dendro's check that the parts cover every row fails), dendro
+    /// logs a warning and seals the stream's rows as one segment.
     pub fn maybe_seal(&mut self) -> Result<(), Error> {
         let now = Instant::now();
         let policy = &self.config.seal;
@@ -1287,7 +1295,7 @@ impl SourceRecorder {
         }
         for stream in &batch {
             if let Some(state) = self.groups.get_mut(stream) {
-                state.anchored.clear();
+                state.anchored = None;
             }
             if let Some(state) = self.samplers.get_mut(stream) {
                 state.described.clear();
