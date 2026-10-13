@@ -59,6 +59,245 @@ pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
     Ok(out)
 }
 
+/// Each selector of a query: the metric names it can select (one, or none
+/// for a selector with no name) and its label matchers as a filter
+/// (`extract_filter_labels`). Like [`referenced_metrics`], needs no source;
+/// a reader uses it to leave out tables whose fixed labels no selector can
+/// match.
+pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let mut out = Vec::new();
+    walk_selectors(&expr, &mut out);
+    Ok(out)
+}
+
+/// A selector: the metric names it can select and its matchers as a filter.
+pub(crate) type Selector = (HashSet<String>, Labels);
+
+/// Which labels of the series it combines a combination keeps apart: an
+/// aggregation's grouping, or a binary operator's matching.
+#[derive(Clone)]
+pub(crate) enum Keeps {
+    /// Every label: a binary operator with no `on`/`ignoring`.
+    All,
+    /// Only these: `by (...)`, `on (...)`.
+    Only(HashSet<String>),
+    /// All but these: `without (...)`, `ignoring (...)`.
+    AllBut(HashSet<String>),
+}
+
+impl Keeps {
+    /// Whether series that differ in `key` stay apart. `without` and
+    /// `ignoring` drop internal labels (`__recording__`) along with the
+    /// listed ones, as the engine does (`streaming/aggregate.rs`,
+    /// `streaming/binary.rs`).
+    pub(crate) fn keeps(&self, key: &str) -> bool {
+        match self {
+            Keeps::All => true,
+            Keeps::Only(keys) => keys.contains(key),
+            Keeps::AllBut(keys) => !keys.contains(key) && !crate::labels::is_internal_label(key),
+        }
+    }
+
+    fn of(modifier: Option<&parser::LabelModifier>, default: Keeps) -> Keeps {
+        let set = |l: &promql_parser::label::Labels| l.labels.iter().cloned().collect();
+        match modifier {
+            None => default,
+            Some(parser::LabelModifier::Include(l)) => Keeps::Only(set(l)),
+            Some(parser::LabelModifier::Exclude(l)) => Keeps::AllBut(set(l)),
+        }
+    }
+}
+
+/// A place where a query combines series.
+pub(crate) struct Site {
+    /// The selectors of an aggregation's operand, or of an operator's left
+    /// side.
+    pub(crate) lhs: Vec<Selector>,
+    /// The selectors of an operator's right side; `None` for an aggregation.
+    pub(crate) rhs: Option<Vec<Selector>>,
+    /// The labels the site keeps apart.
+    pub(crate) keeps: Keeps,
+    /// For an operator: the groupings of every aggregation on either side.
+    /// A side's series carry a label only if each of its aggregations keeps
+    /// it.
+    pub(crate) side_groupings: Vec<Keeps>,
+}
+
+impl Site {
+    /// Whether an operator's sides still carry `key` where they meet, and
+    /// its matching keeps it.
+    pub(crate) fn keeps_across(&self, key: &str) -> bool {
+        self.keeps.keeps(key) && self.side_groupings.iter().all(|g| g.keeps(key))
+    }
+}
+
+fn groupings(expr: &Expr, out: &mut Vec<Keeps>) {
+    match expr {
+        Expr::Aggregate(agg) => {
+            out.push(Keeps::of(
+                agg.modifier.as_ref(),
+                Keeps::Only(HashSet::new()),
+            ));
+            groupings(&agg.expr, out);
+        }
+        Expr::Binary(b) => {
+            groupings(&b.lhs, out);
+            groupings(&b.rhs, out);
+        }
+        Expr::Unary(u) => groupings(&u.expr, out),
+        Expr::Paren(p) => groupings(&p.expr, out),
+        Expr::Call(call) => {
+            for a in &call.args.args {
+                groupings(a, out);
+            }
+        }
+        Expr::Subquery(s) => groupings(&s.expr, out),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
+/// Every place `query` combines series: an aggregation and a binary
+/// operator with a selector on both sides, each with the labels it keeps
+/// apart. For a reader that evaluates a query once per recording and must
+/// know where the result would merge series of different recordings.
+pub(crate) fn combination_sites(query: &str) -> Result<Vec<Site>, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let mut out = Vec::new();
+    walk_combinations(&expr, &mut out);
+    Ok(out)
+}
+
+fn selectors_of(expr: &Expr) -> Vec<Selector> {
+    let mut out = Vec::new();
+    walk_selectors(expr, &mut out);
+    out
+}
+
+fn walk_combinations(expr: &Expr, out: &mut Vec<Site>) {
+    match expr {
+        Expr::Aggregate(agg) => {
+            // No grouping keeps nothing apart: `sum(x)` is one series.
+            let keeps = Keeps::of(agg.modifier.as_ref(), Keeps::Only(HashSet::new()));
+            out.push(Site {
+                lhs: selectors_of(&agg.expr),
+                rhs: None,
+                keeps,
+                side_groupings: Vec::new(),
+            });
+            walk_combinations(&agg.expr, out);
+        }
+        Expr::Binary(b) => {
+            let (lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
+            if !lhs.is_empty() && !rhs.is_empty() {
+                let matching = b.modifier.as_ref().and_then(|m| m.matching.as_ref());
+                out.push(Site {
+                    lhs,
+                    rhs: Some(rhs),
+                    keeps: Keeps::of(matching, Keeps::All),
+                    side_groupings: {
+                        let mut g = Vec::new();
+                        groupings(&b.lhs, &mut g);
+                        groupings(&b.rhs, &mut g);
+                        g
+                    },
+                });
+            }
+            walk_combinations(&b.lhs, out);
+            walk_combinations(&b.rhs, out);
+        }
+        Expr::Unary(u) => walk_combinations(&u.expr, out),
+        Expr::Paren(p) => walk_combinations(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_combinations(arg, out);
+            }
+        }
+        Expr::Subquery(s) => walk_combinations(&s.expr, out),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
+/// Mirror of [`walk_names`], collecting each selector whole.
+fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
+    match expr {
+        Expr::Aggregate(agg) => walk_selectors(&agg.expr, out),
+        Expr::Unary(u) => walk_selectors(&u.expr, out),
+        Expr::Binary(b) => {
+            walk_selectors(&b.lhs, out);
+            walk_selectors(&b.rhs, out);
+        }
+        Expr::Paren(p) => walk_selectors(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_selectors(arg, out);
+            }
+        }
+        Expr::VectorSelector(sel) => out.push(selector(sel)),
+        Expr::MatrixSelector(sel) => out.push(selector(&sel.vs)),
+        Expr::Subquery(s) => walk_selectors(&s.expr, out),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
+/// A label a selector of `query` matches more than once
+/// (`{source!="a", source!="b"}`): the filter holds one matcher per label,
+/// so all but one would be dropped silently.
+pub(crate) fn repeated_matcher(query: &str) -> Result<Option<String>, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let mut found = None;
+    walk_vector_selectors(&expr, &mut |sel| {
+        let mut seen = HashSet::new();
+        for m in &sel.matchers.matchers {
+            if m.name != "__name__" && !seen.insert(m.name.clone()) && found.is_none() {
+                found = Some(m.name.clone());
+            }
+        }
+    });
+    Ok(found)
+}
+
+fn walk_vector_selectors(expr: &Expr, f: &mut dyn FnMut(&parser::VectorSelector)) {
+    match expr {
+        Expr::Aggregate(agg) => walk_vector_selectors(&agg.expr, f),
+        Expr::Unary(u) => walk_vector_selectors(&u.expr, f),
+        Expr::Binary(b) => {
+            walk_vector_selectors(&b.lhs, f);
+            walk_vector_selectors(&b.rhs, f);
+        }
+        Expr::Paren(p) => walk_vector_selectors(&p.expr, f),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_vector_selectors(arg, f);
+            }
+        }
+        Expr::VectorSelector(sel) => f(sel),
+        Expr::MatrixSelector(sel) => f(&sel.vs),
+        Expr::Subquery(s) => walk_vector_selectors(&s.expr, f),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
+fn selector(sel: &parser::VectorSelector) -> (HashSet<String>, Labels) {
+    let mut names = HashSet::new();
+    collect_selector_names(sel, &mut names);
+    (names, extract_filter_labels(&sel.matchers.matchers))
+}
+
 /// Mirror of [`walk`] that collects selector names instead of columns. Kept
 /// beside it deliberately: the two must stay in step as the expression grammar
 /// grows, and a missed arm here silently narrows routing rather than failing

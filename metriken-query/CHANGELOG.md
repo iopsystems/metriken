@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** an archive's series carry their recording's labels
+  (`source`, `host`, any `record --label`), and a query naming a metric that
+  several recordings of an archive hold is answered from all of them
+  instead of being refused as cross-recording. Such a query is evaluated
+  once per recording, each with its own interval and cross-cadence
+  timestamps as if it were alone, and the series are concatenated:
+  `rate(x[1m])` returns each recording's series, `x{source="vllm"}` selects
+  one, `sum by (source) (...)` gives one sum per recording, and `g / h`
+  pairs within each recording. A single recording's series carry its
+  labels too. A series that already carries one of the keys keeps its own
+  value under `exported_<key>`; recordings with identical label sets get
+  `__recording__` (their catalog index) so their series stay apart. A
+  recording whose labels no selector of the query can match is left out
+  first, and one lacking a metric the query names that the archive holds
+  elsewhere contributes nothing (as a pair with no match), so one host
+  without a sampler does not fail a ratio for the others; when no recording
+  is left, the answer is empty (also for a query the engine would reject,
+  such as `x or y`, whose error is then not reached). On an archive of
+  several recordings, an instant query without a time reads at the
+  archive's end, whether or not a matcher narrows it to one recording. A
+  selector that matches one label twice is refused, for any label and on
+  any archive, single-recording ones included: the filter applies one
+  matcher per label (the last), so `{source!="a", source!="b"}` let `a`
+  through and `{id=~"1.*", id!="10"}` silently became `id!="10"`;
+  `source!~"a|b"` answers the first. A parquet file read through
+  `ParquetReader` still applies the last matcher silently. Within a recording the engine's own
+  operator rules apply unchanged, including pairing a single right-hand
+  series with every left-hand one (`rate(c) / sum by (source) (rate(c))` is
+  each series' share of its recording's total, where Prometheus would
+  return nothing). `columns` resolves through the same labels.
+- A query whose result would merge series of different recordings is
+  refused, naming the recordings and the labels to keep: an aggregation, or
+  an operator's `on`/`ignoring`, whose kept labels no longer tell the
+  recordings it reaches apart (`sum(x)`, `sum by (cpu) (x)`; `sum by
+  (source)` is answered when `source` differs, also if `host` differs too).
+  Two recordings are told apart by a kept label both carry with different
+  values (a recording lacking a label may carry it on its series), and
+  `without`/`ignoring` keep no internal label, so they do not keep twins
+  apart. An operator whose sides read different recordings is answered
+  when such a label is kept by its matching and by every aggregation on
+  both sides (`g{source="a"} / h`), and refused otherwise
+  (`sum(x{source="a"}) - sum(x{source="b"})`, which per recording would be
+  empty). As a last check, a result in which series of two recordings share
+  a label set is refused. Answering it means
+  evaluating across recordings, and the engine assumes a metric's series
+  share one table's rows: across recordings a raw-mode `sum` alternated
+  between them, a grid `sum` read one alone at the range edges and at
+  another's cadence, twin recordings paired one's `g` with the other's `h`,
+  and a lone unmatched series was paired across recordings. A query
+  reading one histogram from several recordings is refused too. A matcher
+  on a label only some recordings carry counts the others as reached, so
+  such a query can be refused although it reads one; adding a recording
+  label to the matcher answers it. Within a recording, a metric name two
+  samplers share is still refused.
+
 ## [0.36.1] - 2026-10-12
 
 ### Fixed

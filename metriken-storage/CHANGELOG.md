@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `labeled::LabeledSource`, a `DataSource` whose series carry extra labels,
+  delegating every read path (the column scan included). A series' own value
+  of an added key moves to `exported_<key>` (also when equal, and one prefix
+  further when `exported_<key>` is taken), as Prometheus does for a scraped
+  target with `honor_labels: false`; a filter on `<key>` matches the added
+  value and one on `exported_<key>` the series' own. `add_labels`,
+  `add_labels_map`, `translate_filter`, `keeps`, `EXPORTED_PREFIX` and
+  `RECORDING_LABEL`
+  (`__recording__`) are public with it.
+- `SamplerReader::recording_labels`, `same_recording`, `holds` and
+  `holds_histogram`, `ArchiveReader::recording_count`, and
+  `ArchiveReader::series_labels` (a `reader::SeriesLabels`): the labels each recording's series carry,
+  with `__recording__` (the recording's catalog index) added for recordings
+  whose label sets are identical, found among every recording of the reader
+  whether it has tables or not. Worked out once per reader and returned by
+  reference.
+
+### Fixed
+
+- `HistogramStream::merge` decoded every stream under the first stream's
+  bucket configuration, checked only by a `debug_assert!`, so a release build
+  read a differently configured stream's buckets as other buckets. It now
+  leaves out streams of another configuration with a warning (a label
+  matcher reaches them), as a table split into `__run__`s does, and finds
+  each series' merged index by hash rather than a linear search.
+
+### Changed
+
+- **Breaking:** `ArchiveReader::counter_labels`, `gauge_labels` and
+  `histogram_labels` return each label set with its recording's labels
+  added, matching the series metriken-query now returns.
+
 ## [0.2.3] - 2026-10-13
 
 ### Fixed

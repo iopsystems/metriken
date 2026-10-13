@@ -678,15 +678,28 @@ Open sub-questions:
    recordings instead of refusing them (keeps per-query table selection and
    both refusals; new code). The cost of either on a large multi-recording
    archive is not measured; the 9.6 h archive has one recording.
+   Decided 2026-10-13: `route()`. Built; see "Series labels, as built"
+   below.
 2. Which recording labels become series labels: all of them, or a fixed set
    (`source`, `host`). Whether `arm`, which selects A/B, is also one.
+   Decided 2026-10-13: all of them, `arm` included.
 3. A recording label whose key a series already carries (a scraped
    Prometheus series with `host` or `source`): replace, as
    `MultiParquetSource` does in a release build, refuse, or rename one.
+   Decided 2026-10-13: the recording's value wins and the series' own moves
+   to `exported_<key>`, as Prometheus does with `honor_labels: false`: also
+   when the values are equal, and one prefix further when the series has
+   `exported_<key>` too.
 4. Two recordings with identical label sets (two endpoints that infer the
    same `source` and `host`): refuse, or add a reserved label
    (`__recording__`, under the `__` rule of rezolus `docs/labels.md`) to keep
    their series apart.
+   Decided 2026-10-13: `__recording__`, added only to recordings whose
+   label set another recording shares, carrying the recording's catalog
+   index. Twins are found among every recording of the reader, tables or
+   not, so the label neither changes value nor comes and goes on a live
+   reopen. A twin group that repeats an index (readers of different archives
+   joined by `flatten`) is numbered by position.
 5. Recordings of different runs. `recording combine a.rez b.rez -o ab.rez`,
    rezolus's documented A/B form, does not set `arm` (no non-test `"arm"`
    under `src/parquet_tools/`), so under the rule above its output opens
@@ -695,6 +708,11 @@ Open sub-questions:
    time ranges overlap.
 6. The cross-cadence evaluation timestamps in a combined view, where each
    recording has its own row times.
+   Decided 2026-10-13 (after six reviews): a query reaching several
+   recordings is evaluated once per recording, each with its own
+   cross-cadence timestamps, and one whose result would merge recordings is
+   refused until the engine aligns and matches across them. See "Series
+   labels, as built".
 7. Whether `rezolus mcp`, which refuses a multi-recording archive without
    `--recording` today, reads the combined source by default.
 8. (Added 2026-10-12 with Q12.) How a template instance's queries are
@@ -709,6 +727,222 @@ Open sub-questions:
    `MetricsSource` (`time_range()` comes from the rows), so an instance
    needs either its own recording's values or the combined reader's. Which
    one is open.
+
+#### Series labels, as built (2026-10-13)
+
+metriken branch `feat/recording-series-labels` (metriken-storage and
+metriken-query, unreleased):
+
+- `SamplerReader` holds its recording's labels in an `Arc` shared by the
+  recording's tables; `same_recording` compares the pointers, so recordings
+  of readers joined by `ArchiveReader::flatten`, whose `recording` numbers
+  repeat, stay distinct. `ArchiveReader::series_labels` gives each
+  recording its labels plus `__recording__` when its label set is shared.
+- metriken-storage `labeled::LabeledSource` wraps a `DataSource`: every
+  returned series (counters, counter streams, the counter scan, gauges,
+  histogram streams, label listings, `column_map`) gets the labels, with a
+  clashing key's own value under `exported_<key>` (equal values too, so a
+  series with the key and one without stay apart; a taken
+  `exported_<key>` moves one prefix further). A filter on an added
+  key is decided against the added value and stripped; one on
+  `exported_<key>` is decided on the relabelled series (a scan declines
+  then, and a histogram drops the rows), because whether a series has
+  `exported_<key>` depends on both values.
+- metriken-query `route()` groups the tables a query names by recording and
+  builds each recording's source as before (the table, or a `try_new`
+  union that still refuses a name two samplers share), wrapped in
+  `LabeledSource`, one engine per recording. `columns` resolves through the
+  same wrapper. The cross-recording refusal is gone.
+- Queries across recordings (decided 2026-10-13, after six reviews). The
+  engine assumes a metric's series share one table's rows, and each review
+  found another way that fails when one query's series come from several
+  recordings, each seen on a test archive:
+  - Rows fall at different instants: in `RateMode::Raw`, `sum(g)` over two
+    recordings half an interval apart alternated 10, 100, 10, 100 where it
+    should read 110; on the grid, a `sum` at the range edges read only the
+    recording that had a row there.
+  - Cadences differ: with a 1 s and a 10 s recording, a grid `sum(g)` read
+    110 only at the slow rows and 10 between; applying the cross-cadence
+    timestamps across recordings fixed that and cut a partly overlapping
+    recording's series to 2 of 40 points.
+  - Intervals differ: one joined source reports the fastest recording's
+    interval, and a gauge's staleness follows it, so a 10 s recording's
+    gauge was dropped between its rows beside a 1 s recording (8 of 40
+    points), also for a query combining nothing.
+  - Matching: binary operators match on visible labels only
+    (`streaming/binary.rs`, `match_key`), so twin recordings, told apart by
+    the internal `__recording__`, paired one's `g` with the other's `h`;
+    and a lone unmatched series on the right is paired with every unmatched
+    series on the left, whatever its recording.
+  - Kinds: a name that is a gauge in one recording and a counter in
+    another read one recording's series and dropped the other's silently.
+  - Histogram functions pool each row of the series they select, so a
+    histogram from two recordings alternated between them.
+  As built: a query reaching several recordings is evaluated once per
+  recording (`route` returns a `Part` per recording, each an engine over
+  that recording's labelled tables with its own interval and cross-cadence
+  timestamps) and the series concatenated, so every failure above that
+  came from one engine seeing two recordings is gone: per-series queries,
+  `sum by (source)`, and plain operators (which pair within a recording)
+  are answered as each recording would answer alone, and a kind clash is
+  that recording's error. A recording lacking a metric the query names is
+  left out (`g / h` on a host with no `h` answers for the others, as a
+  Prometheus pair with no match does); when no recording is left (`x` only
+  in a, `y` only in b, `x / y`; or a matcher keeping only the recording
+  lacking `x`), the answer is empty, as in Prometheus; a query the engine
+  would reject (`x or y`) is then empty too rather than an error. On an
+  archive of several recordings, an instant query without a time reads at
+  the archive's end, narrowed by a matcher or not (the ninth and tenth
+  reviews found each recording read at its own last row, then the default
+  changing with the matcher). A selector matching one label twice is
+  refused, for any label and on any archive read through `ArchiveReader`
+  (single-recording ones included): `extract_filter_labels` keeps one
+  matcher per label (the last), so `{source!="a", source!="b"}` let `a`
+  through, a pre-existing engine limit that recording labels make an
+  ordinary query hit. Upstream answered `{id=~"1.*", id!="10"}` as
+  `id!="10"`, silently; the eleventh review found no rezolus dashboard,
+  template or MCP query that repeats a label. A parquet file read through
+  `ParquetReader` keeps the silent last-wins.
+- The tenth review ran 39 query patterns five ways (range at two steps,
+  instant with and without a time, display) on two real single-recording
+  rezolus archives against upstream main and this branch: with the
+  recording labels removed, the outputs are identical (last-digit float
+  differences that upstream shows between its own runs aside). Within a recording
+  the engine's operator rules apply unchanged, including its pairing of a
+  single right-hand series with every left-hand one.
+  Refused, because the per-recording results would have to merge: an
+  aggregation, or an operator's `on`/`ignoring`, whose kept labels no
+  longer tell the recordings it reaches apart (`sum(x)`, `sum by (cpu)
+  (x)`, `sum by (source)` over twins), and a histogram from several
+  recordings (`promql::combination_sites` with the labels each site keeps,
+  `refuse_combining_across_recordings`,
+  `refuse_histograms_across_recordings`). The seventh review found the
+  first rule (refuse when any differing label is dropped) refused `sum by
+  (source)` on an agent-and-service archive whose `host` also differs, and
+  its message suggested `sum by (host)`, which was refused in turn; the
+  rule now asks whether the kept labels still tell the recordings apart,
+  and the message names every differing label. The eighth review found
+  three wrong answers that rule let through, each fixed: an operator
+  between aggregates of different recordings
+  (`count(x{source="a"}) + count(x{source="b"})`) came back empty, since
+  each recording held one side, so an operator whose sides read different
+  recordings is answered only when a label telling them apart survives its
+  matching and every aggregation on both sides (`Site::keeps_across`);
+  `without` kept twins "apart" by `__recording__`, which the engine drops
+  under `without` and `ignoring`, so those keep no internal label; and a
+  recording lacking `host` while its series carry `host` collided with one
+  that has it, so two recordings count as apart only on a label both
+  carry. A last check refuses any result in which series of two
+  recordings share a label set (`refuse_shared_label_sets`); with it in
+  place, the "both carry" mutation survives, since the check catches the
+  same case. A matcher on a label only some
+  recordings carry (`g{host="h1"}` where one recording has no `host`)
+  counts the others as reached, so `sum(g{host="h1"})` is refused although
+  it reads one recording; this over-refuses and answers nothing wrong. The
+  engine change that would answer the refused queries: recording identity
+  in binary-operator matching, no broadcast across recordings, alignment
+  across recordings (onto the slow recording's rows where they cover the
+  others), per-series staleness, and trimmed range edges.
+- Each query works out its owning tables once (`Plan`), shared by routing,
+  the refusals, the cross-cadence timestamps and `columns`; the recordings'
+  labels are worked out once per reader (`ArchiveReader::series_labels`,
+  cached, keyed by a map). A reviewer measured the uncached version at
+  1.23 ms per call with 400 recordings.
+- `Plan::new` leaves out a recording (whole: all its owning tables) when
+  no selector naming one of its metrics can match its labels; leaving out
+  single tables (the first version) left a recording with `h` and without
+  `g` for `g{source="a"} / h`, which failed as "metric not found". With
+  incomplete recordings now left out of evaluation, a test cannot tell the
+  two apart (the per-table mutation survives); whole recordings stay,
+  since that is what pruning means. Before that change:
+- `Plan::new` leaves out a table when no selector naming one of its
+  metrics can match its recording's labels (`translate_filter` against
+  `series_labels`); when that leaves none, the first recording's tables
+  answer, empty, so
+  `x{source="a"}` neither opens recording b's tables nor loses recording
+  a's cross-cadence alignment.
+- `HistogramStream::merge`, which `MultiParquetSource` uses to join its
+  files (and, in an earlier version of this branch, recordings), decoded
+  every stream under the first stream's bucket configuration (a
+  `debug_assert!` only). Two recordings of `lat` at grouping power 3 and 7
+  panicked a debug build and, in release, read the second recording's
+  buckets as other buckets. It now leaves out streams of another
+  configuration with a warning, as a table's `__run__`s are split. Found in
+  review; archives no longer join recordings through it, and the fix stays
+  for multi-file parquet readers.
+- A query that reads one histogram from several recordings is refused,
+  naming the recordings and a matcher to use (`lat{source="a"}`). The
+  histogram functions pool each row of the series they select
+  (`quantiles_impl` sums every series' deltas per row timestamp), and two
+  recordings' rows fall at different times: a reviewer joined two
+  recordings of `lat` whose rows were half a second apart and got
+  `histogram_quantiles([0.5], lat)` alternating 2, 959, 2, 959 between
+  them on the union of their row times. A combined view therefore draws a
+  histogram per source, which per-source template instances (sub-question
+  8) do anyway. Pooling across recordings, onto a common grid, is left
+  until something needs it.
+- The filter's regex form is literals and alternations
+  (`labels::match_pattern`), so `source=~"a|b"` works and `source=~"a.*"`
+  matches nothing, as for any label.
+- Tests: metriken-query `archive::tests` (one recording carries its
+  labels; two recordings: per-series queries, by `source=`, `!=`, `=~`,
+  `sum by (source)` answered and `sum` refused; the `exported_` rename and
+  its matchers; identical label sets; the shared-name refusal; `columns`;
+  cross-cadence from one recording only; a partly overlapping recording
+  read at full resolution; which combinations are answered and refused in
+  both modes, twins included; each recording's own interval; a name of
+  two kinds; a matcher on one operand; a recording lacking an operand;
+  recordings that differ in several labels) and metriken-storage
+  `labeled::tests`. Seen red: no
+  wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
+  the clashing value dropped, cross-cadence across recordings, the merge
+  mixing configurations, no owner pruning, `__recording__` by position, no
+  chained prefix, no histogram refusal, catalog indices kept when
+  flattened twins repeat one, twins only among recordings with tables, no
+  refusal of merging combinations, every cross-recording combination
+  refused, the slow recording read at a 1 s interval, incomplete recordings
+  kept, refusal whenever a differing label is dropped, side groupings
+  ignored, `without` keeping internal labels, no shared-label-set check,
+  each recording's own default instant, the default instant only for
+  several parts, no repeated-matcher refusal.
+- Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
+  at a 500-point budget, five runs per query, three alternating rounds of
+  upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
+  to 41.2 ms for `sum by (id) (irate(cpu_usage[5m])) / 1e9`, 24.6 to 24.7
+  and 24.5 to 26.6 ms for `irate(cpu_usage[5m])`, 391.8 to 396.1 and 400.3
+  to 417.7 ms for `histogram_quantiles([0.5, 0.99],
+  scheduler_runqueue_latency)` (one base round, run while the host was
+  loaded, is left out: 2 to 5 times slower on every query). Results are
+  identical between the builds for three queries; `sum(irate(cpu_usage[5m]))`
+  differs from run to run within each build (its last digits), so it was not
+  compared. No cost above the run-to-run spread was seen; a multi-recording
+  archive was not measured. Rerun after the review fixes (owner pruning
+  parses the query's selectors once more per query): in the rounds the
+  host left quiet (two of three per build), medians 39.4 and 40.4 ms
+  against 40.6 and 44.4 ms, 24.2 and 24.4 ms against 24.3 and 24.9 ms,
+  396.6 and 399.8 ms against 400.1 and 401.9 ms for the same three
+  queries.
+- The engine's binary operators would pair series across recordings
+  (`rate(x[3s]) / rate(y[3s])` with `x` only in `source=a` and `y` only in
+  `source=b` returned one series labelled `source=a`, where Prometheus
+  returns nothing); evaluated per recording, neither recording holds both,
+  and the answer is empty.
+- What this changes for rezolus, on the release: series of every archive
+  carry `source` and `host` (and `__recording__` where it applies), and
+  the cross-recording refusal its tests assert is gone. Every rezolus
+  series also gains `exported_source="rezolus"`: rezolus's columns already
+  carry `source`, which the recording's `source` now replaces (seen on
+  three real archives, e.g. `blockio_bytes` with `endpoint,
+  exported_source, host, op, sampler, source`).
+  The viewer names a series by its first visible label in sorted order
+  (`src/viewer/assets/lib/labels.js`, `firstVisibleLabelValue`) and keys
+  the `multi` chart style by it, so with `host` added a per-CPU chart's
+  series would all be named, and keyed, by the host. The viewer has to
+  treat recording labels as it treats a constant label (leave them out of
+  a series' name when every series of the chart shares them) before it
+  moves to this release.
+  The combined view (`init_file_mode_rez`, the WASM `Viewer::new`) and
+  `rezolus mcp`'s default (sub-question 7) are rezolus work on this release.
 
 ### Q12. How do templates travel, and do rezolus's sections become templates?
 

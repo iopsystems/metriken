@@ -34,26 +34,42 @@ impl HistogramStream {
             return streams.into_iter().next();
         }
 
-        // Build unified series list; record per-stream remapping tables.
+        // One stream decodes under one bucket configuration. Streams of a
+        // different configuration are left out, with a warning, rather than
+        // decoded under the first one's (which reads their bucket indices
+        // as other buckets): split, warn, never coerce, as a table whose
+        // configuration changed is split into `__run__`s. A label matcher
+        // that selects only the left-out streams' series reaches them.
         let config = streams[0].meta.config;
-        debug_assert!(
-            streams.iter().all(|s| s.meta.config == config),
-            "HistogramStream::merge called with mismatched histogram configs"
-        );
+        let (streams, other): (Vec<_>, Vec<_>) =
+            streams.into_iter().partition(|s| s.meta.config == config);
+        if !other.is_empty() {
+            let first = other[0].meta.series.first().cloned().unwrap_or_default();
+            tracing::warn!(
+                "{} histogram stream(s) with a bucket configuration other than {:?} left \
+                 out of a merged query (first left-out series: {:?}); select them with a \
+                 label matcher",
+                other.len(),
+                config,
+                first.inner
+            );
+        }
+        if streams.len() == 1 {
+            return streams.into_iter().next();
+        }
+
+        // Build unified series list; record per-stream remapping tables.
         let mut global_series: Vec<Labels> = Vec::new();
+        let mut index: std::collections::HashMap<Labels, usize> = std::collections::HashMap::new();
         // remap[stream_idx][local_series_idx] = global_series_idx
         let mut remap: Vec<Vec<usize>> = Vec::with_capacity(streams.len());
         for stream in &streams {
             let mut local_remap = Vec::with_capacity(stream.meta.series.len());
             for labels in &stream.meta.series {
-                let global_idx = global_series
-                    .iter()
-                    .position(|g| g == labels)
-                    .unwrap_or_else(|| {
-                        let idx = global_series.len();
-                        global_series.push(labels.clone());
-                        idx
-                    });
+                let global_idx = *index.entry(labels.clone()).or_insert_with(|| {
+                    global_series.push(labels.clone());
+                    global_series.len() - 1
+                });
                 local_remap.push(global_idx);
             }
             remap.push(local_remap);

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use crate::parquet::MultiParquetSource;
 use crate::segmented::SegmentedSource;
-use crate::{BufferPool, CompositionSource, DataSource, UnionChild};
+use crate::{BufferPool, CompositionSource, DataSource, Labels, UnionChild};
 
 use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
@@ -545,16 +545,23 @@ impl TableReader {
 /// it; this field is never split eagerly because most tables (every V2
 /// table, and any V3 sampler with only one group) don't need it to be.
 ///
-/// `recording` is the index (within `from_recordings`'s input) of the
-/// recording this table belongs to — carried so `route()` can tell "two
-/// group tables of one sampler in one recording" (union) apart from "the
-/// same sampler's table in two DIFFERENT recordings" (still a refusal; see
-/// the module docs). An index rather than the recording's `dir` string:
-/// `dir` is a display name derived from labels (`recording_dir_slug`), not a
-/// guaranteed-unique identity — two recordings with the same labels are
-/// entirely legal and would collide on `dir`.
+/// `recording` is the index of the recording this table belongs to, in its
+/// catalog (or in `from_in_memory`'s input). It is what `__recording__`
+/// carries for recordings with identical label sets. Which recording a table
+/// belongs to, for grouping a query's tables, is decided by
+/// `recording_labels` instead: the index repeats across readers joined by
+/// [`ArchiveReader::flatten`]. An index rather than the recording's `dir`
+/// string: `dir` is a display name derived from labels
+/// (`recording_dir_slug`), not a guaranteed-unique identity — two
+/// recordings with the same labels are entirely legal and would collide on
+/// `dir`.
 pub struct SamplerReader {
     recording: usize,
+    /// The labels of the recording this table belongs to, one allocation per
+    /// recording, so tables of one recording share it: the pointer identifies
+    /// the recording, also across readers [`ArchiveReader::flatten`] joined,
+    /// whose `recording` numbers can repeat.
+    recording_labels: Arc<BTreeMap<String, String>>,
     sampler: String,
     /// Every metric name this table holds, probed from ONE segment's footer at
     /// open. A table's segments share a schema — `schema_hash` is what asserts
@@ -623,6 +630,27 @@ impl SamplerReader {
     /// The index of the recording this table belongs to.
     pub fn recording(&self) -> usize {
         self.recording
+    }
+
+    /// Whether this table holds metric `name`, of any kind.
+    pub fn holds(&self, name: &str) -> bool {
+        self.names.holds(name)
+    }
+
+    /// Whether this table holds histogram `name`.
+    pub fn holds_histogram(&self, name: &str) -> bool {
+        self.names.histograms.contains(name)
+    }
+
+    /// The labels of the recording this table belongs to, as the catalog
+    /// holds them.
+    pub fn recording_labels(&self) -> &BTreeMap<String, String> {
+        &self.recording_labels
+    }
+
+    /// Whether `other` is a table of the same recording.
+    pub fn same_recording(&self, other: &SamplerReader) -> bool {
+        Arc::ptr_eq(&self.recording_labels, &other.recording_labels)
     }
 
     /// The table's key: `<sampler>/<group>` or `<sampler>`.
@@ -868,6 +896,15 @@ pub struct ArchiveReader {
     /// green. Carrying the count here makes the invariant explicit and
     /// refactor-proof.
     recordings: usize,
+    /// Every recording behind this reader, tables or not: its shared label
+    /// map (the identity tables carry) and its catalog index. What
+    /// [`series_labels`](Self::series_labels) finds twins among, so a
+    /// recording's `__recording__` does not come and go as a twin gains or
+    /// loses tables.
+    members: Vec<(Arc<BTreeMap<String, String>>, usize)>,
+    /// [`series_labels`](Self::series_labels), worked out on first use:
+    /// `members` is fixed once the reader is built.
+    series_labels: std::sync::OnceLock<SeriesLabels>,
 }
 
 /// One `ArchiveReader` per recording, paired with that recording's label set.
@@ -1146,17 +1183,21 @@ impl ArchiveReader {
     /// multi-source archive. Its metadata is the first reader's, and it is
     /// complete when every reader is.
     ///
-    /// Flattening several recordings gives every table name several
-    /// owners, so routing refuses a query that names one, and
-    /// [`composition_sources`](Self::composition_sources) refuses outright.
-    /// Prefer one reader per source.
+    /// Flattening several recordings gives a table name several owners,
+    /// one per recording: a query naming it is answered from every
+    /// recording, each recording's series under its labels
+    /// ([`series_labels`](Self::series_labels)).
+    /// [`composition_sources`](Self::composition_sources) refuses a
+    /// flattened reader.
     pub fn flatten(readers: Vec<ArchiveReader>, filename: Option<String>) -> Self {
         let mut tables = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut complete = true;
         let mut recordings = 0usize;
+        let mut members = Vec::new();
         for (i, reader) in readers.into_iter().enumerate() {
             recordings += reader.recordings;
+            members.extend(reader.members);
             if i == 0 {
                 metadata = reader.metadata;
             }
@@ -1169,6 +1210,8 @@ impl ArchiveReader {
             filename,
             complete,
             recordings,
+            members,
+            series_labels: std::sync::OnceLock::new(),
         }
     }
 
@@ -1295,6 +1338,7 @@ impl ArchiveReader {
             // Phase two: parse the footers. One probe per table, independent.
             let probed: Vec<Result<ProbedTable, String>> = probe_tables(&pending);
 
+            let recording_labels = Arc::new(rec.labels.clone());
             let mut tables = Vec::new();
             for probe in probed {
                 let (sampler, names, probed_interval, span) = probe?;
@@ -1306,6 +1350,7 @@ impl ArchiveReader {
                     .unwrap_or(probed_interval);
                 tables.push(Arc::new(SamplerReader {
                     recording,
+                    recording_labels: Arc::clone(&recording_labels),
                     sampler: sampler.clone(),
                     names,
                     span,
@@ -1344,6 +1389,8 @@ impl ArchiveReader {
                     filename: Some(crate::source_name(&rec.labels)),
                     complete: rec.complete,
                     recordings: 1,
+                    members: vec![(recording_labels, recording)],
+                    series_labels: std::sync::OnceLock::new(),
                 },
             ));
         }
@@ -1365,9 +1412,12 @@ impl ArchiveReader {
         // count, which `composition_sources` refuses on.
         let recording_count = recordings.len();
         let mut tables = Vec::new();
+        let mut members = Vec::new();
         let mut complete = true;
         for (recording, rec) in recordings.into_iter().enumerate() {
             complete &= rec.complete;
+            let recording_labels = Arc::new(rec.labels.clone());
+            members.push((Arc::clone(&recording_labels), recording));
             if !rec.complete {
                 tracing::warn!(
                     "recording {} was not cleanly finalized; it was recovered up to its \
@@ -1425,6 +1475,7 @@ impl ArchiveReader {
 
                 tables.push(Arc::new(SamplerReader {
                     recording,
+                    recording_labels: Arc::clone(&recording_labels),
                     sampler,
                     names,
                     span,
@@ -1448,6 +1499,8 @@ impl ArchiveReader {
             filename,
             complete,
             recordings: recording_count,
+            members,
+            series_labels: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1491,34 +1544,98 @@ impl ArchiveReader {
         )
     }
 
-    /// The label sets of counter `name`, from every table holding it.
+    /// The label sets of counter `name`, from every table holding it, each
+    /// with its recording's labels ([`series_labels`](Self::series_labels)).
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.tables
-            .iter()
-            .filter(|t| t.names.counters.contains(name))
-            .filter_map(|t| t.reader())
-            .flat_map(|r| r.source().counter_labels(name))
-            .collect()
+        self.labeled_listing(
+            |t| t.names.counters.contains(name),
+            |r| r.source().counter_labels(name),
+        )
     }
 
-    /// The label sets of gauge `name`, from every table holding it.
+    /// The label sets of gauge `name`, as [`counter_labels`](Self::counter_labels).
     pub fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing(
+            |t| t.names.gauges.contains(name),
+            |r| r.source().gauge_labels(name),
+        )
+    }
+
+    /// The label sets of histogram `name`, as [`counter_labels`](Self::counter_labels).
+    pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing(
+            |t| t.names.histograms.contains(name),
+            |r| r.source().histogram_labels(name),
+        )
+    }
+
+    fn labeled_listing(
+        &self,
+        holds: impl Fn(&SamplerReader) -> bool,
+        list: impl Fn(&TableReader) -> Vec<BTreeMap<String, String>>,
+    ) -> Vec<BTreeMap<String, String>> {
+        let extras = self.series_labels();
         self.tables
             .iter()
-            .filter(|t| t.names.gauges.contains(name))
-            .filter_map(|t| t.reader())
-            .flat_map(|r| r.source().gauge_labels(name))
+            .filter(|t| holds(t))
+            .filter_map(|t| t.reader().map(|r| (extras.of(t), list(r))))
+            .flat_map(|(extra, sets)| {
+                sets.into_iter().map(move |mut set| {
+                    crate::labeled::add_labels_map(&mut set, extra);
+                    set
+                })
+            })
             .collect()
     }
 
-    /// The label sets of histogram `name`, from every table holding it.
-    pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.tables
-            .iter()
-            .filter(|t| t.names.histograms.contains(name))
-            .filter_map(|t| t.reader())
-            .flat_map(|r| r.source().histogram_labels(name))
-            .collect()
+    /// How many recordings this reader holds, tables or not.
+    pub fn recording_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// The labels each recording's series carry: the recording's labels, and
+    /// for recordings whose label sets are identical,
+    /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
+    /// recording's index in its catalog, so their series stay apart. Twins
+    /// are found among every recording, tables or not, and the index does
+    /// not change when a live archive is reopened. Recordings of readers
+    /// joined by [`flatten`](Self::flatten) can share an index; a group of
+    /// twins in which two do is numbered by position instead.
+    pub fn series_labels(&self) -> &SeriesLabels {
+        self.series_labels.get_or_init(|| {
+            // Recordings by label set, so twins are found in one pass.
+            let mut twins: HashMap<&BTreeMap<String, String>, Vec<usize>> = HashMap::new();
+            for (position, (labels, _)) in self.members.iter().enumerate() {
+                twins.entry(labels.as_ref()).or_default().push(position);
+            }
+            let mut by_recording = HashMap::with_capacity(self.members.len());
+            for (position, (labels, index)) in self.members.iter().enumerate() {
+                let mut extra = Labels {
+                    inner: labels.as_ref().clone(),
+                };
+                let group = &twins[labels.as_ref()];
+                if group.len() > 1 {
+                    // Catalog indices, unless two twins share one (readers
+                    // of different archives joined by `flatten`): then the
+                    // whole group is numbered by position, so no two collide.
+                    let mut indices: Vec<usize> =
+                        group.iter().map(|p| self.members[*p].1).collect();
+                    indices.sort_unstable();
+                    indices.dedup();
+                    let value = if indices.len() == group.len() {
+                        *index
+                    } else {
+                        position
+                    };
+                    extra.inner.insert(
+                        crate::labeled::RECORDING_LABEL.to_string(),
+                        value.to_string(),
+                    );
+                }
+                by_recording.insert(Arc::as_ptr(labels) as usize, extra);
+            }
+            SeriesLabels { by_recording }
+        })
     }
 
     /// The union of the tables' probed spans, in nanoseconds. From the
@@ -1564,6 +1681,25 @@ fn union_sorted(iters: impl Iterator<Item = Vec<String>>) -> Vec<String> {
         set.extend(v);
     }
     set.into_iter().collect()
+}
+
+/// The labels each recording's series carry, from
+/// [`ArchiveReader::series_labels`].
+pub struct SeriesLabels {
+    /// Keyed by the address of the recording's shared label map, which
+    /// identifies the recording (see `SamplerReader::recording_labels`).
+    by_recording: HashMap<usize, Labels>,
+}
+
+impl SeriesLabels {
+    /// The labels the series of `table`'s recording carry.
+    pub fn of(&self, table: &SamplerReader) -> &Labels {
+        static EMPTY: std::sync::OnceLock<Labels> = std::sync::OnceLock::new();
+        let ptr = Arc::as_ptr(&table.recording_labels) as usize;
+        self.by_recording
+            .get(&ptr)
+            .unwrap_or_else(|| EMPTY.get_or_init(Labels::default))
+    }
 }
 
 #[cfg(test)]
