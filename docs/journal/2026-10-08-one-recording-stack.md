@@ -233,10 +233,10 @@ release in between, and cachecannon pins no rezolus prerelease. A sampler
 and its section still land in one rezolus commit. Recordings with no
 template fall back to the rezolus template in the viewer's registry, and an
 archive's template renders by default, the registry only on request (a
-viewer flag such as `rezolus view --templates`). rezolus's `crates/dashboard`
-stays as an unpublished transitional crate with its Rust generators until
-systemslab, its only dependent (by git tag), has moved to templates:
-rezolus 6.0.0 ships it with the API systemslab uses unchanged, rezolus CI
+viewer flag such as `rezolus view --templates`). rezolus's
+`crates/dashboard` stays as an unpublished transitional crate with its Rust
+generators until systemslab, its only dependent outside rezolus (by git
+tag), has moved to templates: rezolus 6.0.0 ships it with the API systemslab uses unchanged, rezolus CI
 compares the template's expansion with the generators while both exist,
 and the generators are deleted in a 6.x release after systemslab's entry
 lands (decided 2026-10-12, viewer entry Q2).
