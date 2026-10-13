@@ -334,6 +334,24 @@ still holds in the new form: the template is a file in rezolus's tree that
 the agent embeds, so a sampler and its section still land in one commit and
 ship in one release.
 
+Decided 2026-10-12 (owner): rezolus's `crates/dashboard` stays as a
+transitional crate with its Rust generators until systemslab has moved to
+templates. systemslab is its only dependent, by git dependency (tag v5.22.1
+on systemslab main, `Cargo.toml`; its rezolus-6.0 PR pins rev ab24b072 and
+moves the pin to the v6.0.0 tag before merging); cachecannon and llm-perf
+do not depend on it, and it is never published to crates.io (`publish =
+false`). rezolus 6.0.0 ships it as an unpublished workspace crate with the
+API systemslab uses unchanged (the dashboard model, the generators,
+`TemplateRegistry::embedded()`, `generate_section`,
+`build_dashboard_context`), so systemslab's PR can pin the v6.0.0 tag
+without code changes. While the generators and the template both exist,
+rezolus CI runs the GO 8 comparison against them, so the two cannot drift.
+The generators and the crate's Rust section API are deleted in a 6.x
+release after systemslab's own entry lands and systemslab is on
+metriken-dashboard plus the rezolus template (order of work, step 6).
+rezolus's own viewer stops using the crate at step 3, so with the
+generators gone nothing in it is left in use and the crate goes with them.
+
 ### Q3. Does metriken-viewer publish a WASM bundle, or does each application build one?
 
 Under Q2 (b) the static site needs rezolus's sections compiled into the
@@ -397,7 +415,8 @@ over `metriken-recorder`.
   assets out of the crate (`metriken_viewer::assets::write_to(dir)`, run by
   a small binary or xtask) into an ignored `site/viewer/lib/`. The 11
   symlinks in `site/viewer/templates/` point at `crates/dashboard/templates/`,
-  which is deleted, so they are re-pointed at rezolus's template
+  which goes when that crate is deleted (Q2, after systemslab moves), so
+  they are re-pointed at rezolus's template
   directory (Q7; this said `crates/rezolus-dashboard/templates/` until Q12
   removed that crate). `site/docs/architecture.svg`,
   the one other symlink under `site/`, is unaffected. The two hand-kept copies,
@@ -463,8 +482,10 @@ this paragraph is replaced (2026-10-12):
 
 rezolus's fallback registry holds the 11 `ServiceExtension` files and the
 rezolus section template (Q12). They live in one directory in rezolus's tree
-outside `crates/dashboard`, which step 3 deletes; step 1 names the
-directory. The agent embeds the rezolus template from it, and `rezolus
+outside `crates/dashboard`, which is deleted once systemslab has moved
+(Q2); step 1 names the directory, and whether `crates/dashboard`'s
+`TemplateRegistry::embedded()` reads the same directory until then, so the
+11 files exist once. The agent embeds the rezolus template from it, and `rezolus
 view` and rezolus's `cdylib` register all 12 files as the fallback. The
 rezolus template's registry entry carries a `match` predicate over the
 source's metadata and catalog (`source == "rezolus"`, a `sampler_status`
@@ -521,6 +542,11 @@ rezolus template registered, Q7; this said `rezolus-dashboard` until Q12),
 and its chart sync to `metriken-viewer`'s tag, in its
 own journal entry on dendro artifacts (2026-10-08, in systemslab, a private
 repository), after rezolus 6.0.0, as its reader PR already does.
+Until then systemslab keeps its git dependency on rezolus's
+`crates/dashboard`, which rezolus 6.0.0 ships with the API systemslab uses
+unchanged, so its rezolus-6.0 PR moves the pin to the v6.0.0 tag with no
+code change; the generators are deleted only after systemslab has moved
+(Q2, decided 2026-10-12).
 
 Decided 2026-10-12: step 7 closes when rezolus is on the released crates
 and a cachecannon branch passes GO 1 below (the plan's GO 5); systemslab
@@ -793,8 +819,11 @@ from the code, measured, or estimated.
    - The 16 sections (Overview and the 15 other `SECTION_META` entries; the
      query explorer is placed by `{"builtin": "query"}`, not converted) are
      converted, and each is checked byte-identical against the Rust
-     generator's output on fixture catalogs before the Rust generators are
-     deleted (GO 8).
+     generator's output on fixture catalogs (GO 8). The generators stay in
+     rezolus's `crates/dashboard`, an unpublished transitional crate that
+     systemslab depends on by git, and GO 8 runs in rezolus CI while both
+     exist. They are deleted in a 6.x release after systemslab is on
+     metriken-dashboard plus the rezolus template (Q2, decided 2026-10-12).
    - A recording without a template falls back to the rezolus template in
      the viewer's registry, matched by `source == "rezolus"`, a
      `sampler_status` key, or a metric in `REZOLUS_SELF_ANCHORS` (Q7).
@@ -1088,9 +1117,14 @@ the TUI with its Rust copies of `blockio_device_latency_metric` and
 viewer page built from the library), `rezolus-viewer-<tag>.tar.gz` in the
 release workflow, the JS tests that drive rezolus's built bundle
 (`wasm_viewer_*`), and the `viewer-smoke` and `viewer-render` skills pointed
-at `rezolus view`. `crates/rez`, `crates/report-save` and `crates/dashboard` are
-deleted (`crates/rez`'s re-exports are replaced by imports from
-metriken-storage). The `viewer-parity` skill moves to
+at `rezolus view`. `crates/rez` and `crates/report-save` are deleted
+(`crates/rez`'s re-exports are replaced by imports from metriken-storage).
+`crates/dashboard` stays, unpublished, as a transitional crate with its
+Rust generators and the API systemslab uses, so systemslab can pin rezolus
+6.0.0 by git tag; rezolus's own viewer does not use it, and its CI runs GO 8
+against it. Its generators and Rust section API, and with them the crate,
+are deleted in a 6.x release after systemslab has moved (Q2, decided
+2026-10-12). The `viewer-parity` skill moves to
 `iopsystems/metriken-viewer`, rewritten for one crate.
 
 ### cachecannon
@@ -1199,10 +1233,13 @@ GO when all hold:
    from the rezolus template by metriken-dashboard's expander, is
    byte-identical to the Rust generator's JSON on every fixture catalog (at
    least all metrics, one of each, a pre-rename legacy catalog, and empty,
-   as in the evaluation), and a mutated template fails the comparison. This
-   holds before the Rust generators are deleted, and the generators' JSON
-   is committed as golden fixtures so the template's output stays pinned
-   after they are. GO 8 compares the expansion before source restriction is
+   as in the evaluation), and a mutated template fails the comparison. The
+   generators' JSON is committed as golden fixtures, and the comparison is
+   a rezolus CI check for as long as the generators exist in
+   `crates/dashboard`, so the template and the generators cannot drift.
+   Deleting the generators is gated on systemslab having moved to
+   metriken-dashboard plus the rezolus template (order of work, step 6);
+   after that the golden fixtures keep the template's output pinned. GO 8 compares the expansion before source restriction is
    applied. Restriction is checked separately, by GO 1 and a test that
    every selector in an instance carries the source's matchers.
 
@@ -1233,8 +1270,9 @@ metriken-dashboard naming rezolus metrics, with Q2 (a) as the fallback.)
    `crates/dashboard`; the 16 sections converted into the rezolus template
    with the comparison harness (GO 8), which runs each section's Rust
    generator and the expander on the fixture catalogs and compares the
-   JSON; the generators' JSON committed as golden fixtures, then the Rust
-   generators deleted once GO 8 passes; the agent embedding the template
+   JSON; the generators' JSON committed as golden fixtures, and the Rust
+   generators kept, with GO 8 a rezolus CI check while both exist (Q2,
+   decided 2026-10-12); the agent embedding the template
    and sending it under `dashboard`, in a release that also carries a
    viewer that expands it; the
    fallback registry with the rezolus template's `match` predicate (Q7);
@@ -1290,7 +1328,10 @@ metriken-dashboard naming rezolus metrics, with Q2 (a) as the fallback.)
    through `[patch.crates-io]` and passes GO 3 in its split form, and GO 7
    with `Assets::Dir` pointed at a metriken-viewer checkout, before the
    0.1.0 releases. GO 6 is then a CI step in both repositories it names.
-3. **rezolus on the released crates.** The in-tree copies are deleted, the
+3. **rezolus on the released crates.** The in-tree copies of the viewer
+   crates are deleted; `crates/dashboard` stays, unpublished, for
+   systemslab and GO 8, and rezolus 6.0.0 ships it with the API systemslab
+   uses unchanged (Q2). The
    site build uses `assets::write_to`, the 62 `site/viewer/lib/` symlinks
    and their CI check go, the 11 `site/viewer/templates/` symlinks are
    re-pointed at rezolus's template directory (Q7). GO 2 to GO 6 are re-run
@@ -1306,7 +1347,14 @@ metriken-dashboard naming rezolus metrics, with Q2 (a) as the fallback.)
    ("cachecannon"). Merged on
    cachecannon's schedule (Q9); a later metriken-query release reaches it
    after metriken-dashboard and metriken-viewer release against it.
-5. **systemslab** in its own entry, after rezolus 6.0.0 (Q9).
+5. **systemslab** in its own entry, after rezolus 6.0.0 (Q9). Its
+   rezolus-6.0 PR first moves its git pin on `crates/dashboard` to the
+   v6.0.0 tag with no code change; its entry then moves it to
+   metriken-dashboard plus the rezolus template.
+6. **Delete the generators**, in a rezolus 6.x release after step 5 lands:
+   the Rust generators and `crates/dashboard`'s Rust section API go, and
+   with them the crate, which rezolus has not used since step 3; the golden
+   fixtures from step 1 keep the template's output pinned (GO 8).
 
 ## Left alone
 

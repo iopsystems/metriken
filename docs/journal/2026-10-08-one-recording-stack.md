@@ -190,7 +190,7 @@ Four of these edges need explaining:
 | `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`, `MemoryStoreInner`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` forwards to storage's, where `MemoryStore`'s snapshot loading reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
 | `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.dendro` output (6.x writes no other container). Serves rezolus's 6.x line; 5.x keeps its own recorder (decided 2026-10-12). | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
-| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, templates read from source metadata, and the expander for section templates (schema 1: conditions on the metric catalog, repetition over label values). Released with `metriken-query`. | rezolus `crates/dashboard` without its sampler sections, which become the rezolus section template that the agent sends (viewer entry, Q12) |
+| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, templates read from source metadata, and the expander for section templates (schema 1: conditions on the metric catalog, repetition over label values). Released with `metriken-query`. | rezolus `crates/dashboard` without its sampler sections, which become the rezolus section template that the agent sends (viewer entry, Q12); `crates/dashboard` itself stays in rezolus, unpublished, until systemslab has moved |
 | `metriken-viewer` (in `iopsystems/metriken-viewer`, not this repository) | The viewer as a library: a server router to mount, the chart and UI assets, the WASM exports and the script an application builds its own bundle with, report saving, live mode over `metriken-recorder`. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
 | `metriken-py` (later) | Python bindings over storage and query (piece 4). | new |
 
@@ -233,7 +233,13 @@ release in between, and cachecannon pins no rezolus prerelease. A sampler
 and its section still land in one rezolus commit. Recordings with no
 template fall back to the rezolus template in the viewer's registry, and an
 archive's template renders by default, the registry only on request (a
-viewer flag such as `rezolus view --templates`).
+viewer flag such as `rezolus view --templates`). rezolus's `crates/dashboard`
+stays as an unpublished transitional crate with its Rust generators until
+systemslab, its only dependent (by git tag), has moved to templates:
+rezolus 6.0.0 ships it with the API systemslab uses unchanged, rezolus CI
+compares the template's expansion with the generators while both exist,
+and the generators are deleted in a 6.x release after systemslab's entry
+lands (decided 2026-10-12, viewer entry Q2).
 
 ## Pieces
 
@@ -492,5 +498,7 @@ re-exports what it moves, in the release after.
    counts as `u64`; as of 2026-10-12 it is merged (#261) and not yet
    released. The step closes when rezolus is on the released crates and a
    cachecannon branch passes the viewer entry's GO 1; systemslab moves after
-   rezolus 6.0.0. Design, gate and the scope decisions (2026-10-12):
+   rezolus 6.0.0. The Rust section generators are not deleted in this
+   step: rezolus's `crates/dashboard` keeps them until systemslab has moved,
+   and a later 6.x release deletes them. Design, gate and the scope decisions (2026-10-12):
    [metriken-dashboard and metriken-viewer](2026-10-12-metriken-viewer.md).
