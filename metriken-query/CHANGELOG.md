@@ -12,27 +12,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** an archive's series carry their recording's labels
   (`source`, `host`, any `record --label`), and a query naming a metric that
   several recordings of an archive hold is answered from all of them
-  instead of being refused as cross-recording: `rate(x[1m])` returns each
-  recording's series, and `x{source="vllm"}` selects one. A single
-  recording's series carry its labels too. A series that already carries
-  one of the keys keeps its own value under `exported_<key>`; recordings
-  with identical label sets get `__recording__` (their catalog index) so
-  their series stay apart. A table whose recording's labels no selector of
-  the query can match is left out before routing, so a query narrowed to
-  one recording reads only it. `columns` resolves through the same labels.
-- A query that combines series of different recordings is refused, naming
-  the recordings and a matcher that selects one: an aggregation, or an
-  operator with a selector on both sides, whose selectors reach more than
-  one recording. The engine assumes a metric's series share one table's
-  rows, and across recordings it answered wrong: two recordings' rows fall
-  at different instants and cadences (a raw-mode `sum` alternated between
-  them, and a grid `sum` read one alone at the range edges); binary
-  operators match on visible labels only, so twin recordings paired one's
-  `g` with the other's `h`; and a lone unmatched series on one side was
-  paired across recordings. A query reading one histogram from several
-  recordings is refused for the same reason. Within a recording, a metric
-  name two samplers share is still refused, and the cross-cadence
-  timestamps still apply.
+  instead of being refused as cross-recording. Such a query is evaluated
+  once per recording, each with its own interval and cross-cadence
+  timestamps as if it were alone, and the series are concatenated:
+  `rate(x[1m])` returns each recording's series, `x{source="vllm"}` selects
+  one, `sum by (source) (...)` gives one sum per recording, and `g / h`
+  pairs within each recording. A single recording's series carry its
+  labels too. A series that already carries one of the keys keeps its own
+  value under `exported_<key>`; recordings with identical label sets get
+  `__recording__` (their catalog index) so their series stay apart. A table
+  whose recording's labels no selector of the query can match is left out
+  first. `columns` resolves through the same labels.
+- A query whose result would merge series of different recordings is
+  refused, naming the recordings and the labels to keep: an aggregation
+  that drops a label telling them apart (`sum(x)`, `sum by (cpu) (x)`), or
+  an operator whose `on`/`ignoring` drops one. Answering it means
+  evaluating across recordings, and the engine assumes a metric's series
+  share one table's rows: across recordings a raw-mode `sum` alternated
+  between them, a grid `sum` read one alone at the range edges and at
+  another's cadence, twin recordings paired one's `g` with the other's `h`,
+  and a lone unmatched series was paired across recordings. A query
+  reading one histogram from several recordings is refused too. A matcher
+  on a label only some recordings carry counts the others as reached, so
+  such a query can be refused although it reads one; adding a recording
+  label to the matcher answers it. Within a recording, a metric name two
+  samplers share is still refused.
 
 ## [0.36.1] - 2026-10-12
 

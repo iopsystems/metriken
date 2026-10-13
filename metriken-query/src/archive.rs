@@ -6,10 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use metriken_storage::labeled::{translate_filter, LabeledSource};
-use metriken_storage::parquet::MultiParquetSource;
 use metriken_storage::reader::{SamplerReader, SeriesLabels, TableReader};
 use metriken_storage::union::UnionSource;
-use metriken_storage::{table_sampler, ArchiveReader, DataSource, Labels, UnionChild, UnionError};
+use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
 use crate::promql::QueryEngine;
 use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
@@ -130,109 +129,139 @@ impl<'a> Plan<'a> {
         out
     }
 
-    /// The timestamps a query should be evaluated at, when it spans samplers of
-    /// different cadence — `None` when it does not and the uniform grid is
-    /// right.
-    ///
-    /// The grid walks `start + k·step`. A query combining a fast sampler with a
-    /// slow one therefore produces most of its points where the slow sampler
-    /// has no reading at all: that value is held forward and combined with the fast
-    /// operand as if the two were simultaneous.
-    ///
-    /// The grid cannot be tuned out of this. A slow sampler's rows are not
-    /// evenly spaced — measured on a real recording, one sampler's readings
-    /// fell 30 s apart and then 60 s apart — so no step and no phase puts a
-    /// uniform grid on them. Two earlier attempts are worth recording:
-    /// coarsening the STEP relocated the grid and made the combined band
-    /// explode (0.85% wide before, 6.7x after), and widening only the averaging
-    /// SPAN left the points on the grid, still between the slow sampler's real
-    /// readings.
-    ///
-    /// So hand the engine the slow sampler's own row timestamps. Every point then
-    /// lands where both operands genuinely have data, and each rate averages
-    /// over the gap it actually spans.
-    ///
-    /// Returns `None` unless the query really touches more than one cadence, so
-    /// single-sampler queries — the overwhelming majority — are untouched.
-    ///
-    /// Also `None` under [`RateMode::Raw`], which already answers this question
-    /// its own way: Raw places points at the real, un-snapped sample
-    /// timestamps. Relocating them would contradict that contract, and would
-    /// break the query outright — Raw's counter producer reads sample pairs
-    /// and ignores supplied points, while the gauge producers honour them, so
-    /// a counter-and-gauge expression would have its two sides land on
-    /// different instants and intersect nowhere.
+    /// The cross-cadence timestamps of a query over one recording; `None`
+    /// over several (see [`eval_timestamps_for`]).
     fn cross_cadence(&self, step_s: f64, rate_mode: RateMode) -> Option<Arc<[u64]>> {
-        if matches!(rate_mode, RateMode::Raw) {
-            return None;
-        }
         let owners = &self.owners;
-        if owners.len() < 2 {
-            return None;
-        }
-        // The rows of one recording only (see `eval_timestamps_for`).
         if !owners.iter().all(|t| t.same_recording(owners[0])) {
             return None;
         }
-
-        // Cadence comes from the ROWS, not from `interval()`: that reports
-        // the recording's nominal interval, which every table in an archive
-        // shares — on a real recording a 1 s sampler and a 30 s one both
-        // answered 1.0, so asking it can never detect a cadence difference.
-        // These are the instants the query path reads, nothing having
-        // rounded them.
-        //
-        // Cadence is a property of the SAMPLER, not of a table. Two group
-        // tables of one sampler are read together on one schedule; a group
-        // that dedups or skips ticks is sparse WITHIN that cadence, not a
-        // second cadence, and relocating a query onto its rows would
-        // silently change the answer for a query that merely named a
-        // sibling group's metric.
-        //
-        // So a sampler's cadence is the spacing of its DENSEST
-        // participating table — the one that shows the underlying read
-        // schedule.
-        let mut by_sampler: BTreeMap<&str, (u64, &[u64])> = BTreeMap::new();
-        for t in owners {
-            let ts = t.row_timestamps();
-            let Some(gap) = typical_gap_ns(ts) else {
-                continue;
-            };
-            by_sampler
-                .entry(table_sampler(t.sampler()))
-                .and_modify(|slot| {
-                    if gap < slot.0 {
-                        *slot = (gap, ts);
-                    }
-                })
-                .or_insert((gap, ts));
-        }
-        if by_sampler.len() < 2 {
-            return None;
-        }
-
-        let fastest = by_sampler.values().map(|(gap, _)| *gap).min()?;
-        let (slowest, timestamps) = by_sampler.into_values().max_by_key(|(gap, _)| *gap)?;
-        // Deliberately a ratio, not equality: gaps measured from real rows
-        // are never exactly equal, so "different cadence" has to mean
-        // *materially* different. A sampler read at least twice as far
-        // apart as another is a different cadence in any sense that matters
-        // here.
-        if slowest < fastest.saturating_mul(2) {
-            return None;
-        }
-        // A slow sampler finer than the step is already oversampled by the
-        // grid; moving off it would only lose points.
-        if (slowest as f64) <= step_s * 1e9 {
-            return None;
-        }
-        Some(timestamps.into())
+        cross_cadence(owners, step_s, rate_mode)
     }
 }
 
-/// The engine that answers a query: over the tables that hold a metric it
-/// references, grouped by recording, each recording's series carrying that
-/// recording's labels ([`ArchiveReader::series_labels`]).
+/// The timestamps a query should be evaluated at, when it spans samplers of
+/// different cadence — `None` when it does not and the uniform grid is
+/// right.
+///
+/// The grid walks `start + k·step`. A query combining a fast sampler with a
+/// slow one therefore produces most of its points where the slow sampler
+/// has no reading at all: that value is held forward and combined with the fast
+/// operand as if the two were simultaneous.
+///
+/// The grid cannot be tuned out of this. A slow sampler's rows are not
+/// evenly spaced — measured on a real recording, one sampler's readings
+/// fell 30 s apart and then 60 s apart — so no step and no phase puts a
+/// uniform grid on them. Two earlier attempts are worth recording:
+/// coarsening the STEP relocated the grid and made the combined band
+/// explode (0.85% wide before, 6.7x after), and widening only the averaging
+/// SPAN left the points on the grid, still between the slow sampler's real
+/// readings.
+///
+/// So hand the engine the slow sampler's own row timestamps. Every point then
+/// lands where both operands genuinely have data, and each rate averages
+/// over the gap it actually spans.
+///
+/// Returns `None` unless the query really touches more than one cadence, so
+/// single-sampler queries — the overwhelming majority — are untouched.
+///
+/// Also `None` under [`RateMode::Raw`], which already answers this question
+/// its own way: Raw places points at the real, un-snapped sample
+/// timestamps. Relocating them would contradict that contract, and would
+/// break the query outright — Raw's counter producer reads sample pairs
+/// and ignores supplied points, while the gauge producers honour them, so
+/// a counter-and-gauge expression would have its two sides land on
+/// different instants and intersect nowhere.
+///
+/// `owners` are tables of one recording.
+fn cross_cadence(
+    owners: &[&SamplerReader],
+    step_s: f64,
+    rate_mode: RateMode,
+) -> Option<Arc<[u64]>> {
+    if matches!(rate_mode, RateMode::Raw) {
+        return None;
+    }
+    if owners.len() < 2 {
+        return None;
+    }
+    // Cadence comes from the ROWS, not from `interval()`: that reports
+    // the recording's nominal interval, which every table in an archive
+    // shares — on a real recording a 1 s sampler and a 30 s one both
+    // answered 1.0, so asking it can never detect a cadence difference.
+    // These are the instants the query path reads, nothing having
+    // rounded them.
+    //
+    // Cadence is a property of the SAMPLER, not of a table. Two group
+    // tables of one sampler are read together on one schedule; a group
+    // that dedups or skips ticks is sparse WITHIN that cadence, not a
+    // second cadence, and relocating a query onto its rows would
+    // silently change the answer for a query that merely named a
+    // sibling group's metric.
+    //
+    // So a sampler's cadence is the spacing of its DENSEST
+    // participating table — the one that shows the underlying read
+    // schedule.
+    let mut by_sampler: BTreeMap<&str, (u64, &[u64])> = BTreeMap::new();
+    for t in owners {
+        let ts = t.row_timestamps();
+        let Some(gap) = typical_gap_ns(ts) else {
+            continue;
+        };
+        by_sampler
+            .entry(table_sampler(t.sampler()))
+            .and_modify(|slot| {
+                if gap < slot.0 {
+                    *slot = (gap, ts);
+                }
+            })
+            .or_insert((gap, ts));
+    }
+    if by_sampler.len() < 2 {
+        return None;
+    }
+
+    let fastest = by_sampler.values().map(|(gap, _)| *gap).min()?;
+    let (slowest, timestamps) = by_sampler.into_values().max_by_key(|(gap, _)| *gap)?;
+    // Deliberately a ratio, not equality: gaps measured from real rows
+    // are never exactly equal, so "different cadence" has to mean
+    // *materially* different. A sampler read at least twice as far
+    // apart as another is a different cadence in any sense that matters
+    // here.
+    if slowest < fastest.saturating_mul(2) {
+        return None;
+    }
+    // A slow sampler finer than the step is already oversampled by the
+    // grid; moving off it would only lose points.
+    if (slowest as f64) <= step_s * 1e9 {
+        return None;
+    }
+    Some(timestamps.into())
+}
+
+/// One recording's part of a query: an engine over its tables, its series
+/// carrying the recording's labels, and the tables, for its cross-cadence
+/// timestamps.
+struct Part<'a> {
+    engine: QueryEngine,
+    tables: Vec<&'a SamplerReader>,
+}
+
+impl Part<'_> {
+    /// `opts` with this recording's cross-cadence timestamps, when it has any.
+    fn opts(&self, opts: &QueryOptions, step_s: f64) -> QueryOptions {
+        match cross_cadence(&self.tables, step_s, opts.rate_mode) {
+            // Clone and set the one field: `QueryOptions` is
+            // `#[non_exhaustive]`, so it cannot be built by literal from here
+            // — and cloning preserves whatever else the caller set.
+            Some(points) => opts.clone().with_eval_timestamps(Some(points)),
+            None => opts.clone(),
+        }
+    }
+}
+
+/// The parts that answer a query: one per recording holding a metric it
+/// references, each an engine over that recording's tables.
 ///
 /// Within one recording, tables of different samplers union freely. They
 /// did not always: a query spanning two samplers used to be refused as
@@ -243,17 +272,19 @@ impl<'a> Plan<'a> {
 /// left to protect. Measured, the join costs 1.5–3.0 ms on a 32-core host,
 /// under 1% of a 200 ms interval.
 ///
-/// Across recordings, the recordings' sources are joined side by side: the
-/// same metric in two recordings is two sets of series, told apart by their
-/// recording labels, so `rate(x[1m])` over an archive holding several
-/// producers of one run returns each producer's series, and
-/// `x{source="vllm"}` selects one. A query that combines series of
+/// A query reaching several recordings is evaluated once per recording and
+/// the series concatenated: the same metric in two recordings is two sets
+/// of series, told apart by their recording labels, so `rate(x[1m])` over
+/// an archive holding several producers of one run returns each producer's
+/// series, and `x{source="vllm"}` selects one. Each recording is evaluated
+/// with its own interval (a gauge's staleness) and its own cross-cadence
+/// timestamps, as it would be alone. A query that combines series of
 /// different recordings is refused ([`refuse_combining_across_recordings`]).
 ///
 /// Still refused, within one recording: a metric name held by two tables of
 /// the query (`gpu_nvidia` and `gpu_amd_smi` both publish
 /// `gpu_utilization`). Errors too when the query references no known metric.
-fn route(plan: &Plan<'_>, query: &str) -> Result<QueryEngine, QueryError> {
+fn route<'a>(plan: &Plan<'a>, query: &str) -> Result<Vec<Part<'a>>, QueryError> {
     if plan.owners.is_empty() {
         return Err(QueryError::ParseError(format!(
             "query references no metric present in this .rez: {query}"
@@ -264,34 +295,78 @@ fn route(plan: &Plan<'_>, query: &str) -> Result<QueryEngine, QueryError> {
         refuse_histograms_across_recordings(&recordings, &plan.labels, query)?;
         refuse_combining_across_recordings(plan, &recordings, query)?;
     }
-    let mut sources: Vec<Arc<dyn DataSource>> = Vec::new();
-    for tables in &recordings {
-        if let Some(source) = recording_source(tables, query)? {
-            sources.push(Arc::new(LabeledSource::new(
-                source,
-                plan.labels.of(tables[0]).clone(),
-            )));
+    let mut parts = Vec::new();
+    for tables in recordings {
+        if let Some(source) = recording_source(&tables, query)? {
+            let labeled = LabeledSource::new(source, plan.labels.of(tables[0]).clone());
+            parts.push(Part {
+                engine: QueryEngine::new(Arc::new(labeled)),
+                tables,
+            });
         }
     }
-    let source: Arc<dyn DataSource> = match sources.len() {
+    if parts.is_empty() {
         // A table whose segments have gone since the probe is absent, so its
         // metrics are too: the same error a query naming a metric this
         // archive never held gets.
-        0 => {
-            return Err(QueryError::ParseError(format!(
-                "query references {query}, whose tables have all been evicted since this \
-                 archive was opened"
-            )))
+        return Err(QueryError::ParseError(format!(
+            "query references {query}, whose tables have all been evicted since this \
+             archive was opened"
+        )));
+    }
+    Ok(parts)
+}
+
+/// The recordings' results as one: their series, concatenated.
+fn concatenate(results: Vec<QueryResult>) -> Result<QueryResult, QueryError> {
+    let mut results = results.into_iter();
+    let first = results
+        .next()
+        .ok_or_else(|| QueryError::ParseError("a query answered by no recording".to_string()))?;
+    results.try_fold(first, |acc, next| match (acc, next) {
+        (QueryResult::Matrix { mut result }, QueryResult::Matrix { result: more }) => {
+            result.extend(more);
+            Ok(QueryResult::Matrix { result })
         }
-        1 => sources.pop().expect("one source"),
-        _ => Arc::new(MultiParquetSource {
-            files: sources
-                .into_iter()
-                .map(|s| (s, Labels::default()))
-                .collect(),
-        }),
-    };
-    Ok(QueryEngine::new(source))
+        (QueryResult::Vector { mut result }, QueryResult::Vector { result: more }) => {
+            result.extend(more);
+            Ok(QueryResult::Vector { result })
+        }
+        _ => Err(QueryError::ParseError(
+            "a query over several recordings returns a value per recording that \
+             cannot be listed together; select one recording with a label matcher"
+                .to_string(),
+        )),
+    })
+}
+
+/// [`concatenate`] for display results.
+fn concatenate_display(
+    results: Vec<crate::DisplayResult>,
+) -> Result<crate::DisplayResult, QueryError> {
+    use crate::DisplayResult;
+    let mut results = results.into_iter();
+    let first = results
+        .next()
+        .ok_or_else(|| QueryError::ParseError("a query answered by no recording".to_string()))?;
+    results.try_fold(first, |acc, next| match (acc, next) {
+        (
+            DisplayResult::Series { mut result, budget },
+            DisplayResult::Series { result: more, .. },
+        ) => {
+            result.extend(more);
+            Ok(DisplayResult::Series { result, budget })
+        }
+        (DisplayResult::Vector { mut result }, DisplayResult::Vector { result: more }) => {
+            result.extend(more);
+            Ok(DisplayResult::Vector { result })
+        }
+        _ => Err(QueryError::ParseError(
+            "a query over several recordings returns a value per recording that \
+             cannot be listed together; select one recording with a label matcher"
+                .to_string(),
+        )),
+    })
 }
 
 /// The recordings' label sets, as selectors, for an error message.
@@ -310,51 +385,77 @@ fn recording_selectors(recordings: &[Vec<&SamplerReader>], labels: &SeriesLabels
         .collect()
 }
 
-/// Refuse a query that combines series of different recordings: an
-/// aggregation, or an operator with a selector on both sides, whose
-/// selectors reach more than one recording's tables.
+/// Refuse a query whose result would merge series of different recordings.
 ///
-/// The engine was written for series that share one table's rows, and
-/// combining across recordings breaks that in several ways, each seen on a
-/// test archive: two recordings' rows fall at different instants, so in
-/// `RateMode::Raw` `sum(g)` alternated between them and at the range edges a
-/// grid `sum` read one recording alone; different cadences across
-/// recordings are not aligned (the cross-cadence timestamps answer for one
-/// recording); binary operators match on visible labels only, so twin
-/// recordings (told apart by the internal `__recording__`) paired one's
-/// `g` with the other's `h`; and a lone unmatched series on the right of an
-/// operator is paired with every unmatched series on the left whatever its
-/// recording. Answering these is engine work (recording-aware matching,
-/// alignment per recording, trimmed edges), so until then such a query is
-/// refused, naming the recordings and a matcher that selects one. Each
-/// series on its own (`rate(x[1m])`) is answered across recordings, and
-/// any query narrowed to one recording is answered whole.
+/// A query reaching several recordings is evaluated once per recording
+/// ([`route`]), which is right wherever its result keeps the recordings
+/// apart: each series on its own (`rate(x[1m])`), an aggregation grouped
+/// by every label that differs between them (`sum by (source) (...)`), and a
+/// binary operator matching on all labels (`g / h` pairs within each
+/// recording, since the recording labels differ). It is wrong where the
+/// result merges recordings: an aggregation that drops a differing label
+/// (`sum(x)`, `sum by (cpu) (x)`) or an operator whose `on`/`ignoring`
+/// does (`g / on() h`). Answering those means evaluating across recordings,
+/// and the engine, which assumes a metric's series share one table's rows,
+/// gets that wrong in ways seen on test archives: rows of two recordings
+/// fall at different instants and cadences, binary operators match on
+/// visible labels only (twins, told apart by the internal
+/// `__recording__`, paired one's `g` with the other's `h`), and a lone
+/// unmatched series is paired across recordings. So those are refused,
+/// naming the recordings and the labels to keep, until the engine can.
 fn refuse_combining_across_recordings(
     plan: &Plan<'_>,
     recordings: &[Vec<&SamplerReader>],
     query: &str,
 ) -> Result<(), QueryError> {
-    let combined = crate::promql::combination_sites(query)?
-        .iter()
-        .any(|selectors| recordings_selected(plan, selectors) > 1);
-    if !combined {
-        return Ok(());
+    for (selectors, keeps) in crate::promql::combination_sites(query)? {
+        let reached = recordings_selected(plan, &selectors);
+        if reached.len() < 2 {
+            continue;
+        }
+        let differing = differing_keys(plan, &reached);
+        let dropped: Vec<&String> = differing.iter().filter(|k| !keeps.keeps(k)).collect();
+        if dropped.is_empty() {
+            continue;
+        }
+        let which = recording_selectors(recordings, &plan.labels);
+        let keys: Vec<&str> = dropped.iter().map(|k| k.as_str()).collect();
+        return Err(QueryError::ParseError(format!(
+            "query {query} merges series from {} recordings ({}): it drops the label(s) \
+             {} that tell them apart, and series of different recordings are not \
+             combined yet. Keep them (e.g. sum by ({}) (...)), or select one recording \
+             with a label matcher (e.g. {})",
+            recordings.len(),
+            which.join(", "),
+            keys.join(", "),
+            keys.join(", "),
+            which[0],
+        )));
     }
-    let which = recording_selectors(recordings, &plan.labels);
-    Err(QueryError::ParseError(format!(
-        "query {query} combines series from {} recordings ({}); aggregations and \
-         operators across recordings are not answered yet. Select one recording with \
-         a label matcher (e.g. {}), or query the series without combining them",
-        recordings.len(),
-        which.join(", "),
-        which[0],
-    )))
+    Ok(())
 }
 
-/// How many recordings' tables `selectors` can read: tables of the plan
+/// The labels whose values differ between `reached`'s recordings (a label
+/// one has and another lacks included).
+fn differing_keys(plan: &Plan<'_>, reached: &[&SamplerReader]) -> Vec<String> {
+    let sets: Vec<&metriken_storage::Labels> = reached.iter().map(|t| plan.labels.of(t)).collect();
+    let mut keys: Vec<String> = sets.iter().flat_map(|l| l.inner.keys().cloned()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.retain(|k| {
+        let first = sets[0].inner.get(k);
+        sets.iter().any(|l| l.inner.get(k) != first)
+    });
+    keys
+}
+
+/// One table per recording that `selectors` can read: tables of the plan
 /// holding one of a selector's names under recording labels its matchers
 /// accept.
-fn recordings_selected(plan: &Plan<'_>, selectors: &[crate::promql::Selector]) -> usize {
+fn recordings_selected<'a>(
+    plan: &Plan<'a>,
+    selectors: &[crate::promql::Selector],
+) -> Vec<&'a SamplerReader> {
     let mut seen: Vec<&SamplerReader> = Vec::new();
     for t in &plan.owners {
         let hit = selectors.iter().any(|(names, filter)| {
@@ -365,7 +466,7 @@ fn recordings_selected(plan: &Plan<'_>, selectors: &[crate::promql::Selector]) -
             seen.push(t);
         }
     }
-    seen.len()
+    seen
 }
 
 /// Refuse a query that reads one histogram from several recordings.
@@ -510,18 +611,14 @@ impl MetricsSource for ArchiveReader {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let plan = Plan::new(self, expr)?;
-        let aligned;
-        let opts = match plan.cross_cadence(step_s, opts.rate_mode) {
-            Some(points) => {
-                // Clone and set the one field: `QueryOptions` is
-                // `#[non_exhaustive]`, so it cannot be built by literal from
-                // here — and cloning preserves whatever else the caller set.
-                aligned = opts.clone().with_eval_timestamps(Some(points));
-                &aligned
-            }
-            None => opts,
-        };
-        route(&plan, expr)?.query_range_opts(expr, start_s, end_s, step_s, opts)
+        let results = route(&plan, expr)?
+            .iter()
+            .map(|part| {
+                part.engine
+                    .query_range_opts(expr, start_s, end_s, step_s, &part.opts(opts, step_s))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        concatenate(results)
     }
     /// Routed as [`query_range_opts`](Self::query_range_opts) is, with the
     /// same evaluation timestamps.
@@ -535,18 +632,28 @@ impl MetricsSource for ArchiveReader {
         qopts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
         let plan = Plan::new(self, expr)?;
-        let aligned;
-        let qopts = match plan.cross_cadence(step_s, qopts.rate_mode) {
-            Some(points) => {
-                aligned = qopts.clone().with_eval_timestamps(Some(points));
-                &aligned
-            }
-            None => qopts,
-        };
-        route(&plan, expr)?.query_range_display_opts(expr, start_s, end_s, step_s, opts, qopts)
+        let results = route(&plan, expr)?
+            .iter()
+            .map(|part| {
+                part.engine.query_range_display_opts(
+                    expr,
+                    start_s,
+                    end_s,
+                    step_s,
+                    opts,
+                    &part.opts(qopts, step_s),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        concatenate_display(results)
     }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        route(&Plan::new(self, expr)?, expr)?.query(expr, time)
+        let plan = Plan::new(self, expr)?;
+        let results = route(&plan, expr)?
+            .iter()
+            .map(|part| part.engine.query(expr, time))
+            .collect::<Result<Vec<_>, _>>()?;
+        concatenate(results)
     }
     fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
         // Through the same labelled sources as a query, so a selector
@@ -765,9 +872,10 @@ mod tests {
     }
 
     /// The same metric in two recordings: two sets of series, told apart by
-    /// recording labels. This was refused as cross-recording. Combining
-    /// them is refused until the engine aligns and matches across
-    /// recordings; one recording selected by label is answered whole.
+    /// recording labels. This was refused as cross-recording. A combination
+    /// that keeps the recordings apart is answered per recording; one that
+    /// merges them is refused; one recording selected by label is answered
+    /// whole.
     #[test]
     fn recordings_of_one_run_are_queried_together() {
         let reader = archive(vec![
@@ -804,14 +912,27 @@ mod tests {
             series(&reader, r#"sum(rate(ops{source="vllm"}[3s]))"#),
             [(labels(&[]), 3.0)]
         );
-        for combining in ["sum(rate(ops[3s]))", "sum by (source) (rate(ops[3s]))"] {
-            let err = reader
-                .query_range_opts(combining, 1.0, 10.0, 1.0, &QueryOptions::default())
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("combines series from 2 recordings"), "{err}");
-            assert!(err.contains(r#"{source="rezolus"}"#), "{err}");
-        }
+        // Grouped by the label that tells the recordings apart, a sum is
+        // one per recording.
+        assert_eq!(
+            series(&reader, "sum by (source) (rate(ops[3s]))"),
+            [
+                (labels(&[("source", "rezolus")]), 2.0),
+                (labels(&[("source", "vllm")]), 3.0)
+            ]
+        );
+        let err = reader
+            .query_range_opts(
+                "sum(rate(ops[3s]))",
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merges series from 2 recordings"), "{err}");
+        assert!(err.contains(r#"{source="rezolus"}"#), "{err}");
     }
 
     /// A series' own label under a recording key keeps its value under
@@ -1214,13 +1335,12 @@ mod tests {
         assert!(per_series.iter().any(|s| s.len() == 40), "{per_series:?}");
     }
 
-    /// Combining series of different recordings is refused in every mode:
-    /// aggregations, and operators with a selector on both sides, including
-    /// over twin recordings, where the engine's matching (visible labels
-    /// only) paired one recording's `g` with the other's `h`. A query
-    /// narrowed to one recording, and each series on its own, are answered.
+    /// Across recordings, a combination that keeps them apart is answered
+    /// per recording (a plain operator pairs within each, also for twins
+    /// told apart only by `__recording__`), and one that merges them is
+    /// refused, in every mode.
     #[test]
-    fn combining_across_recordings_is_refused_in_every_mode() {
+    fn only_combinations_that_merge_recordings_are_refused() {
         let both = |source: &'static str, g: u64, h: u64| {
             recording(
                 &[("source", source)],
@@ -1230,30 +1350,152 @@ mod tests {
                 ],
             )
         };
-        for reader in [
-            archive(vec![both("a", 10, 2), both("b", 100, 4)]),
-            archive(vec![both("same", 10, 2), both("same", 100, 4)]),
-        ] {
-            for mode in [RateMode::default(), RateMode::Raw] {
-                for q in ["sum(g)", "g / h", "g / on() h", "max(g) - min(h)"] {
-                    let err = values(&reader, q, mode).unwrap_err();
+        let last = |r: &ArchiveReader, q: &str, mode| -> Vec<f64> {
+            let mut v: Vec<f64> = values(r, q, mode)
+                .unwrap_or_else(|e| panic!("{q}: {e}"))
+                .into_iter()
+                .map(|s| s.last().unwrap().1)
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v
+        };
+        let distinct = archive(vec![both("a", 10, 2), both("b", 100, 4)]);
+        let twins = archive(vec![both("same", 10, 2), both("same", 100, 4)]);
+        for mode in [RateMode::default(), RateMode::Raw] {
+            for reader in [&distinct, &twins] {
+                assert_eq!(last(reader, "g / h", mode), [5.0, 25.0]);
+                assert_eq!(last(reader, "g * 2", mode), [20.0, 200.0]);
+                for q in ["sum(g)", "g / on() h", "max(g) - min(h)"] {
+                    let err = values(reader, q, mode).unwrap_err();
                     assert!(
-                        err.contains("combines series from 2 recordings"),
+                        err.contains("merges series from 2 recordings"),
                         "{q}: {err}"
                     );
                 }
-                assert_eq!(values(&reader, "g", mode).unwrap().len(), 2);
-                assert_eq!(values(&reader, "g * 2", mode).unwrap().len(), 2);
             }
+            assert_eq!(last(&distinct, "sum by (source) (g)", mode), [10.0, 100.0]);
+            assert_eq!(
+                last(&distinct, "sum by (source) (g) / sum by (source) (h)", mode),
+                [5.0, 25.0]
+            );
+            // Twins differ only in `__recording__`, which `by (source)` drops.
+            let err = values(&twins, "sum by (source) (g)", mode).unwrap_err();
+            assert!(err.contains("__recording__"), "{err}");
+            assert_eq!(
+                last(&twins, "sum by (__recording__) (g)", mode),
+                [10.0, 100.0]
+            );
         }
-        let reader = archive(vec![both("a", 10, 2), both("b", 100, 4)]);
-        let ratio = values(
-            &reader,
-            r#"g{source="b"} / h{source="b"}"#,
-            RateMode::default(),
-        )
-        .unwrap();
-        assert_eq!(ratio.len(), 1);
-        assert!(ratio[0].iter().all(|(_, v)| *v == 25.0), "{ratio:?}");
+    }
+
+    /// Each recording is evaluated with its own interval: a gauge of a
+    /// recording that declares 10 s stays as fresh beside a 1 s recording
+    /// as alone. Joined into one source, it went stale after the fast
+    /// recording's 1 s.
+    #[test]
+    fn each_recording_keeps_its_own_interval() {
+        let fast = || {
+            recording(
+                &[("source", "a")],
+                vec![("t", declared_table("g", &gauge_rows(1, 40, 1, 10), 1000))],
+            )
+        };
+        let slow = || {
+            recording(
+                &[("source", "b")],
+                vec![(
+                    "t",
+                    declared_table("g", &gauge_rows(1, 40, 10, 100), 10_000),
+                )],
+            )
+        };
+        let alone = archive(vec![slow()]);
+        let joined = archive(vec![fast(), slow()]);
+        let points = |r: &ArchiveReader, q: &str| -> usize {
+            values(r, q, RateMode::default())
+                .unwrap()
+                .iter()
+                .map(|s| s.len())
+                .max()
+                .unwrap()
+        };
+        assert_eq!(points(&joined, r#"g{source="b"}"#), points(&alone, "g"),);
+        let QueryResult::Matrix { result } = joined
+            .query_range_opts("g", 1.0, 40.0, 1.0, &QueryOptions::default())
+            .unwrap()
+        else {
+            panic!("not a matrix");
+        };
+        let b = result
+            .iter()
+            .find(|m| m.metric.get("source").map(String::as_str) == Some("b"))
+            .unwrap();
+        assert_eq!(b.values.len(), points(&alone, "g"));
+        let QueryResult::Vector { result } = joined.query("g", Some(25.0)).unwrap() else {
+            panic!("not a vector");
+        };
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    /// A name that is a gauge in one recording and a counter in another is
+    /// an error for the recording that reads it wrong, not a silent drop.
+    #[test]
+    fn a_name_of_two_kinds_across_recordings_is_an_error() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("t", explicit_table("m", "gauge", &gauge_rows(1, 40, 1, 10)))],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![(
+                    "t",
+                    explicit_table("m", "counter", &gauge_rows(1, 40, 1, 10)),
+                )],
+            ),
+        ]);
+        assert!(values(&reader, "m", RateMode::default()).is_err());
+        assert!(values(&reader, "rate(m[3s])", RateMode::default()).is_err());
+        assert_eq!(
+            values(&reader, r#"m{source="a"}"#, RateMode::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A gauge table declaring its sampling interval.
+    fn declared_table(name: &str, rows: &[(u64, u64)], interval_ms: u64) -> Vec<u8> {
+        use arrow::array::{ArrayRef, Int64Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+        let mut meta = HashMap::new();
+        meta.insert("metric".to_string(), name.to_string());
+        meta.insert("metric_type".to_string(), "gauge".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new(name, DataType::Int64, true).with_metadata(meta),
+        ]));
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue {
+                key: "sampling_interval_ms".to_string(),
+                value: Some(interval_ms.to_string()),
+            }]))
+            .build();
+        let ts: ArrayRef = Arc::new(UInt64Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        ));
+        let values: ArrayRef = Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.1 as i64).collect::<Vec<_>>(),
+        ));
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        w.write(&RecordBatch::try_new(schema, vec![ts, values]).unwrap())
+            .unwrap();
+        w.close().unwrap();
+        buf
     }
 }

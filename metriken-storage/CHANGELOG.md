@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   further when `exported_<key>` is taken), as Prometheus does for a scraped
   target with `honor_labels: false`; a filter on `<key>` matches the added
   value and one on `exported_<key>` the series' own. `add_labels`,
-  `translate_filter`, `keeps`, `EXPORTED_PREFIX` and `RECORDING_LABEL`
+  `add_labels_map`, `translate_filter`, `keeps`, `EXPORTED_PREFIX` and
+  `RECORDING_LABEL`
   (`__recording__`) are public with it.
 - `SamplerReader::recording_labels`, `same_recording`, `holds` and
   `holds_histogram`, and `ArchiveReader::series_labels` (a

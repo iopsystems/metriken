@@ -708,10 +708,11 @@ Open sub-questions:
    time ranges overlap.
 6. The cross-cadence evaluation timestamps in a combined view, where each
    recording has its own row times.
-   Decided 2026-10-13 (after five reviews): the timestamps answer for one
-   recording, and a query that combines series of different recordings is
-   refused until the engine aligns and matches across recordings. See
-   "Series labels, as built".
+   Decided 2026-10-13 (after six reviews): a query reaching several
+   recordings is evaluated once per recording, each with its own
+   cross-cadence timestamps, and one whose result would merge recordings is
+   refused until the engine aligns and matches across them. See "Series
+   labels, as built".
 7. Whether `rezolus mcp`, which refuses a multi-recording archive without
    `--recording` today, reads the combined source by default.
 8. (Added 2026-10-12 with Q12.) How a template instance's queries are
@@ -747,66 +748,75 @@ metriken-query, unreleased):
   `exported_<key>` is decided on the relabelled series (a scan declines
   then, and a histogram drops the rows), because whether a series has
   `exported_<key>` depends on both values.
-- metriken-query `route()` groups the tables a query names by recording,
+- metriken-query `route()` groups the tables a query names by recording and
   builds each recording's source as before (the table, or a `try_new`
-  union that still refuses a name two samplers share), wraps it in
-  `LabeledSource`, and joins several recordings through
-  `MultiParquetSource`. `columns` resolves through the same wrapper. The
-  cross-recording refusal is gone.
-- Combining across recordings (decided 2026-10-13: refused in this
-  change; answering it is a separate engine change). The engine assumes a
-  metric's series share one table's rows, and each review of this branch
-  found another way that assumption fails across recordings, each seen on
-  a test archive:
+  union that still refuses a name two samplers share), wrapped in
+  `LabeledSource`, one engine per recording. `columns` resolves through the
+  same wrapper. The cross-recording refusal is gone.
+- Queries across recordings (decided 2026-10-13, after six reviews). The
+  engine assumes a metric's series share one table's rows, and each review
+  found another way that fails when one query's series come from several
+  recordings, each seen on a test archive:
   - Rows fall at different instants: in `RateMode::Raw`, `sum(g)` over two
     recordings half an interval apart alternated 10, 100, 10, 100 where it
     should read 110; on the grid, a `sum` at the range edges read only the
     recording that had a row there.
   - Cadences differ: with a 1 s and a 10 s recording, a grid `sum(g)` read
-    110 only at the slow rows and 10 between. Applying the cross-cadence
-    timestamps across recordings fixed that case and broke others: a slow
-    recording starting halfway cut a fast recording's series to 2 of 40
-    points, and the check had to use the slow table's rows, not the
-    recording's span.
+    110 only at the slow rows and 10 between; applying the cross-cadence
+    timestamps across recordings fixed that and cut a partly overlapping
+    recording's series to 2 of 40 points.
+  - Intervals differ: one joined source reports the fastest recording's
+    interval, and a gauge's staleness follows it, so a 10 s recording's
+    gauge was dropped between its rows beside a 1 s recording (8 of 40
+    points), also for a query combining nothing.
   - Matching: binary operators match on visible labels only
     (`streaming/binary.rs`, `match_key`), so twin recordings, told apart by
-    the internal `__recording__`, paired one's `g` with the other's `h`
-    and dropped the second ratio; and a lone unmatched series on the right
-    is paired with every unmatched series on the left whatever its
-    recording, so with ragged label sets (different CPU counts per host)
-    `rate(g) / rate(h)` divided recording a's `g` by recording b's `h`.
+    the internal `__recording__`, paired one's `g` with the other's `h`;
+    and a lone unmatched series on the right is paired with every unmatched
+    series on the left, whatever its recording.
+  - Kinds: a name that is a gauge in one recording and a counter in
+    another read one recording's series and dropped the other's silently.
   - Histogram functions pool each row of the series they select, so a
     histogram from two recordings alternated between them.
-  So a query whose aggregations, or whose operators with a selector on
-  both sides, reach more than one recording is refused, naming the
-  recordings and a matcher (`promql::combination_sites`,
-  `refuse_combining_across_recordings`); so is a histogram read from more
-  than one. Each series on its own (`rate(x[1m])`) is answered across
-  recordings, and a query narrowed to one recording by a matcher is
-  answered whole, with its cross-cadence alignment: what a template
-  instance per source needs (sub-question 8). The engine change that would
-  answer combinations: recording identity in binary-operator matching, no
-  broadcast across recordings, alignment per recording (or onto the slow
-  recording's rows where they cover the others), and trimmed range edges.
-  A rule that answered `sum by (source)` and per-recording `g / h` was
-  built and reviewed twice before this; it failed on the matching cases
-  above.
+  As built: a query reaching several recordings is evaluated once per
+  recording (`route` returns a `Part` per recording, each an engine over
+  that recording's labelled tables with its own interval and cross-cadence
+  timestamps) and the series concatenated, so every failure above that
+  came from one engine seeing two recordings is gone: per-series queries,
+  `sum by (source)`, and plain operators (which pair within a recording)
+  are answered as each recording would answer alone, and a kind clash is
+  that recording's error. Refused, because the per-recording results would
+  have to merge: an aggregation that drops a label whose value differs
+  between the recordings it reaches (`sum(x)`, `sum by (cpu) (x)`, `sum by
+  (source)` over twins), an operator whose `on`/`ignoring` drops one, and a
+  histogram from several recordings (`promql::combination_sites` with the
+  labels each site keeps, `refuse_combining_across_recordings`,
+  `refuse_histograms_across_recordings`). A matcher on a label only some
+  recordings carry (`g{host="h1"}` where one recording has no `host`)
+  counts the others as reached, so `sum(g{host="h1"})` is refused although
+  it reads one recording; this over-refuses and answers nothing wrong. The
+  engine change that would answer the refused queries: recording identity
+  in binary-operator matching, no broadcast across recordings, alignment
+  across recordings (onto the slow recording's rows where they cover the
+  others), per-series staleness, and trimmed range edges.
 - Each query works out its owning tables and the recordings' labels once
   (`Plan`), shared by routing, the refusals, the cross-cadence timestamps
   and `columns`.
-- `owners()` leaves out a table when no selector naming one of its
+- `Plan::new` leaves out a table when no selector naming one of its
   metrics can match its recording's labels (`translate_filter` against
   `series_labels`); when that leaves none, the first recording's tables
   answer, empty, so
   `x{source="a"}` neither opens recording b's tables nor loses recording
   a's cross-cadence alignment.
-- `HistogramStream::merge`, which `MultiParquetSource` uses to join
-  recordings, decoded every stream under the first stream's bucket
-  configuration (a `debug_assert!` only). Two recordings of `lat` at
-  grouping power 3 and 7 panicked a debug build and, in release, read the
-  second recording's buckets as other buckets. It now leaves out streams of
-  another configuration with a warning, as a table's `__run__`s are split.
-  Found in review; for an archive, the refusal below now decides first.
+- `HistogramStream::merge`, which `MultiParquetSource` uses to join its
+  files (and, in an earlier version of this branch, recordings), decoded
+  every stream under the first stream's bucket configuration (a
+  `debug_assert!` only). Two recordings of `lat` at grouping power 3 and 7
+  panicked a debug build and, in release, read the second recording's
+  buckets as other buckets. It now leaves out streams of another
+  configuration with a warning, as a table's `__run__`s are split. Found in
+  review; archives no longer join recordings through it, and the fix stays
+  for multi-file parquet readers.
 - A query that reads one histogram from several recordings is refused,
   naming the recordings and a matcher to use (`lat{source="a"}`). The
   histogram functions pool each row of the series they select
@@ -822,18 +832,21 @@ metriken-query, unreleased):
   (`labels::match_pattern`), so `source=~"a|b"` works and `source=~"a.*"`
   matches nothing, as for any label.
 - Tests: metriken-query `archive::tests` (one recording carries its
-  labels; two recordings queried together, by `source=`, `!=`, `=~`,
-  `sum`, `sum by`; the `exported_` rename and its matchers; identical label
-  sets; the shared-name refusal; `columns`; cross-cadence from one
-  recording only; a partly overlapping recording read at full resolution;
-  combining refused in both modes, twins included) and metriken-storage
+  labels; two recordings: per-series queries, by `source=`, `!=`, `=~`,
+  `sum by (source)` answered and `sum` refused; the `exported_` rename and
+  its matchers; identical label sets; the shared-name refusal; `columns`;
+  cross-cadence from one recording only; a partly overlapping recording
+  read at full resolution; which combinations are answered and refused in
+  both modes, twins included; each recording's own interval; a name of
+  two kinds) and metriken-storage
   `labeled::tests`. Seen red: no
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
   the clashing value dropped, cross-cadence across recordings, the merge
   mixing configurations, no owner pruning, `__recording__` by position, no
   chained prefix, no histogram refusal, catalog indices kept when
   flattened twins repeat one, twins only among recordings with tables, no
-  combining refusal, binary operators not counted as combining.
+  refusal of merging combinations, every cross-recording combination
+  refused, the slow recording read at a 1 s interval.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
@@ -851,9 +864,6 @@ metriken-query, unreleased):
   against 40.6 and 44.4 ms, 24.2 and 24.4 ms against 24.3 and 24.9 ms,
   396.6 and 399.8 ms against 400.1 and 401.9 ms for the same three
   queries.
-- Joined recordings take the per-series rate path: `MultiParquetSource`
-  does not implement `counter_scan`, so a per-series query reading two
-  recordings skips `batch_rates`. Not measured.
 - The engine's binary operators would pair series across recordings
   (`rate(x[3s]) / rate(y[3s])` with `x` only in `source=a` and `y` only in
   `source=b` returned one series labelled `source=a`, where Prometheus

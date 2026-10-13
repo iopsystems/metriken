@@ -76,11 +76,43 @@ pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
 /// A selector: the metric names it can select and its matchers as a filter.
 pub(crate) type Selector = (HashSet<String>, Labels);
 
-/// The selectors of every place `query` combines series: an aggregation
-/// (the selectors of its operand) and a binary operator with a selector on
-/// both sides (the selectors of both). For a reader that has to know which
-/// of them reach more than one of its recordings.
-pub(crate) fn combination_sites(query: &str) -> Result<Vec<Vec<Selector>>, QueryError> {
+/// Which labels of the series it combines a combination keeps apart: an
+/// aggregation's grouping, or a binary operator's matching.
+pub(crate) enum Keeps {
+    /// Every label: a binary operator with no `on`/`ignoring`.
+    All,
+    /// Only these: `by (...)`, `on (...)`.
+    Only(HashSet<String>),
+    /// All but these: `without (...)`, `ignoring (...)`.
+    AllBut(HashSet<String>),
+}
+
+impl Keeps {
+    /// Whether series that differ in `key` stay apart.
+    pub(crate) fn keeps(&self, key: &str) -> bool {
+        match self {
+            Keeps::All => true,
+            Keeps::Only(keys) => keys.contains(key),
+            Keeps::AllBut(keys) => !keys.contains(key),
+        }
+    }
+
+    fn of(modifier: Option<&parser::LabelModifier>, default: Keeps) -> Keeps {
+        let set = |l: &promql_parser::label::Labels| l.labels.iter().cloned().collect();
+        match modifier {
+            None => default,
+            Some(parser::LabelModifier::Include(l)) => Keeps::Only(set(l)),
+            Some(parser::LabelModifier::Exclude(l)) => Keeps::AllBut(set(l)),
+        }
+    }
+}
+
+/// Every place `query` combines series: an aggregation (the selectors of
+/// its operand) and a binary operator with a selector on both sides (the
+/// selectors of both), each with the labels it keeps apart. For a reader
+/// that evaluates a query once per recording and must know where the
+/// result would merge series of different recordings.
+pub(crate) fn combination_sites(query: &str) -> Result<Vec<(Vec<Selector>, Keeps)>, QueryError> {
     let stripped = strip_rezolus_wrapper(query)?;
     let expr = parser::parse(stripped)
         .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
@@ -95,17 +127,20 @@ fn selectors_of(expr: &Expr) -> Vec<Selector> {
     out
 }
 
-fn walk_combinations(expr: &Expr, out: &mut Vec<Vec<Selector>>) {
+fn walk_combinations(expr: &Expr, out: &mut Vec<(Vec<Selector>, Keeps)>) {
     match expr {
         Expr::Aggregate(agg) => {
-            out.push(selectors_of(&agg.expr));
+            // No grouping keeps nothing apart: `sum(x)` is one series.
+            let keeps = Keeps::of(agg.modifier.as_ref(), Keeps::Only(HashSet::new()));
+            out.push((selectors_of(&agg.expr), keeps));
             walk_combinations(&agg.expr, out);
         }
         Expr::Binary(b) => {
             let (mut lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
             if !lhs.is_empty() && !rhs.is_empty() {
                 lhs.extend(rhs);
-                out.push(lhs);
+                let matching = b.modifier.as_ref().and_then(|m| m.matching.as_ref());
+                out.push((lhs, Keeps::of(matching, Keeps::All)));
             }
             walk_combinations(&b.lhs, out);
             walk_combinations(&b.rhs, out);
