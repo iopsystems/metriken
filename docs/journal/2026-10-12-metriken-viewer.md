@@ -787,8 +787,13 @@ metriken-query, unreleased):
   are answered as each recording would answer alone, and a kind clash is
   that recording's error. A recording lacking a metric the query names is
   left out (`g / h` on a host with no `h` answers for the others, as a
-  Prometheus pair with no match does); when no one recording holds every
-  metric named (`x` only in a, `y` only in b, `x / y`), the error says so.
+  Prometheus pair with no match does); when no recording is left (`x` only
+  in a, `y` only in b, `x / y`; or a matcher keeping only the recording
+  lacking `x`), the answer is empty, as in Prometheus. An instant query
+  without a time reads every recording at the archive's end (the ninth
+  review found each recording read at its own last row). Within a recording
+  the engine's operator rules apply unchanged, including its pairing of a
+  single right-hand series with every left-hand one.
   Refused, because the per-recording results would have to merge: an
   aggregation, or an operator's `on`/`ignoring`, whose kept labels no
   longer tell the recordings it reaches apart (`sum(x)`, `sum by (cpu)
@@ -881,7 +886,8 @@ metriken-query, unreleased):
   refusal of merging combinations, every cross-recording combination
   refused, the slow recording read at a 1 s interval, incomplete recordings
   kept, refusal whenever a differing label is dropped, side groupings
-  ignored, `without` keeping internal labels, no shared-label-set check.
+  ignored, `without` keeping internal labels, no shared-label-set check,
+  each recording's own default instant.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
@@ -903,7 +909,7 @@ metriken-query, unreleased):
   (`rate(x[3s]) / rate(y[3s])` with `x` only in `source=a` and `y` only in
   `source=b` returned one series labelled `source=a`, where Prometheus
   returns nothing); evaluated per recording, neither recording holds both,
-  and the query is an error saying so.
+  and the answer is empty.
 - What this changes for rezolus, on the release: series of every archive
   carry `source` and `host` (and `__recording__`, `exported_<key>` where
   they apply), and the cross-recording refusal its tests assert is gone.

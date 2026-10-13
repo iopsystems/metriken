@@ -64,8 +64,9 @@ pub fn eval_timestamps_for(
 struct Plan<'a> {
     owners: Vec<&'a SamplerReader>,
     labels: &'a SeriesLabels,
-    /// The metric names the query references.
-    referenced: Vec<String>,
+    /// The metric names the query references that some table of the
+    /// archive holds (before pruning).
+    held: Vec<String>,
 }
 
 impl<'a> Plan<'a> {
@@ -110,10 +111,14 @@ impl<'a> Plan<'a> {
             true => all.first().is_some_and(|first| first.same_recording(t)),
         };
         let owners = all.iter().copied().filter(keep).collect();
+        let held = referenced
+            .into_iter()
+            .filter(|n| all.iter().any(|t| t.holds(n)))
+            .collect();
         Ok(Self {
             owners,
             labels,
-            referenced,
+            held,
         })
     }
 
@@ -260,8 +265,9 @@ impl Part<'_> {
     }
 }
 
-/// The parts that answer a query: one per recording holding a metric it
-/// references, each an engine over that recording's tables.
+/// The parts that answer a query: one per recording holding the metrics it
+/// references, each an engine over that recording's tables. No parts means
+/// the answer is empty.
 ///
 /// Within one recording, tables of different samplers union freely. They
 /// did not always: a query spanning two samplers used to be refused as
@@ -290,32 +296,21 @@ fn route<'a>(plan: &Plan<'a>, query: &str) -> Result<Vec<Part<'a>>, QueryError> 
             "query references no metric present in this .rez: {query}"
         )));
     }
-    let mut recordings = plan.recordings();
-    if recordings.len() > 1 {
-        // A recording lacking a metric the query names answers nothing
-        // (`g / h` on a host with no `h`), as Prometheus answers a pair with
-        // no match; alone it is "metric not found", which would fail the
-        // whole query for every other recording.
-        let holds_all = |tables: &Vec<&SamplerReader>| {
-            plan.referenced
-                .iter()
-                .all(|n| tables.iter().any(|t| t.holds(n)))
-        };
-        let complete: Vec<Vec<&SamplerReader>> = recordings
-            .iter()
-            .filter(|r| holds_all(r))
-            .cloned()
-            .collect();
-        if complete.is_empty() {
-            let which = recording_selectors(&recordings, plan.labels);
-            return Err(QueryError::ParseError(format!(
-                "query {query} names metrics that no one recording holds all of ({}); a \
-                 query is answered within each recording, and series of different \
-                 recordings are not combined yet",
-                which.join(", ")
-            )));
-        }
-        recordings = complete;
+    // A recording lacking a metric the query names, that the archive holds
+    // elsewhere, answers nothing (`g / h` on a host with no `h`), as
+    // Prometheus answers a pair with no match; evaluated, it would be
+    // "metric not found" and fail the query for every other recording. With
+    // none left (`x / y`, `x` only in one recording and `y` only in
+    // another; or a matcher that keeps the one recording lacking `x`), the
+    // answer is empty. A name the archive holds nowhere is left to the
+    // engine's error, as for one recording.
+    let recordings: Vec<Vec<&SamplerReader>> = plan
+        .recordings()
+        .into_iter()
+        .filter(|tables| plan.held.iter().all(|n| tables.iter().any(|t| t.holds(n))))
+        .collect();
+    if recordings.is_empty() {
+        return Ok(Vec::new());
     }
     if recordings.len() > 1 {
         refuse_histograms_across_recordings(&recordings, plan.labels, query)?;
@@ -741,6 +736,9 @@ impl MetricsSource for ArchiveReader {
                     .query_range_opts(expr, start_s, end_s, step_s, &part.opts(opts, step_s))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if results.is_empty() {
+            return Ok(QueryResult::Matrix { result: Vec::new() });
+        }
         concatenate(results)
     }
     /// Routed as [`query_range_opts`](Self::query_range_opts) is, with the
@@ -768,14 +766,31 @@ impl MetricsSource for ArchiveReader {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if results.is_empty() {
+            return Ok(crate::DisplayResult::Series {
+                result: Vec::new(),
+                budget: opts.budget as u32,
+            });
+        }
         concatenate_display(results)
     }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
         let plan = Plan::new(self, expr)?;
-        let results = route(&plan, expr)?
+        let parts = route(&plan, expr)?;
+        // One instant for every recording: each engine's own default would
+        // be its recording's last row, not the archive's.
+        let time = time.or_else(|| {
+            (parts.len() > 1)
+                .then(|| ArchiveReader::time_range_ns(self).map(|(_, end)| end as f64 / 1e9))
+                .flatten()
+        });
+        let results = parts
             .iter()
             .map(|part| part.engine.query(expr, time))
             .collect::<Result<Vec<_>, _>>()?;
+        if results.is_empty() {
+            return Ok(QueryResult::Vector { result: Vec::new() });
+        }
         concatenate(results)
     }
     fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
@@ -1658,7 +1673,7 @@ mod tests {
 
     /// A recording lacking an operand answers nothing for the query, as a
     /// pair with no match does; the others answer. When no one recording
-    /// holds every metric named, the error says so.
+    /// holds every metric named, the answer is empty.
     #[test]
     fn a_recording_lacking_an_operand_is_left_out() {
         let reader = archive(vec![
@@ -1677,8 +1692,14 @@ mod tests {
             recording(&[("source", "a")], vec![("t", gauge("x", 10))]),
             recording(&[("source", "b")], vec![("t", gauge("y", 2))]),
         ]);
-        let err = values(&split, "x / y", RateMode::default()).unwrap_err();
-        assert!(err.contains("no one recording holds all"), "{err}");
+        // No one recording holds both: empty, as Prometheus answers it.
+        assert!(values(&split, "x / y", RateMode::default())
+            .unwrap()
+            .is_empty());
+        // A matcher keeping only the recording that lacks `x`: empty too.
+        assert!(values(&split, r#"x{source="b"} + y"#, RateMode::default())
+            .unwrap()
+            .is_empty());
     }
 
     /// Recordings that differ in more than one label: a combination is
@@ -1800,5 +1821,26 @@ mod tests {
                 "{q}: {err}"
             );
         }
+    }
+
+    /// An instant query without a time reads every recording at the
+    /// archive's end, not each at its own last row.
+    #[test]
+    fn an_instant_query_reads_every_recording_at_one_time() {
+        let reader = archive(vec![
+            recording(&[("source", "a")], vec![("t", gauge("g", 10))]),
+            recording(
+                &[("source", "b")],
+                vec![(
+                    "t",
+                    explicit_table("g", "gauge", &gauge_rows(1, 20, 1, 100)),
+                )],
+            ),
+        ]);
+        let QueryResult::Vector { result } = reader.query("g", None).unwrap() else {
+            panic!("not a vector");
+        };
+        let times: Vec<f64> = result.iter().map(|s| s.value.0).collect();
+        assert!(times.windows(2).all(|w| w[0] == w[1]), "{times:?}");
     }
 }

@@ -22,10 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value under `exported_<key>`; recordings with identical label sets get
   `__recording__` (their catalog index) so their series stay apart. A
   recording whose labels no selector of the query can match is left out
-  first, and one lacking a metric the query names contributes nothing (as
-  a pair with no match), so one host without a sampler does not fail a
-  ratio for the others; when no one recording holds every metric named, the
-  error says so. `columns` resolves through the same labels.
+  first, and one lacking a metric the query names that the archive holds
+  elsewhere contributes nothing (as a pair with no match), so one host
+  without a sampler does not fail a ratio for the others; when no recording
+  is left, the answer is empty. An instant query without a time reads every
+  recording at the archive's end. Within a recording the engine's own
+  operator rules apply unchanged, including pairing a single right-hand
+  series with every left-hand one (`rate(c) / sum by (source) (rate(c))` is
+  each series' share of its recording's total, where Prometheus would
+  return nothing). `columns` resolves through the same labels.
 - A query whose result would merge series of different recordings is
   refused, naming the recordings and the labels to keep: an aggregation, or
   an operator's `on`/`ignoring`, whose kept labels no longer tell the
