@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-recorder 0.1.0
+
+- **Added:** a new crate that records metriken producers into one `.dendro`
+  archive through metriken-storage's `ArchiveWriter`: a producer's
+  `/metrics/stream`, Prometheus text scraped as one acquisition group per
+  scrape, and local sources the caller takes passes of
+  (`RegistrySource`, feature `registry`). `detect` decides how each
+  endpoint is recorded (its stream first, then the caller's `Probe` hook,
+  then Prometheus); `Recorder` runs the aligned tick, reconnects, refuses an
+  endpoint mid-run, writes producer restarts into the metadata, applies
+  retention, and reports `Event`s and a `Summary`; it never exits the
+  process. Feature `http` (default) brings reqwest over a caller-built
+  `Client`; without `registry` the crate does not depend on `metriken`.
+  Design: `docs/journal/2026-10-12-metriken-recorder.md`.
+
 ### metriken-query 0.36.1
 
 - **Fixed:** the histogram functions (`histogram_quantile(s)`,
