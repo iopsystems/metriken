@@ -1,6 +1,7 @@
 # metriken-recorder: one recorder for every metriken producer
 
-**Status:** OPEN. Design 2026-10-12. This is path step 4 of
+**Status:** OPEN. Design 2026-10-12; the crate built 2026-10-12 (order of
+work step 3, see Built below), not yet released. This is path step 4 of
 [one recording stack](2026-10-08-one-recording-stack.md) (piece 2). "Step N
 below" means this entry's own order of work. Decided 2026-10-12:
 
@@ -159,7 +160,8 @@ endpoint. An endpoint whose path is `/` or `/metrics/stream`:
 2. Otherwise (404, 409, a foreign content type, a 5xx, a handshake timeout,
    a connection error) ask the caller's probe hook, passing the stream
    route's answer as a `StreamAnswer` (`Status(u16)`, `ContentType(String)`,
-   `Timeout`, `Unreachable`), so the hook does not parse error text.
+   `Malformed(String)` (added 2026-10-12, rezolus #1447), `Timeout`,
+   `Unreachable`), so the hook does not parse error text.
    rezolus's hook identifies a rezolus agent by `/status`, else the `/`
    banner, which every agent serves (`mod.rs:441-447`). For an agent it
    returns `Pending` on a 5xx, a timeout or a connection error, retried each
@@ -375,6 +377,102 @@ The clap and TOML CLI, `-- cmd`, signals and exit codes; the probe hook
 for an agent that cannot stream; the legacy wire names, passed through the
 config; hindsight's dumps and the live reader.
 
+## Built (2026-10-12)
+
+The crate is `metriken-recorder/` on metriken branch
+`feat/metriken-recorder`, version 0.1.0, unreleased. rezolus `record`,
+hindsight and the live viewer run over it on a local rezolus branch,
+`feat/record-over-metriken-recorder`, building against the metriken branch
+through `[patch.crates-io]` (not committed).
+
+### Gaps settled in rezolus #1447, carried into the crate
+
+- `StreamAnswer::Malformed(String)`: a success in an accepted content type
+  whose first frame does not decode, is not a handshake, or does not apply.
+  It is not transient.
+- `StreamAnswer::is_transient` is true for a 5xx, 408, 429, a timeout and a
+  connection failure. The retry split on a reconnect, `NoProbe` and
+  rezolus's hook all read it.
+- An agent's `source` comes from the hook as a label (rezolus's `enrich`
+  returns `source=rezolus`) and ranks below the handshake's `source`: user,
+  handshake, hook, inferred.
+- An endpoint declared `Transport::Stream` whose hook says `Scrape` is
+  refused, quoting the route's answer, unless the answer is transient, when
+  it is pending. It is never scraped.
+- A scraped endpoint, declared `Prometheus` or at a path other than `/` and
+  `/metrics/stream`, is active only once its URL answers 2xx; until then it
+  is pending.
+- Late detection and `enrich` run off the tick, one task in flight per
+  endpoint; the tick that consumes a `Pending` starts the next detection.
+- rezolus's `enrich` returns `Retry` while neither `/status` nor `/`
+  answers.
+- The caller's metadata keys (the endpoint's `metadata`, and every key passed
+  to `patch_metadata`) are pinned: a restart does not replace them, and a
+  scraped source's HELP text does not replace a caller's `descriptions`.
+- `producer_epoch` and `producer_epochs` are refused as caller metadata
+  (`StartError::Reserved`); rezolus refuses `--metadata` with either key
+  earlier, at argument parsing.
+
+### API as built, against the sketch
+
+- `Detected::Streamed { spec, subscription: Box<Subscription> }`: the
+  handshake is `subscription.handshake()`, not a second field.
+  `Detected::Scraped { spec, url }` carries the URL scraped (`/metrics` for
+  a root URL). `Detected::Pending { spec, reason }` carries the line
+  rezolus logs.
+- `RecorderConfig` gains `events` (the channel's capacity) and
+  `RecorderConfig::new(path, interval)`, whose timeout is
+  `default_timeout(interval)`: twice the interval, between 2 s and 10 s.
+- `Recorder::start_local(cfg, local)` records local sources with no HTTP
+  client, and is the only constructor without feature `http`. `Probe`,
+  `NoProbe`, `detect` and `EndpointSpec` are behind `http`, since they name
+  `url::Url`.
+- `Recorder::discard` is `async`: it waits for the writer thread to join
+  before removing the archive and its sidecars.
+- `Event::Active` carries `name` (the recording's `source`) and `inferred`
+  (nobody named it), so rezolus prints its "no source name specified"
+  warning. `Pending`, `Dropped` and `Refused` carry `reason`;
+  `Reconnected` carries `epoch` and `restarted`; `Gap` carries the `seq`
+  jumped to. `Event::Restarted { source, epoch, version }` is new: rezolus
+  logs "now records the agent restart" from it, and its tests wait for that
+  line. Only `Frame`, `Gap` and `Committed` are dropped when the channel is
+  full; every other event is awaited.
+- `Summary { sources: Vec<SourceSummary>, discarded }`. A `SourceSummary`
+  has the endpoint, the recording's name, `SourceState { Pending,
+  Activating, Active, Refused }`, the transport, `passes_total`, and the
+  first and last wall clock a frame, scrape or pass arrived. rezolus's
+  end-of-run lines (refused mid-run, never recordable, metadata not
+  arrived) are built from it.
+- `SourceIdentity` gains `epoch: Option<String>`, written as
+  `producer_epoch`. A local source is named by its `source` label, else
+  `local`. `RegistrySource` (feature `registry`) is a `LocalSource` over a
+  `GroupBuilder`, with the process's anchor and epoch from
+  `metriken::epoch`.
+- `pump(idx, subscription, client, base, PumpConfig, tx)` and
+  `StreamEvent::Connected(Handshake)` are public, for a caller that drives
+  one stream itself; rezolus's agent tests use them.
+- Restart patching is generic (`restart::metadata_patch`): every key the new
+  process reports, its handshake's metadata under the hook's reply, is
+  merged with the hook's `merge`, except the recorder's four (`source`,
+  `sampling_interval_ms`, `producer_epoch`, `producer_epochs`) and the
+  pinned keys. `version` also goes into the new `producer_epochs` entry.
+  rezolus's `restart::Agent` (version, systeminfo, descriptions) is gone;
+  its `merge` unions `descriptions` as before.
+
+### Found while building
+
+- A tick that overruns its interval (a scrape that takes longer than the
+  interval, a slow commit) is ready again as soon as it ends, because the
+  missed tick fires at once. With the tick ranked above commands, `finish`
+  then waited behind every later tick. Commands that arrive during a tick
+  are now taken after it. The test is
+  `a_tick_that_overruns_its_interval_does_not_hold_off_finish`.
+- The identical-labels warning compares label sets only. rezolus's second
+  warning, for label sets that differ only in case and so seal in lockstep
+  (`seal_policy::staggers_identically`, a `rez` function), is not carried.
+- The library's log lines say "producer" where rezolus's said "agent".
+  rezolus prints its own lines for the events its tests read.
+
 ## GO / NO-GO
 
 GO when all hold:
@@ -407,6 +505,31 @@ GO when all hold:
    commit before step 2: a build fails when a median is more than 5% worse
    and the ranges do not overlap (the storage scan's rule). The harness is
    committed in rezolus with the change.
+
+Status 2026-10-12, on the branches above (macOS; Linux-only tests not run):
+
+- Check 1, record part, holds: `tests/record_lifecycle.rs` 31 of 31,
+  `tests/hindsight_dump.rs` 14 of 14, and rezolus's workspace suite passes
+  with `record`, hindsight and the live viewer on `Recorder`. No test
+  expectation changed; rezolus unit tests of code that moved were removed
+  and are covered by the crate's tests, except the case-only label warning
+  above.
+- Check 3 holds in the crate's tests (`tests/recorder.rs`): a stream-only
+  producer is streamed, a Prometheus root is scraped at `/metrics`, an agent
+  older than the stream is refused at startup and on activation (the rest
+  recorded and finalized), each through a test probe shaped like rezolus's.
+- Check 4 holds against an in-process producer whose handshake names
+  `source=cachecannon` and `version`; not run against cachecannon itself.
+- Check 5 holds: with default features and with `--no-default-features
+  --features http`, `cargo tree -e normal` lists no `metriken`,
+  `metriken-core` or `linkme`; feature `registry` adds them.
+- Check 6 is not run. It needs a Linux host, an agent, and a harness that
+  runs each build's `rezolus record` and `rezolus hindsight` for 300
+  one-second passes, five alternating runs per build, reading `utime` and
+  `stime` from `/proc/<pid>/stat` and `VmHWM` from `/proc/<pid>/status`
+  while the process is alive (polled until it exits), against rezolus at the
+  commit before step 2.
+- Check 2 is step 5's.
 
 Intended changes, each to be named in its commit: a streamed producer's
 `source` and `version` come from its handshake; a stream-only producer is
@@ -455,7 +578,9 @@ wrong and this entry records why.
    `record_lifecycle` scenarios rewritten as library tests (the fake agent,
    the fake exporter, legacy and metriken names, restart metadata, refusals).
    rezolus builds against the branch through `[patch.crates-io]` and passes
-   check 1 before the release; checks 5 and 6 run here.
+   check 1 before the release; checks 5 and 6 run here. Built 2026-10-12,
+   with hindsight and the live viewer moved too (see Built); check 6 not
+   yet run.
 4. **rezolus on the released crate,** with `record`, hindsight and the live
    viewer all on `Recorder` (check 1).
 5. **llm-perf in process** (its plan's step 5), check 2. cachecannon's
