@@ -1,7 +1,8 @@
 //! Records metriken producers into one `.dendro` archive.
 //!
 //! A [`Recorder`] owns the archive and its sources and records them on an
-//! aligned tick, one commit per tick, through metriken-storage's
+//! aligned tick, one commit per tick (or per streamed frame with
+//! `commit_streams_on_arrival`), through metriken-storage's
 //! `ArchiveWriter`. A source is one of:
 //!
 //! - **Streamed**: a producer's `/metrics/stream`, read by a [`pump`] per

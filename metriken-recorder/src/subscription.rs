@@ -20,6 +20,18 @@ pub struct Refusal {
     pub message: String,
 }
 
+impl Refusal {
+    /// A refusal: what the route answered, and the line that says so. A
+    /// subscription builds these; a caller builds one to test code that
+    /// consumes [`StreamEvent::Refused`].
+    pub fn new(answer: StreamAnswer, message: impl Into<String>) -> Self {
+        Self {
+            answer,
+            message: message.into(),
+        }
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)

@@ -172,13 +172,16 @@ pub enum Stop {
 /// What a [`Recorder`] reports while it records.
 ///
 /// The recorder never waits for the caller to read. `Frame`, `Gap` and
-/// `Committed` are dropped when the channel is full and counted, and a
-/// `Lagged` is delivered before the next event after a drop. Every other
-/// event is queued inside the recorder and sent as the channel has room; a
-/// caller that reads late gets them late, in order. The queue is bounded
-/// only for `Dropped` and `Reconnected`, which a flapping producer can
-/// emit without limit: past 1,024 queued events those two are counted in
-/// `Lagged` instead. The rest number at most a few per source. Events still
+/// `Committed` are dropped when the channel is full and counted in a
+/// `Lagged`, which the caller reads where the drops happened: after the
+/// events emitted before them. Every other event is queued inside the
+/// recorder and sent as the channel has room; a caller that reads late gets
+/// them late, in order. `Dropped`, `Reconnected` and `Restarted`, which a
+/// producer that flaps or restarts in a loop emits without limit, are
+/// counted in `Lagged` instead once 1,024 events are queued (a restart is
+/// still written into the recording's `producer_epochs`). The others
+/// (`Active`, `Pending`, `Refused`, `Failed`) come at most a few per source,
+/// so the queue stays bounded. Events still
 /// queued when the recorder stops are sent from a task of their own until
 /// the receiver is dropped. A caller that ignores events drops the
 /// receiver.
@@ -693,17 +696,19 @@ struct Archive {
     writer: ArchiveWriter,
 }
 
-/// Past this many queued events, `Dropped` and `Reconnected` are counted
-/// in `Lagged` instead of queued.
+/// Past this many queued events, `Dropped`, `Reconnected` and `Restarted`
+/// are counted in `Lagged` instead of queued.
 const QUEUE_CAP: usize = 1024;
 
 /// Sends events without waiting for the caller: `try_send` for every
-/// event, a queue for the ones that are never dropped, and a `Lagged`
-/// before the next delivery after a drop. See [`Event`].
+/// event, and a queue for the ones that are never dropped. A drop is
+/// recorded in the queue as a `Lagged` at the point it happened, merged
+/// with a `Lagged` already at the back, so the caller reads it after the
+/// events queued before the drop and before those queued after it. See
+/// [`Event`].
 struct Emitter {
     tx: mpsc::Sender<Event>,
     queue: VecDeque<Event>,
-    dropped: u64,
 }
 
 impl Emitter {
@@ -711,15 +716,20 @@ impl Emitter {
         Self {
             tx,
             queue: VecDeque::new(),
-            dropped: 0,
         }
     }
 
     /// An event that is never dropped (but see [`QUEUE_CAP`]).
     fn must(&mut self, event: Event) {
-        let flapping = matches!(event, Event::Dropped { .. } | Event::Reconnected { .. });
-        if flapping && self.queue.len() >= QUEUE_CAP {
-            self.dropped += 1;
+        // Each can be emitted without limit by a producer that flaps or
+        // restarts in a loop. A restart's history is kept in the
+        // recording's `producer_epochs` metadata either way.
+        let unbounded = matches!(
+            event,
+            Event::Dropped { .. } | Event::Reconnected { .. } | Event::Restarted { .. }
+        );
+        if unbounded && self.queue.len() >= QUEUE_CAP {
+            self.note_drop();
         } else {
             self.queue.push_back(event);
         }
@@ -734,32 +744,29 @@ impl Emitter {
         if self.tx.is_closed() {
             return;
         }
-        if !self.queue.is_empty() || self.dropped > 0 {
-            self.dropped += 1;
+        if !self.queue.is_empty() {
+            self.note_drop();
             return;
         }
         if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
-            self.dropped += 1;
+            self.note_drop();
         }
     }
 
-    /// Send what the channel has room for: the `Lagged` count, then the
-    /// queue in order.
+    /// Count one dropped event at the back of the queue.
+    fn note_drop(&mut self) {
+        match self.queue.back_mut() {
+            Some(Event::Lagged { dropped }) => *dropped += 1,
+            _ => self.queue.push_back(Event::Lagged { dropped: 1 }),
+        }
+    }
+
+    /// Send the queue in order, as far as the channel has room.
     fn flush(&mut self) {
         use mpsc::error::TrySendError;
         if self.tx.is_closed() {
             self.queue.clear();
-            self.dropped = 0;
             return;
-        }
-        if self.dropped > 0 {
-            match self.tx.try_send(Event::Lagged {
-                dropped: self.dropped,
-            }) {
-                Ok(()) => self.dropped = 0,
-                Err(TrySendError::Full(_)) => return,
-                Err(TrySendError::Closed(_)) => return self.queue.clear(),
-            }
         }
         while let Some(event) = self.queue.pop_front() {
             match self.tx.try_send(event) {
@@ -778,24 +785,13 @@ impl Emitter {
     /// dropped.
     fn hand_off(mut self) {
         self.flush();
-        if self.queue.is_empty() && self.dropped == 0 {
+        if self.queue.is_empty() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         runtime.spawn(async move {
-            if self.dropped > 0
-                && self
-                    .tx
-                    .send(Event::Lagged {
-                        dropped: self.dropped,
-                    })
-                    .await
-                    .is_err()
-            {
-                return;
-            }
             for event in self.queue {
                 if self.tx.send(event).await.is_err() {
                     return;
@@ -2462,6 +2458,54 @@ mod tests {
         assert_eq!(rx.recv().await, Some(refused(2)));
     }
 
+    /// A `Lagged` is read where its drops happened: after the event queued
+    /// before them, before the one queued after.
+    #[tokio::test]
+    async fn lagged_is_read_where_the_drops_happened() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut emitter = Emitter::new(tx);
+        let gap = |seq| Event::Gap {
+            source: SourceId(0),
+            seq,
+        };
+        let refused = |n| Event::Refused {
+            source: SourceId(n),
+            reason: String::new(),
+        };
+        emitter.lossy(gap(1));
+        emitter.must(refused(0));
+        emitter.lossy(gap(2));
+        emitter.lossy(gap(3));
+        emitter.must(refused(1));
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(rx.recv().await.unwrap());
+            emitter.flush();
+        }
+        assert_eq!(
+            seen,
+            [gap(1), refused(0), Event::Lagged { dropped: 2 }, refused(1)]
+        );
+    }
+
+    /// A producer that restarts without end cannot grow the queue without
+    /// bound: past the cap its `Restarted` events are counted.
+    #[test]
+    fn restarted_events_are_capped_like_reconnects() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut emitter = Emitter::new(tx);
+        for _ in 0..5_000 {
+            emitter.must(Event::Restarted {
+                source: SourceId(0),
+                epoch: "e".into(),
+                version: None,
+            });
+        }
+        assert_eq!(emitter.queue.len(), QUEUE_CAP + 1);
+        let dropped = 5_000 - 1 - QUEUE_CAP as u64;
+        assert_eq!(emitter.queue.back(), Some(&Event::Lagged { dropped }));
+    }
+
     #[tokio::test]
     async fn a_full_channel_drops_lossy_events_and_says_how_many() {
         let (tx, mut rx) = mpsc::channel(2);
@@ -2474,7 +2518,7 @@ mod tests {
         emitter.lossy(gap(2));
         emitter.lossy(gap(3));
         emitter.lossy(gap(4));
-        assert_eq!(emitter.dropped, 2);
+        assert_eq!(emitter.queue, [Event::Lagged { dropped: 2 }]);
         assert_eq!(rx.recv().await, Some(gap(1)));
         assert_eq!(rx.recv().await, Some(gap(2)));
         emitter.must(Event::Failed { error: "x".into() });

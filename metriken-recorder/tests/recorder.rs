@@ -1450,3 +1450,30 @@ async fn a_streamed_frame_can_be_committed_on_arrival() {
         "committed within 400 ms of the frame's stamp: {lags:?}"
     );
 }
+
+/// A caller can build the events a pump sends, to test its own handling of
+/// them, though `Handshake` and `Refusal` are `#[non_exhaustive]`.
+#[test]
+fn a_caller_builds_the_events_a_pump_sends() {
+    let handshake = Handshake::new(
+        Some("epoch-1".into()),
+        map(&[("source", "svc")]),
+        map(&[("version", "1.0.0")]),
+        42,
+    );
+    assert_eq!(handshake.epoch(), Some("epoch-1"));
+    assert_eq!(handshake.labels["source"], "svc");
+    assert_eq!(handshake.metadata["version"], "1.0.0");
+    assert_eq!(handshake.clock_anchor_wall_ns, 42);
+    let events = [
+        StreamEvent::Connected(handshake),
+        StreamEvent::Refused(Refusal::new(StreamAnswer::Status(404), "gone")),
+    ];
+    match &events[1] {
+        StreamEvent::Refused(r) => {
+            assert_eq!(r.answer, StreamAnswer::Status(404));
+            assert_eq!(r.to_string(), "gone");
+        }
+        other => panic!("{other:?}"),
+    }
+}

@@ -115,6 +115,26 @@ pub struct Handshake {
 }
 
 impl Handshake {
+    /// A handshake from a producer with epoch `uuid`, anchored at
+    /// `clock_anchor_wall_ns` (0 for none). The recorder builds these from
+    /// the stream; a caller builds one to test code that consumes
+    /// [`StreamEvent::Connected`].
+    ///
+    /// [`StreamEvent::Connected`]: crate::StreamEvent::Connected
+    pub fn new(
+        uuid: Option<String>,
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+        clock_anchor_wall_ns: u64,
+    ) -> Self {
+        Self {
+            uuid,
+            labels,
+            metadata,
+            clock_anchor_wall_ns,
+        }
+    }
+
     /// The epoch, when the handshake named a non-empty one.
     pub fn epoch(&self) -> Option<&str> {
         self.uuid.as_deref().filter(|u| !u.is_empty())
