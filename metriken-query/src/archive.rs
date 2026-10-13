@@ -137,6 +137,9 @@ fn route(reader: &ArchiveReader, query: &str) -> Result<QueryEngine, QueryError>
         }
     }
     let labels = reader.series_labels();
+    if recordings.len() > 1 {
+        refuse_histograms_across_recordings(&recordings, &labels, query)?;
+    }
     let mut sources: Vec<Arc<dyn DataSource>> = Vec::new();
     for tables in &recordings {
         if let Some(source) = recording_source(tables, query)? {
@@ -165,6 +168,62 @@ fn route(reader: &ArchiveReader, query: &str) -> Result<QueryEngine, QueryError>
         }),
     };
     Ok(QueryEngine::new(source))
+}
+
+/// Refuse a query that reads one histogram from several recordings.
+///
+/// The histogram functions pool, per row, the buckets of every series they
+/// select, and two recordings' rows fall at different instants (two
+/// producers, or two runs). Pooled, the answer alternates between the
+/// recordings row by row instead of describing either. A label matcher
+/// that selects one recording answers. The recordings' bucket
+/// configurations may also differ, which pooling cannot reconcile.
+fn refuse_histograms_across_recordings(
+    recordings: &[Vec<&SamplerReader>],
+    labels: &metriken_storage::reader::SeriesLabels,
+    query: &str,
+) -> Result<(), QueryError> {
+    let referenced = crate::referenced_metrics(query)?;
+    let mut names: Vec<&String> = referenced
+        .iter()
+        .filter(|name| {
+            recordings
+                .iter()
+                .filter(|tables| tables.iter().any(|t| t.holds_histogram(name)))
+                .count()
+                > 1
+        })
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort();
+    let which: Vec<String> = recordings
+        .iter()
+        .map(|tables| {
+            let set: Vec<String> = labels
+                .of(tables[0])
+                .inner
+                .iter()
+                .map(|(k, v)| format!("{k}=\"{v}\""))
+                .collect();
+            format!("{{{}}}", set.join(", "))
+        })
+        .collect();
+    Err(QueryError::ParseError(format!(
+        "query {query} reads histogram {} from {} recordings ({}); a histogram function \
+         pools each row of the series it selects, and these recordings' rows fall at \
+         different times, so select one recording with a label matcher, e.g. {}{}",
+        names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        recordings.len(),
+        which.join(", "),
+        names[0],
+        which[0],
+    )))
 }
 
 /// One recording's tables that hold a metric of `query`, as one source: the
@@ -898,20 +957,21 @@ mod tests {
         assert!(series(&reader, r#"rate(fast_ops{source="c"}[3s])"#).is_empty());
     }
 
-    /// Two recordings recording one histogram under different bucket
-    /// configurations: an unqualified query answers from the first
-    /// recording's configuration, and a matcher reaches the other. Before,
-    /// the merge decoded the second under the first's configuration (and a
-    /// debug build panicked).
+    /// A histogram in two recordings: an unqualified query is refused,
+    /// because the histogram functions pool each row and the recordings'
+    /// rows fall at different times (here half a second apart, which made
+    /// the answer alternate between the recordings row by row); a matcher
+    /// selecting one recording answers. The recordings' bucket
+    /// configurations also differ here, which pooling could not reconcile.
     #[test]
-    fn histograms_of_different_configurations_are_not_mixed() {
+    fn a_histogram_across_recordings_is_refused() {
         use crate::segmented::tests::segment_histogram;
-        let rows = |n: usize| -> Vec<(u64, Vec<u64>)> {
+        let rows = |n: usize, offset: u64| -> Vec<(u64, Vec<u64>)> {
             (1..=10u64)
                 .map(|t| {
                     let mut b = vec![0u64; n];
                     b[n / 2] = t * 10;
-                    (t * S, b)
+                    (t * S + offset, b)
                 })
                 .collect()
         };
@@ -920,29 +980,74 @@ mod tests {
         let reader = archive(vec![
             recording(
                 &[("source", "a")],
-                vec![("lat", segment_histogram("lat", 3, 10, &rows(a)))],
+                vec![("lat", segment_histogram("lat", 3, 10, &rows(a, 0)))],
             ),
             recording(
                 &[("source", "b")],
-                vec![("lat", segment_histogram("lat", 7, 20, &rows(b)))],
+                vec![("lat", segment_histogram("lat", 7, 20, &rows(b, S / 2)))],
             ),
         ]);
-        // `histogram_quantiles` sums the selected series, so the answer is
-        // compared by value: unqualified, it is recording a's alone.
-        let p50 = |query: &str| -> Vec<(f64, f64)> {
-            let QueryResult::Matrix { result } = reader
-                .query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default())
-                .unwrap_or_else(|e| panic!("{query}: {e}"))
+        let p50 =
+            |query: &str| reader.query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default());
+        let err = p50("histogram_quantiles([0.5], lat)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 recordings"), "{err}");
+        assert!(err.contains(r#"lat{source="a"}"#), "{err}");
+        let one = |query: &str| -> Vec<(f64, f64)> {
+            let QueryResult::Matrix { result } = p50(query).unwrap_or_else(|e| panic!("{e}"))
             else {
                 panic!("{query}: not a matrix");
             };
             assert_eq!(result.len(), 1, "{query}");
             result[0].values.clone()
         };
-        let all = p50("histogram_quantiles([0.5], lat)");
-        let only_a = p50(r#"histogram_quantiles([0.5], lat{source="a"})"#);
-        let only_b = p50(r#"histogram_quantiles([0.5], lat{source="b"})"#);
-        assert_eq!(all, only_a);
-        assert_ne!(only_a, only_b);
+        let only_a = one(r#"histogram_quantiles([0.5], lat{source="a"})"#);
+        let only_b = one(r#"histogram_quantiles([0.5], lat{source="b"})"#);
+        // Each on its own recording's rows, one value throughout.
+        assert!(only_a.windows(2).all(|w| w[0].1 == w[1].1), "{only_a:?}");
+        assert!(only_b.windows(2).all(|w| w[0].1 == w[1].1), "{only_b:?}");
+        assert_ne!(only_a[0].1, only_b[0].1);
+    }
+
+    /// A twin without tables still marks the other: the label does not come
+    /// and go as a recording gains or loses tables.
+    #[test]
+    fn a_twin_without_tables_still_counts() {
+        let reader = archive(vec![
+            recording(&[("source", "rezolus")], vec![]),
+            recording(
+                &[("source", "rezolus")],
+                vec![("cpu_usage", counter_table("ops", &[(&[], 2)], 10))],
+            ),
+        ]);
+        let got: Vec<String> = series(&reader, "rate(ops[3s])")
+            .into_iter()
+            .map(|(l, _)| l[RECORDING_LABEL].clone())
+            .collect();
+        assert_eq!(got, ["1"]);
+    }
+
+    /// Readers of different archives joined by `flatten` repeat catalog
+    /// indices; a group of twins that repeats one is numbered by position,
+    /// so no two of its recordings share a value.
+    #[test]
+    fn flattened_twins_never_share_a_recording_label() {
+        let one = || {
+            recording(
+                &[("source", "x")],
+                vec![("cpu_usage", counter_table("ops", &[(&[], 2)], 10))],
+            )
+        };
+        let reader = ArchiveReader::flatten(
+            vec![archive(vec![one()]), archive(vec![one(), one()])],
+            None,
+        );
+        let mut got: Vec<String> = series(&reader, "rate(ops[3s])")
+            .into_iter()
+            .map(|(l, _)| l[RECORDING_LABEL].clone())
+            .collect();
+        got.sort();
+        assert_eq!(got, ["0", "1", "2"]);
     }
 }

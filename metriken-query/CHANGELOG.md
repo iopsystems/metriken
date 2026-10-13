@@ -23,11 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Within a recording, a metric name two samplers share is still refused.
   `columns` resolves through the same labels. A table whose recording's
   labels no selector of the query can match is left out before routing, so
-  `x{source="vllm"}` opens only that recording's tables. A histogram that
-  two recordings record under different bucket configurations is answered,
-  unqualified, from the first recording's configuration, with a warning; a
-  label matcher selects the other. Joined recordings take the per-series
-  rate path (`MultiParquetSource` has no column scan).
+  `x{source="vllm"}` opens only that recording's tables. A query that
+  reads one histogram from several recordings is refused, naming them: the
+  histogram functions pool each row of the series they select, and two
+  recordings' rows fall at different times, so the answer alternated
+  between recordings row by row; a label matcher selecting one recording
+  answers. Joined recordings take the per-series rate path
+  (`MultiParquetSource` has no column scan).
 - The cross-cadence evaluation timestamps are applied only when every
   table a query reads is in one recording (after the label pruning above);
   a query over several stays on the uniform grid, since recordings do not

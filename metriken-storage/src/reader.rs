@@ -637,6 +637,11 @@ impl SamplerReader {
         self.names.holds(name)
     }
 
+    /// Whether this table holds histogram `name`.
+    pub fn holds_histogram(&self, name: &str) -> bool {
+        self.names.histograms.contains(name)
+    }
+
     /// The labels of the recording this table belongs to, as the catalog
     /// holds them.
     pub fn recording_labels(&self) -> &BTreeMap<String, String> {
@@ -891,6 +896,12 @@ pub struct ArchiveReader {
     /// green. Carrying the count here makes the invariant explicit and
     /// refactor-proof.
     recordings: usize,
+    /// Every recording behind this reader, tables or not: its shared label
+    /// map (the identity tables carry) and its catalog index. What
+    /// [`series_labels`](Self::series_labels) finds twins among, so a
+    /// recording's `__recording__` does not come and go as a twin gains or
+    /// loses tables.
+    members: Vec<(Arc<BTreeMap<String, String>>, usize)>,
 }
 
 /// One `ArchiveReader` per recording, paired with that recording's label set.
@@ -1180,8 +1191,10 @@ impl ArchiveReader {
         let mut metadata = BTreeMap::new();
         let mut complete = true;
         let mut recordings = 0usize;
+        let mut members = Vec::new();
         for (i, reader) in readers.into_iter().enumerate() {
             recordings += reader.recordings;
+            members.extend(reader.members);
             if i == 0 {
                 metadata = reader.metadata;
             }
@@ -1194,6 +1207,7 @@ impl ArchiveReader {
             filename,
             complete,
             recordings,
+            members,
         }
     }
 
@@ -1371,6 +1385,7 @@ impl ArchiveReader {
                     filename: Some(crate::source_name(&rec.labels)),
                     complete: rec.complete,
                     recordings: 1,
+                    members: vec![(recording_labels, recording)],
                 },
             ));
         }
@@ -1392,10 +1407,12 @@ impl ArchiveReader {
         // count, which `composition_sources` refuses on.
         let recording_count = recordings.len();
         let mut tables = Vec::new();
+        let mut members = Vec::new();
         let mut complete = true;
         for (recording, rec) in recordings.into_iter().enumerate() {
             complete &= rec.complete;
             let recording_labels = Arc::new(rec.labels.clone());
+            members.push((Arc::clone(&recording_labels), recording));
             if !rec.complete {
                 tracing::warn!(
                     "recording {} was not cleanly finalized; it was recovered up to its \
@@ -1477,6 +1494,7 @@ impl ArchiveReader {
             filename,
             complete,
             recordings: recording_count,
+            members,
         })
     }
 }
@@ -1567,36 +1585,38 @@ impl ArchiveReader {
     /// The labels each recording's series carry: the recording's labels, and
     /// for recordings whose label sets are identical,
     /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
-    /// recording's index in its catalog, so their series stay apart. The
-    /// index does not change when a live archive is reopened. Recordings of
-    /// readers joined by [`flatten`](Self::flatten) can share an index; two
-    /// of those with identical labels are numbered by position instead.
+    /// recording's index in its catalog, so their series stay apart. Twins
+    /// are found among every recording, tables or not, and the index does
+    /// not change when a live archive is reopened. Recordings of readers
+    /// joined by [`flatten`](Self::flatten) can share an index; a group of
+    /// twins in which two do is numbered by position instead.
     pub fn series_labels(&self) -> SeriesLabels {
-        // (identity, catalog index, labels), one per recording, in table order.
-        let mut recordings: Vec<(&Arc<BTreeMap<String, String>>, usize)> = Vec::new();
-        for t in &self.tables {
-            if !recordings
-                .iter()
-                .any(|(r, _)| Arc::ptr_eq(r, &t.recording_labels))
-            {
-                recordings.push((&t.recording_labels, t.recording));
-            }
-        }
-        let by_recording = recordings
+        let members = &self.members;
+        let by_recording = members
             .iter()
             .enumerate()
             .map(|(position, (labels, index))| {
-                let twins: Vec<usize> = recordings
+                let twins: Vec<(usize, usize)> = members
                     .iter()
-                    .filter(|(other, _)| other.as_ref() == labels.as_ref())
-                    .map(|(_, i)| *i)
+                    .enumerate()
+                    .filter(|(_, (other, _))| other.as_ref() == labels.as_ref())
+                    .map(|(p, (_, i))| (p, *i))
                     .collect();
                 let mut extra = Labels {
                     inner: labels.as_ref().clone(),
                 };
                 if twins.len() > 1 {
-                    let unique = twins.iter().filter(|i| *i == index).count() == 1;
-                    let value = if unique { *index } else { position };
+                    // Catalog indices, unless two twins share one (readers
+                    // of different archives joined by `flatten`): then the
+                    // whole group is numbered by position, so no two collide.
+                    let mut indices: Vec<usize> = twins.iter().map(|(_, i)| *i).collect();
+                    indices.sort_unstable();
+                    indices.dedup();
+                    let value = if indices.len() == twins.len() {
+                        *index
+                    } else {
+                        position
+                    };
                     extra.inner.insert(
                         crate::labeled::RECORDING_LABEL.to_string(),
                         value.to_string(),

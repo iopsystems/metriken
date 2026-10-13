@@ -696,7 +696,10 @@ Open sub-questions:
    their series apart.
    Decided 2026-10-13: `__recording__`, added only to recordings whose
    label set another recording shares, carrying the recording's catalog
-   index (stable across a live reopen).
+   index. Twins are found among every recording of the reader, tables or
+   not, so the label neither changes value nor comes and goes on a live
+   reopen. A twin group that repeats an index (readers of different archives
+   joined by `flatten`) is numbered by position.
 5. Recordings of different runs. `recording combine a.rez b.rez -o ab.rez`,
    rezolus's documented A/B form, does not set `arm` (no non-test `"arm"`
    under `src/parquet_tools/`), so under the rule above its output opens
@@ -758,9 +761,19 @@ metriken-query, unreleased):
   configuration (a `debug_assert!` only). Two recordings of `lat` at
   grouping power 3 and 7 panicked a debug build and, in release, read the
   second recording's buckets as other buckets. It now leaves out streams of
-  another configuration with a warning, as a table's `__run__`s are split:
-  unqualified, `lat` answers from the first recording; `lat{source="b"}`
-  reaches the other. Found in review.
+  another configuration with a warning, as a table's `__run__`s are split.
+  Found in review; for an archive, the refusal below now decides first.
+- A query that reads one histogram from several recordings is refused,
+  naming the recordings and a matcher to use (`lat{source="a"}`). The
+  histogram functions pool each row of the series they select
+  (`quantiles_impl` sums every series' deltas per row timestamp), and two
+  recordings' rows fall at different times: a reviewer joined two
+  recordings of `lat` whose rows were half a second apart and got
+  `histogram_quantiles([0.5], lat)` alternating 2, 959, 2, 959 between
+  them on the union of their row times. A combined view therefore draws a
+  histogram per source, which per-source template instances (sub-question
+  8) do anyway. Pooling across recordings, onto a common grid, is left
+  until something needs it.
 - The filter's regex form is literals and alternations
   (`labels::match_pattern`), so `source=~"a|b"` works and `source=~"a.*"`
   matches nothing, as for any label.
@@ -772,7 +785,8 @@ metriken-query, unreleased):
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
   the clashing value dropped, cross-cadence across recordings, the merge
   mixing configurations, no owner pruning, `__recording__` by position, no
-  chained prefix.
+  chained prefix, no histogram refusal, catalog indices kept when
+  flattened twins repeat one, twins only among recordings with tables.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
