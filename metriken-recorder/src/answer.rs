@@ -7,6 +7,7 @@ use std::fmt;
 ///
 /// [`Probe`]: crate::Probe
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamAnswer {
     /// An HTTP status other than success.
     Status(u16),

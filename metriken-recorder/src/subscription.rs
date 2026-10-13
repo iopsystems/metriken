@@ -14,6 +14,7 @@ use crate::StreamAnswer;
 /// A subscription that did not open: what the route answered, and a line
 /// saying so with the URL and the detail.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Refusal {
     pub answer: StreamAnswer,
     pub message: String,
@@ -258,6 +259,13 @@ impl Subscription {
 }
 
 /// What a [`pump`] reports.
+///
+/// Not `#[non_exhaustive]`, for the reason [`Detected`] is not: a caller
+/// driving a pump acts on each event (stage the interval, mark the source
+/// down, adopt the handshake, stop), and a new one should fail its match
+/// rather than fall through a wildcard.
+///
+/// [`Detected`]: crate::Detected
 #[derive(Debug)]
 pub enum StreamEvent {
     /// One interval, applied.
@@ -274,14 +282,29 @@ pub enum StreamEvent {
     Refused(Refusal),
 }
 
-/// How a [`pump`] subscribes and reconnects.
+/// How a [`pump`] subscribes and reconnects. Built with
+/// [`PumpConfig::new`]; every field can be set after.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PumpConfig {
     pub interval: Duration,
     pub layout: Layout,
-    /// Bounds every wait on the socket and every reconnect.
+    /// Bounds every reconnect; a connection silent for `interval + timeout`
+    /// is dead.
     pub timeout: Duration,
     pub wire_names: Vec<WireNames>,
+}
+
+impl PumpConfig {
+    /// The long layout under metriken's wire names.
+    pub fn new(interval: Duration, timeout: Duration) -> Self {
+        Self {
+            interval,
+            layout: Layout::Long,
+            timeout,
+            wire_names: vec![metriken_model::wire::WIRE_NAMES],
+        }
+    }
 }
 
 /// Drive one subscription until the receiver goes away or the producer
@@ -293,10 +316,12 @@ pub struct PumpConfig {
 /// reconnect whose answer is transient ([`StreamAnswer::is_transient`]) is
 /// retried; any other answer ends the pump with [`StreamEvent::Refused`].
 ///
-/// `timeout` bounds every wait on the socket. A producer sends a frame every
-/// interval, empty when nothing is new, so a connection that produces
-/// nothing for longer than that is dead even when the kernel has not noticed
-/// (a peer gone without a RST).
+/// A producer sends a frame every interval, empty when nothing is new, so a
+/// connection that produces nothing for `interval + timeout` is dead even
+/// when the kernel has not noticed (a peer gone without a RST). The interval
+/// is part of the bound because a frame is only due once per interval: with
+/// the timeout alone, an interval longer than the timeout would drop every
+/// connection between two frames.
 pub async fn pump(
     idx: usize,
     mut sub: Subscription,
@@ -306,8 +331,9 @@ pub async fn pump(
     tx: tokio::sync::mpsc::Sender<(usize, StreamEvent)>,
 ) {
     let retry = cfg.interval.max(Duration::from_secs(1));
+    let silence = cfg.interval + cfg.timeout;
     loop {
-        let outcome = match tokio::time::timeout(cfg.timeout, sub.next_interval()).await {
+        let outcome = match tokio::time::timeout(silence, sub.next_interval()).await {
             Ok(Ok(Some(applied))) => {
                 if tx
                     .send((idx, StreamEvent::Interval(applied)))
@@ -322,7 +348,7 @@ pub async fn pump(
             Ok(Err(e)) => e,
             Err(_) => format!(
                 "no frame arrived within {}; the connection is dead",
-                humantime::format_duration(cfg.timeout)
+                humantime::format_duration(silence)
             ),
         };
         if tx.send((idx, StreamEvent::Dropped(outcome))).await.is_err() {

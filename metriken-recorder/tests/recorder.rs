@@ -837,12 +837,12 @@ struct Counting {
 
 impl LocalSource for Counting {
     fn identity(&self) -> SourceIdentity {
-        SourceIdentity {
-            labels: map(&[("source", "self")]),
-            metadata: map(&[("version", "9.9.9")]),
-            clock_anchor_wall_ns: self.anchor,
-            epoch: Some("local-epoch".into()),
-        }
+        SourceIdentity::new(
+            map(&[("source", "self")]),
+            map(&[("version", "9.9.9")]),
+            self.anchor,
+        )
+        .with_epoch("local-epoch")
     }
 
     fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
@@ -1009,4 +1009,444 @@ async fn a_tick_that_overruns_its_interval_does_not_hold_off_finish() {
     .expect("finish returns while ticks overrun");
     assert!(recordings(&path, PROMETHEUS_GROUP)["slow"].complete);
     assert!(!finished.unwrap().discarded);
+}
+
+fn wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// A local source with one counter, named `name`.
+struct Tiny {
+    name: &'static str,
+}
+
+impl LocalSource for Tiny {
+    fn identity(&self) -> SourceIdentity {
+        SourceIdentity::new(map(&[("source", self.name)]), BTreeMap::new(), wall())
+    }
+
+    fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
+        use metriken_model::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
+        let t = wall();
+        let schema = GroupSchema {
+            counters: vec![MetricDesc {
+                name: "c".into(),
+                metadata: [("metric".to_string(), "c".to_string())]
+                    .into_iter()
+                    .collect(),
+            }],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        };
+        let group = GroupSnapshot {
+            name: format!("{}/g", self.name),
+            schema_hash: schema.hash(),
+            schema: Some(Arc::new(schema)),
+            window: Some(metriken_types::Window::new(t - 1000, t)),
+            counters: vec![Some(t)],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+        };
+        Some((
+            Snapshot::V3(SnapshotV3 {
+                systemtime: std::time::SystemTime::now(),
+                duration: Duration::ZERO,
+                metadata: Default::default(),
+                groups: vec![group],
+            }),
+            Stamp {
+                ts: t,
+                wall_offset: 0,
+            },
+        ))
+    }
+}
+
+/// A caller that keeps the receiver and never reads it does not stall the
+/// recorder: with a one-event channel, the second source's `Active` does
+/// not fit, and `finish` still returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_receiver_does_not_hold_off_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unread.dendro");
+    let mut cfg = RecorderConfig::new(&path, INTERVAL);
+    cfg.events = 1;
+    let (recorder, _ids, _events) = Recorder::start_local(
+        cfg,
+        vec![Box::new(Tiny { name: "a" }), Box::new(Tiny { name: "b" })],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recorder.finish(Stop::Now, CancellationToken::new()),
+    )
+    .await
+    .expect("finish returns with an unread receiver")
+    .unwrap();
+}
+
+/// `Committed` events fill the channel of a caller that does not read, and
+/// a late activation's `Active` then has no room: queued, not awaited.
+/// When the caller reads, it gets the `Active`, after a `Lagged`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_channel_then_an_activation_does_not_hold_off_finish() {
+    let fake = serve(Behaviour {
+        down: true,
+        ..exporter("up_total")
+    })
+    .await;
+    let mut url = fake.url.clone();
+    url.set_path("/metrics");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("full.dendro");
+    let mut cfg = RecorderConfig::new(&path, Duration::from_millis(50));
+    cfg.events = 8;
+    let detected = vec![Detected::Pending {
+        spec: EndpointSpec::new(url),
+        reason: "down".into(),
+    }];
+    let (recorder, ids, mut events) = Recorder::start(
+        cfg,
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        vec![Box::new(Tiny { name: "a" })],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    fake.set(exporter("up_total"));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let summary = tokio::time::timeout(
+        Duration::from_secs(5),
+        recorder.finish(Stop::Now, CancellationToken::new()),
+    )
+    .await
+    .expect("finish returns with a full channel")
+    .unwrap();
+    assert_eq!(summary.sources[0].state, SourceState::Active);
+    let mut seen = Vec::new();
+    while let Some(e) = events.recv().await {
+        seen.push(e);
+    }
+    assert!(
+        seen.iter().any(|e| matches!(e, Event::Lagged { .. })),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::Active { source, .. } if *source == ids[0])),
+        "the queued Active is delivered: {seen:?}"
+    );
+}
+
+/// The keys `start` refuses are refused by `patch_metadata` too.
+#[tokio::test(flavor = "multi_thread")]
+async fn patch_metadata_refuses_the_recorders_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reserved.dendro");
+    let (recorder, ids, _events) = Recorder::start_local(
+        RecorderConfig::new(&path, INTERVAL),
+        vec![Box::new(Tiny { name: "a" })],
+    )
+    .await
+    .unwrap();
+    for key in ["producer_epoch", "producer_epochs"] {
+        match recorder.patch_metadata(ids[0], map(&[(key, "mine")])).await {
+            Err(Error::Reserved(e)) => assert!(e.contains(key), "{e}"),
+            other => panic!("{key}: {other:?}"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, "a/g")["a"];
+    assert!(
+        !r.metadata.contains_key("producer_epoch"),
+        "{:?}",
+        r.metadata
+    );
+}
+
+/// A patch to a source refused before it was recorded has nowhere to go and
+/// says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn patch_metadata_on_a_refused_source_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refused.dendro");
+    let detected = vec![Detected::Refused {
+        spec: EndpointSpec::new(unused_url()),
+        reason: "no".into(),
+    }];
+    let (recorder, ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        vec![Box::new(Tiny { name: "a" })],
+    )
+    .await
+    .unwrap();
+    let patched = recorder.patch_metadata(ids[0], map(&[("k", "v")])).await;
+    assert!(matches!(patched, Err(Error::Source(_))), "{patched:?}");
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+}
+
+/// A current-thread runtime records: commits, seals and local passes run
+/// on blocking threads, which it has.
+#[tokio::test(flavor = "current_thread")]
+async fn a_current_thread_runtime_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ct.dendro");
+    let (recorder, _ids, _events) = Recorder::start_local(
+        RecorderConfig::new(&path, INTERVAL),
+        vec![Box::new(Tiny { name: "a" })],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let summary = recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(summary.sources[0].passes_total >= 4, "{summary:?}");
+}
+
+/// A hook whose `enrich` reports `hook_epoch`: the epoch it was asked about.
+struct EpochProbe;
+
+#[async_trait::async_trait]
+impl Probe for EpochProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        Enrich::Metadata {
+            epoch: epoch.map(str::to_string),
+            labels: BTreeMap::new(),
+            metadata: map(&[("hook_epoch", epoch.unwrap_or("none"))]),
+        }
+    }
+}
+
+/// On a restart the probe hook is asked about the new process, and what it
+/// reports reaches the recording's metadata.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_writes_the_hooks_metadata_for_the_new_process() {
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &EpochProbe).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hook.dendro");
+    let (recorder, _ids, mut events) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        Arc::new(EpochProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while let Some(e) = events.recv().await {
+            if matches!(e, Event::Restarted { .. }) {
+                return;
+            }
+        }
+        panic!("closed");
+    })
+    .await
+    .expect("the restart is written within 6 s");
+    recorder
+        .finish(Stop::Grace(INTERVAL), CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["hook_epoch"], "epoch-2", "{:?}", r.metadata);
+}
+
+/// `Stop::AfterExit` takes one more pass of a scraped source when the exit
+/// came after the last pass, so the interval the exit landed in is sampled.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_exit_takes_one_more_scrape() {
+    let exporter = serve(exporter("up_total")).await;
+    let mut url = exporter.url.clone();
+    url.set_path("/metrics");
+    let detected = vec![Detected::Scraped {
+        spec: named(&exporter.url, "svc"),
+        url,
+    }];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("extra.dendro");
+    let (recorder, _ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, Duration::from_secs(1)),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let exit = wall();
+    recorder
+        .finish(
+            Stop::AfterExit {
+                wall_ns: exit,
+                bound: Duration::from_secs(1),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
+    let last = r.last_ts.expect("rows");
+    assert!(
+        last >= exit,
+        "the last scrape ({last}) is after the exit ({exit})"
+    );
+}
+
+/// A pump whose reconnect is answered 503 (transient) keeps trying, and
+/// reconnects once the producer streams again; it is not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pump_waits_out_a_transient_answer_and_reconnects() {
+    let fake = serve(Behaviour {
+        streams: Streams::OnceThen(2, 503),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let sub = Subscription::connect(&client(), &fake.url, INTERVAL, Layout::Long, &[WIRE_NAMES])
+        .await
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let pump = tokio::spawn(pump(
+        0,
+        sub,
+        client(),
+        fake.url.clone(),
+        PumpConfig::new(INTERVAL, Duration::from_secs(2)),
+        tx,
+    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut dropped = false;
+        while let Some((_, event)) = rx.recv().await {
+            match event {
+                StreamEvent::Dropped(_) => {
+                    dropped = true;
+                    // The reconnect is answered 503 for a while, then
+                    // streams.
+                    let fake = &fake;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    fake.set(stream_only(&[("source", "svc")], &[]));
+                }
+                StreamEvent::Connected(_) => return Ok(dropped),
+                StreamEvent::Refused(r) => return Err(r.to_string()),
+                _ => {}
+            }
+        }
+        Err("closed".to_string())
+    })
+    .await
+    .expect("reconnected within 10 s");
+    pump.abort();
+    assert_eq!(outcome, Ok(true));
+}
+
+/// A stream whose interval is longer than the timeout is not dropped
+/// between two frames: the silence bound is interval plus timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_slower_than_the_timeout_is_not_dropped() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let interval = Duration::from_millis(1500);
+    let mut cfg = DetectConfig::new(interval, Duration::from_secs(1));
+    cfg.timeout = Duration::from_secs(1);
+    let detected = detect(&client(), &cfg, vec![spec(&fake.url)], &NoProbe).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slow.dendro");
+    let mut rcfg = RecorderConfig::new(&path, interval);
+    rcfg.timeout = Duration::from_secs(1);
+    let (recorder, _ids, mut events) =
+        Recorder::start(rcfg, client(), Arc::new(NoProbe), detected, Vec::new())
+            .await
+            .unwrap();
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+    recorder
+        .finish(Stop::Grace(Duration::ZERO), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while let Some(e) = events.recv().await {
+        seen.push(e);
+    }
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::Dropped { .. })),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .filter(|e| matches!(e, Event::Frame { .. }))
+            .count()
+            >= 2
+    );
+}
+
+/// With `commit_streams_on_arrival`, a frame is committed when it arrives,
+/// not on the next tick: at a 1 s interval, its `Committed` follows its
+/// stamp by much less than the interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_frame_can_be_committed_on_arrival() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let interval = Duration::from_secs(1);
+    let detected = detect(
+        &client(),
+        &DetectConfig::new(interval, Duration::from_secs(2)),
+        vec![spec(&fake.url)],
+        &NoProbe,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("arrival.dendro");
+    let mut cfg = RecorderConfig::new(&path, interval);
+    cfg.commit_streams_on_arrival = true;
+    let (recorder, _ids, mut events) =
+        Recorder::start(cfg, client(), Arc::new(NoProbe), detected, Vec::new())
+            .await
+            .unwrap();
+    let lags = tokio::time::timeout(Duration::from_secs(6), async {
+        let mut lags = Vec::new();
+        while let Some(e) = events.recv().await {
+            if let Event::Committed { wall_ns, .. } = e {
+                lags.push(wall().saturating_sub(wall_ns));
+                if lags.len() == 3 {
+                    return lags;
+                }
+            }
+        }
+        lags
+    })
+    .await
+    .expect("three commits within 6 s");
+    recorder
+        .finish(Stop::Grace(Duration::ZERO), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        lags.iter().all(|lag| *lag < 400_000_000),
+        "committed within 400 ms of the frame's stamp: {lags:?}"
+    );
 }

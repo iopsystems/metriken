@@ -10,6 +10,7 @@ use crate::StreamAnswer;
 
 /// What to do with an endpoint whose stream route did not open.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Verdict {
     /// Not a producer that streams: scrape it as Prometheus.
     Scrape,
@@ -22,6 +23,7 @@ pub enum Verdict {
 
 /// When the hook is asked, which decides how a refusal is worded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum At {
     /// Before the archive exists: a refusal ends the run.
     Startup,
@@ -35,6 +37,7 @@ pub enum At {
 
 /// What a producer says about itself beyond its handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Enrich {
     Metadata {
         /// The producer's epoch as the hook read it. A reply whose epoch

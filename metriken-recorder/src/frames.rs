@@ -29,6 +29,7 @@ use dendro::replicate::Frame;
 
 /// What one interval's frames amounted to.
 #[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Applied {
     /// The interval index the producer stamped. Not a frame count: a gap says
     /// an interval the subscriber asked for produced no reading.
@@ -42,6 +43,7 @@ pub struct Applied {
 /// One pass off the stream: the producer's stamp and its rows, in the order
 /// they arrived.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct StreamPass {
     pub ts: u64,
     pub wall_offset: i64,
@@ -97,15 +99,19 @@ impl Applied {
 
 /// What a stream's handshake says about its producer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Handshake {
     /// The producer epoch: changes when, and only when, every cumulative
     /// counter restarted from zero.
     pub uuid: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
-    /// The producer's anchor. Row timestamps are on this timeline, so a
-    /// recording that discarded it could not place its own rows in wall time.
-    pub clock_anchor_wall_ns: i64,
+    /// The producer's anchor, nanoseconds since the Unix epoch. Row
+    /// timestamps are on this timeline, so a recording that discarded it
+    /// could not place its own rows in wall time. 0 when the handshake
+    /// carried none (dendro's field is signed; a negative anchor reads as
+    /// none too).
+    pub clock_anchor_wall_ns: u64,
 }
 
 impl Handshake {
@@ -163,7 +169,7 @@ impl StreamSubscriber {
                         uuid,
                         labels,
                         metadata,
-                        clock_anchor_wall_ns,
+                        clock_anchor_wall_ns: u64::try_from(clock_anchor_wall_ns).unwrap_or(0),
                     });
                 }
 

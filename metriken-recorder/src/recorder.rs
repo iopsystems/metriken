@@ -1,6 +1,6 @@
 //! [`Recorder`]: the sources, the tick, and the archive.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -42,6 +42,9 @@ use url::Url;
 
 /// When a pass read its values: a timestamp on its source's timeline and the
 /// wall clock's disagreement with it, both in nanoseconds.
+///
+/// Not `#[non_exhaustive]`: a [`LocalSource`] builds one for every pass, and
+/// the two fields are the whole of a reading's time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     /// `anchor + monotonic elapsed` on the source's timeline.
@@ -60,6 +63,7 @@ impl Stamp {
 
 /// What a local source is recorded as.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SourceIdentity {
     /// The recording's labels; `source` names it.
     pub labels: BTreeMap<String, String>,
@@ -72,9 +76,39 @@ pub struct SourceIdentity {
     pub epoch: Option<String>,
 }
 
+impl SourceIdentity {
+    /// A source recorded with `labels` (a `source` names it) and
+    /// `metadata`, on a timeline anchored at `clock_anchor_wall_ns`, with no
+    /// producer epoch.
+    pub fn new(
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+        clock_anchor_wall_ns: u64,
+    ) -> Self {
+        Self {
+            labels,
+            metadata,
+            clock_anchor_wall_ns,
+            epoch: None,
+        }
+    }
+
+    /// With the process's producer epoch.
+    pub fn with_epoch(mut self, epoch: impl Into<String>) -> Self {
+        self.epoch = Some(epoch.into());
+        self
+    }
+}
+
 /// A source the caller takes passes of itself, in process: a producer
 /// recording its own registry. Its snapshots are staged as they are, so
 /// histogram groups stay native.
+///
+/// `pass` is called on each tick on a blocking thread
+/// (`tokio::task::spawn_blocking`), every local source's in one call, so a
+/// snapshot that takes a while does not hold a runtime worker that other
+/// tasks need. The tick still waits for it: a pass slower than the
+/// interval delays that tick's commit and the passes after it.
 pub trait LocalSource: Send + 'static {
     /// The source's labels, metadata and clock anchor, read once when the
     /// recorder starts.
@@ -97,6 +131,7 @@ impl fmt::Display for SourceId {
 
 /// How an active source is recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActiveTransport {
     Stream,
     Prometheus,
@@ -105,6 +140,7 @@ pub enum ActiveTransport {
 
 /// Where a source stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourceState {
     /// Not detected yet; detected again on each tick.
     Pending,
@@ -120,6 +156,7 @@ pub enum SourceState {
 
 /// How [`Recorder::finish`] ends the recording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stop {
     /// A wrapped command exited at `wall_ns`. One more pass of every local
     /// and scraped source, unless the exit landed during the pass just
@@ -134,12 +171,19 @@ pub enum Stop {
 
 /// What a [`Recorder`] reports while it records.
 ///
-/// The channel is bounded. `Frame`, `Gap` and `Committed` are dropped when
-/// it is full and counted, and the next event delivered after a drop is
-/// `Lagged`. Every other event is never dropped: the recorder waits for room
-/// to send it, so a caller that stops reading stalls the tick. A caller that
-/// ignores events drops the receiver.
+/// The recorder never waits for the caller to read. `Frame`, `Gap` and
+/// `Committed` are dropped when the channel is full and counted, and a
+/// `Lagged` is delivered before the next event after a drop. Every other
+/// event is queued inside the recorder and sent as the channel has room; a
+/// caller that reads late gets them late, in order. The queue is bounded
+/// only for `Dropped` and `Reconnected`, which a flapping producer can
+/// emit without limit: past 1,024 queued events those two are counted in
+/// `Lagged` instead. The rest number at most a few per source. Events still
+/// queued when the recorder stops are sent from a task of their own until
+/// the receiver is dropped. A caller that ignores events drops the
+/// receiver.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// The source is in the archive. `name` is its `source`, and `inferred`
     /// says that nobody named it and `name` was made from its URL.
@@ -195,12 +239,14 @@ pub enum Event {
         ts: u64,
         wall_ns: u64,
     },
-    /// `dropped` events were dropped because the channel was full.
+    /// `dropped` events were dropped because the channel was full (or, for
+    /// `Dropped` and `Reconnected`, the queue was).
     Lagged { dropped: u64 },
 }
 
 /// One source at the end of a recording.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SourceSummary {
     pub id: SourceId,
     /// The endpoint's URL; `None` for a local source.
@@ -219,6 +265,7 @@ pub struct SourceSummary {
 
 /// How a recording ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Summary {
     pub sources: Vec<SourceSummary>,
     /// No source delivered a frame, a scrape or a pass, so the archive was
@@ -226,7 +273,9 @@ pub struct Summary {
     pub discarded: bool,
 }
 
-/// What a recording is written with.
+/// What a recording is written with. Built with [`RecorderConfig::new`];
+/// every field can be set after.
+#[non_exhaustive]
 pub struct RecorderConfig {
     /// The `.dendro` archive to create; it must not exist.
     pub path: PathBuf,
@@ -234,7 +283,8 @@ pub struct RecorderConfig {
     /// The tick, on multiples of which since the Unix epoch the recorder
     /// scrapes, takes local passes and commits.
     pub interval: Duration,
-    /// Bounds each scrape, connect, probe call and silent stream.
+    /// Bounds each scrape, connect and probe call; a stream silent for
+    /// `interval + timeout` is reconnected.
     pub timeout: Duration,
     /// The layout streams are asked for.
     pub layout: Layout,
@@ -245,6 +295,12 @@ pub struct RecorderConfig {
     pub retain: Option<Duration>,
     /// The event channel's capacity.
     pub events: usize,
+    /// Stage and commit each streamed frame as it arrives, with a seal check
+    /// and retention after it, rather than on the next tick. A buffer that
+    /// is copied while it records (hindsight's dumps) then holds every
+    /// frame received; at the cost of one commit per frame per source
+    /// rather than one per tick.
+    pub commit_streams_on_arrival: bool,
 }
 
 impl RecorderConfig {
@@ -261,6 +317,7 @@ impl RecorderConfig {
             wire_names: vec![WIRE_NAMES],
             retain: None,
             events: 1024,
+            commit_streams_on_arrival: false,
         }
     }
 }
@@ -275,11 +332,14 @@ pub fn default_timeout(interval: Duration) -> Duration {
 
 /// Why a recording failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The archive failed mid-run ([`Event::Failed`]), or at finalize.
     Archive(String),
-    /// No such source, or it was never added.
+    /// No such source, or one that was refused before it was recorded.
     Source(String),
+    /// A metadata key the recorder writes itself.
+    Reserved(String),
     /// The recorder is gone.
     Closed,
 }
@@ -287,7 +347,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Archive(e) | Error::Source(e) => f.write_str(e),
+            Error::Archive(e) | Error::Source(e) | Error::Reserved(e) => f.write_str(e),
             Error::Closed => f.write_str("the recorder has stopped"),
         }
     }
@@ -297,6 +357,7 @@ impl std::error::Error for Error {}
 
 /// Why a recording did not start. Nothing is left on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StartError {
     /// The archive could not be created.
     Create(String),
@@ -440,7 +501,13 @@ impl Recorder {
             let identity = source.identity();
             reserved(&identity.metadata)?;
             let id = SourceId(slots.len() as u32);
-            let mut slot = Slot::new(id, Kind::Local { source, identity });
+            let mut slot = Slot::new(
+                id,
+                Kind::Local {
+                    source: Some(source),
+                    identity,
+                },
+            );
             slot.state = SourceState::Active;
             slots.push(slot);
             ids.push(id);
@@ -459,10 +526,8 @@ impl Recorder {
             slots,
             archive: None,
             path: cfg.path.clone(),
-            emitter: Emitter {
-                tx: event_tx,
-                dropped: 0,
-            },
+            emitter: Emitter::new(event_tx),
+            commit_streams_on_arrival: cfg.commit_streams_on_arrival,
             stream_tx,
             stream_rx,
             anchor_wall_ns,
@@ -578,12 +643,16 @@ impl Recorder {
 /// rewrites on every restart: a caller's value would seed the restart
 /// history with an epoch no process had.
 fn reserved(metadata: &BTreeMap<String, String>) -> Result<(), StartError> {
+    reserved_key(metadata).map_err(StartError::Reserved)
+}
+
+fn reserved_key(metadata: &BTreeMap<String, String>) -> Result<(), String> {
     for key in [keys::PRODUCER_EPOCH, keys::PRODUCER_EPOCHS] {
         if metadata.contains_key(key) {
-            return Err(StartError::Reserved(format!(
+            return Err(format!(
                 "{key} is written by the recorder from the producer's handshake and rewritten \
                  when the producer restarts, so it cannot be set"
-            )));
+            ));
         }
     }
     Ok(())
@@ -624,33 +693,63 @@ struct Archive {
     writer: ArchiveWriter,
 }
 
-/// Sends events: awaited for the ones that are never dropped, `try_send`
-/// for the rest, with a `Lagged` before the next one delivered after a
-/// drop.
+/// Past this many queued events, `Dropped` and `Reconnected` are counted
+/// in `Lagged` instead of queued.
+const QUEUE_CAP: usize = 1024;
+
+/// Sends events without waiting for the caller: `try_send` for every
+/// event, a queue for the ones that are never dropped, and a `Lagged`
+/// before the next delivery after a drop. See [`Event`].
 struct Emitter {
     tx: mpsc::Sender<Event>,
+    queue: VecDeque<Event>,
     dropped: u64,
 }
 
 impl Emitter {
-    async fn must(&mut self, event: Event) {
-        if self.dropped > 0
-            && self
-                .tx
-                .send(Event::Lagged {
-                    dropped: self.dropped,
-                })
-                .await
-                .is_ok()
-        {
-            self.dropped = 0;
+    fn new(tx: mpsc::Sender<Event>) -> Self {
+        Self {
+            tx,
+            queue: VecDeque::new(),
+            dropped: 0,
         }
-        let _ = self.tx.send(event).await;
     }
 
+    /// An event that is never dropped (but see [`QUEUE_CAP`]).
+    fn must(&mut self, event: Event) {
+        let flapping = matches!(event, Event::Dropped { .. } | Event::Reconnected { .. });
+        if flapping && self.queue.len() >= QUEUE_CAP {
+            self.dropped += 1;
+        } else {
+            self.queue.push_back(event);
+        }
+        self.flush();
+    }
+
+    /// An event dropped when it cannot be sent at once. One that would
+    /// overtake a queued event is dropped too, so events stay in order.
     fn lossy(&mut self, event: Event) {
         use mpsc::error::TrySendError;
+        self.flush();
         if self.tx.is_closed() {
+            return;
+        }
+        if !self.queue.is_empty() || self.dropped > 0 {
+            self.dropped += 1;
+            return;
+        }
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
+            self.dropped += 1;
+        }
+    }
+
+    /// Send what the channel has room for: the `Lagged` count, then the
+    /// queue in order.
+    fn flush(&mut self) {
+        use mpsc::error::TrySendError;
+        if self.tx.is_closed() {
+            self.queue.clear();
+            self.dropped = 0;
             return;
         }
         if self.dropped > 0 {
@@ -658,22 +757,58 @@ impl Emitter {
                 dropped: self.dropped,
             }) {
                 Ok(()) => self.dropped = 0,
-                Err(TrySendError::Full(_)) => {
-                    self.dropped += 1;
-                    return;
-                }
-                Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(_)) => return,
+                Err(TrySendError::Closed(_)) => return self.queue.clear(),
             }
         }
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
-            self.dropped += 1;
+        while let Some(event) = self.queue.pop_front() {
+            match self.tx.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    self.queue.push_front(event);
+                    return;
+                }
+                Err(TrySendError::Closed(_)) => return self.queue.clear(),
+            }
         }
+    }
+
+    /// The recorder has stopped: send what is still queued from a task of
+    /// its own, which ends when the queue is empty or the receiver is
+    /// dropped.
+    fn hand_off(mut self) {
+        self.flush();
+        if self.queue.is_empty() && self.dropped == 0 {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if self.dropped > 0
+                && self
+                    .tx
+                    .send(Event::Lagged {
+                        dropped: self.dropped,
+                    })
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            for event in self.queue {
+                if self.tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
     }
 }
 
 enum Kind {
     Local {
-        source: Box<dyn LocalSource>,
+        /// `None` while its pass runs on a blocking thread.
+        source: Option<Box<dyn LocalSource>>,
         identity: SourceIdentity,
     },
     #[cfg(feature = "http")]
@@ -776,10 +911,8 @@ impl Endpoint {
     /// when it differs from the one on record: a restarted producer.
     fn adopt(&mut self, handshake: &Handshake, rows_staged: bool) -> Option<String> {
         // Zero is what no producer anchors at (1970), so it is not an anchor.
-        if let Ok(anchor) = u64::try_from(handshake.clock_anchor_wall_ns) {
-            if anchor != 0 {
-                self.anchor = Some(anchor);
-            }
+        if handshake.clock_anchor_wall_ns != 0 {
+            self.anchor = Some(handshake.clock_anchor_wall_ns);
         }
         self.handshake_metadata = handshake.metadata.clone();
         let seen = handshake.epoch()?;
@@ -945,6 +1078,23 @@ struct Driver {
     failed: Option<String>,
     /// Each added recording's label set, for the identical-labels warning.
     seen_labels: BTreeMap<BTreeMap<String, String>, String>,
+    commit_streams_on_arrival: bool,
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        let (closed, _) = mpsc::channel(1);
+        std::mem::replace(&mut self.emitter, Emitter::new(closed)).hand_off();
+    }
+}
+
+/// `rx.recv()` when `on`, otherwise a future that never resolves.
+async fn recv_if<T>(rx: &mut mpsc::Receiver<T>, on: bool) -> Option<T> {
+    if on {
+        rx.recv().await
+    } else {
+        std::future::pending().await
+    }
 }
 
 #[cfg(feature = "http")]
@@ -979,7 +1129,7 @@ impl Driver {
                 }
             };
             if let Some(event) = event {
-                self.emitter.must(event).await;
+                self.emitter.must(event);
             }
         }
 
@@ -1004,6 +1154,21 @@ impl Driver {
                     }
                 }
                 command = commands.recv() => command,
+                received = recv_if(
+                    &mut self.stream_rx,
+                    self.commit_streams_on_arrival && self.failed.is_none(),
+                ) => {
+                    #[cfg(feature = "http")]
+                    if let Some((i, event)) = received {
+                        match self.on_stream_event(i, event).await {
+                            Ok(()) => self.commit(true).await,
+                            Err(e) => self.fail(e).await,
+                        }
+                    }
+                    #[cfg(not(feature = "http"))]
+                    let _ = received;
+                    continue;
+                }
             };
             match command {
                 Some(Command::Patch {
@@ -1056,6 +1221,7 @@ impl Driver {
     }
 
     async fn tick(&mut self) {
+        self.emitter.flush();
         let (wall, ts, wall_offset) = self.stamp_now();
         let mut failure: Option<String> = None;
         #[cfg(feature = "http")]
@@ -1064,7 +1230,7 @@ impl Driver {
         }
         #[cfg(not(feature = "http"))]
         let _ = (ts, wall_offset);
-        if let Err(e) = self.local_passes(wall) {
+        if let Err(e) = self.local_passes(wall).await {
             failure.get_or_insert(e);
         }
         #[cfg(feature = "http")]
@@ -1091,7 +1257,7 @@ impl Driver {
         self.failed = Some(error.clone());
         self.abort_tasks();
         self.drop_archive().await;
-        self.emitter.must(Event::Failed { error }).await;
+        self.emitter.must(Event::Failed { error });
     }
 
     /// Run `f` on the archive on a blocking thread: commits, seals and
@@ -1214,16 +1380,40 @@ impl Driver {
         Ok(())
     }
 
-    fn local_passes(&mut self, wall: u64) -> Result<(), String> {
-        for i in 0..self.slots.len() {
-            if self.slots[i].state != SourceState::Active || !self.slots[i].added {
+    /// One pass of every active local source, on a blocking thread (see
+    /// [`LocalSource`]), staged in order.
+    // Without `http`, `Kind::Local` is the only kind.
+    #[cfg_attr(not(feature = "http"), allow(irrefutable_let_patterns))]
+    async fn local_passes(&mut self, wall: u64) -> Result<(), String> {
+        let mut taken: Vec<(usize, Box<dyn LocalSource>)> = Vec::new();
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.state != SourceState::Active || !slot.added {
                 continue;
             }
-            let pass = match &mut self.slots[i].kind {
-                Kind::Local { source, .. } => source.pass(),
-                #[cfg(feature = "http")]
-                _ => continue,
-            };
+            if let Kind::Local { source, .. } = &mut slot.kind {
+                if let Some(source) = source.take() {
+                    taken.push((i, source));
+                }
+            }
+        }
+        if taken.is_empty() {
+            return Ok(());
+        }
+        let passes = tokio::task::spawn_blocking(move || {
+            taken
+                .into_iter()
+                .map(|(i, mut source)| {
+                    let pass = source.pass();
+                    (i, source, pass)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| format!("a local source's pass failed: {e}"))?;
+        for (i, returned, pass) in passes {
+            if let Kind::Local { source, .. } = &mut self.slots[i].kind {
+                *source = Some(returned);
+            }
             let Some((snapshot, stamp)) = pass else {
                 continue;
             };
@@ -1309,11 +1499,8 @@ impl Driver {
         };
         metadata.extend(std::mem::take(&mut self.slots[i].pending_patch));
         let label = self.slots[i].label();
-        if let Some(other) = self.seen_labels.get(&labels) {
-            warn!(
-                "{other} and {label} carry identical labels ({labels:?}), so nothing downstream \
-                 can tell their recordings apart; give each its own source"
-            );
+        if let Some(warning) = label_collision(&self.seen_labels, &labels, &label) {
+            warn!("{warning}");
         }
         self.seen_labels.insert(labels.clone(), label);
 
@@ -1346,11 +1533,18 @@ impl Driver {
         if let Some(e) = &self.failed {
             return Err(Error::Archive(e.clone()));
         }
+        reserved_key(&patch).map_err(Error::Reserved)?;
         let i = source.0 as usize;
         let slot = self
             .slots
             .get_mut(i)
             .ok_or_else(|| Error::Source(format!("no {source}")))?;
+        if slot.state == SourceState::Refused && !slot.added {
+            return Err(Error::Source(format!(
+                "{} was refused and has no recording to patch",
+                slot.label()
+            )));
+        }
         slot.pinned.extend(patch.keys().cloned());
         if !slot.added {
             slot.pending_patch.extend(patch);
@@ -1402,7 +1596,7 @@ impl Driver {
                     if let Err(e) = self.scrape_all(wall, ts, wall_offset).await {
                         failure.get_or_insert(e);
                     }
-                    if let Err(e) = self.local_passes(wall) {
+                    if let Err(e) = self.local_passes(wall).await {
                         failure.get_or_insert(e);
                     }
                 }
@@ -1424,7 +1618,7 @@ impl Driver {
                 }
             }
             Stop::Now => {
-                if let Err(e) = self.local_passes(wall) {
+                if let Err(e) = self.local_passes(wall).await {
                     failure.get_or_insert(e);
                 }
             }
@@ -1517,6 +1711,39 @@ impl Driver {
         self.drop_archive().await;
         remove_files(&self.path);
     }
+}
+
+/// What is wrong with `labels` against the label sets already added, or
+/// `None` when nothing is: identical label sets, which no reader can tell
+/// apart, or label sets equal but for ASCII case. dendro staggers each
+/// source's seals by its label key, and two keys that differ only in case
+/// fall in the same stagger bucket, so those recordings seal in lockstep.
+fn label_collision(
+    seen: &BTreeMap<BTreeMap<String, String>, String>,
+    labels: &BTreeMap<String, String>,
+    label: &str,
+) -> Option<String> {
+    if let Some(other) = seen.get(labels) {
+        return Some(format!(
+            "{other} and {label} carry identical labels ({labels:?}), so nothing downstream \
+             can tell their recordings apart; give each its own source"
+        ));
+    }
+    let folded = |m: &BTreeMap<String, String>| -> Vec<(String, String)> {
+        m.iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.to_ascii_lowercase()))
+            .collect()
+    };
+    let mine = folded(labels);
+    seen.iter()
+        .find(|(other, _)| folded(other) == mine)
+        .map(|(other_labels, other)| {
+            format!(
+                "{other} ({other_labels:?}) and {label} ({labels:?}) differ only in case; dendro \
+                 staggers seals by label key and cannot tell them apart, so their recordings \
+                 will seal in lockstep. Give them labels that differ by more than case"
+            )
+        })
 }
 
 fn remove_files(path: &Path) {
@@ -1789,9 +2016,7 @@ impl Driver {
             }
             StreamEvent::Dropped(reason) => {
                 warn!("{label}: the stream ended ({reason}); reconnecting");
-                self.emitter
-                    .must(Event::Dropped { source: id, reason })
-                    .await;
+                self.emitter.must(Event::Dropped { source: id, reason });
             }
             StreamEvent::Connected(handshake) => {
                 info!("{label}: stream reconnected");
@@ -1800,13 +2025,11 @@ impl Driver {
                     Kind::Endpoint(ep) => ep.adopt(&handshake, rows).is_some(),
                     _ => false,
                 };
-                self.emitter
-                    .must(Event::Reconnected {
-                        source: id,
-                        epoch: handshake.epoch().map(str::to_string),
-                        restarted,
-                    })
-                    .await;
+                self.emitter.must(Event::Reconnected {
+                    source: id,
+                    epoch: handshake.epoch().map(str::to_string),
+                    restarted,
+                });
             }
             StreamEvent::Refused(refusal) => {
                 // Asked for the wording only: a streamed source is never
@@ -1844,7 +2067,7 @@ impl Driver {
             ep.abort_tasks();
         }
         let source = slot.id;
-        self.emitter.must(Event::Refused { source, reason }).await;
+        self.emitter.must(Event::Refused { source, reason });
     }
 
     /// Write each restart into its recording's metadata once a row from the
@@ -1912,15 +2135,11 @@ impl Driver {
             });
             let source = slot.id;
             match self.write_metadata(i, patch).await {
-                Ok(()) => {
-                    self.emitter
-                        .must(Event::Restarted {
-                            source,
-                            epoch: newest,
-                            version,
-                        })
-                        .await
-                }
+                Ok(()) => self.emitter.must(Event::Restarted {
+                    source,
+                    epoch: newest,
+                    version,
+                }),
                 Err(e) => warn!(
                     "{label}: the producer restart could not be written into the recording's \
                      metadata: {e}"
@@ -2063,7 +2282,7 @@ impl Driver {
                 name: self.slots[i].name.clone().unwrap_or_default(),
                 inferred: self.inferred(i),
             };
-            self.emitter.must(event).await;
+            self.emitter.must(event);
         }
         Ok(())
     }
@@ -2210,10 +2429,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn labels_that_differ_only_in_case_are_warned_about() {
+        let labels = |v: &str| BTreeMap::from([("source".to_string(), v.to_string())]);
+        let mut seen = BTreeMap::new();
+        seen.insert(labels("Web"), "a".to_string());
+        let same = label_collision(&seen, &labels("Web"), "b").unwrap();
+        assert!(same.contains("identical labels"), "{same}");
+        let case = label_collision(&seen, &labels("web"), "b").unwrap();
+        assert!(case.contains("differ only in case"), "{case}");
+        assert_eq!(label_collision(&seen, &labels("api"), "b"), None);
+    }
+
+    /// A must-deliver event into a full channel is queued, not awaited, and
+    /// is delivered in order once the caller reads.
+    #[tokio::test]
+    async fn a_must_deliver_event_never_waits_for_the_caller() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut emitter = Emitter::new(tx);
+        let refused = |n| Event::Refused {
+            source: SourceId(n),
+            reason: String::new(),
+        };
+        emitter.must(refused(0));
+        emitter.must(refused(1));
+        emitter.must(refused(2));
+        assert_eq!(emitter.queue.len(), 2, "queued, not awaited");
+        assert_eq!(rx.recv().await, Some(refused(0)));
+        emitter.flush();
+        assert_eq!(rx.recv().await, Some(refused(1)));
+        emitter.hand_off();
+        assert_eq!(rx.recv().await, Some(refused(2)));
+    }
+
     #[tokio::test]
     async fn a_full_channel_drops_lossy_events_and_says_how_many() {
         let (tx, mut rx) = mpsc::channel(2);
-        let mut emitter = Emitter { tx, dropped: 0 };
+        let mut emitter = Emitter::new(tx);
         let gap = |seq| Event::Gap {
             source: SourceId(0),
             seq,
@@ -2225,7 +2477,7 @@ mod tests {
         assert_eq!(emitter.dropped, 2);
         assert_eq!(rx.recv().await, Some(gap(1)));
         assert_eq!(rx.recv().await, Some(gap(2)));
-        emitter.must(Event::Failed { error: "x".into() }).await;
+        emitter.must(Event::Failed { error: "x".into() });
         assert_eq!(rx.recv().await, Some(Event::Lagged { dropped: 2 }));
         assert_eq!(rx.recv().await, Some(Event::Failed { error: "x".into() }));
     }

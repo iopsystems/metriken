@@ -14,6 +14,8 @@ use crate::keys;
 
 /// A restart seen on a source, waiting for its first row and then for the
 /// new process's metadata.
+///
+/// Not `#[non_exhaustive]`: a caller of [`metadata_patch`] builds these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Restart {
     /// The new process's producer epoch.

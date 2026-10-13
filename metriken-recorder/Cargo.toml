@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 description = "Records metriken producers (streamed, scraped as Prometheus, or the process's own registry) into one .dendro archive"
 homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
+readme = "README.md"
 
 [features]
 default = ["http"]

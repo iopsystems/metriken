@@ -24,6 +24,7 @@ use crate::StreamAnswer;
 
 /// How an endpoint is declared.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     /// Detected: see the module docs.
     #[default]
@@ -35,8 +36,10 @@ pub enum Transport {
     Prometheus,
 }
 
-/// An endpoint to record, and what the caller says about it.
+/// An endpoint to record, and what the caller says about it. Built with
+/// [`EndpointSpec::new`]; every field can be set after.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EndpointSpec {
     pub url: Url,
     pub transport: Transport,
@@ -57,11 +60,31 @@ impl EndpointSpec {
             metadata: BTreeMap::new(),
         }
     }
+
+    /// With `transport`.
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// With the label `key=value`; `source` names the recording.
+    pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
+        self
+    }
+
+    /// With the metadata `key=value`.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
 }
 
 /// The subscription settings detection opens a stream with, so the stream it
-/// hands on is the one the recording reads.
+/// hands on is the one the recording reads. Built with
+/// [`DetectConfig::new`]; every field can be set after.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DetectConfig {
     pub interval: Duration,
     /// Bounds the stream connect, the hook's call, and the check of a
@@ -86,6 +109,11 @@ impl DetectConfig {
 }
 
 /// How one endpoint is to be recorded, for [`Recorder::start`].
+///
+/// Not `#[non_exhaustive]`: a caller decides what to do with each outcome
+/// before the archive exists (exit on a refusal, log a pending endpoint),
+/// and a new outcome should fail its match rather than fall through a
+/// wildcard.
 ///
 /// [`Recorder::start`]: crate::Recorder::start
 pub enum Detected {

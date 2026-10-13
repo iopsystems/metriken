@@ -28,6 +28,15 @@
 //! - `registry`: [`RegistrySource`], the process's own metriken registry as
 //!   a local source. It is the only feature that links the registry.
 //!
+//! # Runtime
+//!
+//! A `Recorder` runs on the caller's tokio runtime, current-thread or
+//! multi-thread. The runtime needs its time driver (`enable_time`, or
+//! `enable_all`), and with `http` its IO driver; without them the tick and
+//! the HTTP client panic. Commits, seals, metadata updates and local
+//! passes run on the runtime's blocking pool, since each is a blocking send
+//! to dendro's writer thread or a call into the caller's code.
+//!
 //! The design is metriken's `docs/journal/2026-10-12-metriken-recorder.md`.
 //!
 //! [`pump`]: crate::pump
@@ -61,6 +70,11 @@ mod subscription;
 pub use answer::StreamAnswer;
 #[cfg(feature = "http")]
 pub use detect::{detect, DetectConfig, Detected, EndpointSpec, Transport};
+// dendro's frame and row types appear in `FrameDecoder::push`,
+// `StreamSubscriber::apply` and `Applied::rows`; re-exported so a caller
+// names the same types without depending on dendro.
+pub use dendro::archive::WalRow;
+pub use dendro::replicate::Frame;
 pub use frames::{Applied, FrameDecoder, Handshake, StreamPass, StreamSubscriber};
 pub use identity::infer_source_name;
 #[cfg(feature = "registry")]
