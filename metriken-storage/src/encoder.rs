@@ -149,7 +149,9 @@ impl SegmentEncoder for Encoder {
         // The writer states the schema on every change of hash and seals
         // a stream before retention can cut its open segment's first row,
         // so this needs a tail whose anchor was lost some other way: one a
-        // 0.2.2 writer left after retention cut into it.
+        // 0.2.2 writer left after retention cut into it, or a seal dendro
+        // deferred after its retries (another connection holding the lock)
+        // followed by an eviction that deleted the anchor row.
         // The names fingerprint, so a reader probes one footer per distinct
         // set of metric names rather than only the table's first.
         Ok(tail.map(|t| Segment {

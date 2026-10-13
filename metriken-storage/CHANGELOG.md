@@ -55,8 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hindsight lookback or a recorder `retain`. `evict_before` now first
   seals each stream whose open segment started before the cutoff, so its
   rows stay in a segment, which retention drops once its last row is past
-  the cutoff. Such a window therefore also bounds segment age, and up to
-  about twice the window is kept where it used to be cut at the window.
+  the cutoff. Such a window therefore also bounds segment age: up to
+  `window + min(window, max_age)` is kept (about twice the window when it
+  is shorter than `max_age`). Before, the WAL rows were cut at the window
+  and segments straddling it were kept whole but held nothing readable. A
+  window of `max_age` or longer (hindsight's 15 m default) is unaffected.
+  When a window is just under `max_age`, every stream of a source is sealed
+  in the same eviction, so their seals align from then on. A seal that
+  dendro defers after its retries, followed by an eviction, can still cut
+  an anchor; closing that needs dendro to skip evicting a stream whose seal
+  deferred.
 - The WAL decoders (`materialize_wal_tail`, `materialize_long_wal_tail`)
   resolve a schema-less row against the schema its hash names, wherever in
   the tail it was stated, rather than only the last schema stated. A tail
