@@ -190,9 +190,9 @@ pub fn merge_segment_metadata(
 ///
 /// A run whose first segment is not long takes only segments with the same
 /// entries as it, in any order, and is written with the first's order; a
-/// long run takes no segment that is not long. A long segment with no segment list, a list that does not
-/// decode within its segment's rows, or a key given twice is refused; this
-/// never panics on a malformed list.
+/// long run takes no segment that is not long. A long segment with no
+/// segment list, a list that does not decode within its segment's rows, or
+/// a key given twice is refused; this never panics on a malformed list.
 #[derive(Debug, Clone)]
 pub struct SegmentMetadataMerge(Merge);
 

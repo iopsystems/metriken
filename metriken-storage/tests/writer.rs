@@ -1107,7 +1107,9 @@ fn a_compacted_long_stream_answers_as_before() {
     let pool = BufferPool::new(64 * 1024 * 1024);
     let (before, _) = open_counting(&path, &pool);
     let expected = answers(&before, 0);
+    let interval = before.interval();
     drop(before);
+    let rows = catalog_rows(&path);
     {
         let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
         let tables = streams(&path);
@@ -1124,6 +1126,27 @@ fn a_compacted_long_stream_answers_as_before() {
     }
     let (after, _) = open_counting(&path, &pool);
     assert_eq!(answers(&after, 0), expected);
+    assert_eq!(after.interval(), interval);
+    assert_eq!(catalog_rows(&path), rows, "catalog rows count WAL rows");
+}
+
+/// Each stream's catalog rows, summed over its segments: the WAL rows it
+/// covers, which compaction must not change.
+fn catalog_rows(path: &Path) -> BTreeMap<String, u64> {
+    let db = dendro::archive::Archive::open(path).unwrap();
+    let mut out = BTreeMap::new();
+    for source in db.read_sources().unwrap() {
+        for stream in db.all_streams(source.id).unwrap() {
+            let rows = db
+                .read_segment_meta(source.id, &stream)
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.rows)
+                .sum();
+            out.insert(format!("{}/{stream}", source.id), rows);
+        }
+    }
+    out
 }
 
 /// Compacting a long stream with [`SegmentMetadataMerge`] merges across
@@ -1178,7 +1201,9 @@ fn a_long_stream_compacted_by_union_answers_as_before() {
         record(&path, true, true, None);
         let (before, _) = open_counting(&path, &pool);
         let expected = answers(&before, 0);
+        let interval = before.interval();
         drop(before);
+        let rows = catalog_rows(&path);
         let id = DendroCatalog::open(&path).unwrap().sources().unwrap()[0].id;
         let segments = |path: &Path| {
             dendro::archive::Archive::open(path)
@@ -1203,6 +1228,8 @@ fn a_long_stream_compacted_by_union_answers_as_before() {
         }
         let (after, _) = open_counting(&path, &pool);
         assert_eq!(answers(&after, 0), expected, "union: {by_union}");
+        assert_eq!(after.interval(), interval, "union: {by_union}");
+        assert_eq!(catalog_rows(&path), rows, "union: {by_union}");
         listings_match_queries(&after, &wide);
         tasks.push((sealed, segments(&path)));
     }
