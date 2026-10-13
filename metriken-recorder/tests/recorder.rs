@@ -1065,6 +1065,78 @@ impl LocalSource for Tiny {
     }
 }
 
+/// A local source whose pass takes `delay`, holding up the tick it is taken
+/// on.
+struct Slow {
+    inner: Tiny,
+    delay: Duration,
+}
+
+impl LocalSource for Slow {
+    fn identity(&self) -> SourceIdentity {
+        self.inner.identity()
+    }
+
+    fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
+        std::thread::sleep(self.delay);
+        self.inner.pass()
+    }
+}
+
+/// Streamed frames that queue up while a tick is busy are committed one per
+/// commit, each followed by a seal check, so no segment holds more rows
+/// than the seal policy's cap. A local source that takes 350 ms per pass at
+/// a 100 ms interval holds every tick up for about three frames, which the
+/// tick then drains together. Committed as one, they sealed as one segment
+/// of four or more rows against a cap of two.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_frames_seal_within_the_row_cap() {
+    let producer = serve(stream_only(&[("source", "producer")], &[])).await;
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&producer.url)],
+        &NoProbe,
+    )
+    .await;
+    let slow: Box<dyn LocalSource> = Box::new(Slow {
+        inner: Tiny { name: "slow" },
+        delay: Duration::from_millis(350),
+    });
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        vec![slow],
+        |cfg| {
+            cfg.writer.seal.max_rows = 2;
+        },
+        Duration::from_millis(2500),
+        Stop::Grace(Duration::ZERO),
+    )
+    .await;
+    run.summary.expect("finished");
+
+    let archive = dendro::archive::Archive::open(&run.path).unwrap();
+    let source = archive
+        .read_sources()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.meta.labels.get("source").map(String::as_str) == Some("producer"))
+        .expect("the producer's recording");
+    let rows: Vec<u64> = archive
+        .read_segments(source.id, "fake/ops")
+        .unwrap()
+        .iter()
+        .map(|s| s.meta.rows)
+        .collect();
+    // Enough frames to have queued behind the slow ticks at all.
+    assert!(rows.iter().sum::<u64>() >= 12, "{rows:?}");
+    assert!(
+        rows.iter().all(|&r| r <= 2),
+        "a segment past the row cap of 2: {rows:?}"
+    );
+}
+
 /// A caller that keeps the receiver and never reads it does not stall the
 /// recorder: with a one-event channel, the second source's `Active` does
 /// not fit, and `finish` still returns.

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-recorder
+
+- **Fixed:** streamed passes that queued while a tick or a commit was
+  running were committed together and sealed as one segment, past the seal
+  policy's `max_rows`. A commit took every queued pass and ran one seal check
+  after it, and the seal takes every live row of the stream. With 2-row
+  segments at 10 Hz, a commit that waited ~350 ms on a seal let three or four
+  frames queue, and the next tick (which outranks an arriving frame) sealed
+  them as one 3- or 4-row segment. `commit_streams_on_arrival` did not help,
+  since the tick drained the queue first. A source's second pass now commits
+  the first before it is staged, so each commit holds at most one pass per
+  source and is followed by its own seal check.
+
 ### metriken-recorder 0.1.0
 
 - **Added:** a new crate that records metriken producers into one `.dendro`

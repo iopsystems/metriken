@@ -3,7 +3,9 @@
 //! A [`Recorder`] owns the archive and its sources and records them on an
 //! aligned tick, one commit per tick (or per streamed frame with
 //! `commit_streams_on_arrival`), through metriken-storage's
-//! `ArchiveWriter`. A source is one of:
+//! `ArchiveWriter`. A commit holds at most one pass of each source, so
+//! streamed passes that queued up are committed one at a time, each followed
+//! by a seal check. A source is one of:
 //!
 //! - **Streamed**: a producer's `/metrics/stream`, read by a [`pump`] per
 //!   source and staged as it arrives, on the producer's own timeline.

@@ -9,7 +9,9 @@ trip), or a local source the caller takes passes of in process.
 `detect` decides how each endpoint is recorded before the archive opens: by
 its stream first, then by the caller's `Probe` hook with the route's answer,
 then as Prometheus. `Recorder` runs an aligned tick with one commit per tick
-(or per streamed frame with `commit_streams_on_arrival`),
+(or per streamed frame with `commit_streams_on_arrival`; streamed passes that
+queued up are committed one at a time, so a segment never exceeds the seal
+policy's row cap),
 detects pending endpoints off the tick, reconnects dropped streams, refuses
 an endpoint mid-run, writes producer restarts into the recording's metadata,
 applies retention, and reports `Event`s and a `Summary`. It never exits the
