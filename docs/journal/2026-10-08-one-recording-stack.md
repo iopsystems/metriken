@@ -9,7 +9,9 @@ recorder; rezolus 6.x writes `.dendro` only (`.rez`, parquet and raw output
 are removed; reading them stays), so `metriken-recorder` writes `.dendro` only
 and an agent older than 5.21.0 is refused by 6.x, replacing the rezolus
 entry's decision 1; rezolus 6.0.0 is released after steps 4 to 7 and the
-follow-ups listed in step 7. Decided
+follow-ups listed in step 7; rezolus's sampler sections become a section
+template the agent sends in its handshake, expanded by `metriken-dashboard`,
+replacing the planned `rezolus-dashboard` crate (viewer entry, Q12). Decided
 2026-10-08:
 
 - recording, exposition and viewing converge on one stack, and per-project
@@ -123,7 +125,11 @@ Each crate and what it depends on:
 - `metriken-viewer`, in `iopsystems/metriken-viewer`: `metriken-dashboard`,
   `metriken-query`, `metriken-storage` (report saving), `metriken-recorder`
   (live mode), all by crates.io version.
-- `rezolus-dashboard`, in rezolus: `metriken-dashboard`, `metriken-query`.
+
+rezolus's sampler sections are not a crate: they are a section template the
+rezolus agent sends in its handshake, expanded by `metriken-dashboard`
+(decided 2026-10-12, viewer entry Q12; this list named a `rezolus-dashboard`
+crate until then).
 
 Four of these edges need explaining:
 
@@ -184,7 +190,7 @@ Four of these edges need explaining:
 | `metriken-storage` | Everything about tables and files: the arrow/parquet layouts (wide, long, occupant streams), turning rows into segments (`materialize_wal_tail`), the containers as features (`dendro`, the default; `rez`; `parquet`, single files, including `MsgpackToParquet`), the public data-access trait, the column readers, the long-table relabel, writers behind `write` (including staging streamed rows, `StreamDecoder`), and opening a file by its content. | `metriken-archive` (renamed); metriken-segment's tables; rezolus's `crates/rez` without its `caller_rows` identity index (`indexed.rs`), which only 5.x's preview `record --stream -o .rez` wrote; `metriken-query`'s column readers (the `DataSource` halves of `ParquetReader`, `SegmentedParquetReader` and `UnionMetricsSource`: `FileSource`, `MultiParquetSource`, `LazySource`, `SegmentedSource`, `UnionSource`, `MemoryStoreInner`) and `long`; the `MetricsSource` wrappers stay in `metriken-query`; metriken-exposition's `MsgpackToParquet` |
 | `metriken-query` | The PromQL engine over storage's data-access trait, including routing a query to tables. `ingest` forwards to storage's, where `MemoryStore`'s snapshot loading reads model types, so `metriken-query` no longer depends on `metriken`. | itself, without the column readers |
 | `metriken-recorder` | Sources to storage: a stream subscription, a Prometheus scrape (one acquisition group per scrape), the process's own snapshots handed over directly. Reconnects, restart metadata, several sources in one archive, `.dendro` output (6.x writes no other container). Serves rezolus's 6.x line; 5.x keeps its own recorder (decided 2026-10-12). | rezolus `src/recorder` (`stream.rs`, `prometheus.rs`, `restart.rs` and the orchestration in `mod.rs`) |
-| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, templates read from source metadata, and a section-provider trait for sections an application generates in Rust. Released with `metriken-query`. | rezolus `crates/dashboard` without its sampler sections (those become `rezolus-dashboard`, published from rezolus) |
+| `metriken-dashboard` | The dashboard model: sections, groups and plots from a source, templates read from source metadata, and the expander for section templates (schema 1: conditions on the metric catalog, repetition over label values). Released with `metriken-query`. | rezolus `crates/dashboard` without its sampler sections, which become the rezolus section template that the agent sends (viewer entry, Q12) |
 | `metriken-viewer` (in `iopsystems/metriken-viewer`, not this repository) | The viewer as a library: a server router to mount, the chart and UI assets, the WASM exports and the script an application builds its own bundle with, report saving, live mode over `metriken-recorder`. | rezolus `src/viewer`, `crates/viewer`, `crates/report-save` |
 | `metriken-py` (later) | Python bindings over storage and query (piece 4). | new |
 
@@ -215,14 +221,19 @@ the caller's `metriken-query`. `metriken-viewer`, with its JS build and
 static assets, lives in `iopsystems/metriken-viewer` and depends on the
 metriken crates by version. This repository's CI gains the
 `metriken-dashboard` wasm32 check and a check that the display wire fixture
-is in that crate's package. rezolus's sampler sections stay in rezolus
-as `rezolus-dashboard`, published to crates.io from rezolus's own release
-workflow with rezolus's version (Q2; decided 2026-10-12, because a section
-changes with its sampler). A metriken-query change to `MetricsSource`
-therefore reaches cachecannon and systemslab after a rezolus release, and a
-cachecannon branch before rezolus 6.0.0 pins a 6.0.0-alpha. Whether
-rezolus's sections can instead be templates the agent sends, so that no
-viewer depends on a rezolus crate, is being evaluated (viewer entry, Q12).
+is in that crate's package. rezolus's sampler sections stay in rezolus as
+a section template the agent embeds and sends under a `dashboard` key in
+its handshake (viewer entry, Q12; decided 2026-10-12 after an evaluation
+the owner accepted). This supersedes the earlier decision of the same day
+(Q2) that they become a `rezolus-dashboard` crate published from rezolus's
+release workflow: there is no such crate and no section-provider trait, a
+metriken-query change to `MetricsSource` reaches cachecannon and systemslab
+after metriken-dashboard and metriken-viewer release with no rezolus
+release in between, and cachecannon pins no rezolus prerelease. A sampler
+and its section still land in one rezolus commit. Recordings with no
+template fall back to the rezolus template in the viewer's registry, and an
+archive's template renders by default, the registry only on request (a
+viewer flag such as `rezolus view --templates`).
 
 ## Pieces
 
@@ -281,12 +292,14 @@ vllm, sglang and valkey live in rezolus (`crates/dashboard/templates/`), so a
 change to one needs a rezolus release.
 
 - A producer that serves the stream passes its template to the route helper,
-  which sends it in the handshake's `metadata` or in a frame after the
-  handshake (decided 2026-10-12, viewer entry Q12; which of the two is
-  open). dendro carries the handshake map verbatim (`Frame::Handshake`), and
+  which sends it in the handshake's `metadata` (decided 2026-10-12, viewer
+  entry Q12: a frame after the handshake was the other option, and the
+  evaluation there settled on the handshake, since the template is sent
+  once per subscription and no dendro frame updates a source's metadata).
+  dendro carries the handshake map verbatim (`Frame::Handshake`), and
   dendro's own `Subscriber` stores it as the source's metadata. dendro
   0.4.0 has no frame that changes a source's metadata after the handshake,
-  so the second form needs a dendro change. rezolus's recorder does not use that subscriber
+  so sending it after the handshake would need a dendro change. rezolus's recorder does not use that subscriber
   (`src/recorder/stream.rs`): it keeps only the handshake's uuid and clock
   anchor (`adopt_source`, `src/recorder/mod.rs`) and reads metadata from the
   agent's `/status`, `/systeminfo` and `/metrics/descriptions`. The recorder
@@ -297,6 +310,16 @@ change to one needs a rezolus release.
   already writes into a `.rez` or `.dendro` source's metadata and
   `rezolus recording check` already reads. Templates are the same
   `ServiceExtension` JSON.
+- The rezolus agent also sends `dashboard` alongside `service_queries`: its
+  sampler sections as a section template (schema 1, a document separate
+  from `ServiceExtension`, with conditions on the metric catalog), which
+  `metriken-dashboard` expands (viewer entry, Q12). The full template is
+  estimated at about 17 KB gzipped. A viewer that expands schema N is
+  released before any agent sends N, because the stream has no negotiation.
+- The viewer looks up a source's dashboard in this order: the source's
+  `dashboard` key, its `service_queries`, `per_source_metadata`, the
+  application's fallback registry by each entry's `match` predicate, then a
+  simple-capture section (viewer entry, "Templates").
 - A program recording itself writes its template into its own source's
   metadata.
 - A scraped Prometheus endpoint has no handshake. The recorder takes a
@@ -347,8 +370,9 @@ cachecannon branch is on the released crates by then (decided 2026-10-12; it
 was planned for after, because the viewer is the part of rezolus changing
 fastest). systemslab, which today vendors rezolus's chart code at a rezolus
 revision and takes `dashboard` from a rezolus git tag, moves to
-`metriken-dashboard`, `rezolus-dashboard` and `metriken-viewer`'s assets
-after rezolus 6.0.0, in its own entry (viewer entry, Q9). `cachecannon view` reads
+`metriken-dashboard` and `metriken-viewer`'s assets, with the rezolus
+template registered in its registry (viewer entry, Q7), after rezolus 6.0.0,
+in its own entry (viewer entry, Q9). `cachecannon view` reads
 `.dendro` before then through its metriken bump (cachecannon entry).
 
 ### 6. What stays
@@ -429,9 +453,13 @@ re-exports what it moves, in the release after.
    llm-perf records in process. Design and gate:
    [metriken-recorder](2026-10-12-metriken-recorder.md).
 5. **Templates in the archive** (piece 3): the route helper sends the
-   template in the handshake or a frame after it (the recorder adopts
-   handshake metadata since step 4), and the viewer reads `service_queries`
-   from a source's metadata. A multi-recording archive from one run opens as
+   template in the handshake (the recorder adopts handshake metadata since
+   step 4), and the viewer reads `service_queries` from a source's
+   metadata. The rezolus agent sends `dashboard` alongside
+   `service_queries`; this step defines the section-template document
+   (schema 1) and the expander, and the viewer's lookup order (viewer entry,
+   Q12 and "Templates"). The first agent release that sends a template is
+   not released before a viewer that expands it. A multi-recording archive from one run opens as
    one combined view, with recording labels as series labels and A/B only
    on request (viewer entry, Q11).
 6. **`metriken-py`** (piece 4), before any consumer outside Rust gets
