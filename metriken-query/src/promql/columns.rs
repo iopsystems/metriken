@@ -64,7 +64,7 @@ pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
 /// (`extract_filter_labels`). Like [`referenced_metrics`], needs no source;
 /// a reader uses it to leave out tables whose fixed labels no selector can
 /// match.
-pub(crate) fn selectors(query: &str) -> Result<Vec<(HashSet<String>, Labels)>, QueryError> {
+pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
     let stripped = strip_rezolus_wrapper(query)?;
     let expr = parser::parse(stripped)
         .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
@@ -73,36 +73,75 @@ pub(crate) fn selectors(query: &str) -> Result<Vec<(HashSet<String>, Labels)>, Q
     Ok(out)
 }
 
-/// Whether a query combines series: an aggregation, or a binary operator
-/// with a selector on both sides. A query that does not evaluates each
-/// series on its own (`rate(x[1m])`, `x * 8`).
-pub(crate) fn combines_series(query: &str) -> Result<bool, QueryError> {
+/// A selector: the metric names it can select and its matchers as a filter.
+pub(crate) type Selector = (HashSet<String>, Labels);
+
+/// A place where a query combines series.
+pub(crate) enum Combination {
+    /// An aggregation over the series its operand selects.
+    All(Vec<Selector>),
+    /// A binary operator with a selector on both sides. `matched` is set
+    /// when it pairs by fewer labels than all of them (`on`, `ignoring`) or
+    /// many to one (`group_left`, `group_right`).
+    Pair {
+        lhs: Vec<Selector>,
+        rhs: Vec<Selector>,
+        matched: bool,
+    },
+}
+
+/// Every place `query` combines series, for a reader that has to know which
+/// of them span more than one of its recordings.
+pub(crate) fn combinations(query: &str) -> Result<Vec<Combination>, QueryError> {
     let stripped = strip_rezolus_wrapper(query)?;
     let expr = parser::parse(stripped)
         .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
-    Ok(combines(&expr))
+    let mut out = Vec::new();
+    walk_combinations(&expr, &mut out);
+    Ok(out)
 }
 
-fn combines(expr: &Expr) -> bool {
-    let selects = |e: &Expr| {
-        let mut names = Vec::new();
-        walk_selectors(e, &mut names);
-        !names.is_empty()
-    };
+fn selectors_of(expr: &Expr) -> Vec<Selector> {
+    let mut out = Vec::new();
+    walk_selectors(expr, &mut out);
+    out
+}
+
+fn walk_combinations(expr: &Expr, out: &mut Vec<Combination>) {
     match expr {
-        Expr::Aggregate(_) => true,
-        Expr::Binary(b) => {
-            (selects(&b.lhs) && selects(&b.rhs)) || combines(&b.lhs) || combines(&b.rhs)
+        Expr::Aggregate(agg) => {
+            out.push(Combination::All(selectors_of(&agg.expr)));
+            walk_combinations(&agg.expr, out);
         }
-        Expr::Unary(u) => combines(&u.expr),
-        Expr::Paren(p) => combines(&p.expr),
-        Expr::Call(call) => call.args.args.iter().any(|a| combines(a)),
-        Expr::Subquery(s) => combines(&s.expr),
+        Expr::Binary(b) => {
+            let (lhs, rhs) = (selectors_of(&b.lhs), selectors_of(&b.rhs));
+            if !lhs.is_empty() && !rhs.is_empty() {
+                let matched = b.modifier.as_ref().is_some_and(|m| {
+                    m.matching.is_some()
+                        || matches!(
+                            m.card,
+                            parser::VectorMatchCardinality::ManyToOne(_)
+                                | parser::VectorMatchCardinality::OneToMany(_)
+                        )
+                });
+                out.push(Combination::Pair { lhs, rhs, matched });
+            }
+            walk_combinations(&b.lhs, out);
+            walk_combinations(&b.rhs, out);
+        }
+        Expr::Unary(u) => walk_combinations(&u.expr, out),
+        Expr::Paren(p) => walk_combinations(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_combinations(arg, out);
+            }
+        }
+        Expr::Subquery(s) => walk_combinations(&s.expr, out),
         Expr::VectorSelector(_)
         | Expr::MatrixSelector(_)
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
-        | Expr::Extension(_) => false,
+        | Expr::Extension(_) => {}
     }
 }
 

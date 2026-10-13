@@ -30,22 +30,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between recordings row by row; a label matcher selecting one recording
   answers. Joined recordings take the per-series rate path
   (`MultiParquetSource` has no column scan).
-- The cross-cadence evaluation timestamps apply across recordings whose
-  time ranges overlap (recordings of one run share a wall clock), with each sampler keyed
-  by its recording; recordings that do not overlap (two runs) stay on the
-  uniform grid. A 1 s producer beside a 10 s one in one archive reads
-  `sum(g)` at the 10 s rows, where on the grid the slow gauge had a fresh
-  row only every tenth point.
-- In `RateMode::Raw`, a query combining series of several recordings (an
-  aggregation, or an operator with a selector on both sides) is refused:
-  Raw reads each series at its own rows, and two recordings' rows fall at
-  different instants, so `sum(g)` over two recordings half an interval
-  apart alternated between them. A single series per recording, one
-  recording selected by label, or a grid mode answers.
-- At the edges of a range, a combination across recordings reads only the
-  recordings that have a row there: before the later recording's first row,
-  and at the last point where its next row lies past the range, a `sum`
-  holds the other recording alone. Not changed here.
+- The cross-cadence evaluation timestamps apply across recordings of one
+  run to a query that combines their series (see below), when the slow
+  recording's rows cover every other recording's span to within one of its
+  gaps; each sampler is keyed by its recording. A 1 s producer beside a 10 s
+  one in one archive reads `sum(g)` at the 10 s rows, where on the grid the
+  slow gauge had a fresh row only every tenth point. A query that combines
+  nothing (`g`, `rate(x[1m])` per series) stays on the grid at full
+  resolution, and so do recordings that only partly overlap or are of
+  different runs.
+- A query combines series of different recordings when it aggregates
+  series of more than one, applies an operator with `on`, `ignoring` or a
+  group modifier across more than one, or applies a plain operator whose
+  two sides come from different sets of recordings. A plain operator whose
+  sides come from the same recordings pairs within each (`g / h` is a ratio
+  per recording, since every series carries its recording's labels).
+- In `RateMode::Raw`, a query that combines series of different recordings
+  is refused: Raw reads each series at its own rows, and two recordings'
+  rows fall at different instants, so `sum(g)` over two recordings half an
+  interval apart alternated between them. One recording selected by label,
+  or a grid mode, answers.
+- At the edges of a range, a combination across recordings on the grid
+  reads only the recordings that have a row there: before the later
+  recording's first row, and at the last point when its next row lies past
+  the range, a `sum` holds the other recording alone. With different
+  cadences and a slow recording that does not cover the others, a `sum` on
+  the grid reads the slow one only at its rows. Not changed here.
 
 ## [0.36.1] - 2026-10-12
 

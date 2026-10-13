@@ -12,7 +12,7 @@ use crate::{DataSource, QueryOptions};
 
 mod columns;
 pub use columns::referenced_metrics;
-pub(crate) use columns::{combines_series, selectors};
+pub(crate) use columns::{combinations, selectors, Combination, Selector};
 pub(crate) mod streaming;
 
 #[cfg(test)]

@@ -155,7 +155,7 @@ fn route(
     if recordings.len() > 1 {
         refuse_histograms_across_recordings(&recordings, &labels, query)?;
         if matches!(rate_mode, RateMode::Raw) {
-            refuse_combining_across_recordings(&recordings, &labels, query)?;
+            refuse_combining_across_recordings(reader, &recordings, &labels, query)?;
         }
     }
     let mut sources: Vec<Arc<dyn DataSource>> = Vec::new();
@@ -207,8 +207,8 @@ fn recording_selectors(
         .collect()
 }
 
-/// Refuse, in [`RateMode::Raw`], a query that combines series of several
-/// recordings: an aggregation, or an operator with a selector on both sides.
+/// Refuse, in [`RateMode::Raw`], a query that combines series of different
+/// recordings ([`combines_across_recordings`]).
 ///
 /// Raw places each point at a series' own sample times, by contract, and
 /// never moves them; two recordings' rows fall at different instants, so a
@@ -217,14 +217,15 @@ fn recording_selectors(
 /// 10, 100, 10, 100 where it should read 110. The grid modes evaluate every
 /// series at the same instants (the cross-cadence timestamps, across
 /// recordings of one run, for different cadences), so they answer it. A
-/// query evaluating each series on its own, or selecting one recording by
-/// label, is answered in Raw too.
+/// query evaluating each series on its own, pairing series within each
+/// recording, or selecting one recording by label, is answered in Raw too.
 fn refuse_combining_across_recordings(
+    reader: &ArchiveReader,
     recordings: &[Vec<&SamplerReader>],
     labels: &metriken_storage::reader::SeriesLabels,
     query: &str,
 ) -> Result<(), QueryError> {
-    if !crate::promql::combines_series(query)? {
+    if !combines_across_recordings(reader, labels, query)? {
         return Ok(());
     }
     let which = recording_selectors(recordings, labels);
@@ -237,6 +238,73 @@ fn refuse_combining_across_recordings(
         which.join(", "),
         which[0],
     )))
+}
+
+/// One table per recording whose series a selector of `selectors` can
+/// select: a table holding one of its names, under recording labels the
+/// selector's matchers accept.
+fn recordings_selected<'a>(
+    reader: &'a ArchiveReader,
+    labels: &metriken_storage::reader::SeriesLabels,
+    selectors: &[crate::promql::Selector],
+) -> Vec<&'a SamplerReader> {
+    let mut out: Vec<&SamplerReader> = Vec::new();
+    for (names, filter) in selectors {
+        let names: Vec<String> = names.iter().cloned().collect();
+        for t in reader.owners_of(&names) {
+            if translate_filter(labels.of(t), filter).is_some()
+                && !out.iter().any(|r| r.same_recording(t))
+            {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `query` combines series of different recordings: an aggregation
+/// over series of more than one, a binary operator with `on`, `ignoring`
+/// or a group modifier whose sides span more than one, or a plain binary
+/// operator whose two sides come from different sets of recordings.
+///
+/// A plain binary operator whose sides come from the same recordings pairs
+/// series within each recording, since every series carries its
+/// recording's labels and pairs match on all labels (`g / h` is a ratio per
+/// recording). Sides from different recordings are paired across them: the
+/// engine pairs a side of one series with every series of the other.
+fn combines_across_recordings(
+    reader: &ArchiveReader,
+    labels: &metriken_storage::reader::SeriesLabels,
+    query: &str,
+) -> Result<bool, QueryError> {
+    use crate::promql::Combination;
+    let union = |a: &[&SamplerReader], b: &[&SamplerReader]| {
+        a.len()
+            + b.iter()
+                .filter(|t| !a.iter().any(|r| r.same_recording(t)))
+                .count()
+    };
+    for c in crate::promql::combinations(query)? {
+        let across = match c {
+            Combination::All(selectors) => {
+                recordings_selected(reader, labels, &selectors).len() > 1
+            }
+            Combination::Pair { lhs, rhs, matched } => {
+                let l = recordings_selected(reader, labels, &lhs);
+                let r = recordings_selected(reader, labels, &rhs);
+                let n = union(&l, &r);
+                if matched {
+                    n > 1
+                } else {
+                    n > 1 && !(n == l.len() && n == r.len())
+                }
+            }
+        };
+        if across {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Refuse a query that reads one histogram from several recordings.
@@ -418,10 +486,14 @@ fn cross_cadence_eval_timestamps(
     }
     // Recordings of one run share a wall clock, so one recording's rows are
     // instants the others' series can be read at, as one sampler's rows are
-    // for another's within a recording. Recordings that do not overlap in
-    // time (two runs) share no instants: imposing one's rows on the other
-    // puts every point where it has no data, so those stay on the uniform
-    // grid (see `eval_timestamps_for`).
+    // for another's within a recording. Moving a query onto them helps only
+    // where it combines series of different recordings (each series on its
+    // own is right on the grid at any cadence), and only where the slow
+    // recording's rows cover the others' spans: elsewhere the others'
+    // points would be dropped, and two runs share no instants at all. So
+    // across recordings this applies to a combining query whose slow
+    // recording spans the others (checked below), and otherwise the
+    // uniform grid answers (see `eval_timestamps_for`).
     let mut recordings: Vec<(&SamplerReader, Option<(u64, u64)>)> = Vec::new();
     for t in &owners {
         match recordings.iter_mut().find(|(r, _)| r.same_recording(t)) {
@@ -430,10 +502,11 @@ fn cross_cadence_eval_timestamps(
         }
     }
     if recordings.len() > 1 {
-        let spans: Vec<(u64, u64)> = recordings.iter().filter_map(|(_, s)| *s).collect();
-        let start = spans.iter().map(|s| s.0).max()?;
-        let end = spans.iter().map(|s| s.1).min()?;
-        if spans.len() < recordings.len() || start > end {
+        if recordings.iter().any(|(_, span)| span.is_none()) {
+            return None;
+        }
+        let labels = reader.series_labels();
+        if !combines_across_recordings(reader, &labels, query).ok()? {
             return None;
         }
     }
@@ -481,7 +554,22 @@ fn cross_cadence_eval_timestamps(
     }
 
     let fastest = by_sampler.values().map(|(gap, _)| *gap).min()?;
-    let (slowest, timestamps) = by_sampler.into_values().max_by_key(|(gap, _)| *gap)?;
+    let ((slow_recording, _), (slowest, timestamps)) =
+        by_sampler.into_iter().max_by_key(|(_, (gap, _))| *gap)?;
+    // Across recordings, the slow recording's rows must reach every other
+    // recording's first and last rows, to within one of its gaps.
+    if recordings.len() > 1 {
+        let (slow_start, slow_end) = recordings[slow_recording].1?;
+        let covered = recordings.iter().all(|(_, span)| {
+            span.is_some_and(|(start, end)| {
+                start.saturating_add(slowest) >= slow_start
+                    && end <= slow_end.saturating_add(slowest)
+            })
+        });
+        if !covered {
+            return None;
+        }
+    }
     // Deliberately a ratio, not equality: gaps measured from real rows are
     // never exactly equal, so "different cadence" has to mean *materially*
     // different. A sampler read at least twice as far apart as another is a
@@ -1245,5 +1333,94 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, ["0", "1", "2"]);
+    }
+
+    fn gauge_rows(from: u64, to: u64, every: u64, v: u64) -> Vec<(u64, u64)> {
+        (from..=to)
+            .step_by(every as usize)
+            .map(|t| (t * S, v))
+            .collect()
+    }
+
+    /// The slow recording starts halfway through: its rows do not cover the
+    /// fast one's, so nothing moves onto them, and a query that combines
+    /// nothing keeps every point of the fast recording.
+    #[test]
+    fn a_partly_overlapping_recording_does_not_thin_the_others() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![(
+                    "fast",
+                    explicit_table("g", "gauge", &gauge_rows(1, 40, 1, 10)),
+                )],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![(
+                    "slow",
+                    explicit_table("g", "gauge", &gauge_rows(21, 40, 10, 100)),
+                )],
+            ),
+        ]);
+        let at = |q: &str| eval_timestamps_for(&reader, q, 1.0, RateMode::default());
+        assert!(at("sum(g)").is_none());
+        assert!(at("g").is_none());
+        let per_series = values(&reader, r#"g"#, RateMode::default()).unwrap();
+        assert!(per_series.iter().any(|s| s.len() == 40), "{per_series:?}");
+    }
+
+    /// Fully overlapping recordings at different cadences: a query that
+    /// combines nothing stays on the grid at the fast recording's
+    /// resolution; one that combines them moves onto the slow rows.
+    #[test]
+    fn only_a_combining_query_moves_onto_the_slow_recordings_rows() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![(
+                    "fast",
+                    explicit_table("g", "gauge", &gauge_rows(1, 40, 1, 10)),
+                )],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![(
+                    "slow",
+                    explicit_table("g", "gauge", &gauge_rows(1, 40, 10, 100)),
+                )],
+            ),
+        ]);
+        let at = |q: &str| eval_timestamps_for(&reader, q, 1.0, RateMode::default());
+        assert!(at("g").is_none());
+        assert!(at("g * 2").is_none());
+        assert!(at("sum(g)").is_some());
+        assert!(at("sum by (source) (g)").is_some());
+    }
+
+    /// Which binary operators combine across recordings: one whose sides
+    /// come from the same recordings pairs within each (a ratio per
+    /// recording); one whose sides come from different recordings, or that
+    /// matches on fewer labels, pairs across them.
+    #[test]
+    fn raw_mode_refuses_only_operators_that_pair_across_recordings() {
+        let both = |source: &'static str, g: u64, h: u64| {
+            recording(
+                &[("source", source)],
+                vec![
+                    ("tg", explicit_table("g", "gauge", &gauge_rows(1, 40, 1, g))),
+                    ("th", explicit_table("h", "gauge", &gauge_rows(1, 40, 1, h))),
+                ],
+            )
+        };
+        let reader = archive(vec![both("a", 10, 2), both("b", 100, 4)]);
+        let raw = |q: &str| values(&reader, q, RateMode::Raw);
+        assert_eq!(raw("g / h").unwrap().len(), 2);
+        assert!(raw("g / on() h").unwrap_err().contains("raw mode"));
+        assert!(raw(r#"g{source="a"} / h{source="b"}"#)
+            .unwrap_err()
+            .contains("raw mode"));
+        assert!(raw("sum(g)").unwrap_err().contains("raw mode"));
+        assert_eq!(raw(r#"sum(g{source="a"})"#).unwrap().len(), 1);
     }
 }

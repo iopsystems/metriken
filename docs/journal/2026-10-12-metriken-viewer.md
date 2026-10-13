@@ -762,19 +762,38 @@ metriken-query, unreleased):
   cross-cadence timestamps move a query onto the slow sampler's rows. The
   second was first applied within one recording only, which left
   different cadences across recordings on the grid: with a 1 s and a 10 s
-  recording, `sum(g)` read 110 at the slow one's rows and 10 between. It
-  now applies across recordings whose time ranges overlap. What the engine
-  had no answer for across recordings, because a metric's series always
-  shared one table's rows: combining in `RateMode::Raw` (`sum(g)`
-  alternated 10, 100, 10, 100 for recordings half an interval apart), now
-  refused; histogram functions, refused above; and the range edges, where
+  recording, `sum(g)` read 110 at the slow one's rows and 10 between.
+  Applying it to every query over overlapping recordings (the next
+  attempt) was wrong too, as the following review showed: a recording
+  starting halfway through cut every other series to the slow rows inside
+  its span and dropped them outside it (`g` over 40 s kept 2 of 40 points),
+  and even a query combining nothing was drawn at the slow resolution. As
+  built: across recordings the timestamps apply only to a query that
+  combines series of different recordings (`combines_across_recordings`,
+  from `promql::combinations`), and only when the slow recording's rows
+  cover every other recording's span to within one of its gaps. A query
+  combines across recordings when it aggregates series of more than one,
+  applies an operator with `on`, `ignoring` or a group modifier across more
+  than one, or applies a plain operator whose sides come from different
+  sets of recordings; a plain operator whose sides come from the same
+  recordings pairs within each (`g / h`), and one whose sides differ is
+  paired across them by the engine, which pairs a side of one series with
+  every series of the other. What the engine had no answer for across
+  recordings, because a metric's series always shared one table's rows:
+  combining in `RateMode::Raw` (`sum(g)` alternated 10, 100, 10, 100 for
+  recordings half an interval apart), now refused by the same rule;
+  histogram functions, refused above; the range edges on the grid, where
   a `sum` reads only the recordings that have a row (the first point
   before the later recording's first row, and the last point when its next
-  row lies past the range, read low). The edges are left as they are; a
-  combining query could trim its range to the span every recording covers.
-  A stricter rule refusing every aggregation across recordings was
-  considered and not taken: the grid answers `sum by (source)` correctly
-  apart from the edges.
+  row lies past the range, read low); and different cadences where the
+  slow recording does not cover the others, which stay on the grid and
+  read the slow one only at its rows. Those last two are left as they are;
+  trimming a combining query's range to the span every recording covers
+  would address both. A stricter rule refusing every aggregation across
+  recordings was considered and not taken: the grid answers
+  `sum by (source)` correctly apart from those cases. `scalar()` and
+  `absent()` reduce across series but are not supported by the engine; if
+  they become so, `combinations` needs a case for them.
 - `owners()` leaves out a table when no selector naming one of its
   metrics can match its recording's labels (`translate_filter` against
   `series_labels`); when that leaves none, the first recording's tables
@@ -807,13 +826,17 @@ metriken-query, unreleased):
   `sum`, `sum by`; the `exported_` rename and its matchers; identical label
   sets; the shared-name refusal; `columns`; cross-cadence across
   recordings of one run and not of two; `sum` across a 1 s and a 10 s
-  recording; Raw refusal) and metriken-storage `labeled::tests`. Seen red: no
+  recording; a partly overlapping recording; only combining queries moving
+  onto slow rows; which operators Raw refuses) and metriken-storage
+  `labeled::tests`. Seen red: no
   wrapper in `route`, no `__recording__`, `exported_` matchers unchecked,
   the clashing value dropped, cross-cadence across recordings, the merge
   mixing configurations, no owner pruning, `__recording__` by position, no
   chained prefix, no histogram refusal, catalog indices kept when
   flattened twins repeat one, twins only among recordings with tables, no
-  cross-cadence across recordings, no overlap check, no Raw refusal.
+  cross-cadence across recordings, no overlap check, no Raw refusal, no
+  coverage check, every operator across recordings counted as combining,
+  non-combining queries moved onto slow rows.
 - Cost, measured on `metrics-9.6h.dendro` (one recording), display queries
   at a 500-point budget, five runs per query, three alternating rounds of
   upstream main (95d0d52) and this branch: medians 39.7 to 42.1 ms and 39.9
