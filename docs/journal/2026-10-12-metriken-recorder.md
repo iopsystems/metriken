@@ -485,8 +485,12 @@ change has a test, and each test was seen to fail with the fix reverted.
   never returned (repros: `events = 1` with two local sources; `events = 8`
   filled by `Committed`, then a late `Active`). Must-deliver events are now
   queued in the recorder and flushed with `try_send` on every emit and every
-  tick; `Dropped` and `Reconnected` are counted in `Lagged` past 1,024
-  queued events, since a flapping producer emits them without limit. Events
+  tick; `Dropped`, `Reconnected` and `Restarted` are counted in `Lagged`
+  past 1,024 queued events, since a producer that flaps or restarts in a
+  loop emits them without limit (a restart is still written into
+  `producer_epochs`). A drop is queued as a `Lagged` where it happened,
+  merged with one already at the back, so the caller reads it after the
+  events emitted before the drop. Events
   still queued at the end are sent from a spawned task until the receiver is
   dropped. Tests: `an_unread_receiver_does_not_hold_off_finish`,
   `a_full_channel_then_an_activation_does_not_hold_off_finish` (both time
@@ -534,24 +538,29 @@ Measured 2026-10-12 on macOS, one unprivileged agent at 1 s, three release
 hindsight builds subscribed to it at once with a 10 min lookback:
 upstream/main (rezolus 50075985, which committed each frame on arrival),
 the branch committing on the tick, and the branch with
-`commit_streams_on_arrival`. Ten `POST /dump/file` per build at a random
-phase within the interval; lag is the request's wall time minus the dump's
-last row.
+`commit_streams_on_arrival`. Five `POST /dump/file` per build at a random
+phase within the interval; lag is the request's wall time minus the dump
+file's newest row (the larger of `segments.last_ts` and `wal.ts`).
 
-| build | lag minus phase, each of 10 trials | median lag |
-|---|---|---|
-| upstream/main | 1000 ms | 1484 ms |
-| commit on tick | 2000 ms | 2245 ms |
-| commit on arrival | 1000 ms | 1519 ms |
+| build | lag minus phase, each of 5 trials |
+|---|---|
+| upstream/main | -1 to -3 ms |
+| commit on tick | 997 to 998 ms |
+| commit on arrival | -2 to -3 ms |
 
-The agent's frames arrive 3 ms after each boundary, just after the aligned
-tick, so on the tick a frame waits one interval. Polling each buffer's
-newest WAL row every 20 ms showed the same: visible 2 to 26 ms after its
-stamp on arrival and on upstream/main, 1001 to 1020 ms on the tick.
+A dump on arrival holds every frame received before the request; on the
+tick it is one interval behind. The agent's frames arrive 3 ms after each
+boundary, just after the aligned tick, so on the tick each frame waits for
+the next one. Polling each buffer's newest WAL row every 20 ms agreed:
+visible 2 to 26 ms after its stamp on arrival and on upstream/main, 1001 to
+1020 ms on the tick. (The negative figures are rows stamped a few ms after
+the boundary the phase is measured from.)
 
-The 1000 ms the on-arrival builds share is in the dump, not the commit. In a
-first run, upstream/main's lag minus phase was 0 ms; I do not know what
-moved it between runs. The difference between builds was 1000 ms in both.
+The dump response's `time_range` is in whole seconds (rezolus
+`src/hindsight/http.rs`, `to_secs` truncates), so it cannot measure a lag
+within an interval. An earlier version of this table read it, and the
+truncation was the whole of an extra second it attributed to the dump and
+of a change between runs it could not explain.
 
 ## GO / NO-GO
 
