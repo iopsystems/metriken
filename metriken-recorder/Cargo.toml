@@ -1,0 +1,65 @@
+[package]
+name = "metriken-recorder"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+]
+license = "MIT OR Apache-2.0"
+description = "Records metriken producers (streamed, scraped as Prometheus, or the process's own registry) into one .dendro archive"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
+readme = "README.md"
+
+[features]
+default = ["http"]
+# `detect`, `Subscription`, `pump` and the scrape client, over a
+# `reqwest::Client` the caller builds and passes in.
+http = ["dep:reqwest", "dep:url"]
+# `RegistrySource`: the process's own metriken registry as a local source.
+# The only feature that links the registry.
+registry = ["dep:metriken-exposition", "dep:metriken"]
+
+[dependencies]
+async-trait = "0.1"
+# The frame decoder needs `replicate::{Frame, wire}`, and
+# `StreamDecoder::decode` takes dendro's `WalRow`; storage does not
+# re-export dendro.
+dendro = { version = "0.4.0", default-features = false, features = ["archive"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+histogram.workspace = true
+humantime = "2"
+metriken-model = { version = "0.1.2", path = "../metriken-model" }
+metriken-storage = { version = "0.2.2", path = "../metriken-storage", default-features = false, features = ["write"] }
+metriken-types = { version = "0.1.0", path = "../metriken-types" }
+prometheus-parse = "0.2.5"
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }
+serde_json.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+tokio-util = { version = "0.7", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+metriken = { version = "0.11.3", path = "../metriken", optional = true }
+metriken-exposition = { version = "0.22.1", path = "../metriken-exposition", default-features = false, features = ["msgpack"], optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+futures-util = { version = "0.3", default-features = false }
+metriken = { path = "../metriken" }
+metriken-exposition = { path = "../metriken-exposition", features = ["stream-tokio"] }
+metriken-storage = { path = "../metriken-storage", features = ["write"] }
+tempfile.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[test]]
+name = "recorder"
+required-features = ["http"]
+
+[[test]]
+name = "registry"
+required-features = ["registry"]
