@@ -200,9 +200,8 @@ pub(crate) fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Lab
         GroupBy::Exclude(without) => {
             // Internal labels go with the named ones: an aggregate is over a
             // set of series, and which incarnation or run each input was is
-            // meaningless for the sum. `__name__` was always dropped here;
-            // the rule is now the prefix, not the one name. `__recording__`
-            // stays, as it does in matching (`is_matched_label`): two
+            // meaningless for the sum. Every internal label is dropped except
+            // `__recording__`, as in matching (`is_matched_label`): two
             // recordings with identical labels are two sets of series.
             for (k, v) in &labels.inner {
                 if !is_matched_label(k) {

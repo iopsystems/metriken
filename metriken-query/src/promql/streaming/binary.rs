@@ -515,9 +515,8 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 /// and `y` carries some. Two series are of different recordings when they
 /// carry one of `recording_keys` with different values
 /// ([`DataSource::recording_label_keys`](crate::DataSource::recording_label_keys)).
-/// With no recording keys, every series is of one recording, and the rule
-/// is the eager engine's: a single unmatched right series pairs with every
-/// unmatched left one.
+/// With no recording keys, every series is of one recording, so a single
+/// unmatched right series pairs with every unmatched left one.
 pub fn matrix_matrix_op<'a>(
     left_set: SeriesSet<'a>,
     right_set: SeriesSet<'a>,
@@ -919,7 +918,8 @@ mod broadcast_tests {
 
     /// A single right series of another recording is not paired: with `x`
     /// only in recording a and `y` only in b, `x / y` is empty, as in
-    /// Prometheus. Without recording keys the eager rule stands, and it is.
+    /// Prometheus. Without recording keys a single right series pairs with
+    /// every left one, so the result has one series.
     #[test]
     fn a_broadcast_never_crosses_recordings() {
         let keys = ["source".to_string()];

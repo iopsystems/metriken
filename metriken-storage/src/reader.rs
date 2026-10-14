@@ -642,8 +642,9 @@ impl SamplerReader {
         self.names.histograms.contains(name)
     }
 
-    /// The table's row spacing in seconds: measured from its catalog where
-    /// the catalog says, else probed from its first segment.
+    /// The table's row spacing in seconds. Opened from a catalog: the table's
+    /// span over its row count. Opened from bytes: the interval its first
+    /// segment declares, else the median gap of its first rows.
     pub fn interval(&self) -> f64 {
         self.interval
     }

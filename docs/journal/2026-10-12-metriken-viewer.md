@@ -956,7 +956,7 @@ A query reaching several recordings is evaluated by one engine over all of
 them: `metriken_storage::recordings::RecordingsSource` joins each
 recording's labelled source (`LabeledSource`), and a read of a name
 concatenates every recording's series of it. Each failure #269 listed for
-one engine over two recordings is fixed in the engine:
+one engine over two recordings is fixed in the engine or refused:
 
 - Matching: `__recording__` takes part in binary-operator matching and in
   `without` (`is_matched_label`); other internal labels still do not. Twins
@@ -1017,29 +1017,36 @@ one engine over two recordings is fixed in the engine:
   `sum(irate(cgroup_syscall[5m]))` on two copies of the 9.6 h archive).
 
 Measured on `metrics-9.6h.dendro` (one recording), 274 queries from
-rezolus's dashboards, upstream main (daeaa13) against this branch: range
-queries over the last hour at 10 s, instant queries, and raw-mode range
-queries over the last two minutes. Range: 261 identical; the other 13
-differ by at most 4.6e-16 relative, and main differs from itself between
-runs on 15 queries by the same last-digit summation order. Instant: 272
-identical, 2 differ in the last digit. So on this archive neither the held
-end point nor the measured interval changed any answer: its tables share a
-1 s cadence and every series ends at the archive's end. Raw: identical at
-6eb621c; after the first review's raw fix (results cut at the range's
-start), 266 identical and 8 gauge queries (`memory_available` and the
-like) each without the one point main returned from before the start.
+rezolus's dashboards, upstream main (daeaa13) against this branch at
+ec734ec: range queries over the last hour at 10 s, instant queries, and
+raw-mode range queries over the last two minutes. Range and instant: every
+difference is in the last digit (at most 4.7e-16 relative; 12 range and 1
+instant query differ), as main shows against itself between runs on 15
+queries. So on this archive neither the held end point nor the measured
+interval changed any answer: its tables share a 1 s cadence and every
+series ends at the archive's end. Raw: 266 identical, and 8 gauge queries
+(`memory_available` and the like) each without the one point main
+returned from before the range's start.
 
 Measured on two copies of the same archive joined (`ArchiveReader::flatten`,
-twins told apart by `__recording__`): 87 `sum` queries return exactly twice
-the single answer (largest relative difference 7e-16), 25 averages and
-ratios exactly the single answer, 9 per-series queries every series twice
-with identical values, 87 errors as on one copy (metrics this host lacks),
-27 empty as on one copy. 16 queries of the form `sum(irate(x[5m])) /
-cpu_cores` are empty: the left side has no labels and `cpu_cores` has one
-series per recording, so the broadcast has two candidates. Prometheus
-answers it empty too; a dashboard meant for one host needs a matcher, or
-`sum(...) / sum(cpu_cores)` across hosts. Time for all 274: 3.0 s on one
-copy, 5.3 s on two.
+twins told apart by `__recording__`), at ec734ec: 87 queries whose result
+is an aggregate (`sum`, `count`) return exactly twice the single answer at
+every point (largest relative difference 7e-16), 25 averages and ratios
+exactly the single answer, 23 aggregates that are zero throughout on both,
+9 per-series queries every series twice with identical values, 87 errors as
+on one copy (metrics this host lacks), 27 empty as on one copy. 16 queries
+of the form `sum(irate(x[5m])) / cpu_cores` are empty: the left side has no
+labels and `cpu_cores` has one series per recording, so the broadcast has
+two candidates. Prometheus answers it empty too; a dashboard meant for one
+host needs a matcher, or `sum(...) / sum(cpu_cores)` across hosts. Time for
+all 274: 3.2 s on one copy, 5.5 s on two.
+
+Raw-mode cost, 200 counter series, raw `sum(irate(c[5m]))` over 30 s,
+median of 9 (release build): with the series on shared timestamps (one
+acquisition group) 0.74 ms against 0.96 ms on main; with each series 1 ms
+from the next, 8.3 ms against 3.4 ms. Offset series make the latest-point
+join evaluate every series at each of their 6000 timestamps, where main
+summed the one series present at each.
 
 Tests: metriken-query `archive::tests` (combinations across recordings in
 both modes, twins included; recordings of different phase and cadence
@@ -1077,7 +1084,20 @@ First review (of 6eb621c), each fixed with a test seen red:
 - The CHANGELOG said the held rate adds at most one point; it adds the
   grid points within the series' spacing of the range's end.
 
+Second review (of 171fcbf), each fixed with a test seen red:
+- Raw rates read back the `[range]` only, so a `[1s]` range did not reach a
+  series' last point before the start; and they emitted every pair of the
+  lookback, five minutes of points per series for `[5m]`, through every
+  operator before the cut. They now read back two steps or two intervals
+  and emit only the last point before the range.
+- `from_in_memory` still reported 1 s for a table whose first segment has
+  one row; it now takes the gap from the next segment.
+- The journal's counts came from a run before the raw fix; the numbers
+  above are from ec734ec.
+
 Still open:
+- The raw read reaches two of the source's (shortest) intervals back, so a
+  slower recording's series can lack its point before the range.
 - The catalog path's interval is the mean spacing (span over rows), which
   a long gap lengthens, so a gauge can be held longer than its cadence past
   a gap. The median needs every table's timestamps decoded.

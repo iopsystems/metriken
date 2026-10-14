@@ -53,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An archive opened from bytes (`ArchiveReader::from_in_memory`) reported
   1 s for a table whose segment declares no `sampling_interval_ms` (a
   dendro segment declares none). It now reports the median gap of the
-  first segment's rows for such a table; a declared interval is reported
-  as before.
+  table's first rows (the first segment's, or the first segments' when the
+  first has one row) for such a table; a declared interval is reported as
+  before.
 
 ### Changed
 

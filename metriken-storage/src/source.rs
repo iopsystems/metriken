@@ -158,15 +158,16 @@ pub trait DataSource: Send + Sync {
     /// several. Two series that carry one of these keys with different
     /// values are of different recordings, and a binary operator's
     /// broadcast never pairs them. Empty for a source of one recording that
-    /// adds no such labels.
+    /// adds no such labels. A source wrapping one that reports keys forwards
+    /// this and [`gauge_parts`](Self::gauge_parts); the defaults lose them.
     fn recording_label_keys(&self) -> Vec<String> {
         Vec::new()
     }
     /// Gauge `name`'s series for a grid from `start_ns` to `end_ns` at
     /// `step_ns`, as parts whose series share one sampling interval, each
-    /// returned with that interval in seconds. A gauge is held a step, or its interval when that is
-    /// longer, past each sample, so each part is read from that far before
-    /// `start_ns`. A source joining recordings of different intervals gives
+    /// returned with that interval in seconds. A gauge is held a step, or its
+    /// interval when that is longer, past each sample, so each part is read
+    /// from that far before `start_ns`. A source joining recordings of different intervals gives
     /// each recording's series its own. The default is one part at
     /// [`interval`](Self::interval).
     fn gauge_parts(
