@@ -32,8 +32,10 @@ fn stream_of(
 
 /// Pair-wise rate producer over a counter sample stream. Emits one point per
 /// consecutive sample pair, stamped at the later sample, for pairs whose stamp
-/// falls in `[start_ns, end_ns]`. The stream is fetched with lookback (for
-/// context), so the `start_ns` bound is what keeps a windowed/zoomed query
+/// falls in `[start_ns, end_ns]`; with
+/// [`with_one_before`](Self::with_one_before), also the last pair before
+/// `start_ns`, ahead of the first in range. The stream is fetched with
+/// lookback (for context), so the `start_ns` bound is what keeps a windowed/zoomed query
 /// from spilling points before the requested window — mirroring how the grid
 /// producer's cursor starts at `start_ns`.
 ///
@@ -47,6 +49,14 @@ pub struct CounterPairwiseRate<'a> {
     prev: Option<(u64, u64)>,
     start_ns: u64,
     end_ns: u64,
+    /// Emit the last point before `start_ns` too; see
+    /// [`with_one_before`](Self::with_one_before).
+    one_before: bool,
+    /// The latest pair before `start_ns` (`(ts, value)` of each sample),
+    /// kept when `one_before` is set and not yet emitted.
+    before: Option<((u64, u64), (u64, u64))>,
+    /// The first point in range, read while emitting `before`.
+    pending: Option<Point>,
 }
 
 impl<'a> CounterPairwiseRate<'a> {
@@ -60,7 +70,19 @@ impl<'a> CounterPairwiseRate<'a> {
             prev: None,
             start_ns,
             end_ns,
+            one_before: false,
+            before: None,
+            pending: None,
         }
+    }
+
+    /// Also emit the series' last point before `start_ns`, ahead of the
+    /// first in range: a join of series read at different instants holds it
+    /// at the range's start (`Join::Latest`). The caller cuts the result at
+    /// the start.
+    pub(crate) fn with_one_before(mut self) -> Self {
+        self.one_before = true;
+        self
     }
 }
 
@@ -68,32 +90,52 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
+        if let Some(p) = self.pending.take() {
+            return Some(p);
+        }
         loop {
-            let cur = self.source.next()?;
-            let Some((ts_prev, v_prev)) = self.prev.replace((cur.ts, cur.value)) else {
+            let Some(cur) = self.source.next() else {
+                return self.before.take().and_then(pair_rate);
+            };
+            let Some(prev) = self.prev.replace((cur.ts, cur.value)) else {
                 continue;
             };
-            let (ts_cur, v_cur) = (cur.ts, cur.value);
-            if ts_cur > self.end_ns {
-                return None;
+            let cur = (cur.ts, cur.value);
+            if cur.0 > self.end_ns {
+                return self.before.take().and_then(pair_rate);
             }
-            // Skip pairs before the requested window; the stream carries
-            // lookback context whose stamps precede start_ns.
-            if ts_cur < self.start_ns {
+            // Pairs before the requested window: the stream carries lookback
+            // context whose stamps precede start_ns. Only the latest is kept,
+            // and its rate computed when it is emitted.
+            if cur.0 < self.start_ns {
+                if self.one_before && cur.0 > prev.0 {
+                    self.before = Some((prev, cur));
+                }
                 continue;
             }
-            let delta = if v_cur >= v_prev {
-                (v_cur - v_prev) as f64
-            } else {
-                v_cur as f64
+            let Some(point) = pair_rate((prev, cur)) else {
+                continue;
             };
-            let dur_s = (ts_cur - ts_prev) as f64 / 1e9;
-            if dur_s <= 0.0 {
-                continue;
+            if let Some(before) = self.before.take().and_then(pair_rate) {
+                self.pending = Some(point);
+                return Some(before);
             }
-            return Some(Point::at(ts_cur, delta / dur_s));
+            return Some(point);
         }
     }
+}
+
+/// The rate between two `(ts, value)` samples of a counter, at the later;
+/// `None` for samples at one time. A decrease is a reset: the later value is
+/// the increase.
+fn pair_rate(((ts_prev, v_prev), (ts_cur, v_cur)): ((u64, u64), (u64, u64))) -> Option<Point> {
+    let delta = if v_cur >= v_prev {
+        (v_cur - v_prev) as f64
+    } else {
+        v_cur as f64
+    };
+    let dur_s = (ts_cur.checked_sub(ts_prev)?) as f64 / 1e9;
+    (dur_s > 0.0).then(|| Point::at(ts_cur, delta / dur_s))
 }
 
 /// One sample as the grid producer keeps it: its stamp, the reset-adjusted
@@ -433,18 +475,35 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // Bring the kept samples to this interval: through its right edge,
             // and no further back than the read before its left edge.
             self.reach(t);
-            self.trim(left);
-            // Past the observed range on the uniform grid, every later tick
-            // is too; on explicit points a later one might not be, so only
-            // the grid stops here.
-            if self.exhausted && self.last_ts.is_some_and(|last| t > last) {
-                self.points.as_ref()?;
-                continue;
-            }
-            let (Some(v_hi), Some(v_lo)) = (self.interp(t), self.interp(left)) else {
+            // At the end of the range, the series' latest rate is held: when
+            // its last sample is within its typical spacing of the range's
+            // end, a point past that sample is the rate over the same span
+            // ending at it, as a gauge is held past its last sample. Without
+            // it, a series whose rows fall between the grid's points has none
+            // at the range's end, and `sum` across series out of phase with
+            // one another (two recordings) drops the ones that read last
+            // before the end. A series that stops earlier in the range is not
+            // held: it ended. Otherwise nothing past the last sample: on the
+            // uniform grid every later tick is too, so the grid stops; on
+            // explicit points a later one might not be.
+            let (at, from) = match self.last_ts.filter(|last| self.exhausted && t > *last) {
+                None => (t, left),
+                Some(last)
+                    if self.pulled >= 2 && self.end_ns.saturating_sub(last) <= self.typical =>
+                {
+                    (last, last.saturating_sub(t - left))
+                }
+                Some(_) => {
+                    self.points.as_ref()?;
+                    continue;
+                }
+            };
+            self.trim(from);
+            let (t_eval, left) = (at, from);
+            let (Some(v_hi), Some(v_lo)) = (self.interp(t_eval), self.interp(left)) else {
                 continue;
             };
-            let step_s = (t - left) as f64 / 1e9;
+            let step_s = (t_eval - left) as f64 / 1e9;
             if step_s <= 0.0 {
                 continue;
             }
@@ -464,7 +523,7 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // the producer did not read, and the band then claims a precision
             // nobody measured. Where that would happen, the point is emitted
             // with a value and no band, flagged `interpolated`; see `Point`.
-            let window_pair = self.sampled_window(left).zip(self.sampled_window(t));
+            let window_pair = self.sampled_window(left).zip(self.sampled_window(t_eval));
             let interpolated = window_pair.is_none() && self.windowed;
             let bounds = window_pair
                 .and_then(|((b_left, e_left), (b_hi, e_hi))| {
@@ -501,6 +560,21 @@ impl<'a> Iterator for CounterGridRate<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With `with_one_before`, the last pair before the start comes first,
+    /// then the pairs in range; a pair of two samples at one time does not
+    /// replace it.
+    #[test]
+    fn one_point_before_the_range() {
+        const S: u64 = 1_000_000_000;
+        let ts = vec![S, 2 * S, 3 * S, 3 * S, 4 * S, 5 * S];
+        let vals = vec![0u64, 10, 30, 30, 60, 100];
+        let got: Vec<(u64, f64)> = CounterPairwiseRate::new(ts, vals, 4 * S, 5 * S)
+            .with_one_before()
+            .map(|p| (p.t, p.v))
+            .collect();
+        assert_eq!(got, vec![(3 * S, 20.0), (4 * S, 30.0), (5 * S, 40.0)]);
+    }
 
     // ---- Grid producer (RateMode::Grid) ----
 
@@ -647,7 +721,7 @@ mod tests {
     /// interval nobody watched.
     #[test]
     fn combining_with_an_interpolated_operand_drops_the_band() {
-        use crate::promql::streaming::{matrix_matrix_op, BinOp, LabeledSeries, MatchSpec};
+        use crate::promql::streaming::{matrix_matrix_op, BinOp, Join, LabeledSeries, MatchSpec};
 
         let banded = Point {
             t: 1,
@@ -673,7 +747,14 @@ mod tests {
             std::iter::once(hole),
         )];
 
-        let out = matrix_matrix_op(left, right, BinOp::Div, MatchSpec::Default);
+        let out = matrix_matrix_op(
+            left,
+            right,
+            BinOp::Div,
+            MatchSpec::Default,
+            &[],
+            Join::Exact,
+        );
         let pts: Vec<Point> = out.into_iter().next().unwrap().iter.collect();
 
         assert_eq!(pts.len(), 1);
@@ -701,12 +782,41 @@ mod tests {
             CounterGridRate::new(ts.to_vec(), &vals, 0, 3 * S, S, S, Some(windows.clone()))
                 .collect();
 
-        assert_eq!(pts.len(), 1);
-        assert!(
-            pts[0].bounds.is_some(),
-            "an edge between adjacent reads is not a hole"
-        );
-        assert!(!pts[0].interpolated);
+        // t=2s is interior; t=3s is past the last read, held (see
+        // `a_rate_is_held_at_the_end_of_the_range`), and carries the last
+        // span's real windows.
+        assert_eq!(pts.len(), 2);
+        for p in &pts {
+            assert!(
+                p.bounds.is_some(),
+                "an edge between adjacent reads is not a hole"
+            );
+            assert!(!p.interpolated);
+        }
+    }
+
+    /// At the end of the range, a series whose last sample falls between
+    /// the grid's points is held for its spacing: the point past it is the
+    /// rate over the same span ending at that sample. A series that stops
+    /// earlier in the range is not held.
+    #[test]
+    fn a_rate_is_held_at_the_end_of_the_range() {
+        const S: u64 = 1_000_000_000;
+        // 100/s, then 300/s over the last second.
+        let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000, 3_500_000_000];
+        let vals = [0u64, 100, 200, 500];
+        let pts: Vec<(u64, f64)> = CounterGridRate::new(ts.to_vec(), &vals, 0, 4 * S, S, S, None)
+            .map(|p| (p.t, p.v))
+            .collect();
+        // 3.5 s is within a spacing of the end (4 s): the point at 4 s is the
+        // rate over [2.5, 3.5].
+        assert_eq!(pts.last(), Some(&(4 * S, 300.0)), "{pts:?}");
+
+        // Over a longer range the series stopped: no point past 3.5 s.
+        let pts: Vec<u64> = CounterGridRate::new(ts.to_vec(), &vals, 0, 6 * S, S, S, None)
+            .map(|p| p.t)
+            .collect();
+        assert_eq!(pts.last(), Some(&(3 * S)), "{pts:?}");
     }
 
     #[test]
@@ -727,7 +837,9 @@ mod tests {
             None,
         )
         .collect();
-        assert_eq!(pts.len(), 1, "only the interior grid point is emitted");
+        // t=2s is the interior point; t=3s is held past the last sample, at
+        // the end of the range (`a_rate_is_held_at_the_end_of_the_range`).
+        assert_eq!(pts.len(), 2, "the interior point and the held one");
         assert_eq!(pts[0].t, 2_000_000_000);
         // V(2s)=150 (interp 1.5→2.5), V(1s)=50 (interp 0.5→1.5) → 100/s.
         assert!((pts[0].v - 100.0).abs() < 1e-6, "v={}", pts[0].v);

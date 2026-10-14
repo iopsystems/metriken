@@ -2199,14 +2199,15 @@ pub(crate) mod tests {
             "listing needs no bytes"
         );
 
-        // A range over the middle second touches the middle segment only.
+        // A range in the middle segment, its raw lookback of two intervals
+        // included, touches the middle segment only.
         let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
-        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
         assert_eq!(store.fetched(), vec![1]);
         assert_eq!(r.cached_segments().0, 1);
 
         // Again: served from the cache.
-        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
         assert_eq!(store.fetched(), Vec::<usize>::new());
 
         // The whole range: the two not yet cached.
@@ -3190,8 +3191,10 @@ pub(crate) mod tests {
         let QueryResult::Matrix { result } = batch else {
             panic!("a matrix");
         };
+        // 15 s is past the last sample read (14.5 s) and within a spacing of
+        // the range's end, so the rate is held there.
         let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
-        assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0]);
+        assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0, 15.0]);
     }
 
     /// A store whose segments become unreadable after open.

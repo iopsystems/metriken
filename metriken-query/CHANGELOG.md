@@ -12,57 +12,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** an archive's series carry their recording's labels
   (`source`, `host`, any `record --label`), and a query naming a metric that
   several recordings of an archive hold is answered from all of them
-  instead of being refused as cross-recording. Such a query is evaluated
-  once per recording, each with its own interval and cross-cadence
-  timestamps as if it were alone, and the series are concatenated:
-  `rate(x[1m])` returns each recording's series, `x{source="vllm"}` selects
-  one, `sum by (source) (...)` gives one sum per recording, and `g / h`
-  pairs within each recording. A single recording's series carry its
-  labels too. A series that already carries one of the keys keeps its own
-  value under `exported_<key>`; recordings with identical label sets get
-  `__recording__` (their catalog index) so their series stay apart. A
+  instead of being refused as cross-recording. The query is evaluated by one
+  engine over every recording it reaches (metriken-storage's
+  `RecordingsSource`), so the same metric in two recordings is two sets of
+  series and combines as PromQL combines series: `rate(x[1m])` returns each
+  recording's series, `x{source="vllm"}` selects one, `sum(x)` sums all of
+  them, `sum by (source) (...)` gives one sum per recording, and `g / h`
+  pairs each recording's `g` with its own `h`. A single recording's series
+  carry its labels too. A series that already carries one of the keys keeps
+  its own value under `exported_<key>`; recordings with identical label sets
+  get `__recording__` (their catalog index) so their series stay apart. A
   recording whose labels no selector of the query can match is left out
-  first, and one lacking a metric the query names that the archive holds
-  elsewhere contributes nothing (as a pair with no match), so one host
-  without a sampler does not fail a ratio for the others; when no recording
-  is left, the answer is empty (also for a query the engine would reject,
-  such as `x or y`, whose error is then not reached). On an archive of
-  several recordings, an instant query without a time reads at the
-  archive's end, whether or not a matcher narrows it to one recording. A
-  selector that matches one label twice is refused, for any label and on
-  any archive, single-recording ones included: the filter applies one
-  matcher per label (the last), so `{source!="a", source!="b"}` let `a`
-  through and `{id=~"1.*", id!="10"}` silently became `id!="10"`;
-  `source!~"a|b"` answers the first. A parquet file read through
-  `ParquetReader` still applies the last matcher silently. Within a recording the engine's own
-  operator rules apply unchanged, including pairing a single right-hand
-  series with every left-hand one (`rate(c) / sum by (source) (rate(c))` is
-  each series' share of its recording's total, where Prometheus would
-  return nothing). `columns` resolves through the same labels.
-- A query whose result would merge series of different recordings is
-  refused, naming the recordings and the labels to keep: an aggregation, or
-  an operator's `on`/`ignoring`, whose kept labels no longer tell the
-  recordings it reaches apart (`sum(x)`, `sum by (cpu) (x)`; `sum by
-  (source)` is answered when `source` differs, also if `host` differs too).
-  Two recordings are told apart by a kept label both carry with different
-  values (a recording lacking a label may carry it on its series), and
-  `without`/`ignoring` keep no internal label, so they do not keep twins
-  apart. An operator whose sides read different recordings is answered
-  when such a label is kept by its matching and by every aggregation on
-  both sides (`g{source="a"} / h`), and refused otherwise
-  (`sum(x{source="a"}) - sum(x{source="b"})`, which per recording would be
-  empty). As a last check, a result in which series of two recordings share
-  a label set is refused. Answering it means
-  evaluating across recordings, and the engine assumes a metric's series
-  share one table's rows: across recordings a raw-mode `sum` alternated
-  between them, a grid `sum` read one alone at the range edges and at
-  another's cadence, twin recordings paired one's `g` with the other's `h`,
-  and a lone unmatched series was paired across recordings. A query
-  reading one histogram from several recordings is refused too. A matcher
-  on a label only some recordings carry counts the others as reached, so
-  such a query can be refused although it reads one; adding a recording
-  label to the matcher answers it. Within a recording, a metric name two
-  samplers share is still refused.
+  first; when that leaves out every recording holding a metric the query
+  names, the answer is empty, also for a query the engine would reject
+  (such as `x or y`), whose error is then not reached. On an archive of several recordings, an
+  instant query without a time reads at the archive's end, whether or not a
+  matcher narrows it to one recording. A selector that matches one label
+  twice is refused, for any label and on any archive, single-recording ones
+  included: the filter applies one matcher per label (the last), so
+  `{source!="a", source!="b"}` let `a` through and `{id=~"1.*", id!="10"}`
+  silently became `id!="10"`; `source!~"a|b"` answers the first. A parquet
+  file read through `ParquetReader` still applies the last matcher
+  silently. `columns` resolves through the same labels. Refused across
+  recordings: a metric that is a different kind in two recordings a query
+  reaches, and a result holding one label set twice (a recording carrying
+  `host` as a recording label and another carrying it on its series), as
+  Prometheus refuses a vector with duplicate label sets. Within a
+  recording, a metric name two samplers share is still refused.
+- A query across recordings is evaluated with each recording's own rows,
+  cadence and interval: a gauge is held for its own recording's interval
+  (the interval the archive measures from the recording's rows, where a
+  segment reports 1 s), a histogram is pooled on the slowest recording's
+  rows, and a rate across recordings takes the batch path (one pass over
+  every recording's segments). Cross-cadence evaluation timestamps apply to
+  a query reaching one recording; across several, the uniform grid.
+- **Breaking:** binary-operator matching and `without` consider
+  `__recording__` (metriken-storage `is_matched_label`), so twin recordings'
+  series pair with their own and stay apart under `without`. Other internal
+  labels are still left out.
+- **Breaking:** the single-right broadcast (an unmatched left series paired
+  with the one unmatched right series) pairs series of one recording only:
+  two series carrying a key of `DataSource::recording_label_keys` with
+  different values are not paired, and an unmatched left series is paired
+  with the one unmatched right series of its recording. `x / y` with `x`
+  only in one recording and `y` only in another is empty, as in
+  Prometheus. A source with no recording keys keeps the old rule.
+- A `rate`/`irate` on the grid is held past a series' last sample when that
+  sample is within the series' typical spacing of the range's end: the
+  point is the rate over the same span ending at the last sample. A series
+  whose rows fall between the grid's points used to have no point at the
+  range's end, so a `sum` across series out of phase dropped the ones that
+  read last before it. A series that stops earlier in the range is not
+  held. On one recording this adds the grid points between a series' last
+  row and the range's end, when that row is within the series' typical
+  spacing of the end: up to that spacing over the step.
+- In `RateMode::Raw`, aggregations and binary operators combine series read
+  at different instants: a point at every timestamp any of them has, each
+  series contributing its latest point while that point is no older than
+  the gap before it, its last point before the range included (read back
+  the `[range]`, and at least two steps or two of the source's intervals).
+  On exact timestamps a raw-mode `sum` over two acquisition groups or
+  recordings alternated between them, and `x / y` across two groups was
+  empty. A
+  raw-mode result no longer includes points before the range's start
+  (a bare gauge selector returned its lookback rows).
 
 ## [0.36.1] - 2026-10-12
 

@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `add_labels_map`, `translate_filter`, `keeps`, `EXPORTED_PREFIX` and
   `RECORDING_LABEL`
   (`__recording__`) are public with it.
+- `recordings::RecordingsSource`: several recordings' sources as one
+  `DataSource`, each recording's series under its own labels. Gauges come
+  in parts at each recording's interval (`gauge_parts`), a histogram is
+  pooled on the rows of the recording with the longest interval, and
+  `counter_scan` joins every recording's scan with chunks interleaved by
+  start time.
+- `HistogramStream::merge_on_clock`: a merge whose rows of other streams
+  take the time of the clock stream's next row, for streams read at
+  different instants; and `histogram_stream::common_config`.
+- `DataSource::recording_label_keys` and `DataSource::gauge_parts`, with
+  defaults (no keys; one part at `interval`). `LabeledSource` reports its
+  added keys and takes an interval to report (`with_interval`).
+- `is_matched_label`: whether binary-operator matching and `without`
+  consider a label (every non-internal label, and `__recording__`).
+- `SamplerReader::interval`, `holds_counter` and `holds_gauge`.
 - `SamplerReader::recording_labels`, `same_recording`, `holds` and
   `holds_histogram`, `ArchiveReader::recording_count`, and
   `ArchiveReader::series_labels` (a `reader::SeriesLabels`): the labels each recording's series carry,
@@ -31,9 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HistogramStream::merge` decoded every stream under the first stream's
   bucket configuration, checked only by a `debug_assert!`, so a release build
   read a differently configured stream's buckets as other buckets. It now
-  leaves out streams of another configuration with a warning (a label
-  matcher reaches them), as a table split into `__run__`s does, and finds
-  each series' merged index by hash rather than a linear search.
+  decodes every stream under the coarsest configuration among them (the
+  smallest grouping power, the largest max value power), into which every
+  bucket maps without splitting, and finds each series' merged index by
+  hash rather than a linear search.
+- An archive opened from bytes (`ArchiveReader::from_in_memory`) reported
+  1 s for a table whose segment declares no `sampling_interval_ms` (a
+  dendro segment declares none). It now reports the median gap of the
+  table's first rows (the first segment's, or the first segments' when the
+  first has one row) for such a table; a declared interval is reported as
+  before.
 
 ### Changed
 

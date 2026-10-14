@@ -122,11 +122,24 @@ pub fn keeps(labels: &Labels, extra: &Labels, filter: &Labels) -> bool {
 pub struct LabeledSource {
     inner: Arc<dyn DataSource>,
     extra: Labels,
+    interval: Option<f64>,
 }
 
 impl LabeledSource {
     pub fn new(inner: Arc<dyn DataSource>, extra: Labels) -> Self {
-        Self { inner, extra }
+        Self {
+            inner,
+            extra,
+            interval: None,
+        }
+    }
+
+    /// Report `interval` (seconds) rather than the source's own. A segment
+    /// that declares no interval reports 1 s; pass the spacing measured from
+    /// the recording's rows.
+    pub fn with_interval(mut self, interval: f64) -> Self {
+        self.interval = Some(interval).filter(|i| *i > 0.0);
+        self
     }
 
     /// The labels this adds.
@@ -287,7 +300,16 @@ impl DataSource for LabeledSource {
     }
 
     fn interval(&self) -> f64 {
-        self.inner.interval()
+        self.interval.unwrap_or_else(|| self.inner.interval())
+    }
+
+    /// The keys this adds, and the source's own.
+    fn recording_label_keys(&self) -> Vec<String> {
+        let mut keys = self.inner.recording_label_keys();
+        keys.extend(self.extra.inner.keys().cloned());
+        keys.sort();
+        keys.dedup();
+        keys
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {

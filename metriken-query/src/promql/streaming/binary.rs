@@ -33,9 +33,9 @@ use std::rc::Rc;
 
 use promql_parser::parser::token::TokenType;
 
-use crate::labels::{is_internal_label, Labels};
+use crate::labels::{is_matched_label, Labels};
 
-use super::{Band, LabeledSeries, Point, RateEdges, SeriesSet};
+use super::{Band, Held, Join, LabeledSeries, Point, RateEdges, SeriesSet};
 
 /// Timestamp → `(value, optional band)` lookup for the right singleton in a
 /// single-right broadcast. Aliased to keep the `Rc<HashMap<…>>` readable
@@ -45,6 +45,9 @@ use super::{Band, LabeledSeries, Point, RateEdges, SeriesSet};
 /// for the same reason the zip path carries them — without them this path
 /// could not tell a same-read combination from a cross-table one.
 type RightLookup = HashMap<u64, (f64, Option<Band>, Option<RateEdges>, bool)>;
+
+/// A series' points, not yet pulled.
+type PointIter<'a> = Box<dyn Iterator<Item = Point> + 'a>;
 
 /// Subset of PromQL binary operators the streaming pipeline
 /// recognises. Maps directly onto the eager `apply_binary_op`
@@ -304,8 +307,10 @@ fn match_key(labels: &Labels, spec: MatchSpec<'_>) -> BTreeMap<String, String> {
             // Default matching is on the visible label set: internal labels
             // (`__name__`, `__run__`, a reader's `__incarnation__`) are
             // identity within one side, not a key to join the two sides on.
+            // `__recording__` is the exception: it is what tells apart two
+            // recordings with identical labels (`is_matched_label`).
             for (key, val) in &labels.inner {
-                if !is_internal_label(key) {
+                if is_matched_label(key) {
                     k.insert(key.clone(), val.clone());
                 }
             }
@@ -319,7 +324,7 @@ fn match_key(labels: &Labels, spec: MatchSpec<'_>) -> BTreeMap<String, String> {
         }
         MatchSpec::Exclude(list) => {
             for (key, val) in &labels.inner {
-                if is_internal_label(key) || list.iter().any(|x| x == key) {
+                if !is_matched_label(key) || list.iter().any(|x| x == key) {
                     continue;
                 }
                 k.insert(key.clone(), val.clone());
@@ -327,6 +332,42 @@ fn match_key(labels: &Labels, spec: MatchSpec<'_>) -> BTreeMap<String, String> {
         }
     }
     k
+}
+
+/// `op` over one left and one right point at the left's time; `None` where
+/// the op drops the point (division by zero).
+fn combine_points(op: BinOp, left: Point, right: Point) -> Option<Point> {
+    let v = op.apply(left.v, right.v)?;
+    let bounds = combine_bounds(
+        op,
+        left.v,
+        left.bounds,
+        left.edges,
+        right.v,
+        right.bounds,
+        right.edges,
+    );
+    // The result is a single read only when both operands were: otherwise it
+    // belongs to no one window and must not claim one downstream.
+    let edges = if left.edges == right.edges {
+        left.edges
+    } else {
+        None
+    };
+    // Either side spanning an unobserved stretch makes the combination one
+    // too — and drops its band with it. `combine_bounds` will happily derive
+    // one from the operand that HAS a band, treating the other as exact; for
+    // an operand nobody observed that is a band the combination has not
+    // earned. The producer's invariant is that an interpolated point carries
+    // no band, and it has to survive the operators or it means nothing.
+    let interpolated = left.interpolated || right.interpolated;
+    Some(Point {
+        t: left.t,
+        v,
+        bounds: if interpolated { None } else { bounds },
+        edges,
+        interpolated,
+    })
 }
 
 /// Pairs two point streams that emit at the same step grid (or
@@ -355,44 +396,79 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
                 std::cmp::Ordering::Equal => {
                     let left = self.left.next().expect("peek matched");
                     let right = self.right.next().expect("peek matched");
-                    if let Some(v) = self.op.apply(left.v, right.v) {
-                        let bounds = combine_bounds(
-                            self.op,
-                            left.v,
-                            left.bounds,
-                            left.edges,
-                            right.v,
-                            right.bounds,
-                            right.edges,
-                        );
-                        // The result is a single read only when both operands
-                        // were: otherwise it belongs to no one window and must
-                        // not claim one downstream.
-                        let edges = if left.edges == right.edges {
-                            left.edges
-                        } else {
-                            None
-                        };
-                        // Either side spanning an unobserved stretch makes the
-                        // combination one too — and drops its band with it.
-                        // `combine_bounds` will happily derive one from the
-                        // operand that HAS a band, treating the other as exact;
-                        // for an operand nobody observed that is a band the
-                        // combination has not earned. The producer's invariant
-                        // is that an interpolated point carries no band, and it
-                        // has to survive the operators or it means nothing.
-                        let interpolated = left.interpolated || right.interpolated;
-                        return Some(Point {
-                            t: left.t,
-                            v,
-                            bounds: if interpolated { None } else { bounds },
-                            edges,
-                            interpolated,
-                        });
+                    if let Some(p) = combine_points(self.op, left, right) {
+                        return Some(p);
                     }
                 }
             }
         }
+    }
+}
+
+/// [`Join::Latest`]'s pairing: a point at every timestamp either side has,
+/// from each side's latest point while it is held ([`Held`]).
+pub struct LatestBinary<'a> {
+    left: Held<'a>,
+    right: Held<'a>,
+    op: BinOp,
+}
+
+impl<'a> Iterator for LatestBinary<'a> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        loop {
+            let t = match (self.left.peek_t(), self.right.peek_t()) {
+                (None, None) => return None,
+                (l, r) => l.into_iter().chain(r).min()?,
+            };
+            self.left.advance_to(t);
+            self.right.advance_to(t);
+            let (Some(mut left), Some(right)) = (self.left.at(t), self.right.at(t)) else {
+                continue;
+            };
+            left.t = t;
+            if let Some(p) = combine_points(self.op, left, right) {
+                return Some(p);
+            }
+        }
+    }
+}
+
+/// A shared, materialised series replayed from the start.
+struct Replay {
+    points: Rc<[Point]>,
+    next: usize,
+}
+
+impl Iterator for Replay {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Point> {
+        let p = *self.points.get(self.next)?;
+        self.next += 1;
+        Some(p)
+    }
+}
+
+/// `left OP right` for one pair, under `join`.
+fn pair<'a>(
+    left: Box<dyn Iterator<Item = Point> + 'a>,
+    right: Box<dyn Iterator<Item = Point> + 'a>,
+    op: BinOp,
+    join: Join,
+) -> Box<dyn Iterator<Item = Point> + 'a> {
+    match join {
+        Join::Exact => Box::new(ZipMergeBinary {
+            left: left.peekable(),
+            right: right.peekable(),
+            op,
+        }),
+        Join::Latest => Box::new(LatestBinary {
+            left: Held::new(left),
+            right: Held::new(right),
+            op,
+        }),
     }
 }
 
@@ -413,18 +489,15 @@ impl<'a> Iterator for RightLookupBinary<'a> {
     fn next(&mut self) -> Option<Point> {
         for p in self.upstream.by_ref() {
             if let Some(&(rv, rb, re, r_interp)) = self.rhs.get(&p.t) {
-                if let Some(v) = self.op.apply(p.v, rv) {
-                    let bounds = combine_bounds(self.op, p.v, p.bounds, p.edges, rv, rb, re);
-                    let edges = if p.edges == re { p.edges } else { None };
-                    // See the matrix-matrix arm: interpolated drops the band.
-                    let interpolated = p.interpolated || r_interp;
-                    return Some(Point {
-                        t: p.t,
-                        v,
-                        bounds: if interpolated { None } else { bounds },
-                        edges,
-                        interpolated,
-                    });
+                let right = Point {
+                    t: p.t,
+                    v: rv,
+                    bounds: rb,
+                    edges: re,
+                    interpolated: r_interp,
+                };
+                if let Some(out) = combine_points(self.op, p, right) {
+                    return Some(out);
                 }
             }
         }
@@ -433,18 +506,24 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 }
 
 /// `left OP right` over two series sets, joining by `spec`-derived
-/// match key. Output preserves left's labels (matching the eager
-/// path, which copies `left_sample.metric.clone()` to the result).
+/// match key. Output preserves left's labels (matching the eager path,
+/// which copies `left_sample.metric.clone()` to the result).
 ///
-/// When `spec` is `Default` and exactly one right-side series remains
-/// unmatched after the keyed join, that singleton is broadcast against
-/// every unmatched left series — common case is `sum(rate(x[..])) / y`
-/// where `sum(...)` strips labels and `y` carries some.
+/// When `spec` is `Default`, an unmatched left series is paired with the one
+/// unmatched right series of its recording, when there is exactly one —
+/// the common case is `sum(rate(x[..])) / y`, where `sum(...)` strips labels
+/// and `y` carries some. Two series are of different recordings when they
+/// carry one of `recording_keys` with different values
+/// ([`DataSource::recording_label_keys`](crate::DataSource::recording_label_keys)).
+/// With no recording keys, every series is of one recording, so a single
+/// unmatched right series pairs with every unmatched left one.
 pub fn matrix_matrix_op<'a>(
     left_set: SeriesSet<'a>,
     right_set: SeriesSet<'a>,
     op: BinOp,
     spec: MatchSpec<'_>,
+    recording_keys: &[String],
+    join: Join,
 ) -> SeriesSet<'a> {
     // Index right side by match key.  If two right-side series share
     // a key, the later one wins (the eager engine's HashMap-insert
@@ -462,40 +541,77 @@ pub fn matrix_matrix_op<'a>(
         let lk = match_key(&left.labels, spec);
         match right_by_key.remove(&lk) {
             Some(right) => {
-                let iter = ZipMergeBinary {
-                    left: left.iter.peekable(),
-                    right: right.iter.peekable(),
-                    op,
-                };
+                let iter = pair(left.iter, right.iter, op, join);
                 out.push(LabeledSeries::new(left.labels, iter));
             }
             None => unmatched_left.push(left),
         }
     }
 
-    // Single-right broadcast: with no explicit matcher and exactly one
-    // unmatched right series, pair every unmatched left with that
-    // singleton (timestamps via a shared lookup).  Mirrors the eager
-    // engine's per-left fallback for `aggregated / scalar_metric`.
-    if !unmatched_left.is_empty() && matches!(spec, MatchSpec::Default) && right_by_key.len() == 1 {
-        let (_, right_singleton) = right_by_key.into_iter().next().unwrap();
-        let rhs: Rc<RightLookup> = Rc::new(
-            right_singleton
-                .iter
-                .map(|p| (p.t, (p.v, p.bounds, p.edges, p.interpolated)))
-                .collect(),
-        );
-        for left in unmatched_left {
-            let iter = RightLookupBinary {
+    if unmatched_left.is_empty() || !matches!(spec, MatchSpec::Default) || right_by_key.is_empty() {
+        return out;
+    }
+    // Broadcast: each unmatched left series against the one unmatched right
+    // series of its recording. A right series is materialised the first time
+    // a left series pairs with it, and decoded once whatever the left
+    // fan-out.
+    let mut rights: Vec<(Labels, Option<PointIter<'a>>)> = right_by_key
+        .into_values()
+        .map(|ls| (ls.labels, Some(ls.iter)))
+        .collect();
+    let mut shared: Vec<Option<Rc<[Point]>>> = vec![None; rights.len()];
+    let mut lookups: Vec<Option<Rc<RightLookup>>> = vec![None; rights.len()];
+    for left in unmatched_left {
+        let mut candidates = rights
+            .iter()
+            .enumerate()
+            .filter(|(_, (labels, _))| same_recording(&left.labels, labels, recording_keys));
+        let (Some((index, _)), None) = (candidates.next(), candidates.next()) else {
+            continue;
+        };
+        let points = shared[index].get_or_insert_with(|| {
+            let iter = rights[index].1.take().expect("materialised once");
+            iter.collect()
+        });
+        let iter: Box<dyn Iterator<Item = Point> + 'a> = match join {
+            // At the left's timestamps, through a timestamp lookup.
+            Join::Exact => Box::new(RightLookupBinary {
                 upstream: left.iter,
                 op,
-                rhs: Rc::clone(&rhs),
-            };
-            out.push(LabeledSeries::new(left.labels, iter));
-        }
+                rhs: Rc::clone(lookups[index].get_or_insert_with(|| {
+                    Rc::new(
+                        points
+                            .iter()
+                            .map(|p| (p.t, (p.v, p.bounds, p.edges, p.interpolated)))
+                            .collect(),
+                    )
+                })),
+            }),
+            Join::Latest => pair(
+                left.iter,
+                Box::new(Replay {
+                    points: Rc::clone(points),
+                    next: 0,
+                }),
+                op,
+                join,
+            ),
+        };
+        out.push(LabeledSeries::new(left.labels, iter));
     }
-
     out
+}
+
+/// Whether two series can be of one recording: neither carries a recording
+/// key with a value the other contradicts. A key one of them lacks (an
+/// aggregation dropped it) contradicts nothing.
+fn same_recording(a: &Labels, b: &Labels, recording_keys: &[String]) -> bool {
+    recording_keys
+        .iter()
+        .all(|k| match (a.inner.get(k), b.inner.get(k)) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        })
 }
 
 #[cfg(test)]
@@ -519,6 +635,18 @@ mod match_key_tests {
         assert_eq!(
             match_key(&left, MatchSpec::Exclude(&excl)),
             match_key(&right, MatchSpec::Exclude(&excl))
+        );
+        // `__recording__` is matched on: it is what tells apart two
+        // recordings with identical labels.
+        let twin = Labels::from([("__recording__", "1"), ("cpu", "1")]);
+        let other = Labels::from([("__recording__", "2"), ("cpu", "1")]);
+        assert_ne!(
+            match_key(&twin, MatchSpec::Default),
+            match_key(&other, MatchSpec::Default)
+        );
+        assert_ne!(
+            match_key(&twin, MatchSpec::Exclude(&excl)),
+            match_key(&other, MatchSpec::Exclude(&excl))
         );
         // `on(__incarnation__)` still names it explicitly.
         let on = ["__incarnation__".to_string()];
@@ -731,5 +859,98 @@ mod interval_tests {
         let p = sb.next().unwrap();
         let (lo, hi) = p.bounds.expect("positive denominator band propagates");
         assert!(lo <= p.v && p.v <= hi, "nominal {} in [{lo}, {hi}]", p.v);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    fn series<'a>(pairs: &[(&str, &str)], v: f64) -> LabeledSeries<'a> {
+        LabeledSeries::new(
+            Labels::from(pairs),
+            (1..=3u64).map(move |t| Point::at(t, v)),
+        )
+    }
+
+    fn run(left: SeriesSet<'_>, right: SeriesSet<'_>, keys: &[String]) -> Vec<(Labels, f64)> {
+        let mut out: Vec<(Labels, f64)> = matrix_matrix_op(
+            left,
+            right,
+            BinOp::Div,
+            MatchSpec::Default,
+            keys,
+            Join::Exact,
+        )
+        .into_iter()
+        .map(|ls| {
+            let v = ls.iter.last().map(|p| p.v).unwrap_or(f64::NAN);
+            (ls.labels, v)
+        })
+        .collect();
+        out.sort_by(|a, b| a.0.inner.cmp(&b.0.inner));
+        out
+    }
+
+    /// With recording keys, an unmatched left series is paired with the
+    /// unmatched right series of its own recording: `x / cores` on two
+    /// hosts, each with its own `cores`.
+    #[test]
+    fn a_broadcast_pairs_within_each_recording() {
+        let keys = ["source".to_string()];
+        let left = vec![
+            series(&[("cpu", "0"), ("source", "a")], 8.0),
+            series(&[("cpu", "0"), ("source", "b")], 8.0),
+        ];
+        let right = vec![
+            series(&[("source", "a")], 4.0),
+            series(&[("source", "b")], 2.0),
+        ];
+        let out = run(left, right, &keys);
+        assert_eq!(
+            out,
+            vec![
+                (Labels::from([("cpu", "0"), ("source", "a")]), 2.0),
+                (Labels::from([("cpu", "0"), ("source", "b")]), 4.0),
+            ]
+        );
+    }
+
+    /// A single right series of another recording is not paired: with `x`
+    /// only in recording a and `y` only in b, `x / y` is empty, as in
+    /// Prometheus. Without recording keys a single right series pairs with
+    /// every left one, so the result has one series.
+    #[test]
+    fn a_broadcast_never_crosses_recordings() {
+        let keys = ["source".to_string()];
+        let out = run(
+            vec![series(&[("source", "a")], 8.0)],
+            vec![series(&[("source", "b")], 2.0)],
+            &keys,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let out = run(
+            vec![series(&[("source", "a")], 8.0)],
+            vec![series(&[("source", "b")], 2.0)],
+            &[],
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    /// A left series that lost the recording keys (an aggregation dropped
+    /// them) is of either recording, so with two candidates it pairs with
+    /// neither.
+    #[test]
+    fn a_series_without_recording_labels_is_ambiguous_between_two() {
+        let keys = ["source".to_string()];
+        let out = run(
+            vec![series(&[], 8.0)],
+            vec![
+                series(&[("source", "a")], 4.0),
+                series(&[("source", "b")], 2.0),
+            ],
+            &keys,
+        );
+        assert!(out.is_empty(), "{out:?}");
     }
 }

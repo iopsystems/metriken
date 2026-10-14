@@ -642,6 +642,23 @@ impl SamplerReader {
         self.names.histograms.contains(name)
     }
 
+    /// The table's row spacing in seconds. Opened from a catalog: the table's
+    /// span over its row count. Opened from bytes: the interval its first
+    /// segment declares, else the median gap of its first rows.
+    pub fn interval(&self) -> f64 {
+        self.interval
+    }
+
+    /// Whether this table holds counter `name`.
+    pub fn holds_counter(&self, name: &str) -> bool {
+        self.names.counters.contains(name)
+    }
+
+    /// Whether this table holds gauge `name`.
+    pub fn holds_gauge(&self, name: &str) -> bool {
+        self.names.gauges.contains(name)
+    }
+
     /// The labels of the recording this table belongs to, as the catalog
     /// holds them.
     pub fn recording_labels(&self) -> &BTreeMap<String, String> {
@@ -1450,7 +1467,39 @@ impl ArchiveReader {
                     histograms: probe.histogram_names().into_iter().collect(),
                 };
                 let first_span = probe.time_range();
-                let interval = probe.interval();
+                // The interval the segment declares, or else the median gap
+                // of the first segment's rows, rounded to whole milliseconds
+                // as the catalog path rounds its measurement. A source
+                // reports 1 s for a segment that declares none.
+                let interval = match probe.metadata_get("sampling_interval_ms") {
+                    Some(_) => probe.interval(),
+                    None => {
+                        // From the first segments holding two rows between
+                        // them: a short first segment (a seal right after
+                        // a start) has no gap of its own.
+                        let mut timestamps = probe.sample_timestamps();
+                        for more in segments.iter().skip(1) {
+                            if timestamps.len() >= 2 {
+                                break;
+                            }
+                            if let Ok(next) = MultiParquetSource::open_bytes_with_pool(
+                                more.clone(),
+                                Arc::clone(&pool),
+                            ) {
+                                timestamps.extend(next.sample_timestamps());
+                            }
+                        }
+                        let mut gaps: Vec<u64> = timestamps
+                            .windows(2)
+                            .map(|w| w[1].saturating_sub(w[0]))
+                            .collect();
+                        gaps.sort_unstable();
+                        match gaps.get(gaps.len() / 2) {
+                            Some(&gap) if gap > 0 => (gap as f64 / 1e6).round().max(1.0) / 1e3,
+                            _ => probe.interval(),
+                        }
+                    }
+                };
                 drop(probe);
 
                 // Segments are in segment order, so the last one carries the

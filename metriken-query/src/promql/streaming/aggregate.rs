@@ -30,9 +30,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use crate::labels::{is_internal_label, Labels};
+use crate::labels::{is_matched_label, Labels};
 
-use super::{LabeledSeries, Point, SeriesSet};
+use super::{Held, Join, LabeledSeries, Point, SeriesSet};
 
 /// Reduction operator. Mirrors the PromQL aggregate operations the
 /// streaming dispatcher recognises.
@@ -62,13 +62,18 @@ pub enum GroupBy<'a> {
 /// `aggregate(input, AggOp::Sum, GroupBy::Include(labels))`.
 #[cfg(test)]
 pub fn sum_by<'a>(input: SeriesSet<'a>, by_labels: &[String]) -> SeriesSet<'a> {
-    aggregate(input, AggOp::Sum, GroupBy::Include(by_labels))
+    aggregate(input, AggOp::Sum, GroupBy::Include(by_labels), Join::Exact)
 }
 
 /// Group `input` by the reduced label set selected via `group_by`,
 /// then emit one [`LabeledSeries`] per group whose iterator reduces
 /// all member iterators per timestamp using `op`.
-pub fn aggregate<'a>(input: SeriesSet<'a>, op: AggOp, group_by: GroupBy<'_>) -> SeriesSet<'a> {
+pub fn aggregate<'a>(
+    input: SeriesSet<'a>,
+    op: AggOp,
+    group_by: GroupBy<'_>,
+    join: Join,
+) -> SeriesSet<'a> {
     let mut groups: HashMap<Labels, Vec<Box<dyn Iterator<Item = Point> + 'a>>> = HashMap::new();
     for ls in input {
         let group_labels = derive_group_labels(&ls.labels, group_by);
@@ -78,12 +83,14 @@ pub fn aggregate<'a>(input: SeriesSet<'a>, op: AggOp, group_by: GroupBy<'_>) -> 
     if groups.len() < 2 {
         return groups
             .into_iter()
-            .map(|(labels, children)| LabeledSeries::new(labels, MergeReduce::new(children, op)))
+            .map(|(labels, children)| {
+                LabeledSeries::new(labels, MergeReduce::joined(children, op, join))
+            })
             .collect();
     }
     let (labels, merges): (Vec<Labels>, Vec<MergeReduce<'a>>) = groups
         .into_iter()
-        .map(|(labels, children)| (labels, MergeReduce::new(children, op)))
+        .map(|(labels, children)| (labels, MergeReduce::joined(children, op, join)))
         .unzip();
     let shared = Rc::new(RefCell::new(Lockstep {
         buffers: merges.iter().map(|_| VecDeque::new()).collect(),
@@ -175,7 +182,7 @@ impl Drop for LockstepGroup<'_> {
         shared.live[self.index] = false;
         shared.buffers[self.index] = VecDeque::new();
         // Its children are never read again.
-        shared.merges[self.index].children.clear();
+        shared.merges[self.index].clear();
         shared.heads[self.index] = None;
     }
 }
@@ -193,10 +200,11 @@ pub(crate) fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Lab
         GroupBy::Exclude(without) => {
             // Internal labels go with the named ones: an aggregate is over a
             // set of series, and which incarnation or run each input was is
-            // meaningless for the sum. `__name__` was always dropped here;
-            // the rule is now the prefix, not the one name.
+            // meaningless for the sum. Every internal label is dropped except
+            // `__recording__`, as in matching (`is_matched_label`): two
+            // recordings with identical labels are two sets of series.
             for (k, v) in &labels.inner {
-                if is_internal_label(k) {
+                if !is_matched_label(k) {
                     continue;
                 }
                 if without.iter().any(|x| x == k) {
@@ -209,28 +217,52 @@ pub(crate) fn derive_group_labels(labels: &Labels, group_by: GroupBy<'_>) -> Lab
     out
 }
 
-/// Per-group merge reducer. Pulls one point per child whose peeked
-/// timestamp equals the smallest among children, applies `op`, emits
-/// one output point per timestamp tick.
+/// Per-group merge reducer. Emits one output point per timestamp: under
+/// [`Join::Exact`] it pulls one point per child whose peeked timestamp equals
+/// the smallest among children; under [`Join::Latest`] every child
+/// contributes its latest point while held ([`Held`]).
 pub struct MergeReduce<'a> {
-    children: Vec<std::iter::Peekable<Box<dyn Iterator<Item = Point> + 'a>>>,
+    children: Children<'a>,
     op: AggOp,
 }
 
+enum Children<'a> {
+    Exact(Vec<std::iter::Peekable<Box<dyn Iterator<Item = Point> + 'a>>>),
+    Latest(Vec<Held<'a>>),
+}
+
 impl<'a> MergeReduce<'a> {
+    #[cfg(test)]
     pub fn new(children: Vec<Box<dyn Iterator<Item = Point> + 'a>>, op: AggOp) -> Self {
-        Self {
-            children: children.into_iter().map(Iterator::peekable).collect(),
-            op,
-        }
+        Self::joined(children, op, Join::Exact)
+    }
+
+    pub(crate) fn joined(
+        children: Vec<Box<dyn Iterator<Item = Point> + 'a>>,
+        op: AggOp,
+        join: Join,
+    ) -> Self {
+        let children = match join {
+            Join::Exact => Children::Exact(children.into_iter().map(Iterator::peekable).collect()),
+            Join::Latest => Children::Latest(children.into_iter().map(Held::new).collect()),
+        };
+        Self { children, op }
     }
 
     /// The timestamp of the next point, without emitting it.
     fn next_ts(&mut self) -> Option<u64> {
-        self.children
-            .iter_mut()
-            .filter_map(|c| c.peek().map(|p| p.t))
-            .min()
+        match &mut self.children {
+            Children::Exact(cs) => cs.iter_mut().filter_map(|c| c.peek().map(|p| p.t)).min(),
+            Children::Latest(cs) => cs.iter_mut().filter_map(|c| c.peek_t()).min(),
+        }
+    }
+
+    /// Drop every child: the group is read no more.
+    fn clear(&mut self) {
+        match &mut self.children {
+            Children::Exact(cs) => cs.clear(),
+            Children::Latest(cs) => cs.iter_mut().for_each(Held::clear),
+        }
     }
 }
 
@@ -238,71 +270,106 @@ impl<'a> Iterator for MergeReduce<'a> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
-        let mut min_ts: Option<u64> = None;
-        for c in self.children.iter_mut() {
-            if let Some(&p) = c.peek() {
-                let t = p.t;
-                min_ts = Some(min_ts.map_or(t, |m| m.min(t)));
+        let t = self.next_ts()?;
+        let mut acc = Reduction::default();
+        match &mut self.children {
+            Children::Exact(cs) => {
+                for c in cs.iter_mut() {
+                    if matches!(c.peek(), Some(&p) if p.t == t) {
+                        acc.add(c.next().expect("peek returned Some, next must too"));
+                    }
+                }
+            }
+            Children::Latest(cs) => {
+                for c in cs.iter_mut() {
+                    c.advance_to(t);
+                    if let Some(p) = c.at(t) {
+                        acc.add(p);
+                    }
+                }
             }
         }
-        let t = min_ts?;
+        acc.finish(self.op, t)
+    }
+}
 
-        let mut sum = 0.0;
-        let mut count = 0u32;
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        // Interval arithmetic for sum/avg: a windowless child contributes its
-        // point value as a degenerate band [v, v].
-        let mut any_bounded = false;
-        let mut any_interpolated = false;
-        let (mut lo_sum, mut hi_sum) = (0.0f64, 0.0f64);
-        // Unanimity tracking for the acquisition edges: `Some(e)` while every
-        // contributor so far carried exactly `e`, `None` the moment one
-        // differs or lacks them.
-        let mut shared_edges: Option<super::RateEdges> = None;
-        let mut edges_unanimous = true;
-        let mut seen_any = false;
+/// The points one output point reduces.
+struct Reduction {
+    sum: f64,
+    count: u32,
+    min: f64,
+    max: f64,
+    // Interval arithmetic for sum/avg: a windowless child contributes its
+    // point value as a degenerate band [v, v].
+    any_bounded: bool,
+    any_interpolated: bool,
+    lo_sum: f64,
+    hi_sum: f64,
+    // Unanimity tracking for the acquisition edges: `Some(e)` while every
+    // contributor so far carried exactly `e`, `None` the moment one differs
+    // or lacks them.
+    shared_edges: Option<super::RateEdges>,
+    edges_unanimous: bool,
+    seen_any: bool,
+}
 
-        for c in self.children.iter_mut() {
-            let take = matches!(c.peek(), Some(&p) if p.t == t);
-            if take {
-                let p = c.next().expect("peek returned Some, next must too");
-                let v = p.v;
-                sum += v;
-                count += 1;
-                if v < min {
-                    min = v;
-                }
-                if v > max {
-                    max = v;
-                }
-                let (lo, hi) = p.bounds.unwrap_or((v, v));
-                if p.bounds.is_some() {
-                    any_bounded = true;
-                }
-                // Any contributor spanning an unobserved stretch makes the
-                // aggregate one too — same rule `bounds` follows.
-                any_interpolated |= p.interpolated;
-                if !seen_any {
-                    shared_edges = p.edges;
-                    seen_any = true;
-                } else if shared_edges != p.edges {
-                    edges_unanimous = false;
-                }
-                lo_sum += lo;
-                hi_sum += hi;
-            }
+impl Default for Reduction {
+    fn default() -> Self {
+        Self {
+            sum: 0.0,
+            count: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            any_bounded: false,
+            any_interpolated: false,
+            lo_sum: 0.0,
+            hi_sum: 0.0,
+            shared_edges: None,
+            edges_unanimous: true,
+            seen_any: false,
         }
+    }
+}
 
+impl Reduction {
+    fn add(&mut self, p: Point) {
+        let v = p.v;
+        self.sum += v;
+        self.count += 1;
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+        let (lo, hi) = p.bounds.unwrap_or((v, v));
+        if p.bounds.is_some() {
+            self.any_bounded = true;
+        }
+        // Any contributor spanning an unobserved stretch makes the
+        // aggregate one too — same rule `bounds` follows.
+        self.any_interpolated |= p.interpolated;
+        if !self.seen_any {
+            self.shared_edges = p.edges;
+            self.seen_any = true;
+        } else if self.shared_edges != p.edges {
+            self.edges_unanimous = false;
+        }
+        self.lo_sum += lo;
+        self.hi_sum += hi;
+    }
+
+    fn finish(self, op: AggOp, t: u64) -> Option<Point> {
+        let count = self.count;
         if count == 0 {
             return None;
         }
 
-        let v = match self.op {
-            AggOp::Sum => sum,
-            AggOp::Avg => sum / count as f64,
-            AggOp::Min => min,
-            AggOp::Max => max,
+        let v = match op {
+            AggOp::Sum => self.sum,
+            AggOp::Avg => self.sum / count as f64,
+            AggOp::Min => self.min,
+            AggOp::Max => self.max,
             AggOp::Count => count as f64,
         };
         // sum/avg propagate the band by interval arithmetic ([Σlo, Σhi], /n),
@@ -317,16 +384,20 @@ impl<'a> Iterator for MergeReduce<'a> {
         // while presenting as if it covered all of it. The producer's invariant
         // — an interpolated point carries no band — has to survive the
         // operators or it means nothing downstream.
-        let bounds = if any_bounded && !any_interpolated {
-            match self.op {
-                AggOp::Sum => Some((lo_sum, hi_sum)),
-                AggOp::Avg => Some((lo_sum / count as f64, hi_sum / count as f64)),
+        let bounds = if self.any_bounded && !self.any_interpolated {
+            match op {
+                AggOp::Sum => Some((self.lo_sum, self.hi_sum)),
+                AggOp::Avg => Some((self.lo_sum / count as f64, self.hi_sum / count as f64)),
                 AggOp::Min | AggOp::Max | AggOp::Count => None,
             }
         } else {
             None
         };
-        let edges = if edges_unanimous { shared_edges } else { None };
+        let edges = if self.edges_unanimous {
+            self.shared_edges
+        } else {
+            None
+        };
         // An aggregate keeps its edges only when every contributing point
         // came from the SAME read. `sum(irate(cpu_usage[5m]))` over 32 CPUs is
         // one acquisition group with one window, so it does — and keeping them
@@ -337,7 +408,7 @@ impl<'a> Iterator for MergeReduce<'a> {
             v,
             bounds,
             edges,
-            interpolated: any_interpolated,
+            interpolated: self.any_interpolated,
         })
     }
 }
@@ -365,6 +436,24 @@ mod group_label_tests {
         let gb = derive_group_labels(&b, GroupBy::Exclude(&without));
         assert_eq!(ga, Labels::from([("cpu", "1")]), "{ga:?}");
         assert_eq!(ga, gb, "the two incarnations aggregate as one");
+    }
+
+    /// `without` keeps `__recording__`: two recordings with identical
+    /// labels are two sets of series, and `sum without (cpu)` over them is a
+    /// sum per recording.
+    #[test]
+    fn without_keeps_the_recording_label() {
+        let a = Labels::from([("__recording__", "0"), ("cpu", "1"), ("host", "h")]);
+        let b = Labels::from([("__recording__", "1"), ("cpu", "1"), ("host", "h")]);
+        let without = ["cpu".to_string()];
+        let ga = derive_group_labels(&a, GroupBy::Exclude(&without));
+        let gb = derive_group_labels(&b, GroupBy::Exclude(&without));
+        assert_eq!(
+            ga,
+            Labels::from([("__recording__", "0"), ("host", "h")]),
+            "{ga:?}"
+        );
+        assert_ne!(ga, gb);
     }
 
     /// `by` is unchanged: it keeps exactly what it names, and naming an
@@ -489,7 +578,7 @@ mod lockstep_tests {
             recorded("c", "y", &log),
         ];
         let by = ["group".to_string()];
-        let mut groups = aggregate(input, AggOp::Sum, GroupBy::Include(&by));
+        let mut groups = aggregate(input, AggOp::Sum, GroupBy::Include(&by), Join::Exact);
         groups.sort_by(|a, b| a.labels.inner.cmp(&b.labels.inner));
         let mut drained = Vec::new();
         for g in groups {
@@ -511,7 +600,7 @@ mod lockstep_tests {
         let log = Rc::new(RefCell::new(Vec::new()));
         let input = vec![recorded("a", "x", &log), recorded("c", "y", &log)];
         let by = ["group".to_string()];
-        let mut groups = aggregate(input, AggOp::Sum, GroupBy::Include(&by));
+        let mut groups = aggregate(input, AggOp::Sum, GroupBy::Include(&by), Join::Exact);
         groups.sort_by(|a, b| a.labels.inner.cmp(&b.labels.inner));
         let y = groups.pop().unwrap();
         drop(y);
@@ -560,7 +649,12 @@ mod lockstep_tests {
             )
         };
         let by = ["group".to_string()];
-        let mut groups = aggregate(vec![short, long], AggOp::Sum, GroupBy::Include(&by));
+        let mut groups = aggregate(
+            vec![short, long],
+            AggOp::Sum,
+            GroupBy::Include(&by),
+            Join::Exact,
+        );
         groups.sort_by(|a, b| a.labels.inner.cmp(&b.labels.inner));
         let mut x = groups.remove(0).iter;
         assert_eq!(x.by_ref().count(), 2);

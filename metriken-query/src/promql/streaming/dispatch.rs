@@ -31,7 +31,7 @@ use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
     aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp,
     AtPoints, BinOp, CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv,
-    GaugeIdelta, GaugeStepGrid, GroupBy, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    GaugeIdelta, GaugeStepGrid, GroupBy, Join, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
 };
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
 use crate::{DataSource, QueryOptions, RateMode};
@@ -54,7 +54,7 @@ pub fn try_streaming(
             metric_name,
             metric_name_for_error,
         } => {
-            let collected = collect_to_matrix(series, metric_name);
+            let collected = collect_to_matrix(clip_raw(&ctx, series), metric_name);
             if collected.is_empty() {
                 if let Some(name) = metric_name_for_error {
                     held_somewhere(source, &name)?;
@@ -97,12 +97,28 @@ fn make_ctx<'a>(
         start_ns,
         end_ns: crate::promql::range_end_ns(end),
         step_ns,
-        interval_ns: (source.interval() * 1e9) as u64,
         rate_mode,
         rate_span_ns: opts.rate_span_ns,
         eval_timestamps: opts.eval_timestamps.clone(),
         per_series_rates: opts.per_series_rates,
+        recording_keys: source.recording_label_keys(),
     }
+}
+
+/// In raw mode, `series` without the points before the range's start.
+///
+/// Raw producers emit from their read's lookback, so that a series' last
+/// point before the range is there for a `Join::Latest` to hold at the
+/// range's start.
+fn clip_raw<'a>(ctx: &Ctx<'_>, series: SeriesSet<'a>) -> SeriesSet<'a> {
+    if !matches!(ctx.rate_mode, RateMode::Raw) {
+        return series;
+    }
+    let start = ctx.start_ns;
+    series
+        .into_iter()
+        .map(|ls| LabeledSeries::new(ls.labels, ls.iter.filter(move |p| p.t >= start)))
+        .collect()
 }
 
 /// [`try_streaming`] in display form: each series is reduced per `display`
@@ -126,8 +142,14 @@ pub(crate) fn try_streaming_display(
             metric_name,
             metric_name_for_error,
         } => {
-            let collected =
-                super::collect_to_display(series, metric_name, start, end, step, display);
+            let collected = super::collect_to_display(
+                clip_raw(&ctx, series),
+                metric_name,
+                start,
+                end,
+                step,
+                display,
+            );
             if collected.is_empty() {
                 if let Some(name) = metric_name_for_error {
                     held_somewhere(source, &name)?;
@@ -160,13 +182,14 @@ struct Ctx<'a> {
     start_ns: u64,
     end_ns: u64,
     step_ns: u64,
-    interval_ns: u64,
     rate_mode: RateMode,
     rate_span_ns: Option<u64>,
     /// Explicit evaluation timestamps; see [`QueryOptions::eval_timestamps`].
     eval_timestamps: Option<std::sync::Arc<[u64]>>,
     /// See [`QueryOptions::per_series_rates`].
     per_series_rates: bool,
+    /// See [`DataSource::recording_label_keys`].
+    recording_keys: Vec<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -487,7 +510,7 @@ where
             "aggregation requires a series-typed inner expression".to_string(),
         ));
     };
-    let series = aggregate(inner_series, op, group_by);
+    let series = aggregate(inner_series, op, group_by, Join::for_mode(ctx.rate_mode));
     Ok(Built::Series {
         series,
         metric_name: None,
@@ -547,7 +570,14 @@ where
                 ..
             },
         ) => Ok(Built::Series {
-            series: matrix_matrix_op(left_series, right_series, op, spec),
+            series: matrix_matrix_op(
+                left_series,
+                right_series,
+                op,
+                spec,
+                &ctx.recording_keys,
+                Join::for_mode(ctx.rate_mode),
+            ),
             metric_name: None,
             metric_name_for_error: None,
         }),
@@ -670,9 +700,19 @@ where
             }
             // Grid needs at least one step of lookback to bracket the first
             // interval's left edge, regardless of the (inert) query range.
+            // Raw pairs consecutive samples and emits the last pair before
+            // the range, which a join holds at its start. It reads back the
+            // `[range]`, and at least two steps or two of the source's
+            // intervals: a series read more slowly than that (a slower table
+            // or recording, or a gap before the start) has its sample before
+            // the range only when the `[range]` reaches it.
             let lookback = match ctx.rate_mode {
                 RateMode::Grid => range_ns.max(ctx.step_ns),
-                RateMode::Raw => range_ns,
+                RateMode::Raw => ctx
+                    .step_ns
+                    .max((ctx.source.interval() * 1e9) as u64)
+                    .saturating_mul(2)
+                    .max(range_ns),
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
             let Some(streams) =
@@ -721,7 +761,11 @@ where
                     }
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
-                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns),
+                        // With the series' last point before the range, which
+                        // a join holds at its start; the result is cut at
+                        // `start` (`clip_raw`).
+                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns)
+                            .with_one_before(),
                     ),
                 })
                 .collect();
@@ -929,12 +973,14 @@ where
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
 
-    let staleness_ns = ctx.step_ns.max(ctx.interval_ns);
-    let data_start = ctx.start_ns.saturating_sub(staleness_ns);
-
-    let Some(gauges) = ctx
-        .source
-        .gauges(metric_name, &filter, data_start, ctx.end_ns)
+    // A gauge is held a step, or its sampling interval when that is longer,
+    // past each sample. The interval is the series' own: a source joining
+    // recordings of different intervals hands each recording's series over
+    // with its interval (`gauge_parts`), so a 10 s recording's gauge is not
+    // dropped between its rows beside a 1 s recording's.
+    let Some(parts) =
+        ctx.source
+            .gauge_parts(metric_name, &filter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
     else {
         // A bare selector reads gauges. A counter is read through rate() or
         // irate(), and saying so beats reporting a metric the source holds as
@@ -947,20 +993,22 @@ where
         });
     };
 
-    let series: SeriesSet<'a> = gauges
-        .series
+    let series: SeriesSet<'a> = parts
         .into_iter()
-        .map(|g| {
-            let producer = ctx.place(GaugeStepGrid::new(
-                g.timestamps,
-                g.values,
-                ctx.start_ns,
-                ctx.end_ns,
-                ctx.step_ns,
-                staleness_ns,
-                matches!(ctx.rate_mode, RateMode::Raw),
-            ));
-            LabeledSeries::new(g.labels, producer)
+        .flat_map(|(gauges, interval_s)| {
+            let staleness_ns = ctx.step_ns.max((interval_s * 1e9) as u64);
+            gauges.series.into_iter().map(move |g| {
+                let producer = ctx.place(GaugeStepGrid::new(
+                    g.timestamps,
+                    g.values,
+                    ctx.start_ns,
+                    ctx.end_ns,
+                    ctx.step_ns,
+                    staleness_ns,
+                    matches!(ctx.rate_mode, RateMode::Raw),
+                ));
+                LabeledSeries::new(g.labels, producer)
+            })
         })
         .collect();
     Ok(Built::Series {

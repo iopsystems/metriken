@@ -69,6 +69,7 @@ pub mod occupants;
 pub mod parquet;
 #[cfg(feature = "archive")]
 pub mod reader;
+pub mod recordings;
 #[cfg(feature = "rez")]
 pub mod rez;
 pub mod scan;
@@ -102,7 +103,7 @@ pub use stream::FrameProducer;
 pub use writer::{ArchiveWriter, SourceRecorder, StreamDecoder, StreamedGroup, WriterConfig};
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
-pub use labels::{is_internal_label, is_storage_key, Labels, STORAGE_KEYS};
+pub use labels::{is_internal_label, is_matched_label, is_storage_key, Labels, STORAGE_KEYS};
 pub use lazy::CompositionCatalog;
 pub use parquet::CompositionSource;
 pub use segmented::{ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore};

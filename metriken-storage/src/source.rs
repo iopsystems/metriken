@@ -153,6 +153,36 @@ pub trait DataSource: Send + Sync {
     fn sample_timestamps(&self) -> Vec<u64> {
         Vec::new()
     }
+    /// The label keys that say which recording a series came from (`source`,
+    /// `host`, `__recording__`, …), for a source whose series come from
+    /// several. Two series that carry one of these keys with different
+    /// values are of different recordings, and a binary operator's
+    /// broadcast never pairs them. Empty for a source of one recording that
+    /// adds no such labels. A source wrapping one that reports keys forwards
+    /// this and [`gauge_parts`](Self::gauge_parts); the defaults lose them.
+    fn recording_label_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Gauge `name`'s series for a grid from `start_ns` to `end_ns` at
+    /// `step_ns`, as parts whose series share one sampling interval, each
+    /// returned with that interval in seconds. A gauge is held a step, or its
+    /// interval when that is longer, past each sample, so each part is read
+    /// from that far before `start_ns`. A source joining recordings of different intervals gives
+    /// each recording's series its own. The default is one part at
+    /// [`interval`](Self::interval).
+    fn gauge_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+    ) -> Option<Vec<(Gauges, f64)>> {
+        let interval = self.interval();
+        let lookback_ns = step_ns.max((interval * 1e9) as u64);
+        let gauges = self.gauges(name, filter, start_ns.saturating_sub(lookback_ns), end_ns)?;
+        Some(vec![(gauges, interval)])
+    }
     /// Parsed parquet column descriptors, for callers that need schema-level
     /// detail the metric-name accessors above do not carry (histogram bucket
     /// configs, per-column label sets). Empty for sources with no parquet

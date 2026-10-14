@@ -362,3 +362,157 @@ fn cachecannon_smoke_test() {
 
     println!("\ntotal: {} µs", total.as_micros());
 }
+
+/// A gauge series at `start + k * every` (seconds) for `n` rows, value `v`.
+fn gauge_rows(
+    source: &mut Memory,
+    name: &str,
+    labels: &[(&str, &str)],
+    start: f64,
+    every: f64,
+    n: u64,
+    v: i64,
+) {
+    let timestamps: Vec<u64> = (0..n)
+        .map(|k| ((start + k as f64 * every) * 1e9).round() as u64)
+        .collect();
+    source.add_gauge(
+        name,
+        Gauge {
+            labels: Labels::from(labels.to_vec().as_slice()),
+            values: vec![v; timestamps.len()],
+            timestamps,
+            windows: None,
+        },
+    );
+}
+
+fn raw_points(engine: &QueryEngine, query: &str, start: f64, end: f64) -> Vec<Vec<(f64, f64)>> {
+    let opts = crate::QueryOptions::with_rate_mode(crate::RateMode::Raw);
+    let QueryResult::Matrix { result } = engine
+        .query_range_opts(query, start, end, 1.0, &opts)
+        .unwrap()
+    else {
+        panic!("a matrix");
+    };
+    result.into_iter().map(|m| m.values).collect()
+}
+
+/// In raw mode each series' points are at its own sample times. `sum` over
+/// two series read half a second apart reads both at every point once both
+/// have started, each held for its own spacing, rather than alternating
+/// between them (10, 100, 10, ...) by summing only the series with a sample
+/// at that exact instant.
+#[test]
+fn raw_sum_reads_every_series_at_its_latest_sample() {
+    let mut source = Memory::new(1000);
+    gauge_rows(&mut source, "g", &[("source", "a")], 1000.0, 1.0, 5, 10);
+    gauge_rows(&mut source, "g", &[("source", "b")], 1000.5, 1.0, 5, 100);
+    let engine = QueryEngine::new(Arc::new(source));
+    let series = raw_points(&engine, "sum(g)", 1000.0, 1004.5);
+    assert_eq!(series.len(), 1);
+    let points = &series[0];
+    assert_eq!(points[0], (1000.0, 10.0), "only a has started: {points:?}");
+    assert_eq!(points.len(), 10, "{points:?}");
+    assert!(points[1..].iter().all(|(_, v)| *v == 110.0), "{points:?}");
+}
+
+/// A series' last point before the range is held at its start: with both
+/// series read from well before the range, the first point of the range
+/// has both, for gauges and for rates. Nothing before the start is
+/// returned.
+#[test]
+fn raw_sum_holds_points_from_before_the_range() {
+    let mut source = Memory::new(1000);
+    gauge_rows(&mut source, "g", &[("source", "a")], 990.0, 1.0, 16, 10);
+    gauge_rows(&mut source, "g", &[("source", "b")], 990.5, 1.0, 16, 100);
+    for (label, offset) in [("a", 0.0), ("b", 0.5)] {
+        let timestamps: Vec<u64> = (0..16u64)
+            .map(|k| ((990.0 + offset + k as f64) * 1e9) as u64)
+            .collect();
+        source.add_counter(
+            "c",
+            Counter {
+                labels: Labels::from([("source", label)]),
+                values: (0..16u64)
+                    .map(|k| k * if label == "a" { 10 } else { 100 })
+                    .collect(),
+                timestamps,
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    for q in ["sum(g)", "sum(irate(c[5s]))", "sum(irate(c[1s]))"] {
+        let series = raw_points(&engine, q, 1000.0, 1004.5);
+        let points = &series[0];
+        assert_eq!(points[0], (1000.0, 110.0), "{q}: {points:?}");
+        assert!(
+            points.iter().all(|(t, v)| *t >= 1000.0 && *v == 110.0),
+            "{q}: {points:?}"
+        );
+    }
+}
+
+/// The same for a binary operator: `x / y` with `x` and `y` read at
+/// different instants has a point wherever either was read, once both have
+/// been. On exact timestamps it was empty.
+#[test]
+fn raw_binary_pairs_each_side_at_its_latest_sample() {
+    let mut source = Memory::new(1000);
+    gauge_rows(&mut source, "x", &[], 1000.0, 1.0, 3, 10);
+    gauge_rows(&mut source, "y", &[], 1000.5, 1.0, 3, 2);
+    let engine = QueryEngine::new(Arc::new(source));
+    let series = raw_points(&engine, "x / y", 1000.0, 1003.0);
+    assert_eq!(series.len(), 1);
+    let times: Vec<f64> = series[0].iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        times,
+        vec![1000.5, 1001.0, 1001.5, 1002.0, 1002.5],
+        "{series:?}"
+    );
+    assert!(series[0].iter().all(|(_, v)| *v == 5.0), "{series:?}");
+}
+
+/// A series is held only for the gap that preceded its latest sample: once
+/// it stops, it stops contributing.
+#[test]
+fn raw_sum_stops_holding_a_series_that_ended() {
+    let mut source = Memory::new(1000);
+    gauge_rows(&mut source, "g", &[("source", "a")], 1000.0, 1.0, 2, 10);
+    gauge_rows(&mut source, "g", &[("source", "b")], 1000.5, 1.0, 6, 100);
+    let engine = QueryEngine::new(Arc::new(source));
+    let series = raw_points(&engine, "sum(g)", 1000.0, 1006.0);
+    let points = &series[0];
+    // a's last sample is at 1001.0, held to 1002.0.
+    assert!(points.contains(&(1001.5, 110.0)), "{points:?}");
+    assert!(points.contains(&(1002.5, 100.0)), "{points:?}");
+    assert!(points.contains(&(1005.5, 100.0)), "{points:?}");
+}
+
+/// A raw rate of a table slower than the source's finest interval keeps
+/// its first point in range: the read reaches back the `[range]` at least,
+/// so the sample before the range is there to pair with.
+#[test]
+fn raw_rate_of_a_slow_table_keeps_its_first_point() {
+    let mut source = Memory::new(1000);
+    for (name, every) in [("slow", 10u64), ("fast", 1)] {
+        let timestamps: Vec<u64> = (0..=60 / every)
+            .map(|k| (1000 + k * every) * 1_000_000_000)
+            .collect();
+        source.add_counter(
+            name,
+            Counter {
+                labels: Labels::default(),
+                values: (0..timestamps.len() as u64)
+                    .map(|k| k * 10 * every)
+                    .collect(),
+                timestamps,
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    let series = raw_points(&engine, "irate(slow[5m])", 1005.0, 1060.0);
+    assert_eq!(series[0][0], (1010.0, 10.0), "{series:?}");
+}
