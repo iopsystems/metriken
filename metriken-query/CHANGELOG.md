@@ -70,9 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at different instants: a point at every timestamp any of them has, each
   series contributing its latest point while that point is no older than
   the gap before it, its last point before the range included (read back
-  the `[range]`, and at least two steps or two of the source's intervals). On exact
-  timestamps a raw-mode `sum` over two acquisition groups or recordings
-  alternated between them, and `x / y` across two groups was empty. A
+  the `[range]`, and at least two steps or two of the source's intervals).
+  On exact timestamps a raw-mode `sum` over two acquisition groups or
+  recordings alternated between them, and `x / y` across two groups was
+  empty. A
   raw-mode result no longer includes points before the range's start
   (a bare gauge selector returned its lookback rows).
 

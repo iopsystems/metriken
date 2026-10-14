@@ -1041,13 +1041,14 @@ two candidates. Prometheus answers it empty too; a dashboard meant for one
 host needs a matcher, or `sum(...) / sum(cpu_cores)` across hosts. Time for
 all 274: 3.2 s on one copy, 5.5 s on two.
 
-Raw-mode cost at b1a3b19, 200 counter series, raw `sum(irate(c[5m]))`
-over 30 s, medians of 9 in three rounds (release build): with the series
-on shared timestamps (one acquisition group) 0.32 to 0.92 ms against 0.58
-to 1.01 ms on main; with each series 1 ms from the next, 6.6 ms against 1.9
-to 3.0 ms. Offset series make the latest-point join evaluate every series
-at each of their 6000 timestamps, where main summed the one series present
-at each. The raw comparison on the 9.6 h archive is unchanged at b1a3b19.
+Raw-mode cost at df70dab, 200 counter series in a `Memory` source, raw
+`sum(irate(c[5m]))` over 30 s, six rounds of medians of 9 (release build;
+a run's first round is cold and left out): with the series on shared
+timestamps (one acquisition group) 0.32 to 0.34 ms against 0.22 to 0.28 ms
+on main, about 40% more, the latest-point join's bookkeeping per series;
+with each series 1 ms from the next, 6.8 to 7.0 ms against 1.9 to 2.0 ms.
+Offset series make the join evaluate every series at each of their 6000
+timestamps, where main summed the one series present at each. The raw comparison on the 9.6 h archive is unchanged at b1a3b19.
 
 Tests: metriken-query `archive::tests` (combinations across recordings in
 both modes, twins included; recordings of different phase and cadence

@@ -32,9 +32,10 @@ fn stream_of(
 
 /// Pair-wise rate producer over a counter sample stream. Emits one point per
 /// consecutive sample pair, stamped at the later sample, for pairs whose stamp
-/// falls in `[start_ns, end_ns]`; with [`with_one_before`](Self::with_one_before),
-/// also the last pair before `start_ns`, ahead of the first in range. The stream is fetched with lookback (for
-/// context), so the `start_ns` bound is what keeps a windowed/zoomed query
+/// falls in `[start_ns, end_ns]`; with
+/// [`with_one_before`](Self::with_one_before), also the last pair before
+/// `start_ns`, ahead of the first in range. The stream is fetched with
+/// lookback (for context), so the `start_ns` bound is what keeps a windowed/zoomed query
 /// from spilling points before the requested window — mirroring how the grid
 /// producer's cursor starts at `start_ns`.
 ///
