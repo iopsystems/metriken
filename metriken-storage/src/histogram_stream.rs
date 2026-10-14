@@ -253,8 +253,11 @@ fn merge_streams(streams: Vec<HistogramStream>, clock: Option<usize>) -> Option<
             }
             let mut row = entry.row;
             if entry.is_clock {
-                clock_gap = last_clock.map(|l| row.timestamp.saturating_sub(l));
-                last_clock = Some(row.timestamp);
+                // A clock of several series has a row of each at one time.
+                if last_clock != Some(row.timestamp) {
+                    clock_gap = last_clock.map(|l| row.timestamp.saturating_sub(l));
+                    last_clock = Some(row.timestamp);
+                }
             } else if let Some(last) = last_clock {
                 match clock_head(&heap) {
                     Some(head) => {
@@ -353,6 +356,41 @@ mod tests {
                 },
             })),
         }
+    }
+
+    /// A clock of two series has two rows at each time; the second is the
+    /// same clock row, not an interval of zero after the first.
+    #[test]
+    fn a_clock_of_several_series_restamps_as_one() {
+        let rows: Vec<(u64, u64)> = (10..=50).step_by(10).map(|t| (t, t)).collect();
+        let mut clock = stream(rows.clone(), "slow", (4, 16));
+        clock.meta.series.push(Labels::from([("source", "slow2")]));
+        let both: Vec<HistogramRow> = rows
+            .iter()
+            .flat_map(|&(t, c)| {
+                (0..2).map(move |series_idx| HistogramRow {
+                    series_idx,
+                    timestamp: t,
+                    snapshot: HistogramSnapshot {
+                        index: vec![1],
+                        count: vec![c],
+                    },
+                })
+            })
+            .collect();
+        clock.rows = Box::new(both.into_iter());
+        let fast = stream(
+            (5..=50).step_by(5).map(|t| (t, t)).collect(),
+            "fast",
+            (4, 16),
+        );
+        let merged = HistogramStream::merge_on_clock(vec![clock, fast], 0).unwrap();
+        let fast_times: Vec<u64> = merged
+            .rows
+            .filter(|r| r.series_idx == 2)
+            .map(|r| r.timestamp)
+            .collect();
+        assert_eq!(fast_times, vec![5, 10, 20, 20, 30, 30, 40, 40, 50, 50]);
     }
 
     /// Rows of another stream take the time of the clock's next row, so a

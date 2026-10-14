@@ -440,10 +440,20 @@ fn refuse_kinds_across_recordings(
         })
     };
     let which = recording_selectors(recordings, plan.labels);
+    let selectors = crate::promql::selectors(query)?;
     for name in &plan.held {
+        // The recordings a selector naming `name` can read: `m{source="a"} +
+        // y` reads `m` in recording a only, whatever `y` reaches.
+        let reads = |tables: &[&SamplerReader]| {
+            selectors.iter().any(|(names, filter)| {
+                names.contains(name)
+                    && translate_filter(plan.labels.of(tables[0]), filter).is_some()
+            })
+        };
         let kinds: Vec<(usize, &'static str)> = recordings
             .iter()
             .enumerate()
+            .filter(|(_, tables)| reads(tables))
             .filter_map(|(i, tables)| kind(tables, name).map(|k| (i, k)))
             .collect();
         let Some(&(first, first_kind)) = kinds.first() else {
@@ -1673,6 +1683,30 @@ mod tests {
         ]);
         assert!(values(&reader, "m", RateMode::default()).is_err());
         assert!(values(&reader, "rate(m[3s])", RateMode::default()).is_err());
+        // A matcher selecting one kind answers, though another operand
+        // reaches the other recording.
+        let with_y = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![
+                    ("t", explicit_table("m", "gauge", &gauge_rows(1, 40, 1, 10))),
+                    ("ty", gauge("y", 1)),
+                ],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![
+                    (
+                        "t",
+                        explicit_table("m", "counter", &gauge_rows(1, 40, 1, 10)),
+                    ),
+                    ("ty", gauge("y", 2)),
+                ],
+            ),
+        ]);
+        for q in [r#"m{source="a"} + y"#, r#"sum(m{source="a"}) + sum(y)"#] {
+            values(&with_y, q, RateMode::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
         assert_eq!(
             values(&reader, r#"m{source="a"}"#, RateMode::default())
                 .unwrap()
