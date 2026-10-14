@@ -754,7 +754,8 @@ mod tests {
             MatchSpec::Default,
             &[],
             Join::Exact,
-        );
+        )
+        .expect("one-to-one");
         let pts: Vec<Point> = out.into_iter().next().unwrap().iter.collect();
 
         assert_eq!(pts.len(), 1);

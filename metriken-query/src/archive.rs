@@ -1612,6 +1612,42 @@ mod tests {
         }
     }
 
+    /// Matching is one-to-one across recordings as within one: `g / on() h`
+    /// with an `h` in each recording is many-to-many and refused in every
+    /// mode; `on(source)` makes it one-to-one.
+    #[test]
+    fn a_many_to_many_match_across_recordings_is_refused() {
+        let both = |source: &'static str, g: u64, h: u64| {
+            recording(
+                &[("source", source)],
+                vec![
+                    ("tg", explicit_table("g", "gauge", &gauge_rows(1, 40, 1, g))),
+                    ("th", explicit_table("h", "gauge", &gauge_rows(1, 40, 1, h))),
+                ],
+            )
+        };
+        let reader = archive(vec![both("a", 10, 2), both("b", 100, 4)]);
+        for mode in [RateMode::default(), RateMode::Raw] {
+            for q in ["g / on() h", "sum(g) / on() h"] {
+                let err = values(&reader, q, mode).unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("many-to-many matching not allowed"),
+                    "{q}: {err}"
+                );
+            }
+            let err = values(&reader, "g / on() sum(h)", mode).unwrap_err();
+            assert!(err.to_string().contains("multiple matches"), "{err}");
+            let mut v: Vec<f64> = values(&reader, "g / on(source) h", mode)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.last().unwrap().1)
+                .collect();
+            v.sort_by(f64::total_cmp);
+            assert_eq!(v, [5.0, 25.0]);
+        }
+    }
+
     /// Recordings read at different instants and cadences combine at every
     /// point: a 1 s recording and a 10 s one half a second out of phase sum
     /// to both at every grid point, the slow one held between its rows.
