@@ -15,11 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left series with points that match one right series (`multiple matches
   for labels`; `group_left` is not supported). The right side's last series
   of a shared key used to be kept and the others dropped, and only the
-  first left series of a match group was paired with its right series. A series without points in
-  the range takes no part. The check covers the whole range, where
-  Prometheus checks each step, so two series that share a key at different
-  times in the range are refused.
-
+  first left series of a match group was paired with its right series. A
+  series without points in the range takes no part. The check covers the
+  whole range, where Prometheus checks each step, so two series that share
+  a key at different times in the range are refused.
 - **Breaking:** an archive's series carry their recording's labels
   (`source`, `host`, any `record --label`), and a query naming a metric that
   several recordings of an archive hold is answered from all of them

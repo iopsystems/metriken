@@ -11,15 +11,13 @@
 //! * **Series-set joining** — [`matrix_matrix_op`] groups the right
 //!   side by label-match key (per [`MatchSpec`]) and pairs each
 //!   left-side series with its matching right-side series. Series
-//!   that don't find a match are dropped. Two series with points on one
-//!   side that share a match key are an error (one-to-one matching).
+//!   that don't find a match are dropped. Two right series with points
+//!   that share a match key are an error, and so are two left series with
+//!   points that match one right series (one-to-one matching).
 //!
-//! When no `on()`/`ignoring()` modifier is given AND exactly one
-//! right-side series is left after the keyed join, that singleton is
-//! broadcast against every unmatched left series via
-//! [`RightLookupBinary`] (materialises the one right series's points
-//! into a shared timestamp lookup). Mirrors the eager engine's
-//! per-left-series fallback.
+//! Under default matching, an unmatched left series is paired with the
+//! one unmatched right series of its recording, when there is exactly
+//! one ([`RightLookupBinary`] or [`Replay`]).
 //!
 //! What's NOT covered here:
 //!
@@ -52,9 +50,8 @@ type RightLookup = HashMap<u64, (f64, Option<Band>, Option<RateEdges>, bool)>;
 type PointIter<'a> = Box<dyn Iterator<Item = Point> + 'a>;
 
 /// Subset of PromQL binary operators the streaming pipeline
-/// recognises. Maps directly onto the eager `apply_binary_op`
-/// branches. `from_token` returns `None` for any token outside this
-/// set so the dispatcher falls through to the eager path cleanly.
+/// recognises. `from_token` returns `None` for any token outside this
+/// set, which the dispatcher reports as unsupported.
 #[derive(Copy, Clone, Debug)]
 pub enum BinOp {
     Add,
@@ -508,8 +505,7 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 }
 
 /// `left OP right` over two series sets, joining by `spec`-derived
-/// match key. Output preserves left's labels (matching the eager path,
-/// which copies `left_sample.metric.clone()` to the result).
+/// match key. Output keeps the left series' labels.
 ///
 /// Matching is one-to-one. Two right series with points in the range that
 /// share a match key are an error, and so are two left series with points

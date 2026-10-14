@@ -1110,8 +1110,10 @@ Prometheus; both used to keep one pair and drop the rest. The check is over
 the whole range: Prometheus checks each step, so two series sharing a key
 at different times are refused here and answered there. A series with no
 points in the range is left out of it. Of the 274 rezolus dashboard
-queries on the 9.6 h archive, none is refused by it (two use `on()` or
-`ignoring()`), on one copy or on two.
+queries on the 9.6 h archive, none is refused by it, on one copy or on two.
+Two use `ignoring()`, both over GPU PCIe metrics the archive does not
+hold, so neither was exercised; by their labels, `{vendor, id}`, they are
+one-to-one.
 
 Still open:
 - A raw read reaches back the `[range]` and at least two steps or two of
