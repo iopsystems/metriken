@@ -92,7 +92,7 @@ impl DataSource for RecordingsSource {
     }
 
     /// Every recording's scan as one: series in recording order, chunks
-    /// interleaved by start time ([`Interleaved`]). `None` when a recording
+    /// interleaved by start time (`Interleaved`). `None` when a recording
     /// holding matched series cannot scan them, so the query takes the
     /// per-series path for every recording.
     fn counter_scan(

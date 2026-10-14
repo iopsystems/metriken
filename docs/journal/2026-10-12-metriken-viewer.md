@@ -731,7 +731,9 @@ Open sub-questions:
 #### Series labels, as built (2026-10-13)
 
 metriken branch `feat/recording-series-labels` (metriken-storage and
-metriken-query, unreleased):
+metriken-query, unreleased; merged as #269). Its per-recording evaluation
+and refusals of combinations across recordings are superseded by "One
+engine across recordings" below.
 
 - `SamplerReader` holds its recording's labels in an `Arc` shared by the
   recording's tables; `same_recording` compares the pointers, so recordings
@@ -943,6 +945,127 @@ metriken-query, unreleased):
   moves to this release.
   The combined view (`init_file_mode_rez`, the WASM `Viewer::new`) and
   `rezolus mcp`'s default (sub-question 7) are rezolus work on this release.
+
+#### One engine across recordings (2026-10-13, later)
+
+Decided: the owner asked for queries across recordings to be answered as a
+query engine answers them, in place of #269's per-recording evaluation and
+refusals. metriken branch `feat/cross-recording-engine` (unreleased).
+
+A query reaching several recordings is evaluated by one engine over all of
+them: `metriken_storage::recordings::RecordingsSource` joins each
+recording's labelled source (`LabeledSource`), and a read of a name
+concatenates every recording's series of it. Every failure #269 listed for
+one engine over two recordings was fixed in the engine rather than avoided:
+
+- Matching: `__recording__` takes part in binary-operator matching and in
+  `without` (`is_matched_label`); other internal labels still do not. Twins
+  pair `g` with their own `h`, and `sum without (cpu)` keeps them apart.
+- Broadcast: the single-right broadcast pairs an unmatched left series with
+  the one unmatched right series of its recording, decided by the keys
+  `DataSource::recording_label_keys` reports (`LabeledSource` reports the
+  labels it adds). A left series lacking the keys (an aggregate) has every
+  recording's right series as a candidate, so with two it pairs with
+  neither.
+- Intervals: a gauge is held for its own recording's interval
+  (`DataSource::gauge_parts`, read per recording with that recording's
+  lookback). The interval is the one the archive measures from the
+  recording's rows (`LabeledSource::with_interval`, `SamplerReader::interval`):
+  a segment declares none and reported 1 s, so a 10 s gauge was missing
+  between its rows on any dendro archive, one recording or several. The
+  in-memory path (`from_in_memory`) measured nothing either and now
+  measures from the first segment's rows.
+- Edges: a grid rate is held past a series' last sample when that sample is
+  within its typical spacing of the range's end (`CounterGridRate`, and
+  `SeriesRate` in the batch path). Two recordings half an interval out of
+  phase each had a point at the range's end only if its last row fell at or
+  after the last grid point, so `sum` dropped one there. A series that stops
+  earlier in the range is not held; holding it showed one point after a
+  counter run that ended at a type change, and four tests caught that.
+- Raw mode: aggregations and operators join series on each series' latest
+  point while it is no older than the gap before it (`Join::Latest`,
+  `Held`), at every timestamp any of them has. Exact timestamps made a
+  raw `sum` over two recordings alternate (10, 100, 10, …) and `x / y`
+  across two acquisition groups of one recording empty.
+- Histograms: rows of several recordings are pooled on the rows of the
+  recording with the longest interval (`HistogramStream::merge_on_clock`):
+  a row of another recording takes the time of the clock's next row, so a
+  tick pools every recording's deltas since the previous clock row. Rows
+  before the clock's first row and inside a hole in it keep their own time;
+  rows within one clock interval after its last row read are left out (at
+  the range's end the clock's next row is past the read, and they would make
+  a tick of the other recordings alone: seen as a last point reading only
+  one recording). Streams of different bucket configurations are merged
+  under the coarsest (smallest grouping power, largest max value power),
+  checked bucket by bucket against the `histogram` crate's own bucketing.
+- Kinds: a name that is a counter in one recording and a gauge in another is
+  refused, naming both recordings.
+- Duplicates: a result holding one label set twice is refused, as
+  Prometheus refuses such a vector (a recording carrying `host` as a
+  recording label and another carrying it on its series).
+- A metric the archive holds that no recording the query reaches holds
+  answers empty (`x{source="b"} + y` with `x` only in `a`).
+- Cross-cadence timestamps apply to a query reaching one recording; across
+  several, the grid. The values are right either way; the bands are wider
+  where a slow recording's value is held between its rows.
+- The batch rate path (`counter_scan`) joins every recording's scan:
+  series offset into one list, chunks interleaved by start time so a
+  grouped display read still flushes as it reads. Without it a wide
+  counter across two recordings was 10 times slower (25 to 259 ms for
+  `sum(irate(cgroup_syscall[5m]))` on two copies of the 9.6 h archive).
+
+Measured on `metrics-9.6h.dendro` (one recording), 274 queries from
+rezolus's dashboards, upstream main (daeaa13) against this branch: range
+queries over the last hour at 10 s, instant queries, and raw-mode range
+queries over the last two minutes. Raw: identical. Range: 261 identical;
+the other 13 differ by at most 4.6e-16 relative, and main differs from
+itself between runs on 15 queries by the same last-digit summation order.
+Instant: 272 identical, 2 differ in the last digit. So on this archive
+neither the held end point nor the measured interval changed any answer:
+its tables share a 1 s cadence and every series ends at the archive's end.
+
+Measured on two copies of the same archive joined (`ArchiveReader::flatten`,
+twins told apart by `__recording__`): 87 `sum` queries return exactly twice
+the single answer (largest relative difference 7e-16), 25 averages and
+ratios exactly the single answer, 9 per-series queries every series twice
+with identical values, 87 errors as on one copy (metrics this host lacks),
+27 empty as on one copy. 16 queries of the form `sum(irate(x[5m])) /
+cpu_cores` are empty: the left side has no labels and `cpu_cores` has one
+series per recording, so the broadcast has two candidates. Prometheus
+answers it empty too; a dashboard meant for one host needs a matcher, or
+`sum(...) / sum(cpu_cores)` across hosts. Time for all 274: 3.0 s on one
+copy, 5.3 s on two.
+
+Tests: metriken-query `archive::tests` (combinations across recordings in
+both modes, twins included; recordings of different phase and cadence
+summed at every point; each recording's interval; a slow recording's gauge
+held between its rows; histograms pooled across recordings and on the
+slowest recording's rows; the batch path across recordings, agreeing with
+the per-series path, and falling back when a recording cannot scan; a name
+of two kinds; duplicate label sets; a missing metric), `streaming` tests
+(raw joins, the broadcast, matching and `without` on `__recording__`, the
+held rate), metriken-storage `histogram_stream::tests`. Seen red by
+mutation, each alone: matching without `__recording__`, `without` dropping
+it, the broadcast across recordings, more than one broadcast candidate,
+gauge parts at one interval, no measured interval in the archive or the
+in-memory path, no held rate in either path, holding at any point past the
+last sample, exact joins in raw mode, a first point held for nothing, no
+restamp onto the clock, no drop after the clock's end, the fastest
+recording as the clock, no rebucketing, a wrong bucket lower bound,
+restamping across a hole, clock rows popped before others at one time, no
+kind refusal, no empty answer for a missing metric, no duplicate refusal,
+scan series not offset, an unscannable recording skipped, no joined scan.
+
+Still open:
+- A many-to-many match (`g / on() h` over two recordings) keeps one pair
+  and drops the rest without a word, as it does within one recording;
+  Prometheus refuses it.
+- A histogram's last tick at the range's end leaves out the other
+  recordings' rows after the clock's last row read.
+- rezolus: the viewer must treat recording labels as constant labels, and
+  its tests assert the cross-recording refusal; the 16 `... / cpu_cores`
+  dashboard queries are empty on an archive of two rezolus recordings until
+  the combined view instantiates rezolus's sections per recording.
 
 ### Q12. How do templates travel, and do rezolus's sections become templates?
 

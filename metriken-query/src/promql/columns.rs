@@ -7,6 +7,9 @@
 //! the resolver doesn't need to know which type table a selector
 //! targets — the name alone identifies the column.
 
+// The selector walks serve the archive's routing alone.
+#![cfg_attr(not(feature = "archive"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 
 use promql_parser::label::Matcher;

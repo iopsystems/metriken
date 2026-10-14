@@ -12,6 +12,7 @@ use crate::{DataSource, QueryOptions};
 
 mod columns;
 pub use columns::referenced_metrics;
+#[cfg(feature = "archive")]
 pub(crate) use columns::{repeated_matcher, selectors};
 pub(crate) mod streaming;
 

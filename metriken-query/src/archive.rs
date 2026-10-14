@@ -47,8 +47,8 @@ use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 ///
 /// The timestamps are absolute, so they describe this recording's timeline
 /// and no other, and a query reading tables of several recordings gets
-/// `None`. Querying an [`ArchiveReader`] through [`MetricsSource`] evaluates
-/// such a query once per recording, each with its own timestamps.
+/// `None`: it is evaluated on the uniform grid, each series read at its own
+/// recording's rows and interval.
 pub fn eval_timestamps_for(
     reader: &ArchiveReader,
     query: &str,
