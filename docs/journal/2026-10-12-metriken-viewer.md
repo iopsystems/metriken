@@ -1041,12 +1041,13 @@ two candidates. Prometheus answers it empty too; a dashboard meant for one
 host needs a matcher, or `sum(...) / sum(cpu_cores)` across hosts. Time for
 all 274: 3.2 s on one copy, 5.5 s on two.
 
-Raw-mode cost, 200 counter series, raw `sum(irate(c[5m]))` over 30 s,
-median of 9 (release build): with the series on shared timestamps (one
-acquisition group) 0.74 ms against 0.96 ms on main; with each series 1 ms
-from the next, 8.3 ms against 3.4 ms. Offset series make the latest-point
-join evaluate every series at each of their 6000 timestamps, where main
-summed the one series present at each.
+Raw-mode cost at b1a3b19, 200 counter series, raw `sum(irate(c[5m]))`
+over 30 s, medians of 9 in three rounds (release build): with the series
+on shared timestamps (one acquisition group) 0.32 to 0.92 ms against 0.58
+to 1.01 ms on main; with each series 1 ms from the next, 6.6 ms against 1.9
+to 3.0 ms. Offset series make the latest-point join evaluate every series
+at each of their 6000 timestamps, where main summed the one series present
+at each. The raw comparison on the 9.6 h archive is unchanged at b1a3b19.
 
 Tests: metriken-query `archive::tests` (combinations across recordings in
 both modes, twins included; recordings of different phase and cadence
@@ -1095,9 +1096,17 @@ Second review (of 171fcbf), each fixed with a test seen red:
 - The journal's counts came from a run before the raw fix; the numbers
   above are from ec734ec.
 
+Third review (of 03ffca8), fixed with a test seen red:
+- The raw read of two steps or two of the source's intervals missed the
+  sample before the range of a table slower than the source's finest
+  interval (in one recording too), so its first point in range was lost
+  where main had it. The `[range]` is a floor again; the lookback's pairs
+  are no longer each turned into a point, only the latest is kept.
+
 Still open:
-- The raw read reaches two of the source's (shortest) intervals back, so a
-  slower recording's series can lack its point before the range.
+- A raw read reaches back the `[range]` and at least two steps or two of
+  the source's (finest) intervals, so a series read more slowly than that
+  lacks its point before the range, and a join starts without it.
 - The catalog path's interval is the mean spacing (span over rows), which
   a long gap lengthens, so a gauge can be held longer than its cadence past
   a gap. The median needs every table's timestamps decoded.
