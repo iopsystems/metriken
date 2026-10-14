@@ -1019,12 +1019,15 @@ one engine over two recordings is fixed in the engine:
 Measured on `metrics-9.6h.dendro` (one recording), 274 queries from
 rezolus's dashboards, upstream main (daeaa13) against this branch: range
 queries over the last hour at 10 s, instant queries, and raw-mode range
-queries over the last two minutes. Raw: identical. Range: 261 identical;
-the other 13 differ by at most 4.6e-16 relative, and main differs from
-itself between runs on 15 queries by the same last-digit summation order.
-Instant: 272 identical, 2 differ in the last digit. So on this archive
-neither the held end point nor the measured interval changed any answer:
-its tables share a 1 s cadence and every series ends at the archive's end.
+queries over the last two minutes. Range: 261 identical; the other 13
+differ by at most 4.6e-16 relative, and main differs from itself between
+runs on 15 queries by the same last-digit summation order. Instant: 272
+identical, 2 differ in the last digit. So on this archive neither the held
+end point nor the measured interval changed any answer: its tables share a
+1 s cadence and every series ends at the archive's end. Raw: identical at
+6eb621c; after the first review's raw fix (results cut at the range's
+start), 266 identical and 8 gauge queries (`memory_available` and the
+like) each without the one point main returned from before the start.
 
 Measured on two copies of the same archive joined (`ArchiveReader::flatten`,
 twins told apart by `__recording__`): 87 `sum` queries return exactly twice
