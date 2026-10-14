@@ -109,8 +109,7 @@ fn make_ctx<'a>(
 ///
 /// Raw producers emit from their read's lookback, so that a series' last
 /// point before the range is there for a `Join::Latest` to hold at the
-/// range's start; without it, a `sum` over series read at different
-/// instants covered only the series with a point at or after the start.
+/// range's start.
 fn clip_raw<'a>(ctx: &Ctx<'_>, series: SeriesSet<'a>) -> SeriesSet<'a> {
     if !matches!(ctx.rate_mode, RateMode::Raw) {
         return series;

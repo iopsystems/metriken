@@ -163,8 +163,8 @@ pub trait DataSource: Send + Sync {
         Vec::new()
     }
     /// Gauge `name`'s series for a grid from `start_ns` to `end_ns` at
-    /// `step_ns`, in parts of one sampling interval each, with that interval
-    /// in seconds. A gauge is held a step, or its interval when that is
+    /// `step_ns`, as parts whose series share one sampling interval, each
+    /// returned with that interval in seconds. A gauge is held a step, or its interval when that is
     /// longer, past each sample, so each part is read from that far before
     /// `start_ns`. A source joining recordings of different intervals gives
     /// each recording's series its own. The default is one part at

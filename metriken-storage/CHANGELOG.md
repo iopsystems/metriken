@@ -51,10 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bucket maps without splitting, and finds each series' merged index by
   hash rather than a linear search.
 - An archive opened from bytes (`ArchiveReader::from_in_memory`) reported
-  each table's declared interval, which a segment does not carry, so every
-  table reported 1 s. It now measures the interval from the first
-  segment's rows, as an archive opened from its catalog measures it from
-  the table's span and row count.
+  1 s for a table whose segment declares no `sampling_interval_ms` (a
+  dendro segment declares none). It now reports the median gap of the
+  first segment's rows for such a table; a declared interval is reported
+  as before.
 
 ### Changed
 

@@ -134,9 +134,9 @@ impl LabeledSource {
         }
     }
 
-    /// Report `interval` (seconds) rather than the source's own: a reader
-    /// that measured the recording's row spacing knows it better than a
-    /// segment, which declares none and reports 1 s.
+    /// Report `interval` (seconds) rather than the source's own. A segment
+    /// that declares no interval reports 1 s; pass the spacing measured from
+    /// the recording's rows.
     pub fn with_interval(mut self, interval: f64) -> Self {
         self.interval = Some(interval).filter(|i| *i > 0.0);
         self

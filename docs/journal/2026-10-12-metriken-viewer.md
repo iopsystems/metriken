@@ -955,8 +955,8 @@ refusals. metriken branch `feat/cross-recording-engine` (unreleased).
 A query reaching several recordings is evaluated by one engine over all of
 them: `metriken_storage::recordings::RecordingsSource` joins each
 recording's labelled source (`LabeledSource`), and a read of a name
-concatenates every recording's series of it. Every failure #269 listed for
-one engine over two recordings was fixed in the engine rather than avoided:
+concatenates every recording's series of it. Each failure #269 listed for
+one engine over two recordings is fixed in the engine:
 
 - Matching: `__recording__` takes part in binary-operator matching and in
   `without` (`is_matched_label`); other internal labels still do not. Twins
@@ -973,8 +973,8 @@ one engine over two recordings was fixed in the engine rather than avoided:
   recording's rows (`LabeledSource::with_interval`, `SamplerReader::interval`):
   a segment declares none and reported 1 s, so a 10 s gauge was missing
   between its rows on any dendro archive, one recording or several. The
-  in-memory path (`from_in_memory`) measured nothing either and now
-  measures from the first segment's rows.
+  in-memory path (`from_in_memory`) now reports a declared interval, and
+  for a segment declaring none the median gap of its first segment's rows.
 - Edges: a grid rate is held past a series' last sample when that sample is
   within its typical spacing of the range's end (`CounterGridRate`, and
   `SeriesRate` in the batch path). Two recordings half an interval out of
@@ -1006,8 +1006,10 @@ one engine over two recordings was fixed in the engine rather than avoided:
 - A metric the archive holds that no recording the query reaches holds
   answers empty (`x{source="b"} + y` with `x` only in `a`).
 - Cross-cadence timestamps apply to a query reaching one recording; across
-  several, the grid. The values are right either way; the bands are wider
-  where a slow recording's value is held between its rows.
+  several, the grid. On the grid a slow recording's value is held (a
+  gauge) or interpolated (a rate) between its rows and combined with a
+  faster one as if read together, which its band accounts for when edges
+  differ; the cross-cadence timestamps avoid that within one recording.
 - The batch rate path (`counter_scan`) joins every recording's scan:
   series offset into one list, chunks interleaved by start time so a
   grouped display read still flushes as it reads. Without it a wide
@@ -1056,7 +1058,31 @@ restamping across a hole, clock rows popped before others at one time, no
 kind refusal, no empty answer for a missing metric, no duplicate refusal,
 scan series not offset, an unscannable recording skipped, no joined scan.
 
+First review (of 6eb621c), each fixed with a test seen red:
+- `merge_on_clock` took a clock's second series at one time for an
+  interval of zero, so every later clock interval read as a hole and
+  nothing was restamped: any histogram with more than one series in the
+  slowest recording alternated again. The tests had one-series clocks.
+- The kind refusal checked every recording the query reached through any
+  metric, so `m{source="a"} + y` was refused although its matcher selects
+  one kind.
+- Raw producers started at the range, so the first points of a raw `sum`
+  across series read at different instants had only the series with a
+  point at or after the start. They now emit from the read's lookback, and
+  the result is cut at the start.
+- `from_in_memory` replaced a declared interval with the mean spacing.
+- The CHANGELOG said the held rate adds at most one point; it adds the
+  grid points within the series' spacing of the range's end.
+
 Still open:
+- The catalog path's interval is the mean spacing (span over rows), which
+  a long gap lengthens, so a gauge can be held longer than its cadence past
+  a gap. The median needs every table's timestamps decoded.
+- A `ParquetBuilder` reader with per-file labels reports no recording keys
+  and one interval, so its files broadcast across each other and share
+  staleness, where an archive's recordings do not.
+- No option turns off the held rate at the range's end or the measured
+  staleness.
 - A many-to-many match (`g / on() h` over two recordings) keeps one pair
   and drops the rest without a word, as it does within one recording;
   Prometheus refuses it.

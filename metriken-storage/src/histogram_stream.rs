@@ -40,9 +40,8 @@ impl HistogramStream {
     /// share the later one's time.
     ///
     /// The histogram functions pool, at each row time, the deltas of every
-    /// series with a row there. Two recordings' rows fall at different times,
-    /// and pooled by exact time the answer alternated between them row by
-    /// row. On the clock's times, each pooled delta is every series' increase
+    /// series with a row there, and two recordings' rows fall at different
+    /// times. On the clock's times, each pooled delta is every series' increase
     /// since the previous clock row, give or take the part of one row
     /// interval of a faster stream that straddles a clock row. A series with
     /// several rows between two clock rows contributes each delta, which sum

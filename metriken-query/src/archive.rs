@@ -319,9 +319,9 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         if let Some(source) = recording_source(tables, query)? {
             let labels = plan.labels.of(tables[0]).clone();
             // The interval measured from the rows of the recording's
-            // fastest table the query reads. A segment declares none and
-            // reports 1 s, so a 10 s recording's gauge was held 1 s past
-            // each row and missing between them.
+            // fastest table the query reads. A segment that declares none
+            // reports 1 s, which would hold a 10 s recording's gauge 1 s
+            // past each row.
             let interval = tables
                 .iter()
                 .map(|t| t.interval())
@@ -363,9 +363,8 @@ fn refuse_shared_label_sets<'r>(
         key.sort();
         if !seen.insert(key) {
             return Err(QueryError::Unsupported(format!(
-                "the result holds two series with the labels {metric:?}, from different \
-                 recordings; aggregate them (e.g. sum by (...)) or select one with a label \
-                 matcher"
+                "the result holds two series with the labels {metric:?}; aggregate them \
+                 (e.g. sum by (...)) or select one with a label matcher"
             )));
         }
     }
@@ -420,7 +419,7 @@ fn recording_selectors(recordings: &[Vec<&SamplerReader>], labels: &SeriesLabels
 ///
 /// Each function reads one kind: `rate(x[1m])` reads counters, a bare `x`
 /// gauges. Over such recordings it would read the series of the
-/// recordings holding that kind and leave the others out without a word.
+/// recordings holding that kind and leave the others out silently.
 fn refuse_kinds_across_recordings(
     plan: &Plan<'_>,
     recordings: &[Vec<&SamplerReader>],

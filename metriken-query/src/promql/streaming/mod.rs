@@ -157,7 +157,7 @@ impl Join {
     }
 }
 
-/// A series read at instants of another series' choosing ([`Join::Latest`]):
+/// A series sampled at instants taken from other series ([`Join::Latest`]):
 /// its latest point at or before the instant, held while the instant is no
 /// further past it than the gap from the point before. A series' first
 /// point is held for the gap to its second.

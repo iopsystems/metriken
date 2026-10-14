@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   get `__recording__` (their catalog index) so their series stay apart. A
   recording whose labels no selector of the query can match is left out
   first; when that leaves out every recording holding a metric the query
-  names, the answer is empty. On an archive of several recordings, an
+  names, the answer is empty, also for a query the engine would reject
+  (such as `x or y`), whose error is then not reached. On an archive of several recordings, an
   instant query without a time reads at the archive's end, whether or not a
   matcher narrows it to one recording. A selector that matches one label
   twice is refused, for any label and on any archive, single-recording ones
@@ -62,14 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose rows fall between the grid's points used to have no point at the
   range's end, so a `sum` across series out of phase dropped the ones that
   read last before it. A series that stops earlier in the range is not
-  held. On one recording this adds at most one point at the end of a range
-  that ends between a series' rows.
+  held. On one recording this adds the grid points between a series' last
+  row and the range's end, when that row is within the series' typical
+  spacing of the end: up to that spacing over the step.
 - In `RateMode::Raw`, aggregations and binary operators combine series read
   at different instants: a point at every timestamp any of them has, each
   series contributing its latest point while that point is no older than
-  the gap before it. On exact timestamps a raw-mode `sum` over two
-  acquisition groups or recordings alternated between them, and `x / y`
-  across two groups was empty.
+  the gap before it, its last point before the range included. On exact
+  timestamps a raw-mode `sum` over two acquisition groups or recordings
+  alternated between them, and `x / y` across two groups was empty. A
+  raw-mode result no longer includes points before the range's start
+  (a bare gauge selector returned its lookback rows).
 
 ## [0.36.1] - 2026-10-12
 

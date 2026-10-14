@@ -3,22 +3,24 @@
 //! Each child is one recording's source, its series carrying that
 //! recording's labels ([`LabeledSource`](crate::labeled::LabeledSource)), so
 //! the same metric in two recordings is two sets of series told apart by
-//! their labels. A read of a name concatenates every child's series of that
-//! name; nothing is joined or spliced. What differs between recordings is
-//! kept per child where the query engine needs it:
+//! their labels. A read of a name returns every child's series of that name;
+//! series of different children are never spliced into one. What differs
+//! between recordings is kept per child where the query engine needs it:
 //!
 //! - A gauge is held for its own recording's interval
 //!   ([`gauge_parts`](DataSource::gauge_parts)).
 //! - A histogram's rows are pooled on the slowest recording's row times
 //!   ([`HistogramStream::merge_on_clock`]), since two recordings' rows fall
 //!   at different instants.
+//! - A counter scan joins every child's scan, its chunks interleaved by
+//!   start time.
 //! - The recordings' label keys are reported
 //!   ([`recording_label_keys`](DataSource::recording_label_keys)), so a
 //!   binary operator's broadcast pairs series of one recording only.
 //!
 //! [`UnionSource`](crate::union::UnionSource) is the other composition: it
-//! joins tables holding different names of one recording, and refuses a
-//! name two of them hold.
+//! joins tables holding different names of one recording, and
+//! `UnionSource::try_new` refuses a name two of them hold.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
