@@ -47,6 +47,13 @@ pub struct CounterPairwiseRate<'a> {
     prev: Option<(u64, u64)>,
     start_ns: u64,
     end_ns: u64,
+    /// Emit the last point before `start_ns` too; see
+    /// [`with_one_before`](Self::with_one_before).
+    one_before: bool,
+    /// The latest point before `start_ns`, while `one_before` holds it.
+    before: Option<Point>,
+    /// The first point in range, read while emitting `before`.
+    pending: Option<Point>,
 }
 
 impl<'a> CounterPairwiseRate<'a> {
@@ -60,7 +67,19 @@ impl<'a> CounterPairwiseRate<'a> {
             prev: None,
             start_ns,
             end_ns,
+            one_before: false,
+            before: None,
+            pending: None,
         }
+    }
+
+    /// Also emit the series' last point before `start_ns`, ahead of the
+    /// first in range: a join of series read at different instants holds it
+    /// at the range's start (`Join::Latest`). The caller cuts the result at
+    /// the start.
+    pub(crate) fn with_one_before(mut self) -> Self {
+        self.one_before = true;
+        self
     }
 }
 
@@ -68,18 +87,23 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
+        if let Some(p) = self.pending.take() {
+            return Some(p);
+        }
         loop {
-            let cur = self.source.next()?;
+            let Some(cur) = self.source.next() else {
+                return self.before.take();
+            };
             let Some((ts_prev, v_prev)) = self.prev.replace((cur.ts, cur.value)) else {
                 continue;
             };
             let (ts_cur, v_cur) = (cur.ts, cur.value);
             if ts_cur > self.end_ns {
-                return None;
+                return self.before.take();
             }
-            // Skip pairs before the requested window; the stream carries
-            // lookback context whose stamps precede start_ns.
-            if ts_cur < self.start_ns {
+            // Pairs before the requested window: the stream carries lookback
+            // context whose stamps precede start_ns.
+            if ts_cur < self.start_ns && !self.one_before {
                 continue;
             }
             let delta = if v_cur >= v_prev {
@@ -91,7 +115,16 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
             if dur_s <= 0.0 {
                 continue;
             }
-            return Some(Point::at(ts_cur, delta / dur_s));
+            let point = Point::at(ts_cur, delta / dur_s);
+            if ts_cur < self.start_ns {
+                self.before = Some(point);
+                continue;
+            }
+            if let Some(before) = self.before.take() {
+                self.pending = Some(point);
+                return Some(before);
+            }
+            return Some(point);
         }
     }
 }

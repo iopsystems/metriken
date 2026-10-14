@@ -443,7 +443,7 @@ fn raw_sum_holds_points_from_before_the_range() {
         );
     }
     let engine = QueryEngine::new(Arc::new(source));
-    for q in ["sum(g)", "sum(irate(c[5s]))"] {
+    for q in ["sum(g)", "sum(irate(c[5s]))", "sum(irate(c[1s]))"] {
         let series = raw_points(&engine, q, 1000.0, 1004.5);
         let points = &series[0];
         assert_eq!(points[0], (1000.0, 110.0), "{q}: {points:?}");

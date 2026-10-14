@@ -700,9 +700,16 @@ where
             }
             // Grid needs at least one step of lookback to bracket the first
             // interval's left edge, regardless of the (inert) query range.
+            // Raw pairs consecutive samples, so it reads back two samples
+            // (two steps or two intervals, the longer): enough for each
+            // series' last point before the range, which a join holds at its
+            // start. The `[range]` does not enter into a raw rate.
             let lookback = match ctx.rate_mode {
                 RateMode::Grid => range_ns.max(ctx.step_ns),
-                RateMode::Raw => range_ns,
+                RateMode::Raw => ctx
+                    .step_ns
+                    .max((ctx.source.interval() * 1e9) as u64)
+                    .saturating_mul(2),
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
             let Some(streams) =
@@ -751,10 +758,11 @@ where
                     }
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
-                        // From the lookback: a series' last point before the
-                        // range is what a join holds at its start; the
-                        // result is cut at `start` (`clip_raw`).
-                        CounterPairwiseRate::from_stream(stream.samples, data_start, ctx.end_ns),
+                        // With the series' last point before the range, which
+                        // a join holds at its start; the result is cut at
+                        // `start` (`clip_raw`).
+                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns)
+                            .with_one_before(),
                     ),
                 })
                 .collect();
