@@ -1280,6 +1280,178 @@ mod tests {
         assert_eq!(got[0].len(), 40, "{got:?}");
     }
 
+    /// A table of counter `name` in segments of `rows` each: series `cpu=i`
+    /// grows by `i + 1` a second, rows one second apart from `offset`.
+    fn counter_segments(
+        name: &str,
+        cpus: u64,
+        offset: u64,
+        segments: u64,
+        rows: u64,
+    ) -> Vec<Vec<u8>> {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        (0..segments)
+            .map(|seg| {
+                let ts: Vec<u64> = (seg * rows..(seg + 1) * rows)
+                    .map(|k| (k + 1) * S + offset)
+                    .collect();
+                let mut fields = vec![Field::new("timestamp", DataType::UInt64, false)];
+                let mut columns: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(ts.clone()))];
+                for cpu in 0..cpus {
+                    let mut meta = HashMap::new();
+                    meta.insert("metric".to_string(), name.to_string());
+                    meta.insert("metric_type".to_string(), "counter".to_string());
+                    meta.insert("cpu".to_string(), cpu.to_string());
+                    fields.push(
+                        Field::new(format!("{name}__{cpu}"), DataType::UInt64, true)
+                            .with_metadata(meta),
+                    );
+                    columns.push(Arc::new(UInt64Array::from(
+                        ts.iter().map(|t| t / S * (cpu + 1)).collect::<Vec<_>>(),
+                    )));
+                }
+                let schema = Arc::new(Schema::new(fields));
+                let mut buf = Vec::new();
+                let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+                w.write(&RecordBatch::try_new(schema, columns).unwrap())
+                    .unwrap();
+                w.close().unwrap();
+                buf
+            })
+            .collect()
+    }
+
+    /// Rates across recordings are computed in one pass over every
+    /// recording's segments, as within one, and agree with the per-series
+    /// path; so does a display read.
+    #[test]
+    fn rates_across_recordings_take_the_batch_path() {
+        let rec = |source: &str, offset: u64| InMemorySource {
+            name: source.to_string(),
+            metadata: BTreeMap::new(),
+            labels: labels(&[("source", source)]),
+            complete: true,
+            tables: vec![("t".to_string(), counter_segments("c", 4, offset, 3, 10))],
+        };
+        let reader = archive(vec![rec("a", 0), rec("b", S / 2)]);
+        let batched = || crate::promql::streaming::dispatch::BATCH_RATES.with(|n| n.get());
+        let displayed = || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
+        let per_series = QueryOptions::default().with_per_series_rates(true);
+        for q in [
+            "rate(c[3s])",
+            "sum(rate(c[3s]))",
+            "sum by (cpu) (rate(c[3s]))",
+            "max by (source) (rate(c[3s]))",
+        ] {
+            let before = batched();
+            let fast = reader
+                .query_range_opts(q, 2.0, 30.0, 1.0, &QueryOptions::default())
+                .unwrap();
+            assert_eq!(batched(), before + 1, "{q}: the batch path");
+            let slow = reader
+                .query_range_opts(q, 2.0, 30.0, 1.0, &per_series)
+                .unwrap();
+            let (
+                QueryResult::Matrix { result: mut fast },
+                QueryResult::Matrix { result: mut slow },
+            ) = (fast, slow)
+            else {
+                panic!("{q}: not matrices");
+            };
+            let key = |m: &crate::MatrixSample| {
+                let mut l: Vec<_> = m.metric.iter().collect();
+                l.sort();
+                format!("{l:?}")
+            };
+            fast.sort_by_key(key);
+            slow.sort_by_key(key);
+            assert_eq!(fast.len(), slow.len(), "{q}");
+            assert!(!fast.is_empty(), "{q}");
+            for (f, s) in fast.iter().zip(&slow) {
+                assert_eq!(f.metric, s.metric, "{q}");
+                assert_eq!(f.values.len(), s.values.len(), "{q}");
+                for (a, b) in f.values.iter().zip(&s.values) {
+                    assert_eq!(a.0, b.0, "{q}");
+                    assert!(
+                        (a.1 - b.1).abs() <= 1e-9 * a.1.abs().max(1.0),
+                        "{q}: {a:?} {b:?}"
+                    );
+                }
+            }
+            let display = crate::DisplayOptions::default();
+            let before = displayed();
+            let shown = reader
+                .query_range_display_opts(q, 2.0, 30.0, 1.0, &display, &QueryOptions::default())
+                .unwrap();
+            assert_eq!(displayed(), before + 1, "{q}: the batch display path");
+            let crate::DisplayResult::Series { result, .. } = shown else {
+                panic!("{q}: not series");
+            };
+            assert_eq!(result.len(), fast.len(), "{q}");
+        }
+        // Both recordings, every point: four series growing 1 to 4 a second,
+        // in each.
+        let sum = series(&reader, "sum(rate(c[3s]))");
+        assert_eq!(sum, [(labels(&[]), 20.0)]);
+
+        // A recording that holds matched series it cannot scan sends the
+        // query to the per-series path rather than being left out of it.
+        // Here b's series carry their own `source`, under `exported_source`
+        // beside the recording's, and a filter on `exported_source` is
+        // decided per series (`LabeledSource::counter_scan`).
+        let own = InMemorySource {
+            tables: vec![("t".to_string(), own_source_segments())],
+            ..rec("b", 0)
+        };
+        let mixed = archive(vec![rec("a", 0), own]);
+        let before = batched();
+        // a's four series (1 + 2 + 3 + 4) and b's series whose own source is
+        // not "y" (growing 5 a second).
+        assert_eq!(
+            series(&mixed, r#"sum(rate(c{exported_source!="y"}[3s]))"#),
+            [(labels(&[]), 15.0)]
+        );
+        assert_eq!(batched(), before, "the per-series path");
+    }
+
+    /// Two segments of counter `c` with two series carrying their own
+    /// `source`: `x` growing 5 a second, `y` 7.
+    fn own_source_segments() -> Vec<Vec<u8>> {
+        use arrow::array::{ArrayRef, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        (0..2u64)
+            .map(|seg| {
+                let ts: Vec<u64> = (seg * 15..(seg + 1) * 15).map(|k| (k + 1) * S).collect();
+                let mut fields = vec![Field::new("timestamp", DataType::UInt64, false)];
+                let mut columns: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(ts.clone()))];
+                for (own, per_second) in [("x", 5u64), ("y", 7)] {
+                    let mut meta = HashMap::new();
+                    meta.insert("metric".to_string(), "c".to_string());
+                    meta.insert("metric_type".to_string(), "counter".to_string());
+                    meta.insert("source".to_string(), own.to_string());
+                    fields.push(
+                        Field::new(format!("c__{own}"), DataType::UInt64, true).with_metadata(meta),
+                    );
+                    columns.push(Arc::new(UInt64Array::from(
+                        ts.iter().map(|t| t / S * per_second).collect::<Vec<_>>(),
+                    )));
+                }
+                let schema = Arc::new(Schema::new(fields));
+                let mut buf = Vec::new();
+                let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+                w.write(&RecordBatch::try_new(schema, columns).unwrap())
+                    .unwrap();
+                w.close().unwrap();
+                buf
+            })
+            .collect()
+    }
+
     /// A twin without tables still marks the other: the label does not come
     /// and go as a recording gains or loses tables.
     #[test]
