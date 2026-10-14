@@ -1462,6 +1462,25 @@ mod tests {
             .collect()
     }
 
+    /// An archive opened from bytes reports a table's declared interval, and
+    /// for a table declaring none the median gap of its rows, so a hole does
+    /// not lengthen it.
+    #[test]
+    fn an_in_memory_table_reports_its_declared_or_median_interval() {
+        let declared = archive(vec![recording(
+            &[("source", "a")],
+            vec![("t", declared_table("g", &gauge_rows(1, 40, 1, 1), 5000))],
+        )]);
+        assert_eq!(ArchiveReader::interval(&declared), 5.0);
+        let mut rows = gauge_rows(1, 100, 10, 1);
+        rows.extend(gauge_rows(500, 600, 10, 1));
+        let holed = archive(vec![recording(
+            &[("source", "a")],
+            vec![("t", explicit_table("g", "gauge", &rows))],
+        )]);
+        assert_eq!(ArchiveReader::interval(&holed), 10.0);
+    }
+
     /// A twin without tables still marks the other: the label does not come
     /// and go as a recording gains or loses tables.
     #[test]

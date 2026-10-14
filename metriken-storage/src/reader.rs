@@ -1466,17 +1466,24 @@ impl ArchiveReader {
                     histograms: probe.histogram_names().into_iter().collect(),
                 };
                 let first_span = probe.time_range();
-                // Measured from the first segment's rows, as the catalog path
-                // measures it from the table's span and row count, rounded to
-                // whole milliseconds: a segment declares no interval and
-                // reports 1 s.
-                let timestamps = probe.sample_timestamps();
-                let interval = match (timestamps.first(), timestamps.last()) {
-                    (Some(b), Some(e)) if timestamps.len() >= 2 => {
-                        let gap_ns = e.saturating_sub(*b) as f64 / (timestamps.len() - 1) as f64;
-                        (gap_ns / 1e6).round().max(1.0) / 1e3
+                // The interval the segment declares, or else the median gap
+                // of the first segment's rows, rounded to whole milliseconds
+                // as the catalog path rounds its measurement. A source
+                // reports 1 s for a segment that declares none.
+                let interval = match probe.metadata_get("sampling_interval_ms") {
+                    Some(_) => probe.interval(),
+                    None => {
+                        let timestamps = probe.sample_timestamps();
+                        let mut gaps: Vec<u64> = timestamps
+                            .windows(2)
+                            .map(|w| w[1].saturating_sub(w[0]))
+                            .collect();
+                        gaps.sort_unstable();
+                        match gaps.get(gaps.len() / 2) {
+                            Some(&gap) if gap > 0 => (gap as f64 / 1e6).round().max(1.0) / 1e3,
+                            _ => probe.interval(),
+                        }
                     }
-                    _ => probe.interval(),
                 };
                 drop(probe);
 
