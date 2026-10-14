@@ -577,7 +577,7 @@ where
                 spec,
                 &ctx.recording_keys,
                 Join::for_mode(ctx.rate_mode),
-            ),
+            )?,
             metric_name: None,
             metric_name_for_error: None,
         }),

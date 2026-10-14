@@ -11,14 +11,13 @@
 //! * **Series-set joining** — [`matrix_matrix_op`] groups the right
 //!   side by label-match key (per [`MatchSpec`]) and pairs each
 //!   left-side series with its matching right-side series. Series
-//!   that don't find a match are dropped.
+//!   that don't find a match are dropped. Two right series with points
+//!   that share a match key are an error, and so are two left series with
+//!   points that match one right series (one-to-one matching).
 //!
-//! When no `on()`/`ignoring()` modifier is given AND exactly one
-//! right-side series is left after the keyed join, that singleton is
-//! broadcast against every unmatched left series via
-//! [`RightLookupBinary`] (materialises the one right series's points
-//! into a shared timestamp lookup). Mirrors the eager engine's
-//! per-left-series fallback.
+//! Under default matching, an unmatched left series is paired with the
+//! one unmatched right series of its recording, when there is exactly
+//! one ([`RightLookupBinary`] or [`Replay`]).
 //!
 //! What's NOT covered here:
 //!
@@ -34,6 +33,7 @@ use std::rc::Rc;
 use promql_parser::parser::token::TokenType;
 
 use crate::labels::{is_matched_label, Labels};
+use crate::promql::QueryError;
 
 use super::{Band, Held, Join, LabeledSeries, Point, RateEdges, SeriesSet};
 
@@ -50,9 +50,8 @@ type RightLookup = HashMap<u64, (f64, Option<Band>, Option<RateEdges>, bool)>;
 type PointIter<'a> = Box<dyn Iterator<Item = Point> + 'a>;
 
 /// Subset of PromQL binary operators the streaming pipeline
-/// recognises. Maps directly onto the eager `apply_binary_op`
-/// branches. `from_token` returns `None` for any token outside this
-/// set so the dispatcher falls through to the eager path cleanly.
+/// recognises. `from_token` returns `None` for any token outside this
+/// set, which the dispatcher reports as unsupported.
 #[derive(Copy, Clone, Debug)]
 pub enum BinOp {
     Add,
@@ -506,8 +505,14 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 }
 
 /// `left OP right` over two series sets, joining by `spec`-derived
-/// match key. Output preserves left's labels (matching the eager path,
-/// which copies `left_sample.metric.clone()` to the result).
+/// match key. Output keeps the left series' labels.
+///
+/// Matching is one-to-one. Two right series with points in the range that
+/// share a match key are an error, and so are two left series with points
+/// that match one right series, as in PromQL. A series without points is
+/// left out before that check. The check covers the whole range, where
+/// Prometheus checks each step, so two series that share a key and have
+/// points at different times in the range are refused.
 ///
 /// When `spec` is `Default`, an unmatched left series is paired with the one
 /// unmatched right series of its recording, when there is exactly one —
@@ -524,21 +529,36 @@ pub fn matrix_matrix_op<'a>(
     spec: MatchSpec<'_>,
     recording_keys: &[String],
     join: Join,
-) -> SeriesSet<'a> {
-    // Index right side by match key.  If two right-side series share
-    // a key, the later one wins (the eager engine's HashMap-insert
-    // has the same shape).
+) -> Result<SeriesSet<'a>, QueryError> {
+    let right = keyed(right_set, spec);
+    let right = unique_by_key(right, |_| true).map_err(|(key, a, b)| {
+        QueryError::EvaluationError(format!(
+            "many-to-many matching not allowed: the right side holds {} and {}, which \
+             share the match group {}; matching labels must be unique on one side",
+            braces(&a.inner),
+            braces(&b.inner),
+            braces(&key)
+        ))
+    })?;
     let mut right_by_key: HashMap<BTreeMap<String, String>, LabeledSeries<'a>> =
-        HashMap::with_capacity(right_set.len());
-    for ls in right_set {
-        let key = match_key(&ls.labels, spec);
-        right_by_key.insert(key, ls);
-    }
+        right.into_iter().collect();
+
+    let left = keyed(left_set, spec);
+    let left =
+        unique_by_key(left, |key| right_by_key.contains_key(key)).map_err(|(key, a, b)| {
+            QueryError::EvaluationError(format!(
+                "multiple matches for labels: the left side holds {} and {}, which share the \
+             match group {}; group_left is not supported, so match on more labels or \
+             aggregate the left side",
+                braces(&a.inner),
+                braces(&b.inner),
+                braces(&key)
+            ))
+        })?;
 
     let mut out: SeriesSet<'a> = Vec::new();
     let mut unmatched_left: Vec<LabeledSeries<'a>> = Vec::new();
-    for left in left_set {
-        let lk = match_key(&left.labels, spec);
+    for (lk, left) in left {
         match right_by_key.remove(&lk) {
             Some(right) => {
                 let iter = pair(left.iter, right.iter, op, join);
@@ -549,7 +569,7 @@ pub fn matrix_matrix_op<'a>(
     }
 
     if unmatched_left.is_empty() || !matches!(spec, MatchSpec::Default) || right_by_key.is_empty() {
-        return out;
+        return Ok(out);
     }
     // Broadcast: each unmatched left series against the one unmatched right
     // series of its recording. A right series is materialised the first time
@@ -599,7 +619,73 @@ pub fn matrix_matrix_op<'a>(
         };
         out.push(LabeledSeries::new(left.labels, iter));
     }
-    out
+    Ok(out)
+}
+
+type Keyed<'a> = Vec<(BTreeMap<String, String>, LabeledSeries<'a>)>;
+
+/// Each series with its match key.
+fn keyed<'a>(set: SeriesSet<'a>, spec: MatchSpec<'_>) -> Keyed<'a> {
+    set.into_iter()
+        .map(|ls| (match_key(&ls.labels, spec), ls))
+        .collect()
+}
+
+/// `series` with no two sharing a key that `checked` selects, in their
+/// order. Where several share one, those without points are dropped; two
+/// with points are returned as the error, with their key. Only the series
+/// of a shared key are read ahead, one point each.
+#[allow(clippy::type_complexity)]
+fn unique_by_key<'a>(
+    series: Keyed<'a>,
+    checked: impl Fn(&BTreeMap<String, String>) -> bool,
+) -> Result<Keyed<'a>, (BTreeMap<String, String>, Labels, Labels)> {
+    let mut count: HashMap<&BTreeMap<String, String>, usize> = HashMap::new();
+    for (key, _) in &series {
+        if checked(key) {
+            *count.entry(key).or_default() += 1;
+        }
+    }
+    let shared: Vec<BTreeMap<String, String>> = count
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(key, _)| key.clone())
+        .collect();
+    if shared.is_empty() {
+        return Ok(series);
+    }
+    let mut kept: HashMap<BTreeMap<String, String>, Labels> = HashMap::new();
+    let mut out = Vec::with_capacity(series.len());
+    for (key, ls) in series {
+        if !shared.contains(&key) {
+            out.push((key, ls));
+            continue;
+        }
+        let Some(ls) = with_points(ls) else {
+            continue;
+        };
+        if let Some(first) = kept.get(&key) {
+            return Err((key, first.clone(), ls.labels));
+        }
+        kept.insert(key.clone(), ls.labels.clone());
+        out.push((key, ls));
+    }
+    Ok(out)
+}
+
+/// `ls` with its first point read and put back, or `None` when it has none.
+fn with_points(mut ls: LabeledSeries<'_>) -> Option<LabeledSeries<'_>> {
+    let first = ls.iter.next()?;
+    Some(LabeledSeries::new(
+        ls.labels,
+        std::iter::once(first).chain(ls.iter),
+    ))
+}
+
+/// A label set as PromQL writes one: `{a="1", b="2"}`.
+fn braces(labels: &BTreeMap<String, String>) -> String {
+    let inner: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+    format!("{{{}}}", inner.join(", "))
 }
 
 /// Whether two series can be of one recording: neither carries a recording
@@ -882,6 +968,7 @@ mod broadcast_tests {
             keys,
             Join::Exact,
         )
+        .expect("one-to-one")
         .into_iter()
         .map(|ls| {
             let v = ls.iter.last().map(|p| p.v).unwrap_or(f64::NAN);
@@ -952,5 +1039,109 @@ mod broadcast_tests {
             &keys,
         );
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    fn on<'a>(
+        left: SeriesSet<'a>,
+        right: SeriesSet<'a>,
+        labels: &[String],
+    ) -> Result<Vec<(Labels, f64)>, QueryError> {
+        let mut out: Vec<(Labels, f64)> = matrix_matrix_op(
+            left,
+            right,
+            BinOp::Div,
+            MatchSpec::Include(labels),
+            &[],
+            Join::Exact,
+        )?
+        .into_iter()
+        .map(|ls| {
+            let v = ls.iter.last().map(|p| p.v).unwrap_or(f64::NAN);
+            (ls.labels, v)
+        })
+        .collect();
+        out.sort_by(|a, b| a.0.inner.cmp(&b.0.inner));
+        Ok(out)
+    }
+
+    fn empty<'a>(pairs: &[(&str, &str)]) -> LabeledSeries<'a> {
+        LabeledSeries::new(Labels::from(pairs), std::iter::empty())
+    }
+
+    /// `g / on() h` with two `h` series is many-to-many, and refused.
+    #[test]
+    fn two_right_series_in_one_match_group_are_refused() {
+        let err = on(
+            vec![series(&[("source", "a")], 8.0)],
+            vec![
+                series(&[("source", "a")], 4.0),
+                series(&[("source", "b")], 2.0),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("many-to-many matching not allowed"),
+            "{err}"
+        );
+    }
+
+    /// Two left series matching one right series need `group_left`, which
+    /// is not supported, so they are refused.
+    #[test]
+    fn two_left_series_matching_one_right_are_refused() {
+        let err = on(
+            vec![
+                series(&[("cpu", "0"), ("source", "a")], 8.0),
+                series(&[("cpu", "1"), ("source", "a")], 6.0),
+            ],
+            vec![series(&[("source", "a")], 2.0)],
+            &["source".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("multiple matches"), "{err}");
+    }
+
+    /// Left series that share a key and match nothing are dropped; only a
+    /// match makes them many-to-one.
+    #[test]
+    fn unmatched_left_series_may_share_a_key() {
+        let out = on(
+            vec![
+                series(&[("cpu", "0"), ("source", "a")], 8.0),
+                series(&[("cpu", "1"), ("source", "a")], 6.0),
+            ],
+            vec![series(&[("source", "b")], 2.0)],
+            &["source".to_string()],
+        )
+        .unwrap();
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A series with no points in the range takes no part: one `h` with
+    /// points and one without is one-to-one, on both sides.
+    #[test]
+    fn a_series_without_points_does_not_count() {
+        let out = on(
+            vec![series(&[("source", "a")], 8.0)],
+            vec![empty(&[("source", "b")]), series(&[("source", "a")], 4.0)],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out, vec![(Labels::from([("source", "a")]), 2.0)]);
+        let out = on(
+            vec![
+                empty(&[("cpu", "1"), ("source", "a")]),
+                series(&[("cpu", "0"), ("source", "a")], 8.0),
+            ],
+            vec![series(&[("source", "a")], 2.0)],
+            &["source".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![(Labels::from([("cpu", "0"), ("source", "a")]), 4.0)]
+        );
     }
 }
