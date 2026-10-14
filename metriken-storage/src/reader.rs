@@ -642,6 +642,22 @@ impl SamplerReader {
         self.names.histograms.contains(name)
     }
 
+    /// The table's row spacing in seconds: measured from its catalog where
+    /// the catalog says, else probed from its first segment.
+    pub fn interval(&self) -> f64 {
+        self.interval
+    }
+
+    /// Whether this table holds counter `name`.
+    pub fn holds_counter(&self, name: &str) -> bool {
+        self.names.counters.contains(name)
+    }
+
+    /// Whether this table holds gauge `name`.
+    pub fn holds_gauge(&self, name: &str) -> bool {
+        self.names.gauges.contains(name)
+    }
+
     /// The labels of the recording this table belongs to, as the catalog
     /// holds them.
     pub fn recording_labels(&self) -> &BTreeMap<String, String> {
@@ -1450,7 +1466,18 @@ impl ArchiveReader {
                     histograms: probe.histogram_names().into_iter().collect(),
                 };
                 let first_span = probe.time_range();
-                let interval = probe.interval();
+                // Measured from the first segment's rows, as the catalog path
+                // measures it from the table's span and row count, rounded to
+                // whole milliseconds: a segment declares no interval and
+                // reports 1 s.
+                let timestamps = probe.sample_timestamps();
+                let interval = match (timestamps.first(), timestamps.last()) {
+                    (Some(b), Some(e)) if timestamps.len() >= 2 => {
+                        let gap_ns = e.saturating_sub(*b) as f64 / (timestamps.len() - 1) as f64;
+                        (gap_ns / 1e6).round().max(1.0) / 1e3
+                    }
+                    _ => probe.interval(),
+                };
                 drop(probe);
 
                 // Segments are in segment order, so the last one carries the

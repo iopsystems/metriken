@@ -3190,8 +3190,10 @@ pub(crate) mod tests {
         let QueryResult::Matrix { result } = batch else {
             panic!("a matrix");
         };
+        // 15 s is past the last sample read (14.5 s) and within a spacing of
+        // the range's end, so the rate is held there.
         let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
-        assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0]);
+        assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0, 15.0]);
     }
 
     /// A store whose segments become unreadable after open.

@@ -260,12 +260,24 @@ impl SeriesRate {
             let Some(left) = t.checked_sub(grid.span_ns) else {
                 continue;
             };
-            self.trim(left);
-            if exhausted && self.last_ts.is_some_and(|last| t > last) {
-                self.done = true;
-                return;
-            }
-            if let Some(p) = self.point(t, left) {
+            // Past the last sample, as `CounterGridRate` does: held when that
+            // sample is within the typical spacing of the range's end,
+            // nothing otherwise.
+            let (at, from) = match self.last_ts.filter(|last| exhausted && t > *last) {
+                None => (t, left),
+                Some(last)
+                    if self.pulled >= 2 && grid.end_ns.saturating_sub(last) <= self.typical =>
+                {
+                    (last, last.saturating_sub(t - left))
+                }
+                Some(_) => {
+                    self.done = true;
+                    return;
+                }
+            };
+            self.trim(from);
+            if let Some(mut p) = self.point(at, from) {
+                p.t = t;
                 sink.emit(series, grid.index(t), p);
             }
         }
@@ -1469,6 +1481,7 @@ mod tests {
                         .collect(),
                     op,
                     GroupBy::Include(&by),
+                    crate::promql::streaming::Join::Exact,
                 )
                 .into_iter()
                 .map(|s| (s.labels, s.iter.collect()))

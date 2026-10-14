@@ -38,7 +38,7 @@ pub fn is_storage_key(key: &str) -> bool {
 /// reserved for internal Prometheus use". An internal label is part of a
 /// series' identity and matchable in a selector — `foo{__run__="1"}` works —
 /// and it is dropped by `without` and by default binary-op matching alongside
-/// `__name__`.
+/// `__name__`, except `__recording__` ([`is_matched_label`]).
 ///
 /// This crate emits internal labels on every result it returns. Hiding them
 /// from listings and legends is the consumer's contract, not something done
@@ -54,6 +54,18 @@ pub fn is_storage_key(key: &str) -> bool {
 /// Readers above this crate may add their own under the same rule.
 pub fn is_internal_label(name: &str) -> bool {
     name.starts_with("__")
+}
+
+/// Whether binary-operator matching and `without` grouping consider `name`:
+/// every label that is not internal, and
+/// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL).
+///
+/// `__recording__` is internal so that a listing or a legend leaves it out,
+/// but it is the only label telling apart two recordings whose label sets
+/// are identical. Matching without it pairs one recording's `g` with the
+/// other's `h`, and `sum without (cpu)` merges the two recordings.
+pub fn is_matched_label(name: &str) -> bool {
+    !is_internal_label(name) || name == crate::labeled::RECORDING_LABEL
 }
 
 #[derive(Default, Eq, PartialEq, Hash, Clone, Debug)]

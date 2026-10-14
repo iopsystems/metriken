@@ -131,6 +131,80 @@ impl Point {
     }
 }
 
+/// How an aggregation or a binary operator lines up the points of the
+/// series it combines.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Join {
+    /// At the timestamps the series share. Every producer on the grid (or on
+    /// explicit evaluation timestamps) places its points at the same
+    /// instants, so this is the join for [`crate::RateMode::Grid`].
+    Exact,
+    /// At every timestamp any of them has, each series contributing its
+    /// latest point while that point is no older than the gap that preceded
+    /// it (the series' own spacing; [`Held`]). For
+    /// [`crate::RateMode::Raw`], where each series' points are at its own
+    /// sample times: two acquisition groups, or two recordings, read at
+    /// different instants and share none.
+    Latest,
+}
+
+impl Join {
+    pub(crate) fn for_mode(mode: crate::RateMode) -> Self {
+        match mode {
+            crate::RateMode::Grid => Join::Exact,
+            crate::RateMode::Raw => Join::Latest,
+        }
+    }
+}
+
+/// A series read at instants of another series' choosing ([`Join::Latest`]):
+/// its latest point at or before the instant, held while the instant is no
+/// further past it than the gap from the point before. A series' first
+/// point is held for the gap to its second.
+pub(crate) struct Held<'a> {
+    iter: std::iter::Peekable<Box<dyn Iterator<Item = Point> + 'a>>,
+    latest: Option<(Point, u64)>,
+}
+
+impl<'a> Held<'a> {
+    pub(crate) fn new(iter: Box<dyn Iterator<Item = Point> + 'a>) -> Self {
+        Self {
+            iter: iter.peekable(),
+            latest: None,
+        }
+    }
+
+    /// The time of the series' next point not yet taken.
+    pub(crate) fn peek_t(&mut self) -> Option<u64> {
+        self.iter.peek().map(|p| p.t)
+    }
+
+    /// Take every point at or before `t`.
+    pub(crate) fn advance_to(&mut self, t: u64) {
+        while let Some(p) = self.iter.next_if(|p| p.t <= t) {
+            let hold = match self.latest {
+                Some((q, _)) => p.t.saturating_sub(q.t),
+                None => self.iter.peek().map_or(0, |n| n.t.saturating_sub(p.t)),
+            };
+            self.latest = Some((p, hold));
+        }
+    }
+
+    /// The series' value at `t`, after [`advance_to`](Self::advance_to) it.
+    pub(crate) fn at(&self, t: u64) -> Option<Point> {
+        self.latest
+            .filter(|(p, hold)| t.saturating_sub(p.t) <= *hold)
+            .map(|(p, _)| p)
+    }
+
+    /// Drop the rest of the series.
+    pub(crate) fn clear(&mut self) {
+        self.iter =
+            (Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Point> + 'a>).peekable();
+        self.latest = None;
+    }
+}
+
 /// A labeled, lazily-produced time series.
 pub struct LabeledSeries<'a> {
     pub labels: Labels,
