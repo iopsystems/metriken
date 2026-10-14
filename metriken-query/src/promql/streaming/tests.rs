@@ -400,9 +400,9 @@ fn raw_points(engine: &QueryEngine, query: &str, start: f64, end: f64) -> Vec<Ve
 
 /// In raw mode each series' points are at its own sample times. `sum` over
 /// two series read half a second apart reads both at every point once both
-/// have started, each held for its own spacing; it used to alternate
-/// between them (10, 100, 10, ...), summing only the series with a sample at
-/// that exact instant.
+/// have started, each held for its own spacing, rather than alternating
+/// between them (10, 100, 10, ...) by summing only the series with a sample
+/// at that exact instant.
 #[test]
 fn raw_sum_reads_every_series_at_its_latest_sample() {
     let mut source = Memory::new(1000);
@@ -488,4 +488,31 @@ fn raw_sum_stops_holding_a_series_that_ended() {
     assert!(points.contains(&(1001.5, 110.0)), "{points:?}");
     assert!(points.contains(&(1002.5, 100.0)), "{points:?}");
     assert!(points.contains(&(1005.5, 100.0)), "{points:?}");
+}
+
+/// A raw rate of a table slower than the source's finest interval keeps
+/// its first point in range: the read reaches back the `[range]` at least,
+/// so the sample before the range is there to pair with.
+#[test]
+fn raw_rate_of_a_slow_table_keeps_its_first_point() {
+    let mut source = Memory::new(1000);
+    for (name, every) in [("slow", 10u64), ("fast", 1)] {
+        let timestamps: Vec<u64> = (0..=60 / every)
+            .map(|k| (1000 + k * every) * 1_000_000_000)
+            .collect();
+        source.add_counter(
+            name,
+            Counter {
+                labels: Labels::default(),
+                values: (0..timestamps.len() as u64)
+                    .map(|k| k * 10 * every)
+                    .collect(),
+                timestamps,
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    let series = raw_points(&engine, "irate(slow[5m])", 1005.0, 1060.0);
+    assert_eq!(series[0][0], (1010.0, 10.0), "{series:?}");
 }

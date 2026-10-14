@@ -700,16 +700,19 @@ where
             }
             // Grid needs at least one step of lookback to bracket the first
             // interval's left edge, regardless of the (inert) query range.
-            // Raw pairs consecutive samples, so it reads back two samples
-            // (two steps or two intervals, the longer): enough for each
-            // series' last point before the range, which a join holds at its
-            // start. The `[range]` does not enter into a raw rate.
+            // Raw pairs consecutive samples and emits the last pair before
+            // the range, which a join holds at its start. It reads back the
+            // `[range]`, and at least two steps or two of the source's
+            // intervals: a series read more slowly than that (a slower table
+            // or recording, or a gap before the start) has its sample before
+            // the range only when the `[range]` reaches it.
             let lookback = match ctx.rate_mode {
                 RateMode::Grid => range_ns.max(ctx.step_ns),
                 RateMode::Raw => ctx
                     .step_ns
                     .max((ctx.source.interval() * 1e9) as u64)
-                    .saturating_mul(2),
+                    .saturating_mul(2)
+                    .max(range_ns),
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
             let Some(streams) =

@@ -32,7 +32,8 @@ fn stream_of(
 
 /// Pair-wise rate producer over a counter sample stream. Emits one point per
 /// consecutive sample pair, stamped at the later sample, for pairs whose stamp
-/// falls in `[start_ns, end_ns]`. The stream is fetched with lookback (for
+/// falls in `[start_ns, end_ns]`; with [`with_one_before`](Self::with_one_before),
+/// also the last pair before `start_ns`, ahead of the first in range. The stream is fetched with lookback (for
 /// context), so the `start_ns` bound is what keeps a windowed/zoomed query
 /// from spilling points before the requested window — mirroring how the grid
 /// producer's cursor starts at `start_ns`.
@@ -50,8 +51,9 @@ pub struct CounterPairwiseRate<'a> {
     /// Emit the last point before `start_ns` too; see
     /// [`with_one_before`](Self::with_one_before).
     one_before: bool,
-    /// The latest point before `start_ns`, while `one_before` holds it.
-    before: Option<Point>,
+    /// The latest pair before `start_ns` (`(ts, value)` of each sample),
+    /// kept when `one_before` is set and not yet emitted.
+    before: Option<((u64, u64), (u64, u64))>,
     /// The first point in range, read while emitting `before`.
     pending: Option<Point>,
 }
@@ -92,41 +94,47 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
         }
         loop {
             let Some(cur) = self.source.next() else {
-                return self.before.take();
+                return self.before.take().and_then(pair_rate);
             };
-            let Some((ts_prev, v_prev)) = self.prev.replace((cur.ts, cur.value)) else {
+            let Some(prev) = self.prev.replace((cur.ts, cur.value)) else {
                 continue;
             };
-            let (ts_cur, v_cur) = (cur.ts, cur.value);
-            if ts_cur > self.end_ns {
-                return self.before.take();
+            let cur = (cur.ts, cur.value);
+            if cur.0 > self.end_ns {
+                return self.before.take().and_then(pair_rate);
             }
             // Pairs before the requested window: the stream carries lookback
-            // context whose stamps precede start_ns.
-            if ts_cur < self.start_ns && !self.one_before {
+            // context whose stamps precede start_ns. Only the latest is kept,
+            // and its rate computed when it is emitted.
+            if cur.0 < self.start_ns {
+                if self.one_before && cur.0 > prev.0 {
+                    self.before = Some((prev, cur));
+                }
                 continue;
             }
-            let delta = if v_cur >= v_prev {
-                (v_cur - v_prev) as f64
-            } else {
-                v_cur as f64
+            let Some(point) = pair_rate((prev, cur)) else {
+                continue;
             };
-            let dur_s = (ts_cur - ts_prev) as f64 / 1e9;
-            if dur_s <= 0.0 {
-                continue;
-            }
-            let point = Point::at(ts_cur, delta / dur_s);
-            if ts_cur < self.start_ns {
-                self.before = Some(point);
-                continue;
-            }
-            if let Some(before) = self.before.take() {
+            if let Some(before) = self.before.take().and_then(pair_rate) {
                 self.pending = Some(point);
                 return Some(before);
             }
             return Some(point);
         }
     }
+}
+
+/// The rate between two `(ts, value)` samples of a counter, at the later;
+/// `None` for samples at one time. A decrease is a reset: the later value is
+/// the increase.
+fn pair_rate(((ts_prev, v_prev), (ts_cur, v_cur)): ((u64, u64), (u64, u64))) -> Option<Point> {
+    let delta = if v_cur >= v_prev {
+        (v_cur - v_prev) as f64
+    } else {
+        v_cur as f64
+    };
+    let dur_s = (ts_cur.checked_sub(ts_prev)?) as f64 / 1e9;
+    (dur_s > 0.0).then(|| Point::at(ts_cur, delta / dur_s))
 }
 
 /// One sample as the grid producer keeps it: its stamp, the reset-adjusted
@@ -551,6 +559,21 @@ impl<'a> Iterator for CounterGridRate<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With `with_one_before`, the last pair before the start comes first,
+    /// then the pairs in range; a pair of two samples at one time does not
+    /// replace it.
+    #[test]
+    fn one_point_before_the_range() {
+        const S: u64 = 1_000_000_000;
+        let ts = vec![S, 2 * S, 3 * S, 3 * S, 4 * S, 5 * S];
+        let vals = vec![0u64, 10, 30, 30, 60, 100];
+        let got: Vec<(u64, f64)> = CounterPairwiseRate::new(ts, vals, 4 * S, 5 * S)
+            .with_one_before()
+            .map(|p| (p.t, p.v))
+            .collect();
+        assert_eq!(got, vec![(3 * S, 20.0), (4 * S, 30.0), (5 * S, 40.0)]);
+    }
 
     // ---- Grid producer (RateMode::Grid) ----
 

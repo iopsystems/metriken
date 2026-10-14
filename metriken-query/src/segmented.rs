@@ -2199,20 +2199,20 @@ pub(crate) mod tests {
             "listing needs no bytes"
         );
 
-        // A range over the middle second touches the middle segment and,
-        // through a raw read's lookback of two intervals, the first.
+        // A range in the middle segment, its raw lookback of two intervals
+        // included, touches the middle segment only.
         let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
-        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
-        assert_eq!(store.fetched(), vec![0, 1]);
-        assert_eq!(r.cached_segments().0, 2);
+        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
+        assert_eq!(store.fetched(), vec![1]);
+        assert_eq!(r.cached_segments().0, 1);
 
         // Again: served from the cache.
-        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
         assert_eq!(store.fetched(), Vec::<usize>::new());
 
-        // The whole range: the one not yet cached.
+        // The whole range: the two not yet cached.
         let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
-        assert_eq!(store.fetched(), vec![2]);
+        assert_eq!(store.fetched(), vec![0, 2]);
         assert_eq!(r.cached_segments().0, 3);
     }
 
