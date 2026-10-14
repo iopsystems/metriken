@@ -417,6 +417,43 @@ fn raw_sum_reads_every_series_at_its_latest_sample() {
     assert!(points[1..].iter().all(|(_, v)| *v == 110.0), "{points:?}");
 }
 
+/// A series' last point before the range is held at its start: with both
+/// series read from well before the range, the first point of the range
+/// has both, for gauges and for rates. Nothing before the start is
+/// returned.
+#[test]
+fn raw_sum_holds_points_from_before_the_range() {
+    let mut source = Memory::new(1000);
+    gauge_rows(&mut source, "g", &[("source", "a")], 990.0, 1.0, 16, 10);
+    gauge_rows(&mut source, "g", &[("source", "b")], 990.5, 1.0, 16, 100);
+    for (label, offset) in [("a", 0.0), ("b", 0.5)] {
+        let timestamps: Vec<u64> = (0..16u64)
+            .map(|k| ((990.0 + offset + k as f64) * 1e9) as u64)
+            .collect();
+        source.add_counter(
+            "c",
+            Counter {
+                labels: Labels::from([("source", label)]),
+                values: (0..16u64)
+                    .map(|k| k * if label == "a" { 10 } else { 100 })
+                    .collect(),
+                timestamps,
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    for q in ["sum(g)", "sum(irate(c[5s]))"] {
+        let series = raw_points(&engine, q, 1000.0, 1004.5);
+        let points = &series[0];
+        assert_eq!(points[0], (1000.0, 110.0), "{q}: {points:?}");
+        assert!(
+            points.iter().all(|(t, v)| *t >= 1000.0 && *v == 110.0),
+            "{q}: {points:?}"
+        );
+    }
+}
+
 /// The same for a binary operator: `x / y` with `x` and `y` read at
 /// different instants has a point wherever either was read, once both have
 /// been. On exact timestamps it was empty.

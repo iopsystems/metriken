@@ -54,7 +54,7 @@ pub fn try_streaming(
             metric_name,
             metric_name_for_error,
         } => {
-            let collected = collect_to_matrix(series, metric_name);
+            let collected = collect_to_matrix(clip_raw(&ctx, series), metric_name);
             if collected.is_empty() {
                 if let Some(name) = metric_name_for_error {
                     held_somewhere(source, &name)?;
@@ -105,6 +105,23 @@ fn make_ctx<'a>(
     }
 }
 
+/// In raw mode, `series` without the points before the range's start.
+///
+/// Raw producers emit from their read's lookback, so that a series' last
+/// point before the range is there for a `Join::Latest` to hold at the
+/// range's start; without it, a `sum` over series read at different
+/// instants covered only the series with a point at or after the start.
+fn clip_raw<'a>(ctx: &Ctx<'_>, series: SeriesSet<'a>) -> SeriesSet<'a> {
+    if !matches!(ctx.rate_mode, RateMode::Raw) {
+        return series;
+    }
+    let start = ctx.start_ns;
+    series
+        .into_iter()
+        .map(|ls| LabeledSeries::new(ls.labels, ls.iter.filter(move |p| p.t >= start)))
+        .collect()
+}
+
 /// [`try_streaming`] in display form: each series is reduced per `display`
 /// as it is collected (see `collect_to_display`).
 pub(crate) fn try_streaming_display(
@@ -126,8 +143,14 @@ pub(crate) fn try_streaming_display(
             metric_name,
             metric_name_for_error,
         } => {
-            let collected =
-                super::collect_to_display(series, metric_name, start, end, step, display);
+            let collected = super::collect_to_display(
+                clip_raw(&ctx, series),
+                metric_name,
+                start,
+                end,
+                step,
+                display,
+            );
             if collected.is_empty() {
                 if let Some(name) = metric_name_for_error {
                     held_somewhere(source, &name)?;
@@ -729,7 +752,10 @@ where
                     }
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
-                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns),
+                        // From the lookback: a series' last point before the
+                        // range is what a join holds at its start; the
+                        // result is cut at `start` (`clip_raw`).
+                        CounterPairwiseRate::from_stream(stream.samples, data_start, ctx.end_ns),
                     ),
                 })
                 .collect();
