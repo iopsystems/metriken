@@ -1473,7 +1473,21 @@ impl ArchiveReader {
                 let interval = match probe.metadata_get("sampling_interval_ms") {
                     Some(_) => probe.interval(),
                     None => {
-                        let timestamps = probe.sample_timestamps();
+                        // From the first segments holding two rows between
+                        // them: a short first segment (a seal right after
+                        // a start) has no gap of its own.
+                        let mut timestamps = probe.sample_timestamps();
+                        for more in segments.iter().skip(1) {
+                            if timestamps.len() >= 2 {
+                                break;
+                            }
+                            if let Ok(next) = MultiParquetSource::open_bytes_with_pool(
+                                more.clone(),
+                                Arc::clone(&pool),
+                            ) {
+                                timestamps.extend(next.sample_timestamps());
+                            }
+                        }
                         let mut gaps: Vec<u64> = timestamps
                             .windows(2)
                             .map(|w| w[1].saturating_sub(w[0]))

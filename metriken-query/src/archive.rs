@@ -1478,6 +1478,18 @@ mod tests {
             vec![("t", explicit_table("g", "gauge", &rows))],
         )]);
         assert_eq!(ArchiveReader::interval(&holed), 10.0);
+        // A first segment of one row: the next segment's rows give the gap.
+        let short = archive(vec![InMemorySource {
+            tables: vec![(
+                "t".to_string(),
+                vec![
+                    explicit_table("g", "gauge", &gauge_rows(1, 1, 10, 1)),
+                    explicit_table("g", "gauge", &gauge_rows(11, 100, 10, 1)),
+                ],
+            )],
+            ..recording(&[("source", "a")], vec![])
+        }]);
+        assert_eq!(ArchiveReader::interval(&short), 10.0);
     }
 
     /// A twin without tables still marks the other: the label does not come
