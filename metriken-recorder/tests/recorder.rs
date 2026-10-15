@@ -1550,12 +1550,22 @@ async fn a_stream_slower_than_the_timeout_is_not_dropped() {
 }
 
 /// With `commit_streams_on_arrival`, a frame is committed when it arrives,
-/// not on the next tick: at a 1 s interval, its `Committed` follows its
-/// stamp by much less than the interval.
+/// not on the next tick: at a 2 s interval, its `Committed` follows its
+/// stamp by less than 1.4 s, where a frame left for the next tick lags by
+/// about 2 s. The producer's frames and the recorder's ticks fall on the
+/// same interval boundaries, so a frame usually arrives while its
+/// boundary's tick commits, and its lag is the tick's commit plus its own:
+/// the bound allows about 700 ms a commit. One that reaches the recorder
+/// before the tick drains the stream is committed by the tick at once, and
+/// this test cannot tell that case from arrival. Frames sent before the
+/// recorder's loop runs wait in the subscription and are committed one per
+/// commit until the first tick takes the rest, each late by the time it
+/// waited, so only frames stamped an interval after the test sees the first
+/// `Committed` are measured.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_streamed_frame_can_be_committed_on_arrival() {
     let fake = serve(stream_only(&[("source", "svc")], &[])).await;
-    let interval = Duration::from_secs(1);
+    let interval = Duration::from_secs(2);
     let detected = detect(
         &client(),
         &DetectConfig::new(interval, Duration::from_secs(2)),
@@ -1571,10 +1581,15 @@ async fn a_streamed_frame_can_be_committed_on_arrival() {
         Recorder::start(cfg, client(), Arc::new(NoProbe), detected, Vec::new())
             .await
             .unwrap();
-    let lags = tokio::time::timeout(Duration::from_secs(6), async {
+    let lags = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut fresh = None;
         let mut lags = Vec::new();
         while let Some(e) = events.recv().await {
             if let Event::Committed { wall_ns, .. } = e {
+                let fresh = *fresh.get_or_insert_with(|| wall() + interval.as_nanos() as u64);
+                if wall_ns < fresh {
+                    continue;
+                }
                 lags.push(wall().saturating_sub(wall_ns));
                 if lags.len() == 3 {
                     return lags;
@@ -1584,14 +1599,15 @@ async fn a_streamed_frame_can_be_committed_on_arrival() {
         lags
     })
     .await
-    .expect("three commits within 6 s");
+    .expect("three fresh commits within 30 s");
     recorder
         .finish(Stop::Grace(Duration::ZERO), CancellationToken::new())
         .await
         .unwrap();
+    assert_eq!(lags.len(), 3, "{lags:?}");
     assert!(
-        lags.iter().all(|lag| *lag < 400_000_000),
-        "committed within 400 ms of the frame's stamp: {lags:?}"
+        lags.iter().all(|lag| *lag < 1_400_000_000),
+        "committed within 1.4 s of the frame's stamp: {lags:?}"
     );
 }
 
