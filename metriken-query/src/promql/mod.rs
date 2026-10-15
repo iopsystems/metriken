@@ -242,14 +242,75 @@ pub(crate) fn histogram_read_start(
     start_ns.saturating_sub(2 * interval_ns)
 }
 
-/// How far back an instant query of a histogram function reads, in
-/// seconds: Prometheus's default lookback for an instant vector.
+/// How far back an instant query of a strided histogram call
+/// (`histogram_count(lat, 60)`) reads, in seconds, and an unstrided one when
+/// no metric it names has a positive interval: Prometheus's default lookback
+/// for an instant vector.
 const INSTANT_LOOKBACK_S: f64 = 300.0;
 
+/// How many of a histogram's row intervals an unstrided instant query reads
+/// back. A series whose latest row is older than that has no value at the
+/// instant, nor has a series whose row before its latest is more than five
+/// row intervals before the instant: that row, which the delta needs, is not
+/// read.
+const INSTANT_LOOKBACK_ROWS: f64 = 3.0;
+
+/// How far back an instant query of a histogram function reads, in
+/// seconds: [`INSTANT_LOOKBACK_ROWS`] times the longest
+/// `DataSource::histogram_interval` among the metrics `query` names, at most
+/// [`INSTANT_LOOKBACK_S`]. A strided call reads back
+/// [`INSTANT_LOOKBACK_S`]: its windows are laid from the first row read, so
+/// the read back decides where they fall. A source with no per-histogram
+/// interval answers its `interval()` (1 s for a parquet file or a
+/// `MemoryStore` without `sampling_interval_ms`).
+fn instant_histogram_lookback(source: &dyn crate::DataSource, query: &str) -> f64 {
+    let strided =
+        histogram_calls(query).any(|args| matches!(parse_optional_stride(args), Ok((_, Some(_)))));
+    if strided {
+        return INSTANT_LOOKBACK_S;
+    }
+    let interval = crate::referenced_metrics(query)
+        .unwrap_or_default()
+        .iter()
+        .map(|name| source.histogram_interval(name))
+        .filter(|i| i.is_finite() && *i > 0.0)
+        .fold(0.0, f64::max);
+    if interval > 0.0 {
+        (INSTANT_LOOKBACK_ROWS * interval).min(INSTANT_LOOKBACK_S)
+    } else {
+        INSTANT_LOOKBACK_S
+    }
+}
+
 /// Whether `query` calls one of the histogram functions that give a value
-/// per tick. `histogram_heatmap` is left out: its instant is the heatmap of
-/// the one-point range.
+/// per tick, with or without a `by`/`without` clause after its name.
+/// `histogram_heatmap` is left out: its instant is the heatmap of the
+/// one-point range.
 fn calls_histogram_function(query: &str) -> bool {
+    histogram_calls(query).next().is_some()
+}
+
+/// The argument text of each call in `query` to a histogram function that
+/// gives a value per tick (see [`calls_histogram_function`]). Text inside a
+/// string literal or a `#` comment is neither a call nor a parenthesis.
+fn histogram_calls(query: &str) -> impl Iterator<Item = &str> {
+    // The offset of the `)` closing a `(` just before `from`, outside string
+    // literals.
+    fn close(bytes: &[u8], quoted: &[bool], from: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (i, &b) in bytes.iter().enumerate().skip(from) {
+            if quoted[i] {
+                continue;
+            }
+            match b {
+                b'(' => depth += 1,
+                b')' if depth == 0 => return Some(i),
+                b')' => depth -= 1,
+                _ => {}
+            }
+        }
+        None
+    }
     const FUNCTIONS: [&str; 7] = [
         "histogram_quantile",
         "histogram_quantiles",
@@ -260,18 +321,67 @@ fn calls_histogram_function(query: &str) -> bool {
         "histogram_irate",
     ];
     let bytes = query.as_bytes();
-    query.match_indices("histogram_").any(|(at, _)| {
-        let starts_word =
-            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
-        let rest = &query[at..];
-        let name_len = rest
-            .bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            .count();
-        starts_word
-            && FUNCTIONS.contains(&&rest[..name_len])
-            && rest[name_len..].trim_start().starts_with('(')
-    })
+    // Byte offsets inside a string literal (`"..."`, `'...'` or `` `...` ``,
+    // each taking backslash escapes as promql-parser lexes them) or a `#`
+    // comment, which runs to the end of the line: there a function name or a
+    // parenthesis is text.
+    let mut quoted = vec![false; bytes.len()];
+    let mut open: Option<u8> = None;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match open {
+            Some(q) => {
+                quoted[i] = true;
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' && q != b'\n' {
+                    escaped = true;
+                } else if b == q || (q == b'\n' && b == b'\r') {
+                    open = None;
+                }
+            }
+            None if matches!(b, b'"' | b'\'' | b'`' | b'#') => {
+                open = Some(if b == b'#' { b'\n' } else { b });
+                quoted[i] = true;
+            }
+            None => {}
+        }
+    }
+    let skip_ws = move |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    query
+        .match_indices("histogram_")
+        .filter_map(move |(at, _)| {
+            if quoted[at]
+                || (at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_'))
+            {
+                return None;
+            }
+            let name_len = bytes[at..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                .count();
+            if !FUNCTIONS.contains(&&query[at..at + name_len]) {
+                return None;
+            }
+            let mut i = skip_ws(at + name_len);
+            for keyword in ["by", "without"] {
+                if query[i..].starts_with(keyword) {
+                    let k = skip_ws(i + keyword.len());
+                    if bytes.get(k) == Some(&b'(') {
+                        i = skip_ws(close(bytes, &quoted, k + 1)? + 1);
+                    }
+                }
+            }
+            if bytes.get(i) != Some(&b'(') {
+                return None;
+            }
+            Some(&query[i + 1..close(bytes, &quoted, i + 1)?])
+        })
 }
 
 /// How far beyond a query range's bounds samples are still read, in
@@ -718,9 +828,9 @@ impl QueryEngine {
         let step = self.source.interval().max(1.0);
         // A histogram function emits at the rows it reads, which an instant
         // rarely falls on, and needs the row before for a delta: it reads
-        // back the lookback, and each series' latest point is kept below.
+        // back a few rows, and each series' latest point is kept below.
         let start = if calls_histogram_function(query_str) {
-            target - INSTANT_LOOKBACK_S
+            target - instant_histogram_lookback(&*self.source, query_str)
         } else {
             target
         };

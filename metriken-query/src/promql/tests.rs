@@ -4136,3 +4136,156 @@ fn a_histogram_function_reads_a_name_matcher_by_the_promql_rule() {
         assert!(err.contains("takes no `offset` or `@`"), "{q}: {err}");
     }
 }
+
+/// An instant query of a histogram function reads back three of the
+/// histogram's row intervals: a row up to that far before the instant
+/// answers it, an older one does not.
+#[test]
+fn an_instant_histogram_query_reads_back_three_row_intervals() {
+    // Rows each second from 1000 s to 1004 s.
+    let engine = QueryEngine::new(Arc::new(create_hist_source(&[0, 10, 20, 30, 40])));
+    let at = |t: f64| {
+        let QueryResult::Vector { result } = engine
+            .query("histogram_mean(req_latency)", Some(t))
+            .unwrap()
+        else {
+            panic!("not a vector");
+        };
+        result.len()
+    };
+    assert_eq!(at(1004.0), 1);
+    assert_eq!(at(1006.5), 1, "2.5 rows after the last row");
+    assert_eq!(at(1007.5), 0, "3.5 rows after the last row");
+}
+
+/// A histogram source with rows every `every_s` seconds from `from_s`
+/// through `to_s`, each row adding one observation.
+fn hist_rows(interval_ms: u64, from_s: u64, to_s: u64, every_s: u64) -> Memory {
+    let mut source = Memory::new(interval_ms);
+    let times: Vec<u64> = (from_s..=to_s).step_by(every_s as usize).collect();
+    source.add_histogram(
+        "lat",
+        Histogram {
+            labels: Labels::default(),
+            config: ::histogram::Config::new(4, 16).unwrap(),
+            timestamps: times.iter().map(|t| t * 1_000_000_000).collect(),
+            snapshots: (0..times.len() as u64).map(hist_snap_cumulative).collect(),
+        },
+    );
+    source
+}
+
+/// The instant lookback is three of the longest row interval among the
+/// sources holding the histogram: 5 s after the last rows of a 1 s and a
+/// 10 s recording, both answer, as three of the 1 s interval would not.
+/// And it is at most 300 s.
+#[test]
+fn an_instant_histogram_lookback_takes_the_slowest_interval_up_to_300_s() {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+
+    let fast: Arc<dyn DataSource> = Arc::new(LabeledSource::new(
+        Arc::new(hist_rows(1000, 1000, 1060, 1)),
+        make_labels(&[("source", "fast")]),
+    ));
+    let slow: Arc<dyn DataSource> = Arc::new(LabeledSource::new(
+        Arc::new(hist_rows(10_000, 1000, 1060, 10)),
+        make_labels(&[("source", "slow")]),
+    ));
+    let engine = QueryEngine::new(Arc::new(RecordingsSource::new(vec![fast, slow])));
+    let QueryResult::Vector { result } = engine
+        .query("histogram_count by (source) (lat)", Some(1065.0))
+        .unwrap()
+    else {
+        panic!("not a vector");
+    };
+    let mut sources: Vec<&str> = result
+        .iter()
+        .map(|s| s.metric.get("source").map(String::as_str).unwrap_or(""))
+        .collect();
+    sources.sort();
+    assert_eq!(sources, ["fast", "slow"], "{result:?}");
+
+    // 200 s rows: three intervals would be 600 s, the cap is 300 s.
+    let engine = QueryEngine::new(Arc::new(hist_rows(200_000, 1000, 1400, 200)));
+    let at = |t: f64| {
+        let QueryResult::Vector { result } = engine.query("histogram_count(lat)", Some(t)).unwrap()
+        else {
+            panic!("not a vector");
+        };
+        result.len()
+    };
+    assert_eq!(at(1650.0), 1, "250 s after the last row");
+    assert_eq!(at(1750.0), 0, "350 s after the last row");
+}
+
+/// A strided call as an instant query reads back 300 s, whatever the row
+/// interval: on 1 s rows of one observation each, `histogram_count(lat, 60)`
+/// counts 60, not the three rows an unstrided call reads back.
+#[test]
+fn a_strided_instant_histogram_query_reads_back_300_s() {
+    let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
+    let count = |q: &str| {
+        let QueryResult::Vector { result } = engine.query(q, Some(1400.0)).unwrap() else {
+            panic!("not a vector");
+        };
+        result[0].value.1
+    };
+    assert_eq!(count("histogram_count(lat, 60)"), 60.0);
+    assert_eq!(count("histogram_count(lat, 10)"), 10.0);
+    // A parenthesis in a label value is text, not the end of the call.
+    assert_eq!(count(r#"histogram_count(lat{x!=")"}, 60)"#), 60.0);
+    assert_eq!(count(r#"histogram_count(lat{x!="("}, 60)"#), 60.0);
+}
+
+/// A histogram function's name inside a quoted label value is no call: a
+/// gauge selected by such a value reads as a gauge at the instant.
+#[test]
+fn a_histogram_name_in_a_label_value_is_no_call() {
+    let mut source = Memory::new(100);
+    source.add_gauge(
+        "g",
+        Gauge {
+            labels: make_labels(&[("x", "histogram_mean(y)")]),
+            timestamps: (0u64..=20)
+                .map(|i| 1_000_000_000_000 + i * 100_000_000)
+                .collect(),
+            values: (0i64..=20).collect(),
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let at = |q: &str| {
+        let QueryResult::Vector { result } = engine.query(q, Some(1000.95)).unwrap() else {
+            panic!("not a vector");
+        };
+        result[0].value
+    };
+    assert_eq!(at(r#"g{x="histogram_mean(y)"}"#), at("g"));
+    assert_eq!(at(r#"g{x='histogram_mean(y)'}"#), at("g"));
+    assert_eq!(at("g{x=`histogram_mean(y)`}"), at("g"));
+}
+
+/// A backslash escape in a string literal does not end it, in any of the
+/// three quote forms, and a `#` comment is text: neither hides a histogram
+/// call that follows.
+#[test]
+fn an_escape_or_a_comment_does_not_hide_a_histogram_call() {
+    let engine = QueryEngine::new(Arc::new(create_hist_source(&[0, 10, 20, 30, 40])));
+    for q in [
+        r#"histogram_count(req_latency{cpu!="\""})"#,
+        r#"histogram_count(req_latency{cpu!='\''})"#,
+        "histogram_count(req_latency{cpu!=`\\``})",
+        "# it's a comment\nhistogram_quantile(0.5, req_latency)",
+        "# it's a comment\rhistogram_quantile(0.5, req_latency)",
+        "# a comment ending in a backslash \\\nhistogram_quantile(0.5, req_latency)",
+    ] {
+        let QueryResult::Vector { result } = engine
+            .query(q, Some(1003.5))
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a vector");
+        };
+        assert_eq!(result.len(), 1, "{q}: {result:?}");
+    }
+}
