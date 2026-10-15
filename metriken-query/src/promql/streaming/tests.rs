@@ -81,13 +81,13 @@ fn assert_matrices_eq(a: &[MatrixSample], b: &[MatrixSample]) {
 }
 
 #[test]
-fn query_rate_and_irate_are_identical() {
-    // `rate` and `irate` are the same operation in this engine (RateMode::Grid):
-    // the `[range]` window is inert and both compute the per-step grid rate.
+fn irate_is_rate_over_one_step() {
+    // `irate` ignores its `[range]` and computes the rate over one step, as
+    // `rate` over a range of one step does.
     let engine = QueryEngine::new(cgroup_source());
     let rate = into_sorted(
         engine
-            .query_range("rate(cgroup_cpu_usage[5s])", 1000.0, 1003.0, 1.0)
+            .query_range("rate(cgroup_cpu_usage[1s])", 1000.0, 1003.0, 1.0)
             .unwrap(),
     );
     let irate = into_sorted(
@@ -100,13 +100,13 @@ fn query_rate_and_irate_are_identical() {
 
 #[test]
 fn sum_by_rate_equals_sum_by_irate() {
-    // `sum by (name)` over the per-step rate; since rate ≡ irate, aggregating
-    // either yields the same series. Exercises sum_by over the grid producer.
+    // `sum by (name)` over the per-step rate: `irate`, or `rate` over one
+    // step, yields the same series. Exercises sum_by over the grid producer.
     let engine = QueryEngine::new(cgroup_source());
     let via_rate = into_sorted(
         engine
             .query_range(
-                "sum by (name) (rate(cgroup_cpu_usage[5s]))",
+                "sum by (name) (rate(cgroup_cpu_usage[1s]))",
                 1000.0,
                 1003.0,
                 1.0,
@@ -491,12 +491,16 @@ fn raw_sum_stops_holding_a_series_that_ended() {
 }
 
 /// A raw rate of a table slower than the source's finest interval keeps
-/// its first point in range: the read reaches back the `[range]` at least,
-/// so the sample before the range is there to pair with.
+/// its first point in range, when the source reports the table's interval
+/// (as an archive does for each table): the read and the hold bound cover
+/// two of that interval, so the sample before the range is there to pair
+/// with.
 #[test]
 fn raw_rate_of_a_slow_table_keeps_its_first_point() {
-    let mut source = Memory::new(1000);
-    for (name, every) in [("slow", 10u64), ("fast", 1)] {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+    let table = |name: &str, every: u64| -> Arc<dyn crate::DataSource> {
+        let mut source = Memory::new(every * 1000);
         let timestamps: Vec<u64> = (0..=60 / every)
             .map(|k| (1000 + k * every) * 1_000_000_000)
             .collect();
@@ -511,8 +515,14 @@ fn raw_rate_of_a_slow_table_keeps_its_first_point() {
                 windows: None,
             },
         );
-    }
-    let engine = QueryEngine::new(Arc::new(source));
+        Arc::new(
+            LabeledSource::new(Arc::new(source), Labels::default()).with_interval(every as f64),
+        )
+    };
+    let engine = QueryEngine::new(Arc::new(RecordingsSource::new(vec![
+        table("slow", 10),
+        table("fast", 1),
+    ])));
     let series = raw_points(&engine, "irate(slow[5m])", 1005.0, 1060.0);
     assert_eq!(series[0][0], (1010.0, 10.0), "{series:?}");
 }

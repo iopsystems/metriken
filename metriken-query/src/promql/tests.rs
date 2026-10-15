@@ -527,28 +527,30 @@ fn test_windowed_rate_basic() {
 
 #[test]
 fn test_grid_rate_counter_reset() {
-    // reset_counter [100,200,300,50,150]: reset-adjusted increments are
-    // 100,100,50,100 over 1s each. Grid evaluates the per-step interval
-    // [1003s, 1004s] → the 50→150 delta = 100/s (the old 5s-window value was
-    // 87.5; the [range] token is inert now).
+    // reset_counter [100,200,300,50,150] at 1000..1004 s: reset-adjusted
+    // increments are 100,100,50,100 over 1 s each. A 5 s window at 1004
+    // starts at the first sample (1000): 350 over 4 s. A 1 s window is the
+    // 50→150 delta.
     let source = Arc::new(create_counter_reset_source());
     let engine = QueryEngine::new(source);
 
-    let result = engine
-        .query_range("rate(reset_counter[5s])", 1004.0, 1004.0, 1.0)
-        .unwrap();
+    for (query, expected) in [
+        ("rate(reset_counter[5s])", 87.5),
+        ("rate(reset_counter[2s])", 75.0),
+        ("rate(reset_counter[1s])", 100.0),
+    ] {
+        let result = engine.query_range(query, 1004.0, 1004.0, 1.0).unwrap();
+        let all_values = get_matrix_values(&result);
+        assert_eq!(all_values.len(), 1);
+        assert_eq!(all_values[0].len(), 1);
 
-    let all_values = get_matrix_values(&result);
-    assert_eq!(all_values.len(), 1);
-    assert_eq!(all_values[0].len(), 1);
-
-    let (ts, rate) = all_values[0][0];
-    assert!((ts - 1004.0).abs() < 1e-9, "grid timestamp {ts}");
-    assert!(
-        (rate - 100.0).abs() < 1e-6,
-        "Expected per-step rate 100, got {}",
-        rate
-    );
+        let (ts, rate) = all_values[0][0];
+        assert!((ts - 1004.0).abs() < 1e-9, "grid timestamp {ts}");
+        assert!(
+            (rate - expected).abs() < 1e-6,
+            "{query}: expected {expected}, got {rate}"
+        );
+    }
 }
 
 #[test]
@@ -573,15 +575,15 @@ fn test_windowed_irate_basic() {
 }
 
 #[test]
-fn test_rate_and_irate_identical_with_reset() {
-    // rate ≡ irate in this engine (RateMode::Grid), including across a counter
-    // reset — both compute the same per-step grid rate; `[range]` is inert.
+fn test_irate_is_rate_over_one_step_with_reset() {
+    // `irate` ignores its `[range]` and is the rate over one step, across a
+    // counter reset too: `rate` over a range of one step.
     let source = Arc::new(create_counter_reset_source());
     let engine = QueryEngine::new(source);
 
     let rate = get_matrix_values(
         &engine
-            .query_range("rate(reset_counter[5s])", 1001.0, 1004.0, 1.0)
+            .query_range("rate(reset_counter[1s])", 1001.0, 1004.0, 1.0)
             .unwrap(),
     );
     let irate = get_matrix_values(
@@ -589,9 +591,15 @@ fn test_rate_and_irate_identical_with_reset() {
             .query_range("irate(reset_counter[5s])", 1001.0, 1004.0, 1.0)
             .unwrap(),
     );
+    let wide = get_matrix_values(
+        &engine
+            .query_range("rate(reset_counter[5s])", 1001.0, 1004.0, 1.0)
+            .unwrap(),
+    );
 
     assert!(!rate.is_empty() && !rate[0].is_empty(), "expected points");
-    assert_eq!(rate, irate, "rate and irate must be identical");
+    assert_eq!(rate, irate, "irate must be rate over one step");
+    assert_ne!(wide, irate, "rate over 5 s must average over more");
 }
 
 #[test]
@@ -684,21 +692,25 @@ fn eval_timestamps_place_points_on_a_slow_irregular_sources_readings() {
     assert_eq!(vals.len(), 1, "one series expected");
     let got: Vec<(f64, f64)> = vals[0].clone();
 
-    // Points sit on the gauge's real readings — never between them. The first
-    // supplied timestamp yields no rate (no predecessor to measure across),
-    // exactly as the grid's own start point does.
+    // Points sit on the gauge's real readings, never between them. A `rate`
+    // is over its `[range]`, so the first supplied timestamp has a value too:
+    // at 0.3 s the window starts at the first sample, 0 s.
     let times: Vec<f64> = got.iter().map(|(t, _)| *t).collect();
-    assert_eq!(times, vec![2.3, 6.3], "got {got:?}");
+    assert_eq!(times, vec![0.3, 2.3, 6.3], "got {got:?}");
 
-    // 100/s over a gauge reading taken at that same instant: 100/4 then 100/5.
-    // A held-forward gauge would have divided by the STALE reading instead, so
-    // these values are what proves both sides moved together.
+    // 100/s over a gauge reading taken at that same instant: 100/2, 100/4,
+    // then 100/5. A held-forward gauge would have divided by the stale
+    // reading instead.
     assert!(
-        (got[0].1 - 25.0).abs() < 1e-6,
+        (got[0].1 - 50.0).abs() < 1e-6,
+        "at 0.3s expected 50, got {got:?}"
+    );
+    assert!(
+        (got[1].1 - 25.0).abs() < 1e-6,
         "at 2.3s expected 25, got {got:?}"
     );
     assert!(
-        (got[1].1 - 20.0).abs() < 1e-6,
+        (got[2].1 - 20.0).abs() < 1e-6,
         "at 6.3s expected 20, got {got:?}"
     );
 }
@@ -2764,5 +2776,1229 @@ fn referenced_metrics_is_a_superset_of_what_columns_resolves() {
             !names.is_empty(),
             "{q}: routing would open nothing and the query would be refused"
         );
+    }
+}
+
+/// The value of `query` at `t` from a range query starting at `start`.
+fn rate_at(engine: &QueryEngine, query: &str, start: f64, t: f64) -> Option<f64> {
+    let result = engine.query_range(query, start, t + 20.0, 1.0).unwrap();
+    get_matrix_values(&result)
+        .first()?
+        .iter()
+        .find(|(ts, _)| (ts - t).abs() < 1e-9)
+        .map(|(_, v)| *v)
+}
+
+fn counter_engine(interval_ms: u64, timestamps: Vec<u64>, values: Vec<u64>) -> QueryEngine {
+    let mut source = Memory::new(interval_ms);
+    source.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            timestamps,
+            values,
+            windows: None,
+        },
+    );
+    QueryEngine::new(Arc::new(source))
+}
+
+/// A `rate`'s window does not depend on where the query starts: across a
+/// hole longer than the reach before its left edge, it starts at the first
+/// sample after the edge whether or not the read reached the sample before
+/// the hole.
+#[test]
+fn a_rate_across_a_hole_is_the_same_from_any_start() {
+    const S: u64 = 1_000_000_000;
+    // Rows every second from 1000 s, none in [1050, 1100); 10/s, and 5000
+    // more accrued inside the hole.
+    let ts: Vec<u64> = (1000..1200u64)
+        .filter(|s| !(1050..1100).contains(s))
+        .map(|s| s * S)
+        .collect();
+    let vals: Vec<u64> = ts
+        .iter()
+        .map(|t| {
+            let s = t / S - 1000;
+            s * 10 + if s >= 100 { 5000 } else { 0 }
+        })
+        .collect();
+    let engine = counter_engine(1000, ts, vals);
+    for t in [1105.0, 1108.0] {
+        let early = rate_at(&engine, "rate(c[10s])", 1040.0, t);
+        let late = rate_at(&engine, "rate(c[10s])", t, t);
+        assert_eq!(early, late, "at {t}");
+        assert!((late.unwrap() - 10.0).abs() < 1e-9, "at {t}: {late:?}");
+    }
+}
+
+/// A counter read every 10 s from a source whose interval says 1 s: a
+/// `rate` at one time has one value from any start.
+#[test]
+fn a_slow_counter_rate_is_the_same_from_any_start() {
+    const S: u64 = 1_000_000_000;
+    let ts: Vec<u64> = (0..60u64).map(|k| (1005 + 10 * k) * S).collect();
+    // Flat until 1100 s, then 10/s.
+    let vals: Vec<u64> = ts
+        .iter()
+        .map(|t| (t / S).saturating_sub(1100) * 10)
+        .collect();
+    let engine = counter_engine(1000, ts, vals);
+    for t in [1121.0, 1124.0, 1128.0] {
+        let early = rate_at(&engine, "rate(c[30s])", t - 200.0, t);
+        let late = rate_at(&engine, "rate(c[30s])", t, t);
+        assert!(early.is_some(), "at {t}");
+        assert_eq!(early, late, "at {t}");
+    }
+}
+
+/// At explicit evaluation timestamps a `rate` has a point at each one in
+/// the range, the first included, and none before it; an `irate` has none
+/// at the first, which has no predecessor.
+#[test]
+fn a_rate_at_explicit_timestamps_has_a_point_at_each() {
+    const S: u64 = 1_000_000_000;
+    let engine = counter_engine(
+        1000,
+        (0..20u64).map(|k| (1000 + k) * S).collect(),
+        (0..20u64).map(|k| k * 10).collect(),
+    );
+    let times = |query: &str, points: Vec<u64>| -> Vec<f64> {
+        let opts = QueryOptions::default().with_eval_timestamps(Some(points.into()));
+        let result = engine
+            .query_range_opts(query, 1005.0, 1009.0, 1.0, &opts)
+            .unwrap();
+        get_matrix_values(&result)
+            .first()
+            .map(|s| s.iter().map(|(t, _)| *t).collect())
+            .unwrap_or_default()
+    };
+    let three = vec![1005 * S, 1007 * S, 1009 * S];
+    assert_eq!(
+        times("rate(c[3s])", three.clone()),
+        vec![1005.0, 1007.0, 1009.0]
+    );
+    assert_eq!(times("rate(c[3s])", vec![1009 * S]), vec![1009.0]);
+    // A timestamp before the range's start is not a point.
+    assert_eq!(times("rate(c[3s])", vec![1003 * S, 1005 * S]), vec![1005.0]);
+    assert_eq!(times("irate(c[3s])", three), vec![1007.0, 1009.0]);
+}
+
+/// The points of `result` at or after `from`.
+fn points_from(result: &QueryResult, from: f64) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = match result {
+        QueryResult::Matrix { result } => result.iter().flat_map(|s| s.values.clone()).collect(),
+        QueryResult::Vector { result } => result.iter().map(|s| s.value).collect(),
+        other => panic!("{other:?}"),
+    };
+    out.retain(|(t, _)| *t >= from);
+    out
+}
+
+/// A point held past a series' last sample has one value from any start:
+/// its window ends at that sample, up to the series' spacing before the
+/// range's start, and the read reaches far enough back for the sample
+/// before the window's left edge.
+#[test]
+fn a_held_rate_is_the_same_from_any_start() {
+    const S: u64 = 1_000_000_000;
+    // Every 10 s to 1140 s, then a row 2 s late and every 10 s to 1200 s;
+    // flat until 1160 s, then 100/s.
+    let mut ts: Vec<u64> = (0..15u64).map(|k| 1000 + 10 * k).collect();
+    ts.extend([1152, 1172, 1182, 1192, 1200]);
+    let vals: Vec<u64> = ts.iter().map(|s| s.saturating_sub(1160) * 100).collect();
+    let engine = counter_engine(10_000, ts.iter().map(|s| s * S).collect(), vals);
+    let q = "rate(c[30s])";
+    let wide = engine.query_range(q, 1100.0, 1205.0, 1.0).unwrap();
+    let narrow = engine.query_range(q, 1203.0, 1205.0, 1.0).unwrap();
+    let instant = engine.query(q, Some(1205.0)).unwrap();
+    let at = |r: &QueryResult| points_from(r, 1205.0).first().map(|p| p.1);
+    assert!(at(&wide).is_some(), "{wide:?}");
+    assert_eq!(at(&wide), at(&narrow));
+    assert_eq!(at(&wide), at(&instant));
+}
+
+/// Across recordings, a series' rate is the same whichever other
+/// recordings the query reaches: each series takes its reach from its own
+/// table's interval.
+#[test]
+fn a_rate_across_recordings_takes_its_own_tables_reach() {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+    const S: u64 = 1_000_000_000;
+    let source = |interval_ms: u64, ts: Vec<u64>, vals: Vec<u64>, name: &str| {
+        let mut m = Memory::new(interval_ms);
+        m.add_counter(
+            "c",
+            Counter {
+                labels: Labels::default(),
+                timestamps: ts.iter().map(|s| s * S).collect(),
+                values: vals,
+                windows: None,
+            },
+        );
+        let labeled = LabeledSource::new(Arc::new(m), make_labels(&[("source", name)]))
+            .with_interval(interval_ms as f64 / 1000.0);
+        Arc::new(labeled) as Arc<dyn DataSource>
+    };
+    // a: every second, none in [1050, 1062), 5000 more inside the gap.
+    let ts_a: Vec<u64> = (1000..1200u64)
+        .filter(|s| !(1050..1062).contains(s))
+        .collect();
+    let v_a: Vec<u64> = ts_a
+        .iter()
+        .map(|s| (s - 1000) * 10 + if *s >= 1062 { 5000 } else { 0 })
+        .collect();
+    let a = source(1000, ts_a, v_a, "a");
+    // b: every 10 s.
+    let ts_b: Vec<u64> = (0..20u64).map(|k| 1000 + 10 * k).collect();
+    let v_b: Vec<u64> = ts_b.iter().map(|s| s - 1000).collect();
+    let b = source(10_000, ts_b, v_b, "b");
+    let alone = QueryEngine::new(Arc::new(RecordingsSource::new(vec![a.clone()])));
+    let both = QueryEngine::new(Arc::new(RecordingsSource::new(vec![a, b])));
+    let q = r#"rate(c{source="a"}[10s])"#;
+    let x = alone.query_range(q, 1060.0, 1070.0, 1.0).unwrap();
+    let y = both.query_range(q, 1060.0, 1070.0, 1.0).unwrap();
+    assert_eq!(points_from(&x, 0.0), points_from(&y, 0.0));
+    assert!(
+        points_from(&y, 1063.0)
+            .iter()
+            .all(|(_, v)| (v - 10.0).abs() < 1e-9),
+        "{y:?}"
+    );
+}
+
+/// A source over `(name, seconds, values)` counters at `interval_ms`.
+fn counters_source(interval_ms: u64, counters: Vec<(&str, Vec<u64>, Vec<u64>)>) -> Memory {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(interval_ms);
+    for (name, ts, values) in counters {
+        m.add_counter(
+            name,
+            Counter {
+                labels: Labels::default(),
+                timestamps: ts.iter().map(|s| s * S).collect(),
+                values,
+                windows: None,
+            },
+        );
+    }
+    m
+}
+
+/// In raw mode, a series' point before the range, held at the range's
+/// start, has one value from any start: a point whose window the read
+/// does not hold is not emitted.
+#[test]
+fn a_raw_rate_point_before_the_range_is_the_same_from_any_start() {
+    // `a` every second with a gap over (1105, 1130) and a step of 1000 at
+    // 1098; `b` every second.
+    let ts_a: Vec<u64> = (1000..=1105u64).chain(1130..=1200).collect();
+    let v_a: Vec<u64> = ts_a
+        .iter()
+        .map(|t| 10 * (t - 1000) + if *t >= 1098 { 1000 } else { 0 })
+        .collect();
+    let ts_b: Vec<u64> = (1000..=1200u64).collect();
+    let v_b: Vec<u64> = ts_b.iter().map(|t| t - 1000).collect();
+    let engine = QueryEngine::new(Arc::new(counters_source(
+        1000,
+        vec![("a", ts_a, v_a), ("b", ts_b, v_b)],
+    )));
+    assert_raw_point_before_the_range(&engine, "rate(a[10s]) + rate(b[10s])", 111.0);
+}
+
+/// Across recordings whose sources set no interval, a series takes its
+/// own recording's: its rate is the same with or without a slower
+/// recording beside it.
+#[test]
+fn a_rate_across_plain_recordings_takes_its_own_recordings_reach() {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+    let ts_a: Vec<u64> = (1000..1200u64)
+        .filter(|s| !(1050..1062).contains(s))
+        .collect();
+    let v_a: Vec<u64> = ts_a
+        .iter()
+        .map(|s| (s - 1000) * 10 + if *s >= 1062 { 5000 } else { 0 })
+        .collect();
+    let ts_b: Vec<u64> = (0..20u64).map(|k| 1000 + 10 * k).collect();
+    let v_b: Vec<u64> = ts_b.iter().map(|s| s - 1000).collect();
+    let a: Arc<dyn DataSource> = Arc::new(LabeledSource::new(
+        Arc::new(counters_source(1000, vec![("c", ts_a, v_a)])),
+        make_labels(&[("source", "a")]),
+    ));
+    let b: Arc<dyn DataSource> = Arc::new(LabeledSource::new(
+        Arc::new(counters_source(10_000, vec![("c", ts_b, v_b)])),
+        make_labels(&[("source", "b")]),
+    ));
+    let alone = QueryEngine::new(Arc::new(RecordingsSource::new(vec![a.clone()])));
+    let both = QueryEngine::new(Arc::new(RecordingsSource::new(vec![a, b])));
+    let q = r#"rate(c{source="a"}[10s])"#;
+    let x = alone.query_range(q, 1060.0, 1070.0, 1.0).unwrap();
+    let y = both.query_range(q, 1060.0, 1070.0, 1.0).unwrap();
+    assert_eq!(points_from(&x, 0.0), points_from(&y, 0.0));
+}
+
+/// An outer `with_interval` is the one a series carries, so its reach is
+/// what the read covers: one value from any start.
+#[test]
+fn nested_intervals_give_one_value_from_any_start() {
+    use metriken_storage::labeled::LabeledSource;
+    let ts: Vec<u64> = (0..30u64)
+        .map(|k| 1000 + 10 * k)
+        .filter(|t| *t != 1100)
+        .collect();
+    let v: Vec<u64> = ts
+        .iter()
+        .map(|t| (t - 1000) * 10 + if *t > 1100 { 5000 } else { 0 })
+        .collect();
+    let inner = LabeledSource::new(
+        Arc::new(counters_source(10_000, vec![("c", ts, v)])),
+        Labels::default(),
+    )
+    .with_interval(10.0);
+    let outer = LabeledSource::new(Arc::new(inner), Labels::default()).with_interval(1.0);
+    let engine = QueryEngine::new(Arc::new(outer));
+    let at = |start: f64| {
+        let r = engine
+            .query_range("rate(c[10s])", start, 1125.0, 1.0)
+            .unwrap();
+        points_from(&r, 1115.0).first().copied()
+    };
+    assert_eq!(at(1050.0), at(1115.0));
+}
+
+/// The same for the raw windowed gauge functions: `avg_over_time`,
+/// `idelta` and `deriv`.
+#[test]
+fn a_raw_avg_over_time_point_before_the_range_is_the_same_from_any_start() {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(1000);
+    // `g` every second with a gap over (1105, 1130), stepping up at 1098;
+    // `h` every second.
+    let ts_g: Vec<u64> = (1000..=1105u64).chain(1130..=1200).collect();
+    m.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts_g.iter().map(|s| s * S).collect(),
+            values: ts_g
+                .iter()
+                .map(|t| if *t >= 1098 { 100 } else { 0 })
+                .collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000..=1200u64).map(|s| s * S).collect(),
+            values: vec![1; 201],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    for (query, expected) in [
+        ("avg_over_time(g[10s]) + h", 100.0 * 8.0 / 11.0 + 1.0),
+        ("idelta(g[10s]) + h", 1.0),
+        // The least-squares slope of 0, 0, 0 then eight 100s, a second apart.
+        ("deriv(g[10s]) + h", 120.0 / 11.0 + 1.0),
+    ] {
+        assert_raw_point_before_the_range(&engine, query, expected);
+    }
+}
+
+/// In raw mode, the points of `query` from `start` until 1130 s, for starts
+/// from 1106 s to 1125 s, are one point at 1106 s of `expected` when the
+/// start is 1106 s, and none otherwise: the series' last point before its
+/// gap, at 1105 s, is over its whole window and held for the gap before it
+/// (1 s), whatever the start.
+fn assert_raw_point_before_the_range(engine: &QueryEngine, query: &str, expected: f64) {
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for start in [1106.0, 1107.0, 1110.0, 1115.0, 1120.0, 1125.0] {
+        let r = engine
+            .query_range_opts(query, start, 1131.0, 1.0, &raw)
+            .unwrap();
+        let got: Vec<(f64, f64)> = points_from(&r, start)
+            .into_iter()
+            .filter(|(t, _)| *t < 1130.0)
+            .collect();
+        if start == 1106.0 {
+            assert_eq!(got.len(), 1, "{query} from {start}: {got:?}");
+            assert_eq!(got[0].0, 1106.0, "{query} from {start}: {got:?}");
+            assert!(
+                (got[0].1 - expected).abs() < 1e-9,
+                "{query} from {start}: {got:?}"
+            );
+        } else {
+            assert!(got.is_empty(), "{query} from {start}: {got:?}");
+        }
+    }
+}
+
+/// A raw `idelta` or `deriv` point before the range whose sample before it
+/// has no value of its own (alone in its window) is held for the gap to
+/// that sample, not to the series' previous point.
+#[test]
+fn a_raw_point_after_a_sample_without_a_value_is_held_for_its_own_gap() {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(1000);
+    // `g` (its value the seconds past 1000) every second to 1080, then at
+    // 1100 and 1105, then every second from 1130; `h` every second.
+    let ts_g: Vec<u64> = (1000..=1080u64)
+        .chain([1100, 1105])
+        .chain(1130..=1200)
+        .collect();
+    m.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts_g.iter().map(|s| s * S).collect(),
+            values: ts_g.iter().map(|t| (*t - 1000) as i64).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000..=1200u64).map(|s| s * S).collect(),
+            values: vec![1; 201],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    // The point at 1105 s is held 5 s, to 1110 s. At a 5 s step the hold
+    // bound is 10 s (two steps), longer than the gaps compared.
+    for (query, expected) in [("idelta(g[10s]) + h", 6.0), ("deriv(g[10s]) + h", 2.0)] {
+        for start in [1106.0, 1108.0, 1112.0, 1120.0] {
+            let r = engine
+                .query_range_opts(query, start, 1131.0, 5.0, &raw)
+                .unwrap();
+            let got: Vec<(f64, f64)> = points_from(&r, start)
+                .into_iter()
+                .filter(|(t, _)| *t < 1130.0)
+                .collect();
+            let want: Vec<(f64, f64)> = (start as u64..=1110)
+                .map(|t| (t as f64, expected))
+                .collect();
+            assert_eq!(got.len(), want.len(), "{query} from {start}: {got:?}");
+            for ((t, v), (wt, wv)) in got.iter().zip(&want) {
+                assert_eq!(t, wt, "{query} from {start}: {got:?}");
+                assert!((v - wv).abs() < 1e-9, "{query} from {start}: {got:?}");
+            }
+        }
+    }
+}
+
+/// A sample whose function gives no value is a timing point, never a value:
+/// nothing without a value reaches the range.
+#[test]
+fn a_timing_point_without_its_point_is_dropped() {
+    const S: u64 = 1_000_000_000;
+    // Samples to 1080, then at 1102 and 1120 for the counter and at 1110
+    // and 1122 for the gauge, then every second from 1128. Each pair's
+    // first is read and its second, the point before the range, has no
+    // value: a 10 s rate at 1120 and a 10 s `deriv` at 1122 have no sample
+    // close enough before their windows.
+    let series = |a: u64, b: u64| -> Vec<u64> {
+        (1000..=1080u64).chain([a, b]).chain(1128..=1200).collect()
+    };
+    let ts = series(1102, 1120);
+    let ts_g = series(1110, 1122);
+    let mut m = Memory::new(1000);
+    m.add_counter(
+        "a",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| t - 1000).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts_g.iter().map(|s| s * S).collect(),
+            values: ts_g.iter().map(|t| (*t - 1000) as i64).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000..=1200u64).map(|s| s * S).collect(),
+            values: vec![1; 201],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for query in ["rate(a[10s]) + h", "deriv(g[10s]) + h"] {
+        let r = engine
+            .query_range_opts(query, 1125.0, 1140.0, 1.0, &raw)
+            .unwrap();
+        let got = points_from(&r, 0.0);
+        assert!(
+            got.iter().all(|(t, v)| *t >= 1128.0 && v.is_finite()),
+            "{query}: {got:?}"
+        );
+    }
+}
+
+/// Raw compositions of out-of-phase recordings, nested and not, never show
+/// a timing point: every value in a result, matrix or display, is finite.
+#[test]
+fn raw_compositions_never_show_a_timing_point() {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+    const MS: u64 = 1_000_000;
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+    // Row times in ms, spaced from one to two intervals.
+    let times = |rng: &mut Rng, iv: u64, phase: u64| -> Vec<u64> {
+        let mut t = 1_000_000 + phase;
+        let mut out = vec![];
+        while t < 1_200_000 {
+            out.push(t);
+            t += iv + rng.below(iv + 1);
+        }
+        out
+    };
+    let queries = [
+        r#"(sum(rate(a{source="x"}[5s])) + sum(rate(a{source="y"}[5s]))) + sum(rate(a{source="z"}[5s]))"#,
+        r#"(sum(rate(a{source="z"}[25s])) + sum(rate(a{source="y"}[4s]))) * sum(rate(a{source="x"}[2s]))"#,
+        r#"(sum(avg_over_time(g{source="z"}[30s])) + sum(idelta(g{source="y"}[8s]))) + sum(deriv(g{source="x"}[3s]))"#,
+        r#"(sum(irate(a{source="z"}[5s])) + sum(irate(a{source="y"}[5s]))) + sum(g)"#,
+        "count(rate(a[20s])) + sum(rate(a{source=\"z\"}[20s]))",
+        r#"(2 * sum(rate(a{source="x"}[5s])) + sum(rate(a{source="y"}[5s]))) + sum(g)"#,
+    ];
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for seed in 1..12u64 {
+        let mut rng = Rng(seed);
+        let mut children: Vec<Arc<dyn DataSource>> = vec![];
+        for (name, iv) in [("x", 1000u64), ("y", 3000), ("z", 10_000)] {
+            let mut m = Memory::new(iv);
+            let phase = rng.below(iv);
+            let ts = times(&mut rng, iv, phase);
+            let mut acc = 0u64;
+            let values: Vec<u64> = ts
+                .iter()
+                .map(|_| {
+                    acc += rng.below(50);
+                    acc
+                })
+                .collect();
+            m.add_counter(
+                "a",
+                Counter {
+                    labels: Labels::default(),
+                    timestamps: ts.iter().map(|s| s * MS).collect(),
+                    values,
+                    windows: None,
+                },
+            );
+            let ts = times(&mut rng, iv, phase);
+            let values: Vec<i64> = ts.iter().map(|_| rng.below(100) as i64).collect();
+            m.add_gauge(
+                "g",
+                Gauge {
+                    labels: Labels::default(),
+                    timestamps: ts.iter().map(|s| s * MS).collect(),
+                    values,
+                    windows: None,
+                },
+            );
+            let labeled = LabeledSource::new(Arc::new(m), make_labels(&[("source", name)]))
+                .with_interval(iv as f64 / 1000.0);
+            children.push(Arc::new(labeled));
+        }
+        let engine = QueryEngine::new(Arc::new(RecordingsSource::new(children)));
+        for q in queries {
+            for half in (2100..2240u64).step_by(3) {
+                let start = half as f64 / 2.0;
+                let r = engine
+                    .query_range_opts(q, start, 1150.0, 1.0, &raw)
+                    .unwrap();
+                let bad: Vec<(f64, f64)> = points_from(&r, 0.0)
+                    .into_iter()
+                    .filter(|(_, v)| !v.is_finite())
+                    .collect();
+                assert!(bad.is_empty(), "seed {seed} {q} from {start}: {bad:?}");
+                let d = engine
+                    .query_range_display_opts(
+                        q,
+                        start,
+                        1150.0,
+                        1.0,
+                        &crate::DisplayOptions::default(),
+                        &raw,
+                    )
+                    .unwrap();
+                assert!(
+                    !format!("{d:?}").contains("NaN"),
+                    "seed {seed} {q} from {start}: display {d:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A raw `irate`'s point before the range is held for the gap before it,
+/// as a `rate`'s is.
+#[test]
+fn a_raw_irate_point_before_the_range_is_held_for_the_gap_before_it() {
+    const S: u64 = 1_000_000_000;
+    let ts: Vec<u64> = (1000..=1099u64).chain(1130..=1200).collect();
+    let mut m = Memory::new(1000);
+    m.add_counter(
+        "a",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| (t - 1000) * 3).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000..1200u64).map(|s| s * S).collect(),
+            values: vec![1; 200],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for q in ["irate(a[5s]) + h", "rate(a[5s]) + h"] {
+        // The point at 1099 s is held 1 s: only 1100 s in [1100, 1130).
+        for (start, want) in [(1095.0, 1), (1100.0, 1), (1110.0, 0)] {
+            let r = engine
+                .query_range_opts(q, start, 1135.0, 1.0, &raw)
+                .unwrap();
+            let got = points_from(&r, 0.0)
+                .into_iter()
+                .filter(|(t, _)| (1100.0..1130.0).contains(t))
+                .count();
+            assert_eq!(got, want, "{q} from {start}");
+        }
+    }
+}
+
+/// A point that gives no value, before the range or in it, is the timing
+/// point for the next, so the next is held for the gap before it, from any
+/// start.
+#[test]
+fn a_first_point_after_a_point_without_a_value_is_held_for_its_own_gap() {
+    const S: u64 = 1_000_000_000;
+    // Every second to 1080; the counter at 1102 and 1120, the gauge at 1110
+    // and 1122; both at 1128 and then every second from 1150. At 1120 a
+    // 10 s rate, and at 1122 a 10 s `deriv`, has no value.
+    let series = |a: u64, b: u64| -> Vec<u64> {
+        (1000..=1080u64)
+            .chain([a, b, 1128])
+            .chain(1150..=1200)
+            .collect()
+    };
+    let (ts, ts_g) = (series(1102, 1120), series(1110, 1122));
+    let mut m = Memory::new(1000);
+    m.add_counter(
+        "a",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| t - 1000).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts_g.iter().map(|s| s * S).collect(),
+            values: ts_g.iter().map(|t| (*t - 1000) as i64).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000..=1200u64).map(|s| s * S).collect(),
+            values: vec![1; 201],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    // At a 5 s step the hold bound is 10 s (two steps), longer than the
+    // gaps compared. The point at 1128 is held for 8 s after the counter's
+    // 1120 and 6 s
+    // after the gauge's 1122 (where neither `deriv` nor `idelta` has a
+    // value), from any start.
+    for (query, last) in [
+        ("rate(a[10s]) + h", 1136.0),
+        ("deriv(g[10s]) + h", 1134.0),
+        ("idelta(g[10s]) + h", 1134.0),
+    ] {
+        for start in [1050.0, 1101.0, 1105.0, 1110.0, 1115.0, 1121.0, 1125.0] {
+            let r = engine
+                .query_range_opts(query, start, 1149.0, 5.0, &raw)
+                .unwrap();
+            let times: Vec<f64> = points_from(&r, 1126.0)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect();
+            let want: Vec<f64> = (1128..=last as u64).map(|t| t as f64).collect();
+            assert_eq!(times, want, "{query} from {start}");
+        }
+    }
+}
+
+/// A timing point inside the range, the sample of a point there that gave
+/// no value, is not in the result, matrix or display.
+#[test]
+fn a_timing_point_in_the_range_is_not_in_the_result() {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(1000);
+    // At 1013 and 1030, a 10 s window holds no sample but the point's own.
+    let ts = [900u64, 1000, 1013, 1030, 1031, 1032, 1033];
+    m.add_counter(
+        "a",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| t - 900).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| (*t - 900) as i64).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (900..=1040u64).map(|s| s * S).collect(),
+            values: vec![1; 141],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for q in [
+        "rate(a[10s])",
+        "rate(a[10s]) + h",
+        "sum(rate(a[10s]))",
+        "deriv(g[10s])",
+        "deriv(g[10s]) + h",
+        "idelta(g[10s])",
+    ] {
+        for start in [1001.0, 1012.0, 1013.5, 1014.0, 1020.0, 1029.0] {
+            let r = engine
+                .query_range_opts(q, start, 1036.0, 1.0, &raw)
+                .unwrap();
+            let bad: Vec<(f64, f64)> = points_from(&r, 0.0)
+                .into_iter()
+                .filter(|(_, v)| !v.is_finite())
+                .collect();
+            assert!(bad.is_empty(), "{q} from {start}: {bad:?}");
+            let d = engine
+                .query_range_display_opts(
+                    q,
+                    start,
+                    1036.0,
+                    1.0,
+                    &crate::DisplayOptions::default(),
+                    &raw,
+                )
+                .unwrap();
+            assert!(!format!("{d:?}").contains("NaN"), "{q} from {start}: {d:?}");
+        }
+    }
+}
+
+/// The one-to-one check counts a series' points in the range: a raw series'
+/// point before the range counts only when it is held to the range's
+/// start.
+#[test]
+fn a_point_before_the_range_does_not_count_for_one_to_one() {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(1000);
+    let ts: Vec<u64> = (1000..=1200).collect();
+    m.add_counter(
+        "a",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| t - 1000).collect(),
+            windows: None,
+        },
+    );
+    // `h{i="1"}` ends at 1099, `h{i="2"}` starts at 1101.
+    for (i, range) in [("1", 1000..=1099u64), ("2", 1101..=1200u64)] {
+        let t: Vec<u64> = range.collect();
+        m.add_gauge(
+            "h",
+            Gauge {
+                labels: make_labels(&[("i", i)]),
+                timestamps: t.iter().map(|s| s * S).collect(),
+                values: vec![1; t.len()],
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for start in [1100.5, 1105.0, 1110.0] {
+        let r = engine.query_range_opts(
+            "rate(a[5s]) + on() avg_over_time(h[5s])",
+            start,
+            1150.0,
+            1.0,
+            &raw,
+        );
+        assert!(r.is_ok(), "from {start}: {r:?}");
+    }
+    // From 1100, `h{i="1"}`'s point at 1099 is held to the start (for the
+    // second before it), so both series have points in the range.
+    let r = engine.query_range_opts(
+        "rate(a[5s]) + on() avg_over_time(h[5s])",
+        1100.0,
+        1150.0,
+        1.0,
+        &raw,
+    );
+    assert!(
+        matches!(&r, Err(e) if e.to_string().contains("many-to-many")),
+        "{r:?}"
+    );
+}
+
+/// In raw mode a query's result at a time does not depend on where the
+/// range starts: over sparse series with holes longer than their windows,
+/// for single and nested joins, aggregates, scalar ops and bare selectors,
+/// every point at a time is the same from every start at or before it, and
+/// present from all of them.
+#[test]
+fn raw_results_do_not_depend_on_the_start() {
+    use std::collections::BTreeMap;
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+    // In ms: mostly a second or two apart with up to 0.3 s of jitter,
+    // often a hole of 4 to 25 s.
+    let times = |rng: &mut Rng| -> Vec<u64> {
+        let mut t = 1_000_000u64 + rng.below(3000);
+        let mut out = vec![];
+        while t < 1_200_000 {
+            out.push(t);
+            let r = rng.below(100);
+            t += if r < 25 {
+                4000 + rng.below(22_000)
+            } else if r < 50 {
+                2000
+            } else {
+                1000
+            } + rng.below(300);
+        }
+        out
+    };
+    let queries = [
+        "rate(a[2s])",
+        "rate(a[3s]) + h",
+        "sum(rate(a[2s]))",
+        "count(rate(a[2s]))",
+        "count(rate(a[3s])) + count(deriv(g[3s]))",
+        "min(rate(a[2s]))",
+        "avg(rate(a[3s]))",
+        "rate(a[2s]) + on(i) deriv(g[3s])",
+        "rate(a[2s]) + on(i) idelta(g[2s])",
+        "sum(rate(a[2s]) + on(i) deriv(g[3s]))",
+        "sum(rate(a[2s])) + sum(idelta(g[3s]))",
+        r#"(rate(a{i="0"}[2s]) + h) * 2 + h"#,
+        r#"(rate(a{i="0"}[2s]) + rate(a{i="1"}[3s])) + rate(a{i="2"}[2s])"#,
+        "deriv(g[2s]) + h",
+        "max(idelta(g[2s])) / sum(rate(a[2s]))",
+        "irate(a[2s]) + h",
+        "avg_over_time(g[2s]) + rate(a[2s])",
+        "g + h",
+        r#"sum(g) + on() g{i="0"}"#,
+    ];
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    let mut failures = Vec::new();
+    for seed in 1..10u64 {
+        let mut rng = Rng(seed);
+        let mut m = Memory::new(1000);
+        for i in 0..3 {
+            let labels = make_labels(&[("i", &i.to_string())]);
+            let ts = times(&mut rng);
+            let mut acc = 0u64;
+            let values: Vec<u64> = ts
+                .iter()
+                .map(|_| {
+                    acc += rng.below(50);
+                    acc
+                })
+                .collect();
+            m.add_counter(
+                "a",
+                Counter {
+                    labels: labels.clone(),
+                    timestamps: ts.iter().map(|ms| ms * 1_000_000).collect(),
+                    values,
+                    windows: None,
+                },
+            );
+            let ts = times(&mut rng);
+            let values: Vec<i64> = ts.iter().map(|_| rng.below(100) as i64).collect();
+            m.add_gauge(
+                "g",
+                Gauge {
+                    labels,
+                    timestamps: ts.iter().map(|ms| ms * 1_000_000).collect(),
+                    values,
+                    windows: None,
+                },
+            );
+        }
+        let ts = times(&mut rng);
+        m.add_gauge(
+            "h",
+            Gauge {
+                labels: Labels::default(),
+                timestamps: ts.iter().map(|ms| ms * 1_000_000).collect(),
+                values: vec![1; ts.len()],
+                windows: None,
+            },
+        );
+        let engine = QueryEngine::new(Arc::new(m));
+        for q in queries {
+            // (labels, ms) -> (start, value) from each start.
+            let mut by: BTreeMap<(String, u64), Vec<(u64, f64)>> = BTreeMap::new();
+            let starts: Vec<u64> = (2060..2240).step_by(2).collect();
+            for &half in &starts {
+                let start = half as f64 / 2.0;
+                let r = engine
+                    .query_range_opts(q, start, 1150.0, 1.0, &raw)
+                    .unwrap();
+                let QueryResult::Matrix { result } = r else {
+                    panic!("{q}: not a matrix");
+                };
+                for s in result {
+                    let mut k: Vec<_> = s.metric.iter().collect();
+                    k.sort();
+                    for (t, v) in s.values {
+                        assert!(v.is_finite(), "seed {seed} {q} from {start}: {t} {v}");
+                        by.entry((format!("{k:?}"), (t * 1000.0).round() as u64))
+                            .or_default()
+                            .push((half, v));
+                    }
+                }
+            }
+            for ((k, t), vs) in &by {
+                let v0 = vs[0].1;
+                let differ = vs
+                    .iter()
+                    .any(|(_, v)| (v - v0).abs() > 1e-9 * v0.abs().max(1.0));
+                let from = starts.iter().filter(|s| **s * 500 <= *t).count();
+                if differ || vs.len() != from {
+                    failures.push(format!(
+                        "seed {seed} {q} {k} at {}: {} of {from} starts, {:?}",
+                        *t as f64 / 1000.0,
+                        vs.len(),
+                        &vs[..vs.len().min(3)]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} differ, first: {:#?}",
+        failures.len(),
+        &failures[..failures.len().min(10)]
+    );
+}
+
+/// The first sample a raw `irate` reads is a timing point, so the point
+/// after it is held for the gap between them: from 1013 s the read starts
+/// after 1000 s, 1010 s is the first sample read, and the point at 1011 s
+/// is held 1 s, not to 1013 s.
+#[test]
+fn a_raw_irate_after_the_first_sample_read_is_held_for_its_gap() {
+    const S: u64 = 1_000_000_000;
+    let ts: Vec<u64> = [1000u64, 1010, 1011]
+        .into_iter()
+        .chain(1030..=1040)
+        .collect();
+    let mut m = Memory::new(1000);
+    m.add_counter(
+        "a",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.iter().map(|s| s * S).collect(),
+            values: ts.iter().map(|t| t - 1000).collect(),
+            windows: None,
+        },
+    );
+    m.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000..=1040u64).map(|s| s * S).collect(),
+            values: vec![1; 41],
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for start in [1000.5, 1005.0, 1013.0] {
+        let r = engine
+            .query_range_opts("irate(a[2s]) + h", start, 1020.0, 1.0, &raw)
+            .unwrap();
+        let got = points_from(&r, 1013.0);
+        assert!(got.is_empty(), "from {start}: {got:?}");
+    }
+}
+
+/// A raw join holds a slow series across its own spacing: a gauge read
+/// every 10 s beside one read every second gives a point every second,
+/// since the hold bound covers two of the longest interval read.
+#[test]
+fn a_raw_join_holds_a_slow_series_across_its_spacing() {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+    const S: u64 = 1_000_000_000;
+    let gauge = |interval_ms: u64, name: &str, ts: Vec<u64>| -> Arc<dyn DataSource> {
+        let mut m = Memory::new(interval_ms);
+        m.add_gauge(
+            name,
+            Gauge {
+                labels: Labels::default(),
+                timestamps: ts.iter().map(|s| s * S).collect(),
+                values: vec![1; ts.len()],
+                windows: None,
+            },
+        );
+        Arc::new(LabeledSource::new(
+            Arc::new(m),
+            make_labels(&[("source", name)]),
+        ))
+    };
+    let slow = gauge(10_000, "g", (1000..=1100).step_by(10).collect());
+    let fast = gauge(1000, "h", (1000..=1100).collect());
+    let engine = QueryEngine::new(Arc::new(RecordingsSource::new(vec![slow, fast])));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    let r = engine
+        .query_range_opts("sum(g) + sum(h)", 1050.0, 1080.0, 1.0, &raw)
+        .unwrap();
+    let times: Vec<f64> = points_from(&r, 0.0).into_iter().map(|(t, _)| t).collect();
+    let want: Vec<f64> = (1050..=1080u64).map(|t| t as f64).collect();
+    assert_eq!(times, want);
+}
+
+/// A raw join nested in another holds as the outer join needs from any
+/// start: the read reaches back twice the hold bound for each nested join.
+#[test]
+fn a_nested_raw_join_is_the_same_from_any_start() {
+    let gauge = |m: &mut Memory, name: &str, ms: &[u64], values: &[i64]| {
+        m.add_gauge(
+            name,
+            Gauge {
+                labels: Labels::default(),
+                timestamps: ms.iter().map(|t| t * 1_000_000).collect(),
+                values: values.to_vec(),
+                windows: None,
+            },
+        );
+    };
+    let mut m = Memory::new(1000);
+    gauge(&mut m, "a", &[994_600, 996_200, 999_000], &[1, 2, 3]);
+    gauge(&mut m, "b", &[998_100, 999_000], &[10, 20]);
+    gauge(&mut m, "c", &[1_000_000, 1_001_000], &[100, 100]);
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    let q = "(a + b) + c";
+    let late = engine
+        .query_range_opts(q, 1000.0, 1001.0, 1.0, &raw)
+        .unwrap();
+    let early = engine
+        .query_range_opts(q, 990.0, 1001.0, 1.0, &raw)
+        .unwrap();
+    assert_eq!(points_from(&late, 1000.0), points_from(&early, 1000.0));
+
+    // Each nested join reads back twice the bound: here the inner join's
+    // operand `a` needs its sample at 992.9 s, more than three bounds (of
+    // 2 s) before a start at 1000 s.
+    let mut m = Memory::new(1000);
+    gauge(&mut m, "a", &[992_900, 994_500, 998_100], &[1, 2, 3]);
+    gauge(&mut m, "b", &[996_000, 996_400, 998_100], &[10, 20, 30]);
+    gauge(&mut m, "c", &[1_000_000, 1_001_000], &[100, 100]);
+    let engine = QueryEngine::new(Arc::new(m));
+    for q in ["(a + b) + c", "sum(a + b) + c", "sum(sum(a + b) + c)"] {
+        let late = engine
+            .query_range_opts(q, 1000.0, 1001.0, 1.0, &raw)
+            .unwrap();
+        let early = engine
+            .query_range_opts(q, 980.0, 1001.0, 1.0, &raw)
+            .unwrap();
+        assert_eq!(
+            points_from(&late, 1000.0),
+            points_from(&early, 1000.0),
+            "{q}"
+        );
+    }
+
+    // Three nested joins: `a`'s sample at 988.9 s, more than five bounds
+    // before the start, decides the result at 1000 s, so each join below
+    // the first adds two bounds to the read, not one.
+    let mut m = Memory::new(1000);
+    gauge(&mut m, "a", &[988_900, 990_950, 994_500, 998_100], &[1; 4]);
+    gauge(&mut m, "b", &[992_900, 994_500, 998_100], &[1; 3]);
+    gauge(&mut m, "c", &[996_000, 996_400, 998_100], &[1; 3]);
+    gauge(&mut m, "d", &[1_000_000, 1_001_000], &[1; 2]);
+    let engine = QueryEngine::new(Arc::new(m));
+    let q = "((a + b) + c) + d";
+    let late = engine
+        .query_range_opts(q, 1000.0, 1001.0, 1.0, &raw)
+        .unwrap();
+    let early = engine
+        .query_range_opts(q, 980.0, 1001.0, 1.0, &raw)
+        .unwrap();
+    assert_eq!(
+        points_from(&late, 1000.0),
+        points_from(&early, 1000.0),
+        "{q}"
+    );
+    assert!(!points_from(&early, 1000.0).is_empty(), "{q}");
+}
+
+/// A raw `irate` spans a missed tick with jitter, at any step: its pair may
+/// be up to four of the counter's interval apart.
+#[test]
+fn a_raw_irate_spans_a_missed_tick() {
+    let mut ts: Vec<u64> = (1000..=1010).map(|s| s * 1_000_000_000).collect();
+    ts.extend([1_012_100_000_000, 1_013_100_000_000]);
+    let values: Vec<u64> = (0..ts.len() as u64).map(|i| i * 100).collect();
+    let mut m = Memory::new(1000);
+    m.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts,
+            values,
+            windows: None,
+        },
+    );
+    // A pair of 3.5 s just before a range from 1004.5: the read reaches the
+    // pair's first sample, so its point at 1003.5 is held into the range.
+    let mut m2 = Memory::new(1000);
+    let ts2: Vec<u64> = (990..=1000u64)
+        .map(|s| s * 1_000_000_000)
+        .chain([1_003_500_000_000])
+        .collect();
+    m2.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            values: (0..ts2.len() as u64).map(|i| i * 100).collect(),
+            timestamps: ts2,
+            windows: None,
+        },
+    );
+    m2.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (990..=1010u64).map(|s| s * 1_000_000_000).collect(),
+            values: vec![1; 21],
+            windows: None,
+        },
+    );
+    let engine2 = QueryEngine::new(Arc::new(m2));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for start in [995.0, 1004.5] {
+        let r = engine2
+            .query_range_opts("irate(c[1s]) + h", start, 1006.0, 1.0, &raw)
+            .unwrap();
+        let at = points_from(&r, 1005.0).first().copied();
+        assert_eq!(at, Some((1005.0, 100.0 / 3.5 + 1.0)), "from {start}");
+    }
+    let engine = QueryEngine::new(Arc::new(m));
+    for step in [1.0, 5.0] {
+        let r = engine
+            .query_range_opts("irate(c[1s])", 1005.0, 1014.0, step, &raw)
+            .unwrap();
+        let at = points_from(&r, 1012.0).first().copied();
+        assert!(
+            at.is_some_and(|(t, v)| (t - 1012.1).abs() < 1e-9 && (v - 100.0 / 2.1).abs() < 1e-6),
+            "step {step}: {at:?}"
+        );
+    }
+}
+
+/// In raw mode, a series whose function gives no value at a sample is left
+/// out of an aggregate there, directly or through a scalar op: the sum is over
+/// the series that have a value.
+#[test]
+fn a_raw_aggregate_skips_a_series_with_no_value() {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(1000);
+    // `c{id="gap"}` misses 1040 to 1059, more than four of its interval, so
+    // its irate at 1060 has no value; `c{id="full"}` reads every second.
+    for (id, ts) in [
+        (
+            "gap",
+            (1000..=1100u64)
+                .filter(|s| !(1040..1060).contains(s))
+                .collect::<Vec<_>>(),
+        ),
+        ("full", (1000..=1100u64).collect()),
+    ] {
+        m.add_counter(
+            "c",
+            Counter {
+                labels: make_labels(&[("id", id)]),
+                values: ts.iter().map(|s| (s - 1000) * 10).collect(),
+                timestamps: ts.iter().map(|s| s * S).collect(),
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for (q, want) in [("sum(irate(c[5s]))", 10.0), ("sum(2 * irate(c[5s]))", 20.0)] {
+        let r = engine
+            .query_range_opts(q, 1000.0, 1070.0, 1.0, &raw)
+            .unwrap();
+        let at = points_from(&r, 1060.0).first().copied();
+        assert_eq!(at, Some((1060.0, want)), "{q}");
     }
 }

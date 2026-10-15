@@ -819,10 +819,9 @@ mod reader_tests {
             segs[i].push(r.clone());
         }
         let per_series = crate::QueryOptions::default().with_per_series_rates(true);
-        let span = crate::QueryOptions::default().with_rate_span_ns(Some(3_000_000_000));
-        let span_per_series = span.clone().with_per_series_rates(true);
         let queries = [
             "rate(cpu[3s])",
+            "rate(cpu[1s])",
             "irate(cpu[3s])",
             "sum(rate(cpu[3s]))",
             "avg(irate(cpu[3s]))",
@@ -856,16 +855,6 @@ mod reader_tests {
                     let what = format!("{layout} {q} [{start}, {end}] step {step}");
                     assert_close(&batch, &streams, &what);
                 }
-                let r = SegmentedParquetReader::open_bytes_with_pool(
-                    bytes.clone(),
-                    BufferPool::new(64 << 20),
-                )
-                .unwrap();
-                let batch = r.query_range_opts(q, 1.0, 60.0, 1.0, &span).unwrap();
-                let streams = r
-                    .query_range_opts(q, 1.0, 60.0, 1.0, &span_per_series)
-                    .unwrap();
-                assert_close(&batch, &streams, &format!("{layout} {q} span 3s"));
             }
         }
     }

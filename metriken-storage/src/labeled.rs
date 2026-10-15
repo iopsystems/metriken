@@ -134,9 +134,11 @@ impl LabeledSource {
         }
     }
 
-    /// Report `interval` (seconds) rather than the source's own. A segment
-    /// that declares no interval reports 1 s; pass the spacing measured from
-    /// the recording's rows.
+    /// Report `interval` (seconds) rather than the source's own, hold its
+    /// gauges for it ([`gauge_parts`](DataSource::gauge_parts)), and set it
+    /// on each counter series it returns. A segment that
+    /// declares no interval reports 1 s; pass the spacing measured from the
+    /// table's rows.
     pub fn with_interval(mut self, interval: f64) -> Self {
         self.interval = Some(interval).filter(|i| *i > 0.0);
         self
@@ -196,6 +198,9 @@ impl DataSource for LabeledSource {
             .counter_streams(name, &inner_filter, start_ns, end_ns)?;
         for s in &mut streams {
             self.relabel(&mut s.labels);
+            if self.interval.is_some() {
+                s.interval = self.interval;
+            }
         }
         streams.retain(|s| keeps(&s.labels, &self.extra, filter));
         (!streams.is_empty()).then_some(streams)
@@ -241,6 +246,9 @@ impl DataSource for LabeledSource {
             .counter_scan(name, &inner_filter, start_ns, end_ns)?;
         for s in &mut scan.series {
             self.relabel(&mut s.labels);
+            if self.interval.is_some() {
+                s.interval = self.interval;
+            }
         }
         // A scan's series are positions in its chunks, so one cannot be
         // dropped here; a filter that needs the exact `exported_` check
@@ -265,6 +273,37 @@ impl DataSource for LabeledSource {
             .series
             .retain(|g| keeps(&g.labels, &self.extra, filter));
         (!gauges.series.is_empty()).then_some(gauges)
+    }
+
+    /// With an interval set, the gauges as one part at that interval; else
+    /// the source's parts, relabelled.
+    fn gauge_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+    ) -> Option<Vec<(Gauges, f64)>> {
+        if let Some(interval) = self.interval {
+            let lookback_ns = step_ns.max((interval * 1e9) as u64);
+            let gauges = self.gauges(name, filter, start_ns.saturating_sub(lookback_ns), end_ns)?;
+            return Some(vec![(gauges, interval)]);
+        }
+        let inner_filter = translate_filter(&self.extra, filter)?;
+        let mut parts = self
+            .inner
+            .gauge_parts(name, &inner_filter, start_ns, end_ns, step_ns)?;
+        for (gauges, _) in &mut parts {
+            for g in &mut gauges.series {
+                self.relabel(&mut g.labels);
+            }
+            gauges
+                .series
+                .retain(|g| keeps(&g.labels, &self.extra, filter));
+        }
+        parts.retain(|(g, _)| !g.series.is_empty());
+        (!parts.is_empty()).then_some(parts)
     }
 
     fn histogram_stream(
@@ -301,6 +340,21 @@ impl DataSource for LabeledSource {
 
     fn interval(&self) -> f64 {
         self.interval.unwrap_or_else(|| self.inner.interval())
+    }
+
+    fn histogram_interval(&self, name: &str) -> f64 {
+        self.interval
+            .unwrap_or_else(|| self.inner.histogram_interval(name))
+    }
+
+    fn counter_interval(&self, name: &str) -> f64 {
+        self.interval
+            .unwrap_or_else(|| self.inner.counter_interval(name))
+    }
+
+    fn gauge_interval(&self, name: &str) -> f64 {
+        self.interval
+            .unwrap_or_else(|| self.inner.gauge_interval(name))
     }
 
     /// The keys this adds, and the source's own.
@@ -514,6 +568,7 @@ mod tests {
                 .map(|labels| ScanSeries {
                     labels,
                     windowed: false,
+                    interval: None,
                 })
                 .collect();
             Some(CounterScan::new(series, Box::new(NoChunks)))
@@ -616,6 +671,24 @@ mod tests {
                 labels(&[("exported_host", "lb"), ("host", "lb"), ("source", "svc")]).inner,
             ]
         );
+    }
+
+    /// With an interval, every counter series returned carries it, on the
+    /// stream and the scan path; without, none does.
+    #[test]
+    fn counter_series_carry_the_interval() {
+        let timed = labeled().with_interval(10.0);
+        let streams = timed
+            .counter_streams("c", &Labels::default(), 0, 9)
+            .unwrap();
+        assert!(streams.iter().all(|s| s.interval == Some(10.0)));
+        let scan = timed.counter_scan("c", &Labels::default(), 0, 9).unwrap();
+        assert!(scan.series.iter().all(|s| s.interval == Some(10.0)));
+        let plain = labeled();
+        let streams = plain
+            .counter_streams("c", &Labels::default(), 0, 9)
+            .unwrap();
+        assert!(streams.iter().all(|s| s.interval.is_none()));
     }
 
     /// `exported_` matchers are decided on the relabelled series.

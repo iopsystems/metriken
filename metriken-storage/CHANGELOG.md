@@ -29,7 +29,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different instants; and `histogram_stream::common_config`.
 - `DataSource::recording_label_keys` and `DataSource::gauge_parts`, with
   defaults (no keys; one part at `interval`). `LabeledSource` reports its
-  added keys and takes an interval to report (`with_interval`).
+  added keys and takes an interval to report and hold its gauges for
+  (`with_interval`); without one, its gauge parts are its source's.
+  `UnionSource` answers `gauge_parts` from the table holding the name, so
+  each table's gauges are held for that table's interval.
+- `DataSource::histogram_interval(name)`: the row spacing of the table
+  holding histogram `name`, defaulting to `interval`. `LabeledSource`
+  reports its interval, `UnionSource` the holding table's, and
+  `RecordingsSource` the longest among the recordings holding it.
+- `DataSource::counter_interval(name)` and `gauge_interval(name)`: the row
+  spacing of the table holding counter or gauge `name`, defaulting to
+  `interval`, answered as `histogram_interval` is. metriken-query reads a
+  `rate` back by `counter_interval` and bounds a raw join's hold by all
+  three. `MultiParquetSource` answers all three with the longest interval
+  among the files holding the name (it answered `histogram_interval` with
+  its finest file's).
+- `CounterStream::interval` and `ScanSeries::interval`: the row spacing of
+  the table a counter series is read from, where the source knows it.
+  `LabeledSource::with_interval` sets it on every counter series it
+  returns, and `RecordingsSource` and `MultiParquetSource` set each
+  child's `counter_interval` on a series that has none, so no series
+  carries an interval longer than its source's `counter_interval`.
+  Breaking for code that builds either with a struct literal.
 - `is_matched_label`: whether binary-operator matching and `without`
   consider a label (every non-internal label, and `__recording__`).
 - `SamplerReader::interval`, `holds_counter` and `holds_gauge`.
@@ -43,6 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `GroupTableBuilder` wrote each row of a histogram to a new column when
+  the descriptor's metadata did not carry `grouping_power` and
+  `max_value_power`: it stamps both on the column from the first cell, and
+  then, comparing the stamped metadata with the descriptor's, started a new
+  column on every row. A query read one series per row and found no two
+  rows of one series to take a delta from. A cell's configuration is now
+  compared in place of the descriptor's when the descriptor lacks it, so a
+  cell of another configuration starts a column of its own and a row with
+  no value, first or not, continues the column. Descriptors from
+  metriken-exposition carry both and were not affected.
 - `HistogramStream::merge` decoded every stream under the first stream's
   bucket configuration, checked only by a `debug_assert!`, so a release build
   read a differently configured stream's buckets as other buckets. It now

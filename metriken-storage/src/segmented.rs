@@ -1046,6 +1046,7 @@ impl SegmentedSource {
             series.push(ScanSeries {
                 labels: l.clone(),
                 windowed,
+                interval: None,
             });
         }
         if series.is_empty() {
@@ -1532,6 +1533,7 @@ impl DataSource for SegmentedSource {
             out.push(crate::CounterStream {
                 labels,
                 windowed,
+                interval: None,
                 samples: Box::new(samples),
             });
         }

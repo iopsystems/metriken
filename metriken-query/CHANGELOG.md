@@ -18,46 +18,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rust 1.88.
 - `lru` is no longer a dependency; this crate did not use it. (It was 0.12,
   which carries GHSA-rhfx-m35p-ff5j.)
+- **Breaking:** `rate(x[range])` is the rate over `[t - range, t]`: the
+  increase of the reset-adjusted counter, interpolated at both ends, over
+  the range. It was the rate over one step with the `[range]` ignored, the
+  same as `irate`. This holds on the grid, at explicit evaluation timestamps
+  (where it was the rate over the gap from the preceding timestamp), and in
+  `RateMode::Raw`, where `rate` is evaluated at each sample over the
+  `[range]` before it (it was the rate from the previous sample). The value
+  at `t - range` is interpolated from the sample before it when that sample
+  is within two of the series' interval: its table's, where the source sets
+  it on the series (an archive does, per table), else metriken-storage's
+  `counter_interval`. Otherwise (the series starts later, or has a gap
+  there) the window starts at the first sample after `t - range`, where
+  Prometheus extrapolates, and with no sample in `(t - range, t)` such a
+  window gives no point. A point's value does not depend on where the query
+  starts, up to floating-point rounding, except a point held past a series'
+  last sample when the series' rows are further apart than two of its
+  interval. `irate(x[range])` is unchanged: the rate over one step on the
+  grid, over the gap from the preceding timestamp at explicit points, and
+  between consecutive samples in raw mode; its `[range]` is not used. A
+  query written for the per-step rate is `irate(x[..])`, or `rate(x[s])` at
+  a step of `s`. A `rate` is read from its range and four of
+  `counter_interval` before the first point, and a series holds that range's
+  samples in memory while it is evaluated.
+- **Breaking:** `QueryOptions::rate_span_ns` and `with_rate_span_ns` are
+  removed: a `rate`'s window is its `[range]`.
 - **Breaking:** a binary operator between two series sets is one-to-one, as
   in PromQL. Two right series with points in the range that share a match
   key are an error (`many-to-many matching not allowed`), and so are two
-  left series with points that match one right series (`multiple matches
-  for labels`; `group_left` is not supported). The right side's last series
-  of a shared key used to be kept and the others dropped, and only the
-  first left series of a match group was paired with its right series. A
-  series without points in the range takes no part. The check covers the
-  whole range, where Prometheus checks each step, so two series that share
-  a key at different times in the range are refused.
+  left series with points that match one right series (`multiple matches for
+  labels`; `group_left` is not supported). The right side's last series of a
+  shared key used to be kept and the others dropped, and only the first left
+  series of a match group was paired with its right series. A series without
+  points in the range takes no part; a raw series' point before the range
+  counts when it is held to the range's start, and a timing point never
+  does. The check covers the whole range, where Prometheus checks each step,
+  so two series that share a key at different times in the range are
+  refused.
 - **Breaking:** an archive's series carry their recording's labels
   (`source`, `host`, any `record --label`), and a query naming a metric that
-  several recordings of an archive hold is answered from all of them
-  instead of being refused as cross-recording. The query is evaluated by one
-  engine over every recording it reaches (metriken-storage's
-  `RecordingsSource`), so the same metric in two recordings is two sets of
-  series and combines as PromQL combines series: `rate(x[1m])` returns each
-  recording's series, `x{source="vllm"}` selects one, `sum(x)` sums all of
-  them, `sum by (source) (...)` gives one sum per recording, and `g / h`
-  pairs each recording's `g` with its own `h`. A single recording's series
-  carry its labels too. A series that already carries one of the keys keeps
-  its own value under `exported_<key>`; recordings with identical label sets
-  get `__recording__` (their catalog index) so their series stay apart. A
+  several recordings of an archive hold is answered from all of them instead
+  of being refused as cross-recording. The query is evaluated by one engine
+  over every recording it reaches (metriken-storage's `RecordingsSource`),
+  so the same metric in two recordings is two sets of series and combines as
+  PromQL combines series: `rate(x[1m])` returns each recording's series,
+  `x{source="vllm"}` selects one, `sum(x)` sums all of them,
+  `sum by (source) (...)` gives one sum per `source`, and `g / h` pairs each
+  recording's `g` with its own `h`. A single recording's series carry its
+  labels too. A series that already carries one of the keys keeps its own
+  value under `exported_<key>`; recordings with identical label sets get
+  `__recording__` (their catalog index) so their series stay apart. A
   recording whose labels no selector of the query can match is left out
   first; when that leaves out every recording holding a metric the query
-  names, the answer is empty, also for a query the engine would reject
-  (such as `x or y`), whose error is then not reached. On an archive of several recordings, an
-  instant query without a time reads at the archive's end, whether or not a
-  matcher narrows it to one recording. A selector that matches one label
-  twice is refused, for any label and on any archive, single-recording ones
-  included: the filter applies one matcher per label (the last), so
-  `{source!="a", source!="b"}` let `a` through and `{id=~"1.*", id!="10"}`
-  silently became `id!="10"`; `source!~"a|b"` answers the first. A parquet
-  file read through `ParquetReader` still applies the last matcher
-  silently. `columns` resolves through the same labels. Refused across
-  recordings: a metric that is a different kind in two recordings a query
-  reaches, and a result holding one label set twice (a recording carrying
-  `host` as a recording label and another carrying it on its series), as
-  Prometheus refuses a vector with duplicate label sets. Within a
-  recording, a metric name two samplers share is still refused.
+  names, the answer is empty, also for a query the engine would reject (such
+  as `x or y`), whose error is then not reached. On an archive of several
+  recordings, an instant query without a time reads at the archive's end,
+  whether or not a matcher narrows it to one recording. A selector that
+  matches one label twice is refused, for any label and on any archive,
+  single-recording ones included: the filter applies one matcher per label
+  (the last), so `{source!="a", source!="b"}` let `a` through and
+  `{id=~"1.*", id!="10"}` silently became `id!="10"`; `source!~"a|b"`
+  answers the first. A parquet file read through `ParquetReader` still
+  applies the last matcher silently. `columns` resolves through the same
+  labels. Refused across recordings: a metric that is a different kind in
+  two recordings a query reaches, and a result holding one label set twice
+  (a recording carrying `host` as a recording label and another carrying it
+  on its series), as Prometheus refuses a vector with duplicate label sets.
+  Within a recording, a metric name two samplers share is still refused.
 - A query across recordings is evaluated with each recording's own rows,
   cadence and interval: a gauge is held for its own recording's interval
   (the interval the archive measures from the recording's rows, where a
@@ -77,24 +104,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only in one recording and `y` only in another is empty, as in
   Prometheus. A source with no recording keys keeps the old rule.
 - A `rate`/`irate` on the grid is held past a series' last sample when that
-  sample is within the series' typical spacing of the range's end: the
-  point is the rate over the same span ending at the last sample. A series
-  whose rows fall between the grid's points used to have no point at the
-  range's end, so a `sum` across series out of phase dropped the ones that
-  read last before it. A series that stops earlier in the range is not
-  held. On one recording this adds the grid points between a series' last
-  row and the range's end, when that row is within the series' typical
-  spacing of the end: up to that spacing over the step.
-- In `RateMode::Raw`, aggregations and binary operators combine series read
-  at different instants: a point at every timestamp any of them has, each
-  series contributing its latest point while that point is no older than
-  the gap before it, its last point before the range included (read back
-  the `[range]`, and at least two steps or two of the source's intervals).
-  On exact timestamps a raw-mode `sum` over two acquisition groups or
-  recordings alternated between them, and `x / y` across two groups was
-  empty. A
-  raw-mode result no longer includes points before the range's start
-  (a bare gauge selector returned its lookback rows).
+  sample is less than the series' typical spacing before the range's end (so
+  its next row would fall after the end): the point is the rate over the
+  same span ending at the last sample. A series whose rows fall between the
+  grid's points used to have no point at the range's end, so a `sum` across
+  series out of phase dropped the ones that read last before it. A series
+  that stops earlier in the range is not held. On one recording this adds
+  the grid points between a series' last row and the range's end, when that
+  row is within the series' typical spacing of the end: up to that spacing
+  over the step.
+- **Breaking:** in `RateMode::Raw`, aggregations and binary operators
+  combine series read at different instants: a point at every timestamp any
+  of them has, each series contributing its latest point while that point is
+  no older than the gap before it, and at most a hold bound: two steps, or
+  two of the longest interval of a metric the query reads
+  (`DataSource::counter_interval`, `gauge_interval` or
+  `histogram_interval`), whichever is longer. A series' first point is held
+  for the bound; the hold so depends on the step. A raw producer emits a
+  point at every sample it reads; where its function gives no value (a
+  window holding too little, or a raw `irate` pair further apart than four
+  of the counter's interval), the sample is a timing point with no value,
+  which a join measures the next point's gap from and passes on when nothing
+  else gives it a value. Every raw read starts twice the bound for each join
+  the query nests, and the function's window, before the range, so which
+  points a result has and their values do not depend on where the range
+  starts, up to floating-point rounding. A rate's band and its interpolated
+  flag treat a gap longer than twice the median spacing of the first nine
+  samples read as a hole, so on a series whose spacing changes they can
+  depend on where the range starts. A source whose interval understates a
+  series' spacing (one interval for tables read at different cadences) gives
+  a raw `irate` of the slower series no value and holds its points for less
+  than its spacing. On exact timestamps a raw-mode `sum` over two
+  acquisition groups or recordings alternated between them, and `x / y`
+  across two groups was empty. A raw-mode result includes no points before
+  the range's start (a bare gauge selector returned its lookback rows) and
+  no timing points.
+- An operator over two rates read too far apart to bound together (their
+  spans share no time, as for a slow series' rate held at a range's end
+  beside a current one) gives the value with no band, and the point is
+  marked interpolated, as a point across a hole is. Widened over the union
+  of both reads, such a band has no shortest span; it was left unwidened,
+  so the band narrowed to its tightest exactly where the operands were
+  furthest apart.
+- **Breaking:** `deriv(x[range])` is the least-squares slope of the samples
+  in `[t - range, t]`, as in PromQL. It was the slope over
+  `[t - 2 * step, t + step]`, which ignored the range, read a step past `t`,
+  and was empty where fewer than two samples fell in that window, such as a
+  10 s gauge at a 1 s step. Over a counter it is the slope of the counter's
+  values, as in PromQL; it was the slope of the counter's rate.
+
+### Fixed
+
+- A negative rate band (a negated rate's, or a product with a negative
+  side) was not widened when combined with an operand from another table:
+  the widening scaled each end toward or away from zero by a ratio chosen
+  for positive ends, and keeping the wider of old and new left a negative
+  band as it was. Each end now takes whichever ratio moves it away from
+  the value, so `(-1 * a) * b` has the band of `-1 * (a * b)`.
+- An instant query was evaluated at the requested time rounded down to a
+  multiple of the source's interval: at 67.9 s on a 1 s source it read
+  67 s, and on a source whose interval is 10 s it read 60 s for any time
+  from 60 s to 69.9 s. A range of one point is no longer moved to the step
+  grid.
+- A gauge was held for the interval of the fastest table its recording's
+  query read, so a 10 s table's gauge in a query that also read a 1 s
+  table had no value more than 1 s after each of its rows: `rate(c[1m]) /
+  g` was empty at an instant between the slow table's rows. Each table's
+  gauges are held for that table's measured interval.
+- A histogram function's first point in a range was missing when no row
+  fell on the range's start, because the row before the start was not read
+  to take a delta from. A histogram is read from two of its rows before the
+  range; points are emitted from the start.
+- An instant query of a histogram function returned nothing unless a row
+  fell on the requested time. It reads back five minutes, Prometheus's
+  default lookback, and returns each series' latest point, at that point's
+  own time (the tick's row). `histogram_heatmap` is not read back: its
+  instant is the heatmap of the one-point range, as before.
+- `deriv` returned values near 0 for timestamps at the current epoch: the
+  least-squares fit used seconds since 1970, whose squares near 3e18 left
+  no precision in the denominator. It now fits seconds from the point's
+  time.
+- In `RateMode::Raw`, a `rate`/`irate` point carries a band when both
+  samples have acquisition windows and the windows do not overlap (and, for
+  `rate`, when neither edge falls in a gap longer than twice the typical
+  spacing of the first samples read), from the two reads' windows as on the
+  grid (the increase over the latest end less
+  the earliest begin, and over the later begin less the earlier end); it had
+  none. A raw operator combines its operands' bands as they are: an operand
+  held from an earlier read is not widened to the union of both reads, as a
+  grid operand from another table is.
+- Explicit evaluation timestamps (`QueryOptions::eval_timestamps`, and the
+  slow sampler's rows a query combining samplers of different cadence is
+  evaluated at) before the range's start are no longer points of the
+  result. One before the start is still the left edge of the first rate.
+- In `RateMode::Raw`, the point before the range of `avg_over_time`,
+  `idelta` or `deriv`, which a join holds at the range's start, was
+  computed over the part of its window inside `[start - range, end]`. The
+  read now reaches the window of that point too.
 
 ## [0.36.1] - 2026-10-12
 

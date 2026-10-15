@@ -230,6 +230,50 @@ pub enum QueryResult {
     HistogramHeatmap { result: HistogramHeatmapResult },
 }
 
+/// Where to read histogram `name` from for a range starting at `start_ns`:
+/// two of its rows earlier, so the range's first row has the row before it
+/// to take a delta from. Points are emitted from `start_ns` only.
+pub(crate) fn histogram_read_start(
+    source: &dyn crate::DataSource,
+    name: &str,
+    start_ns: u64,
+) -> u64 {
+    let interval_ns = (source.histogram_interval(name).max(0.0) * 1e9) as u64;
+    start_ns.saturating_sub(2 * interval_ns)
+}
+
+/// How far back an instant query of a histogram function reads, in
+/// seconds: Prometheus's default lookback for an instant vector.
+const INSTANT_LOOKBACK_S: f64 = 300.0;
+
+/// Whether `query` calls one of the histogram functions that give a value
+/// per tick. `histogram_heatmap` is left out: its instant is the heatmap of
+/// the one-point range.
+fn calls_histogram_function(query: &str) -> bool {
+    const FUNCTIONS: [&str; 7] = [
+        "histogram_quantile",
+        "histogram_quantiles",
+        "histogram_percentiles",
+        "histogram_mean",
+        "histogram_count",
+        "histogram_sum",
+        "histogram_irate",
+    ];
+    let bytes = query.as_bytes();
+    query.match_indices("histogram_").any(|(at, _)| {
+        let starts_word =
+            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        let rest = &query[at..];
+        let name_len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        starts_word
+            && FUNCTIONS.contains(&&rest[..name_len])
+            && rest[name_len..].trim_start().starts_with('(')
+    })
+}
+
 /// How far beyond a query range's bounds samples are still read, in
 /// nanoseconds.
 ///
@@ -247,9 +291,9 @@ pub(crate) fn range_start_ns(start: f64) -> u64 {
     (start * 1e9).round() as u64
 }
 
-/// A query range's start for a read with no lookback (the histogram
-/// handlers): rounded, then moved [`RANGE_SLACK_NS`] earlier so a sample at
-/// the start is read.
+/// Where the histogram handlers start emitting: the range's start, rounded,
+/// then moved [`RANGE_SLACK_NS`] earlier so a sample at the start is
+/// included.
 pub(crate) fn range_read_start_ns(start: f64) -> u64 {
     range_start_ns(start).saturating_sub(RANGE_SLACK_NS)
 }
@@ -573,7 +617,15 @@ impl QueryEngine {
                 .unwrap_or(0.0)
         });
         let step = self.source.interval().max(1.0);
-        let result = self.query_range(query_str, target, target, step)?;
+        // A histogram function emits at the rows it reads, which an instant
+        // rarely falls on, and needs the row before for a delta: it reads
+        // back the lookback, and each series' latest point is kept below.
+        let start = if calls_histogram_function(query_str) {
+            target - INSTANT_LOOKBACK_S
+        } else {
+            target
+        };
+        let result = self.query_range(query_str, start, target, step)?;
         let QueryResult::Matrix { result: samples } = result else {
             return Ok(result);
         };
@@ -710,9 +762,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stream = self
-            .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let stream = self.source.histogram_stream(
+            &metric_name,
+            &labels,
+            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            end_ns,
+        );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
             return Ok(QueryResult::Matrix { result: vec![] });
@@ -736,9 +791,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stream = self
-            .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let stream = self.source.histogram_stream(
+            &metric_name,
+            &labels,
+            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            end_ns,
+        );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
             return Ok(QueryResult::Matrix { result: vec![] });
@@ -767,9 +825,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stream = self
-            .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let stream = self.source.histogram_stream(
+            &metric_name,
+            &labels,
+            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            end_ns,
+        );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
             return Ok(QueryResult::Matrix { result: vec![] });
@@ -794,9 +855,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stream = self
-            .source
-            .histogram_stream(&metric_name, &labels, start_ns, end_ns);
+        let stream = self.source.histogram_stream(
+            &metric_name,
+            &labels,
+            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            end_ns,
+        );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
             return Ok(QueryResult::Matrix { result: vec![] });

@@ -34,8 +34,14 @@ pub(crate) struct GridRateRequest<'a> {
     pub end_ns: u64,
     /// The spacing of the grid points.
     pub step_ns: u64,
-    /// The averaging window per point; see `CounterGridRate`.
+    /// The window per point; see `CounterGridRate`.
     pub span_ns: u64,
+    /// `rate(x[r])` with `span_ns` as `r`: a window starts as
+    /// `CounterGridRate::over_range` says.
+    pub range: bool,
+    /// The reach of a series' window start (`range_start`), for a series
+    /// that does not carry its table's interval.
+    pub reach_ns: u64,
     /// Aggregate the series, or `None` for one result per series.
     pub group: Option<(AggOp, GroupBy<'a>)>,
     /// Reduce each series for display as its points are computed, or
@@ -81,6 +87,8 @@ struct Kept {
 /// out-of-order input gives points that differ from `CounterGridRate`'s.
 pub(crate) struct SeriesRate {
     windowed: bool,
+    /// The reach of a `rate`'s window start; see `range_start`.
+    reach_ns: u64,
     probe: Vec<Sample>,
     settled: bool,
     typical: u64,
@@ -109,9 +117,10 @@ struct Edge {
 }
 
 impl SeriesRate {
-    pub fn new(windowed: bool, start_ns: u64) -> Self {
+    pub fn new(windowed: bool, start_ns: u64, reach_ns: u64) -> Self {
         Self {
             windowed,
+            reach_ns,
             probe: Vec::new(),
             settled: false,
             typical: 1,
@@ -257,8 +266,10 @@ impl SeriesRate {
                 Some(next) => self.cursor_ns = next,
                 None => self.done = true,
             }
-            let Some(left) = t.checked_sub(grid.span_ns) else {
-                continue;
+            let left = match t.checked_sub(grid.span_ns) {
+                Some(left) => left,
+                None if grid.range => 0,
+                None => continue,
             };
             // Past the last sample, as `CounterGridRate` does: held when that
             // sample is within the typical spacing of the range's end,
@@ -274,6 +285,20 @@ impl SeriesRate {
                     self.done = true;
                     return;
                 }
+            };
+            let from = if grid.range {
+                match crate::promql::streaming::range_start(
+                    &self.kept,
+                    |k| k.ts,
+                    from,
+                    at,
+                    self.reach_ns,
+                ) {
+                    Some(from) => from,
+                    None => continue,
+                }
+            } else {
+                from
             };
             self.trim(from);
             if let Some(mut p) = self.point(at, from) {
@@ -379,8 +404,15 @@ impl SeriesRate {
             bounds,
             edges,
             interpolated,
+            timing: false,
         })
     }
+}
+
+/// A `rate`'s reach (`range_start`) for a table read every `interval_s`
+/// seconds: two intervals.
+pub(crate) fn interval_reach(interval_s: f64) -> u64 {
+    ((interval_s * 2e9) as u64).max(1)
 }
 
 /// The evaluation grid.
@@ -389,6 +421,8 @@ pub(crate) struct Grid {
     pub end_ns: u64,
     pub step_ns: u64,
     pub span_ns: u64,
+    /// See [`GridRateRequest::range`].
+    pub range: bool,
 }
 
 impl Grid {
@@ -398,6 +432,7 @@ impl Grid {
             end_ns: r.end_ns,
             step_ns: r.step_ns,
             span_ns: r.span_ns.max(1),
+            range: r.range,
         }
     }
 
@@ -508,6 +543,7 @@ fn group_point(
         bounds,
         edges,
         interpolated: any_interpolated,
+        timing: false,
     }
 }
 
@@ -893,7 +929,10 @@ pub(crate) fn grid_rates(
     let rates: Vec<SeriesRate> = scan
         .series
         .iter()
-        .map(|s| SeriesRate::new(s.windowed, request.start_ns))
+        .map(|s| {
+            let reach = s.interval.map_or(request.reach_ns, interval_reach);
+            SeriesRate::new(s.windowed, request.start_ns, reach)
+        })
         .collect();
     let labels: Vec<Labels> = std::mem::take(&mut scan.series)
         .into_iter()
@@ -1298,11 +1337,11 @@ mod tests {
 
     const S: u64 = 1_000_000_000;
 
-    fn batch(samples: &[Sample], windowed: bool, grid: &Grid) -> Vec<Point> {
+    fn batch(samples: &[Sample], windowed: bool, grid: &Grid, reach_ns: u64) -> Vec<Point> {
         let mut sink = PerSeries {
             points: vec![Vec::new()],
         };
-        let mut r = SeriesRate::new(windowed, grid.start_ns);
+        let mut r = SeriesRate::new(windowed, grid.start_ns, reach_ns);
         for s in samples {
             r.push(*s, grid, 0, &mut sink);
         }
@@ -1310,11 +1349,11 @@ mod tests {
         sink.points.pop().unwrap()
     }
 
-    fn streamed(samples: &[Sample], windowed: bool, grid: &Grid) -> Vec<Point> {
+    fn streamed(samples: &[Sample], windowed: bool, grid: &Grid, reach_ns: u64) -> Vec<Point> {
         let ts: Vec<u64> = samples.iter().map(|s| s.ts).collect();
         let vs: Vec<u64> = samples.iter().map(|s| s.value).collect();
         let ws = windowed.then(|| samples.iter().map(|s| s.window.unwrap()).collect());
-        CounterGridRate::new(
+        let rate = CounterGridRate::new(
             ts,
             &vs,
             grid.start_ns,
@@ -1322,8 +1361,12 @@ mod tests {
             grid.step_ns,
             grid.span_ns,
             ws,
-        )
-        .collect()
+        );
+        if grid.range {
+            rate.over_range(reach_ns).collect()
+        } else {
+            rate.collect()
+        }
     }
 
     /// Samples in increasing time order, with duplicates, resets and holes
@@ -1366,7 +1409,8 @@ mod tests {
 
     /// For samples in increasing time order, `SeriesRate` gives exactly
     /// `CounterGridRate`'s points: with duplicates at grid points, resets
-    /// and holes, windowed or not, on several steps and spans.
+    /// and holes, windowed or not, on several steps and spans, with and
+    /// without a `rate`'s `[range]`.
     #[test]
     fn series_rate_matches_counter_grid_rate() {
         for (class, dups, resets, holes) in [
@@ -1381,22 +1425,25 @@ mod tests {
                 let windowed = rng.below(2) == 0;
                 let input = samples(&mut rng, dups, resets, holes, windowed);
                 let step = [S, S / 2, 2 * S, 2_500_000_000][rng.below(4) as usize];
-                let span = if rng.below(2) == 0 {
-                    step
-                } else {
-                    step * (1 + rng.below(3))
+                let span = match rng.below(3) {
+                    0 => step,
+                    1 => step * (1 + rng.below(3)),
+                    _ => 1 + rng.below(step),
                 };
+                let range = rng.below(2) == 0;
+                let reach_ns = [0, S / 2, S, 2 * S, 10 * S][rng.below(5) as usize];
                 let start = rng.below(8) * step;
                 let grid = Grid {
                     start_ns: start,
                     end_ns: start + rng.below(40) * step,
                     step_ns: step,
                     span_ns: span,
+                    range,
                 };
                 assert_eq!(
-                    format!("{:?}", batch(&input, windowed, &grid)),
-                    format!("{:?}", streamed(&input, windowed, &grid)),
-                    "{class} case {case}: step {step} span {span}"
+                    format!("{:?}", batch(&input, windowed, &grid, reach_ns)),
+                    format!("{:?}", streamed(&input, windowed, &grid, reach_ns)),
+                    "{class} case {case}: step {step} span {span} range {range} reach {reach_ns}"
                 );
             }
         }
@@ -1429,6 +1476,7 @@ mod tests {
             end_ns: 2999 * S,
             step_ns: S,
             span_ns: S,
+            range: false,
         };
         let edges = [
             None,
@@ -1466,6 +1514,7 @@ mod tests {
                                 .then_some((v - 1.0, v + 1.0)),
                             edges: edges[rng.below(3) as usize],
                             interpolated,
+                            timing: false,
                         });
                     }
                     (labels, points)
@@ -1598,6 +1647,7 @@ mod tests {
             end_ns: 1_000 + 3_000 * 10,
             step_ns: 10,
             span_ns: 10,
+            range: false,
         };
         for (t, n) in [
             (0, 0),
@@ -1623,6 +1673,7 @@ mod tests {
             end_ns: 2 * BLOCK as u64,
             step_ns: 1,
             span_ns: 1,
+            range: false,
         };
         let labels = vec![Labels::default()];
         // One series per partition, all in group 0, whose sum depends on
@@ -1633,6 +1684,7 @@ mod tests {
             bounds: None,
             edges: None,
             interpolated: false,
+            timing: false,
         };
         let parts = |values: &[f64]| -> Vec<Grouped<Compact>> {
             values
@@ -1675,7 +1727,7 @@ mod tests {
 
     /// A series with no sample yet emits nothing before its earliest point
     /// once samples start at the bound's `w`, for spans of one to three
-    /// steps and either window.
+    /// steps, with and without a `rate`'s `[range]`, and either window.
     #[test]
     fn a_series_with_no_sample_emits_nothing_before_its_earliest_point() {
         struct Collect(Vec<u64>);
@@ -1684,16 +1736,21 @@ mod tests {
                 self.0.push(point.t);
             }
         }
-        for span in [10, 20, 30] {
+        let reach_ns = 20;
+        for (span, range) in [10, 20, 30]
+            .into_iter()
+            .flat_map(|s| [(s, false), (s, true)])
+        {
             for windowed in [false, true] {
                 let grid = Grid {
                     start_ns: 0,
                     end_ns: 10_000,
                     step_ns: 10,
                     span_ns: span,
+                    range,
                 };
                 let w = 5_000;
-                let mut rate = SeriesRate::new(windowed, grid.start_ns);
+                let mut rate = SeriesRate::new(windowed, grid.start_ns, reach_ns);
                 let bound = earliest_point(&rate, w, &grid).unwrap();
                 let mut sink = Collect(Vec::new());
                 for k in 0..40u64 {

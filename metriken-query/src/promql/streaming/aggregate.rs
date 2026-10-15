@@ -244,7 +244,9 @@ impl<'a> MergeReduce<'a> {
     ) -> Self {
         let children = match join {
             Join::Exact => Children::Exact(children.into_iter().map(Iterator::peekable).collect()),
-            Join::Latest => Children::Latest(children.into_iter().map(Held::new).collect()),
+            Join::Latest(hold) => {
+                Children::Latest(children.into_iter().map(|c| Held::new(c, hold)).collect())
+            }
         };
         Self { children, op }
     }
@@ -270,26 +272,36 @@ impl<'a> Iterator for MergeReduce<'a> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
-        let t = self.next_ts()?;
-        let mut acc = Reduction::default();
-        match &mut self.children {
-            Children::Exact(cs) => {
-                for c in cs.iter_mut() {
-                    if matches!(c.peek(), Some(&p) if p.t == t) {
-                        acc.add(c.next().expect("peek returned Some, next must too"));
+        loop {
+            let t = self.next_ts()?;
+            let mut acc = Reduction::default();
+            let mut timing = false;
+            match &mut self.children {
+                Children::Exact(cs) => {
+                    for c in cs.iter_mut() {
+                        if matches!(c.peek(), Some(&p) if p.t == t) {
+                            acc.add(c.next().expect("peek returned Some, next must too"));
+                        }
+                    }
+                }
+                Children::Latest(cs) => {
+                    for c in cs.iter_mut() {
+                        c.advance_to(t);
+                        if let Some(p) = c.at(t) {
+                            acc.add(p);
+                        }
+                        timing |= c.timing_at(t);
                     }
                 }
             }
-            Children::Latest(cs) => {
-                for c in cs.iter_mut() {
-                    c.advance_to(t);
-                    if let Some(p) = c.at(t) {
-                        acc.add(p);
-                    }
-                }
+            // Without a value, a child's timing point at `t` is passed on,
+            // for a join of this result to hold from.
+            match acc.finish(self.op, t) {
+                Some(p) => return Some(p),
+                None if timing => return Some(Point::timing_at(t)),
+                None => continue,
             }
         }
-        acc.finish(self.op, t)
     }
 }
 
@@ -409,6 +421,7 @@ impl Reduction {
             bounds,
             edges,
             interpolated: self.any_interpolated,
+            timing: false,
         })
     }
 }
@@ -480,6 +493,7 @@ mod interval_tests {
             bounds: b,
             edges: None,
             interpolated: false,
+            timing: false,
         }))
     }
 
@@ -562,6 +576,7 @@ mod lockstep_tests {
                     bounds: None,
                     edges: None,
                     interpolated: false,
+                    timing: false,
                 }
             }),
         )
@@ -628,6 +643,7 @@ mod lockstep_tests {
                         bounds: None,
                         edges: None,
                         interpolated: false,
+                        timing: false,
                     }
                 }),
             )
@@ -644,6 +660,7 @@ mod lockstep_tests {
                         bounds: None,
                         edges: None,
                         interpolated: false,
+                        timing: false,
                     }
                 }),
             )
@@ -661,5 +678,23 @@ mod lockstep_tests {
         assert!(x.next().is_none());
         let b = log.borrow().iter().filter(|(id, _)| *id == "b").count();
         assert!(b <= 4, "b pulled {b} times");
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    /// A raw aggregate passes on a child's timing point when no child has
+    /// a value there.
+    #[test]
+    fn a_raw_aggregate_passes_on_a_timing_point() {
+        let a: Box<dyn Iterator<Item = Point>> =
+            Box::new([Point::timing_at(10), Point::at(11, 1.0), Point::at(30, 1.0)].into_iter());
+        let b: Box<dyn Iterator<Item = Point>> = Box::new([Point::at(30, 2.0)].into_iter());
+        let out: Vec<Point> =
+            MergeReduce::joined(vec![a, b], AggOp::Sum, Join::Latest(20)).collect();
+        assert!(out[0].timing && out[0].t == 10, "{out:?}");
+        assert_eq!((out[1].t, out[1].v), (11, 1.0));
     }
 }

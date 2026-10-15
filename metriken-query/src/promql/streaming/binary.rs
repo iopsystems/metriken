@@ -144,11 +144,25 @@ fn widen_band(band: Band, own: &RateEdges, union: &RateEdges, nominal: f64) -> B
     if own_max <= 0.0 || own_min <= 0.0 || union_max <= 0.0 || union_min <= 0.0 {
         return band;
     }
-    // lo = increase/elapsed_max, so a longer max span lowers it; hi is the
-    // mirror image.
-    let lo = band.0 * (own_max / union_max);
-    let hi = band.1 * (own_min / union_min);
+    // lo = increase/elapsed_max, so a longer max span moves it toward zero;
+    // hi = increase/elapsed_min, and a shorter min span moves it away. Which
+    // ratio widens an end depends on its sign (a negated rate's band is
+    // negative), so each end takes whichever of the two widens it.
+    let (shrink, grow) = (own_max / union_max, own_min / union_min);
+    let lo = (band.0 * shrink).min(band.0 * grow);
+    let hi = (band.1 * shrink).max(band.1 * grow);
     (band.0.min(lo).min(nominal), band.1.max(hi).max(nominal))
+}
+
+/// Whether two rate points' reads are too far apart to bound their
+/// combination: the union of their edges leaves no time that both spans
+/// cover (the later left edge ends after the earlier right edge begins), as
+/// for a rate held from a slow series' last read combined with a current
+/// one at a range's end.
+fn spans_apart(l: &RateEdges, r: &RateEdges) -> bool {
+    let left_end = l.left.1.max(r.left.1);
+    let right_begin = l.right.0.min(r.right.0);
+    right_begin - left_end <= 0.0
 }
 
 /// Combine two operands' optional bands for `op`.
@@ -214,6 +228,9 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
             }
         };
         for p in self.upstream.by_ref() {
+            if p.timing {
+                return Some(p);
+            }
             if let Some(r) = apply(p.v) {
                 // Propagate the uncertainty band through the scalar op via the
                 // same interval arithmetic as series-op-series: treat the scalar
@@ -240,6 +257,7 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
                     // cross-table combination can still detect that.
                     edges: p.edges,
                     interpolated: p.interpolated,
+                    timing: false,
                 });
             }
             // Skip on division by zero, mirroring the eager path's
@@ -353,19 +371,25 @@ fn combine_points(op: BinOp, left: Point, right: Point) -> Option<Point> {
     } else {
         None
     };
-    // Either side spanning an unobserved stretch makes the combination one
-    // too — and drops its band with it. `combine_bounds` will happily derive
-    // one from the operand that HAS a band, treating the other as exact; for
-    // an operand nobody observed that is a band the combination has not
-    // earned. The producer's invariant is that an interpolated point carries
-    // no band, and it has to survive the operators or it means nothing.
-    let interpolated = left.interpolated || right.interpolated;
+    // Either side spanning an unobserved stretch makes the combination
+    // interpolated, with no band. So do two reads too far apart to bound
+    // together (`spans_apart`): widened over their union, the band would
+    // have no shortest span. `combine_bounds` derives a band from the
+    // operand that has one, treating the other as exact, which for an
+    // operand that was not observed is a band no read supports. An
+    // interpolated point carries no band, through every operator.
+    let apart = matches!(
+        (&left.edges, &right.edges),
+        (Some(l), Some(r)) if l != r && spans_apart(l, r)
+    );
+    let interpolated = left.interpolated || right.interpolated || apart;
     Some(Point {
         t: left.t,
         v,
         bounds: if interpolated { None } else { bounds },
         edges,
         interpolated,
+        timing: false,
     })
 }
 
@@ -424,6 +448,11 @@ impl<'a> Iterator for LatestBinary<'a> {
             self.left.advance_to(t);
             self.right.advance_to(t);
             let (Some(mut left), Some(right)) = (self.left.at(t), self.right.at(t)) else {
+                // Without a value, a timing point of either side at `t` is
+                // passed on, for a join of this result to hold from.
+                if self.left.timing_at(t) || self.right.timing_at(t) {
+                    return Some(Point::timing_at(t));
+                }
                 continue;
             };
             left.t = t;
@@ -463,9 +492,9 @@ fn pair<'a>(
             right: right.peekable(),
             op,
         }),
-        Join::Latest => Box::new(LatestBinary {
-            left: Held::new(left),
-            right: Held::new(right),
+        Join::Latest(hold) => Box::new(LatestBinary {
+            left: Held::new(left, hold),
+            right: Held::new(right, hold),
             op,
         }),
     }
@@ -494,6 +523,7 @@ impl<'a> Iterator for RightLookupBinary<'a> {
                     bounds: rb,
                     edges: re,
                     interpolated: r_interp,
+                    timing: false,
                 };
                 if let Some(out) = combine_points(self.op, p, right) {
                     return Some(out);
@@ -509,8 +539,10 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 ///
 /// Matching is one-to-one. Two right series with points in the range that
 /// share a match key are an error, and so are two left series with points
-/// that match one right series, as in PromQL. A series without points is
-/// left out before that check. The check covers the whole range, where
+/// that match one right series, as in PromQL. A series without points in
+/// the range is left out before that check: a raw series' point before the
+/// range counts when it is held to the range's start, and a timing point
+/// never does. The check covers the whole range, where
 /// Prometheus checks each step, so two series that share a key and have
 /// points at different times in the range are refused.
 ///
@@ -529,9 +561,15 @@ pub fn matrix_matrix_op<'a>(
     spec: MatchSpec<'_>,
     recording_keys: &[String],
     join: Join,
+    start_ns: u64,
 ) -> Result<SeriesSet<'a>, QueryError> {
+    // How long a raw join holds a point; a grid join holds none.
+    let hold = match join {
+        Join::Latest(hold) => hold,
+        Join::Exact => 0,
+    };
     let right = keyed(right_set, spec);
-    let right = unique_by_key(right, |_| true).map_err(|(key, a, b)| {
+    let right = unique_by_key(right, start_ns, hold, |_| true).map_err(|(key, a, b)| {
         QueryError::EvaluationError(format!(
             "many-to-many matching not allowed: the right side holds {} and {}, which \
              share the match group {}; matching labels must be unique on one side",
@@ -544,8 +582,8 @@ pub fn matrix_matrix_op<'a>(
         right.into_iter().collect();
 
     let left = keyed(left_set, spec);
-    let left =
-        unique_by_key(left, |key| right_by_key.contains_key(key)).map_err(|(key, a, b)| {
+    let left = unique_by_key(left, start_ns, hold, |key| right_by_key.contains_key(key)).map_err(
+        |(key, a, b)| {
             QueryError::EvaluationError(format!(
                 "multiple matches for labels: the left side holds {} and {}, which share the \
              match group {}; group_left is not supported, so match on more labels or \
@@ -554,7 +592,8 @@ pub fn matrix_matrix_op<'a>(
                 braces(&b.inner),
                 braces(&key)
             ))
-        })?;
+        },
+    )?;
 
     let mut out: SeriesSet<'a> = Vec::new();
     let mut unmatched_left: Vec<LabeledSeries<'a>> = Vec::new();
@@ -607,7 +646,7 @@ pub fn matrix_matrix_op<'a>(
                     )
                 })),
             }),
-            Join::Latest => pair(
+            Join::Latest(_) => pair(
                 left.iter,
                 Box::new(Replay {
                     points: Rc::clone(points),
@@ -632,12 +671,15 @@ fn keyed<'a>(set: SeriesSet<'a>, spec: MatchSpec<'_>) -> Keyed<'a> {
 }
 
 /// `series` with no two sharing a key that `checked` selects, in their
-/// order. Where several share one, those without points are dropped; two
-/// with points are returned as the error, with their key. Only the series
-/// of a shared key are read ahead, one point each.
+/// order. Where several share one, those without points in the range from
+/// `start_ns` are dropped; two with points are returned as the error, with
+/// their key. Only the series of a shared key are read ahead, to their
+/// first point in the range.
 #[allow(clippy::type_complexity)]
 fn unique_by_key<'a>(
     series: Keyed<'a>,
+    start_ns: u64,
+    hold_ns: u64,
     checked: impl Fn(&BTreeMap<String, String>) -> bool,
 ) -> Result<Keyed<'a>, (BTreeMap<String, String>, Labels, Labels)> {
     let mut count: HashMap<&BTreeMap<String, String>, usize> = HashMap::new();
@@ -661,7 +703,7 @@ fn unique_by_key<'a>(
             out.push((key, ls));
             continue;
         }
-        let Some(ls) = with_points(ls) else {
+        let Some(ls) = with_points(ls, start_ns, hold_ns) else {
             continue;
         };
         if let Some(first) = kept.get(&key) {
@@ -673,12 +715,38 @@ fn unique_by_key<'a>(
     Ok(out)
 }
 
-/// `ls` with its first point read and put back, or `None` when it has none.
-fn with_points(mut ls: LabeledSeries<'_>) -> Option<LabeledSeries<'_>> {
-    let first = ls.iter.next()?;
+/// `ls` with the points read put back, or `None` when it has no point in
+/// the range from `start_ns`: no point with a value at or after it, and no
+/// point before it held to it ([`Held`]: for the gap from the point before
+/// it, at most `hold_ns`). A raw series' points before the range, and its
+/// timing points, are read but are not points in the range.
+fn with_points(
+    mut ls: LabeledSeries<'_>,
+    start_ns: u64,
+    hold_ns: u64,
+) -> Option<LabeledSeries<'_>> {
+    let mut read = Vec::new();
+    let mut in_range = false;
+    for p in ls.iter.by_ref() {
+        read.push(p);
+        if !p.timing && p.t >= start_ns {
+            in_range = true;
+            break;
+        }
+    }
+    if !in_range {
+        // The last point with a value before the range, held to its start.
+        let held = read.iter().rposition(|p| !p.timing).is_some_and(|i| {
+            let gap = i.checked_sub(1).map_or(hold_ns, |b| read[i].t - read[b].t);
+            start_ns - read[i].t <= gap.min(hold_ns)
+        });
+        if !held {
+            return None;
+        }
+    }
     Some(LabeledSeries::new(
         ls.labels,
-        std::iter::once(first).chain(ls.iter),
+        read.into_iter().chain(ls.iter),
     ))
 }
 
@@ -857,6 +925,53 @@ mod interval_tests {
         assert_eq!(with_one, with_none);
     }
 
+    /// A negated rate's band widens as the rate's does, mirrored: widening
+    /// `[-11, -9]` over a longer span gives the negation of widening
+    /// `[9, 11]`.
+    #[test]
+    fn a_negative_band_widens_like_its_negation() {
+        let own = RateEdges {
+            left: (0.0, 10.0),
+            right: (1000.0, 1010.0),
+        };
+        let union = RateEdges {
+            left: (0.0, 50.0),
+            right: (1000.0, 1050.0),
+        };
+        let (lo, hi) = widen_band((9.0, 11.0), &own, &union, 10.0);
+        let (nlo, nhi) = widen_band((-11.0, -9.0), &own, &union, -10.0);
+        assert!(lo < 9.0 && hi > 11.0, "[{lo}, {hi}]");
+        assert_eq!((nlo, nhi), (-hi, -lo));
+    }
+
+    /// Two rates whose spans share no time (one held from a read that ended
+    /// before the other's span began) have a value and no band, and the
+    /// result is marked interpolated; spans that overlap keep a band.
+    #[test]
+    fn rates_read_too_far_apart_have_no_band() {
+        let point = |left: (f64, f64), right: (f64, f64)| Point {
+            t: 0,
+            v: 10.0,
+            bounds: Some((9.0, 11.0)),
+            edges: Some(RateEdges { left, right }),
+            interpolated: false,
+            timing: false,
+        };
+        // Held: 79.7 s to 80.7 s. Current: 84 s to 85 s.
+        let held = point((79.65e9, 79.7e9), (80.65e9, 80.7e9));
+        let current = point((83.98e9, 84.0e9), (84.98e9, 85.0e9));
+        let out = combine_points(BinOp::Add, held, current).unwrap();
+        assert_eq!(out.v, 20.0);
+        assert_eq!(out.bounds, None);
+        assert!(out.interpolated);
+        // Overlapping: 80 s to 81 s against 80.5 s to 81.5 s.
+        let a = point((79.98e9, 80.0e9), (80.98e9, 81.0e9));
+        let b = point((80.45e9, 80.5e9), (81.45e9, 81.5e9));
+        let out = combine_points(BinOp::Add, a, b).unwrap();
+        assert!(out.bounds.is_some());
+        assert!(!out.interpolated);
+    }
+
     #[test]
     fn combine_bounds_none_when_both_exact() {
         assert!(combine_bounds(BinOp::Div, 100.0, None, None, 10.0, None, None).is_none());
@@ -874,6 +989,7 @@ mod interval_tests {
             bounds: Some((80.0, 120.0)),
             edges: None,
             interpolated: false,
+            timing: false,
         }));
         let r: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
             t: 1,
@@ -881,6 +997,7 @@ mod interval_tests {
             bounds: Some((8.0, 12.0)),
             edges: None,
             interpolated: false,
+            timing: false,
         }));
         let mut z = ZipMergeBinary {
             left: l.peekable(),
@@ -909,6 +1026,7 @@ mod interval_tests {
             bounds: Some((-4.0, 4.0)),
             edges: None,
             interpolated: false,
+            timing: false,
         }));
         let mut sb = ScalarBroadcast {
             upstream: up,
@@ -935,6 +1053,7 @@ mod interval_tests {
             bounds: Some((8.0, 12.0)),
             edges: None,
             interpolated: false,
+            timing: false,
         }));
         let mut sb = ScalarBroadcast {
             upstream: up,
@@ -967,6 +1086,7 @@ mod broadcast_tests {
             MatchSpec::Default,
             keys,
             Join::Exact,
+            0,
         )
         .expect("one-to-one")
         .into_iter()
@@ -1053,6 +1173,7 @@ mod broadcast_tests {
             MatchSpec::Include(labels),
             &[],
             Join::Exact,
+            0,
         )?
         .into_iter()
         .map(|ls| {
@@ -1143,5 +1264,28 @@ mod broadcast_tests {
             out,
             vec![(Labels::from([("cpu", "0"), ("source", "a")]), 4.0)]
         );
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    /// A raw join passes on an operand's timing point when it has no value
+    /// there, so a join of its result holds the next point for the gap from
+    /// it: here the point at 11, held 1 and no further.
+    #[test]
+    fn a_raw_join_passes_on_a_timing_point() {
+        let left: Box<dyn Iterator<Item = Point>> =
+            Box::new([Point::timing_at(10), Point::at(11, 1.0), Point::at(30, 1.0)].into_iter());
+        let right: Box<dyn Iterator<Item = Point>> =
+            Box::new([Point::at(0, 2.0), Point::at(30, 2.0)].into_iter());
+        let inner: Vec<Point> = pair(left, right, BinOp::Add, Join::Latest(20)).collect();
+        assert!(inner[0].timing && inner[0].t == 10, "{inner:?}");
+        let mut held = Held::new(Box::new(inner.into_iter()), 20);
+        held.advance_to(11);
+        assert!(held.at(11).is_some());
+        held.advance_to(13);
+        assert!(held.at(13).is_none());
     }
 }
