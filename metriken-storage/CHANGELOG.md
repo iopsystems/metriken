@@ -62,6 +62,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `ArchiveReader::counter_labels`, `gauge_labels` and
   `histogram_labels` return each label set with its recording's labels
   added, matching the series metriken-query now returns.
+- **Breaking:** arrow and parquet are 60 (were 58), and dendro is 0.5 (was
+  0.4), which is on arrow and parquet 60. Parquet 59 and later no longer
+  depend on `thrift`, which clears GHSA-2f9f-gq7v-9h6m (thrift 0.17). Arrow
+  and parquet types appear in this crate's public API (the crate-root
+  re-exports `Compression` and `ZstdLevel`, `segment_props` returning
+  `WriterProperties`, `default_compression`, `format::stamped`,
+  `table::table_to_batch`, `table::segment_writer_props`,
+  `table::write_table_parquet_with`, the `convert` writer's `ParquetError`
+  and `ParquetMetaData` returns), and so do dendro types
+  (`DendroCatalog(dendro::archive::Archive)`, `KeepMetrics` implementing
+  `dendro::ColumnFilter`, `StreamDecoder::decode` taking a `WalRow`), so a
+  caller must use the same major versions.
+- `lru` is 0.18 (was 0.12), which clears GHSA-rhfx-m35p-ff5j
+  (RUSTSEC-2026-0002, fixed in 0.16.3) and RUSTSEC-2026-0253 (fixed in
+  0.18.2).
+- Arrow and parquet 60 require Rust 1.88.
 
 ## [0.2.3] - 2026-10-13
 

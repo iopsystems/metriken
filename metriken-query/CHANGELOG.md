@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** arrow and parquet are 60 (were 58), and metriken-storage is
+  the release on them and dendro 0.5. Parquet 59 and later no longer depend
+  on `thrift`, which clears GHSA-2f9f-gq7v-9h6m (thrift 0.17).
+  metriken-storage types are in this crate's API (`BufferPool` in
+  `ParquetBuilder::pool` and `open_file_with_pool`), so a caller naming
+  metriken-storage must use the same release. Arrow and parquet 60 require
+  Rust 1.88.
+- `lru` is no longer a dependency; this crate did not use it. (It was 0.12,
+  which carries GHSA-rhfx-m35p-ff5j.)
 - **Breaking:** a binary operator between two series sets is one-to-one, as
   in PromQL. Two right series with points in the range that share a match
   key are an error (`many-to-many matching not allowed`), and so are two

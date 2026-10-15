@@ -15,9 +15,9 @@ members = [
 
 [workspace.dependencies]
 # Shared across multiple crates
-arrow = { version = "58.2.0", default-features = false }
+arrow = { version = "60.0.0", default-features = false }
 histogram = "1.4.1"
-parquet = { version = "58.2.0", default-features = false }
+parquet = { version = "60.0.0", default-features = false }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
