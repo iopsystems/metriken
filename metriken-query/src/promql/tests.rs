@@ -3963,3 +3963,42 @@ fn a_raw_irate_spans_a_missed_tick() {
         );
     }
 }
+
+/// In raw mode, a series whose function gives no value at a sample is left
+/// out of an aggregate there, directly or through a scalar op: the sum is over
+/// the series that have a value.
+#[test]
+fn a_raw_aggregate_skips_a_series_with_no_value() {
+    const S: u64 = 1_000_000_000;
+    let mut m = Memory::new(1000);
+    // `c{id="gap"}` misses 1040 to 1059, more than four of its interval, so
+    // its irate at 1060 has no value; `c{id="full"}` reads every second.
+    for (id, ts) in [
+        (
+            "gap",
+            (1000..=1100u64)
+                .filter(|s| !(1040..1060).contains(s))
+                .collect::<Vec<_>>(),
+        ),
+        ("full", (1000..=1100u64).collect()),
+    ] {
+        m.add_counter(
+            "c",
+            Counter {
+                labels: make_labels(&[("id", id)]),
+                values: ts.iter().map(|s| (s - 1000) * 10).collect(),
+                timestamps: ts.iter().map(|s| s * S).collect(),
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(m));
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    for (q, want) in [("sum(irate(c[5s]))", 10.0), ("sum(2 * irate(c[5s]))", 20.0)] {
+        let r = engine
+            .query_range_opts(q, 1000.0, 1070.0, 1.0, &raw)
+            .unwrap();
+        let at = points_from(&r, 1060.0).first().copied();
+        assert_eq!(at, Some((1060.0, want)), "{q}");
+    }
+}
