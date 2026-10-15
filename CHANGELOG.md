@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.38.0
+
+- An unstrided instant query of a histogram function reads back three
+  times the histogram's row interval (`DataSource::histogram_interval`, at
+  most 300 s), where it read back 300 s. A series whose latest row is older
+  than that has no value at the instant: in a multi-recording archive
+  queried at its end, a recording whose last row is more than three times
+  the slowest recording's row interval before the end is left out. Nor has
+  a series whose row before its latest is more than five row intervals
+  before the instant: that row, which the delta needs, is not read. A strided call
+  (`histogram_count(lat, 60)`) still reads back 300 s.
+- A source that reports no interval for a histogram answers its
+  `interval()`, 1 s for a parquet file or a `MemoryStore` without
+  `sampling_interval_ms`; on such a source whose rows are further apart
+  than 1 s, an instant histogram query has no value. Set the key.
+- On a 9.6 h recording at 1 s (debug build, warm), an instant
+  `histogram_mean(syscall_latency)` took 1.0 to 1.1 s and takes 44 to
+  52 ms.
+- An instant query of a histogram function with a `by`/`without` clause
+  after its name (`histogram_count by (x) (lat)`) reads back as above. It
+  read only the instant itself, so it had a value only at an instant that
+  fell on a row.
+- An instant query whose label value contains a histogram function call
+  (`g{x="histogram_mean(y)"}`) is evaluated as the query it is. It was read
+  back as a histogram query: the answer was stamped at the step grid point
+  at or before the requested time, on a sub-second recording with a value
+  up to a second old, and a series answered up to 300 s after its last row.
+
 ### metriken-query 0.37.1
 
 - A selector with no name and one `__name__="x"` matcher selects the metric
