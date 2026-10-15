@@ -17,7 +17,8 @@ use promql_parser::parser::{self, Expr};
 
 use crate::labels::Labels;
 use crate::promql::{
-    extract_filter_labels, parse_histogram_call, parse_optional_stride, QueryEngine, QueryError,
+    extract_filter_labels, parse_histogram_call, parse_optional_stride,
+    unwrap_sum_around_histogram, QueryEngine, QueryError,
 };
 
 impl QueryEngine {
@@ -27,9 +28,7 @@ impl QueryEngine {
     /// Returns an empty set if the query parses cleanly but matches
     /// no series. Returns `QueryError::ParseError` on syntax error.
     pub fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
-        let stripped = strip_rezolus_wrapper(query)?;
-        let expr = parser::parse(stripped)
-            .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+        let expr = parse_selector_expr(query)?;
         let col_map = self.source.column_map();
         let mut out = HashSet::new();
         walk(&col_map, &expr, &mut out);
@@ -54,9 +53,7 @@ impl QueryEngine {
 /// scalar, say). Returns `QueryError::ParseError` on syntax error, matching
 /// `columns`.
 pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
-    let stripped = strip_rezolus_wrapper(query)?;
-    let expr = parser::parse(stripped)
-        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let expr = parse_selector_expr(query)?;
     let mut out = HashSet::new();
     walk_names(&expr, &mut out);
     Ok(out)
@@ -68,9 +65,7 @@ pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
 /// a reader uses it to leave out tables whose fixed labels no selector can
 /// match.
 pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
-    let stripped = strip_rezolus_wrapper(query)?;
-    let expr = parser::parse(stripped)
-        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let expr = parse_selector_expr(query)?;
     let mut out = Vec::new();
     walk_selectors(&expr, &mut out);
     Ok(out)
@@ -105,9 +100,7 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
 /// (`{source!="a", source!="b"}`): the filter holds one matcher per label,
 /// so all but one would be dropped silently.
 pub(crate) fn repeated_matcher(query: &str) -> Result<Option<String>, QueryError> {
-    let stripped = strip_rezolus_wrapper(query)?;
-    let expr = parser::parse(stripped)
-        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let expr = parse_selector_expr(query)?;
     let mut found = None;
     walk_vector_selectors(&expr, &mut |sel| {
         let mut seen = HashSet::new();
@@ -188,6 +181,19 @@ fn collect_selector_names(sel: &parser::VectorSelector, out: &mut HashSet<String
             out.insert(m.value.clone());
         }
     }
+}
+
+/// Parse `query` for the selector walks. A `sum [by|without (..)] (..)`
+/// around `histogram_irate`, `histogram_mean`, `histogram_count` or
+/// `histogram_sum` is rewritten by `unwrap_sum_around_histogram`, as
+/// `QueryEngine` rewrites it before dispatch, and `strip_rezolus_wrapper`
+/// then removes the histogram function, leaving its selector. The walks
+/// read a `__name__` matcher on a selector with no name themselves.
+fn parse_selector_expr(query: &str) -> Result<Expr, QueryError> {
+    let unwrapped = unwrap_sum_around_histogram(query)?;
+    let stripped = strip_rezolus_wrapper(unwrapped.as_deref().unwrap_or(query))?;
+    parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))
 }
 
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {

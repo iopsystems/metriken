@@ -4002,3 +4002,137 @@ fn a_raw_aggregate_skips_a_series_with_no_value() {
         assert_eq!(at, Some((1060.0, want)), "{q}");
     }
 }
+
+/// A `__name__="x"` matcher on a selector with no name selects `x`, with
+/// any other matchers, and is how a query names a metric whose name is not
+/// a PromQL identifier.
+#[test]
+fn a_name_matcher_names_the_selector() {
+    let mut source = create_cgroup_source();
+    source.add_counter(
+        "svc/ops",
+        Counter {
+            labels: make_labels(&[("state", "user")]),
+            timestamps: (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect(),
+            values: (0u64..3).map(|s| s * 50).collect(),
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let range = |q: &str| {
+        engine
+            .query_range(q, 1001.0, 1002.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+    };
+    // Each series' labels and values, in a fixed order.
+    let series = |q: &str| {
+        let QueryResult::Matrix { result } = range(q) else {
+            panic!("{q}: not a matrix");
+        };
+        let mut out: Vec<_> = result
+            .into_iter()
+            .map(|m| {
+                let labels: std::collections::BTreeMap<_, _> = m.metric.into_iter().collect();
+                (labels, m.values)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    };
+    assert_eq!(
+        series(r#"sum(irate(cgroup_cpu_usage{name="/system.slice/foo.service"}[5s]))"#),
+        series(
+            r#"sum(irate({__name__="cgroup_cpu_usage", name="/system.slice/foo.service"}[5s]))"#
+        )
+    );
+    let all = series("irate(cgroup_cpu_usage[5s])");
+    assert_eq!(all.len(), 3);
+    assert_eq!(all, series(r#"irate({__name__="cgroup_cpu_usage"}[5s])"#));
+    let QueryResult::Matrix { result } = range(r#"sum(irate({__name__="svc/ops"}[5s]))"#) else {
+        panic!("not a matrix");
+    };
+    assert_eq!(result.len(), 1);
+    assert!(
+        result[0].values.iter().all(|(_, v)| *v == 50.0),
+        "{result:?}"
+    );
+
+    // A regex, a negation or two `__name__` matchers do not name one metric.
+    for q in [
+        r#"irate({__name__=~"cgroup_cpu_usage"}[5s])"#,
+        r#"irate({__name__!="cgroup_cpu_usage"}[5s])"#,
+        r#"irate({__name__="cgroup_cpu_usage", __name__="svc/ops"}[5s])"#,
+    ] {
+        assert!(engine.query_range(q, 1001.0, 1002.0, 1.0).is_err(), "{q}");
+    }
+}
+
+/// In the histogram functions, which parse their selector apart from
+/// PromQL, a `__name__` matcher names the selector under the same rule as
+/// `name_selectors`, and anything else carrying one is refused.
+#[test]
+fn a_histogram_function_reads_a_name_matcher_by_the_promql_rule() {
+    let engine = QueryEngine::new(Arc::new(create_hist_source(&[0, 10, 20, 30, 40])));
+    let range = |q: &str| engine.query_range(q, 1001.0, 1004.0, 1.0);
+    // Each series' labels and values, in a fixed order.
+    let series = |q: &str| {
+        let QueryResult::Matrix { result } = range(q).unwrap_or_else(|e| panic!("{q}: {e}")) else {
+            panic!("{q}: not a matrix");
+        };
+        let mut out: Vec<_> = result
+            .into_iter()
+            .map(|m| {
+                let labels: std::collections::BTreeMap<_, _> = m.metric.into_iter().collect();
+                (labels, m.values)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    };
+    for (by_matcher, by_name) in [
+        (
+            r#"histogram_irate({__name__="req_latency"})"#,
+            "histogram_irate(req_latency)",
+        ),
+        (
+            r#"histogram_quantiles([0.5], { __name__ = "req_latency" })"#,
+            "histogram_quantiles([0.5], req_latency)",
+        ),
+        // `__name__` in a label's value or as part of a key is no matcher.
+        (
+            r#"histogram_irate(req_latency{path!="/__name__"})"#,
+            "histogram_irate(req_latency)",
+        ),
+        (
+            r#"histogram_irate(req_latency{__name__x!="1"})"#,
+            "histogram_irate(req_latency)",
+        ),
+    ] {
+        let got = series(by_matcher);
+        assert!(!got.is_empty(), "{by_matcher}");
+        assert_eq!(got, series(by_name), "{by_matcher}");
+    }
+    for q in [
+        r#"histogram_mean({__name__="", __name__="req_latency"})"#,
+        r#"histogram_mean({__name__="req_latency", __name__="req_latency"})"#,
+        r#"histogram_mean({__name__=~"req_latency"})"#,
+    ] {
+        let err = range(q).expect_err(q).to_string();
+        assert!(
+            err.contains("accepted only as a single `__name__"),
+            "{q}: {err}"
+        );
+    }
+    // The quoted name is the whole value, comma and all.
+    let err = range(r#"histogram_mean({__name__="req_latency,x"})"#)
+        .expect_err("req_latency,x")
+        .to_string();
+    assert!(err.contains("req_latency,x"), "{err}");
+    for q in [
+        r#"histogram_mean({__name__="req_latency"} offset 5s)"#,
+        r#"histogram_mean({__name__="req_latency"} @ 1003)"#,
+    ] {
+        let err = range(q).expect_err(q).to_string();
+        assert!(err.contains("takes no `offset` or `@`"), "{q}: {err}");
+    }
+}

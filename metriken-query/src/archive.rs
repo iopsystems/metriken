@@ -1241,6 +1241,162 @@ mod tests {
         assert!(counts[0].iter().all(|(_, v)| *v == 20.0), "{counts:?}");
     }
 
+    /// A `sum(...)` around a histogram function answers as the bare
+    /// function does on an archive, with and without a grouping clause.
+    #[test]
+    fn a_sum_around_a_histogram_function_routes() {
+        use crate::segmented::tests::segment_histogram;
+        let n = histogram::Config::new(4, 10).unwrap().total_buckets();
+        let rows = |per_row: u64| -> Vec<(u64, Vec<u64>)> {
+            (1..=10u64)
+                .map(|k| {
+                    let mut b = vec![0u64; n];
+                    b[20] = k * per_row;
+                    (k * S, b)
+                })
+                .collect()
+        };
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("lat", segment_histogram("lat", 4, 10, &rows(5)))],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("lat", segment_histogram("lat", 4, 10, &rows(7)))],
+            ),
+        ]);
+        let values = |query: &str| -> Vec<Vec<(f64, f64)>> {
+            let QueryResult::Matrix { result } = reader
+                .query_range_opts(query, 1.0, 10.0, 1.0, &QueryOptions::default())
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+            else {
+                panic!("{query}: not a matrix");
+            };
+            result.into_iter().map(|m| m.values).collect()
+        };
+        for func in [
+            "histogram_irate",
+            "histogram_mean",
+            "histogram_count",
+            "histogram_sum",
+        ] {
+            let bare = values(&format!("{func}(lat)"));
+            assert!(!bare.is_empty() && !bare[0].is_empty(), "{func}: {bare:?}");
+            assert_eq!(values(&format!("sum({func}(lat))")), bare, "{func}");
+            let only_a = values(&format!(r#"sum({func}(lat{{source="a"}}))"#));
+            assert_eq!(only_a, values(&format!(r#"{func}(lat{{source="a"}})"#)));
+            if func != "histogram_mean" {
+                assert_ne!(only_a, bare, "{func}: the matcher prunes recording b");
+            }
+            for grouping in ["by (source)", "without (source)"] {
+                assert_eq!(
+                    values(&format!("sum {grouping} ({func}(lat))")),
+                    values(&format!("{func} {grouping} (lat)")),
+                    "{func} {grouping}"
+                );
+            }
+            assert_eq!(
+                reader
+                    .columns(&format!(r#"sum({func}(lat{{source="a"}}))"#))
+                    .unwrap(),
+                reader
+                    .columns(&format!(r#"{func}(lat{{source="a"}})"#))
+                    .unwrap(),
+                "{func}"
+            );
+            assert!(
+                crate::referenced_metrics(&format!("sum by (x) ({func}(lat))"))
+                    .unwrap()
+                    .contains("lat"),
+                "{func}"
+            );
+            // A grouping on both is refused rather than answered as either.
+            for query in [
+                format!("sum({func} by (source) (lat))"),
+                format!("sum({func} by\n(source) (lat))"),
+                format!("sum({func} without (source) (lat))"),
+            ] {
+                let err = reader
+                    .query_range_opts(&query, 1.0, 10.0, 1.0, &QueryOptions::default())
+                    .expect_err(&query);
+                assert!(
+                    err.to_string().contains("takes no `by`/`without` clause"),
+                    "{query:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// A selector named by a `__name__` matcher routes on an archive as the
+    /// bare name does.
+    #[test]
+    fn a_name_matcher_routes() {
+        use crate::segmented::tests::segment_histogram;
+        let n = histogram::Config::new(4, 10).unwrap().total_buckets();
+        let rows: Vec<(u64, Vec<u64>)> = (1..=10u64)
+            .map(|k| {
+                let mut b = vec![0u64; n];
+                b[20] = k * 5;
+                (k * S, b)
+            })
+            .collect();
+        let reader = archive(vec![recording(
+            &[("source", "a")],
+            vec![
+                ("svc/ops", counter_table("svc/ops", &[(&[], 7)], 10)),
+                ("lat", segment_histogram("lat", 4, 10, &rows)),
+            ],
+        )]);
+        let values = |query: &str| -> Vec<Vec<(f64, f64)>> {
+            let QueryResult::Matrix { result } = reader
+                .query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default())
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+            else {
+                panic!("{query}: not a matrix");
+            };
+            result.into_iter().map(|m| m.values).collect()
+        };
+        let named = values(r#"sum(irate({__name__="svc/ops"}[5s]))"#);
+        assert!(!named.is_empty() && !named[0].is_empty(), "{named:?}");
+        assert_eq!(
+            values(r#"sum(irate({__name__="svc/ops", source="a"}[5s]))"#),
+            named
+        );
+        // The histogram functions, parsed apart from PromQL, read it too.
+        for (by_matcher, by_name) in [
+            (r#"histogram_mean({__name__="lat"})"#, "histogram_mean(lat)"),
+            (
+                r#"sum(histogram_irate({__name__="lat", source="a"}))"#,
+                r#"sum(histogram_irate(lat{source="a"}))"#,
+            ),
+            (
+                r#"histogram_quantiles([0.5], {__name__="lat"})"#,
+                "histogram_quantiles([0.5], lat)",
+            ),
+        ] {
+            let got = values(by_matcher);
+            assert!(!got.is_empty() && !got[0].is_empty(), "{by_matcher}");
+            assert_eq!(got, values(by_name), "{by_matcher}");
+        }
+        for query in [
+            r#"histogram_mean({__name__!="lat"})"#,
+            r#"histogram_mean({__name__=~"lat"})"#,
+            r#"histogram_mean(lat{__name__="lat"})"#,
+            r#"histogram_mean({__name__="lat", __name__="lat"})"#,
+            r#"histogram_mean({__name__="", __name__="lat"})"#,
+            r#"histogram_mean({__name__="lat,x"})"#,
+            r#"histogram_mean({__name__=""})"#,
+        ] {
+            assert!(
+                reader
+                    .query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default())
+                    .is_err(),
+                "{query}"
+            );
+        }
+    }
+
     /// A histogram from a 1 s recording and a 10 s one is pooled on the
     /// 10 s recording's rows: each tick holds ten of the fast recording's
     /// deltas and one of the slow one's. On the fast recording's rows the

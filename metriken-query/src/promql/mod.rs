@@ -366,9 +366,110 @@ impl HistogramGroupBy {
     }
 }
 
+/// Give each selector of `expr` with no name, and exactly one `__name__="x"`
+/// matcher, the name `x`, removing that matcher: `{__name__="x", a="b"}`
+/// selects what `x{a="b"}` selects. This is how a query names a metric whose
+/// name is not a PromQL identifier (`redis/commands`).
+pub(crate) fn name_selectors(expr: &mut Expr) {
+    match expr {
+        Expr::Aggregate(agg) => {
+            name_selectors(&mut agg.expr);
+            if let Some(param) = agg.param.as_mut() {
+                name_selectors(param);
+            }
+        }
+        Expr::Unary(u) => name_selectors(&mut u.expr),
+        Expr::Binary(b) => {
+            name_selectors(&mut b.lhs);
+            name_selectors(&mut b.rhs);
+        }
+        Expr::Paren(p) => name_selectors(&mut p.expr),
+        Expr::Call(call) => {
+            for arg in call.args.args.iter_mut() {
+                name_selectors(arg);
+            }
+        }
+        Expr::VectorSelector(sel) => name_selector(sel),
+        Expr::MatrixSelector(sel) => name_selector(&mut sel.vs),
+        Expr::Subquery(s) => name_selectors(&mut s.expr),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
+fn name_selector(sel: &mut parser::VectorSelector) {
+    if sel.name.is_some() || !sel.matchers.or_matchers.is_empty() {
+        return;
+    }
+    let mut names = sel
+        .matchers
+        .matchers
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.name == "__name__");
+    let (Some((at, m)), None) = (names.next(), names.next()) else {
+        return;
+    };
+    if m.op != promql_parser::label::MatchOp::Equal {
+        return;
+    }
+    let name = m.value.clone();
+    sel.matchers.matchers.remove(at);
+    sel.name = Some(name);
+}
+
+/// A histogram function's selector that carries a `__name__` matcher,
+/// parsed as PromQL and named by `name_selector`: its metric name and the
+/// filter of its other matchers. `None` when `selector` does not parse as a
+/// PromQL vector selector with a `__name__` matcher; the caller parses it by
+/// hand. An error for an `offset` or `@`, or for `__name__` matchers that do
+/// not name one metric.
+fn name_matcher_selector(selector: &str) -> Option<Result<(String, Labels), QueryError>> {
+    let Ok(Expr::VectorSelector(mut sel)) = parser::parse(selector) else {
+        return None;
+    };
+    if !sel.matchers.matchers.iter().any(|m| m.name == "__name__") {
+        return None;
+    }
+    let refused = |why: &str| Some(Err(QueryError::ParseError(format!("{selector}: {why}"))));
+    if sel.offset.is_some() || sel.at.is_some() {
+        return refused("a histogram function's selector takes no `offset` or `@`");
+    }
+    name_selector(&mut sel);
+    match sel.name {
+        Some(name) => Some(Ok((name, extract_filter_labels(&sel.matchers.matchers)))),
+        None => refused(
+            "`__name__` is accepted only as a single `__name__=\"x\"` matcher on a \
+             selector with no metric name",
+        ),
+    }
+}
+
 /// Rewrite `sum [by/without (...)] (<histogram_func>(...))` to the
-/// native `<histogram_func> [by/without (...)] (...)` form.
-fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
+/// native `<histogram_func> [by/without (...)] (...)` form. `None` when
+/// `query` is not of that form. A grouping on the inner function
+/// (`sum(histogram_irate by (x) (lat))`) is an error: the native form has
+/// one grouping.
+pub(crate) fn unwrap_sum_around_histogram(query: &str) -> Result<Option<String>, QueryError> {
+    match sum_around_histogram(query) {
+        None => Ok(None),
+        Some(SumAround::Native(rewritten)) => Ok(Some(rewritten)),
+        Some(SumAround::InnerGrouping) => Err(QueryError::ParseError(format!(
+            "{query}: a histogram function inside `sum` takes no `by`/`without` \
+             clause; drop it for one series (`sum(histogram_mean(lat))`), or move \
+             it to the `sum` for a series per group (`sum by (x) (histogram_mean(lat))`)"
+        ))),
+    }
+}
+
+/// What `sum_around_histogram` found.
+enum SumAround {
+    /// The native form.
+    Native(String),
+    /// A grouping clause on the function inside the `sum`.
+    InnerGrouping,
+}
+
+fn sum_around_histogram(query: &str) -> Option<SumAround> {
     let query = query.trim();
     let after_sum = query.strip_prefix("sum")?;
     if !matches!(after_sum.chars().next(), Some('(' | ' ' | '\t')) {
@@ -412,20 +513,18 @@ fn unwrap_sum_around_histogram(query: &str) -> Option<String> {
     }
 
     let inner_after_name = after_name.trim_start();
-    if inner_after_name.starts_with("by") || inner_after_name.starts_with("without") {
-        let next = inner_after_name
-            .chars()
-            .nth("by".len().max("without".len()))
-            .unwrap_or(' ');
-        if matches!(next, '(' | ' ' | '\t') {
-            return None;
+    for keyword in ["by", "without"] {
+        if let Some(rest) = inner_after_name.strip_prefix(keyword) {
+            if rest.trim_start().starts_with('(') {
+                return Some(SumAround::InnerGrouping);
+            }
         }
     }
 
-    match grouping_clause {
-        Some(clause) => Some(format!("{inner_func} {clause} {inner_after_name}")),
-        None => Some(inner.to_string()),
-    }
+    Some(SumAround::Native(match grouping_clause {
+        Some(clause) => format!("{inner_func} {clause} {inner_after_name}"),
+        None => inner.to_string(),
+    }))
 }
 
 fn take_grouping_clause<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, String)> {
@@ -643,6 +742,9 @@ impl QueryEngine {
     }
 
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
+        if let Some(named) = name_matcher_selector(selector) {
+            return named;
+        }
         if let Some(brace_pos) = selector.find('{') {
             let metric_name = selector[..brace_pos].trim().to_string();
             let labels_part = &selector[brace_pos + 1..selector.len() - 1];
@@ -979,7 +1081,7 @@ impl QueryEngine {
                 .map(from_result);
         }
 
-        let rewritten = unwrap_sum_around_histogram(query_str);
+        let rewritten = unwrap_sum_around_histogram(query_str)?;
         let query_str: &str = rewritten.as_deref().unwrap_or(query_str);
 
         for func in ["histogram_mean", "histogram_count", "histogram_sum"] {
@@ -996,7 +1098,10 @@ impl QueryEngine {
         }
 
         match parser::parse(query_str) {
-            Ok(parsed) => expr(&parsed),
+            Ok(mut parsed) => {
+                name_selectors(&mut parsed);
+                expr(&parsed)
+            }
             Err(err) => {
                 let error_msg = format!("{:?}", err);
                 if error_msg.contains("invalid promql query") && query_str.contains(" by ") {
