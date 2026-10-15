@@ -4219,23 +4219,255 @@ fn an_instant_histogram_lookback_takes_the_slowest_interval_up_to_300_s() {
     assert_eq!(at(1750.0), 0, "350 s after the last row");
 }
 
-/// A strided call as an instant query reads back 300 s, whatever the row
-/// interval: on 1 s rows of one observation each, `histogram_count(lat, 60)`
-/// counts 60, not the three rows an unstrided call reads back.
+/// `hist_rows` with one series per label value of `x`, each adding one
+/// observation a row.
+fn hist_rows_per(xs: &[&str], from_s: u64, to_s: u64) -> Memory {
+    let mut source = Memory::new(1000);
+    let times: Vec<u64> = (from_s..=to_s).collect();
+    for x in xs {
+        source.add_histogram(
+            "lat",
+            Histogram {
+                labels: make_labels(&[("x", x)]),
+                config: ::histogram::Config::new(4, 16).unwrap(),
+                timestamps: times.iter().map(|t| t * 1_000_000_000).collect(),
+                snapshots: (0..times.len() as u64).map(hist_snap_cumulative).collect(),
+            },
+        );
+    }
+    source
+}
+
+/// A strided call as an instant query counts the one stride ending at the
+/// instant, on or between rows, and near a recording's start only the rows
+/// there are.
 #[test]
-fn a_strided_instant_histogram_query_reads_back_300_s() {
+fn a_strided_instant_counts_the_stride_ending_at_the_instant() {
     let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
-    let count = |q: &str| {
-        let QueryResult::Vector { result } = engine.query(q, Some(1400.0)).unwrap() else {
+    let count = |q: &str, t: f64| {
+        let QueryResult::Vector { result } = engine.query(q, Some(t)).unwrap() else {
             panic!("not a vector");
         };
-        result[0].value.1
+        result.first().map(|s| s.value.1)
     };
-    assert_eq!(count("histogram_count(lat, 60)"), 60.0);
-    assert_eq!(count("histogram_count(lat, 10)"), 10.0);
+    assert_eq!(count("histogram_count(lat, 60)", 1400.0), Some(60.0));
+    assert_eq!(count("histogram_count(lat, 60)", 1399.5), Some(60.0));
+    assert_eq!(count("histogram_count(lat, 10)", 1400.0), Some(10.0));
+    // 7 s does not divide 300 s; the window is still the 7 s before.
+    assert_eq!(count("histogram_count(lat, 7)", 1400.0), Some(7.0));
+    // 300 s back from 1050 opens before the first row at 1000: the window
+    // holds the 50 rows after it.
+    assert_eq!(count("histogram_count(lat, 300)", 1050.0), Some(50.0));
     // A parenthesis in a label value is text, not the end of the call.
-    assert_eq!(count(r#"histogram_count(lat{x!=")"}, 60)"#), 60.0);
-    assert_eq!(count(r#"histogram_count(lat{x!="("}, 60)"#), 60.0);
+    assert_eq!(
+        count(r#"histogram_count(lat{x!=")"}, 60)"#, 1400.0),
+        Some(60.0)
+    );
+    assert_eq!(
+        count(r#"histogram_count(lat{x!="("}, 60)"#, 1400.0),
+        Some(60.0)
+    );
+    // Past the window there is nothing to count.
+    assert_eq!(count("histogram_count(lat, 10)", 1420.0), None);
+}
+
+/// Several series at one timestamp fall in one window: at a window's
+/// boundary, `histogram_count(lat, 60)` over two series is one point
+/// counting both.
+#[test]
+fn strided_windows_hold_every_series_at_a_timestamp() {
+    let engine = QueryEngine::new(Arc::new(hist_rows_per(&["a", "b"], 1000, 1400)));
+    let QueryResult::Matrix { result } = engine
+        .query_range("histogram_count(lat, 60)", 1200.0, 1400.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
+    let mut unique = times.clone();
+    unique.dedup();
+    assert_eq!(times, unique, "{result:?}");
+    // The window (1320, 1380] counts 60 rows of each series; the open one
+    // after it, (1380, 1440], the 20 rows read so far.
+    let tail: Vec<(f64, f64)> = result[0]
+        .values
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .copied()
+        .collect();
+    assert_eq!(tail, vec![(1380.0, 120.0), (1400.0, 40.0)], "{result:?}");
+    let QueryResult::Vector { result } = engine
+        .query("histogram_count(lat, 60)", Some(1400.0))
+        .unwrap()
+    else {
+        panic!("not a vector");
+    };
+    assert_eq!(result[0].value, (1400.0, 120.0));
+}
+
+/// A range query lays strided windows at multiples of the stride, so the
+/// range read does not move them, and the first window is whole.
+#[test]
+fn strided_range_windows_fall_at_multiples_of_the_stride() {
+    let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
+    let points = |start: f64| {
+        let QueryResult::Matrix { result } = engine
+            .query_range("histogram_count(lat, 60)", start, 1380.0, 1.0)
+            .unwrap()
+        else {
+            panic!("not a matrix");
+        };
+        result[0].values.clone()
+    };
+    let from_1100 = points(1100.0);
+    let from_1130 = points(1130.0);
+    assert_eq!(
+        from_1100,
+        vec![
+            (1140.0, 60.0),
+            (1200.0, 60.0),
+            (1260.0, 60.0),
+            (1320.0, 60.0),
+            (1380.0, 60.0)
+        ]
+    );
+    assert_eq!(from_1130, from_1100);
+}
+
+/// Quantiles and heatmaps lay strided windows as counts do: the same
+/// timestamps, and each heatmap column holding a whole window.
+#[test]
+fn strided_quantiles_and_heatmaps_share_the_windows() {
+    let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
+    let expected = vec![1140.0, 1200.0, 1260.0, 1320.0, 1380.0];
+    let QueryResult::Matrix { result } = engine
+        .query_range("histogram_quantiles([0.5], lat, 60)", 1130.0, 1380.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
+    assert_eq!(times, expected, "{result:?}");
+    let QueryResult::HistogramHeatmap { result } = engine
+        .query_range("histogram_heatmap(lat, 60)", 1130.0, 1380.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a heatmap");
+    };
+    assert_eq!(result.timestamps, expected);
+    let counts: Vec<f64> = result.data.iter().map(|(_, _, c)| *c).collect();
+    assert_eq!(counts, vec![60.0; 5], "{:?}", result.data);
+}
+
+/// Rows before a strided range's first window count in no window: with
+/// observations in a high bucket up to 1080 s and a low one after, the
+/// window (1080, 1140] holds only low ones.
+#[test]
+fn rows_before_the_first_strided_window_count_in_none() {
+    let mut source = Memory::new(1000);
+    let times: Vec<u64> = (1000..=1200).collect();
+    let snapshots = times
+        .iter()
+        .map(|&t| {
+            let high = (t.min(1080) - 1000) + 1;
+            let low = t.saturating_sub(1080);
+            HistogramSnapshot {
+                index: vec![10, 30],
+                count: vec![low, low + high],
+            }
+        })
+        .collect();
+    source.add_histogram(
+        "lat",
+        Histogram {
+            labels: Labels::default(),
+            config: ::histogram::Config::new(4, 16).unwrap(),
+            timestamps: times.iter().map(|t| t * 1_000_000_000).collect(),
+            snapshots,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let QueryResult::Matrix { result } = engine
+        .query_range("histogram_quantiles([1.0], lat, 60)", 1130.0, 1140.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    let QueryResult::Matrix { result: low } = engine
+        .query_range("histogram_quantiles([1.0], lat)", 1140.0, 1140.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    assert_eq!(result[0].values, low[0].values, "{result:?}");
+    let QueryResult::HistogramHeatmap { result } = engine
+        .query_range("histogram_heatmap(lat, 60)", 1130.0, 1140.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a heatmap");
+    };
+    assert_eq!(
+        result.data.len(),
+        1,
+        "one bucket in the window: {:?}",
+        result.data
+    );
+}
+
+/// No strided point falls before the range: a window holding the range's
+/// start but no row at or after it gives none.
+#[test]
+fn a_strided_window_with_no_row_in_the_range_gives_no_point() {
+    // Rows every 50 s: the window (1140, 1200] holding 1160 has its last row
+    // at 1150, before the range [1160, 1170].
+    let engine = QueryEngine::new(Arc::new(hist_rows(50_000, 1000, 1400, 50)));
+    let result = engine
+        .query_range("histogram_count(lat, 60)", 1160.0, 1170.0, 1.0)
+        .unwrap();
+    let QueryResult::Matrix { result } = result else {
+        panic!("not a matrix");
+    };
+    assert!(result.is_empty(), "{result:?}");
+}
+
+/// A window that closes unemitted leaves nothing for the next: with rows
+/// every 50 s and a 30 s stride over [1155, 1230], the window (1140, 1170]
+/// holds only 1150 and is not emitted, and (1170, 1200] counts the one
+/// observation from 1150 to 1200.
+#[test]
+fn a_window_closed_unemitted_leaves_nothing_for_the_next() {
+    let engine = QueryEngine::new(Arc::new(hist_rows(50_000, 1000, 1400, 50)));
+    let QueryResult::Matrix { result } = engine
+        .query_range("histogram_count(lat, 30)", 1155.0, 1230.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    assert_eq!(result[0].values, vec![(1200.0, 1.0)], "{result:?}");
+    let QueryResult::HistogramHeatmap { result } = engine
+        .query_range("histogram_heatmap(lat, 30)", 1155.0, 1230.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a heatmap");
+    };
+    assert_eq!(result.timestamps, vec![1200.0]);
+    let counts: Vec<f64> = result.data.iter().map(|(_, _, c)| *c).collect();
+    assert_eq!(counts, vec![1.0], "{:?}", result.data);
+}
+
+/// A stride shorter than a nanosecond, or not a number, is refused.
+#[test]
+fn a_stride_under_a_nanosecond_is_refused() {
+    let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
+    for q in ["histogram_count(lat, 1e-10)", "histogram_count(lat, NaN)"] {
+        let err = engine
+            .query_range(q, 1100.0, 1200.0, 1.0)
+            .expect_err(q)
+            .to_string();
+        assert!(err.contains("stride"), "{q}: {err}");
+    }
 }
 
 /// A histogram function's name inside a quoted label value is no call: a

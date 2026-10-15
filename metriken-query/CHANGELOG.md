@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A strided histogram call (`histogram_count(lat, 60)`,
+  `histogram_quantiles([..], lat, 60)`, `histogram_heatmap(lat, 60)`) in a
+  range query lays its windows at multiples of the stride, `(k·60 s,
+  (k+1)·60 s]`, where it laid them from the first row read. The range read
+  no longer moves them, the first window holding the range's start is read
+  whole, and the last window is the open one holding the range's end. Each
+  point is stamped at the last row of its window, as before.
+  A window is emitted only when it holds a row at or after the range's
+  start, so no point falls before the range. The read begins up to one
+  stride and two row intervals before the range. A stride that is not a multiple of the row
+  interval gives windows whose row counts alternate (2 and 3 rows for a
+  5 s stride over 2 s rows), where the windows used to stretch to whole
+  rows; a caller decimating a chart should round its stride to the row
+  interval.
+- A strided call as an instant query counts the one stride ending at the
+  instant and reads that window and the two rows before it, where
+  `histogram_count`, `_sum`, `_mean` and `_quantiles` read back 300 s and
+  their window fell wherever the read began, and `histogram_heatmap`
+  counted one row.
+- A stride under a nanosecond, or `NaN`, is a parse error; it gave a point
+  per row.
+
+### Fixed
+
+- Rows of several series at one timestamp fall in one strided window. A
+  window closed on the first of them, so the rest opened the next window,
+  and a boundary gave a second point holding one row (#279).
+
 ## [0.38.0] - 2026-10-15
 
 ### Changed

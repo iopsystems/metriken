@@ -417,7 +417,10 @@ Arrow `index` list is the crate's index and is passed through unchanged.
    `ArchiveReader::owners_of`, `SamplerReader::reader()` and
    `TableReader::source()`) but would reimplement the accumulation, which
    check 8 must test one copy of. `heatmap_impl` disagrees with the other
-   two when a stride is given.
+   two when a stride is given. (Corrected 2026-10-15: from metriken-query
+   0.39.0, the fix for #279, all three lay strided windows through one
+   `Windows` at multiples of the stride and agree; the rest of this item
+   describes 0.38 and earlier.)
    After a stride with no counts, `flush_accum` clears the accumulator and
    returns false. `quantiles_impl` moves `stride_last_emit` to that tick
    anyway (`histogram.rs:352-369`), so its next point is a full stride
