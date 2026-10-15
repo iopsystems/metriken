@@ -28,16 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### metriken-storage, metriken-query (not yet released)
 
 - **Breaking:** an archive's series carry their recording's labels, and a
-  query naming a metric several recordings hold is evaluated once per
-  recording and returns each recording's series instead of being refused.
-  A series' own value of a recording key moves to `exported_<key>`;
-  recordings with identical label sets are told apart by `__recording__`.
-  A query whose result would merge series of different recordings (`sum(x)`
-  over them, or `on()`) is refused until the engine can align and match
-  across recordings. This
-  is path step 5's series-label piece
-  (`docs/journal/2026-10-12-metriken-viewer.md`, Q11). See the crates'
-  CHANGELOGs.
+  query naming a metric several recordings hold is answered from all of
+  them, by one engine over every recording it reaches, instead of being
+  refused: `sum(x)` sums every recording's series and `sum by (source)`
+  gives one per `source`. A series' own value of a recording key moves to
+  `exported_<key>`; recordings with identical label sets are told apart by
+  `__recording__`. See the crates' CHANGELOGs.
+- **Breaking:** in metriken-query, `rate(x[range])` is the rate over
+  `[t - range, t]` (it was the per-step rate, the same as `irate`); a binary
+  operator between two series sets refuses many-to-many and many-to-one
+  matching; `deriv` is the slope over its `[range]`; and raw-mode joins hold
+  a point for the gap before it, up to a bound. See its CHANGELOG.
 
 ### metriken-storage 0.2.3
 

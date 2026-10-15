@@ -1,7 +1,6 @@
 //! Gauge-side streaming producers.
 //!
-//! All own their sample vectors (see `CounterPairwiseRate::new` for why a
-//! producer owns rather than borrows) and emit `f64` values at step-aligned
+//! All own their sample vectors and emit `f64` values at step-aligned
 //! timestamps. State is the cursor plus, for the windowed forms, the indices
 //! into the samples — no buffering beyond the input itself.
 //!
@@ -9,7 +8,8 @@
 //!   subject to the staleness rule.
 //! * [`GaugeAvgOverTime`] — `avg_over_time(metric[range])`.
 //! * [`GaugeIdelta`] — `idelta(metric[range])`, last-two-samples delta.
-//! * [`GaugeDeriv`] — `deriv(metric[range])`, least-squares slope.
+//! * [`GaugeDeriv`] — `deriv(metric[range])`, least-squares slope of a
+//!   gauge's or a counter's values.
 
 use super::Point;
 
@@ -33,6 +33,8 @@ use super::Point;
 ///   `start + k·step`.
 pub(crate) struct Placement {
     raw: bool,
+    /// The range's start: explicit points before it are not evaluated.
+    start_ns: u64,
     cursor_ns: u64,
     pub(crate) step_ns: u64,
     raw_idx: usize,
@@ -43,6 +45,7 @@ impl Placement {
     fn new(raw: bool, start_ns: u64, step_ns: u64) -> Self {
         Self {
             raw,
+            start_ns,
             cursor_ns: start_ns,
             step_ns,
             raw_idx: 0,
@@ -59,9 +62,13 @@ impl Placement {
     /// out of points/samples, or grid with `step_ns == 0`).
     fn next(&mut self, timestamps: &[u64], end_ns: u64) -> Option<u64> {
         if let Some((points, idx)) = &mut self.points {
-            let t = *points.get(*idx)?;
-            *idx += 1;
-            return (t <= end_ns).then_some(t);
+            loop {
+                let t = *points.get(*idx)?;
+                *idx += 1;
+                if t >= self.start_ns {
+                    return (t <= end_ns).then_some(t);
+                }
+            }
         }
         if self.raw {
             let t = *timestamps.get(self.raw_idx)?;
@@ -238,6 +245,11 @@ impl Iterator for GaugeIdelta {
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
             let hi = self.timestamps.partition_point(|&ts| ts <= t);
             if hi.saturating_sub(lo) < 2 {
+                // In raw mode, a sample with no value is a timing point: a
+                // join holds the next point for the gap from it.
+                if self.place.raw {
+                    return Some(Point::timing_at(t));
+                }
                 continue;
             }
             let cur = self.values[hi - 1] as f64;
@@ -249,24 +261,27 @@ impl Iterator for GaugeIdelta {
 
 pub struct GaugeDeriv {
     timestamps: Vec<u64>,
-    values: Vec<i64>,
+    values: Vec<f64>,
     end_ns: u64,
+    range_ns: u64,
     place: Placement,
 }
 
 impl GaugeDeriv {
     pub fn new(
         timestamps: Vec<u64>,
-        values: Vec<i64>,
+        values: Vec<f64>,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
+        range_ns: u64,
         raw: bool,
     ) -> Self {
         Self {
             timestamps,
             values,
             end_ns,
+            range_ns,
             place: Placement::new(raw, start_ns, step_ns),
         }
     }
@@ -275,15 +290,21 @@ impl GaugeDeriv {
 impl Iterator for GaugeDeriv {
     type Item = Point;
 
+    /// The least-squares slope, per second, of the samples in
+    /// `[t - range, t]`; no point where there are fewer than two.
     fn next(&mut self) -> Option<Point> {
         loop {
             let t = self.place.next(&self.timestamps, self.end_ns)?;
 
-            let window_start = t.saturating_sub(self.place.step_ns.saturating_mul(2));
-            let window_end = t.saturating_add(self.place.step_ns);
+            let window_start = t.saturating_sub(self.range_ns);
             let lo = self.timestamps.partition_point(|&ts| ts < window_start);
-            let hi = self.timestamps.partition_point(|&ts| ts <= window_end);
+            let hi = self.timestamps.partition_point(|&ts| ts <= t);
             if hi.saturating_sub(lo) < 2 {
+                // In raw mode, a sample with no value is a timing point: a
+                // join holds the next point for the gap from it.
+                if self.place.raw {
+                    return Some(Point::timing_at(t));
+                }
                 continue;
             }
 
@@ -292,9 +313,13 @@ impl Iterator for GaugeDeriv {
             let mut sum_y = 0.0_f64;
             let mut sum_xy = 0.0_f64;
             let mut sum_x2 = 0.0_f64;
+            // `x` in seconds from `t` and `y` from the first value: from the
+            // epoch, `x * x` is near 3e18 and the denominator below cancels
+            // to nothing, and a large counter loses the slope the same way.
+            let y0 = self.values[lo];
             for i in lo..hi {
-                let x = self.timestamps[i] as f64 / 1e9;
-                let y = self.values[i] as f64;
+                let x = (self.timestamps[i] as i64 - t as i64) as f64 / 1e9;
+                let y = self.values[i] - y0;
                 sum_x += x;
                 sum_y += y;
                 sum_xy += x * y;

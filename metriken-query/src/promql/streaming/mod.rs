@@ -16,7 +16,7 @@
 //! Wired-up shapes:
 //!
 //! * Counter producers: `CounterGridRate` (rate/irate — grid-aligned,
-//!   interval-attributable), `CounterPairwiseRate` (Raw mode / `deriv`).
+//!   interval-attributable), `CounterPairwiseRate` (Raw mode).
 //! * Gauge producers: `GaugeStepGrid` (bare selector),
 //!   `GaugeAvgOverTime`, `GaugeIdelta`, `GaugeDeriv`.
 //! * Aggregations: `MergeReduce` reducer driven by [`AggOp`]
@@ -29,7 +29,7 @@
 //! and assembles the pipeline for each recognised shape. Eager
 //! handlers in `promql::mod` cover the residual cases (heatmaps,
 //! one-side-eager binary ops, group_left/right, scalar/vector
-//! wrappers, counter-rate `deriv`).
+//! wrappers).
 
 use std::collections::HashMap;
 
@@ -38,7 +38,6 @@ use crate::promql::MatrixSample;
 
 mod aggregate;
 mod binary;
-mod deriv;
 pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod histogram;
@@ -52,9 +51,8 @@ pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
 pub(crate) use binary::{
     interval_binop, matrix_matrix_op, matrix_scalar_op, scalar_point, BinOp, MatchSpec,
 };
-pub(crate) use deriv::StreamingDeriv;
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
-pub(crate) use rate::{CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
+pub(crate) use rate::{range_start, CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
 
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;
@@ -104,18 +102,28 @@ pub struct Point {
     ///
     /// A counter that is null for a stretch — a device that appears at runtime,
     /// a partially-populated group, a read that failed — leaves a hole that
-    /// `rate`/`irate` still span, because the total across the hole is known
-    /// even though its distribution inside is not. Such a point carries a
-    /// value, and no `bounds`: an uncertainty band answers "how precisely do we
-    /// know the average over THIS interval", and for an interval nobody
-    /// observed the honest answer is unbounded, not a number. This flag is what
-    /// says so, and it is what lets a consumer render the difference (a
-    /// desaturated connector, a dashed segment) rather than showing an
-    /// interpolated point as though it had been measured.
+    /// `rate`/`irate` still span (except a raw `irate` across a gap longer
+    /// than four of its interval, which gives a timing point), because the
+    /// total across the hole is known even though its distribution inside is
+    /// not. Such a point carries a value, and no `bounds`: an uncertainty
+    /// band answers "how precisely do we know the average over THIS
+    /// interval", and for an interval nobody observed the honest answer is
+    /// unbounded, not a number. This flag is what says so, and it is what
+    /// lets a consumer render the difference (a desaturated connector, a
+    /// dashed segment) rather than showing an interpolated point as though
+    /// it had been measured.
     ///
     /// Propagates through operators the way `bounds` does: any operand being
     /// interpolated makes the result interpolated.
     pub interpolated: bool,
+    /// A timing point: in raw mode, a sample read whose function gives no
+    /// value there (its window holds too little), the first sample a raw
+    /// `irate` reads or one further from the sample before it than its gap
+    /// limit, and a join's or an aggregate's time where an operand has only
+    /// a timing point. A join holds a point for the gap before it
+    /// ([`Held`]), and a timing point is what that gap is measured from; it
+    /// is never a value. A result leaves timing points out.
+    pub(crate) timing: bool,
 }
 impl Point {
     /// A point with no uncertainty bound (the default for every producer/operator
@@ -127,6 +135,15 @@ impl Point {
             bounds: None,
             edges: None,
             interpolated: false,
+            timing: false,
+        }
+    }
+
+    /// A timing point at `t`; see [`Point::timing`](Point#structfield.timing).
+    pub(crate) fn timing_at(t: u64) -> Self {
+        Self {
+            timing: true,
+            ..Self::at(t, f64::NAN)
         }
     }
 }
@@ -141,36 +158,47 @@ pub(crate) enum Join {
     Exact,
     /// At every timestamp any of them has, each series contributing its
     /// latest point while that point is no older than the gap that preceded
-    /// it (the series' own spacing; [`Held`]). For
-    /// [`crate::RateMode::Raw`], where each series' points are at its own
-    /// sample times: two acquisition groups, or two recordings, read at
-    /// different instants and share none.
-    Latest,
+    /// it (the series' own spacing), and at most the bound given, in
+    /// nanoseconds ([`Held`]). For [`crate::RateMode::Raw`], where each
+    /// series' points are at its own sample times: two acquisition groups,
+    /// or two recordings, read at different instants and share none.
+    Latest(u64),
 }
 
 impl Join {
-    pub(crate) fn for_mode(mode: crate::RateMode) -> Self {
+    /// The join for `mode`; `hold_ns` bounds a raw join's hold.
+    pub(crate) fn for_mode(mode: crate::RateMode, hold_ns: u64) -> Self {
         match mode {
             crate::RateMode::Grid => Join::Exact,
-            crate::RateMode::Raw => Join::Latest,
+            crate::RateMode::Raw => Join::Latest(hold_ns),
         }
     }
 }
 
 /// A series sampled at instants taken from other series ([`Join::Latest`]):
 /// its latest point at or before the instant, held while the instant is no
-/// further past it than the gap from the point before. A series' first
-/// point is held for the gap to its second.
+/// further past it than the gap from the point before, and at most
+/// `max_hold_ns`. A series' first point is held for `max_hold_ns`. A
+/// timing point ([`Point::timing`](Point#structfield.timing)) is a point the
+/// gap is measured from and never a value.
+///
+/// The bound is what lets a read that starts a bounded time before the
+/// range give every point its hold: the dispatcher reads back twice the
+/// bound for each nested join, and the window (`raw_read_back`), so a point
+/// whose hold can reach the range's start has the point before it read, or
+/// is more than the bound past it.
 pub(crate) struct Held<'a> {
     iter: std::iter::Peekable<Box<dyn Iterator<Item = Point> + 'a>>,
     latest: Option<(Point, u64)>,
+    max_hold_ns: u64,
 }
 
 impl<'a> Held<'a> {
-    pub(crate) fn new(iter: Box<dyn Iterator<Item = Point> + 'a>) -> Self {
+    pub(crate) fn new(iter: Box<dyn Iterator<Item = Point> + 'a>, max_hold_ns: u64) -> Self {
         Self {
             iter: iter.peekable(),
             latest: None,
+            max_hold_ns,
         }
     }
 
@@ -183,18 +211,24 @@ impl<'a> Held<'a> {
     pub(crate) fn advance_to(&mut self, t: u64) {
         while let Some(p) = self.iter.next_if(|p| p.t <= t) {
             let hold = match self.latest {
-                Some((q, _)) => p.t.saturating_sub(q.t),
-                None => self.iter.peek().map_or(0, |n| n.t.saturating_sub(p.t)),
+                Some((q, _)) => p.t.saturating_sub(q.t).min(self.max_hold_ns),
+                None => self.max_hold_ns,
             };
             self.latest = Some((p, hold));
         }
     }
 
     /// The series' value at `t`, after [`advance_to`](Self::advance_to) it.
+    /// A timing point is never a value.
     pub(crate) fn at(&self, t: u64) -> Option<Point> {
         self.latest
-            .filter(|(p, hold)| t.saturating_sub(p.t) <= *hold)
+            .filter(|(p, hold)| !p.timing && t.saturating_sub(p.t) <= *hold)
             .map(|(p, _)| p)
+    }
+
+    /// Whether the series' latest point is a timing point at `t`.
+    pub(crate) fn timing_at(&self, t: u64) -> bool {
+        self.latest.is_some_and(|(p, _)| p.timing && p.t == t)
     }
 
     /// Drop the rest of the series.

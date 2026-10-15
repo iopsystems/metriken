@@ -157,6 +157,19 @@ impl DataSource for UnionSource {
         self.children[i].gauges(name, filter, start_ns, end_ns)
     }
 
+    /// The parts of the table holding `name`, at that table's interval.
+    fn gauge_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+    ) -> Option<Vec<(Gauges, f64)>> {
+        let i = *self.gauge_index.get(name)?;
+        self.children[i].gauge_parts(name, filter, start_ns, end_ns, step_ns)
+    }
+
     fn histogram_stream(
         &self,
         name: &str,
@@ -168,24 +181,32 @@ impl DataSource for UnionSource {
         self.children[i].histogram_stream(name, filter, start_ns, end_ns)
     }
 
-    /// The FINEST (minimum) interval across children — the same policy
-    /// [`crate::segmented`]'s `SegmentedSource::interval()` uses: `rate()`'s
-    /// default grid step should track the fastest-ticking child, not be
-    /// dragged wide by a lagging one.
-    ///
-    /// What this does NOT do today: `interval()` never measures actual row
-    /// spacing. Each child's `interval()` is `MultiParquetSource::interval`
-    /// reading the `sampling_interval_ms` FOOTER key-value (defaulting to
-    /// 1000ms when absent) — and a `.rez` table's parquet carries no
-    /// file-level KV metadata at all (recording metadata lives in the
-    /// manifest JSON), so every child of a rezolus union reports the same
-    /// 1.0s default and this `min` is a no-op in practice. The policy is
-    /// still the right one to keep — a child that skipped ticks (a group's
-    /// window-advance dedup) genuinely does tick slower than a sibling that
-    /// didn't, and `min` is the correct response once intervals are real —
-    /// but that genuinely-different-cadence case can't be exercised by a
-    /// test until `.rez` stamps a per-table interval instead of relying on
-    /// the shared default.
+    /// The holding table's interval.
+    fn histogram_interval(&self, name: &str) -> f64 {
+        match self.histogram_index.get(name) {
+            Some(i) => self.children[*i].histogram_interval(name),
+            None => self.interval(),
+        }
+    }
+
+    /// The holding table's interval.
+    fn counter_interval(&self, name: &str) -> f64 {
+        match self.counter_index.get(name) {
+            Some(i) => self.children[*i].counter_interval(name),
+            None => self.interval(),
+        }
+    }
+
+    /// The holding table's interval.
+    fn gauge_interval(&self, name: &str) -> f64 {
+        match self.gauge_index.get(name) {
+            Some(i) => self.children[*i].gauge_interval(name),
+            None => self.interval(),
+        }
+    }
+
+    /// The finest (minimum) interval across children: the default step
+    /// tracks the fastest-ticking child.
     fn interval(&self) -> f64 {
         // `f64::INFINITY` (not `f64::MAX`) as the fold seed: an empty
         // `children` must not silently report `f64::MAX` as "the interval",

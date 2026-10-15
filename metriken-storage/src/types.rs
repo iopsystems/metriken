@@ -89,6 +89,9 @@ pub struct CounterSample {
 pub struct CounterStream<'a> {
     pub labels: Labels,
     pub windowed: bool,
+    /// The row spacing, in seconds, of the table it is read from, where a
+    /// source knows it (`LabeledSource::with_interval`).
+    pub interval: Option<f64>,
     pub samples: Box<dyn Iterator<Item = CounterSample> + 'a>,
 }
 
@@ -111,6 +114,7 @@ impl<'a> From<Counter> for CounterStream<'a> {
         CounterStream {
             labels,
             windowed,
+            interval: None,
             samples: Box::new(samples),
         }
     }

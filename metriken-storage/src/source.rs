@@ -117,6 +117,31 @@ pub trait DataSource: Send + Sync {
     ) -> Option<HistogramStream>;
     /// Sampling interval in seconds.
     fn interval(&self) -> f64;
+    /// The row spacing, in seconds, of the table holding histogram `name`,
+    /// answered as [`counter_interval`](Self::counter_interval) is.
+    fn histogram_interval(&self, name: &str) -> f64 {
+        let _ = name;
+        self.interval()
+    }
+    /// The row spacing, in seconds, of the table holding counter `name`.
+    /// `LabeledSource` answers the interval set with `with_interval`, else
+    /// its source's; `UnionSource` the holding table's; `RecordingsSource`
+    /// and `MultiParquetSource` the longest among the children holding it;
+    /// other sources answer `interval`. No counter series a source returns
+    /// carries a longer `CounterStream::interval` or
+    /// `ScanSeries::interval`: `LabeledSource::with_interval` sets its
+    /// interval on every series, and `RecordingsSource` and
+    /// `MultiParquetSource` set each child's on a series that has none.
+    fn counter_interval(&self, name: &str) -> f64 {
+        let _ = name;
+        self.interval()
+    }
+    /// The row spacing, in seconds, of the table holding gauge `name`,
+    /// answered as [`counter_interval`](Self::counter_interval) is.
+    fn gauge_interval(&self, name: &str) -> f64 {
+        let _ = name;
+        self.interval()
+    }
     /// Full time extent of the stored data in nanoseconds, or `None` if empty.
     fn time_range(&self) -> Option<(u64, u64)>;
     /// Names of all counter metrics (sorted, deduplicated).

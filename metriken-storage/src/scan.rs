@@ -15,6 +15,9 @@ pub struct ScanSeries {
     pub labels: Labels,
     /// Whether its first column carries acquisition-window columns.
     pub windowed: bool,
+    /// The row spacing, in seconds, of the table it is read from, where a
+    /// source knows it (`LabeledSource::with_interval`).
+    pub interval: Option<f64>,
 }
 
 /// Which series each row of a read column is.

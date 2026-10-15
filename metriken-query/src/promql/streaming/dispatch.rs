@@ -6,9 +6,12 @@
 //! Recognised AST shapes:
 //!
 //! * `metric{matchers}` — gauge VectorSelector at step grid.
-//! * `irate(metric[range])` / `rate(metric[range])` — counter producers.
-//! * `avg_over_time(metric[range])` / `idelta(metric[range])` /
-//!   `deriv(metric[range])` — gauge / counter-rate producers.
+//! * `rate(metric[range])` — the rate over `[t - range, t]`;
+//!   `irate(metric[range])` — the rate over one step, or between consecutive
+//!   samples in raw mode.
+//! * `avg_over_time(metric[range])` / `idelta(metric[range])` — gauge
+//!   producers; `deriv(metric[range])` — the slope of a gauge's or a
+//!   counter's values.
 //! * `histogram_quantile(q, metric)` — single-quantile histogram
 //!   extraction. Output is `Built::Materialized` since the streaming
 //!   histogram pipeline emits ready-made `MatrixSample`s.
@@ -31,7 +34,7 @@ use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
     aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp,
     AtPoints, BinOp, CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv,
-    GaugeIdelta, GaugeStepGrid, GroupBy, Join, LabeledSeries, MatchSpec, SeriesSet, StreamingDeriv,
+    GaugeIdelta, GaugeStepGrid, GroupBy, Join, LabeledSeries, MatchSpec, SeriesSet,
 };
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
 use crate::{DataSource, QueryOptions, RateMode};
@@ -47,7 +50,7 @@ pub fn try_streaming(
     step: f64,
     opts: &QueryOptions,
 ) -> Result<QueryResult, QueryError> {
-    let ctx = make_ctx(source, start, end, step, opts);
+    let ctx = make_ctx(source, expr, start, end, step, opts);
     let result = match build(&ctx, expr)? {
         Built::Series {
             series,
@@ -76,6 +79,7 @@ pub fn try_streaming(
 /// The evaluation context for `[start, end]` at `step`.
 fn make_ctx<'a>(
     source: &'a dyn DataSource,
+    expr: &Expr,
     start: f64,
     end: f64,
     step: f64,
@@ -86,10 +90,12 @@ fn make_ctx<'a>(
     let raw_start_ns = crate::promql::range_start_ns(start);
     // Grid mode fixes the evaluation-grid phase to the step boundary so two
     // recordings on the same step share a grid (A/B alignment) and gauge/rate
-    // labels land on round step multiples. Raw keeps the caller's start. Snap
-    // once here so every downstream producer inherits the fixed phase.
+    // labels land on round step multiples. Raw keeps the caller's start, and
+    // so does a range of one point (an instant query), which is evaluated at
+    // the time asked for. Snap once here so every downstream producer
+    // inherits the fixed phase.
     let start_ns = match rate_mode {
-        RateMode::Grid if step_ns > 0 => (raw_start_ns / step_ns) * step_ns,
+        RateMode::Grid if step_ns > 0 && end > start => (raw_start_ns / step_ns) * step_ns,
         _ => raw_start_ns,
     };
     Ctx {
@@ -98,18 +104,125 @@ fn make_ctx<'a>(
         end_ns: crate::promql::range_end_ns(end),
         step_ns,
         rate_mode,
-        rate_span_ns: opts.rate_span_ns,
         eval_timestamps: opts.eval_timestamps.clone(),
         per_series_rates: opts.per_series_rates,
         recording_keys: source.recording_label_keys(),
+        raw_hold_ns: match rate_mode {
+            RateMode::Raw => raw_hold(source, expr, step_ns),
+            RateMode::Grid => 0,
+        },
+        raw_depth: join_depth(expr),
     }
 }
 
-/// In raw mode, `series` without the points before the range's start.
+/// The longest a raw join holds a point ([`Join::Latest`]): two steps, or
+/// two of the longest interval of a metric the query reads, whichever is
+/// longer.
+fn raw_hold(source: &dyn DataSource, expr: &Expr, step_ns: u64) -> u64 {
+    fn walk(expr: &Expr, names: &mut Vec<String>) {
+        match expr {
+            Expr::Aggregate(a) => walk(&a.expr, names),
+            Expr::Unary(u) => walk(&u.expr, names),
+            Expr::Binary(b) => {
+                walk(&b.lhs, names);
+                walk(&b.rhs, names);
+            }
+            Expr::Paren(p) => walk(&p.expr, names),
+            Expr::Call(call) => {
+                for arg in &call.args.args {
+                    walk(arg, names);
+                }
+            }
+            Expr::VectorSelector(sel) => names.extend(sel.name.clone()),
+            Expr::MatrixSelector(sel) => names.extend(sel.vs.name.clone()),
+            Expr::Subquery(s) => walk(&s.expr, names),
+            Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+        }
+    }
+    let mut names = Vec::new();
+    walk(expr, &mut names);
+    let interval = names
+        .iter()
+        .map(|n| {
+            source
+                .counter_interval(n)
+                .max(source.gauge_interval(n))
+                .max(source.histogram_interval(n))
+        })
+        .fold(source.interval(), f64::max);
+    step_ns.saturating_mul(2).max((interval * 2e9) as u64)
+}
+
+/// How many joins (aggregations and operators between two series sets) are
+/// nested in `expr`, at the deepest.
+fn join_depth(expr: &Expr) -> u64 {
+    match expr {
+        Expr::Aggregate(a) => 1 + join_depth(&a.expr),
+        Expr::Binary(b) => {
+            let (l, r) = (join_depth(&b.lhs), join_depth(&b.rhs));
+            fn scalar(e: &Expr) -> bool {
+                match e {
+                    Expr::NumberLiteral(_) => true,
+                    Expr::Paren(p) => scalar(&p.expr),
+                    _ => false,
+                }
+            }
+            if scalar(&b.lhs) || scalar(&b.rhs) {
+                l.max(r)
+            } else {
+                1 + l.max(r)
+            }
+        }
+        Expr::Unary(u) => join_depth(&u.expr),
+        Expr::Paren(p) => join_depth(&p.expr),
+        Expr::Call(call) => call
+            .args
+            .args
+            .iter()
+            .map(|a| join_depth(a))
+            .max()
+            .unwrap_or(0),
+        Expr::Subquery(s) => join_depth(&s.expr),
+        _ => 0,
+    }
+}
+
+/// How far before the range a raw read starts, for points over `window_ns`:
+/// twice the hold bound for each nested join, and the window. A series'
+/// value at `t` in a join is its latest point, within the bound before `t`,
+/// held for the gap from the point before it, which matters only within the
+/// bound again: so a join's points from `t - 2L` need its operands' points
+/// from `t - 4L`, and each join below adds `2L` more.
+fn raw_read_back(ctx: &Ctx<'_>, window_ns: u64) -> u64 {
+    ctx.raw_hold_ns
+        .saturating_mul(2 * ctx.raw_depth)
+        .saturating_add(window_ns)
+}
+
+/// How far before a `rate(name[range])` window's left edge a sample is
+/// interpolated from, for a series that does not carry its table's
+/// interval: two of `counter_interval`, which no series of the source
+/// exceeds (`DataSource::counter_interval`). A window with no sample that
+/// close before its left edge starts at the first sample after it
+/// (`range_start`).
+fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
+    crate::batch_rate::interval_reach(ctx.source.counter_interval(name))
+}
+
+/// How far before a `rate(name[range])` point's time its read starts: the
+/// `[range]`, the reach before it ([`rate_reach`]), and one reach more for
+/// a point held past a series' last sample, whose window ends at that
+/// sample, up to the series' typical spacing before the point.
+fn rate_lookback(ctx: &Ctx<'_>, name: &str, range_ns: u64) -> u64 {
+    range_ns.saturating_add(rate_reach(ctx, name).saturating_mul(2))
+}
+
+/// In raw mode, `series` without the points before the range's start and
+/// without timing points.
 ///
-/// Raw producers emit from their read's lookback, so that a series' last
-/// point before the range is there for a `Join::Latest` to hold at the
-/// range's start.
+/// Raw producers emit a point at every sample they read, from before the
+/// range, so that a join holds each point for the gap before it
+/// (`Join::Latest`).
 fn clip_raw<'a>(ctx: &Ctx<'_>, series: SeriesSet<'a>) -> SeriesSet<'a> {
     if !matches!(ctx.rate_mode, RateMode::Raw) {
         return series;
@@ -117,7 +230,12 @@ fn clip_raw<'a>(ctx: &Ctx<'_>, series: SeriesSet<'a>) -> SeriesSet<'a> {
     let start = ctx.start_ns;
     series
         .into_iter()
-        .map(|ls| LabeledSeries::new(ls.labels, ls.iter.filter(move |p| p.t >= start)))
+        .map(|ls| {
+            LabeledSeries::new(
+                ls.labels,
+                ls.iter.filter(move |p| p.t >= start && !p.timing),
+            )
+        })
         .collect()
 }
 
@@ -132,7 +250,7 @@ pub(crate) fn try_streaming_display(
     opts: &QueryOptions,
     display: &crate::DisplayOptions,
 ) -> Result<crate::DisplayResult, QueryError> {
-    let ctx = make_ctx(source, start, end, step, opts);
+    let ctx = make_ctx(source, expr, start, end, step, opts);
     if let Some(result) = batch_display(&ctx, expr, start, end, step, display)? {
         return Ok(result);
     }
@@ -183,13 +301,16 @@ struct Ctx<'a> {
     end_ns: u64,
     step_ns: u64,
     rate_mode: RateMode,
-    rate_span_ns: Option<u64>,
     /// Explicit evaluation timestamps; see [`QueryOptions::eval_timestamps`].
     eval_timestamps: Option<std::sync::Arc<[u64]>>,
     /// See [`QueryOptions::per_series_rates`].
     per_series_rates: bool,
     /// See [`DataSource::recording_label_keys`].
     recording_keys: Vec<String>,
+    /// In raw mode, the longest a join holds a point ([`raw_hold`]).
+    raw_hold_ns: u64,
+    /// How many joins the query nests ([`join_depth`]).
+    raw_depth: u64,
 }
 
 impl<'a> Ctx<'a> {
@@ -267,12 +388,21 @@ fn grid_request<'c, 'g>(
     let name = sel.vs.name.as_deref()?;
     let filter = extract_filter_labels(&sel.vs.matchers.matchers);
     let range_ns = sel.range.as_nanos() as u64;
+    // `rate` is over its `[range]`; `irate` over one step.
+    let range = call.func.name == "rate";
+    let (lookback, span_ns) = if range {
+        (rate_lookback(ctx, name, range_ns), range_ns)
+    } else {
+        (range_ns.max(ctx.step_ns), ctx.step_ns)
+    };
     let request = crate::batch_rate::GridRateRequest {
-        data_start: ctx.start_ns.saturating_sub(range_ns.max(ctx.step_ns)),
+        data_start: ctx.start_ns.saturating_sub(lookback),
         start_ns: ctx.start_ns,
         end_ns: ctx.end_ns,
         step_ns: ctx.step_ns,
-        span_ns: ctx.rate_span_ns.unwrap_or(ctx.step_ns),
+        span_ns,
+        range,
+        reach_ns: rate_reach(ctx, name),
         group,
         display,
     };
@@ -510,7 +640,12 @@ where
             "aggregation requires a series-typed inner expression".to_string(),
         ));
     };
-    let series = aggregate(inner_series, op, group_by, Join::for_mode(ctx.rate_mode));
+    let series = aggregate(
+        inner_series,
+        op,
+        group_by,
+        Join::for_mode(ctx.rate_mode, ctx.raw_hold_ns),
+    );
     Ok(Built::Series {
         series,
         metric_name: None,
@@ -576,7 +711,8 @@ where
                 op,
                 spec,
                 &ctx.recording_keys,
-                Join::for_mode(ctx.rate_mode),
+                Join::for_mode(ctx.rate_mode, ctx.raw_hold_ns),
+                ctx.start_ns,
             )?,
             metric_name: None,
             metric_name_for_error: None,
@@ -684,13 +820,19 @@ where
         .ok_or_else(|| QueryError::ParseError("Matrix selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.vs.matchers.matchers);
     let range_ns = sel.range.as_nanos() as u64;
-    let data_start = ctx.start_ns.saturating_sub(range_ns);
+    // A windowed function's point at `t` reads `[t - range, t]`. Raw reads
+    // as `raw_read_back` says.
+    let data_start = match ctx.rate_mode {
+        RateMode::Grid => ctx.start_ns.saturating_sub(range_ns),
+        RateMode::Raw => ctx.start_ns.saturating_sub(raw_read_back(ctx, range_ns)),
+    };
 
     match call.func.name {
-        // `rate` and `irate` are the same operation in this engine: the query's
-        // `[range]` window is inert, and the value is the per-step rate. The
-        // mode only chooses point placement (see `RateMode`).
+        // `rate` is the rate over its `[range]` before each point; `irate`
+        // ignores the `[range]` and is the rate over one step, or between
+        // consecutive samples in raw mode (see `RateMode`).
         "rate" | "irate" => {
+            let range = call.func.name == "rate";
             if let Some((series, _)) = batch_rates(ctx, call, None) {
                 return Ok(Built::Series {
                     series,
@@ -698,21 +840,20 @@ where
                     metric_name_for_error: Some(metric_name.to_string()),
                 });
             }
-            // Grid needs at least one step of lookback to bracket the first
-            // interval's left edge, regardless of the (inert) query range.
-            // Raw pairs consecutive samples and emits the last pair before
-            // the range, which a join holds at its start. It reads back the
-            // `[range]`, and at least two steps or two of the source's
-            // intervals: a series read more slowly than that (a slower table
-            // or recording, or a gap before the start) has its sample before
-            // the range only when the `[range]` reaches it.
-            let lookback = match ctx.rate_mode {
-                RateMode::Grid => range_ns.max(ctx.step_ns),
-                RateMode::Raw => ctx
-                    .step_ns
-                    .max((ctx.source.interval() * 1e9) as u64)
-                    .saturating_mul(2)
-                    .max(range_ns),
+            // A `rate` reads back its window (`rate_lookback`). An `irate`
+            // on the grid needs at least one step of lookback to bracket the
+            // first interval's left edge. Raw reads as `raw_read_back` says:
+            // a raw `rate` over its window, a raw `irate` over the pair, no
+            // further apart than four of its interval (`max_gap`).
+            let lookback = match (ctx.rate_mode, range) {
+                (RateMode::Grid, true) => rate_lookback(ctx, metric_name, range_ns),
+                (RateMode::Grid, false) => range_ns.max(ctx.step_ns),
+                (RateMode::Raw, true) => {
+                    raw_read_back(ctx, rate_lookback(ctx, metric_name, range_ns))
+                }
+                (RateMode::Raw, false) => {
+                    raw_read_back(ctx, rate_reach(ctx, metric_name).saturating_mul(2))
+                }
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
             let Some(streams) =
@@ -731,9 +872,18 @@ where
             // per series and each producer one interval's worth of samples,
             // not every series' every sample. Collecting here used to be
             // most of a query's memory on a wide table.
+            let default_reach = rate_reach(ctx, metric_name);
             let series: SeriesSet<'a> = streams
                 .into_iter()
-                .map(|stream| match ctx.rate_mode {
+                .map(|stream| {
+                    (
+                        stream
+                            .interval
+                            .map_or(default_reach, crate::batch_rate::interval_reach),
+                        stream,
+                    )
+                })
+                .map(|(reach, stream)| match ctx.rate_mode {
                     RateMode::Grid => {
                         let rate = CounterGridRate::from_stream(
                             stream.samples,
@@ -741,17 +891,14 @@ where
                             ctx.start_ns,
                             ctx.end_ns,
                             ctx.step_ns,
-                            // Wider than the step only when the caller
-                            // asked for smoothing (a cross-cadence query):
-                            // points stay on the grid, each value averages
-                            // over more.
-                            ctx.rate_span_ns.unwrap_or(ctx.step_ns),
+                            if range { range_ns } else { ctx.step_ns },
                         );
-                        // Explicit timestamps override the grid entirely —
-                        // placement AND averaging window both come from
-                        // them, so a value lands on a slow source's real
-                        // reading instead of being interpolated to a grid
-                        // point that source never observed.
+                        let rate = if range { rate.over_range(reach) } else { rate };
+                        // Explicit timestamps replace the grid, so a value
+                        // lands on a slow source's real reading instead of
+                        // being interpolated to a grid point that source
+                        // never observed. An `irate`'s window is then the gap
+                        // from the preceding timestamp.
                         match &ctx.eval_timestamps {
                             Some(points) => {
                                 LabeledSeries::new(stream.labels, rate.at_points(points.clone()))
@@ -759,13 +906,27 @@ where
                             None => LabeledSeries::new(stream.labels, rate),
                         }
                     }
+                    // A point at every sample read, from before the range;
+                    // the result is cut at `start` (`clip_raw`).
+                    RateMode::Raw if range => LabeledSeries::new(
+                        stream.labels,
+                        CounterGridRate::from_stream(
+                            stream.samples,
+                            stream.windowed,
+                            ctx.start_ns,
+                            ctx.end_ns,
+                            ctx.step_ns,
+                            range_ns,
+                        )
+                        .over_range(reach)
+                        .at_samples(),
+                    ),
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
-                        // With the series' last point before the range, which
-                        // a join holds at its start; the result is cut at
-                        // `start` (`clip_raw`).
-                        CounterPairwiseRate::from_stream(stream.samples, ctx.start_ns, ctx.end_ns)
-                            .with_one_before(),
+                        // A pair spans up to four of the series' interval
+                        // (two reaches): a missed tick or two with jitter.
+                        CounterPairwiseRate::from_stream(stream.samples, ctx.end_ns)
+                            .max_gap(reach.saturating_mul(2)),
                     ),
                 })
                 .collect();
@@ -844,56 +1005,66 @@ where
             })
         }
         "deriv" => {
-            // Try gauge path first; fall back to counter 2nd-derivative.
-            let deriv_data_start = ctx.start_ns.saturating_sub(ctx.step_ns.saturating_mul(2));
-            if let Some(gauges) =
-                ctx.source
-                    .gauges(metric_name, &filter, deriv_data_start, ctx.end_ns)
+            // The slope of the values in `[t - range, t]`: a gauge's, or a
+            // counter's as read (no reset handling), as in PromQL.
+            let values: Vec<(crate::labels::Labels, Vec<u64>, Vec<f64>)> = if let Some(gauges) = ctx
+                .source
+                .gauges(metric_name, &filter, data_start, ctx.end_ns)
             {
-                let series: SeriesSet<'a> = gauges
+                gauges
                     .series
                     .into_iter()
                     .map(|g| {
-                        let producer = ctx.place(GaugeDeriv::new(
+                        (
+                            g.labels,
                             g.timestamps,
-                            g.values,
-                            ctx.start_ns,
-                            ctx.end_ns,
-                            ctx.step_ns,
-                            matches!(ctx.rate_mode, RateMode::Raw),
-                        ));
-                        LabeledSeries::new(g.labels, producer)
+                            g.values.iter().map(|v| *v as f64).collect(),
+                        )
                     })
-                    .collect();
-                return Ok(Built::Series {
-                    series,
-                    metric_name: Some("deriv"),
-                    metric_name_for_error: Some(metric_name.to_string()),
-                });
-            }
-            let Some(counters) =
+                    .collect()
+            } else if let Some(counters) =
                 ctx.source
-                    .counters(metric_name, &filter, deriv_data_start, ctx.end_ns)
-            else {
-                nothing_read(ctx.source, metric_name, MetricKind::Counter)?;
+                    .counters(metric_name, &filter, data_start, ctx.end_ns)
+            {
+                counters
+                    .series
+                    .into_iter()
+                    .map(|c| {
+                        (
+                            c.labels,
+                            c.timestamps,
+                            c.values.iter().map(|v| *v as f64).collect(),
+                        )
+                    })
+                    .collect()
+            } else {
+                // Nothing matched: empty, unless the source holds the name
+                // as neither a gauge nor a counter.
+                let kind = if ctx.source.counter_names().iter().any(|n| n == metric_name) {
+                    MetricKind::Counter
+                } else {
+                    MetricKind::Gauge
+                };
+                nothing_read(ctx.source, metric_name, kind)?;
                 return Ok(Built::Series {
                     series: Vec::new(),
                     metric_name: Some(metric_name),
                     metric_name_for_error: None,
                 });
             };
-            let series: SeriesSet<'a> = counters
-                .series
+            let series: SeriesSet<'a> = values
                 .into_iter()
-                .map(|c| {
-                    // deriv wraps the pairwise rate in StreamingDeriv, which does
-                    // its own windowing and needs the pre-start lookback, so no
-                    // start bound here (0).
-                    let rate_iter = CounterPairwiseRate::new(c.timestamps, c.values, 0, ctx.end_ns);
-                    LabeledSeries::new(
-                        c.labels,
-                        StreamingDeriv::new(rate_iter, ctx.start_ns, ctx.end_ns, ctx.step_ns),
-                    )
+                .map(|(labels, timestamps, values)| {
+                    let producer = ctx.place(GaugeDeriv::new(
+                        timestamps,
+                        values,
+                        ctx.start_ns,
+                        ctx.end_ns,
+                        ctx.step_ns,
+                        range_ns,
+                        matches!(ctx.rate_mode, RateMode::Raw),
+                    ));
+                    LabeledSeries::new(labels, producer)
                 })
                 .collect();
             Ok(Built::Series {
@@ -943,10 +1114,12 @@ where
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
-    let Some(stream) = ctx
-        .source
-        .histogram_stream(metric_name, &filter, ctx.start_ns, ctx.end_ns)
-    else {
+    let Some(stream) = ctx.source.histogram_stream(
+        metric_name,
+        &filter,
+        crate::promql::histogram_read_start(ctx.source, metric_name, ctx.start_ns),
+        ctx.end_ns,
+    ) else {
         nothing_read(ctx.source, metric_name, MetricKind::Histogram)?;
         return Ok(Built::Materialized {
             result: Vec::new(),
@@ -978,9 +1151,14 @@ where
     // recordings of different intervals hands each recording's series over
     // with its interval (`gauge_parts`), so a 10 s recording's gauge is not
     // dropped between its rows beside a 1 s recording's.
+    // In raw mode the read starts as `raw_read_back` says.
+    let read_start = match ctx.rate_mode {
+        RateMode::Grid => ctx.start_ns,
+        RateMode::Raw => ctx.start_ns.saturating_sub(raw_read_back(ctx, 0)),
+    };
     let Some(parts) =
         ctx.source
-            .gauge_parts(metric_name, &filter, ctx.start_ns, ctx.end_ns, ctx.step_ns)
+            .gauge_parts(metric_name, &filter, read_start, ctx.end_ns, ctx.step_ns)
     else {
         // A bare selector reads gauges. A counter is read through rate() or
         // irate(), and saying so beats reporting a metric the source holds as
@@ -1016,4 +1194,28 @@ where
         metric_name: Some(metric_name),
         metric_name_for_error: Some(metric_name.to_string()),
     })
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::join_depth;
+
+    /// Aggregations and operators between two series sets count; a scalar
+    /// operand and a function do not.
+    #[test]
+    fn join_depth_counts_nested_joins() {
+        for (query, depth) in [
+            ("rate(x[1m])", 0),
+            ("x * 2", 0),
+            ("sum(x)", 1),
+            ("a + b", 1),
+            ("2 * (a + b)", 1),
+            ("(a + b) + c", 2),
+            ("sum(a + b) + c", 3),
+            ("sum(irate(x[1m])) / sum(irate(y[1m]))", 2),
+        ] {
+            let expr = promql_parser::parser::parse(query).unwrap();
+            assert_eq!(join_depth(&expr), depth, "{query}");
+        }
+    }
 }

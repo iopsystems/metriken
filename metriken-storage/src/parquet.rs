@@ -152,7 +152,9 @@ impl DataSource for MultiParquetSource {
             let Some(streams) = pf.counter_streams(name, &pq_filter, start_ns, end_ns) else {
                 continue;
             };
+            let interval = pf.counter_interval(name);
             for mut stream in streams {
+                stream.interval.get_or_insert(interval);
                 for (k, v) in &extra.inner {
                     debug_assert!(
                         !stream.labels.inner.contains_key(k),
@@ -256,6 +258,36 @@ impl DataSource for MultiParquetSource {
             .iter()
             .map(|(pf, _)| pf.interval())
             .fold(f64::MAX, f64::min)
+    }
+
+    /// The longest of the intervals of the files holding `name`.
+    fn counter_interval(&self, name: &str) -> f64 {
+        self.files
+            .iter()
+            .filter(|(pf, _)| pf.counter_names().iter().any(|n| n == name))
+            .map(|(pf, _)| pf.counter_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+
+    /// The longest of the intervals of the files holding `name`.
+    fn gauge_interval(&self, name: &str) -> f64 {
+        self.files
+            .iter()
+            .filter(|(pf, _)| pf.gauge_names().iter().any(|n| n == name))
+            .map(|(pf, _)| pf.gauge_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+
+    /// The longest of the intervals of the files holding `name`.
+    fn histogram_interval(&self, name: &str) -> f64 {
+        self.files
+            .iter()
+            .filter(|(pf, _)| pf.histogram_names().iter().any(|n| n == name))
+            .map(|(pf, _)| pf.histogram_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {
@@ -3283,5 +3315,92 @@ mod schema_tests {
 
         // The readers bail before they would consult it.
         assert!(read_gauges(&source, "lonely_gauge", &Labels::default(), 0, u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use std::sync::Arc;
+
+    use super::MultiParquetSource;
+    use crate::labels::Labels;
+    use crate::memory::Memory;
+    use crate::source::DataSource;
+    use crate::types::Counter;
+
+    fn file(interval_ms: u64, name: &str) -> Arc<dyn DataSource> {
+        let mut m = Memory::new(interval_ms);
+        m.add_counter(
+            name,
+            Counter {
+                labels: Labels::default(),
+                timestamps: vec![0, interval_ms * 1_000_000],
+                values: vec![0, 1],
+                windows: None,
+            },
+        );
+        Arc::new(m)
+    }
+
+    /// A counter's interval is that of the slowest file holding it; the
+    /// source's own is the finest file's.
+    #[test]
+    fn counter_interval_is_the_slowest_holding_file() {
+        let source = MultiParquetSource {
+            files: vec![
+                (file(1000, "fast"), Labels::default()),
+                (file(10_000, "slow"), Labels::default()),
+                (file(5_000, "slow"), Labels::default()),
+            ],
+        };
+        assert_eq!(source.interval(), 1.0);
+        assert_eq!(source.counter_interval("slow"), 10.0);
+        assert_eq!(source.counter_interval("fast"), 1.0);
+        assert_eq!(source.counter_interval("absent"), 1.0);
+    }
+
+    /// Each counter series carries its own file's interval.
+    #[test]
+    fn counter_series_carry_their_files_interval() {
+        let source = MultiParquetSource {
+            files: vec![
+                (file(1000, "c"), Labels::default()),
+                (file(10_000, "c"), Labels::default()),
+            ],
+        };
+        let mut got: Vec<Option<f64>> = source
+            .counter_streams("c", &Labels::default(), 0, u64::MAX)
+            .unwrap()
+            .iter()
+            .map(|s| s.interval)
+            .collect();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(got, vec![Some(1.0), Some(10.0)]);
+    }
+
+    /// A histogram's interval is that of the slowest file holding it.
+    #[test]
+    fn histogram_interval_is_the_slowest_holding_file() {
+        let file = |interval_ms: u64| -> Arc<dyn DataSource> {
+            let mut m = Memory::new(interval_ms);
+            m.add_histogram(
+                "h",
+                crate::types::Histogram {
+                    labels: Labels::default(),
+                    config: ::histogram::Config::new(4, 10).unwrap(),
+                    timestamps: Vec::new(),
+                    snapshots: Vec::new(),
+                },
+            );
+            Arc::new(m)
+        };
+        let source = MultiParquetSource {
+            files: vec![
+                (file(1000), Labels::default()),
+                (file(10_000), Labels::default()),
+            ],
+        };
+        assert_eq!(source.histogram_interval("h"), 10.0);
+        assert_eq!(source.histogram_interval("absent"), 1.0);
     }
 }

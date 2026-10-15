@@ -86,11 +86,14 @@ impl DataSource for RecordingsSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<Vec<CounterStream<'s>>> {
-        concat(
-            self.children
-                .iter()
-                .map(|c| c.counter_streams(name, filter, start_ns, end_ns)),
-        )
+        concat(self.children.iter().map(|c| {
+            let mut streams = c.counter_streams(name, filter, start_ns, end_ns)?;
+            let interval = c.counter_interval(name);
+            for s in &mut streams {
+                s.interval.get_or_insert(interval);
+            }
+            Some(streams)
+        }))
     }
 
     /// Every recording's scan as one: series in recording order, chunks
@@ -109,6 +112,10 @@ impl DataSource for RecordingsSource {
         for c in &self.children {
             match c.counter_scan(name, filter, start_ns, end_ns) {
                 Some(mut scan) => {
+                    let interval = c.counter_interval(name);
+                    for s in &mut scan.series {
+                        s.interval.get_or_insert(interval);
+                    }
                     let offset = series.len() as u32;
                     series.append(&mut scan.series);
                     readers.push(Child {
@@ -185,6 +192,36 @@ impl DataSource for RecordingsSource {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)?;
         HistogramStream::merge_on_clock(streams, clock)
+    }
+
+    /// The longest of the intervals of the recordings holding `name`.
+    fn histogram_interval(&self, name: &str) -> f64 {
+        self.children
+            .iter()
+            .filter(|c| c.histogram_names().iter().any(|n| n == name))
+            .map(|c| c.histogram_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+
+    /// The longest of the intervals of the recordings holding `name`.
+    fn counter_interval(&self, name: &str) -> f64 {
+        self.children
+            .iter()
+            .filter(|c| c.counter_names().iter().any(|n| n == name))
+            .map(|c| c.counter_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+
+    /// The longest of the intervals of the recordings holding `name`.
+    fn gauge_interval(&self, name: &str) -> f64 {
+        self.children
+            .iter()
+            .filter(|c| c.gauge_names().iter().any(|n| n == name))
+            .map(|c| c.gauge_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
     }
 
     /// The shortest of the recordings' intervals.

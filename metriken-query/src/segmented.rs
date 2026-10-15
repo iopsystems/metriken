@@ -1061,9 +1061,10 @@ pub(crate) mod tests {
         let narrow_pool = BufferPool::new(64 * 1024 * 1024);
         let r =
             SegmentedParquetReader::open_bytes_with_pool(segs(), Arc::clone(&narrow_pool)).unwrap();
-        // Grid mode looks back one step, so 9..10s reaches no further than 8s —
-        // still clear of the 1s/2s segments. Pool entries count decodes on the
-        // per-series path, which is the one read through the pool.
+        // A rate over 1 s at 9..10 s reads back its range and two of the
+        // source's intervals, to 6 s: still clear of the 1s/2s segments.
+        // Pool entries count decodes on the per-series path, which is the
+        // one read through the pool.
         let opts = crate::QueryOptions::default().with_per_series_rates(true);
         let _ = r.query_range_opts("rate(cpu_cycles[1s])", 9.0, 10.0, 1.0, &opts);
         let narrow = narrow_pool.stats();
@@ -1105,10 +1106,10 @@ pub(crate) mod tests {
         // rate() across the segment boundary must be identical to the
         // single-file evaluation, including the boundary window.
         let qa = a
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         let qb = b
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         assert_eq!(format!("{qa:?}"), format!("{qb:?}"));
         let QueryResult::Matrix { result } = qb else {
@@ -1209,10 +1210,10 @@ pub(crate) mod tests {
         let a = SegmentedParquetReader::open_bytes_with_pool(single, Arc::clone(&pool)).unwrap();
         let b = SegmentedParquetReader::open_bytes_with_pool(split, pool).unwrap();
         let qa = a
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         let qb = b
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         assert_eq!(format!("{qa:?}"), format!("{qb:?}"));
         let QueryResult::Matrix { result } = qb else {
@@ -1258,7 +1259,7 @@ pub(crate) mod tests {
         let pool = BufferPool::new(64 * 1024 * 1024);
         let c = SegmentedParquetReader::open_bytes_with_pool(plain, pool).unwrap();
         let qc = c
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         let QueryResult::Matrix { result } = qc else {
             panic!("expected matrix result");
@@ -1374,7 +1375,7 @@ pub(crate) mod tests {
         // cpu_cycles still splices across both segments: the rate at the
         // boundary uses segment A's last sample and segment B's first.
         let q = r
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         let QueryResult::Matrix { result } = q else {
             panic!("expected matrix result");
@@ -1497,7 +1498,7 @@ pub(crate) mod tests {
             let pool = BufferPool::new(64 * 1024 * 1024);
             let r = SegmentedParquetReader::open_bytes_with_pool(segments, pool).unwrap();
             let q = r
-                .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+                .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
                 .unwrap();
             let QueryResult::Matrix { result } = q else {
                 panic!("expected matrix result");
@@ -1525,7 +1526,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let q = r
-            .query_range("rate(cpu_cycles[2s])", 1.0, 5.0, 1.0)
+            .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         let QueryResult::Matrix { result } = q else {
             panic!("expected matrix result");
@@ -2199,9 +2200,10 @@ pub(crate) mod tests {
             "listing needs no bytes"
         );
 
-        // A range in the middle segment, its raw lookback of two intervals
-        // included, touches the middle segment only.
-        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        // A range in the middle segment, its lookback of one step
+        // included, touches the middle segment only. Per series, so the
+        // segments are opened as the series' stream reads them.
+        let opts = QueryOptions::default().with_per_series_rates(true);
         let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
         assert_eq!(store.fetched(), vec![1]);
         assert_eq!(r.cached_segments().0, 1);
@@ -2231,7 +2233,7 @@ pub(crate) mod tests {
         // Room for two segments, not three.
         let pool = BufferPool::new(2 * one + one / 2);
         let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
-        let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
+        let opts = QueryOptions::default().with_per_series_rates(true);
         let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
         store.fetched();
         let (n, bytes) = r.cached_segments();
@@ -3168,8 +3170,8 @@ pub(crate) mod tests {
     }
 
     /// Samples outside the range a query reads do not make edges outside
-    /// it observed: with samples half a second off the grid, a query over
-    /// 10-15 s has points at 11-14 s on both paths.
+    /// it observed: with samples half a second off the grid, an `irate` over
+    /// 10-15 s has points at 11-15 s on both paths.
     #[test]
     fn a_batch_read_keeps_to_the_range() {
         let rows: Vec<(u64, u64)> = (0..30u64)
@@ -3182,10 +3184,10 @@ pub(crate) mod tests {
         .unwrap();
         let per_series = crate::QueryOptions::default().with_per_series_rates(true);
         let batch = r
-            .query_range("rate(cpu_cycles[1s])", 10.0, 15.0, 1.0)
+            .query_range("irate(cpu_cycles[1s])", 10.0, 15.0, 1.0)
             .unwrap();
         let streams = r
-            .query_range_opts("rate(cpu_cycles[1s])", 10.0, 15.0, 1.0, &per_series)
+            .query_range_opts("irate(cpu_cycles[1s])", 10.0, 15.0, 1.0, &per_series)
             .unwrap();
         assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
         let QueryResult::Matrix { result } = batch else {

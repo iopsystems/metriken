@@ -301,6 +301,24 @@ impl TableBuilder {
     }
 }
 
+/// The keys [`GroupTableBuilder::push_row`] adds to a histogram column's
+/// metadata from the cells.
+const STAMPED: [&str; 2] = ["grouping_power", "max_value_power"];
+
+/// Whether a column with metadata `column` is the one a descriptor with
+/// metadata `wanted` writes to: equal, except for a stamped key one of the
+/// two lacks.
+fn same_column(column: &HashMap<String, String>, wanted: &HashMap<String, String>) -> bool {
+    let compared = |k: &String| {
+        !STAMPED.contains(&k.as_str()) || (column.contains_key(k) && wanted.contains_key(k))
+    };
+    column.keys().filter(|k| compared(k)).count() == wanted.keys().filter(|k| compared(k)).count()
+        && wanted
+            .iter()
+            .filter(|(k, _)| compared(k))
+            .all(|(k, v)| column.get(k) == Some(v))
+}
+
 /// A growing V3 acquisition-group table: like [`TableBuilder`], but rows
 /// carry ONE table-level acquisition window (`Table::table_window`)
 /// instead of a window per metric, and membership per row comes from a
@@ -413,13 +431,15 @@ impl GroupTableBuilder {
         // The live column for this descriptor name, if its labels still match.
         // Compared on the FULL metadata map, `metric_type` included: the map is
         // what becomes the column's parquet field metadata, so anything that
-        // differs in it is a different column.
+        // differs in it is a different column. The histogram configuration
+        // this builder stamps on a column (`push_row`) is left out where the
+        // descriptor does not carry it.
         let key = match self.live.get(desc.name.as_str()) {
             Some(key)
                 if self
                     .columns
                     .get(key)
-                    .is_some_and(|c| c.metadata == metadata) =>
+                    .is_some_and(|c| same_column(&c.metadata, &metadata)) =>
             {
                 key.clone()
             }
@@ -544,6 +564,19 @@ impl GroupTableBuilder {
                 None => None,
             };
 
+            // A cell whose configuration differs from the column's starts a
+            // column of its own, as a relabel does.
+            let configured;
+            let desc = match &decoded {
+                Some((_, gp, mvp)) if !desc.metadata.contains_key(STAMPED[0]) => {
+                    let mut d = desc.clone();
+                    d.metadata.insert(STAMPED[0].to_string(), gp.to_string());
+                    d.metadata.insert(STAMPED[1].to_string(), mvp.to_string());
+                    configured = d;
+                    &configured
+                }
+                _ => desc,
+            };
             let col = self.get_or_create(desc, "histogram", Values::Histogram(Vec::new()));
             Self::pad(col, row);
             if let Some((_, gp, mvp)) = &decoded {
@@ -595,6 +628,58 @@ impl GroupTableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A histogram descriptor without `grouping_power`/`max_value_power`
+    /// writes every row to one column, rows without a value included, first
+    /// or not; a cell of another configuration starts its own column.
+    #[test]
+    fn a_histogram_without_its_config_in_the_descriptor_keeps_one_column() {
+        let schema = crate::schema::GroupSchema {
+            histograms: vec![crate::schema::MetricDesc {
+                name: "lat_0".to_string(),
+                metadata: [("metric".to_string(), "lat".to_string())]
+                    .into_iter()
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let buckets = histogram::Config::new(4, 10).unwrap().total_buckets();
+        // The first and third rows have no value, so their descriptor
+        // carries no configuration to compare.
+        let mut b = GroupTableBuilder::new("h/lat".to_string());
+        for row in 0..4u64 {
+            let cell = (row % 2 == 1).then(|| (4, 10, vec![row; buckets]));
+            b.push_row(row, 0, None, &schema, &[], &[], &[cell]);
+        }
+        let table = b.finish();
+        let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["lat_0"]);
+
+        // A cell of another configuration starts a column of its own, as
+        // a relabel does, rather than being filed under the first's.
+        let mut b = GroupTableBuilder::new("h/lat".to_string());
+        for (row, gp) in [(0u64, 4u8), (1, 4), (2, 5)] {
+            let n = histogram::Config::new(gp, 10).unwrap().total_buckets();
+            b.push_row(
+                row,
+                0,
+                None,
+                &schema,
+                &[],
+                &[],
+                &[Some((gp, 10, vec![1; n]))],
+            );
+        }
+        let table = b.finish();
+        let powers: Vec<Option<&String>> = table
+            .columns
+            .iter()
+            .map(|c| c.metadata.get("grouping_power"))
+            .collect();
+        assert_eq!(powers.len(), 2, "{powers:?}");
+        assert_eq!(powers[0].map(String::as_str), Some("4"));
+        assert_eq!(powers[1].map(String::as_str), Some("5"));
+    }
 
     // `approx_bytes` bounds the DATA, and a `Vec` grown by push carries up to
     // 2x that in capacity, which a writer would then hold across its channel

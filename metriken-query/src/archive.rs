@@ -318,20 +318,7 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     for tables in &recordings {
         if let Some(source) = recording_source(tables, query)? {
             let labels = plan.labels.of(tables[0]).clone();
-            // The interval measured from the rows of the recording's
-            // fastest table the query reads. A segment that declares none
-            // reports 1 s, which would hold a 10 s recording's gauge 1 s
-            // past each row.
-            let interval = tables
-                .iter()
-                .map(|t| t.interval())
-                .filter(|i| *i > 0.0)
-                .min_by(f64::total_cmp);
-            let mut labeled = LabeledSource::new(source, labels);
-            if let Some(interval) = interval {
-                labeled = labeled.with_interval(interval);
-            }
-            sources.push(Arc::new(labeled));
+            sources.push(Arc::new(LabeledSource::new(source, labels)));
         }
     }
     let source: Arc<dyn DataSource> = match sources.len() {
@@ -469,6 +456,22 @@ fn refuse_kinds_across_recordings(
     Ok(())
 }
 
+/// `reader`'s source, reporting the interval measured from `table`'s rows
+/// and holding its gauges for it, or `fallback` for a table whose spacing
+/// was not measured (one row). A segment that declares no interval reports
+/// 1 s, which would hold a 10 s table's gauge 1 s past each row.
+fn timed(
+    table: &SamplerReader,
+    reader: &TableReader,
+    fallback: Option<f64>,
+) -> Arc<dyn DataSource> {
+    let source = LabeledSource::new(reader.source(), Default::default());
+    match Some(table.interval()).filter(|i| *i > 0.0).or(fallback) {
+        Some(i) => Arc::new(source.with_interval(i)),
+        None => Arc::new(source),
+    }
+}
+
 /// One recording's tables that hold a metric of `query`, as one source: the
 /// table itself, or a union of them. `None` when every one of them has been
 /// evicted since the archive was opened.
@@ -476,8 +479,14 @@ fn recording_source(
     tables: &[&SamplerReader],
     query: &str,
 ) -> Result<Option<Arc<dyn DataSource>>, QueryError> {
+    // The finest measured interval among the recording's tables.
+    let fallback = tables
+        .iter()
+        .map(|t| t.interval())
+        .filter(|i| *i > 0.0)
+        .min_by(f64::total_cmp);
     if let [one] = tables {
-        return Ok(one.reader().map(TableReader::source));
+        return Ok(one.reader().map(|r| timed(one, r, fallback)));
     }
     // Building the union only touches each table's already-open,
     // footer-level name catalog (no row-group decode), so a fresh one per
@@ -492,7 +501,10 @@ fn recording_source(
     // here, and the rest still answer.
     let children: Vec<UnionChild> = tables
         .iter()
-        .filter_map(|t| t.reader().map(TableReader::union_child))
+        .filter_map(|t| {
+            t.reader()
+                .map(|r| UnionChild::from_source(timed(t, r, fallback)))
+        })
         .collect();
     if children.is_empty() {
         return Ok(None);
@@ -1221,9 +1233,10 @@ mod tests {
             p75[0].iter().all(|(_, v)| *v <= b * 1.2 && *v >= b * 0.8),
             "{p75:?}"
         );
-        // On b's rows, 3.5 s to 9.5 s; a's row at 10 s is in the interval
-        // after b's last row read, which the range cut.
-        assert_eq!(p25[0].len(), 7, "{p25:?}");
+        // On b's rows, 2.5 s to 9.5 s, the first with b's row at 1.5 s
+        // before the range; a's row at 10 s is in the interval after b's
+        // last row read, which the range cut.
+        assert_eq!(p25[0].len(), 8, "{p25:?}");
         let counts = quantile("histogram_count(lat)");
         assert!(counts[0].iter().all(|(_, v)| *v == 20.0), "{counts:?}");
     }

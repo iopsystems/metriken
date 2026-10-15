@@ -38,6 +38,8 @@
 #[cfg(feature = "archive")]
 mod archive;
 pub(crate) mod batch_rate;
+#[cfg(all(test, feature = "archive"))]
+mod conformance;
 pub mod display;
 #[cfg(test)]
 mod long;
@@ -67,27 +69,50 @@ pub use promql::{
 pub use segmented::SegmentedParquetReader;
 pub use union::UnionMetricsSource;
 
-/// How `rate()` / `irate()` are aligned to the evaluation grid.
+/// Where `rate()` / `irate()` points are placed in time.
 ///
-/// In this engine `rate` and `irate` are **the same operation** — the query's
-/// `[range]` window is not used to compute the value; the step interval is.
-/// The mode only chooses how points are placed in time:
+/// `rate(x[r])` at `t` is the increase of the reset-adjusted cumulative
+/// counter across `[t − r, t]`, interpolated at both ends, divided by the
+/// window's length. The value at `t − r` is interpolated from a sample up
+/// to two of the series' interval before it: its table's, where the source
+/// sets it on the series (`LabeledSource::with_interval`, as an archive
+/// does for each table), else the source's `DataSource::counter_interval`.
+/// Where the series has no sample that close before `t − r` (it starts
+/// later, or has a gap there), the window starts at the first sample after
+/// `t − r` and is shorter than `r`, and with no sample in `(t − r, t)` such
+/// a window gives no point. `irate(x[r])` ignores `r`: on the grid its
+/// window is one step, and in raw mode it is the gap to the previous
+/// sample.
 ///
-/// * [`Grid`](RateMode::Grid) (default): at each grid tick `t = floor(start/step)·step + k·step`,
-///   the value is the reset-adjusted cumulative counter interpolated across
-///   `[t − step, t]`, divided by the step. The grid phase is fixed to the step
-///   boundary, so two recordings on the same step share a grid and are directly
-///   comparable (A/B). The value is attributable to the grid interval.
-/// * [`Raw`](RateMode::Raw): points land at the actual sample timestamps, one
-///   per consecutive sample pair (pairwise delta / elapsed). Honest sample
-///   cadence, un-alignable across recordings by construction — for
-///   jitter/cadence and single-recording analysis.
+/// * [`Grid`](RateMode::Grid) (default): points at each grid tick
+///   `t = floor(start/step)·step + k·step`. The grid phase is fixed to the
+///   step boundary, so two recordings on the same step share a grid and are
+///   directly comparable (A/B). `irate`'s value is attributable to the grid
+///   interval `[t − step, t]`.
+/// * [`Raw`](RateMode::Raw): points at the series' sample timestamps. `irate`
+///   is the rate between each sample and the one before it, with no value
+///   when they are further apart than four of the counter's interval. The
+///   points of two series are not aligned with one another; for
+///   jitter/cadence and single-recording analysis. An aggregation or a
+///   binary operator over raw series has a point at every time one of them
+///   has one, each series contributing its latest point while it is no
+///   older than the gap before it, and at most the hold bound: two steps,
+///   or two of the longest interval (`DataSource::counter_interval` and its
+///   gauge and histogram counterparts) of a metric the query reads,
+///   whichever is longer. A series' first point is held for the bound, and
+///   so the hold depends on the step. Every raw read starts twice the bound
+///   for each join the query nests, and the function's window, before the
+///   range, so which points a result has and their values do not depend on
+///   where the range starts, up to floating-point rounding. A rate's band
+///   and its interpolated flag treat a gap longer than twice the median
+///   spacing of the first nine samples read as a hole, so on a series whose
+///   spacing changes they can depend on where the range starts.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum RateMode {
-    /// Fixed-phase grid with interval-attributable interpolated values. Default.
+    /// Fixed-phase grid. Default.
     #[default]
     Grid,
-    /// Actual sample timestamps, pairwise deltas. Not grid-aligned.
+    /// The series' sample timestamps. Not grid-aligned.
     Raw,
 }
 
@@ -99,26 +124,7 @@ pub enum RateMode {
 pub struct QueryOptions {
     /// Rate/irate time-alignment mode. See [`RateMode`].
     pub rate_mode: RateMode,
-    /// Averaging span for `rate`/`irate`, in nanoseconds — the window each
-    /// value is computed over, as distinct from the spacing between values.
-    ///
-    /// `None` (the default) means "one step", which is the historical
-    /// behaviour: each point is the increase across the step that precedes it.
-    ///
-    /// Setting it wider SMOOTHS without changing point placement. That
-    /// distinction is the whole reason this exists. When a query combines a
-    /// fast source with a slow one, the points that survive are those where
-    /// both have data — the slow source's real read times — and at each of
-    /// those the two operands were sampled nearly together, which is what
-    /// keeps their combined uncertainty band tight. Coarsening the STEP to
-    /// smooth the fast side destroys that: the grid then lands where the slow
-    /// source has no reading, its window is interpolated across the whole gap,
-    /// and the band explodes (measured: 0.85% wide before, 6.7x after).
-    ///
-    /// Widening the span instead smooths the fast operand while leaving the
-    /// grid — and therefore the simultaneity — alone.
-    pub rate_span_ns: Option<u64>,
-    /// Evaluate at THESE timestamps instead of on a uniform grid.
+    /// Evaluate at these timestamps instead of on a uniform grid.
     ///
     /// The grid is uniform by default: `start`, `start + step`, … Every value
     /// is therefore produced wherever the grid happens to fall, which is
@@ -128,13 +134,13 @@ pub struct QueryOptions {
     ///
     /// A slow source's readings are not evenly spaced either. Measured on a
     /// real recording, one sampler's rows fell 30 s apart and then 60 s apart,
-    /// so NO uniform grid can sit on them at any step or phase. Supplying the
+    /// so no uniform grid can sit on them at any step or phase. Supplying the
     /// timestamps explicitly is the only way to evaluate where the data
-    /// genuinely is.
+    /// is.
     ///
-    /// When set, each rate's averaging window is the gap to the preceding
-    /// timestamp — so the uniform grid is just the special case where those
-    /// gaps are all equal.
+    /// When set, an `irate`'s window is the gap to the preceding timestamp,
+    /// so the uniform grid is the case where those gaps are all equal; a
+    /// `rate`'s window is its `[range]`.
     pub eval_timestamps: Option<std::sync::Arc<[u64]>>,
     /// Compute `rate`/`irate` from one sample stream per series rather than
     /// in one pass over a segmented reader's columns. For samples in
@@ -149,7 +155,6 @@ impl QueryOptions {
     pub fn with_rate_mode(rate_mode: RateMode) -> Self {
         Self {
             rate_mode,
-            rate_span_ns: None,
             eval_timestamps: None,
             per_series_rates: false,
         }
@@ -166,12 +171,6 @@ impl QueryOptions {
     /// [`QueryOptions::eval_timestamps`].
     pub fn with_eval_timestamps(mut self, ts: Option<std::sync::Arc<[u64]>>) -> Self {
         self.eval_timestamps = ts;
-        self
-    }
-
-    /// Set the rate averaging span. See [`QueryOptions::rate_span_ns`].
-    pub fn with_rate_span_ns(mut self, span_ns: Option<u64>) -> Self {
-        self.rate_span_ns = span_ns;
         self
     }
 }

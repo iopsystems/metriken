@@ -1137,6 +1137,405 @@ Still open:
   dashboard queries are empty on an archive of two rezolus recordings until
   the combined view instantiates rezolus's sections per recording.
 
+#### Conformance suite (2026-10-14)
+
+`metriken-query/src/conformance.rs` checks queries against values worked
+out from the fixture's definition, not from the engine. Every series
+changes once, at 60 s: a counter's rate doubles, a gauge's slope doubles,
+and a histogram's observations move to four times their value. A point
+whose window contains that instant is not compared (its value depends on
+how the function weighs the two sides); every other point has one exact
+answer, so a function reading the wrong rows is wrong near 60 s. A counter
+and a gauge stop at 75 s, a counter resets at 65 s, and one does not move
+before 60 s. Tables are built
+through `GroupTableBuilder` with acquisition windows (20 ms; 50 ms on the
+slow sampler's rows), and placed five ways: one table; two samplers at
+1 s and 10 s, each with a gauge and a counter; two recordings half a second
+out of phase; two recordings at different cadences; twins. 228 queries
+(selectors with each matcher type and with none matching, `rate` over 5 s
+and over ranges of 1 s, 3 s, 20 s and 1 m, `irate`, also over the
+resetting and the idle counter,
+`sum`/`avg`/`min`/`max`/`count` with `by` and `without`, scalar and series
+operators with `on`/`ignoring`, combinations of two samplers, series that
+stop, `idelta`, `deriv` over gauges and counters, `avg_over_time`,
+`histogram_quantile`, `histogram_quantiles`, `histogram_percentiles`,
+`histogram_count`/`sum`/`mean`/`irate`) run in each layout: on the grid at
+a 1 s and a 5 s step, from a start off the step grid, and to one row and
+to a row and a half past the stop, each with rates in one pass and per
+series; as instants; in raw mode
+(all but the histogram functions); and in display mode.
+- Grid: each point is compared with the expected value at its time; a
+  rate's band equals the closed form `[v·s/(s + w), v·s/(s − w)]` for its
+  span `s` and window `w`, through sums, averages and constants, and an
+  operator's equals its operands' combined after widening each to the
+  union of both operands' windows where they differ; a histogram
+  function's equals its buckets'; a gauge, its `avg_over_time` or `idelta`,
+  and an operator over those have no band; any
+  other band must have width and contain the value and the expected one;
+  each series' points cover the range at its own row spacing, start and end
+  where expected, and where one cadence is read sit on multiples of the
+  step.
+- Instant: the value, at the time asked for, or for a histogram function at
+  the slowest series' latest row.
+- Raw: every series, point, value and band equal to a model that builds the
+  result from the rows up, each operand held for the gap before its point.
+- Display: equal to reducing the grid result, and on the one-table layout,
+  for a gauge and a sum of rates, equal to 5 s buckets worked out from the
+  fixture (minimum, quartiles, median, maximum, band).
+
+Its first run failed 944 checks, most of them from bugs (seven in the
+engine, one in the table builder) and the rest from errors in the suite
+(display compared series in order; the quantile label; raw mode's value of a
+windowed function). Each bug is fixed with the suite red without the fix:
+- An instant query was evaluated at the time rounded down to the source's
+  interval: on a 10 s table, at 60 s for any time from 60 s to 69.9 s.
+- A recording's gauges were held for its fastest table's interval, so a
+  10 s gauge combined with a 1 s counter was empty between the gauge's
+  rows (`UnionSource` and `LabeledSource` had no `gauge_parts`).
+- `deriv` lost all precision at the current epoch (x² near 3e18), returning
+  about 0.
+- `deriv` ignored `[range]` (window `[t - 2 step, t + step]`, reading past
+  `t`), was empty where fewer than two samples fell in that window, and
+  over a counter was the slope of its rate.
+- `GroupTableBuilder` started a new histogram column on every row when the
+  descriptor lacked `grouping_power`/`max_value_power`, so one recording's
+  histogram read as one series per row and every histogram function
+  returned nothing. Pooling two recordings merged the rows by label and hid
+  it.
+- A histogram range dropped its first tick (the row before the start was
+  not read).
+- An instant histogram query returned nothing unless a row fell on the
+  time. It now gives the latest tick at or before it, at the tick's time.
+- A raw windowed function's point before the range was computed over a
+  truncated window.
+- A raw-mode rate had no band (found later, by the second review's
+  checks).
+
+The review of the first version found the suite blind to which rows a
+function read (every series was linear, so any rows gave the same answer),
+to zero-width bands, to the instant's time, to alignment (every range
+started on the grid), and to three of the five histogram read sites. The
+change at 60 s and the checks above answer those. The same review found
+`deriv` over a counter selector that matches nothing refused as "a
+counter", an instant `histogram_heatmap` returning five minutes of
+heatmap, and a table whose spacing was not measured (one row) reporting the
+segment's 1 s; all three are fixed.
+
+The second review found a regression in this change: in a recording whose
+samplers run at different cadences, a grid query combining them returned
+a point 9.7 s before the range's start. Such a query is evaluated at the
+slow sampler's rows, all of them, and nothing kept those before the start
+out; until each table's gauge read back its own interval, the gauge side
+had no value there to join. Explicit timestamps before the start are now
+skipped (the rate keeps one as its first left edge). The suite had missed
+it because its two-cadence fixture put both tables in one sampler, which
+is one cadence; the slow tables are now a sampler of their own, each
+sampler holds a gauge and a counter, and a query combining two gauges reads
+its range back so the gauge's skip is seen on its own. The same review
+found the raw join, raw end, gauge staleness, display buckets and bands
+unchecked against anything but containment: a counter and a gauge now stop
+at 75 s, raw results are compared point for point with a model that
+builds them from the rows up, decimation is checked against buckets worked
+out from the fixture, and bands against the closed form
+`[v·s/(s + 20 ms), v·s/(s − 20 ms)]` for a span `s`. Raw-mode rates had no
+band at all; they now have one.
+
+The third review found the raw-mode band wrong once it existed: each raw
+rate carried its reads' edges, so an operator across two tables widened
+both operands to the union of edges from reads up to ten seconds apart (a
+band 4% wide at one point and 600% at the next, by where the point fell
+relative to the slow sampler's rows). A raw rate now carries its band and
+no edges, and a raw operator combines the bands as they are. The suite had
+not seen it because neither its raw model nor its grid oracle worked out
+an operator's band across two tables, all windows being alike; the slow
+sampler's windows are now longer, and both work out the widened band. It
+also found no counter that resets, and a histogram tolerance of two
+buckets; a counter now resets, and histogram values and bands are worked
+out from the buckets exactly.
+
+The fourth review found the suite would pass an invented band on a gauge,
+untested band arithmetic for a difference of two banded operands and for
+a product with a negative side, the per-series rate path never run on the
+uniform grid (so its hold at the range's end was untested, as was a hold
+twice as long in either path), an operator's edges kept where the oracle
+dropped them, and no flat counter interval (a reset test of `>` for `>=`).
+Each now has a case or a check. Bands are compared relative to the larger
+end's magnitude, since a difference of two bands cancels to an end much
+smaller than either. It also showed what the engine did to a held rate
+combined with a current one at the end of a range: as their spans moved
+apart the widened band grew (at 85 s, a value of 3080 had the band
+[−357, 25696]), and once the spans stopped overlapping it fell back to the
+unwidened band, the tightest of all. Decided 2026-10-14: such a point keeps
+its value, has no band and is marked interpolated, as a point across a hole
+is.
+
+Decided 2026-10-14 (later): `rate(x[range])` is the rate over
+`[t - range, t]`, interpolated at both ends, on the grid, at explicit
+evaluation timestamps and in raw mode (at each sample); `irate` keeps the
+per-step rate. A window whose left edge has no sample within two of the
+counter's table's intervals before it (the series starts later, or has a
+gap) starts at the first sample after the edge (Prometheus extrapolates),
+so a recording's first `range` has values. `QueryOptions::rate_span_ns`,
+which nothing outside metriken-query set, is removed. The suite's `rate`
+cases take a range (5 s by default, and
+1 s, 3 s, 20 s and 1 m: under a 5 s step, between a 10 s table's rows,
+several steps, and reaching before the first row), and the oracle computes
+each over its own window. The first run with the ranges failed because the
+read started the range and two of the source's finest intervals before the
+first point: a counter in a 10 s table beside 1 s tables had no row before
+the window's left edge, so its window was cut at the first row read, or it
+had too few rows to give a point. The read margin is now two of the
+counter's own table's intervals (`DataSource::counter_interval`, answered
+per table as `histogram_interval` is). Two mutations then survived, a reset
+and an unchanged value each counted wrong in raw mode's pairwise rate:
+only `rate` had cases over the resetting and the idle counter, and raw
+`rate` no longer takes that path. `irate` over both is now a case.
+
+The sixth review found two defects the suite's fixtures could not show,
+since they have no holes and every table's interval is measured. The window
+was cut at the first sample the read returned, not the series' first, so
+across a gap longer than the read's margin, or for a 10 s counter in a
+source whose interval says 1 s, one time had two values depending on the
+query's start (59.0 against 10.0 at the same point, measured). The window
+now starts after its left edge only when no sample lies within a reach
+fixed before the read (two of the counter's table's intervals), and the
+read covers that reach. And `rate` at explicit evaluation timestamps
+still paired each with the one before, dropping the first. Both have tests
+through the query entry point, and `MultiParquetSource` answers
+`counter_interval` per file. Rerunning the rate paths' mutations then
+showed `irate` at explicit timestamps uncovered (every case combining two
+samplers used `rate`), so `irate` across samplers is now a case, and a
+`rate` point before the range's start at explicit timestamps reached no
+check, since a join with the gauge side drops it; a unit test covers it.
+
+The seventh review found three more. A point held past a series' last
+sample has its window end at that sample, up to a spacing before the
+range's start, so the read missed the sample within the reach before it
+(97.3 against 100.0 at one point); the read now reaches one more reach
+back, which covers a series whose rows are no further apart than its
+reach. Across recordings, `counter_interval` is the slowest recording's,
+so a 1 s series took a 20 s reach when the query also reached a 10 s
+recording, and its value at a point depended on which recordings the
+query reached (10.0 against 356); each counter series now carries its
+table's interval (`CounterStream::interval`, `ScanSeries::interval`, set
+by the archive's per-table `LabeledSource`), and the reach is the
+series'. A source whose interval understates a series' spacing gives
+`rate` no point where no sample falls in the window, which the docs now
+say. It also found the squashed commit carrying 170 MB of build output
+under `mq-target/`: a relative `CARGO_TARGET_DIR`, which trybuild
+resolved inside the worktree. A test over two archive recordings, one
+with a hole, checks the hole's series on both rate paths against the
+archive holding it alone; its query has no `source` matcher, since one
+would leave the other recording out of the query.
+
+The eighth review found the raw point before the range still read short:
+raw mode emits each series' last point before the range for a join to
+hold, and with a gap before the start that point could lie further back
+than the read held its window, so one point was 111.0, 122.1 or 11.0
+depending on the start. `rate`, `avg_over_time`, `idelta` and `deriv` now
+emit that point only when it is within the raw lookback of the start
+(`raw_floor`, `at_samples(floor)`). It also found the per-series interval
+unset where a composition's children set none, and a nested
+`with_interval` able to give a series a longer reach than the read:
+`RecordingsSource` and `MultiParquetSource` now set each child's
+`counter_interval` on a series without one, and `with_interval` sets its
+own on every series, so none exceeds its source's `counter_interval`.
+
+The ninth review found that floor exposing an older rule: a join holds a
+series' first point for the gap after it, not before, so once the floor
+made the point before the range a series' first, a hole after it held it
+for 24 s from one start and not at all from another. Each windowed raw
+producer now passes the sample before that point on as a timing point
+with no value, which a join uses for the hold and the cut at the range's
+start removes, and emits no point before the range when that sample was
+not read. A point held into the range then has a gap before it longer
+than the lookback, which is at least its window, so its value depends on
+itself and that sample alone, both read; the floor was redundant and is
+gone (its mutations survived for that reason). The suite's raw tests now
+compare the points, not only their values, from every start, for `rate`,
+`avg_over_time`, `idelta` and `deriv`. A bare raw selector keeps the old
+hold, since it has no window. Raw gauge functions read back two of the
+source's finest interval, not their table's, which the CHANGELOG states.
+
+The tenth review found those timing points reaching results in the range.
+A join nested in another join combined a timing point (then a NaN value)
+with the other side's held point into a NaN point, which the outer join
+held into the range: 651 NaN points in its fuzz of three out-of-phase
+recordings, none at the two heads before. A timing point is now a flag on
+`Point`, not a value: a join never takes it as a value, and a join or an
+aggregate with no value at a timing point passes it on, so the gap it marks
+survives composition. Raw `irate` passes one on too, so its point before
+the range is held for the gap before it, as the CHANGELOG says of every
+series. Composed holds are still not independent of the query's start in
+every case: the reviewer's fuzz found points of a join nested in a join
+whose presence or value changed with the start (321 at the previous head,
+2,383 before it, 10,553 at the base), all in nested joins; a single join or
+aggregate showed none in that fuzz. Those are not fixed here. When the point before the
+range gives no value, its own sample is now the timing point, so the first
+point in the range is held for the gap before it; the earlier filter only
+dropped the timing point, leaving that first point held for the gap after
+it.
+
+The eleventh review found that rule incomplete and a regression in it. It
+ran only while a timing point from before the range waited, so a single
+join still held the first point in the range for 0 s, 8 s or 12 s
+depending on the start; a sample whose point gives no value now becomes
+the timing point for the next wherever it falls. A timing point can
+therefore be in the range: with two points in a row giving no value, one
+was, and a plain raw `rate` returned it as NaN, since the cut at the
+range's start kept it; results now leave timing points out. It also found
+the new one-to-one check counting a raw series' point before the range as
+a point in it, so `rate(a[5s]) + on() avg_over_time(h[5s])` was refused as
+many-to-many from one start and answered from another; that point now
+counts only when it is held to the start, and a timing point never does.
+
+The twelfth review found the same class again (a sample skipped because
+the one before it was unread, and bare selectors), with a fuzz of sparse
+series showing single aggregates and joins differing by start. Seven
+rounds of special cases had each closed one path. The cause is that the
+documented hold, the gap before a point, is unbounded, while a read starts
+a bounded time before the range: some point's predecessor is always past
+the read. Decided 2026-10-14 (by the reviews' evidence, with the owner's
+instruction to get raw mode right): a raw join holds a point for the gap
+before it and at most a bound L, two steps or two of the longest interval
+of a metric the query reads; a series' first point is held for L; every
+raw read starts 2L and the function's window before the range; and every
+raw producer emits a point at every sample read, a timing point where its
+function gives no value (and where a raw `irate` pair is further apart
+than L). A point whose hold can reach the start is then within L of it, so
+its window and the point before it are read, or the point before is more
+than L back and the hold is L either way. The special cases (the point
+before the range, the first-read rule, `placed`, the release filter) are
+gone. A fuzz of sparse series with holes of up to 25 s, nine seeds and 19
+queries including nested joins, scalar ops and bare selectors, at 90
+starts each, now finds no point that differs by start; nested joins
+differed at 321 to 10,553 points before. A source whose interval
+understates a series' spacing bounds its hold below that spacing, and a
+raw `irate` across such a gap has no value; an archive reports each
+table's interval, so its series are held across their own spacing.
+
+The thirteenth review found the argument covering one join only: an inner
+join's output times depend on its operands' holds, so each nested join
+needs the bound once more of history (`(a + b) + c` gave two points from
+one start and none from another, with sub-second sample times the fuzz,
+on whole seconds, never produced). The read now starts the bound once per
+nested join and once more before the window, and the fuzz jitters its
+sample times. It also found raw `irate` limited to pairs within the bound,
+which at the viewer's step of one interval is two intervals: one missed
+tick with jitter lost the point, and the step decided which raw points
+existed. A raw `irate` pair now spans up to four of the counter's own
+interval, whatever the step, and the read covers that.
+
+The fourteenth review found one bound per level too little: a series'
+value at a time in a join depends on its points over twice the bound
+before it (its latest point, and the one before that, each within a
+bound), so a join's points over that span need its operands' points over
+twice as far, and each nested join adds two bounds. With one per level,
+`(a + b) + c` again gave a point from one start and none from another,
+with the inner operand's sample at 992.9 s just past a read from 993 s.
+The read is now twice the bound per nested join and the window. Random
+fuzzing found neither shortfall in 200 seeds of the reviewer's own; the
+hand-built cases are the evidence for the bound. The test carries
+`(a + b) + c`, which fails with one bound per level, and the fifteenth
+review's `((a + b) + c) + d`, whose result at the start turns on a sample
+5.55 bounds before it and fails with one bound per level at that depth.
+Results are the same from every start up to floating-point rounding: a
+rate's reset-adjusted running total starts at the first sample read, so
+its last bits depend on the read. The sixteenth review found a rate's band and
+interpolated flag start-dependent: whether an edge falls in a hole is
+judged against the typical spacing of the first nine samples read, which
+on a series whose spacing changes (rows a second apart, then 2.5 s) differs
+by start. The grid has done this since before this change; raw `rate`
+gained bands in it. The claims now cover which points a result has and
+their values, and say that bands and the flag can differ. Making them
+start-independent means judging a hole against the series' reported
+interval, known before the read, which changes the grid's hole detection
+and drops every band where a source understates a series' spacing; that is
+left as a decision for the owner, not taken here.
+
+On the 9.6 h archive, 21 of the 274 dashboard queries use `rate`, all with
+`[5m]`; 19 read GPU metrics the archive does not hold, and of the two with
+data, `rate(memory_numa_local[5m])` now returns the five-minute average in
+range, raw and instant mode, and `rate(memory_numa_foreign[5m])` (the same
+before and after) is flat. Every other query matches the previous run. A
+rezolus upgrade to this release changes the meaning of every `rate` it
+writes: about 86 in `crates/dashboard` (gpu, ext4, xfs, cgroups, memory),
+about 40 in `src/mcp` and a few in `src/analysis`. Each is either meant as
+an average over its range or becomes `irate`; cachecannon and llm-perf
+write no `rate`.
+
+The fifth review found the suite asserting an engine bug the fourth
+round's negative-product case had reached: `widen_band` scaled each end by
+a ratio chosen for positive ends, so a negative band was never widened
+across tables, and `(-1 * a) * b` had a narrower band than
+`-1 * (a * b)`. Each end now takes whichever ratio moves it away from the
+value, in the engine and the oracle. It also found `avg_over_time` and
+`idelta` of a gauge not held to having no band (only `deriv`, a slope over
+row times, may have one), `histogram_irate` treated as exact, and these
+uncovered: a range ending exactly one spacing after a series' last row, a
+constant over a rate, a constant less a gauge, sums over an operator and
+over a sum, `histogram_percentiles`, and an instant's band. A range
+ending one spacing after a series' last row now checks the hold's
+boundary: the series is not held, since its next row would fall at the end
+and would have been read.
+
+Mutations, one per fix and one per gap a review named (101, among them a
+rate reading half a step early, bands shrunk by 0.1%, a deriv window three
+times its range, gauge staleness and the raw hold a hundred times longer, a
+raw series stopping 8 s early, the instant keeping its second-to-last point,
+display buckets off by one, a reset counted as zero in each rate path,
+cross-table widening switched off, `histogram_sum` 1% high, a quantile 0.8%
+high, a band invented on a scalar operator's result, the difference's
+corners wrong, either rate path's hold doubled, a reset on an unchanged
+value, `avg_over_time` inventing a band, the hold reaching a series whose
+last row is one spacing before the end, an instant's band wrong, the
+widening sign-unaware, a held rate's band kept when its operand's reads
+share no time, and for the windowed `rate`: the reach ignored on either
+path, the window taken from the step on either path, from the gap at
+explicit points, or from the previous sample in raw mode, the reach from the
+finest interval, the read without the reach, each source's
+`counter_interval` answering the finest, raw points carrying edges, a point
+before the start or none at the first explicit timestamp, a window before
+time zero dropped, the held point's reach unread, a series' own interval
+ignored or not set on either path or by a composition of recordings or
+files, the innermost interval winning, `MultiParquetSource` answering its
+finest file; and for raw joins: the hold unbounded, a first point held to
+the next, the read back once the bound, the bound without intervals, a bare
+selector's or an `irate`'s read short, a sample without a value skipped
+rather than a timing point, raw `irate` without its first timing point or
+across any gap, a timing point taken as a value, not passed on by a join, an
+aggregate or a scalar operator, or kept in a result, and the one-to-one
+check counting a point before the range or never holding one to the start):
+each turns the suite, or a named unit test, red. `histogram_heatmap` has no
+case, and the `=~` matcher (literal alternatives) is not tested for a value
+that is a prefix of another.
+
+On the 9.6 h archive's 274 dashboard queries (values and times compared;
+the harness records no bands), range and raw results are unchanged except
+17 histogram queries that gain their first tick; instant results now carry
+the requested time (135 queries, values unchanged), and 25 histogram
+instants that were empty have a value.
+
+Differences from PromQL that a query copied from Prometheus meets:
+- `irate(x[range])` is the rate over one step (between consecutive samples
+  in raw mode); its `[range]` is not used. Prometheus's is the rate between
+  the last two samples in the range.
+- `rate(x[range])` is not extrapolated: a window with no sample close before
+  its left edge starts at the first sample after it, and the rate is over
+  the time it has samples for. A window is interpolated at both ends, so
+  `rate` over a range shorter than the row spacing has a value.
+- A grid range is aligned to multiples of the step.
+- Raw mode, display mode and uncertainty bands have no PromQL counterpart.
+- Histograms are a native type; `histogram_quantile(q, h)` takes the
+  histogram, not `rate(h_bucket[..])`, and pools series on the slowest
+  recording's rows.
+- A result keeps `__name__` after a function. A one-to-one match keeps the
+  left series' labels; Prometheus keeps only the `on()` labels, or drops
+  the `ignoring()` ones.
+- Matching is checked over the whole range rather than per step.
+- The single-right broadcast (`sum(x) / y` with one `y` per recording) has
+  no PromQL counterpart; PromQL needs `group_left` or matching labels.
+
 ### Q12. How do templates travel, and do rezolus's sections become templates?
 
 Decided 2026-10-12: a producer's template travels in its stream, in the
@@ -1149,10 +1548,11 @@ needs none (plan piece 3). Which form step 5 uses was open; the evaluation
 below settles it as the handshake.
 
 Direction to evaluate (decided 2026-10-12; kept as history, the evaluation
-and the decisions after it follow): express rezolus's sampler sections as templates too, sent by the
-agent in its stream like any producer's. `rezolus-dashboard` would then be
-data in the archive, and no viewer would depend on a rezolus crate. If the
-evaluation succeeds, it changes these decisions:
+and the decisions after it follow): express rezolus's sampler sections as
+templates too, sent by the agent in its stream like any producer's.
+`rezolus-dashboard` would then be data in the archive, and no viewer would
+depend on a rezolus crate. If the evaluation succeeds, it changes these
+decisions:
 
 - Q2: no `rezolus-dashboard` crate, so the Q2 consequence goes (a
   metriken-query change would no longer wait for a rezolus release), and
