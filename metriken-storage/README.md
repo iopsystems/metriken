@@ -15,7 +15,7 @@ Features:
 - `convert`: `MsgpackToParquet`, msgpack snapshots into one parquet file.
   Needs neither dendro nor the archive.
 - `stream`: `metriken_exposition::stream` re-exported at
-  `metriken_storage::stream` for one release, and the `StreamRow` and `Pass`
+  `metriken_storage::stream` until the next breaking release, and the `StreamRow` and `Pass`
   impls for `rez`'s `AgentRow` and `AgentRows`, which stay.
 - `lz4` (default): reading segments written with LZ4_RAW.
 - `ingest`, `metriken`, `test-support`: see `Cargo.toml`.
