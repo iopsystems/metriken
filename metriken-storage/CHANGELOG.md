@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-15
 
 ### Added
 
@@ -90,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `stream`, the re-export of `metriken_exposition::stream`, remains in
+  this release and is removed in the next breaking one. Import it from
+  `metriken_exposition`.
 - **Breaking:** `ArchiveReader::counter_labels`, `gauge_labels` and
   `histogram_labels` return each label set with its recording's labels
   added, matching the series metriken-query now returns.

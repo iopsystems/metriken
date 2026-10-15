@@ -40,7 +40,7 @@
 //! Without the archive:
 //! - `convert` (feature `convert`): msgpack snapshots into one parquet file.
 //! - `stream` (feature `stream`): `metriken_exposition::stream`, re-exported
-//!   at this path for one release.
+//!   at this path until the next breaking release.
 
 #[cfg(feature = "archive")]
 mod archive;

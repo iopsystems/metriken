@@ -1,6 +1,6 @@
 [package]
 name = "metriken-recorder"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -30,7 +30,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 histogram.workspace = true
 humantime = "2"
 metriken-model = { version = "0.1.2", path = "../metriken-model" }
-metriken-storage = { version = "0.2.3", path = "../metriken-storage", default-features = false, features = ["write"] }
+metriken-storage = { version = "0.3.0", path = "../metriken-storage", default-features = false, features = ["write"] }
 metriken-types = { version = "0.1.0", path = "../metriken-types" }
 prometheus-parse = "0.2.5"
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
@@ -40,7 +40,7 @@ tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 metriken = { version = "0.11.3", path = "../metriken", optional = true }
-metriken-exposition = { version = "0.22.1", path = "../metriken-exposition", default-features = false, features = ["msgpack"], optional = true }
+metriken-exposition = { version = "0.23.0", path = "../metriken-exposition", default-features = false, features = ["msgpack"], optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }
 url = { version = "2", optional = true }
 

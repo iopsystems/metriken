@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-storage, metriken-query, metriken-recorder, metriken-exposition (not yet released)
+### metriken-storage 0.3.0, metriken-query 0.37.0, metriken-recorder 0.2.0, metriken-exposition 0.23.0
 
 - **Breaking:** arrow and parquet are 60 (were 58) in metriken-storage and
   metriken-query (and in metriken-recorder's tests), and dendro is 0.5 (was
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RUSTSEC-2026-0253 (fixed in 0.18.2). metriken-query no longer depends on
   `lru`; it did not use it.
 
-### metriken-storage, metriken-query (not yet released)
+### metriken-storage 0.3.0, metriken-query 0.37.0
 
 - **Breaking:** an archive's series carry their recording's labels, and a
   query naming a metric several recordings hold is answered from all of
