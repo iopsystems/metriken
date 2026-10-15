@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage, metriken-query, metriken-recorder, metriken-exposition (not yet released)
+
+- **Breaking:** arrow and parquet are 60 (were 58) in metriken-storage and
+  metriken-query (and in metriken-recorder's tests), and dendro is 0.5 (was
+  0.4) in metriken-storage, metriken-recorder and metriken-exposition.
+  Parquet 59 and later no longer depend on `thrift`, which clears
+  GHSA-2f9f-gq7v-9h6m (thrift 0.17). Each of the four needs a minor
+  release: arrow, parquet and dendro types are public in metriken-storage
+  (see its CHANGELOG), dendro types in metriken-recorder (`Frame`,
+  `WalRow`) and in metriken-exposition's `stream` feature
+  (`dendro::Result`), and metriken-storage types in metriken-query
+  (`BufferPool` in `ParquetBuilder::pool` and `open_file_with_pool`). Arrow
+  and parquet 60 require Rust 1.88.
+- `lru` is 0.18 (was 0.12) in metriken-storage, which clears
+  GHSA-rhfx-m35p-ff5j (RUSTSEC-2026-0002, fixed in 0.16.3) and
+  RUSTSEC-2026-0253 (fixed in 0.18.2). metriken-query no longer depends on
+  `lru`; it did not use it.
+
 ### metriken-storage, metriken-query (not yet released)
 
 - **Breaking:** an archive's series carry their recording's labels, and a

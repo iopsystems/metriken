@@ -16,9 +16,9 @@ exclude = ["tests/"]
 [dependencies]
 arrow.workspace = true
 bytes = "1"
-dendro = { version = "0.4.2", default-features = false, features = ["archive"], optional = true }
+dendro = { version = "0.5.0", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
-lru = "0.12"
+lru = "0.18.5"
 metriken-exposition = { version = "0.22.0", path = "../metriken-exposition", default-features = false, features = ["stream"], optional = true }
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 histogram.workspace = true
@@ -45,7 +45,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 metriken = { path = "../metriken" }
 metriken-exposition = { path = "../metriken-exposition" }
-dendro = { version = "0.4.2" }
+dendro = { version = "0.5.0" }
 
 [features]
 default = ["lz4", "archive"]

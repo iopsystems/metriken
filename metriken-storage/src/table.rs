@@ -380,7 +380,7 @@ pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Erro
                     .or_default()
                     .extend((0..a.len()).map(|r| (!a.is_null(r)).then(|| a.value(r))));
             } else if let Some(base) = name.strip_suffix(":buckets") {
-                let meta = field.metadata().clone();
+                let meta: HashMap<String, String> = field.metadata().into();
                 let gp: u8 = meta
                     .get("grouping_power")
                     .and_then(|s| s.parse().ok())
@@ -415,7 +415,7 @@ pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Erro
                 }
             } else {
                 // A metric value column: counter (UInt64) or gauge (Int64).
-                let meta = field.metadata().clone();
+                let meta: HashMap<String, String> = field.metadata().into();
                 let is_gauge = meta.get("metric_type").map(String::as_str) == Some("gauge");
                 let entry = match values.entry(name.to_string()) {
                     std::collections::hash_map::Entry::Vacant(v) => {

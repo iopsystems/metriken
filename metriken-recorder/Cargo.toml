@@ -25,7 +25,7 @@ async-trait = "0.1"
 # The frame decoder needs `replicate::{Frame, wire}`, and
 # `StreamDecoder::decode` takes dendro's `WalRow`; storage does not
 # re-export dendro.
-dendro = { version = "0.4.0", default-features = false, features = ["archive"] }
+dendro = { version = "0.5.0", default-features = false, features = ["archive"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 histogram.workspace = true
 humantime = "2"

@@ -1111,8 +1111,9 @@ impl ParquetSource {
         }
         let meta = self.page_meta()?;
         let md = meta.metadata();
-        let index = md.column_index()?.get(rg_idx)?.get(col)?;
-        let locations = md.offset_index()?.get(rg_idx)?.get(col)?.page_locations();
+        let page_index = md.page_index()?;
+        let index = page_index.column_index(rg_idx, col)?;
+        let locations = page_index.offset_index(rg_idx, col)?.page_locations();
         let parquet::file::page_index::column_index::ColumnIndexMetaData::INT64(bounds) = index
         else {
             return None;

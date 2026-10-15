@@ -172,12 +172,12 @@ pub fn ingest_parquet_bytes(
             // `metric_type`, listing off `metric`). A histogram's metric is the
             // name without the `:buckets` suffix.
             let mut md = f.metadata().clone();
-            md.entry("metric".to_string()).or_insert_with(|| {
-                f.name()
-                    .strip_suffix(":buckets")
-                    .unwrap_or(f.name())
-                    .to_string()
-            });
+            if !md.contains_key("metric") {
+                md.insert(
+                    "metric",
+                    f.name().strip_suffix(":buckets").unwrap_or(f.name()),
+                );
+            }
             fields.push(
                 Field::new(f.name(), f.data_type().clone(), f.is_nullable()).with_metadata(md),
             );
