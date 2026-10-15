@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A selector with no name and one `__name__="x"` matcher selects the metric
+  `x`, as in Prometheus, in PromQL expressions and in the histogram
+  functions. `irate({__name__="redis/ops", source="a"}[5s])` reads the
+  counter `redis/ops`, whose name is not a PromQL identifier. A regex or
+  negated `__name__` matcher, or more than one, is still refused.
+
+### Fixed
+
+- `sum(...)` or `sum by|without (..) (...)` around `histogram_irate` or
+  `histogram_mean` answers on an archive (`ArchiveReader`
+  as a `MetricsSource`) as it does on every other source. Since 0.35.0 the
+  archive's routing parsed the query before the `sum(...)` was unwrapped and
+  failed with `unknown function with name 'histogram_irate'` (or
+  `'histogram_mean'`).
+- `columns` (`QueryEngine` and every `MetricsSource`) and
+  `referenced_metrics` accept the same `sum(...)` form. They returned a
+  parse error for it on every source, so a caller trimming columns by a
+  query's references dropped a histogram charted as
+  `sum(histogram_irate(..))`.
+- `sum(histogram_irate by (x) (..))`, a grouping on the function inside a
+  `sum`, is refused on every source with an error naming the cause. Outside
+  an archive, an inner `by` clause could be rewritten with the outer `sum`
+  dropped, depending on its spelling, and return a series per group.
+
 ## [0.37.0] - 2026-10-15
 
 ### Changed
