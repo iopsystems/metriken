@@ -19,7 +19,7 @@
 //! between ticks — the classic lending-iterator problem), so the
 //! function is a straight loop rather than a generic chain.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use ::histogram::{Config, CumulativeROHistogramRef, Quantile, QuantilesResult};
 
@@ -291,36 +291,69 @@ fn bucket_weighted_sum(r: &CumulativeROHistogramRef<'_>) -> (f64, f64) {
     (lo, hi)
 }
 
-/// Decompose a sparse cumulative snapshot into a per-bucket individual count map.
-fn decompose_to_individual(snap: &HistogramSnapshot) -> BTreeMap<u32, u64> {
-    let mut out = BTreeMap::new();
-    let mut prev = 0u64;
-    for k in 0..snap.index.len() {
-        let c = snap.count[k];
-        let individual = c.saturating_sub(prev);
-        if individual > 0 {
-            out.insert(snap.index[k], individual);
+/// Per-bucket counts gathered from row deltas: dense by bucket index, with
+/// the buckets added to since the last flush, so a flush costs the buckets
+/// touched rather than every bucket of the histogram. Indices at or past the
+/// histogram's bucket count belong to no bucket and are ignored.
+struct Accum {
+    counts: Vec<u64>,
+    touched: Vec<u32>,
+    buckets: usize,
+}
+
+impl Accum {
+    fn new(config: Config) -> Self {
+        Self {
+            counts: Vec::new(),
+            touched: Vec::new(),
+            buckets: config.total_buckets(),
         }
-        prev = c;
     }
-    out
+
+    fn add(&mut self, idx: u32, c: u64) {
+        let i = idx as usize;
+        if i >= self.buckets {
+            return;
+        }
+        if i >= self.counts.len() {
+            self.counts.resize(i + 1, 0);
+        }
+        if self.counts[i] == 0 {
+            self.touched.push(idx);
+        }
+        self.counts[i] = self.counts[i].saturating_add(c);
+    }
 }
 
 /// Compute `(curr - prev)` per-bucket individual counts and accumulate
 /// into `accum`. Counter resets (curr < prev for a bucket) are clamped
 /// to zero via `saturating_sub`, mirroring counter irate/rate semantics.
-fn accumulate_delta_into(
-    prev: &HistogramSnapshot,
-    curr: &HistogramSnapshot,
-    accum: &mut BTreeMap<u32, u64>,
-) {
-    let prev_map = decompose_to_individual(prev);
-    let curr_map = decompose_to_individual(curr);
-    for (&idx, &c) in &curr_map {
-        let p = prev_map.get(&idx).copied().unwrap_or(0);
-        let delta = c.saturating_sub(p);
+/// Both snapshots are sparse cumulative with ascending, unique indices,
+/// walked together.
+fn accumulate_delta_into(prev: &HistogramSnapshot, curr: &HistogramSnapshot, accum: &mut Accum) {
+    debug_assert!(prev.index.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(curr.index.windows(2).all(|w| w[0] < w[1]));
+    let mut i = 0;
+    let mut prev_running = 0u64;
+    let mut curr_running = 0u64;
+    for (j, &idx) in curr.index.iter().enumerate() {
+        let individual = curr.count[j].saturating_sub(curr_running);
+        curr_running = curr.count[j];
+        while i < prev.index.len() && prev.index[i] < idx {
+            prev_running = prev.count[i];
+            i += 1;
+        }
+        let before = if i < prev.index.len() && prev.index[i] == idx {
+            let v = prev.count[i].saturating_sub(prev_running);
+            prev_running = prev.count[i];
+            i += 1;
+            v
+        } else {
+            0
+        };
+        let delta = individual.saturating_sub(before);
         if delta > 0 {
-            *accum.entry(idx).or_insert(0) += delta;
+            accum.add(idx, delta);
         }
     }
 }
@@ -356,8 +389,8 @@ fn quantiles_impl(
     // quantization band from the bucket the quantile lands in.
     let mut outputs: Vec<Vec<QuantileRow>> = vec![Vec::new(); quantiles_in.len()];
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
-    let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut tick_accum = Accum::new(config);
+    let mut stride_accum = Accum::new(config);
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
     let mut windows = stride.map(|s| Windows::new(s, start_ns));
@@ -401,19 +434,19 @@ fn quantiles_impl(
         // Emit previous tick on tick boundary.
         {
             if let Some(prev_t) = current_t {
-                if prev_t != t && prev_t >= start_ns {
-                    if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
-                        apply_quantiles(
-                            config,
-                            &scratch_idx,
-                            &scratch_cnt,
-                            &quantile_floats,
-                            &quantile_keys,
-                            prev_t,
-                            &mut outputs,
-                        );
-                    }
-                    tick_accum.clear();
+                if prev_t != t
+                    && prev_t >= start_ns
+                    && flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt)
+                {
+                    apply_quantiles(
+                        config,
+                        &scratch_idx,
+                        &scratch_cnt,
+                        &quantile_floats,
+                        &quantile_keys,
+                        prev_t,
+                        &mut outputs,
+                    );
                 }
             }
         }
@@ -521,8 +554,7 @@ fn reduce(
     let mut bands_per_group: Vec<Vec<Option<(f64, f64)>>> =
         (0..g_count).map(|_| Vec::new()).collect();
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
-    let mut accum_per_group: Vec<BTreeMap<u32, u64>> =
-        (0..g_count).map(|_| BTreeMap::new()).collect();
+    let mut accum_per_group: Vec<Accum> = (0..g_count).map(|_| Accum::new(config)).collect();
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
     let mut windows = stride.map(|s| Windows::new(s, start_ns));
@@ -744,8 +776,8 @@ fn heatmap_impl(
             .collect();
 
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
-    let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut tick_accum = Accum::new(config);
+    let mut stride_accum = Accum::new(config);
     let mut windows = stride.map(|s| Windows::new(s, start_ns));
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
@@ -828,21 +860,21 @@ fn heatmap_impl(
         // On tick boundary: flush previous tick.
         {
             if let Some(prev_t) = current_t {
-                if prev_t != t && prev_t >= start_ns {
-                    if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
-                        emit_tick(
-                            prev_t,
-                            &scratch_idx,
-                            &scratch_cnt,
-                            &mut timestamps,
-                            &mut data,
-                            &mut min_value,
-                            &mut max_value,
-                            &mut min_bucket_idx,
-                            &mut max_bucket_idx,
-                        );
-                    }
-                    tick_accum.clear();
+                if prev_t != t
+                    && prev_t >= start_ns
+                    && flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt)
+                {
+                    emit_tick(
+                        prev_t,
+                        &scratch_idx,
+                        &scratch_cnt,
+                        &mut timestamps,
+                        &mut data,
+                        &mut min_value,
+                        &mut max_value,
+                        &mut min_bucket_idx,
+                        &mut max_bucket_idx,
+                    );
                 }
             }
         }
@@ -928,23 +960,21 @@ fn heatmap_impl(
 /// The cumulative is `u64`: one tick or stride summed over several series
 /// can exceed `u32::MAX` observations, and a `u32` cumulative would have to
 /// clip it, which moves every quantile above the clip point down.
-fn flush_accum(
-    accum: &mut BTreeMap<u32, u64>,
-    scratch_idx: &mut Vec<u32>,
-    scratch_cnt: &mut Vec<u64>,
-) -> bool {
+fn flush_accum(accum: &mut Accum, scratch_idx: &mut Vec<u32>, scratch_cnt: &mut Vec<u64>) -> bool {
     scratch_idx.clear();
     scratch_cnt.clear();
+    accum.touched.sort_unstable();
     let mut running: u64 = 0;
-    for (idx, c) in accum.iter() {
-        if *c == 0 {
+    for &idx in &accum.touched {
+        let c = std::mem::take(&mut accum.counts[idx as usize]);
+        if c == 0 {
             continue;
         }
-        running = running.saturating_add(*c);
-        scratch_idx.push(*idx);
+        running = running.saturating_add(c);
+        scratch_idx.push(idx);
         scratch_cnt.push(running);
     }
-    accum.clear();
+    accum.touched.clear();
     !scratch_idx.is_empty()
 }
 
@@ -1024,4 +1054,88 @@ fn build_grouped_output(
         );
     }
     samples
+}
+
+#[cfg(test)]
+mod accum_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A sparse cumulative snapshot from per-bucket counts.
+    fn snapshot(counts: &BTreeMap<u32, u64>) -> HistogramSnapshot {
+        let mut running = 0u64;
+        let mut index = Vec::new();
+        let mut count = Vec::new();
+        for (&idx, &c) in counts {
+            running += c;
+            index.push(idx);
+            count.push(running);
+        }
+        HistogramSnapshot { index, count }
+    }
+
+    /// Deltas walked from several snapshot pairs into one accumulator flush
+    /// as the running sum of the per-bucket subtraction, in ascending bucket
+    /// order. Buckets present in only one snapshot, growing, shrinking (a
+    /// reset) and unchanged are all covered by the pseudo-random cases, and
+    /// several pairs per flush put touched buckets out of order.
+    #[test]
+    fn the_delta_walk_matches_per_bucket_subtraction() {
+        let config = histogram::Config::new(4, 10).unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut accum = Accum::new(config);
+        for _ in 0..300 {
+            let mut want: BTreeMap<u32, u64> = BTreeMap::new();
+            for _ in 0..(next() % 4 + 1) {
+                let mut a = BTreeMap::new();
+                let mut b = BTreeMap::new();
+                for _ in 0..(next() % 12) {
+                    a.insert((next() % 40) as u32, next() % 9 + 1);
+                }
+                for _ in 0..(next() % 12) {
+                    b.insert((next() % 40) as u32, next() % 9 + 1);
+                }
+                let (prev, curr) = (snapshot(&a), snapshot(&b));
+                accumulate_delta_into(&prev, &curr, &mut accum);
+                for (&k, &c) in &b {
+                    let d = c.saturating_sub(a.get(&k).copied().unwrap_or(0));
+                    if d > 0 {
+                        *want.entry(k).or_insert(0) += d;
+                    }
+                }
+            }
+            let mut idx = Vec::new();
+            let mut cnt = Vec::new();
+            flush_accum(&mut accum, &mut idx, &mut cnt);
+            let want_idx: Vec<u32> = want.keys().copied().collect();
+            let want_cnt: Vec<u64> = want
+                .values()
+                .scan(0u64, |run, c| {
+                    *run += c;
+                    Some(*run)
+                })
+                .collect();
+            assert_eq!((idx, cnt), (want_idx, want_cnt));
+            assert!(accum.touched.is_empty() && accum.counts.iter().all(|c| *c == 0));
+        }
+    }
+
+    /// An index past the histogram's buckets is ignored, not allocated for.
+    #[test]
+    fn an_index_past_the_buckets_is_ignored() {
+        let config = histogram::Config::new(4, 10).unwrap();
+        let mut accum = Accum::new(config);
+        accum.add(u32::MAX, 5);
+        accum.add(3, 2);
+        assert!(accum.counts.len() <= config.total_buckets());
+        let (mut idx, mut cnt) = (Vec::new(), Vec::new());
+        assert!(flush_accum(&mut accum, &mut idx, &mut cnt));
+        assert_eq!((idx, cnt), (vec![3], vec![2]));
+    }
 }

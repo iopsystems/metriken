@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.39.1
+
+- Histogram functions sum each row's delta into a dense per-bucket
+  accumulator, without building maps per row. Results are unchanged; on a
+  9.6 h, 1 s recording (release build, warm) quantiles over one series
+  run 11-16x faster and heatmaps 3-14x.
+
 ### metriken-query 0.39.0
 
 - A strided histogram call (`histogram_count(lat, 60)`,
