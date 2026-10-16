@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Histogram functions sum each row's delta into a dense per-bucket
+  accumulator, without building maps per row. Results are unchanged; on a
+  9.6 h, 1 s recording (release build, warm) quantiles over one series
+  run 11-16x faster and heatmaps 3-14x.
+
 ## [0.39.0] - 2026-10-16
 
 ### Changed

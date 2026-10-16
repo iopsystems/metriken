@@ -25,7 +25,8 @@ pub struct Gauge {
 
 /// Raw cumulative sparse prefix-sum snapshot for one histogram sample.
 ///
-/// `index[i]` is the bucket position; `count[i]` is the monotonically
+/// `index` is ascending with no repeats. `index[i]` is the bucket position;
+/// `count[i]` is the monotonically
 /// non-decreasing cumulative observation count up to and including that
 /// bucket since the last counter reset. Only buckets with at least one
 /// cumulative observation are stored (sparse). The streaming operators
