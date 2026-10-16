@@ -36,6 +36,90 @@ type QuantileRow = (f64, f64, Option<Band>);
 /// keep `Option<GroupBands>` readable (clears clippy's `type_complexity`).
 type GroupBands = Vec<Vec<Option<Band>>>;
 
+/// A strided call's windows, `(anchor + (k - 1)·stride, anchor + k·stride]`
+/// for integer `k`. A range query anchors them at multiples of the stride
+/// (`anchor_ns` 0), so they fall at the same instants whatever range is
+/// read; an instant query anchors them at its own time, so its window is the
+/// stride ending there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stride {
+    pub(crate) ns: u64,
+    pub(crate) anchor_ns: u64,
+    /// A window is emitted only when one of its rows is at or after this:
+    /// a range's start, so no point falls before the range; 0 for an
+    /// instant, whose one window always is.
+    pub(crate) emit_from_ns: u64,
+}
+
+impl Stride {
+    /// The window holding time `t`.
+    pub(crate) fn window(&self, t: u64) -> i64 {
+        let d = i128::from(t) - i128::from(self.anchor_ns);
+        let s = i128::from(self.ns);
+        (d.div_euclid(s) + i128::from(d.rem_euclid(s) != 0)) as i64
+    }
+
+    /// Where window `k` opens: rows after it belong to the window.
+    pub(crate) fn opens_ns(&self, k: i64) -> u64 {
+        let at = i128::from(self.anchor_ns) + (i128::from(k) - 1) * i128::from(self.ns);
+        at.clamp(0, i128::from(u64::MAX)) as u64
+    }
+}
+
+/// Assigns a strided call's rows to windows, in timestamp order. The window
+/// holding `start_ns` is the first that can be emitted; rows before it supply only the
+/// snapshot a delta is taken from. A window closes when a row's timestamp
+/// falls in a later one, so rows of several series at one timestamp stay in
+/// one window.
+struct Windows {
+    stride: Stride,
+    first: i64,
+    current: Option<i64>,
+    last_t: u64,
+    /// The open window has a row at or after `stride.emit_from_ns`.
+    emits: bool,
+}
+
+impl Windows {
+    fn new(stride: Stride, start_ns: u64) -> Self {
+        Self {
+            stride,
+            first: stride.window(start_ns),
+            current: None,
+            last_t: 0,
+            emits: false,
+        }
+    }
+
+    /// For a row at `t`: whether it belongs to a window from the first on,
+    /// and, when it opens a new one, whether the window it closes is emitted
+    /// and if so the time of its last row. A closed window that is not
+    /// emitted still has its rows' deltas, which the caller discards.
+    fn row(&mut self, t: u64) -> (bool, Option<Option<u64>>) {
+        let k = self.stride.window(t);
+        if k < self.first {
+            return (false, None);
+        }
+        let closed = match self.current {
+            Some(c) if c != k => {
+                let at = self.emits.then_some(self.last_t);
+                self.emits = false;
+                Some(at)
+            }
+            _ => None,
+        };
+        self.current = Some(k);
+        self.last_t = t;
+        self.emits |= t >= self.stride.emit_from_ns;
+        (true, closed)
+    }
+
+    /// The time of the last row of the open window, if it is emitted.
+    fn finish(&self) -> Option<u64> {
+        self.current.filter(|_| self.emits).map(|_| self.last_t)
+    }
+}
+
 // ─── impl HistogramStream ────────────────────────────────────────────────────
 
 /// The histogram operators, over a source's histogram row stream.
@@ -47,7 +131,7 @@ pub(crate) trait HistogramOps: Sized {
         quantiles_in: &[f64],
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample>;
 
@@ -56,7 +140,7 @@ pub(crate) trait HistogramOps: Sized {
         group_by: GroupBy<'_>,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample>;
 
@@ -65,7 +149,7 @@ pub(crate) trait HistogramOps: Sized {
         group_by: GroupBy<'_>,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample>;
 
@@ -74,7 +158,7 @@ pub(crate) trait HistogramOps: Sized {
         group_by: GroupBy<'_>,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample>;
 
@@ -90,7 +174,7 @@ pub(crate) trait HistogramOps: Sized {
         self,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
     ) -> Option<HistogramHeatmapResult>;
 }
 
@@ -100,10 +184,10 @@ impl HistogramOps for HistogramStream {
         quantiles_in: &[f64],
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        quantiles_impl(self, quantiles_in, start_ns, end_ns, stride_ns, metric_name)
+        quantiles_impl(self, quantiles_in, start_ns, end_ns, stride, metric_name)
     }
 
     fn mean(
@@ -111,30 +195,22 @@ impl HistogramOps for HistogramStream {
         group_by: GroupBy<'_>,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(
-            self,
-            group_by,
-            start_ns,
-            end_ns,
-            stride_ns,
-            metric_name,
-            |r| {
-                let c = r.total_count();
-                r.mean().map(|m| {
-                    // mean = sum / N; propagate the sum band divided by N.
-                    let band = if c > 0 {
-                        let (lo, hi) = bucket_weighted_sum(r);
-                        Some((lo / c as f64, hi / c as f64))
-                    } else {
-                        None
-                    };
-                    (m, band)
-                })
-            },
-        )
+        reduce(self, group_by, start_ns, end_ns, stride, metric_name, |r| {
+            let c = r.total_count();
+            r.mean().map(|m| {
+                // mean = sum / N; propagate the sum band divided by N.
+                let band = if c > 0 {
+                    let (lo, hi) = bucket_weighted_sum(r);
+                    Some((lo / c as f64, hi / c as f64))
+                } else {
+                    None
+                };
+                (m, band)
+            })
+        })
     }
 
     fn count(
@@ -142,23 +218,15 @@ impl HistogramOps for HistogramStream {
         group_by: GroupBy<'_>,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(
-            self,
-            group_by,
-            start_ns,
-            end_ns,
-            stride_ns,
-            metric_name,
-            |r| {
-                // count is exact — an integer tally, no bucket-resolution
-                // uncertainty. No band.
-                let c = r.total_count();
-                (c > 0).then_some((c as f64, None))
-            },
-        )
+        reduce(self, group_by, start_ns, end_ns, stride, metric_name, |r| {
+            // count is exact — an integer tally, no bucket-resolution
+            // uncertainty. No band.
+            let c = r.total_count();
+            (c > 0).then_some((c as f64, None))
+        })
     }
 
     fn sum(
@@ -166,27 +234,19 @@ impl HistogramOps for HistogramStream {
         group_by: GroupBy<'_>,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(
-            self,
-            group_by,
-            start_ns,
-            end_ns,
-            stride_ns,
-            metric_name,
-            |r| {
-                let c = r.total_count();
-                if c == 0 {
-                    return None;
-                }
-                // Nominal sum = total_count · mean (midpoints); the band is the
-                // bucket-resolution range [Σ count·start, Σ count·end].
-                r.mean()
-                    .map(|m| (c as f64 * m, Some(bucket_weighted_sum(r))))
-            },
-        )
+        reduce(self, group_by, start_ns, end_ns, stride, metric_name, |r| {
+            let c = r.total_count();
+            if c == 0 {
+                return None;
+            }
+            // Nominal sum = total_count · mean (midpoints); the band is the
+            // bucket-resolution range [Σ count·start, Σ count·end].
+            r.mean()
+                .map(|m| (c as f64 * m, Some(bucket_weighted_sum(r))))
+        })
     }
 
     fn irate(
@@ -203,9 +263,9 @@ impl HistogramOps for HistogramStream {
         self,
         start_ns: u64,
         end_ns: u64,
-        stride_ns: Option<u64>,
+        stride: Option<Stride>,
     ) -> Option<HistogramHeatmapResult> {
-        heatmap_impl(self, start_ns, end_ns, stride_ns)
+        heatmap_impl(self, start_ns, end_ns, stride)
     }
 }
 
@@ -272,7 +332,7 @@ fn quantiles_impl(
     quantiles_in: &[f64],
     start_ns: u64,
     end_ns: u64,
-    stride_ns: Option<u64>,
+    stride: Option<Stride>,
     metric_name: &str,
 ) -> Vec<MatrixSample> {
     let HistogramStream { meta, rows } = stream;
@@ -300,8 +360,7 @@ fn quantiles_impl(
     let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
-    let mut stride_last_emit: Option<u64> = None;
-    let mut stride_end_time: u64 = 0;
+    let mut windows = stride.map(|s| Windows::new(s, start_ns));
     let mut current_t: Option<u64> = None;
 
     for HistogramRow {
@@ -314,8 +373,33 @@ fn quantiles_impl(
             continue;
         }
 
-        // Emit previous tick on tick boundary (non-stride path).
-        if stride_ns.is_none() {
+        if let Some(w) = windows.as_mut() {
+            let (inside, closed) = w.row(t);
+            if let Some(emit) = closed {
+                let any = flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt);
+                if let (true, Some(at)) = (any, emit) {
+                    apply_quantiles(
+                        config,
+                        &scratch_idx,
+                        &scratch_cnt,
+                        &quantile_floats,
+                        &quantile_keys,
+                        at,
+                        &mut outputs,
+                    );
+                }
+            }
+            if inside {
+                if let Some(prev) = &prev_per_series[series_idx] {
+                    accumulate_delta_into(prev, &snapshot, &mut stride_accum);
+                }
+            }
+            prev_per_series[series_idx] = Some(snapshot);
+            continue;
+        }
+
+        // Emit previous tick on tick boundary.
+        {
             if let Some(prev_t) = current_t {
                 if prev_t != t && prev_t >= start_ns {
                     if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
@@ -341,41 +425,11 @@ fn quantiles_impl(
             }
         }
         prev_per_series[series_idx] = Some(snapshot);
-
-        if let Some(stride) = stride_ns {
-            if t >= start_ns {
-                for (&idx, &c) in &tick_accum {
-                    *stride_accum.entry(idx).or_insert(0) += c;
-                }
-                tick_accum.clear();
-                stride_end_time = t;
-                match stride_last_emit {
-                    None => {
-                        stride_last_emit = Some(t);
-                    }
-                    Some(last) if t >= last && t - last >= stride => {
-                        if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
-                            apply_quantiles(
-                                config,
-                                &scratch_idx,
-                                &scratch_cnt,
-                                &quantile_floats,
-                                &quantile_keys,
-                                stride_end_time,
-                                &mut outputs,
-                            );
-                        }
-                        stride_last_emit = Some(t);
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
     // Final emit.
-    if let Some(t) = current_t.filter(|&t| t >= start_ns) {
-        if stride_ns.is_some() {
+    if let Some(w) = &windows {
+        if let Some(at) = w.finish() {
             if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
                 apply_quantiles(
                     config,
@@ -383,11 +437,13 @@ fn quantiles_impl(
                     &scratch_cnt,
                     &quantile_floats,
                     &quantile_keys,
-                    stride_end_time,
+                    at,
                     &mut outputs,
                 );
             }
-        } else if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
+        }
+    } else if let Some(t) = current_t.filter(|&t| t >= start_ns) {
+        if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
             apply_quantiles(
                 config,
                 &scratch_idx,
@@ -437,7 +493,7 @@ fn reduce(
     group_by: GroupBy<'_>,
     start_ns: u64,
     end_ns: u64,
-    stride_ns: Option<u64>,
+    stride: Option<Stride>,
     metric_name: &str,
     // Returns (nominal value, optional value-uncertainty band from bucket
     // resolution). sum/mean carry a band; count is exact (None).
@@ -469,8 +525,7 @@ fn reduce(
         (0..g_count).map(|_| BTreeMap::new()).collect();
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
-    let mut stride_last_emit: Option<u64> = None;
-    let mut stride_end_time: u64 = 0;
+    let mut windows = stride.map(|s| Windows::new(s, start_ns));
     let mut current_t: Option<u64> = None;
 
     for HistogramRow {
@@ -483,8 +538,37 @@ fn reduce(
             continue;
         }
 
-        // On tick boundary (non-stride path): emit the previous tick then clear accumulators.
-        if stride_ns.is_none() {
+        if let Some(w) = windows.as_mut() {
+            let (inside, closed) = w.row(t);
+            if let Some(emit) = closed {
+                for g in 0..g_count {
+                    let any =
+                        flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt);
+                    if let (true, Some(at)) = (any, emit) {
+                        let r = CumulativeROHistogramRef::from_parts_unchecked(
+                            config,
+                            &scratch_idx,
+                            &scratch_cnt,
+                        );
+                        if let Some((v, band)) = reducer(&r) {
+                            values_per_group[g].push((at as f64 / 1e9, v));
+                            bands_per_group[g].push(band);
+                        }
+                    }
+                }
+            }
+            if inside {
+                if let Some(prev) = &prev_per_series[series_idx] {
+                    let g = series_group[series_idx];
+                    accumulate_delta_into(prev, &snapshot, &mut accum_per_group[g]);
+                }
+            }
+            prev_per_series[series_idx] = Some(snapshot);
+            continue;
+        }
+
+        // On tick boundary: emit the previous tick then clear accumulators.
+        {
             if let Some(prev_t) = current_t {
                 if prev_t != t && prev_t >= start_ns {
                     for g in 0..g_count {
@@ -514,58 +598,15 @@ fn reduce(
             }
         }
         prev_per_series[series_idx] = Some(snapshot);
-
-        // Stride path: emit when stride interval has elapsed.
-        if let Some(stride) = stride_ns {
-            if t >= start_ns {
-                stride_end_time = t;
-                match stride_last_emit {
-                    None => {
-                        stride_last_emit = Some(t);
-                    }
-                    Some(last) if t >= last && t - last >= stride => {
-                        for g in 0..g_count {
-                            if flush_accum(
-                                &mut accum_per_group[g],
-                                &mut scratch_idx,
-                                &mut scratch_cnt,
-                            ) {
-                                let r = CumulativeROHistogramRef::from_parts_unchecked(
-                                    config,
-                                    &scratch_idx,
-                                    &scratch_cnt,
-                                );
-                                if let Some((v, band)) = reducer(&r) {
-                                    values_per_group[g].push((stride_end_time as f64 / 1e9, v));
-                                    bands_per_group[g].push(band);
-                                }
-                            }
-                        }
-                        stride_last_emit = Some(t);
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
-    // Final emit for the last tick.
-    if let Some(t) = current_t.filter(|&t| t >= start_ns) {
-        if stride_ns.is_some() {
-            for g in 0..g_count {
-                if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
-                    let r = CumulativeROHistogramRef::from_parts_unchecked(
-                        config,
-                        &scratch_idx,
-                        &scratch_cnt,
-                    );
-                    if let Some((v, band)) = reducer(&r) {
-                        values_per_group[g].push((stride_end_time as f64 / 1e9, v));
-                        bands_per_group[g].push(band);
-                    }
-                }
-            }
-        } else {
+    // Final emit for the last window or tick.
+    let last = match &windows {
+        Some(w) => w.finish(),
+        None => current_t.filter(|&t| t >= start_ns),
+    };
+    if let Some(t) = last {
+        {
             for g in 0..g_count {
                 if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
                     let r = CumulativeROHistogramRef::from_parts_unchecked(
@@ -686,7 +727,7 @@ fn heatmap_impl(
     stream: HistogramStream,
     start_ns: u64,
     end_ns: u64,
-    stride_ns: Option<u64>,
+    stride: Option<Stride>,
 ) -> Option<HistogramHeatmapResult> {
     let HistogramStream { meta, rows } = stream;
     let n = meta.series.len();
@@ -705,8 +746,7 @@ fn heatmap_impl(
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut tick_accum: BTreeMap<u32, u64> = BTreeMap::new();
     let mut stride_accum: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut stride_last_emit: Option<u64> = None;
-    let mut stride_end_time: u64 = 0;
+    let mut windows = stride.map(|s| Windows::new(s, start_ns));
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
 
@@ -758,8 +798,35 @@ fn heatmap_impl(
             continue;
         }
 
-        // On tick boundary (non-stride): flush previous tick.
-        if stride_ns.is_none() {
+        if let Some(w) = windows.as_mut() {
+            let (inside, closed) = w.row(t);
+            if let Some(emit) = closed {
+                let any = flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt);
+                if let (true, Some(at)) = (any, emit) {
+                    emit_tick(
+                        at,
+                        &scratch_idx,
+                        &scratch_cnt,
+                        &mut timestamps,
+                        &mut data,
+                        &mut min_value,
+                        &mut max_value,
+                        &mut min_bucket_idx,
+                        &mut max_bucket_idx,
+                    );
+                }
+            }
+            if inside {
+                if let Some(prev) = &prev_per_series[series_idx] {
+                    accumulate_delta_into(prev, &snapshot, &mut stride_accum);
+                }
+            }
+            prev_per_series[series_idx] = Some(snapshot);
+            continue;
+        }
+
+        // On tick boundary: flush previous tick.
+        {
             if let Some(prev_t) = current_t {
                 if prev_t != t && prev_t >= start_ns {
                     if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
@@ -787,49 +854,14 @@ fn heatmap_impl(
             }
         }
         prev_per_series[series_idx] = Some(snapshot);
-
-        // Stride path.
-        if let Some(stride) = stride_ns {
-            if t >= start_ns {
-                for (&idx, &c) in &tick_accum {
-                    *stride_accum.entry(idx).or_insert(0) += c;
-                }
-                tick_accum.clear();
-                stride_end_time = t;
-                let last = match stride_last_emit {
-                    Some(t) => t,
-                    None => {
-                        stride_last_emit = Some(t);
-                        continue;
-                    }
-                };
-                if t >= last
-                    && t - last >= stride
-                    && flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt)
-                {
-                    emit_tick(
-                        stride_end_time,
-                        &scratch_idx,
-                        &scratch_cnt,
-                        &mut timestamps,
-                        &mut data,
-                        &mut min_value,
-                        &mut max_value,
-                        &mut min_bucket_idx,
-                        &mut max_bucket_idx,
-                    );
-                    stride_last_emit = Some(t);
-                }
-            }
-        }
     }
 
     // Final emit.
-    if let Some(t) = current_t.filter(|&t| t >= start_ns) {
-        if stride_ns.is_some() {
+    if let Some(w) = &windows {
+        if let Some(at) = w.finish() {
             if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
                 emit_tick(
-                    stride_end_time,
+                    at,
                     &scratch_idx,
                     &scratch_cnt,
                     &mut timestamps,
@@ -840,7 +872,9 @@ fn heatmap_impl(
                     &mut max_bucket_idx,
                 );
             }
-        } else if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
+        }
+    } else if let Some(t) = current_t.filter(|&t| t >= start_ns) {
+        if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
             emit_tick(
                 t,
                 &scratch_idx,

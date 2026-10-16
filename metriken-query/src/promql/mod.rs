@@ -1,4 +1,4 @@
-use crate::promql::streaming::histogram::HistogramOps;
+use crate::promql::streaming::histogram::{HistogramOps, Stride};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -232,7 +232,9 @@ pub enum QueryResult {
 
 /// Where to read histogram `name` from for a range starting at `start_ns`:
 /// two of its rows earlier, so the range's first row has the row before it
-/// to take a delta from. Points are emitted from `start_ns` only.
+/// to take a delta from. An unstrided call emits points from `start_ns` on; a
+/// strided call passes the opening of the window holding its range's start
+/// (`window_read_start`).
 pub(crate) fn histogram_read_start(
     source: &dyn crate::DataSource,
     name: &str,
@@ -242,10 +244,29 @@ pub(crate) fn histogram_read_start(
     start_ns.saturating_sub(2 * interval_ns)
 }
 
-/// How far back an instant query of a strided histogram call
-/// (`histogram_count(lat, 60)`) reads, in seconds, and an unstrided one when
-/// no metric it names has a positive interval: Prometheus's default lookback
-/// for an instant vector.
+/// A strided call's windows: anchored at the range's end for an instant
+/// query, so its window is the stride ending there, and at multiples of the
+/// stride for a range query.
+fn stride_windows(ns: u64, start_ns: u64, end_ns: u64, opts: &QueryOptions) -> Stride {
+    Stride {
+        ns,
+        anchor_ns: if opts.instant { end_ns } else { 0 },
+        emit_from_ns: if opts.instant { 0 } else { start_ns },
+    }
+}
+
+/// Where a call's rows are needed from: `start_ns`, or for a strided call the
+/// opening of the window holding it, so that window is whole.
+fn window_read_start(stride: Option<Stride>, start_ns: u64) -> u64 {
+    match stride {
+        Some(s) => start_ns.min(s.opens_ns(s.window(start_ns))),
+        None => start_ns,
+    }
+}
+
+/// The most an unstrided instant query of a histogram function reads back, in
+/// seconds, and what it reads back when no metric it names has a positive
+/// interval: Prometheus's default lookback for an instant vector.
 const INSTANT_LOOKBACK_S: f64 = 300.0;
 
 /// How many of a histogram's row intervals an unstrided instant query reads
@@ -258,16 +279,16 @@ const INSTANT_LOOKBACK_ROWS: f64 = 3.0;
 /// How far back an instant query of a histogram function reads, in
 /// seconds: [`INSTANT_LOOKBACK_ROWS`] times the longest
 /// `DataSource::histogram_interval` among the metrics `query` names, at most
-/// [`INSTANT_LOOKBACK_S`]. A strided call reads back
-/// [`INSTANT_LOOKBACK_S`]: its windows are laid from the first row read, so
-/// the read back decides where they fall. A source with no per-histogram
-/// interval answers its `interval()` (1 s for a parquet file or a
-/// `MemoryStore` without `sampling_interval_ms`).
+/// [`INSTANT_LOOKBACK_S`]. A strided call reads back nothing here: its one
+/// window is the stride ending at the instant (`stride_windows`), which its
+/// handler reads from that window's opening (`window_read_start`). A source
+/// with no per-histogram interval answers its `interval()` (1 s for a
+/// parquet file or a `MemoryStore` without `sampling_interval_ms`).
 fn instant_histogram_lookback(source: &dyn crate::DataSource, query: &str) -> f64 {
     let strided =
         histogram_calls(query).any(|args| matches!(parse_optional_stride(args), Ok((_, Some(_)))));
     if strided {
-        return INSTANT_LOOKBACK_S;
+        return 0.0;
     }
     let interval = crate::referenced_metrics(query)
         .unwrap_or_default()
@@ -284,8 +305,9 @@ fn instant_histogram_lookback(source: &dyn crate::DataSource, query: &str) -> f6
 
 /// Whether `query` calls one of the histogram functions that give a value
 /// per tick, with or without a `by`/`without` clause after its name.
-/// `histogram_heatmap` is left out: its instant is the heatmap of the
-/// one-point range.
+/// `histogram_heatmap` is left out: an unstrided one's instant is the
+/// heatmap of the one-point range, and a strided one's the stride ending at
+/// the instant.
 fn calls_histogram_function(query: &str) -> bool {
     histogram_calls(query).next().is_some()
 }
@@ -426,12 +448,13 @@ fn parse_optional_stride(s: &str) -> Result<(&str, Option<u64>), QueryError> {
     let (before, after) = split_last_top_level_comma(s);
     if let Some(tail) = after {
         if let Ok(secs) = tail.parse::<f64>() {
-            if secs <= 0.0 {
+            let ns = (secs * 1_000_000_000.0) as u64;
+            if secs.is_nan() || secs <= 0.0 || ns == 0 {
                 return Err(QueryError::ParseError(
-                    "stride must be a positive number of seconds".to_string(),
+                    "stride must be a positive number of seconds, at least 1 ns".to_string(),
                 ));
             }
-            return Ok((before.trim(), Some((secs * 1_000_000_000.0) as u64)));
+            return Ok((before.trim(), Some(ns)));
         }
     }
     Ok((s, None))
@@ -834,7 +857,11 @@ impl QueryEngine {
         } else {
             target
         };
-        let result = self.query_range(query_str, start, target, step)?;
+        let opts = QueryOptions {
+            instant: true,
+            ..QueryOptions::default()
+        };
+        let result = self.query_range_opts(query_str, start, target, step, &opts)?;
         let QueryResult::Matrix { result: samples } = result else {
             return Ok(result);
         };
@@ -915,6 +942,7 @@ impl QueryEngine {
         query_str: &str,
         start: f64,
         end: f64,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         // Accept both `histogram_quantiles(` and `histogram_percentiles(` as
         // synonyms — quantile and percentile are interchangeable terms for
@@ -974,17 +1002,22 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
+        let stride = stride_ns.map(|ns| stride_windows(ns, start_ns, end_ns, opts));
         let stream = self.source.histogram_stream(
             &metric_name,
             &labels,
-            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            histogram_read_start(
+                self.source.as_ref(),
+                &metric_name,
+                window_read_start(stride, start_ns),
+            ),
             end_ns,
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
             return Ok(QueryResult::Matrix { result: vec![] });
         };
-        let result = stream.quantiles(&quantiles, start_ns, end_ns, stride_ns, &metric_name);
+        let result = stream.quantiles(&quantiles, start_ns, end_ns, stride, &metric_name);
         if result.is_empty() {
             return Ok(QueryResult::Matrix { result: vec![] });
         }
@@ -996,6 +1029,7 @@ impl QueryEngine {
         query_str: &str,
         start: f64,
         end: f64,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let inner = &query_str["histogram_heatmap(".len()..query_str.len() - 1];
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
@@ -1003,17 +1037,22 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
+        let stride = stride_ns.map(|ns| stride_windows(ns, start_ns, end_ns, opts));
         let stream = self.source.histogram_stream(
             &metric_name,
             &labels,
-            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            histogram_read_start(
+                self.source.as_ref(),
+                &metric_name,
+                window_read_start(stride, start_ns),
+            ),
             end_ns,
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
             return Ok(QueryResult::Matrix { result: vec![] });
         };
-        let result = stream.heatmap(start_ns, end_ns, stride_ns);
+        let result = stream.heatmap(start_ns, end_ns, stride);
         match result {
             Some(result) => Ok(QueryResult::HistogramHeatmap { result }),
             None => Ok(QueryResult::Matrix { result: vec![] }),
@@ -1061,16 +1100,22 @@ impl QueryEngine {
         group_by: HistogramGroupBy,
         start: f64,
         end: f64,
+        opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
+        let stride = stride_ns.map(|ns| stride_windows(ns, start_ns, end_ns, opts));
         let stream = self.source.histogram_stream(
             &metric_name,
             &labels,
-            histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
+            histogram_read_start(
+                self.source.as_ref(),
+                &metric_name,
+                window_read_start(stride, start_ns),
+            ),
             end_ns,
         );
         let Some(stream) = stream else {
@@ -1079,9 +1124,9 @@ impl QueryEngine {
         };
         let group = group_by.as_ref();
         let result = match func {
-            "histogram_mean" => stream.mean(group, start_ns, end_ns, stride_ns, &metric_name),
-            "histogram_sum" => stream.sum(group, start_ns, end_ns, stride_ns, &metric_name),
-            _ => stream.count(group, start_ns, end_ns, stride_ns, &metric_name),
+            "histogram_mean" => stream.mean(group, start_ns, end_ns, stride, &metric_name),
+            "histogram_sum" => stream.sum(group, start_ns, end_ns, stride, &metric_name),
+            _ => stream.count(group, start_ns, end_ns, stride, &metric_name),
         };
         if result.is_empty() {
             return Ok(QueryResult::Matrix { result: vec![] });
@@ -1134,6 +1179,7 @@ impl QueryEngine {
             query_str,
             start,
             end,
+            opts,
             |r| crate::display::display_from_result(r, start, end, step, display),
             |expr| {
                 streaming::dispatch::try_streaming_display(
@@ -1161,6 +1207,7 @@ impl QueryEngine {
             query_str,
             start,
             end,
+            opts,
             |r| r,
             |expr| self.evaluate_expr(expr, start, end, step, opts),
         )
@@ -1173,6 +1220,7 @@ impl QueryEngine {
         query_str: &str,
         start: f64,
         end: f64,
+        opts: &QueryOptions,
         from_result: impl Fn(QueryResult) -> T,
         expr: impl FnOnce(&Expr) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
@@ -1181,13 +1229,13 @@ impl QueryEngine {
             && query_str.ends_with(")")
         {
             return self
-                .handle_histogram_quantiles(query_str, start, end)
+                .handle_histogram_quantiles(query_str, start, end, opts)
                 .map(from_result);
         }
 
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self
-                .handle_histogram_heatmap(query_str, start, end)
+                .handle_histogram_heatmap(query_str, start, end, opts)
                 .map(from_result);
         }
 
@@ -1197,7 +1245,7 @@ impl QueryEngine {
         for func in ["histogram_mean", "histogram_count", "histogram_sum"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
                 return self
-                    .handle_histogram_scalar(func, inner, group_by, start, end)
+                    .handle_histogram_scalar(func, inner, group_by, start, end, opts)
                     .map(from_result);
             }
         }

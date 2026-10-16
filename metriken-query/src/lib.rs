@@ -148,6 +148,10 @@ pub struct QueryOptions {
     /// aggregate's values and bands can differ in the last bits, from
     /// summation order. For comparing the two and for diagnosis.
     pub per_series_rates: bool,
+    /// Set by an instant query: a strided histogram call's one window is the
+    /// stride ending at the range's end, not one of the windows a range query
+    /// lays at multiples of the stride.
+    pub(crate) instant: bool,
 }
 
 impl QueryOptions {
@@ -157,6 +161,7 @@ impl QueryOptions {
             rate_mode,
             eval_timestamps: None,
             per_series_rates: false,
+            instant: false,
         }
     }
 
