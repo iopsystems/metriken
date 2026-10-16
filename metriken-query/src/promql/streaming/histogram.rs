@@ -19,7 +19,7 @@
 //! between ticks — the classic lending-iterator problem), so the
 //! function is a straight loop rather than a generic chain.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use ::histogram::{Config, CumulativeROHistogramRef, Quantile, QuantilesResult};
 
@@ -45,9 +45,10 @@ type GroupBands = Vec<Vec<Option<Band>>>;
 pub(crate) struct Stride {
     pub(crate) ns: u64,
     pub(crate) anchor_ns: u64,
-    /// A window is emitted only when one of its rows is at or after this:
-    /// a range's start, so no point falls before the range; 0 for an
-    /// instant, whose one window always is.
+    /// A window is emitted only when its stamp (its close, or its last row
+    /// for the last window) is at or after this: a range's start, so no
+    /// point falls before the range; 0 for an instant, whose one window
+    /// always is.
     pub(crate) emit_from_ns: u64,
 }
 
@@ -64,59 +65,245 @@ impl Stride {
         let at = i128::from(self.anchor_ns) + (i128::from(k) - 1) * i128::from(self.ns);
         at.clamp(0, i128::from(u64::MAX)) as u64
     }
+
+    /// Where window `k` closes: its last instant.
+    fn closes_ns(&self, k: i64) -> u64 {
+        self.opens_ns(k.saturating_add(1))
+    }
 }
 
-/// Assigns a strided call's rows to windows, in timestamp order. The window
-/// holding `start_ns` is the first that can be emitted; rows before it supply only the
-/// snapshot a delta is taken from. A window closes when a row's timestamp
-/// falls in a later one, so rows of several series at one timestamp stay in
-/// one window.
-struct Windows {
+/// The fixed-point scale of a strided window's counts: a window's share of
+/// a row's delta is in units of `1 / SHARE_SCALE` observations, so a window
+/// can hold part of one. Quantiles and means do not depend on the scale;
+/// counts, sums and heatmap cells are divided by it. A window's cumulative
+/// count saturates at 2^48 observations.
+const SHARE_SCALE: u64 = 1 << 16;
+
+/// The most windows a strided call holds open. Past it the oldest is
+/// emitted, and a later share for it counts in the oldest still open.
+const MAX_OPEN_WINDOWS: usize = 256;
+
+/// `floor(a · b / c)` for `b <= c`, without overflow while `a < 2^80`.
+fn mul_div_floor(a: u128, b: u128, c: u128) -> u128 {
+    (a / c) * b + (a % c) * b / c
+}
+
+/// A strided call's open windows, and each row's delta shared among the
+/// windows its interval overlaps, in proportion to the overlap. A row at `t`
+/// whose series' previous row is at `p` adds `d` observations to a bucket
+/// over `(p, t]`; a window overlapping `(p, t]` by `o` gets `d · o / (t − p)`
+/// of them, to `1 / SHARE_SCALE` of an observation. The shares sum to the
+/// delta. Windows before the one holding the range's start get nothing.
+///
+/// A window closes once every series still reporting has a row after its
+/// close, so a series read at another phase or cadence adds its share
+/// before the window is emitted. A series is still reporting while it has
+/// two rows and its latest is less than two of its own row intervals old.
+/// A share for a window already closed, from a series that missed rows,
+/// counts in the oldest window still open. A closed window is stamped at
+/// its close, the last window at its last row; it is emitted when that
+/// stamp is at or after the stride's `emit_from_ns`. At most
+/// [`MAX_OPEN_WINDOWS`] are open at once.
+struct Splitter {
     stride: Stride,
+    /// The window holding the range's start: the first that can be emitted.
     first: i64,
-    current: Option<i64>,
+    /// Windows up to this one are closed.
+    closed_to: i64,
+    /// The latest window a row has fallen in.
+    newest: i64,
+    /// Open windows in order, each with one accumulator per group.
+    open: VecDeque<(i64, Vec<Accum>)>,
+    spare: Vec<Vec<Accum>>,
+    groups: usize,
+    config: Config,
+    /// Per series: its latest row's time and the interval before it (0
+    /// until it has two rows).
+    latest: Vec<Option<(u64, u64)>>,
     last_t: u64,
-    /// The open window has a row at or after `stride.emit_from_ns`.
-    emits: bool,
+    deltas: Vec<(u32, u64)>,
+    /// `settled` at the latest `t` it was taken for. Rows at one `t` only
+    /// raise it, so within a `t` the first value holds as a lower bound.
+    settled_at: Option<(u64, u64)>,
+    /// The most windows open at once.
+    #[cfg(test)]
+    most_open: usize,
 }
 
-impl Windows {
-    fn new(stride: Stride, start_ns: u64) -> Self {
+impl Splitter {
+    fn new(stride: Stride, start_ns: u64, series: usize, groups: usize, config: Config) -> Self {
+        let first = stride.window(start_ns);
         Self {
             stride,
-            first: stride.window(start_ns),
-            current: None,
+            first,
+            closed_to: first - 1,
+            newest: first - 1,
+            open: VecDeque::new(),
+            spare: Vec::new(),
+            groups,
+            config,
+            latest: vec![None; series],
             last_t: 0,
-            emits: false,
+            deltas: Vec::new(),
+            settled_at: None,
+            #[cfg(test)]
+            most_open: 0,
         }
     }
 
-    /// For a row at `t`: whether it belongs to a window from the first on,
-    /// and, when it opens a new one, whether the window it closes is emitted
-    /// and if so the time of its last row. A closed window that is not
-    /// emitted still has its rows' deltas, which the caller discards.
-    fn row(&mut self, t: u64) -> (bool, Option<Option<u64>>) {
-        let k = self.stride.window(t);
-        if k < self.first {
-            return (false, None);
-        }
-        let closed = match self.current {
-            Some(c) if c != k => {
-                let at = self.emits.then_some(self.last_t);
-                self.emits = false;
-                Some(at)
+    /// The accumulators of window `k`, opened if need be; a closed window's
+    /// are the oldest open window's.
+    fn accums(&mut self, k: i64) -> &mut [Accum] {
+        let k = k.max(self.closed_to + 1);
+        let pos = self.open.partition_point(|(j, _)| *j < k);
+        if self.open.get(pos).map(|(j, _)| *j) != Some(k) {
+            let (groups, config) = (self.groups, self.config);
+            let accums = self
+                .spare
+                .pop()
+                .unwrap_or_else(|| (0..groups).map(|_| Accum::new(config)).collect());
+            self.open.insert(pos, (k, accums));
+            #[cfg(test)]
+            {
+                self.most_open = self.most_open.max(self.open.len());
             }
-            _ => None,
-        };
-        self.current = Some(k);
-        self.last_t = t;
-        self.emits |= t >= self.stride.emit_from_ns;
-        (true, closed)
+        }
+        &mut self.open[pos].1
     }
 
-    /// The time of the last row of the open window, if it is emitted.
-    fn finish(&self) -> Option<u64> {
-        self.current.filter(|_| self.emits).map(|_| self.last_t)
+    /// The time up to which no series still reporting at `t` can add: the
+    /// oldest latest row among them.
+    fn settled(&mut self, t: u64) -> u64 {
+        if let Some((at, settled)) = self.settled_at {
+            if at == t {
+                return settled;
+            }
+        }
+        let settled = self
+            .latest
+            .iter()
+            .flatten()
+            .filter(|(at, dt)| *dt > 0 && t.saturating_sub(*at) < dt.saturating_mul(2))
+            .map(|(at, _)| *at)
+            .fold(t, u64::min);
+        self.settled_at = Some((t, settled));
+        settled
+    }
+
+    /// Closes the open windows whose close is at or before `to`, oldest
+    /// first. `emit` gets each one's stamp, its close or `cap` if that is
+    /// earlier, when the window is emitted, and its accumulators, which it
+    /// must drain.
+    fn close_through(
+        &mut self,
+        to: u64,
+        cap: u64,
+        emit: &mut impl FnMut(Option<u64>, &mut [Accum]),
+    ) {
+        while self
+            .open
+            .front()
+            .is_some_and(|(j, _)| self.stride.closes_ns(*j) <= to)
+        {
+            let (j, mut accums) = self.open.pop_front().unwrap();
+            let at = self.stride.closes_ns(j).min(cap);
+            emit((at >= self.stride.emit_from_ns).then_some(at), &mut accums);
+            self.closed_to = j;
+            self.spare.push(accums);
+        }
+    }
+
+    /// Emits the oldest open windows while more than [`MAX_OPEN_WINDOWS`]
+    /// are open.
+    fn close_excess(&mut self, cap: u64, emit: &mut impl FnMut(Option<u64>, &mut [Accum])) {
+        while self.open.len() > MAX_OPEN_WINDOWS {
+            let oldest = self.stride.closes_ns(self.open[0].0);
+            self.close_through(oldest, cap, emit);
+        }
+    }
+
+    /// A row of series `series`, in `group`, at `t`, with the series'
+    /// previous snapshot, if any.
+    fn row(
+        &mut self,
+        series: usize,
+        group: usize,
+        prev: Option<&HistogramSnapshot>,
+        t: u64,
+        curr: &HistogramSnapshot,
+        emit: &mut impl FnMut(Option<u64>, &mut [Accum]),
+    ) {
+        let before = self.latest[series].map(|(at, _)| at);
+        self.latest[series] = Some((t, before.map_or(0, |at| t.saturating_sub(at))));
+        let kt = self.stride.window(t);
+        if kt < self.first {
+            return;
+        }
+        self.last_t = t;
+        if let (Some(p), Some(prev)) = (before, prev) {
+            self.share(group, p, prev, t, curr, emit);
+        }
+        if kt > self.newest {
+            self.newest = kt;
+            // A window closing at `t` waits for a row after `t`: other
+            // series may still have rows at `t`.
+            let to = self.settled(t).min(t.saturating_sub(1));
+            self.close_through(to, t, emit);
+        }
+    }
+
+    /// Adds the delta from `prev` at `p` to `curr` at `t` to the windows
+    /// `(p, t]` overlaps. Windows it fills before the last close as they are
+    /// filled when no series still reporting can add to them, so a long
+    /// interval holds one window open rather than every one it spans.
+    fn share(
+        &mut self,
+        group: usize,
+        p: u64,
+        prev: &HistogramSnapshot,
+        t: u64,
+        curr: &HistogramSnapshot,
+        emit: &mut impl FnMut(Option<u64>, &mut [Accum]),
+    ) {
+        let kt = self.stride.window(t);
+        let kp = self.stride.window(p);
+        if kp >= kt || p >= t {
+            let accum = &mut self.accums(kt)[group];
+            delta_walk(prev, curr, |idx, d| {
+                accum.add(idx, d.saturating_mul(SHARE_SCALE))
+            });
+            self.close_excess(t, emit);
+            return;
+        }
+        let mut deltas = std::mem::take(&mut self.deltas);
+        deltas.clear();
+        delta_walk(prev, curr, |idx, d| deltas.push((idx, d)));
+        let dt = u128::from(t - p);
+        let from = kp.max(self.first);
+        let settled = if kt - from > 1 { self.settled(t) } else { 0 };
+        for k in from..=kt {
+            let upto = u128::from(self.stride.closes_ns(k).min(t) - p);
+            let before = u128::from(self.stride.opens_ns(k).max(p) - p);
+            let accum = &mut self.accums(k)[group];
+            for &(idx, d) in &deltas {
+                let d = u128::from(d) * u128::from(SHARE_SCALE);
+                let share = mul_div_floor(d, upto, dt) - mul_div_floor(d, before, dt);
+                if share > 0 {
+                    accum.add(idx, u64::try_from(share).unwrap_or(u64::MAX));
+                }
+            }
+            if k < kt {
+                self.close_through(settled.min(self.stride.closes_ns(k)), t, emit);
+            }
+            self.close_excess(t, emit);
+        }
+        self.deltas = deltas;
+    }
+
+    /// Closes every window.
+    fn finish(&mut self, emit: &mut impl FnMut(Option<u64>, &mut [Accum])) {
+        let last_t = self.last_t;
+        self.close_through(u64::MAX, last_t, emit);
     }
 }
 
@@ -198,19 +385,27 @@ impl HistogramOps for HistogramStream {
         stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(self, group_by, start_ns, end_ns, stride, metric_name, |r| {
-            let c = r.total_count();
-            r.mean().map(|m| {
-                // mean = sum / N; propagate the sum band divided by N.
-                let band = if c > 0 {
-                    let (lo, hi) = bucket_weighted_sum(r);
-                    Some((lo / c as f64, hi / c as f64))
-                } else {
-                    None
-                };
-                (m, band)
-            })
-        })
+        reduce(
+            self,
+            group_by,
+            start_ns,
+            end_ns,
+            stride,
+            metric_name,
+            |r, _| {
+                let c = r.total_count();
+                r.mean().map(|m| {
+                    // mean = sum / N; propagate the sum band divided by N.
+                    let band = if c > 0 {
+                        let (lo, hi) = bucket_weighted_sum(r);
+                        Some((lo / c as f64, hi / c as f64))
+                    } else {
+                        None
+                    };
+                    (m, band)
+                })
+            },
+        )
     }
 
     fn count(
@@ -221,12 +416,19 @@ impl HistogramOps for HistogramStream {
         stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(self, group_by, start_ns, end_ns, stride, metric_name, |r| {
-            // count is exact — an integer tally, no bucket-resolution
-            // uncertainty. No band.
-            let c = r.total_count();
-            (c > 0).then_some((c as f64, None))
-        })
+        reduce(
+            self,
+            group_by,
+            start_ns,
+            end_ns,
+            stride,
+            metric_name,
+            |r, scale| {
+                // count has no bucket-resolution uncertainty, so no band.
+                let c = r.total_count();
+                (c > 0).then_some((c as f64 / scale, None))
+            },
+        )
     }
 
     fn sum(
@@ -237,16 +439,25 @@ impl HistogramOps for HistogramStream {
         stride: Option<Stride>,
         metric_name: &str,
     ) -> Vec<MatrixSample> {
-        reduce(self, group_by, start_ns, end_ns, stride, metric_name, |r| {
-            let c = r.total_count();
-            if c == 0 {
-                return None;
-            }
-            // Nominal sum = total_count · mean (midpoints); the band is the
-            // bucket-resolution range [Σ count·start, Σ count·end].
-            r.mean()
-                .map(|m| (c as f64 * m, Some(bucket_weighted_sum(r))))
-        })
+        reduce(
+            self,
+            group_by,
+            start_ns,
+            end_ns,
+            stride,
+            metric_name,
+            |r, scale| {
+                let c = r.total_count();
+                if c == 0 {
+                    return None;
+                }
+                // Nominal sum = total_count · mean (midpoints); the band is the
+                // bucket-resolution range [Σ count·start, Σ count·end].
+                let (lo, hi) = bucket_weighted_sum(r);
+                r.mean()
+                    .map(|m| (c as f64 * m / scale, Some((lo / scale, hi / scale))))
+            },
+        )
     }
 
     fn irate(
@@ -331,6 +542,12 @@ impl Accum {
 /// Both snapshots are sparse cumulative with ascending, unique indices,
 /// walked together.
 fn accumulate_delta_into(prev: &HistogramSnapshot, curr: &HistogramSnapshot, accum: &mut Accum) {
+    delta_walk(prev, curr, |idx, d| accum.add(idx, d));
+}
+
+/// Calls `f` with each bucket's `(curr - prev)` individual count, where it
+/// is positive, in ascending bucket order (see [`accumulate_delta_into`]).
+fn delta_walk(prev: &HistogramSnapshot, curr: &HistogramSnapshot, mut f: impl FnMut(u32, u64)) {
     debug_assert!(prev.index.windows(2).all(|w| w[0] < w[1]));
     debug_assert!(curr.index.windows(2).all(|w| w[0] < w[1]));
     let mut i = 0;
@@ -353,7 +570,7 @@ fn accumulate_delta_into(prev: &HistogramSnapshot, curr: &HistogramSnapshot, acc
         };
         let delta = individual.saturating_sub(before);
         if delta > 0 {
-            accum.add(idx, delta);
+            f(idx, delta);
         }
     }
 }
@@ -390,10 +607,26 @@ fn quantiles_impl(
     let mut outputs: Vec<Vec<QuantileRow>> = vec![Vec::new(); quantiles_in.len()];
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut tick_accum = Accum::new(config);
-    let mut stride_accum = Accum::new(config);
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
-    let mut windows = stride.map(|s| Windows::new(s, start_ns));
+    let mut splitter = stride.map(|s| Splitter::new(s, start_ns, n, 1, config));
+    let (mut window_idx, mut window_cnt) = (Vec::new(), Vec::new());
+    let mut emit_window =
+        |at: Option<u64>, accums: &mut [Accum], outputs: &mut Vec<Vec<QuantileRow>>| {
+            if flush_accum(&mut accums[0], &mut window_idx, &mut window_cnt) {
+                if let Some(at) = at {
+                    apply_quantiles(
+                        config,
+                        &window_idx,
+                        &window_cnt,
+                        &quantile_floats,
+                        &quantile_keys,
+                        at,
+                        outputs,
+                    );
+                }
+            }
+        };
     let mut current_t: Option<u64> = None;
 
     for HistogramRow {
@@ -406,27 +639,11 @@ fn quantiles_impl(
             continue;
         }
 
-        if let Some(w) = windows.as_mut() {
-            let (inside, closed) = w.row(t);
-            if let Some(emit) = closed {
-                let any = flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt);
-                if let (true, Some(at)) = (any, emit) {
-                    apply_quantiles(
-                        config,
-                        &scratch_idx,
-                        &scratch_cnt,
-                        &quantile_floats,
-                        &quantile_keys,
-                        at,
-                        &mut outputs,
-                    );
-                }
-            }
-            if inside {
-                if let Some(prev) = &prev_per_series[series_idx] {
-                    accumulate_delta_into(prev, &snapshot, &mut stride_accum);
-                }
-            }
+        if let Some(sp) = splitter.as_mut() {
+            let prev = prev_per_series[series_idx].as_ref();
+            sp.row(series_idx, 0, prev, t, &snapshot, &mut |at, accums| {
+                emit_window(at, accums, &mut outputs)
+            });
             prev_per_series[series_idx] = Some(snapshot);
             continue;
         }
@@ -461,20 +678,8 @@ fn quantiles_impl(
     }
 
     // Final emit.
-    if let Some(w) = &windows {
-        if let Some(at) = w.finish() {
-            if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
-                apply_quantiles(
-                    config,
-                    &scratch_idx,
-                    &scratch_cnt,
-                    &quantile_floats,
-                    &quantile_keys,
-                    at,
-                    &mut outputs,
-                );
-            }
-        }
+    if let Some(sp) = splitter.as_mut() {
+        sp.finish(&mut |at, accums| emit_window(at, accums, &mut outputs));
     } else if let Some(t) = current_t.filter(|&t| t >= start_ns) {
         if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
             apply_quantiles(
@@ -530,7 +735,9 @@ fn reduce(
     metric_name: &str,
     // Returns (nominal value, optional value-uncertainty band from bucket
     // resolution). sum/mean carry a band; count is exact (None).
-    reducer: impl Fn(&CumulativeROHistogramRef<'_>) -> Option<(f64, Option<(f64, f64)>)>,
+    // The counts are in units of `1 / scale` observations (the second
+    // argument): `SHARE_SCALE` in a strided window, 1 in a tick.
+    reducer: impl Fn(&CumulativeROHistogramRef<'_>, f64) -> Option<(f64, Option<(f64, f64)>)>,
 ) -> Vec<MatrixSample> {
     let HistogramStream { meta, rows } = stream;
     let config = meta.config;
@@ -557,7 +764,29 @@ fn reduce(
     let mut accum_per_group: Vec<Accum> = (0..g_count).map(|_| Accum::new(config)).collect();
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
-    let mut windows = stride.map(|s| Windows::new(s, start_ns));
+    let mut splitter = stride.map(|s| Splitter::new(s, start_ns, n, g_count, config));
+    let (mut window_idx, mut window_cnt) = (Vec::new(), Vec::new());
+    let mut emit_window =
+        |at: Option<u64>,
+         accums: &mut [Accum],
+         values_per_group: &mut Vec<Vec<(f64, f64)>>,
+         bands_per_group: &mut Vec<Vec<Option<(f64, f64)>>>| {
+            for (g, accum) in accums.iter_mut().enumerate() {
+                if !flush_accum(accum, &mut window_idx, &mut window_cnt) {
+                    continue;
+                }
+                let Some(at) = at else { continue };
+                let r = CumulativeROHistogramRef::from_parts_unchecked(
+                    config,
+                    &window_idx,
+                    &window_cnt,
+                );
+                if let Some((v, band)) = reducer(&r, SHARE_SCALE as f64) {
+                    values_per_group[g].push((at as f64 / 1e9, v));
+                    bands_per_group[g].push(band);
+                }
+            }
+        };
     let mut current_t: Option<u64> = None;
 
     for HistogramRow {
@@ -570,31 +799,18 @@ fn reduce(
             continue;
         }
 
-        if let Some(w) = windows.as_mut() {
-            let (inside, closed) = w.row(t);
-            if let Some(emit) = closed {
-                for g in 0..g_count {
-                    let any =
-                        flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt);
-                    if let (true, Some(at)) = (any, emit) {
-                        let r = CumulativeROHistogramRef::from_parts_unchecked(
-                            config,
-                            &scratch_idx,
-                            &scratch_cnt,
-                        );
-                        if let Some((v, band)) = reducer(&r) {
-                            values_per_group[g].push((at as f64 / 1e9, v));
-                            bands_per_group[g].push(band);
-                        }
-                    }
-                }
-            }
-            if inside {
-                if let Some(prev) = &prev_per_series[series_idx] {
-                    let g = series_group[series_idx];
-                    accumulate_delta_into(prev, &snapshot, &mut accum_per_group[g]);
-                }
-            }
+        if let Some(sp) = splitter.as_mut() {
+            let prev = prev_per_series[series_idx].as_ref();
+            sp.row(
+                series_idx,
+                series_group[series_idx],
+                prev,
+                t,
+                &snapshot,
+                &mut |at, accums| {
+                    emit_window(at, accums, &mut values_per_group, &mut bands_per_group)
+                },
+            );
             prev_per_series[series_idx] = Some(snapshot);
             continue;
         }
@@ -611,7 +827,7 @@ fn reduce(
                                 &scratch_idx,
                                 &scratch_cnt,
                             );
-                            if let Some((v, band)) = reducer(&r) {
+                            if let Some((v, band)) = reducer(&r, 1.0) {
                                 values_per_group[g].push((prev_t as f64 / 1e9, v));
                                 bands_per_group[g].push(band);
                             }
@@ -633,11 +849,11 @@ fn reduce(
     }
 
     // Final emit for the last window or tick.
-    let last = match &windows {
-        Some(w) => w.finish(),
-        None => current_t.filter(|&t| t >= start_ns),
-    };
-    if let Some(t) = last {
+    if let Some(sp) = splitter.as_mut() {
+        sp.finish(&mut |at, accums| {
+            emit_window(at, accums, &mut values_per_group, &mut bands_per_group)
+        });
+    } else if let Some(t) = current_t.filter(|&t| t >= start_ns) {
         {
             for g in 0..g_count {
                 if flush_accum(&mut accum_per_group[g], &mut scratch_idx, &mut scratch_cnt) {
@@ -646,7 +862,7 @@ fn reduce(
                         &scratch_idx,
                         &scratch_cnt,
                     );
-                    if let Some((v, band)) = reducer(&r) {
+                    if let Some((v, band)) = reducer(&r, 1.0) {
                         values_per_group[g].push((t as f64 / 1e9, v));
                         bands_per_group[g].push(band);
                     }
@@ -777,8 +993,7 @@ fn heatmap_impl(
 
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
     let mut tick_accum = Accum::new(config);
-    let mut stride_accum = Accum::new(config);
-    let mut windows = stride.map(|s| Windows::new(s, start_ns));
+    let mut splitter = stride.map(|s| Splitter::new(s, start_ns, n, 1, config));
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
 
@@ -790,6 +1005,7 @@ fn heatmap_impl(
     let mut max_bucket_idx = 0usize;
 
     let emit_tick = |t_ns: u64,
+                     scale: f64,
                      idx: &[u32],
                      cnt: &[u64],
                      timestamps: &mut Vec<f64>,
@@ -809,7 +1025,7 @@ fn heatmap_impl(
                 continue;
             }
             let bucket_idx = idx[k] as usize;
-            let count_f64 = individual as f64;
+            let count_f64 = individual as f64 / scale;
             data.push((time_idx, bucket_idx, count_f64));
             *min_value = min_value.min(count_f64);
             *max_value = max_value.max(count_f64);
@@ -830,29 +1046,26 @@ fn heatmap_impl(
             continue;
         }
 
-        if let Some(w) = windows.as_mut() {
-            let (inside, closed) = w.row(t);
-            if let Some(emit) = closed {
-                let any = flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt);
-                if let (true, Some(at)) = (any, emit) {
-                    emit_tick(
-                        at,
-                        &scratch_idx,
-                        &scratch_cnt,
-                        &mut timestamps,
-                        &mut data,
-                        &mut min_value,
-                        &mut max_value,
-                        &mut min_bucket_idx,
-                        &mut max_bucket_idx,
-                    );
+        if let Some(sp) = splitter.as_mut() {
+            let prev = prev_per_series[series_idx].as_ref();
+            sp.row(series_idx, 0, prev, t, &snapshot, &mut |at, accums| {
+                if flush_accum(&mut accums[0], &mut scratch_idx, &mut scratch_cnt) {
+                    if let Some(at) = at {
+                        emit_tick(
+                            at,
+                            SHARE_SCALE as f64,
+                            &scratch_idx,
+                            &scratch_cnt,
+                            &mut timestamps,
+                            &mut data,
+                            &mut min_value,
+                            &mut max_value,
+                            &mut min_bucket_idx,
+                            &mut max_bucket_idx,
+                        );
+                    }
                 }
-            }
-            if inside {
-                if let Some(prev) = &prev_per_series[series_idx] {
-                    accumulate_delta_into(prev, &snapshot, &mut stride_accum);
-                }
-            }
+            });
             prev_per_series[series_idx] = Some(snapshot);
             continue;
         }
@@ -866,6 +1079,7 @@ fn heatmap_impl(
                 {
                     emit_tick(
                         prev_t,
+                        1.0,
                         &scratch_idx,
                         &scratch_cnt,
                         &mut timestamps,
@@ -889,26 +1103,30 @@ fn heatmap_impl(
     }
 
     // Final emit.
-    if let Some(w) = &windows {
-        if let Some(at) = w.finish() {
-            if flush_accum(&mut stride_accum, &mut scratch_idx, &mut scratch_cnt) {
-                emit_tick(
-                    at,
-                    &scratch_idx,
-                    &scratch_cnt,
-                    &mut timestamps,
-                    &mut data,
-                    &mut min_value,
-                    &mut max_value,
-                    &mut min_bucket_idx,
-                    &mut max_bucket_idx,
-                );
+    if let Some(sp) = splitter.as_mut() {
+        sp.finish(&mut |at, accums| {
+            if flush_accum(&mut accums[0], &mut scratch_idx, &mut scratch_cnt) {
+                if let Some(at) = at {
+                    emit_tick(
+                        at,
+                        SHARE_SCALE as f64,
+                        &scratch_idx,
+                        &scratch_cnt,
+                        &mut timestamps,
+                        &mut data,
+                        &mut min_value,
+                        &mut max_value,
+                        &mut min_bucket_idx,
+                        &mut max_bucket_idx,
+                    );
+                }
             }
-        }
+        });
     } else if let Some(t) = current_t.filter(|&t| t >= start_ns) {
         if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
             emit_tick(
                 t,
+                1.0,
                 &scratch_idx,
                 &scratch_cnt,
                 &mut timestamps,
@@ -1124,6 +1342,84 @@ mod accum_tests {
             assert_eq!((idx, cnt), (want_idx, want_cnt));
             assert!(accum.touched.is_empty() && accum.counts.iter().all(|c| *c == 0));
         }
+    }
+
+    /// A row after a long gap fills the windows across it one at a time:
+    /// a day's gap at a 1 s stride keeps at most two windows open, and the
+    /// shares still sum to the delta.
+    #[test]
+    fn a_long_gap_holds_few_windows_open() {
+        let config = histogram::Config::new(4, 10).unwrap();
+        let stride = Stride {
+            ns: 1_000_000_000,
+            anchor_ns: 0,
+            emit_from_ns: 0,
+        };
+        let mut sp = Splitter::new(stride, 1_000_000_000_000, 1, 1, config);
+        let (mut idx, mut cnt) = (Vec::new(), Vec::new());
+        let mut total = 0u64;
+        let mut emit = |_: Option<u64>, accums: &mut [Accum]| {
+            if flush_accum(&mut accums[0], &mut idx, &mut cnt) {
+                total += cnt.last().copied().unwrap_or(0);
+            }
+        };
+        let s = 1_000_000_000u64;
+        let snaps = [
+            snapshot(&BTreeMap::from([(3, 1)])),
+            snapshot(&BTreeMap::from([(3, 2)])),
+            snapshot(&BTreeMap::from([(3, 86_402)])),
+        ];
+        let times = [1000 * s, 1001 * s, (1001 + 86_400) * s];
+        for i in 0..3usize {
+            let prev = i.checked_sub(1).map(|p| &snaps[p]);
+            sp.row(0, 0, prev, times[i], &snaps[i], &mut emit);
+        }
+        sp.finish(&mut emit);
+        assert!(sp.most_open <= 2, "{} windows open", sp.most_open);
+        assert_eq!(total, 86_401 * SHARE_SCALE);
+    }
+
+    /// A slow series holding windows open behind a fast one keeps at most
+    /// `MAX_OPEN_WINDOWS` open, and the shares still sum to the deltas.
+    #[test]
+    fn open_windows_are_capped() {
+        let config = histogram::Config::new(4, 10).unwrap();
+        let s = 1_000_000_000u64;
+        let stride = Stride {
+            ns: s,
+            anchor_ns: 0,
+            emit_from_ns: 0,
+        };
+        let mut sp = Splitter::new(stride, 1000 * s, 2, 1, config);
+        let (mut idx, mut cnt) = (Vec::new(), Vec::new());
+        let mut total = 0u64;
+        let mut emit = |_: Option<u64>, accums: &mut [Accum]| {
+            if flush_accum(&mut accums[0], &mut idx, &mut cnt) {
+                total += cnt.last().copied().unwrap_or(0);
+            }
+        };
+        let snap = |n: u64| snapshot(&BTreeMap::from([(3, n)]));
+        // The slow series reads at 0 s and 1000 s: an interval of 1000 s,
+        // so it still reports for 2000 s and holds windows from 1000 s.
+        sp.row(1, 0, None, 0, &snap(1), &mut emit);
+        sp.row(1, 0, Some(&snap(1)), 1000 * s, &snap(2), &mut emit);
+        let mut prev = snap(0);
+        sp.row(0, 0, None, 1000 * s, &prev, &mut emit);
+        for i in 1..=1000u64 {
+            let curr = snap(i);
+            sp.row(0, 0, Some(&prev), (1000 + i) * s, &curr, &mut emit);
+            prev = curr;
+        }
+        sp.finish(&mut emit);
+        assert!(
+            sp.most_open <= MAX_OPEN_WINDOWS + 1,
+            "{} open",
+            sp.most_open
+        );
+        // The slow series' delta at 1000 s opens window 1000 only partly in
+        // range: (999, 1000] is its last second, 1/1000 of one observation.
+        let slow = SHARE_SCALE - SHARE_SCALE * 999 / 1000;
+        assert_eq!(total, 1000 * SHARE_SCALE + slow);
     }
 
     /// An index past the histogram's buckets is ignored, not allocated for.
