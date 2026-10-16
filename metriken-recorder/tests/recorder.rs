@@ -892,6 +892,24 @@ impl LocalSource for Counting {
     }
 }
 
+/// Reads `rx` until a `Committed` event reports at least `passes` passes.
+/// A runner
+/// slow enough to take fewer passes than a fixed sleep allows still gets
+/// there; 30 s bounds a recorder that stops committing, and a writer
+/// failure or a refused source panics with its reason.
+async fn committed_passes(rx: &mut tokio::sync::mpsc::Receiver<Event>, passes: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Event::Committed { passes_total, .. })) if passes_total >= passes => return,
+            Ok(Some(Event::Failed { error })) => panic!("{error}"),
+            Ok(Some(Event::Refused { reason, .. })) => panic!("refused: {reason}"),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!("no {passes} passes within 30 s"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_source_is_recorded_with_its_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -900,15 +918,15 @@ async fn a_local_source_is_recorded_with_its_identity() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
-    let (recorder, ids, rx) = Recorder::start_local(
+    let (recorder, ids, mut rx) = Recorder::start_local(
         RecorderConfig::new(&path, INTERVAL),
         vec![Box::new(Counting { anchor, n: 0 })],
     )
     .await
     .unwrap();
     assert_eq!(ids, vec![SourceId(0)]);
+    committed_passes(&mut rx, 5).await;
     drop(rx);
-    tokio::time::sleep(Duration::from_millis(600)).await;
     let summary = recorder
         .finish(Stop::Now, CancellationToken::new())
         .await
@@ -937,17 +955,31 @@ async fn retention_evicts_rows_older_than_the_window() {
         Recorder::start_local(cfg, vec![Box::new(Counting { anchor, n: 0 })])
             .await
             .unwrap();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    // Record until the passes span 1.4 s, more than three windows. A slow
+    // runner takes fewer passes in that time (7 in 2 s on one Windows CI
+    // run), so the wait is on the span and the pass count, not on a fixed
+    // sleep; 30 s bounds a recorder that stops committing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut last = None;
-    while let Ok(e) = rx.try_recv() {
-        if let Event::Committed {
-            passes_total,
-            first_ts,
-            ts,
-            ..
-        } = e
-        {
-            last = Some((passes_total, first_ts, ts));
+    while !matches!(last, Some((passes, first, ts)) if passes >= 10 && ts - first >= 1_400_000_000)
+    {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Event::Committed {
+                passes_total,
+                first_ts,
+                ts,
+                ..
+            })) => {
+                // `first_ts` is the first pass ever, not the oldest kept.
+                if let Some((_, first, _)) = last {
+                    assert_eq!(first_ts, first, "first_ts moved with eviction");
+                }
+                last = Some((passes_total, first_ts, ts));
+            }
+            Ok(Some(Event::Failed { error })) => panic!("{error}"),
+            Ok(Some(Event::Refused { reason, .. })) => panic!("refused: {reason}"),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!("no 10 passes over 1.4 s within 30 s: {last:?}"),
         }
     }
     drop(rx);
@@ -955,15 +987,7 @@ async fn retention_evicts_rows_older_than_the_window() {
         .finish(Stop::Grace(Duration::ZERO), CancellationToken::new())
         .await
         .unwrap();
-    let (passes, first_ts, newest) = last.expect("Committed events");
-    // About 20 passes at 100 ms. A slow runner takes fewer (13 on one
-    // Windows CI run); the eviction checks below are by time, so they
-    // need only enough passes that more were taken than are kept.
-    assert!(passes >= 10, "{passes}");
-    assert!(
-        newest - first_ts >= 1_400_000_000,
-        "first_ts is the first ever"
-    );
+    let (passes, _, _) = last.unwrap();
     let r = &recordings(&path, "self/latency")["self"];
     assert!(
         r.rows < passes,
@@ -1288,13 +1312,13 @@ async fn patch_metadata_on_a_refused_source_is_an_error() {
 async fn a_current_thread_runtime_records() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ct.dendro");
-    let (recorder, _ids, _events) = Recorder::start_local(
+    let (recorder, _ids, mut events) = Recorder::start_local(
         RecorderConfig::new(&path, INTERVAL),
         vec![Box::new(Tiny { name: "a" })],
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    committed_passes(&mut events, 4).await;
     let summary = recorder
         .finish(Stop::Now, CancellationToken::new())
         .await
