@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.40.0
+
+- A strided histogram call (`histogram_count(lat, 15)`,
+  `histogram_quantiles([..], lat, 15)`, `histogram_heatmap(lat, 15)`)
+  shares each row's delta among the windows its interval overlaps, in
+  proportion to the overlap, where it counted the whole delta in the window
+  holding the row. A window can hold part of an observation (to 1/65536),
+  so a strided count, sum or heatmap cell can be fractional; quantiles and
+  means are taken from the shares. The shares sum to the rows' deltas. A
+  stride that is not a multiple of the row interval gives windows of equal
+  count: 15 s windows over rows every 10 s hold one and a half rows each,
+  where they held one and two in turn. Across a gap in a series, the delta
+  of the row after it is shared over the gap's windows.
+- A strided window is emitted once every series still reporting has a row
+  after its close, so a series read at another phase or cadence adds
+  its share first. A series that misses rows stops holding windows open;
+  when it reports again, its share for windows already emitted counts in
+  the oldest window still open.
+- A closed strided window's point is stamped at the window's close, a
+  multiple of the stride for a range query, where it was stamped at the
+  window's last row; the last window, still open, is stamped at its last
+  row. Two strided calls over series read at different times therefore
+  share their timestamps, so a binary operation between them matches. A
+  window is emitted when that stamp is in the range, so a window closing in
+  the range whose rows all fall before its start now gives a point.
+- A strided instant query counts the share of the row that straddles the
+  window's opening: `histogram_count(lat, 60)` at 1399.5 over rows every
+  second counts 59.5 where it counted 60.
+- A strided call whose stride is shorter than its metric's row interval
+  and lays more than 100 000 windows over its range is refused
+  (`histogram_count(lat, 0.001)` over 300 s of 1 s rows): each row's delta
+  is shared over every window its interval overlaps, so with such a stride
+  the work grows with the windows. At most 256 windows are held open at
+  once.
+- An outlier observation in a row's delta is shared, in part, into each
+  window the row's interval overlaps, so a high quantile or a heatmap's
+  tail can show it in two adjacent windows where it showed in one.
+
 ### metriken-query 0.39.1
 
 - Histogram functions sum each row's delta into a dense per-bucket

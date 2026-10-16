@@ -244,15 +244,42 @@ pub(crate) fn histogram_read_start(
     start_ns.saturating_sub(2 * interval_ns)
 }
 
+/// The most windows a strided call shorter than its metric's row interval
+/// may lay over its range. A row's delta is shared over every window its
+/// interval overlaps, so with such a stride the work grows with the windows
+/// rather than the rows.
+const MAX_STRIDE_WINDOWS: u64 = 100_000;
+
 /// A strided call's windows: anchored at the range's end for an instant
 /// query, so its window is the stride ending there, and at multiples of the
-/// stride for a range query.
-fn stride_windows(ns: u64, start_ns: u64, end_ns: u64, opts: &QueryOptions) -> Stride {
-    Stride {
+/// stride for a range query. A stride shorter than the metric's row
+/// interval (`interval_s`), or with no interval known, laying more than
+/// [`MAX_STRIDE_WINDOWS`] windows is refused.
+fn stride_windows(
+    ns: u64,
+    interval_s: f64,
+    start_ns: u64,
+    end_ns: u64,
+    opts: &QueryOptions,
+) -> Result<Stride, QueryError> {
+    let stride = Stride {
         ns,
         anchor_ns: if opts.instant { end_ns } else { 0 },
         emit_from_ns: if opts.instant { 0 } else { start_ns },
+    };
+    let windows = end_ns.saturating_sub(window_read_start(Some(stride), start_ns)) / ns + 1;
+    // An interval that is not a positive number says nothing about the
+    // rows, so the stride is capped as if it were shorter.
+    let known = interval_s.is_finite() && interval_s > 0.0;
+    let shorter = !known || (ns as f64) < interval_s * 1e9;
+    if shorter && windows > MAX_STRIDE_WINDOWS {
+        return Err(QueryError::Unsupported(format!(
+            "a stride of {} s, shorter than the {interval_s} s row interval, lays {windows} \
+             windows over this range, more than {MAX_STRIDE_WINDOWS}; use a longer stride or none",
+            ns as f64 / 1e9
+        )));
     }
+    Ok(stride)
 }
 
 /// Where a call's rows are needed from: `start_ns`, or for a strided call the
@@ -1002,7 +1029,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stride = stride_ns.map(|ns| stride_windows(ns, start_ns, end_ns, opts));
+        let stride = stride_ns
+            .map(|ns| {
+                let interval = self.source.histogram_interval(&metric_name);
+                stride_windows(ns, interval, start_ns, end_ns, opts)
+            })
+            .transpose()?;
         let stream = self.source.histogram_stream(
             &metric_name,
             &labels,
@@ -1037,7 +1069,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stride = stride_ns.map(|ns| stride_windows(ns, start_ns, end_ns, opts));
+        let stride = stride_ns
+            .map(|ns| {
+                let interval = self.source.histogram_interval(&metric_name);
+                stride_windows(ns, interval, start_ns, end_ns, opts)
+            })
+            .transpose()?;
         let stream = self.source.histogram_stream(
             &metric_name,
             &labels,
@@ -1107,7 +1144,12 @@ impl QueryEngine {
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stride = stride_ns.map(|ns| stride_windows(ns, start_ns, end_ns, opts));
+        let stride = stride_ns
+            .map(|ns| {
+                let interval = self.source.histogram_interval(&metric_name);
+                stride_windows(ns, interval, start_ns, end_ns, opts)
+            })
+            .transpose()?;
         let stream = self.source.histogram_stream(
             &metric_name,
             &labels,

@@ -4251,7 +4251,8 @@ fn a_strided_instant_counts_the_stride_ending_at_the_instant() {
         result.first().map(|s| s.value.1)
     };
     assert_eq!(count("histogram_count(lat, 60)", 1400.0), Some(60.0));
-    assert_eq!(count("histogram_count(lat, 60)", 1399.5), Some(60.0));
+    // The window (1339.5, 1399.5] holds half of the row at 1340's interval.
+    assert_eq!(count("histogram_count(lat, 60)", 1399.5), Some(59.5));
     assert_eq!(count("histogram_count(lat, 10)", 1400.0), Some(10.0));
     // 7 s does not divide 300 s; the window is still the 7 s before.
     assert_eq!(count("histogram_count(lat, 7)", 1400.0), Some(7.0));
@@ -4432,29 +4433,287 @@ fn a_strided_window_with_no_row_in_the_range_gives_no_point() {
     assert!(result.is_empty(), "{result:?}");
 }
 
-/// A window that closes unemitted leaves nothing for the next: with rows
-/// every 50 s and a 30 s stride over [1155, 1230], the window (1140, 1170]
-/// holds only 1150 and is not emitted, and (1170, 1200] counts the one
-/// observation from 1150 to 1200.
+/// A closed strided window is stamped at its close, and emitted when that
+/// is in the range: with rows every 50 s of one observation and a 30 s
+/// stride over [1155, 1230], the window (1140, 1170] holds 10 s of the
+/// interval to 1150 and 20 s of the one to 1200, 0.6 of an observation, and
+/// is emitted at 1170; (1170, 1200] holds the other 30 s of the second.
 #[test]
-fn a_window_closed_unemitted_leaves_nothing_for_the_next() {
+fn a_closed_strided_window_is_stamped_at_its_close() {
     let engine = QueryEngine::new(Arc::new(hist_rows(50_000, 1000, 1400, 50)));
-    let QueryResult::Matrix { result } = engine
-        .query_range("histogram_count(lat, 30)", 1155.0, 1230.0, 1.0)
-        .unwrap()
-    else {
-        panic!("not a matrix");
-    };
-    assert_eq!(result[0].values, vec![(1200.0, 1.0)], "{result:?}");
+    let points = strided_counts(&engine, "histogram_count(lat, 30)", 1155.0, 1230.0);
+    assert_close(&points, &[(1170.0, 0.6), (1200.0, 0.6)]);
     let QueryResult::HistogramHeatmap { result } = engine
         .query_range("histogram_heatmap(lat, 30)", 1155.0, 1230.0, 1.0)
         .unwrap()
     else {
         panic!("not a heatmap");
     };
-    assert_eq!(result.timestamps, vec![1200.0]);
-    let counts: Vec<f64> = result.data.iter().map(|(_, _, c)| *c).collect();
-    assert_eq!(counts, vec![1.0], "{:?}", result.data);
+    assert_eq!(result.timestamps, vec![1170.0, 1200.0]);
+    let counts: Vec<(f64, f64)> = result
+        .data
+        .iter()
+        .map(|(t, _, c)| (*t as f64, *c))
+        .collect();
+    assert_close(&counts, &[(0.0, 0.6), (1.0, 0.6)]);
+}
+
+/// `have` matches `want` in its timestamps and, to the precision of a
+/// window's fixed-point counts, its values.
+fn assert_close(have: &[(f64, f64)], want: &[(f64, f64)]) {
+    assert_eq!(have.len(), want.len(), "{have:?} != {want:?}");
+    for ((ht, hv), (wt, wv)) in have.iter().zip(want) {
+        assert!(ht == wt && (hv - wv).abs() < 1e-3, "{have:?} != {want:?}");
+    }
+}
+
+/// One series per `(label, row times in ms)`, each row adding `per_row`
+/// observations to bucket 10.
+fn hist_series(interval_ms: u64, series: &[(&str, Vec<u64>)], per_row: u64) -> Memory {
+    let mut source = Memory::new(interval_ms);
+    for (x, times_ms) in series {
+        source.add_histogram(
+            "lat",
+            Histogram {
+                labels: make_labels(&[("x", x)]),
+                config: ::histogram::Config::new(4, 16).unwrap(),
+                timestamps: times_ms.iter().map(|t| t * 1_000_000).collect(),
+                snapshots: (0..times_ms.len() as u64)
+                    .map(|i| hist_snap_cumulative(i * per_row))
+                    .collect(),
+            },
+        );
+    }
+    source
+}
+
+fn strided_counts(engine: &QueryEngine, q: &str, start: f64, end: f64) -> Vec<(f64, f64)> {
+    let QueryResult::Matrix { result } = engine.query_range(q, start, end, 1.0).unwrap() else {
+        panic!("not a matrix");
+    };
+    result[0].values.clone()
+}
+
+/// A stride that is not a multiple of the row interval shares each row's
+/// delta among the windows its interval overlaps: 15 s windows over rows
+/// every 10 s of 100 observations each hold 150, where whole rows would
+/// give 100 and 200 in turn. Quantiles and heatmaps use the same windows.
+#[test]
+fn a_stride_off_the_row_interval_shares_each_rows_delta() {
+    let times: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000).collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", times)], 100)));
+    let points = strided_counts(&engine, "histogram_count(lat, 15)", 1100.0, 1380.0);
+    let expected: Vec<(f64, f64)> = (1110..=1380)
+        .step_by(15)
+        .map(|t| (t as f64, 150.0))
+        .collect();
+    assert_eq!(points, expected);
+    let QueryResult::HistogramHeatmap { result } = engine
+        .query_range("histogram_heatmap(lat, 15)", 1100.0, 1380.0, 1.0)
+        .unwrap()
+    else {
+        panic!("not a heatmap");
+    };
+    let times: Vec<f64> = expected.iter().map(|(t, _)| *t).collect();
+    assert_eq!(result.timestamps, times);
+    assert!(
+        result.data.iter().all(|(_, _, c)| *c == 150.0),
+        "{:?}",
+        result.data
+    );
+}
+
+/// Windows over series read at different phases each hold their share of
+/// both: rows every 10 s, one series on the 10 s and one 7 s after. The
+/// second series' row at 1127 opens (1125, 1140] before the first's at
+/// 1130, which still adds (1120, 1125] to the window before.
+#[test]
+fn strided_windows_share_series_read_at_different_phases() {
+    let on: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000).collect();
+    let off: Vec<u64> = on.iter().map(|t| t + 7000).collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", on), ("b", off)], 100)));
+    let points = strided_counts(&engine, "histogram_count(lat, 15)", 1100.0, 1380.0);
+    // The last window, (1365, 1380], lacks the second series' share from
+    // 1377 on: its row at 1387 is after the range.
+    let mut expected: Vec<(f64, f64)> = (1110..1380)
+        .step_by(15)
+        .map(|t| (t as f64, 300.0))
+        .collect();
+    expected.push((1380.0, 270.0));
+    assert_eq!(points, expected);
+}
+
+/// A strided window closes at a multiple of the stride whatever the rows'
+/// phase: rows 300 ms after each 10 s give points at multiples of 60 s,
+/// and the last window, still open, at its last row.
+#[test]
+fn strided_points_fall_at_window_closes() {
+    let times: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000 + 300).collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", times)], 100)));
+    let points = strided_counts(&engine, "histogram_count(lat, 60)", 1130.0, 1395.0);
+    let times: Vec<f64> = points.iter().map(|(t, _)| *t).collect();
+    assert_eq!(times, vec![1140.0, 1200.0, 1260.0, 1320.0, 1380.0, 1390.3]);
+    assert!(points[..5].iter().all(|(_, c)| *c == 600.0), "{points:?}");
+}
+
+/// Across a gap in a series the delta of the row after it is shared over
+/// the gap's windows, and the counts sum to every observation from the
+/// first window's opening: rows every 10 s of 100 observations, none from
+/// 1200 to 1250.
+#[test]
+fn a_gap_shares_its_delta_and_keeps_the_total() {
+    let times: Vec<u64> = (1000..=1400)
+        .step_by(10)
+        .filter(|s| !(1200..=1250).contains(s))
+        .map(|s| s * 1000)
+        .collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", times)], 100)));
+    let points = strided_counts(&engine, "histogram_count(lat, 15)", 1100.0, 1380.0);
+    // The row at 1260 adds 100 over (1190, 1260]: 10/70 of it to
+    // (1185, 1200], which also holds half of the row at 1190, and 15/70 to
+    // each of the windows to 1260.
+    let window = |t: f64| points.iter().find(|(at, _)| *at == t).map(|(_, c)| *c);
+    let gap = 100.0 / 70.0;
+    for (t, want) in [
+        (1200.0, 50.0 + 10.0 * gap),
+        (1215.0, 15.0 * gap),
+        (1230.0, 15.0 * gap),
+        (1245.0, 15.0 * gap),
+        (1260.0, 15.0 * gap),
+    ] {
+        let have = window(t).unwrap();
+        assert!((have - want).abs() < 1e-3, "{t}: {have} != {want}");
+    }
+    let total: f64 = points.iter().map(|(_, c)| c).sum();
+    // (1095, 1380]: half of the row at 1100, the 21 other rows after it
+    // with a row 10 s before, and the 100 across the gap.
+    assert_eq!(total, 50.0 + 21.0 * 100.0 + 100.0);
+}
+
+/// A bucket with one observation a row is shared too: 15 s windows over
+/// rows every 10 s hold one and a half observations each.
+#[test]
+fn a_sparse_bucket_is_shared_in_parts_of_an_observation() {
+    let times: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000).collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", times)], 1)));
+    let points = strided_counts(&engine, "histogram_count(lat, 15)", 1100.0, 1380.0);
+    let want: Vec<(f64, f64)> = (1110..=1380).step_by(15).map(|t| (t as f64, 1.5)).collect();
+    assert_close(&points, &want);
+}
+
+/// A window waits for every series still reporting: one series every 1 s
+/// and one every 10 s, at a 1 s stride, put 10 observations of the first
+/// and 10 of the second in each window.
+#[test]
+fn a_window_waits_for_a_slower_series() {
+    let fast: Vec<u64> = (1000..=1400).map(|s| s * 1000).collect();
+    let slow: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000).collect();
+    // The source's interval is the slower series', as a source holding
+    // both reports, so the read reaches each one's row before the range.
+    let mut source = Memory::new(10_000);
+    for (x, times, per_row) in [("fast", fast, 10), ("slow", slow, 100)] {
+        source.add_histogram(
+            "lat",
+            Histogram {
+                labels: make_labels(&[("x", x)]),
+                config: ::histogram::Config::new(4, 16).unwrap(),
+                timestamps: times.iter().map(|t| t * 1_000_000).collect(),
+                snapshots: (0..times.len() as u64)
+                    .map(|i| hist_snap_cumulative(i * per_row))
+                    .collect(),
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    let points = strided_counts(&engine, "histogram_count(lat, 1)", 1100.0, 1300.0);
+    let want: Vec<(f64, f64)> = (1100..=1300).map(|t| (t as f64, 20.0)).collect();
+    assert_close(&points, &want);
+}
+
+/// A series that misses rows stops holding windows open; when it reports
+/// again, its share for windows already emitted counts in the oldest open
+/// one, so points stay in order and the total is kept.
+#[test]
+fn a_series_that_misses_rows_adds_to_the_oldest_open_window() {
+    let steady: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000).collect();
+    let gappy: Vec<u64> = (1000..=1400)
+        .step_by(10)
+        .filter(|s| !(1200..=1300).contains(s))
+        .map(|s| s * 1000)
+        .collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(
+        10_000,
+        &[("steady", steady), ("gappy", gappy)],
+        100,
+    )));
+    let points = strided_counts(&engine, "histogram_count(lat, 15)", 1100.0, 1380.0);
+    assert!(points.windows(2).all(|w| w[0].0 < w[1].0), "{points:?}");
+    let total: f64 = points.iter().map(|(_, c)| c).sum();
+    // (1095, 1380] of each: half of its row at 1100, then 28 rows of 100 for
+    // the steady series and 17 for the other, whose row at 1310 holds the
+    // 100 across its gap.
+    assert!(
+        (total - (50.0 + 2800.0 + 50.0 + 1700.0)).abs() < 1e-3,
+        "{total}"
+    );
+}
+
+/// A window closing at a row's time waits for a later row, since other
+/// series may have rows at that time: a series that stopped reporting and
+/// then has a row at the range's last window close adds to that window
+/// rather than opening one with the same stamp.
+#[test]
+fn no_two_strided_points_share_a_timestamp() {
+    let steady: Vec<u64> = (1000..=1010).map(|s| s * 1000).collect();
+    let late: Vec<u64> = [1000, 1001, 1002, 1003, 1010]
+        .iter()
+        .map(|s| s * 1000)
+        .collect();
+    for series in [
+        [("a", steady.clone()), ("b", late.clone())],
+        [("b", late.clone()), ("a", steady.clone())],
+    ] {
+        let engine = QueryEngine::new(Arc::new(hist_series(1_000, &series, 100)));
+        let points = strided_counts(&engine, "histogram_count(lat, 1)", 1005.0, 1010.0);
+        assert!(points.windows(2).all(|w| w[0].0 < w[1].0), "{points:?}");
+        let QueryResult::HistogramHeatmap { result } = engine
+            .query_range("histogram_heatmap(lat, 1)", 1005.0, 1010.0, 1.0)
+            .unwrap()
+        else {
+            panic!("not a heatmap");
+        };
+        assert!(
+            result.timestamps.windows(2).all(|w| w[0] < w[1]),
+            "{:?}",
+            result.timestamps
+        );
+    }
+}
+
+/// A stride shorter than the row interval laying more than 100 000 windows
+/// over the range is refused; one at or past the interval is not, however
+/// many windows it lays.
+#[test]
+fn a_short_stride_laying_too_many_windows_is_refused() {
+    let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
+    let err = engine
+        .query_range("histogram_count(lat, 0.001)", 1100.0, 1400.0, 1.0)
+        .expect_err("300 000 windows")
+        .to_string();
+    assert!(err.contains("windows"), "{err}");
+    assert!(engine
+        .query_range("histogram_count(lat, 0.01)", 1100.0, 1400.0, 1.0)
+        .is_ok());
+    // A source with no interval is capped as if the stride were shorter.
+    let engine = QueryEngine::new(Arc::new(hist_rows(0, 1000, 1400, 1)));
+    assert!(engine
+        .query_range("histogram_count(lat, 0.001)", 1100.0, 1400.0, 1.0)
+        .is_err());
+    // 200 001 rows every 1 s: a 1 s stride lays 200 001 windows, one a row.
+    let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 201_000, 1)));
+    assert!(engine
+        .query_range("histogram_count(lat, 1)", 1000.0, 201_000.0, 1.0)
+        .is_ok());
 }
 
 /// A stride shorter than a nanosecond, or not a number, is refused.
