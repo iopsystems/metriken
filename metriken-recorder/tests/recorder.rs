@@ -6,7 +6,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use common::*;
 use metriken_recorder::*;
@@ -243,6 +243,215 @@ async fn a_stream_under_legacy_names_is_read_when_the_caller_accepts_them() {
 }
 
 // ── recording ──────────────────────────────────────────────────────────
+
+/// A producer that does not negotiate serves the offer: the served
+/// interval is the offer, its handshake carries no stream keys, and the
+/// recording's interval is the offer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_producer_that_does_not_negotiate_serves_the_offer() {
+    let producer = serve(Behaviour {
+        update_floor: Duration::from_millis(300),
+        negotiate: false,
+        ..stream_only(&[("source", "producer")], &[])
+    })
+    .await;
+    let sub = Subscription::connect(
+        &client(),
+        &producer.url,
+        INTERVAL,
+        Layout::Long,
+        &[WIRE_NAMES],
+    )
+    .await
+    .expect("subscribed");
+    assert_eq!(sub.served_interval(), Some(INTERVAL));
+    assert!(!sub
+        .handshake()
+        .metadata
+        .keys()
+        .any(|k| k.starts_with("metriken.")));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&producer.url)],
+        &NoProbe,
+    )
+    .await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(1000),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let r = &recordings(&run.path, "fake/ops")["producer"];
+    assert_eq!(r.metadata["sampling_interval_ms"], "100");
+}
+
+/// Without the frame-interval header (a proxy dropped it), the served
+/// interval comes from the handshake.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_served_interval_is_read_from_the_handshake_without_the_header() {
+    let producer = serve(Behaviour {
+        update_floor: Duration::from_millis(300),
+        drop_frame_interval: true,
+        ..stream_only(&[("source", "producer")], &[])
+    })
+    .await;
+    let sub = Subscription::connect(
+        &client(),
+        &producer.url,
+        Duration::from_millis(100),
+        Layout::Long,
+        &[WIRE_NAMES],
+    )
+    .await
+    .expect("subscribed");
+    assert_eq!(sub.served_interval(), Some(Duration::from_millis(300)));
+    assert_eq!(
+        sub.handshake().served_interval,
+        Some(Duration::from_millis(300))
+    );
+}
+
+/// The wait for a frame after a wrapped command exits lasts at least the
+/// interval the producer serves plus the timeout, as the producer said on
+/// its latest connection: after a reconnect at a 2.5 s floor, a 200 ms bound
+/// still gets the frame stamped after the exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stop_waits_for_a_frame_at_the_served_interval() {
+    let producer = serve(Behaviour {
+        streams: Streams::Restarts(2),
+        update_floor: Duration::from_millis(100),
+        ..stream_only(&[("source", "producer")], &[])
+    })
+    .await;
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&producer.url)],
+        &NoProbe,
+    )
+    .await;
+    // The first connection closes after two frames; the reconnect is served
+    // at 2.5 s.
+    producer.set(Behaviour {
+        streams: Streams::Restarts(2),
+        update_floor: Duration::from_millis(2500),
+        ..stream_only(&[("source", "producer")], &[])
+    });
+    // The exit falls 100 ms after a 2.5 s boundary, so the next frame is
+    // 2.4 s away: further than the first connection's 100 ms interval plus
+    // the 1 s timeout.
+    let now_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let step = 2_500_000_000u64;
+    let exit_ns = (now_ns + 4_000_000_000).div_ceil(step) * step + 100_000_000;
+    let run_for = Duration::from_nanos(exit_ns - now_ns);
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |cfg| cfg.timeout = Duration::from_millis(1000),
+        run_for,
+        Stop::AfterExit {
+            wall_ns: exit_ns,
+            bound: Duration::from_millis(200),
+        },
+    )
+    .await;
+    run.summary.expect("finished");
+    let queries = producer.stream_queries.lock().unwrap().clone();
+    assert!(queries.len() >= 2, "{queries:?}");
+    let r = &recordings(&run.path, "fake/ops")["producer"];
+    assert!(
+        r.last_ts.unwrap() >= exit_ns,
+        "the last row ({:?}) is before the exit ({exit_ns})",
+        r.last_ts
+    );
+}
+
+/// A stream is dead only after the interval its producer serves plus the
+/// timeout: a 2.5 s floor against a 100 ms offer and a 2 s timeout keeps one
+/// connection, where the offer's 2.1 s would drop it between every frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_is_held_for_its_served_interval() {
+    let producer = serve(Behaviour {
+        update_floor: Duration::from_millis(2500),
+        ..stream_only(&[("source", "producer")], &[])
+    })
+    .await;
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&producer.url)],
+        &NoProbe,
+    )
+    .await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(7000),
+        Stop::Grace(Duration::from_millis(100)),
+    )
+    .await;
+    run.summary.expect("finished");
+    let queries = producer.stream_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1, "reconnected: {queries:?}");
+}
+
+/// A producer serves at least its update floor: an offer of 100 ms to a
+/// producer with a 300 ms floor is served at 300 ms, the recording's
+/// interval is 300 ms, and a reconnect offers the floor. The stream's own
+/// handshake keys stay out of the recording's metadata.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_is_recorded_at_the_interval_its_producer_serves() {
+    let producer = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        update_floor: Duration::from_millis(300),
+        ..stream_only(&[("source", "producer")], &[("version", "1.0")])
+    })
+    .await;
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&producer.url)],
+        &NoProbe,
+    )
+    .await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(3000),
+        Stop::Grace(Duration::from_millis(400)),
+    )
+    .await;
+    run.summary.expect("finished");
+    let queries = producer.stream_queries.lock().unwrap().clone();
+    assert!(queries.len() >= 2, "{queries:?}");
+    assert!(queries[0].contains("interval=100ms"), "{queries:?}");
+    assert!(
+        queries[1..].iter().all(|q| q.contains("interval=300ms")),
+        "a reconnect offers the floor: {queries:?}"
+    );
+    let r = &recordings(&run.path, "fake/ops")["producer"];
+    assert_eq!(r.metadata["sampling_interval_ms"], "300");
+    assert_eq!(r.metadata["version"], "1.0");
+    assert!(
+        !r.metadata.keys().any(|k| k.starts_with("metriken.")),
+        "{:?}",
+        r.metadata
+    );
+}
 
 /// A streamed producer and a Prometheus exporter in one archive: one
 /// recording each, rows in each, both finalized, and a `Committed` event

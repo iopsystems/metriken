@@ -37,7 +37,8 @@ impl fmt::Display for Layout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WireNames {
     pub content_type: &'static str,
-    /// How often a frame is sent: the request's interval.
+    /// How often a frame is sent: the interval served, which is at least the
+    /// update floor when the producer negotiates.
     pub frame_interval: &'static str,
     /// How often a frame can carry anything new: the producer's freshness
     /// floor.
@@ -45,6 +46,15 @@ pub struct WireNames {
     /// The layout served.
     pub layout: &'static str,
 }
+
+/// The handshake metadata key carrying the interval the producer serves
+/// the subscription at, as a humantime duration: the negotiated interval,
+/// which the frame-interval header also carries.
+pub const HANDSHAKE_FRAME_INTERVAL: &str = "metriken.frame_interval";
+
+/// The handshake metadata key carrying the producer's update floor, as a
+/// humantime duration, which the update-floor header also carries.
+pub const HANDSHAKE_UPDATE_FLOOR: &str = "metriken.update_floor";
 
 /// The names a metriken producer serves.
 pub const WIRE_NAMES: WireNames = WireNames {

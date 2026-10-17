@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use dendro::replicate::Frame;
-use metriken_model::wire::{Layout, WireNames};
+use metriken_model::wire::{Layout, WireNames, HANDSHAKE_FRAME_INTERVAL, HANDSHAKE_UPDATE_FLOOR};
 use reqwest::Client;
 use url::Url;
 
@@ -62,6 +62,7 @@ pub struct Subscription {
     /// Frames decoded but not yet part of a complete interval.
     pending: Vec<Frame>,
     update_floor: Option<Duration>,
+    served_interval: Option<Duration>,
     layout: Layout,
 }
 
@@ -69,9 +70,9 @@ impl Subscription {
     /// Open a subscription to `base`'s `/metrics/stream` asking for
     /// `interval` and `layout`, and wait for its handshake.
     ///
-    /// The interval is a request: the producer's update floor (its
-    /// update-floor header) bounds how often a frame can carry anything new,
-    /// and a shorter interval gets frames, most of them empty.
+    /// The interval is an offer: the producer serves at least its update
+    /// floor, and names the interval it serves (see
+    /// [`served_interval`](Self::served_interval)), which is the stream's.
     ///
     /// `names` lists the wire names accepted. The response's `Content-Type`
     /// picks the entry, and that entry's header names are the ones read; a
@@ -141,11 +142,15 @@ impl Subscription {
             });
         };
 
-        let update_floor = response
-            .headers()
-            .get(served_names.update_floor)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| humantime::parse_duration(v).ok());
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| humantime::parse_duration(v).ok())
+        };
+        let update_floor = header(served_names.update_floor);
+        let served_interval = header(served_names.frame_interval);
         let served = match response
             .headers()
             .get(served_names.layout)
@@ -161,6 +166,7 @@ impl Subscription {
             subscriber: StreamSubscriber::new(),
             pending: Vec::new(),
             update_floor,
+            served_interval,
             layout: served,
         };
 
@@ -205,6 +211,21 @@ impl Subscription {
             }
             None => unreachable!("the loop above exits with a frame pending"),
         }
+
+        // A proxy may drop the headers; the handshake carries both too.
+        let carried = |key: &str| {
+            sub.handshake()
+                .metadata
+                .get(key)
+                .and_then(|v| humantime::parse_duration(v).ok())
+        };
+        let (served, floor) = (
+            carried(HANDSHAKE_FRAME_INTERVAL),
+            carried(HANDSHAKE_UPDATE_FLOOR),
+        );
+        sub.served_interval = sub.served_interval.or(served);
+        sub.update_floor = sub.update_floor.or(floor);
+        sub.subscriber.set_served_interval(sub.served_interval);
 
         Ok(sub)
     }
@@ -256,6 +277,13 @@ impl Subscription {
         self.update_floor
     }
 
+    /// The interval the producer serves this subscription at, as its
+    /// frame-interval header or its handshake said: the stream's interval,
+    /// at least the update floor. `None` when it said neither.
+    pub fn served_interval(&self) -> Option<Duration> {
+        self.served_interval
+    }
+
     /// The handshake, applied before [`connect`](Self::connect) returned.
     pub fn handshake(&self) -> &Handshake {
         self.subscriber
@@ -301,8 +329,8 @@ pub enum StreamEvent {
 pub struct PumpConfig {
     pub interval: Duration,
     pub layout: Layout,
-    /// Bounds every reconnect; a connection silent for `interval + timeout`
-    /// is dead.
+    /// Bounds every reconnect; a connection silent for the interval the
+    /// producer serves plus `timeout` is dead.
     pub timeout: Duration,
     pub wire_names: Vec<WireNames>,
 }
@@ -328,9 +356,13 @@ impl PumpConfig {
 /// reconnect whose answer is transient ([`StreamAnswer::is_transient`]) is
 /// retried; any other answer ends the pump with [`StreamEvent::Refused`].
 ///
-/// A producer sends a frame every interval, empty when nothing is new, so a
-/// connection that produces nothing for `interval + timeout` is dead even
-/// when the kernel has not noticed (a peer gone without a RST). The interval
+/// A reconnect offers `cfg.interval`, or the update floor the producer
+/// named on the last connection when that is longer.
+///
+/// A producer sends a frame every served interval, empty when nothing is
+/// new, so a connection that produces nothing for that interval plus
+/// `timeout` is dead even when the kernel has not noticed (a peer gone
+/// without a RST). The interval
 /// is part of the bound because a frame is only due once per interval: with
 /// the timeout alone, an interval longer than the timeout would drop every
 /// connection between two frames.
@@ -343,8 +375,11 @@ pub async fn pump(
     tx: tokio::sync::mpsc::Sender<(usize, StreamEvent)>,
 ) {
     let retry = cfg.interval.max(Duration::from_secs(1));
-    let silence = cfg.interval + cfg.timeout;
     loop {
+        // What a reconnect offers: never below the floor the producer named
+        // on this connection.
+        let offer = cfg.interval.max(sub.update_floor().unwrap_or_default());
+        let silence = sub.served_interval().unwrap_or(offer) + cfg.timeout;
         let outcome = match tokio::time::timeout(silence, sub.next_interval()).await {
             Ok(Ok(Some(applied))) => {
                 if tx
@@ -373,7 +408,7 @@ pub async fn pump(
             }
             let connected = tokio::time::timeout(
                 cfg.timeout,
-                Subscription::connect(&client, &base, cfg.interval, cfg.layout, &cfg.wire_names),
+                Subscription::connect(&client, &base, offer, cfg.layout, &cfg.wire_names),
             )
             .await;
             match connected {

@@ -382,6 +382,11 @@ impl FrameProducer {
         }
     }
 
+    /// Adds `key` to the handshake's metadata, replacing any value it had.
+    pub(crate) fn insert_metadata(&mut self, key: &str, value: String) {
+        self.metadata.insert(key.to_string(), value);
+    }
+
     /// The opening frame. Sent once per connection, before anything else.
     pub fn handshake(&mut self) -> Frame {
         self.handshake_sent = true;

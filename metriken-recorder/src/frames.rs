@@ -112,6 +112,10 @@ pub struct Handshake {
     /// carried none (dendro's field is signed; a negative anchor reads as
     /// none too).
     pub clock_anchor_wall_ns: u64,
+    /// The interval the producer serves this connection at, from the
+    /// response's frame-interval header or the handshake's metadata; `None`
+    /// when neither said.
+    pub served_interval: Option<std::time::Duration>,
 }
 
 impl Handshake {
@@ -132,6 +136,7 @@ impl Handshake {
             labels,
             metadata,
             clock_anchor_wall_ns,
+            served_interval: None,
         }
     }
 
@@ -156,6 +161,13 @@ impl StreamSubscriber {
     /// The handshake, once it has arrived.
     pub fn handshake(&self) -> Option<&Handshake> {
         self.handshake.as_ref()
+    }
+
+    /// Record the interval the connection is served at on the handshake.
+    pub(crate) fn set_served_interval(&mut self, served: Option<std::time::Duration>) {
+        if let Some(handshake) = &mut self.handshake {
+            handshake.served_interval = served;
+        }
     }
 
     /// Fold one interval's frames in: everything up to and including its
@@ -190,6 +202,8 @@ impl StreamSubscriber {
                         labels,
                         metadata,
                         clock_anchor_wall_ns: u64::try_from(clock_anchor_wall_ns).unwrap_or(0),
+                        // The connection's, set once it was opened.
+                        served_interval: self.handshake.as_ref().and_then(|h| h.served_interval),
                     });
                 }
 

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use metriken_model::wire::{Layout, WireNames, WIRE_NAMES};
+#[cfg(feature = "http")]
+use metriken_model::wire::{HANDSHAKE_FRAME_INTERVAL, HANDSHAKE_UPDATE_FLOOR};
 use metriken_model::Snapshot;
 use metriken_storage::writer::Staged;
 use metriken_storage::{ArchiveWriter, SourceRecorder, WriterConfig};
@@ -161,7 +163,9 @@ pub enum Stop {
     /// A wrapped command exited at `wall_ns`. One more pass of every local
     /// and scraped source, unless the last pass started at or after
     /// `wall_ns`, then a wait of up to `bound` for each streamed source's
-    /// frame stamped at or after `wall_ns`. The skip is decided once for
+    /// frame stamped at or after `wall_ns`; at least the longest interval a
+    /// producer serves plus the timeout, since a frame is due only once per
+    /// served interval. The skip is decided once for
     /// all sources, so a local or scraped source ends on a row stamped at or
     /// after `wall_ns` only when its own last pass succeeded: one whose
     /// scrape failed or timed out on that pass ends on its previous row.
@@ -292,8 +296,8 @@ pub struct RecorderConfig {
     /// The tick, on multiples of which since the Unix epoch the recorder
     /// scrapes, takes local passes and commits.
     pub interval: Duration,
-    /// Bounds each scrape, connect and probe call; a stream silent for
-    /// `interval + timeout` is reconnected.
+    /// Bounds each scrape, connect and probe call; a stream silent for the
+    /// interval its producer serves plus `timeout` is reconnected.
     pub timeout: Duration,
     /// The layout streams are asked for.
     pub layout: Layout,
@@ -848,8 +852,12 @@ struct Endpoint {
     /// The first connection's: a recording's labels are fixed when it is
     /// added.
     handshake_labels: BTreeMap<String, String>,
-    /// The latest connection's: a restarted producer's replaces it.
+    /// The latest connection's: a restarted producer's replaces it. The
+    /// stream's own keys (the served interval and the update floor) are
+    /// taken out.
     handshake_metadata: BTreeMap<String, String>,
+    /// The interval the producer serves the stream at, when it said.
+    served_interval: Option<Duration>,
     epoch: Option<String>,
     anchor: Option<u64>,
     restarts: Vec<Restart>,
@@ -876,6 +884,7 @@ impl Endpoint {
             hook_metadata: BTreeMap::new(),
             handshake_labels: BTreeMap::new(),
             handshake_metadata: BTreeMap::new(),
+            served_interval: None,
             epoch: None,
             anchor: None,
             restarts: Vec::new(),
@@ -890,7 +899,15 @@ impl Endpoint {
     /// metadata of a subscription detection opened.
     fn begin_stream(&mut self, sub: &Subscription, interval: Duration) {
         let url = &self.spec.url;
-        if let Some(floor) = sub.update_floor().filter(|floor| interval < *floor) {
+        self.served_interval = sub.served_interval();
+        if let Some(served) = self.served_interval.filter(|served| *served > interval) {
+            info!(
+                "{url}: asked for a frame every {}; the producer serves one every {}, the \
+                 shortest it offers, and that is this source's interval",
+                humantime::format_duration(interval),
+                humantime::format_duration(served)
+            );
+        } else if let Some(floor) = sub.update_floor().filter(|floor| interval < *floor) {
             warn!(
                 "{url}: --interval {} is shorter than the producer's update floor of {}; a \
                  frame can only carry new readings every {}, and the rest will be empty",
@@ -918,7 +935,15 @@ impl Endpoint {
         if handshake.clock_anchor_wall_ns != 0 {
             self.anchor = Some(handshake.clock_anchor_wall_ns);
         }
-        self.handshake_metadata = handshake.metadata.clone();
+        // A handshake naming no served interval (a producer that does not
+        // negotiate) leaves the one on record.
+        if handshake.served_interval.is_some() {
+            self.served_interval = handshake.served_interval;
+        }
+        let mut metadata = handshake.metadata.clone();
+        metadata.remove(HANDSHAKE_FRAME_INTERVAL);
+        metadata.remove(HANDSHAKE_UPDATE_FLOOR);
+        self.handshake_metadata = metadata;
         let seen = handshake.epoch()?;
         match self.epoch.as_deref() {
             None => {
@@ -1474,6 +1499,10 @@ impl Driver {
             #[cfg(feature = "http")]
             Kind::Endpoint(ep) => {
                 let mut recorder = BTreeMap::new();
+                // A streamed source's interval is the one its producer serves.
+                let interval_ms = ep
+                    .served_interval
+                    .map_or(interval_ms, |served| served.as_millis().to_string());
                 recorder.insert(keys::SAMPLING_INTERVAL_MS.to_string(), interval_ms);
                 if let Some(epoch) = &ep.epoch {
                     recorder.insert(keys::PRODUCER_EPOCH.to_string(), epoch.clone());
@@ -2304,6 +2333,16 @@ impl Driver {
         bound: Duration,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
+        #[cfg(feature = "http")]
+        let bound = self
+            .slots
+            .iter()
+            .filter_map(|slot| match &slot.kind {
+                Kind::Endpoint(ep) => ep.served_interval,
+                _ => None,
+            })
+            .max()
+            .map_or(bound, |served| bound.max(served + self.settings.timeout));
         let deadline = tokio::time::Instant::now() + bound;
         loop {
             let waiting: Vec<usize> = self
