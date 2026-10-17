@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while a view holds the file (`ArchiveMut::open` is refused). A
   `Catalog` implemented outside this crate gets defaults: no snapshot, and
   a matching fetch that reads every segment's catalog row of the table.
+- **Fixed:** a table whose first seal committed while
+  `ArchiveReader::from_catalog` opened the archive could be missing from
+  the reader for as long as it was open. The open read the table's segment
+  list (still empty) and its live WAL (emptied by the seal) as separate
+  statements, so the table had no rows to probe and was skipped. Each
+  source's catalog reads at open now run in one read snapshot, and the
+  segments probed for metric names are fetched by their listed entry.
+- **Fixed:** a long table could open without the labels of occupants whose
+  rows a seal of its occupant stream moved while the stream was read: the
+  stream's segment list and live WAL were separate statements. They are
+  read in one snapshot, and its segments are fetched by their listed entry.
+- **Fixed:** `RezDb::read_snapshot` left its transaction open when the
+  closure panicked. Every later snapshot on that connection then ran inside
+  the stale one, since the call is re-entrant, and a live `.rez` could not
+  checkpoint past it. The transaction is now ended on unwind as well.
 
 ### metriken-exposition 0.23.1
 

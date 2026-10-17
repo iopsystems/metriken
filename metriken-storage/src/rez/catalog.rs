@@ -279,4 +279,36 @@ mod tests {
         .unwrap();
         assert!(inner_ran);
     }
+
+    /// A panic inside a snapshot ends it: the next snapshot on the same
+    /// connection sees what was committed after the panic.
+    #[test]
+    fn a_panic_inside_a_snapshot_does_not_keep_it_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, rid) = archive(dir.path());
+        let reader = RezDb::open(&dir.path().join("t.rez")).unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Catalog::read_snapshot(&reader, &mut || {
+                // A read, so the snapshot is pinned before the panic.
+                reader.total_rows(rid, "cpu")?;
+                panic!("a read that panics");
+            });
+        }));
+        assert!(panicked.is_err());
+
+        let meta = RezMeta {
+            rows: 5,
+            first_ts: 0,
+            last_ts: 4,
+        };
+        writer.insert_segment(rid, "cpu", 0, &meta, b"seg").unwrap();
+        let mut rows = None;
+        Catalog::read_snapshot(&reader, &mut || {
+            rows = Some(reader.total_rows(rid, "cpu")?);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, Some(5));
+    }
 }

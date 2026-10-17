@@ -1,6 +1,7 @@
-//! A table's view of an archive another connection is changing: a seal that
-//! commits while the view is built, and a compaction between the view's
-//! listing and a fetch.
+//! A reader of an archive another connection is changing: a seal that
+//! commits while the reader opens, while a table's view is built, or while
+//! a long table's occupant stream is read, and a renumbered or compacted
+//! segment between a view's listing and a fetch.
 #![cfg(feature = "write")]
 
 use std::collections::{BTreeMap, HashMap};
@@ -10,6 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use dendro::seal::SealPolicy;
 use metriken_exposition::{GroupSchema, GroupSnapshot, MetricDesc, Snapshot, SnapshotV3};
+use metriken_query::{MetricsSource, QueryResult};
 use metriken_storage::catalog::{SegmentMeta, Source, Span, WalRow};
 use metriken_storage::labels::Labels;
 use metriken_storage::{
@@ -109,10 +111,11 @@ fn ticks(reader: &ArchiveReader, from: u64, to: u64) -> Vec<u64> {
 type Hook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// A dendro catalog that runs a hook just before the first `live_wal` read
-/// of [`STREAM`] after the hook is armed: the point between a table's
+/// of `stream` after the hook is armed: the point between a stream's
 /// segment listing and its WAL read.
 struct BeforeLiveWal {
     inner: DendroCatalog,
+    stream: &'static str,
     hook: Hook,
 }
 
@@ -135,7 +138,7 @@ impl Catalog for BeforeLiveWal {
         self.inner.segment_bytes(source_id, table, seq)
     }
     fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String> {
-        if table == STREAM {
+        if table == self.stream {
             let hook = self.hook.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
@@ -193,6 +196,7 @@ fn seal_between_segment_listing_and_wal_read_loses_no_rows() {
     let hook: Hook = Arc::new(Mutex::new(None));
     let reader = open(Box::new(BeforeLiveWal {
         inner: DendroCatalog::open(&path).unwrap(),
+        stream: STREAM,
         hook: Arc::clone(&hook),
     }));
 
@@ -233,6 +237,7 @@ fn renumbered_segment_after_listing_returns_no_row_twice() {
         open(Box::new(DendroCatalog::open(&path).unwrap())),
         open(Box::new(BeforeLiveWal {
             inner: DendroCatalog::open(&path).unwrap(),
+            stream: STREAM,
             hook: Hook::default(),
         })),
     ];
@@ -320,6 +325,7 @@ fn merged_segment_does_not_match_its_first_input() {
         Box::new(DendroCatalog::open(&path).unwrap()),
         Box::new(BeforeLiveWal {
             inner: DendroCatalog::open(&path).unwrap(),
+            stream: STREAM,
             hook: Hook::default(),
         }),
     ];
@@ -344,4 +350,138 @@ fn merged_segment_does_not_match_its_first_input() {
             .unwrap()
             .is_some());
     }
+}
+
+/// A table's first seal committing while the reader is opened, between the
+/// table's segment listing (empty) and its WAL read (emptied by the seal),
+/// leaves the open with no probe for the table. Read as two statements, the
+/// reader does not list the table at all for as long as it is open.
+#[test]
+fn first_seal_while_the_reader_opens_keeps_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.dendro");
+    let (mut w, mut source) = writer(&path);
+    // Ticks 0..=3 are in the WAL; nothing is sealed.
+    for t in 0..=3 {
+        tick(&mut w, &mut source, t);
+    }
+
+    // Armed before the open, so it fires inside it: tick 4 is the fifth
+    // unsealed row, so this seals ticks 0..=4.
+    let hook: Hook = Arc::new(Mutex::new(Some(Box::new(move || {
+        tick(&mut w, &mut source, 4);
+        std::mem::forget(source);
+        w.join().unwrap();
+    }))));
+    let reader = open(Box::new(BeforeLiveWal {
+        inner: DendroCatalog::open(&path).unwrap(),
+        stream: STREAM,
+        hook: Arc::clone(&hook),
+    }));
+    assert!(hook.lock().unwrap().is_none(), "the hook did not run");
+    // The view is built after the seal, so it holds the sealed segment.
+    assert_eq!(ticks(&reader, 0, 100), (0..=4).collect::<Vec<_>>());
+}
+
+const TASKS: &str = "threads/tasks";
+const OCCUPANTS: &str = "threads/tasks/occupants";
+
+/// One tick of a long group: the gauge `rss` for slot 0, held by `a`
+/// throughout, and from tick 1 for slot 1, held by a new occupant `b<t>`
+/// each tick, so the occupant stream gains a row per tick.
+fn long_snapshot(t: u64) -> Snapshot {
+    let ts = BASE + t * S;
+    let mut schema = GroupSchema::default();
+    let mut gauges = Vec::new();
+    let mut slots = vec![(0u64, "a".to_string())];
+    if t >= 1 {
+        slots.push((1, format!("b{t}")));
+    }
+    for (slot, comm) in slots {
+        schema.gauges.push(MetricDesc {
+            name: format!("0x{slot}"),
+            metadata: [
+                ("metric", "rss".to_string()),
+                ("sampler", "threads".to_string()),
+                ("id", slot.to_string()),
+                ("comm", comm.to_string()),
+                ("__uid__", format!("{comm}0")),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        });
+        gauges.push(Some((t * 1000 + slot) as i64));
+    }
+    let group = GroupSnapshot {
+        name: TASKS.to_string(),
+        schema_hash: schema.hash(),
+        schema: Some(Arc::new(schema)),
+        window: Some(metriken::Window::new(ts - S / 2, ts)),
+        counters: Vec::new(),
+        gauges,
+        histograms: Vec::new(),
+    };
+    Snapshot::V3(SnapshotV3 {
+        systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+        duration: Duration::from_millis(1),
+        metadata: HashMap::new(),
+        groups: vec![group],
+    })
+}
+
+fn long_tick(writer: &mut ArchiveWriter, source: &mut SourceRecorder, t: u64) {
+    let staged = source.stage(&long_snapshot(t), BASE + t * S, 0).unwrap();
+    writer.commit(vec![staged]).unwrap();
+    source.maybe_seal().unwrap();
+    source.sync().unwrap();
+}
+
+/// The `comm` labels `rss` answers with, sorted.
+fn comms(reader: &ArchiveReader) -> Vec<String> {
+    let result = reader
+        .query_range("rss", BASE as f64 / 1e9, (BASE + 100 * S) as f64 / 1e9, 1.0)
+        .unwrap();
+    let QueryResult::Matrix { result } = result else {
+        panic!("rss: not a matrix");
+    };
+    let mut comms: Vec<String> = result
+        .into_iter()
+        .filter_map(|m| m.metric.get("comm").cloned())
+        .collect();
+    comms.sort();
+    comms.dedup();
+    comms
+}
+
+/// A seal of a long table's occupant stream that commits between the
+/// stream's segment listing and its WAL read moves the occupant rows into a
+/// segment the listing does not have. Read as two statements, the table
+/// opens with no occupant labels at all.
+#[test]
+fn seal_between_occupant_listing_and_wal_read_keeps_the_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.dendro");
+    let (mut w, mut source) = writer(&path);
+    // Ticks 0..=3 are in both streams' WALs; nothing is sealed.
+    for t in 0..=3 {
+        long_tick(&mut w, &mut source, t);
+    }
+
+    let hook: Hook = Arc::new(Mutex::new(None));
+    let reader = open(Box::new(BeforeLiveWal {
+        inner: DendroCatalog::open(&path).unwrap(),
+        stream: OCCUPANTS,
+        hook: Arc::clone(&hook),
+    }));
+    // Armed after the open, so it fires when the occupant stream is read for
+    // the table's first query: tick 4 seals ticks 0..=4 of both streams.
+    *hook.lock().unwrap() = Some(Box::new(move || {
+        long_tick(&mut w, &mut source, 4);
+        std::mem::forget(source);
+        w.join().unwrap();
+    }));
+    let got = comms(&reader);
+    assert!(hook.lock().unwrap().is_none(), "the hook did not run");
+    assert_eq!(got, ["a", "b1", "b2", "b3"]);
 }

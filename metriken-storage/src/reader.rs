@@ -154,18 +154,18 @@ fn table_probes(
     long: bool,
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut probes = Vec::new();
-    if let Some((first, _)) = sealed.first() {
+    if let Some((first, meta)) = sealed.first() {
         let fingerprints: HashMap<u64, u64> = db
             .segment_indexes(recording_id, table)?
             .into_iter()
             .filter_map(|(seq, index)| Some((seq, crate::names::fingerprint(index.as_deref())?)))
             .collect();
         let mut seen: HashSet<u64> = fingerprints.get(first).copied().into_iter().collect();
-        probes.extend(db.segment_bytes(recording_id, table, *first)?);
-        for (seq, _) in &sealed[1..] {
+        probes.extend(db.segment_bytes_matching(recording_id, table, *first, meta)?);
+        for (seq, meta) in &sealed[1..] {
             if let Some(fp) = fingerprints.get(seq) {
                 if seen.insert(*fp) {
-                    probes.extend(db.segment_bytes(recording_id, table, *seq)?);
+                    probes.extend(db.segment_bytes_matching(recording_id, table, *seq, meta)?);
                 }
             }
         }
@@ -261,9 +261,9 @@ impl DbHandle {
 /// numbers from the catalog, and the live WAL tail materialized once as the
 /// newest segment. The tail is the one thing held in memory — it is at most
 /// a segment's worth of rows, and it is the part of the table SQLite cannot
-/// hand back as parquet. Sealed segments are read by sequence number on
-/// demand; one that retention has removed since reads as gone and the
-/// reader skips it, which is exactly what a live hindsight buffer wants.
+/// hand back as parquet. Sealed segments are read on demand by their listed
+/// catalog entry; one that retention removed, or whose number now names
+/// another segment, reads as gone and is skipped.
 struct DbSegmentStore {
     db: DbHandle,
     recording_id: i64,
@@ -296,17 +296,15 @@ fn segment_key(seq: u64, meta: &crate::catalog::SegmentMeta) -> u64 {
 /// with [`default_compression`](crate::default_compression): the segment is
 /// held in memory while the reader is open.
 fn live_tail(
-    db: &dyn Catalog,
-    recording_id: i64,
     table: &str,
+    rows: &[crate::catalog::WalRow],
     long: bool,
 ) -> Result<Option<crate::wal::MaterializedTail>, Box<dyn std::error::Error>> {
-    let rows = db.live_wal(recording_id, table)?;
     let props = crate::segment_props(crate::default_compression());
     if long {
-        crate::wal::materialize_long_wal_tail_with(table, &rows, false, props)
+        crate::wal::materialize_long_wal_tail_with(table, rows, false, props)
     } else {
-        crate::wal::materialize_wal_tail_with(table, &rows, props)
+        crate::wal::materialize_wal_tail_with(table, rows, props)
     }
 }
 
@@ -338,21 +336,24 @@ impl DbSegmentStore {
         sampler: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // One snapshot: a seal committing between the segment list and the
-        // WAL read would leave its rows in neither.
-        let (listed, tail) = db
+        // WAL read would leave its rows in neither. The tail is encoded after
+        // the snapshot ends, so a live archive's checkpoints wait only for
+        // the reads.
+        let (listed, rows, long) = db
             .with(|db| {
                 in_snapshot(db, || {
                     let listed = db.segment_meta(recording_id, sampler)?;
                     let long = db
                         .tables(recording_id)?
                         .contains(&crate::occupants::stream_of(sampler));
-                    let tail = live_tail(db, recording_id, sampler, long)
-                        .map_err(|e| e.to_string())?
-                        .map(|t| bytes::Bytes::from(t.bytes));
-                    Ok::<_, String>((listed, tail))
+                    let rows = db.live_wal(recording_id, sampler)?;
+                    Ok::<_, String>((listed, rows, long))
                 })
             })
             .map_err(|e| e.to_string())?;
+        let tail = live_tail(sampler, &rows, long)
+            .map_err(|e| e.to_string())?
+            .map(|t| bytes::Bytes::from(t.bytes));
         let keys = listed
             .iter()
             .map(|(seq, meta)| segment_key(*seq, meta))
@@ -454,38 +455,47 @@ impl SegmentSource {
         stream: &str,
         known: &OccupantSegments,
     ) -> Result<(Vec<Occupant>, OccupantSegments), Box<dyn std::error::Error>> {
-        let read = |db: &dyn Catalog, recording_id: i64| {
-            let mut out = Vec::new();
-            let mut decoded = OccupantSegments::new();
-            for (seq, meta) in db.segment_meta(recording_id, stream)? {
-                let key = segment_key(seq, &meta);
-                let rows = match known.get(&key) {
-                    Some(rows) => Arc::clone(rows),
-                    // A segment retention took since the catalog read is
-                    // gone, and so are the rows that named its occupants.
-                    None => match db.segment_bytes(recording_id, stream, seq)? {
-                        // `OccupantLabels::new` keeps the first labels it sees
-                        // for an occupant, and segments are read in order, so
-                        // a later row for the same occupant in this segment
-                        // cannot change any series' labels. The relabel's key
-                        // set can lose a key that appears only on such a row;
-                        // no series carries that key, so a filter on it
-                        // matches the same series either way.
-                        Some(bytes) => Arc::new(first_per_occupant(
-                            crate::occupants::decode_segment(&bytes)?
-                                .into_iter()
-                                .map(|(_, o)| o),
-                        )),
-                        None => continue,
-                    },
-                };
-                out.extend(rows.iter().cloned());
-                decoded.insert(key, rows);
-            }
-            for row in db.live_wal(recording_id, stream)? {
-                out.extend(crate::occupants::decode_wal_row(&row.row)?);
-            }
-            Ok((out, decoded))
+        // One snapshot: a seal committing between the segment list and the
+        // WAL read would leave the occupants it moved in neither.
+        let read = |db: &dyn Catalog, recording_id: i64| -> Result<_, Box<dyn std::error::Error>> {
+            in_snapshot(db, || {
+                let mut out = Vec::new();
+                let mut decoded = OccupantSegments::new();
+                for (seq, meta) in db.segment_meta(recording_id, stream)? {
+                    let key = segment_key(seq, &meta);
+                    let rows = match known.get(&key) {
+                        Some(rows) => Arc::clone(rows),
+                        // Inside a snapshot a listed segment is still there.
+                        // Under a catalog with no snapshot, one that retention
+                        // took since the listing, or whose number now names
+                        // another segment, is gone, and so are the rows that
+                        // named its occupants.
+                        None => {
+                            match db.segment_bytes_matching(recording_id, stream, seq, &meta)? {
+                                // `OccupantLabels::new` keeps the first labels it sees
+                                // for an occupant, and segments are read in order, so
+                                // a later row for the same occupant in this segment
+                                // cannot change any series' labels. The relabel's key
+                                // set can lose a key that appears only on such a row;
+                                // no series carries that key, so a filter on it
+                                // matches the same series either way.
+                                Some(bytes) => Arc::new(first_per_occupant(
+                                    crate::occupants::decode_segment(&bytes)?
+                                        .into_iter()
+                                        .map(|(_, o)| o),
+                                )),
+                                None => continue,
+                            }
+                        }
+                    };
+                    out.extend(rows.iter().cloned());
+                    decoded.insert(key, rows);
+                }
+                for row in db.live_wal(recording_id, stream)? {
+                    out.extend(crate::occupants::decode_wal_row(&row.row)?);
+                }
+                Ok((out, decoded))
+            })
         };
         self.with_catalog(|db, recording_id, _| read(db, recording_id))
             .unwrap_or_else(|| Ok((Vec::new(), OccupantSegments::new())))
@@ -1314,76 +1324,91 @@ impl ArchiveReader {
             // table. Measured at ~0.45 ms per table before splitting them —
             // linear in TABLE COUNT, not archive bytes, so it is the cost that
             // grows as samplers and acquisition groups multiply.
-            let mut pending: Vec<PendingProbe> = Vec::new();
-            let mut measured_intervals: BTreeMap<String, Option<f64>> = BTreeMap::new();
-            // The streams the identity index describes. One catalog query per
-            // recording; a table named here is read through the index.
-            let indexed: HashSet<String> = db.caller_row_streams(rec.id)?.into_iter().collect();
+            //
+            // Phase one reads the catalog in one snapshot. A first seal that
+            // committed between a table's segment list (empty) and its WAL
+            // read (emptied by the seal) would leave the table with no probe,
+            // and the reader would not list it for as long as it is open.
+            let (pending, measured_intervals, indexed, occupant_streams) =
+                in_snapshot(&**db, || {
+                    let mut pending: Vec<PendingProbe> = Vec::new();
+                    let mut measured_intervals: BTreeMap<String, Option<f64>> = BTreeMap::new();
+                    // The streams the identity index describes. One catalog query per
+                    // recording; a table named here is read through the index.
+                    let indexed: HashSet<String> =
+                        db.caller_row_streams(rec.id)?.into_iter().collect();
 
-            // A long table's occupant stream is its labels, not a table of
-            // its own: set aside, and named on the table it belongs to.
-            let (occupant_streams, samplers): (Vec<String>, Vec<String>) = db
-                .tables(rec.id)?
-                .into_iter()
-                .partition(|s| crate::occupants::table_of(s).is_some());
-            let occupant_streams: HashSet<String> = occupant_streams.into_iter().collect();
-            for sampler in samplers {
-                let metas = db.segment_meta(rec.id, &sampler)?;
+                    // A long table's occupant stream is its labels, not a table of
+                    // its own: set aside, and named on the table it belongs to.
+                    let (occupant_streams, samplers): (Vec<String>, Vec<String>) = db
+                        .tables(rec.id)?
+                        .into_iter()
+                        .partition(|s| crate::occupants::table_of(s).is_some());
+                    let occupant_streams: HashSet<String> = occupant_streams.into_iter().collect();
+                    for sampler in samplers {
+                        let metas = db.segment_meta(rec.id, &sampler)?;
 
-                // The footers that name every metric the table holds: sealed
-                // segments by names fingerprint, and the live tail's rows that
-                // carry a schema. A quiet sampler in a live hindsight buffer
-                // has only the latter: rows in the WAL, no seal yet. Skipping
-                // it would make it invisible to the reader, which the eager
-                // path never did because `table_segments` splices the tail in.
-                let probes = table_probes(
-                    &**db,
-                    rec.id,
-                    &sampler,
-                    &metas,
-                    occupant_streams.contains(&crate::occupants::stream_of(&sampler)),
-                )?;
-                // Nothing sealed and nothing live: the table has no rows at
-                // all, so there is nothing to open. Same skip as the eager path.
-                if probes.is_empty() {
-                    continue;
-                }
+                        // The footers that name every metric the table holds: sealed
+                        // segments by names fingerprint, and the live tail's rows that
+                        // carry a schema. A quiet sampler in a live hindsight buffer
+                        // has only the latter: rows in the WAL, no seal yet. Skipping
+                        // it would make it invisible to the reader, which the eager
+                        // path never did because `table_segments` splices the tail in.
+                        let probes = table_probes(
+                            &**db,
+                            rec.id,
+                            &sampler,
+                            &metas,
+                            occupant_streams.contains(&crate::occupants::stream_of(&sampler)),
+                        )?;
+                        // Nothing sealed and nothing live: the table has no rows at
+                        // all, so there is nothing to open. Same skip as the eager path.
+                        if probes.is_empty() {
+                            continue;
+                        }
 
-                // Span from the catalog, widened by the live WAL: a hindsight
-                // buffer's newest rows are unsealed, and a span that stopped at
-                // the last seal would report the archive as ending before its
-                // most recent data. No BLOB is read for either.
-                let (_, sealed) = db.segment_span(rec.id, &sampler)?;
-                let wal = db.live_wal_span(rec.id, &sampler)?;
-                let span = match (
-                    sealed.first_ts.into_iter().chain(wal.first_ts).min(),
-                    sealed.last_ts.into_iter().chain(wal.last_ts).max(),
-                ) {
-                    (Some(b), Some(e)) => Some((b, e)),
-                    _ => None,
-                };
-                // The table's cadence, measured: its span over its gaps. A
-                // segment footer states one too, but only because a producer
-                // wrote it there, and a `.rez` segment does not — which had
-                // every archive reporting the 1 s default whatever it held.
-                // The catalog knows the span and the row count already, so
-                // this costs no decode. Nothing needs it to be exact any
-                // more: it is the staleness hint and the step the viewer
-                // opens at, not something the data is rounded to.
-                let rows = sealed.rows + wal.rows;
-                let measured = span.filter(|_| rows >= 2).map(|(b, e)| {
-                    let gap_ns = e.saturating_sub(b) as f64 / (rows - 1) as f64;
-                    // Rounded to whole milliseconds, which is what a real
-                    // interval is. Purely so the grid the viewer opens at is a
-                    // round number and two recordings of one nominal cadence
-                    // agree on it — 99.996714ms and 100.004ms would otherwise
-                    // be different grids in an A/B. Nothing is rounded TO this.
-                    (gap_ns / 1e6).round().max(1.0) / 1e3
-                });
-                measured_intervals.insert(sampler.clone(), measured);
+                        // Span from the catalog, widened by the live WAL: a hindsight
+                        // buffer's newest rows are unsealed, and a span that stopped at
+                        // the last seal would report the archive as ending before its
+                        // most recent data. No BLOB is read for either.
+                        let (_, sealed) = db.segment_span(rec.id, &sampler)?;
+                        let wal = db.live_wal_span(rec.id, &sampler)?;
+                        let span = match (
+                            sealed.first_ts.into_iter().chain(wal.first_ts).min(),
+                            sealed.last_ts.into_iter().chain(wal.last_ts).max(),
+                        ) {
+                            (Some(b), Some(e)) => Some((b, e)),
+                            _ => None,
+                        };
+                        // The table's cadence, measured: its span over its gaps. A
+                        // segment footer states one too, but only because a producer
+                        // wrote it there, and a `.rez` segment does not — which had
+                        // every archive reporting the 1 s default whatever it held.
+                        // The catalog knows the span and the row count already, so
+                        // this costs no decode. Nothing needs it to be exact any
+                        // more: it is the staleness hint and the step the viewer
+                        // opens at, not something the data is rounded to.
+                        let rows = sealed.rows + wal.rows;
+                        let measured = span.filter(|_| rows >= 2).map(|(b, e)| {
+                            let gap_ns = e.saturating_sub(b) as f64 / (rows - 1) as f64;
+                            // Rounded to whole milliseconds, which is what a real
+                            // interval is. Purely so the grid the viewer opens at is a
+                            // round number and two recordings of one nominal cadence
+                            // agree on it — 99.996714ms and 100.004ms would otherwise
+                            // be different grids in an A/B. Nothing is rounded TO this.
+                            (gap_ns / 1e6).round().max(1.0) / 1e3
+                        });
+                        measured_intervals.insert(sampler.clone(), measured);
 
-                pending.push((sampler, probes, span));
-            }
+                        pending.push((sampler, probes, span));
+                    }
+                    Ok::<_, Box<dyn std::error::Error>>((
+                        pending,
+                        measured_intervals,
+                        indexed,
+                        occupant_streams,
+                    ))
+                })?;
 
             // Phase two: parse the footers. One probe per table, independent.
             let probed: Vec<Result<ProbedTable, String>> = probe_tables(&pending);

@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named another segment by the time it was fetched, as after a writer
   reopened on the archive renumbers a stream whose segments were all
   evicted. Such a segment now reads as gone.
+- A table whose first seal committed while `ArchiveReader::from_catalog`
+  opened the archive could be missing from the reader: its segment list and
+  live WAL were read as separate statements, and the seal left it with no
+  rows in either. Each source's catalog reads at open run in one snapshot.
+- A long table could open without the labels of occupants whose rows a
+  seal of its occupant stream moved while the stream was read. The
+  stream's segment list and live WAL are read in one snapshot.
+- `RezDb::read_snapshot` left its transaction open when the closure
+  panicked, so every later snapshot on that connection ran inside the stale
+  one. The transaction is now ended on unwind as well.
 
 ## [0.3.0] - 2026-10-15
 
