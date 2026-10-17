@@ -601,6 +601,14 @@ From cachecannon's adoption (cachecannon#205):
   measured 26% of cachecannon's admin thread and about 1,300 missed-interval
   warnings in two seconds on the host generating load. Whether the helper
   should refuse below the floor for every producer is open.
+  Decided 2026-10-17: the interval is negotiated. The request is an offer,
+  the producer serves at least its floor and names the served interval in
+  the header and the handshake, and a subscriber MUST use it and offer at
+  least the floor once it knows it. A producer MAY refuse an offer below
+  its floor or MAY serve it at the floor; the helper serves it at the
+  floor. Revised 2026-10-17: negotiation is opt-in
+  (`StreamSubscription::negotiated`), so a patch release does not change any
+  existing producer's served interval, headers or handshake bytes.
 
 ## Left alone
 

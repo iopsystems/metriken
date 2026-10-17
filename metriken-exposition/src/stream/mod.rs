@@ -22,9 +22,29 @@
 //! cache implements [`Pass`] for its pass type.
 //!
 //! Each subscription has its own timer, aligned to its interval since the
-//! Unix epoch, and `seq` is the index of that interval. The producer's
-//! freshness floor bounds how often a pass is built; a subscription asking
-//! faster gets empty frames between passes rather than repeated readings.
+//! Unix epoch, and `seq` is the index of that interval.
+//!
+//! # The interval can be negotiated
+//!
+//! The producer's update floor bounds how often it can have anything new to
+//! send. The request offers an interval. A subscription built with
+//! [`negotiated`](StreamSubscription::negotiated) is served at the larger of
+//! the offer and the floor, and names both in the frame-interval and
+//! update-floor headers and in the handshake's metadata under
+//! [`HANDSHAKE_FRAME_INTERVAL`] and [`HANDSHAKE_UPDATE_FLOOR`]. Without it
+//! the offer is served as given, and only the headers name the interval and
+//! the floor.
+//!
+//! - A subscriber MUST take the served interval as the stream's interval,
+//!   and MUST offer at least the floor once it knows it (a reconnect).
+//! - A producer MAY refuse an offer below its floor, with a 400 naming the
+//!   floor, or MAY serve it at the floor. A
+//!   [`negotiated`](StreamSubscription::negotiated) subscription serves it at
+//!   the floor; a producer that refuses checks the offer against its floor
+//!   before building one.
+//!
+//! The two handshake keys are per connection: a subscriber that keeps a
+//! source's handshake metadata drops them.
 //!
 //! # No identity index
 //!
@@ -93,7 +113,9 @@ pub use frames::{
 };
 // The wire names and layouts are `metriken-model`'s, so a consumer can share
 // them without the registry; re-exported here for producers.
-pub use metriken_model::wire::{Layout, WireNames, WIRE_NAMES};
+pub use metriken_model::wire::{
+    Layout, WireNames, HANDSHAKE_FRAME_INTERVAL, HANDSHAKE_UPDATE_FLOOR, WIRE_NAMES,
+};
 pub use route::{
     Pass, PassStamp, Refusal, RegistryPass, RegistryPasses, StreamRequest, StreamSubscription,
 };

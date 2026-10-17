@@ -65,6 +65,13 @@ pub struct Behaviour {
     pub down: bool,
     /// How long `/metrics` takes to answer.
     pub delay: Duration,
+    /// The stream's update floor.
+    pub update_floor: Duration,
+    /// Leave the frame-interval header out, as a proxy that drops it.
+    pub drop_frame_interval: bool,
+    /// Negotiate the interval, as a producer on metriken-exposition 0.23.1
+    /// that opts in does; without it the offer is served as given.
+    pub negotiate: bool,
 }
 
 impl Default for Behaviour {
@@ -79,6 +86,9 @@ impl Default for Behaviour {
             prometheus: None,
             down: false,
             delay: Duration::ZERO,
+            update_floor: Duration::from_millis(10),
+            drop_frame_interval: false,
+            negotiate: true,
         }
     }
 }
@@ -124,6 +134,8 @@ pub struct Fake {
     state: Arc<Mutex<Behaviour>>,
     /// Requests served, of any path.
     pub hits: Arc<AtomicU64>,
+    /// The query string of each `/metrics/stream` request, in order.
+    pub stream_queries: Arc<Mutex<Vec<String>>>,
 }
 
 impl Fake {
@@ -136,12 +148,19 @@ impl Fake {
 pub async fn serve(behaviour: Behaviour) -> Fake {
     let state = Arc::new(Mutex::new(behaviour));
     let hits = Arc::new(AtomicU64::new(0));
+    let stream_queries = Arc::new(Mutex::new(Vec::new()));
     let subscriptions = Arc::new(AtomicU64::new(0));
     let router = {
-        let (state, hits) = (state.clone(), hits.clone());
+        let (state, hits, queries) = (state.clone(), hits.clone(), stream_queries.clone());
         axum::Router::new().fallback(move |uri: Uri| {
             let behaviour = state.lock().unwrap().clone();
             hits.fetch_add(1, Ordering::SeqCst);
+            if uri.path() == "/metrics/stream" {
+                queries
+                    .lock()
+                    .unwrap()
+                    .push(uri.query().unwrap_or("").to_string());
+            }
             let subscriptions = subscriptions.clone();
             async move {
                 if uri.path() == "/metrics" && !behaviour.delay.is_zero() {
@@ -160,6 +179,7 @@ pub async fn serve(behaviour: Behaviour) -> Fake {
         url: format!("http://{addr}/").parse().unwrap(),
         state,
         hits,
+        stream_queries,
     }
 }
 
@@ -238,15 +258,23 @@ fn stream(
     };
     let subscription = StreamSubscription::for_source(
         request,
-        Duration::from_millis(10),
+        b.update_floor,
         epoch.to_string(),
         wall_ns() as i64,
         b.labels.clone(),
         metadata,
     );
+    let subscription = if b.negotiate {
+        subscription.negotiated()
+    } else {
+        subscription
+    };
     // Rename the headers to the fake's wire names.
     let mut response = Response::builder().status(StatusCode::OK);
     for (name, value) in subscription.headers() {
+        if b.drop_frame_interval && name == WIRE_NAMES.frame_interval {
+            continue;
+        }
         let name = match name {
             "content-type" => header::CONTENT_TYPE.as_str(),
             n if n == WIRE_NAMES.frame_interval => b.names.frame_interval,

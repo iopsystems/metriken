@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use metriken_model::wire::{Layout, WIRE_NAMES};
+use metriken_model::wire::{Layout, HANDSHAKE_FRAME_INTERVAL, HANDSHAKE_UPDATE_FLOOR, WIRE_NAMES};
 use tracing::warn;
 
 use super::clock;
@@ -106,8 +106,9 @@ impl StreamRequest {
     /// leading `?`. Other parameters are ignored.
     ///
     /// Refuses with 400 a zero or malformed interval, an unknown layout, and
-    /// either parameter given twice. An interval below the producer's update
-    /// floor is accepted; most of its frames are empty.
+    /// either parameter given twice. The interval is the subscriber's offer:
+    /// a [`negotiated`](StreamSubscription::negotiated) subscription serves
+    /// at least the producer's update floor.
     pub fn parse(query: &str) -> Result<Self, Refusal> {
         let query = query.strip_prefix('?').unwrap_or(query);
         let mut interval = None;
@@ -190,7 +191,11 @@ fn percent_decode(s: &str) -> String {
 /// send. Synchronous and free of I/O. With feature `stream-tokio`,
 /// `into_stream` runs the timer and the fetch.
 pub struct StreamSubscription {
+    /// The request as served: its interval is the offer, or the negotiated
+    /// one after [`negotiated`](Self::negotiated).
     request: StreamRequest,
+    /// The interval the request offered.
+    offered: Duration,
     update_floor: Duration,
     producer: FrameProducer,
     /// Per stream, the end of the last window sent. A pass carries every
@@ -208,6 +213,8 @@ impl StreamSubscription {
     /// A subscription to this process: the source uuid and clock anchor are
     /// [`metriken::epoch`]'s (see [`FrameProducer::new`]). `update_floor` is
     /// how often a pass can be new, reported in the update-floor header.
+    /// The request's interval is served as given unless
+    /// [`negotiated`](Self::negotiated) is called.
     pub fn new(
         request: StreamRequest,
         update_floor: Duration,
@@ -243,6 +250,7 @@ impl StreamSubscription {
     ) -> Self {
         Self {
             request,
+            offered: request.interval,
             update_floor,
             producer,
             last_window: HashMap::new(),
@@ -251,7 +259,36 @@ impl StreamSubscription {
         }
     }
 
-    /// The request this subscription serves.
+    /// Negotiate the interval: serve the larger of the request's offer and
+    /// the update floor, and name the served interval and the floor in the
+    /// handshake's metadata ([`HANDSHAKE_FRAME_INTERVAL`],
+    /// [`HANDSHAKE_UPDATE_FLOOR`]) as well as the headers. Without it the
+    /// offer is served as given, and an offer below the floor gets mostly
+    /// empty frames. Call before [`opening`](Self::opening).
+    pub fn negotiated(mut self) -> Self {
+        debug_assert!(
+            !self.producer.has_sent_handshake(),
+            "negotiated after the handshake was sent"
+        );
+        self.request.interval = self.offered.max(self.update_floor);
+        self.producer.insert_metadata(
+            HANDSHAKE_FRAME_INTERVAL,
+            humantime::format_duration(self.request.interval).to_string(),
+        );
+        self.producer.insert_metadata(
+            HANDSHAKE_UPDATE_FLOOR,
+            humantime::format_duration(self.update_floor).to_string(),
+        );
+        self
+    }
+
+    /// The interval the request offered, before any negotiation.
+    pub fn offered_interval(&self) -> Duration {
+        self.offered
+    }
+
+    /// The request this subscription serves: the negotiated interval when
+    /// [`negotiated`](Self::negotiated) was called.
     pub fn request(&self) -> StreamRequest {
         self.request
     }
@@ -582,6 +619,7 @@ mod tests {
 
     #[test]
     fn headers_name_the_interval_floor_and_layout() {
+        // Without negotiation an offer below the floor is served as given.
         let sub = StreamSubscription::new(
             StreamRequest {
                 interval: Duration::from_millis(500),
@@ -603,6 +641,64 @@ mod tests {
                 ("x-metriken-layout", "long".to_string()),
             ]
         );
+    }
+
+    /// Without negotiation an offer is served as given, and the handshake
+    /// carries no stream keys.
+    #[test]
+    fn an_offer_is_served_as_given_without_negotiation() {
+        let mut sub = StreamSubscription::new(
+            StreamRequest {
+                interval: Duration::from_millis(500),
+                layout: Layout::Long,
+            },
+            Duration::from_secs(1),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(sub.request().interval, Duration::from_millis(500));
+        let dendro::replicate::Frame::Handshake { metadata, .. } = sub.producer.handshake() else {
+            panic!("not a handshake");
+        };
+        assert!(
+            !metadata.contains_key(HANDSHAKE_FRAME_INTERVAL)
+                && !metadata.contains_key(HANDSHAKE_UPDATE_FLOOR),
+            "{metadata:?}"
+        );
+    }
+
+    /// A negotiated offer below the update floor is served at the floor, and the
+    /// headers and the handshake say so; the offer is kept for the producer
+    /// to log.
+    #[test]
+    fn an_offer_below_the_floor_is_served_at_the_floor() {
+        let mut sub = StreamSubscription::new(
+            StreamRequest {
+                interval: Duration::from_millis(500),
+                layout: Layout::Long,
+            },
+            Duration::from_secs(1),
+            BTreeMap::new(),
+            BTreeMap::from([("version".to_string(), "1.0".to_string())]),
+        )
+        .negotiated();
+        assert_eq!(sub.request().interval, Duration::from_secs(1));
+        assert_eq!(sub.offered_interval(), Duration::from_millis(500));
+        assert!(sub
+            .headers()
+            .contains(&("x-metriken-frame-interval", "1s".to_string())));
+        // The next deadline is on the served interval's grid.
+        let t = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_250);
+        assert_eq!(
+            sub.next_deadline(t),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001)
+        );
+        let dendro::replicate::Frame::Handshake { metadata, .. } = sub.producer.handshake() else {
+            panic!("not a handshake");
+        };
+        assert_eq!(metadata[HANDSHAKE_FRAME_INTERVAL], "1s");
+        assert_eq!(metadata[HANDSHAKE_UPDATE_FLOOR], "1s");
+        assert_eq!(metadata["version"], "1.0");
     }
 
     #[test]

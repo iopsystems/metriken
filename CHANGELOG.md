@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.23.1
+
+- `StreamSubscription::negotiated` negotiates the stream interval. A
+  request's interval is an offer; a negotiated subscription serves the
+  larger of it and the producer's update floor, names the served interval
+  in the frame-interval header, and carries it and the floor in the
+  handshake's metadata under `metriken.frame_interval` and
+  `metriken.update_floor`. The keys are per connection: a subscriber that
+  keeps a source's handshake metadata drops them. Without `negotiated` the
+  offer is served as given, as in 0.23.0, so the served interval, the
+  headers and the handshake bytes of an existing producer do not change.
+  `StreamSubscription::offered_interval` is the offer. A producer that
+  refuses an offer below its floor instead checks it before building the
+  subscription. When metriken-recorder older than 0.3 offers a negotiating
+  producer less than its floor, it records the offer as
+  `sampling_interval_ms`, keeps the two `metriken.*` keys in the recording's
+  metadata, and drops the connection if the floor is longer than its
+  interval plus its timeout. rezolus's default floor (its 10 ms ttl) and the
+  recorder's 2 s minimum timeout keep the drop from happening at default
+  settings.
+
+### metriken-recorder 0.3.0
+
+- A streamed source runs at the interval its producer serves: the
+  frame-interval header, or the handshake's `metriken.frame_interval` when a
+  proxy dropped the header. Its recording's `sampling_interval_ms` is that
+  interval, a stream is dead after that interval plus the timeout, and the
+  wait for a frame after a wrapped command exits is at least as long. A
+  reconnect offers at least the update floor the producer named on the
+  last connection, and the served interval it answers with replaces the
+  old one. The handshake's `metriken.*` stream keys are kept out of the
+  recording's metadata. `Subscription::served_interval` is the interval
+  served, and `Handshake::served_interval` carries it with each
+  connection's handshake. `sampling_interval_ms` is written when the
+  recording is added, so a producer whose served interval changes at a
+  reconnect keeps the first.
+
+### metriken-model 0.1.3
+
+- `wire::HANDSHAKE_FRAME_INTERVAL` and `wire::HANDSHAKE_UPDATE_FLOOR`, the
+  handshake metadata keys for the negotiated interval and the update floor.
+
 ### metriken-query 0.40.0
 
 - A strided histogram call (`histogram_count(lat, 15)`,
