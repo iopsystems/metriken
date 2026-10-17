@@ -875,19 +875,43 @@ impl RezDb {
     /// `f` gets `&Self`, so it may call any reader here; it must not write
     /// through this handle, which is why this is not exposed as a general
     /// transaction.
+    ///
+    /// Re-entrant: called inside a snapshot, `f` runs in that one rather
+    /// than failing on SQLite's "cannot start a transaction within a
+    /// transaction".
     pub fn read_snapshot<T>(
         &self,
         f: impl FnOnce(&Self) -> Result<T, String>,
     ) -> Result<T, String> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
         self.conn
             .execute_batch("BEGIN DEFERRED")
             .map_err(|e| format!("failed to open a read snapshot: {e}"))?;
+
+        /// Ends the snapshot however `f` leaves, including by unwinding.
+        ///
+        /// Ending it on the line after `f(self)` misses a panic in `f`: the
+        /// `BEGIN DEFERRED` stays open, and the re-entrancy check above then
+        /// runs every later snapshot on this connection inside the stale one.
+        /// The reader recovers its catalog lock from poisoning, so one
+        /// panicking read would leave every later read on that handle at the
+        /// old snapshot, and a live archive's checkpoints could not copy past
+        /// it.
+        ///
+        /// `f` only reads, so `ROLLBACK` releases the same snapshot `COMMIT`
+        /// would.
+        struct EndSnapshot<'a>(&'a Connection);
+        impl Drop for EndSnapshot<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.execute_batch("ROLLBACK");
+            }
+        }
+
+        let guard = EndSnapshot(&self.conn);
         let out = f(self);
-        // Read-only either way, so the outcome of ending it cannot change what
-        // was read; the snapshot simply has to be released.
-        let _ = self
-            .conn
-            .execute_batch(if out.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        drop(guard);
         out
     }
 

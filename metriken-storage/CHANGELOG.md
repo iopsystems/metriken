@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Catalog::read_snapshot`, which runs a closure with every read it makes
+  inside one read snapshot, and `Catalog::segment_bytes_matching`, which
+  fetches a sealed segment only while its number still names the listed
+  row count and span. Both have defaults, so other implementations still
+  compile: no snapshot, and a fetch that checks the table's whole segment
+  list. `DendroCatalog` and `RezDb` implement both.
+
+### Changed
+
+- `RezDb::read_snapshot` is re-entrant: called inside a snapshot, it runs
+  the closure in that snapshot.
+
+### Fixed
+
+- A table first queried while a writer sealed it could lose the sealed
+  rows: its segment list and live WAL were read as separate statements, and
+  a seal committing between them left its rows in neither. They are read in
+  one snapshot.
+- A table's view could return rows twice when a sequence number it listed
+  named another segment by the time it was fetched, as after a writer
+  reopened on the archive renumbers a stream whose segments were all
+  evicted. Such a segment now reads as gone.
+- A table whose first seal committed while `ArchiveReader::from_catalog`
+  opened the archive could be missing from the reader: its segment list and
+  live WAL were read as separate statements, and the seal left it with no
+  rows in either. Each source's catalog reads at open run in one snapshot.
+- A long table could open without the labels of occupants whose rows a
+  seal of its occupant stream moved while the stream was read. The
+  stream's segment list and live WAL are read in one snapshot.
+- `RezDb::read_snapshot` left its transaction open when the closure
+  panicked: later reads on that connection saw the old snapshot, later
+  `read_snapshot` calls failed, and a live `.rez` could not checkpoint past
+  it. The transaction is now ended on unwind as well.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added

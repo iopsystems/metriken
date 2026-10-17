@@ -83,8 +83,56 @@ pub trait Catalog: Send {
         seq: u64,
     ) -> Result<Option<Vec<u8>>, String>;
 
+    /// Sealed segment `seq`'s bytes, if it is still the segment `meta`
+    /// describes; `None` when it no longer exists or the number now names
+    /// another segment.
+    ///
+    /// A number can be reused: dendro's compaction gives a merged segment
+    /// the number of the first segment it replaced, and a writer reopened on
+    /// an archive numbers a stream whose every segment was evicted from 0
+    /// again. A reader that listed `(seq, meta)` and fetched by `seq` alone
+    /// could get rows it already holds from elsewhere.
+    ///
+    /// The default reads [`segment_meta`](Self::segment_meta) and
+    /// [`segment_bytes`](Self::segment_bytes) inside one
+    /// [`read_snapshot`](Self::read_snapshot); the catalog-only read is of
+    /// every segment of the table, so a container that can match one
+    /// segment in a single statement should.
+    fn segment_bytes_matching(
+        &self,
+        source_id: i64,
+        table: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let mut out = Ok(None);
+        self.read_snapshot(&mut || {
+            if self.segment_meta(source_id, table)?.contains(&(seq, *meta)) {
+                out = self.segment_bytes(source_id, table, seq);
+            }
+            Ok(())
+        })?;
+        out
+    }
+
     /// A table's WAL rows newer than its last sealed segment.
     fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String>;
+
+    /// Run `f`, with every read it makes through this catalog inside one
+    /// read snapshot of the container, so they agree with each other while
+    /// a writer commits.
+    ///
+    /// [`segment_meta`](Self::segment_meta) then
+    /// [`live_wal`](Self::live_wal) needs this: a seal that commits between
+    /// them puts its segment after the first read, and the watermark it
+    /// installed hides its rows from the second, so they are in neither.
+    ///
+    /// Re-entrant: inside a snapshot, `f` runs in that one. The default runs
+    /// `f` with no snapshot, which is right only for a container nothing
+    /// writes while it is read, such as an archive held as bytes.
+    fn read_snapshot(&self, f: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+        f()
+    }
 
     /// Each sealed segment's caller index, by sequence number, without the
     /// payload: `None` where a segment has none. A container that keeps no
@@ -231,6 +279,46 @@ impl Catalog for DendroCatalog {
         self.0
             .read_segment_bytes(source_id, table, seq)
             .map_err(err)
+    }
+
+    fn segment_bytes_matching(
+        &self,
+        source_id: i64,
+        table: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+    ) -> Result<Option<Vec<u8>>, String> {
+        // One statement, so the catalog row and the bytes are one instant's.
+        // Usually only the segment itself overlaps its own span; a segment
+        // that replaced it overlaps it too and is told apart by its meta.
+        for s in self
+            .0
+            .segments_overlapping(source_id, table, bound(meta.first_ts), bound(meta.last_ts))
+            .map_err(err)?
+        {
+            if s.seq == seq
+                && s.meta.rows == meta.rows
+                && ts(s.meta.first_ts)? == meta.first_ts
+                && ts(s.meta.last_ts)? == meta.last_ts
+            {
+                return Ok(Some(s.bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_snapshot(&self, f: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+        // dendro's snapshot is on this archive's connection, which every
+        // method here reads through. Its closure must return dendro's error,
+        // so `f`'s is carried out beside it.
+        let mut out = Ok(());
+        self.0
+            .read_snapshot(|_| {
+                out = f();
+                Ok(())
+            })
+            .map_err(err)?;
+        out
     }
 
     fn segment_indexes(&self, source_id: i64, table: &str) -> Result<Vec<SegmentIndex>, String> {

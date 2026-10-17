@@ -18,6 +18,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pass is now built at most once per three quarters of the floor, on the
   clock of the callers' `now`.
 
+### metriken-storage 0.3.1
+
+- **Fixed:** a table first queried while a writer sealed it could lose the
+  sealed rows. `DbSegmentStore::build` read the table's segment list and
+  its live WAL as separate statements, so a seal committing between them
+  put its segment after the list and hid its rows from the WAL read by the
+  watermark it installed. Both reads now run in one read snapshot, through
+  the new `Catalog::read_snapshot`, which `DendroCatalog` and `RezDb`
+  implement. Reproduced on a dendro archive: a seal of ticks 5 to 9
+  between the two reads left the view with ticks 0 to 4 of 0 to 8.
+- **Fixed:** a table's view could return rows twice when a sequence number
+  it listed named another segment by the time it fetched it. A fetch now
+  goes through the new `Catalog::segment_bytes_matching`, which returns the
+  bytes only while the number still names the listed row count and span,
+  and otherwise reports the segment as gone. Reproduced with a dendro
+  writer reopened on the archive (`Writer::open`, `resume_source`) after
+  retention evicted every segment of a stream: its next seal is segment 0
+  again, and the view read ticks 5 to 8 from it and from its own live tail.
+  Compaction, which keeps the first replaced segment's number, cannot run
+  while a view holds the file (`ArchiveMut::open` is refused). A
+  `Catalog` implemented outside this crate gets defaults: no snapshot, and
+  a matching fetch that reads every segment's catalog row of the table.
+- **Fixed:** a table whose first seal committed while
+  `ArchiveReader::from_catalog` opened the archive could be missing from
+  the reader for as long as it was open. The open read the table's segment
+  list (still empty) and its live WAL (emptied by the seal) as separate
+  statements, so the table had no rows to probe and was skipped. Each
+  source's catalog reads at open now run in one read snapshot.
+- **Fixed:** a long table could open without the labels of occupants whose
+  rows a seal of its occupant stream moved while the stream was read: the
+  stream's segment list and live WAL were separate statements. They are
+  read in one snapshot, and its segments are fetched by their listed entry.
+- **Fixed:** `RezDb::read_snapshot` left its transaction open when the
+  closure panicked: later reads on that connection saw the old snapshot,
+  later `read_snapshot` calls failed, and a live `.rez` could not
+  checkpoint past it. The transaction is now ended on unwind as well.
+
 ### metriken-exposition 0.23.1
 
 - `StreamSubscription::negotiated` negotiates the stream interval. A
