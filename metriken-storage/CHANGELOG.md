@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Catalog::read_snapshot`, which runs a closure with every read it makes
+  inside one read snapshot, and `Catalog::segment_bytes_matching`, which
+  fetches a sealed segment only while its number still names the listed
+  row count and span. Both have defaults, so other implementations still
+  compile: no snapshot, and a fetch that checks the table's whole segment
+  list. `DendroCatalog` and `RezDb` implement both; `RezDb::read_snapshot`
+  is re-entrant.
+
+### Fixed
+
+- A table first queried while a writer sealed it could lose the sealed
+  rows: its segment list and live WAL were read as separate statements, and
+  a seal committing between them left its rows in neither. They are read in
+  one snapshot.
+- A table's view could return rows twice when a sequence number it listed
+  named another segment by the time it was fetched, as after a writer
+  reopened on the archive renumbers a stream whose segments were all
+  evicted. Such a segment now reads as gone.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added

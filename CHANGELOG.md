@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.3.1
+
+- **Fixed:** a table first queried while a writer sealed it could lose the
+  sealed rows. `DbSegmentStore::build` read the table's segment list and
+  its live WAL as separate statements, so a seal committing between them
+  put its segment after the list and hid its rows from the WAL read by the
+  watermark it installed. Both reads now run in one read snapshot, through
+  the new `Catalog::read_snapshot`, which `DendroCatalog` and `RezDb`
+  implement. Reproduced on a dendro archive: a seal of ticks 5 to 9
+  between the two reads left the view with ticks 0 to 4 of 0 to 8.
+- **Fixed:** a table's view could return rows twice when a sequence number
+  it listed named another segment by the time it fetched it. A fetch now
+  goes through the new `Catalog::segment_bytes_matching`, which returns the
+  bytes only while the number still names the listed row count and span,
+  and otherwise reports the segment as gone. Reproduced with a dendro
+  writer reopened on the archive (`Writer::open`, `resume_source`) after
+  retention evicted every segment of a stream: its next seal is segment 0
+  again, and the view read ticks 5 to 8 from it and from its own live tail.
+  Compaction, which keeps the first replaced segment's number, cannot run
+  while a view holds the file (`ArchiveMut::open` is refused). A
+  `Catalog` implemented outside this crate gets defaults: no snapshot, and
+  a matching fetch that reads every segment's catalog row of the table.
+
 ### metriken-exposition 0.23.1
 
 - `StreamSubscription::negotiated` negotiates the stream interval. A

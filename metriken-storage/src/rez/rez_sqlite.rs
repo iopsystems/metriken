@@ -875,10 +875,17 @@ impl RezDb {
     /// `f` gets `&Self`, so it may call any reader here; it must not write
     /// through this handle, which is why this is not exposed as a general
     /// transaction.
+    ///
+    /// Re-entrant: called inside a snapshot, `f` runs in that one rather
+    /// than failing on SQLite's "cannot start a transaction within a
+    /// transaction".
     pub fn read_snapshot<T>(
         &self,
         f: impl FnOnce(&Self) -> Result<T, String>,
     ) -> Result<T, String> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
         self.conn
             .execute_batch("BEGIN DEFERRED")
             .map_err(|e| format!("failed to open a read snapshot: {e}"))?;

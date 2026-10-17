@@ -269,6 +269,9 @@ struct DbSegmentStore {
     recording_id: i64,
     sampler: String,
     seqs: Vec<u64>,
+    /// Each sealed segment's catalog entry, in `seqs` order: a fetch returns
+    /// a segment's bytes only while its number still names this entry.
+    metas: Vec<crate::catalog::SegmentMeta>,
     /// Each sealed segment's [`segment_key`], in `seqs` order.
     keys: Vec<u64>,
     tail: Option<bytes::Bytes>,
@@ -307,33 +310,60 @@ fn live_tail(
     }
 }
 
+/// `f`, with every read it makes through `db` inside one
+/// [`read_snapshot`](Catalog::read_snapshot).
+fn in_snapshot<T, E: From<String>>(
+    db: &dyn Catalog,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut f = Some(f);
+    let mut out = None;
+    db.read_snapshot(&mut || {
+        if let Some(f) = f.take() {
+            out = Some(f());
+        }
+        Ok(())
+    })?;
+    out.unwrap_or_else(|| {
+        Err(E::from(
+            "the catalog's read_snapshot did not run".to_string(),
+        ))
+    })
+}
+
 impl DbSegmentStore {
     fn build(
         db: DbHandle,
         recording_id: i64,
         sampler: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (seqs, keys, tail) = db
+        // One snapshot: a seal committing between the segment list and the
+        // WAL read would leave its rows in neither.
+        let (listed, tail) = db
             .with(|db| {
-                let (seqs, keys): (Vec<u64>, Vec<u64>) = db
-                    .segment_meta(recording_id, sampler)?
-                    .into_iter()
-                    .map(|(seq, meta)| (seq, segment_key(seq, &meta)))
-                    .unzip();
-                let long = db
-                    .tables(recording_id)?
-                    .contains(&crate::occupants::stream_of(sampler));
-                let tail = live_tail(db, recording_id, sampler, long)
-                    .map_err(|e| e.to_string())?
-                    .map(|t| bytes::Bytes::from(t.bytes));
-                Ok((seqs, keys, tail))
+                in_snapshot(db, || {
+                    let listed = db.segment_meta(recording_id, sampler)?;
+                    let long = db
+                        .tables(recording_id)?
+                        .contains(&crate::occupants::stream_of(sampler));
+                    let tail = live_tail(db, recording_id, sampler, long)
+                        .map_err(|e| e.to_string())?
+                        .map(|t| bytes::Bytes::from(t.bytes));
+                    Ok::<_, String>((listed, tail))
+                })
             })
             .map_err(|e| e.to_string())?;
+        let keys = listed
+            .iter()
+            .map(|(seq, meta)| segment_key(*seq, meta))
+            .collect();
+        let (seqs, metas) = listed.into_iter().unzip();
         Ok(Self {
             db,
             recording_id,
             sampler: sampler.to_string(),
             seqs,
+            metas,
             keys,
             tail,
         })
@@ -353,10 +383,13 @@ impl crate::SegmentStore for DbSegmentStore {
     fn bytes(&self, idx: usize) -> crate::SegmentBytes {
         match self.seqs.get(idx) {
             Some(seq) => {
-                let seq = *seq;
-                let bytes = self
-                    .db
-                    .with(|db| db.segment_bytes(self.recording_id, &self.sampler, seq))?;
+                let (seq, meta) = (*seq, self.metas[idx]);
+                // By the listed entry, not the number alone: a number reused
+                // since the listing names a segment whose rows may already be
+                // in this view's tail. That segment reads as gone.
+                let bytes = self.db.with(|db| {
+                    db.segment_bytes_matching(self.recording_id, &self.sampler, seq, &meta)
+                })?;
                 Ok(bytes.map(bytes::Bytes::from))
             }
             None if idx == self.seqs.len() => Ok(self.tail.clone()),

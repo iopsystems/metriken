@@ -122,6 +122,30 @@ impl Catalog for RezDb {
         self.read_segment_bytes(source_id, table, seq)
     }
 
+    fn segment_bytes_matching(
+        &self,
+        source_id: i64,
+        table: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+    ) -> Result<Option<Vec<u8>>, String> {
+        // One statement, as in `DendroCatalog`'s.
+        Ok(self
+            .segments_overlapping(source_id, table, meta.first_ts, meta.last_ts)?
+            .into_iter()
+            .find(|s| {
+                s.seq == seq
+                    && s.meta.rows == meta.rows
+                    && s.meta.first_ts == meta.first_ts
+                    && s.meta.last_ts == meta.last_ts
+            })
+            .map(|s| s.bytes))
+    }
+
+    fn read_snapshot(&self, f: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+        RezDb::read_snapshot(self, |_| f())
+    }
+
     fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String> {
         Ok(RezDb::live_wal(self, source_id, table)?
             .into_iter()
@@ -172,5 +196,87 @@ fn span(s: crate::rez::rez_sqlite::Span) -> Span {
         rows: s.rows,
         first_ts: s.first_ts,
         last_ts: s.last_ts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rez::rez_sqlite::{RecordingMeta, SegmentMeta as RezMeta};
+
+    fn archive(dir: &Path) -> (RezDb, i64) {
+        let db = RezDb::create(&dir.join("t.rez")).unwrap();
+        let rid = db
+            .insert_recording(&RecordingMeta {
+                labels: Default::default(),
+                metadata: Default::default(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        (db, rid)
+    }
+
+    /// A number that names another segment than the one listed reads as gone.
+    #[test]
+    fn segment_bytes_matching_refuses_a_reused_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, rid) = archive(dir.path());
+        let first = RezMeta {
+            rows: 5,
+            first_ts: 0,
+            last_ts: 4,
+        };
+        db.insert_segment(rid, "cpu", 0, &first, b"first").unwrap();
+        let listed = SegmentMeta {
+            rows: 5,
+            first_ts: 0,
+            last_ts: 4,
+        };
+        let fetch = |db: &RezDb| Catalog::segment_bytes_matching(db, rid, "cpu", 0, &listed);
+        assert_eq!(fetch(&db).unwrap().as_deref(), Some(&b"first"[..]));
+
+        db.evict_before(rid, 5).unwrap();
+        let renumbered = RezMeta {
+            rows: 4,
+            first_ts: 5,
+            last_ts: 8,
+        };
+        db.insert_segment(rid, "cpu", 0, &renumbered, b"renumbered")
+            .unwrap();
+        assert_eq!(
+            Catalog::segment_bytes(&db, rid, "cpu", 0)
+                .unwrap()
+                .as_deref(),
+            Some(&b"renumbered"[..])
+        );
+        assert_eq!(fetch(&db).unwrap(), None);
+
+        // Compaction's shape: the number kept, the span widened over the
+        // listed one.
+        db.evict_before(rid, 9).unwrap();
+        let merged = RezMeta {
+            rows: 15,
+            first_ts: 0,
+            last_ts: 14,
+        };
+        db.insert_segment(rid, "cpu", 0, &merged, b"merged")
+            .unwrap();
+        assert_eq!(fetch(&db).unwrap(), None);
+    }
+
+    /// A snapshot opened inside another runs in it rather than failing.
+    #[test]
+    fn read_snapshot_is_reentrant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = archive(dir.path());
+        let mut inner_ran = false;
+        Catalog::read_snapshot(&db, &mut || {
+            Catalog::read_snapshot(&db, &mut || {
+                inner_ran = true;
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert!(inner_ran);
     }
 }
