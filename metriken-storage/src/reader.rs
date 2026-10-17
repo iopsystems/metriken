@@ -154,18 +154,20 @@ fn table_probes(
     long: bool,
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut probes = Vec::new();
-    if let Some((first, meta)) = sealed.first() {
+    if let Some((first, _)) = sealed.first() {
         let fingerprints: HashMap<u64, u64> = db
             .segment_indexes(recording_id, table)?
             .into_iter()
             .filter_map(|(seq, index)| Some((seq, crate::names::fingerprint(index.as_deref())?)))
             .collect();
         let mut seen: HashSet<u64> = fingerprints.get(first).copied().into_iter().collect();
-        probes.extend(db.segment_bytes_matching(recording_id, table, *first, meta)?);
-        for (seq, meta) in &sealed[1..] {
+        // By number: this runs inside the open's snapshot, where a listed
+        // number still names the listed segment.
+        probes.extend(db.segment_bytes(recording_id, table, *first)?);
+        for (seq, _) in &sealed[1..] {
             if let Some(fp) = fingerprints.get(seq) {
                 if seen.insert(*fp) {
-                    probes.extend(db.segment_bytes_matching(recording_id, table, *seq, meta)?);
+                    probes.extend(db.segment_bytes(recording_id, table, *seq)?);
                 }
             }
         }
@@ -337,8 +339,8 @@ impl DbSegmentStore {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // One snapshot: a seal committing between the segment list and the
         // WAL read would leave its rows in neither. The tail is encoded after
-        // the snapshot ends, so a live archive's checkpoints wait only for
-        // the reads.
+        // the snapshot ends, so a checkpoint of a live archive is held back
+        // only while the reads run.
         let (listed, rows, long) = db
             .with(|db| {
                 in_snapshot(db, || {
@@ -456,7 +458,8 @@ impl SegmentSource {
         known: &OccupantSegments,
     ) -> Result<(Vec<Occupant>, OccupantSegments), Box<dyn std::error::Error>> {
         // One snapshot: a seal committing between the segment list and the
-        // WAL read would leave the occupants it moved in neither.
+        // WAL read would leave the occupants it moved in neither. Occupant
+        // segments not already known are decoded inside it.
         let read = |db: &dyn Catalog, recording_id: i64| -> Result<_, Box<dyn std::error::Error>> {
             in_snapshot(db, || {
                 let mut out = Vec::new();

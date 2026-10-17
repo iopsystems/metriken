@@ -897,7 +897,8 @@ impl RezDb {
         /// runs every later snapshot on this connection inside the stale one.
         /// The reader recovers its catalog lock from poisoning, so one
         /// panicking read would leave every later read on that handle at the
-        /// old snapshot, and a live archive's checkpoints blocked behind it.
+        /// old snapshot, and a live archive's checkpoints could not copy past
+        /// it.
         ///
         /// `f` only reads, so `ROLLBACK` releases the same snapshot `COMMIT`
         /// would.

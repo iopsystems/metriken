@@ -14,8 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetches a sealed segment only while its number still names the listed
   row count and span. Both have defaults, so other implementations still
   compile: no snapshot, and a fetch that checks the table's whole segment
-  list. `DendroCatalog` and `RezDb` implement both; `RezDb::read_snapshot`
-  is re-entrant.
+  list. `DendroCatalog` and `RezDb` implement both.
+
+### Changed
+
+- `RezDb::read_snapshot` is re-entrant: called inside a snapshot, it runs
+  the closure in that snapshot.
 
 ### Fixed
 
@@ -35,8 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seal of its occupant stream moved while the stream was read. The
   stream's segment list and live WAL are read in one snapshot.
 - `RezDb::read_snapshot` left its transaction open when the closure
-  panicked, so every later snapshot on that connection ran inside the stale
-  one. The transaction is now ended on unwind as well.
+  panicked: later reads on that connection saw the old snapshot, later
+  `read_snapshot` calls failed, and a live `.rez` could not checkpoint past
+  it. The transaction is now ended on unwind as well.
 
 ## [0.3.0] - 2026-10-15
 
