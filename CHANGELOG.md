@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.23.2
+
+- `RegistryPasses` reuses a pass for three quarters of its floor, where it
+  reused it for the whole floor. A subscriber served at an interval equal
+  to the floor (as `StreamSubscription::negotiated` serves an offer below
+  it) wakes about one floor after its last pass, a little early or late,
+  and an early wake was handed that pass again and sent an empty frame:
+  cachecannon measured 35% of frames empty at its 10 ms floor. Per layout,
+  a pass is now built at most once per three quarters of the floor, on the
+  clock of the callers' `now`.
+
 ### metriken-storage 0.3.1
 
 - **Fixed:** a table first queried while a writer sealed it could lose the
