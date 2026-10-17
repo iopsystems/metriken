@@ -26,8 +26,10 @@
 //!
 //! # The interval can be negotiated
 //!
-//! The producer's update floor bounds how often it can have anything new to
-//! send. The request offers an interval. A subscription built with
+//! The producer's update floor is the smallest interval a negotiated
+//! subscription is served at. [`RegistryPasses`] reuses a pass for three
+//! quarters of its floor, so a request within that of the last pass's `now`
+//! gets the same pass and an empty frame. The request offers an interval. A subscription built with
 //! [`negotiated`](StreamSubscription::negotiated) is served at the larger of
 //! the offer and the floor, and names both in the frame-interval and
 //! update-floor headers and in the handshake's metadata under

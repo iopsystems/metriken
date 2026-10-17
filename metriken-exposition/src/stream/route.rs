@@ -212,7 +212,7 @@ pub struct StreamSubscription {
 impl StreamSubscription {
     /// A subscription to this process: the source uuid and clock anchor are
     /// [`metriken::epoch`]'s (see [`FrameProducer::new`]). `update_floor` is
-    /// how often a pass can be new, reported in the update-floor header.
+    /// reported in the update-floor header.
     /// The request's interval is served as given unless
     /// [`negotiated`](Self::negotiated) is called.
     pub fn new(
@@ -263,8 +263,9 @@ impl StreamSubscription {
     /// the update floor, and name the served interval and the floor in the
     /// handshake's metadata ([`HANDSHAKE_FRAME_INTERVAL`],
     /// [`HANDSHAKE_UPDATE_FLOOR`]) as well as the headers. Without it the
-    /// offer is served as given, and an offer below the floor gets mostly
-    /// empty frames. Call before [`opening`](Self::opening).
+    /// offer is served as given, and an offer below the floor gets empty
+    /// frames whenever the producer reuses a pass. Call
+    /// before [`opening`](Self::opening).
     pub fn negotiated(mut self) -> Self {
         debug_assert!(
             !self.producer.has_sent_handshake(),
@@ -376,8 +377,8 @@ impl StreamSubscription {
         let frame = match pass {
             Some(pass) => {
                 let stamp = pass.stamp();
-                // The same pass as last time, reached when the interval is
-                // shorter than the update floor: nothing in it can be new.
+                // The same pass as last time: the producer served this wake
+                // from the pass already sent, so nothing in it can be new.
                 let advanced = self.last_sent_wall != Some(stamp.wall_ns);
                 self.last_sent_wall = Some(stamp.wall_ns);
 
@@ -436,8 +437,9 @@ type ExtraFn = dyn Fn() -> Vec<ExtraGroup> + Send + Sync;
 /// metriken registry.
 ///
 /// A pass is built and encoded under a mutex and shared by every
-/// subscription that asks within the freshness floor of it; one pass is kept
-/// per layout. The wide layout is [`GroupBuilder::build_groups`], the long
+/// subscription that asks within three quarters of the freshness floor of
+/// it ([`new`](Self::new) says why); one pass is kept per layout. The wide
+/// layout is [`GroupBuilder::build_groups`], the long
 /// [`GroupBuilder::build_stream`], each with the groups the extra callback
 /// returns. A pass is stamped when it is built ([`Stamp::now`]).
 pub struct RegistryPasses<R: Router, N: MemberNames = Positional> {
@@ -461,14 +463,17 @@ struct LayoutState {
 }
 
 impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
-    /// Passes over `builder`, each reused for `floor` after it is built.
-    /// `floor` is what a subscription reports as its update floor.
+    /// Passes over `builder`, each reused for three quarters of `floor`
+    /// after it is built. `floor` is what a subscription reports as its
+    /// update floor.
     ///
-    /// Choose a floor well below the shortest interval served (rezolus uses
-    /// 10 ms under 1 s intervals). A pass is reused while a caller's clock is
-    /// within the floor of the build, so with an interval equal to the floor,
-    /// wake-time jitter can hand a subscriber the previous boundary's pass and
-    /// it sends an empty frame for that interval.
+    /// The quarter is margin for wake-time jitter: a subscriber served at an
+    /// interval equal to the floor wakes about one floor after the pass it
+    /// was last sent, a little early or late, and reusing for the whole
+    /// floor would hand an early waker that pass again, so it would send an
+    /// empty frame. Per layout, a pass is built at most once per three
+    /// quarters of the floor of the callers' `now`, so two requests that far
+    /// apart cause two builds.
     pub fn new(builder: GroupBuilder<R, N>, floor: Duration) -> Self {
         Self {
             state: Mutex::new(PassState {
@@ -496,11 +501,12 @@ impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
         self.floor
     }
 
-    /// The pass for `layout` at `now`: the last one when `now` is within the
-    /// floor of the `now` it was built for, on either side, otherwise a new
-    /// one. Subscribers that wake at one boundary read slightly different
-    /// clocks, so a `now` just before the cached one shares the pass. `None`
-    /// when a group fails to encode, which is logged.
+    /// The pass for `layout` at `now`: the last one when `now` is within
+    /// three quarters of the floor of the `now` it was built for, on either
+    /// side, otherwise a new one. Subscribers that wake at one boundary read
+    /// slightly different clocks, so a `now` just before the cached one
+    /// shares the pass. `None` when a group fails to encode, which is
+    /// logged.
     pub fn pass(&self, layout: Layout, now: SystemTime) -> Option<RegistryPass> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let PassState {
@@ -513,9 +519,10 @@ impl<R: Router, N: MemberNames> RegistryPasses<R, N> {
             Layout::Long => long,
         };
         if let Some((built, pass)) = &cached.last {
+            let reuse = self.floor - self.floor / 4;
             let fresh = match now.duration_since(*built) {
-                Ok(age) => age < self.floor,
-                Err(e) => e.duration() < self.floor,
+                Ok(age) => age < reuse,
+                Err(e) => e.duration() < reuse,
             };
             if fresh {
                 return Some(Arc::clone(pass));
