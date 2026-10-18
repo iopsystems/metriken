@@ -32,8 +32,6 @@ humantime = "2"
 metriken-model = { version = "0.1.3", path = "../metriken-model" }
 metriken-storage = { version = "0.3.0", path = "../metriken-storage", default-features = false, features = ["write"] }
 metriken-types = { version = "0.1.0", path = "../metriken-types" }
-prometheus-parse = "0.2.5"
-chrono = { version = "0.4.44", default-features = false, features = ["std"] }
 serde_json.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
 tokio-util = { version = "0.7", default-features = false }
@@ -55,12 +53,19 @@ metriken-storage = { path = "../metriken-storage", features = ["write"] }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
+# `scrape_log`: what a scrape's warning reads like in tracing-subscriber's
+# default format, the one a binary such as rezolus installs.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [package.metadata.docs.rs]
 all-features = true
 
 [[test]]
 name = "recorder"
+required-features = ["http"]
+
+[[test]]
+name = "scrape_log"
 required-features = ["http"]
 
 [[test]]

@@ -115,6 +115,10 @@ async-trait, tracing, humantime,
 serde_json and prometheus-parse; `http` adds reqwest and url. It does not
 depend on `metriken` or `metriken-exposition`.
 
+2026-10-17: prometheus-parse was replaced by the crate's own exposition
+parser (`exposition.rs`) in metriken-recorder 0.3.1, because it dropped or
+cut label values containing `=`, `,` or `}`.
+
 - **Wire types move to metriken-model.** `WireNames`, `WIRE_NAMES` and
   `Layout` move to metriken-model; exposition re-exports them at their
   current paths (no release-after removal: producers keep importing from

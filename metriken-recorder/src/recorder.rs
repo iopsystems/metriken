@@ -1934,11 +1934,15 @@ impl Driver {
             };
             self.slots[i].delivered(wall);
             let pinned = self.slots[i].pinned.contains(keys::DESCRIPTIONS);
+            // The converter's own logs (a skipped line) name the endpoint
+            // through this span; it has no other way to know it.
+            let span = tracing::warn_span!("scrape", endpoint = %self.slots[i].label());
             let (snapshot, descriptions) = match &mut self.slots[i].kind {
                 Kind::Endpoint(ep) => match &mut ep.mode {
                     Mode::Scraped { converter, .. } => {
                         let text = String::from_utf8_lossy(&body);
-                        let snapshot = converter.convert(&text, request_ns, response_ns);
+                        let snapshot =
+                            span.in_scope(|| converter.convert(&text, request_ns, response_ns));
                         let pending = converter.pending_descriptions();
                         if pending.is_some() && pinned {
                             converter.descriptions_stored();
