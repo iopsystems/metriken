@@ -78,6 +78,13 @@ pub(crate) struct Scrape {
     /// `# HELP` text by metric name, last seen wins.
     pub docs: HashMap<String, String>,
     pub samples: Vec<Sample>,
+    /// Sample lines that were skipped: a malformed name or label block, a
+    /// value that is not a number, or a histogram or summary line without a
+    /// parseable `le`/`quantile`.
+    pub skipped: usize,
+    /// The first skipped line, trimmed, after colons in the metric name
+    /// became underscores.
+    pub first_skipped: Option<String>,
 }
 
 impl Scrape {
@@ -91,6 +98,12 @@ impl Scrape {
         // keyed by (line's metric name, labels without `le`/`quantile`).
         let mut grouped: Vec<Sample> = Vec::new();
         let mut grouped_index: HashMap<(String, Vec<(String, String)>), usize> = HashMap::new();
+        let mut skipped = 0;
+        let mut first_skipped = None;
+        let mut skip = |line: &str| {
+            skipped += 1;
+            first_skipped.get_or_insert_with(|| line.to_string());
+        };
 
         for line in text.lines() {
             let line = line.trim();
@@ -116,10 +129,13 @@ impl Scrape {
                 }
                 continue;
             }
-            let Some(line) = parse_sample_line(line) else {
+            let text = line;
+            let Some(line) = parse_sample_line(text) else {
+                skip(text);
                 continue;
             };
             let Ok(value) = parse_golang_float(line.value) else {
+                skip(text);
                 continue;
             };
             let kind = types.get(line.name).copied();
@@ -134,10 +150,12 @@ impl Scrape {
             if let Some(key_label) = grouping {
                 let mut labels = line.labels;
                 let Some(pos) = labels.iter().position(|(k, _)| k == key_label) else {
+                    skip(text);
                     continue;
                 };
                 let (_, bound) = labels.remove(pos);
                 let Ok(bound) = parse_golang_float(&bound) else {
+                    skip(text);
                     continue;
                 };
                 let key = (line.name.to_string(), labels);
@@ -182,7 +200,12 @@ impl Scrape {
             });
         }
         samples.extend(grouped);
-        Scrape { docs, samples }
+        Scrape {
+            docs,
+            samples,
+            skipped,
+            first_skipped,
+        }
     }
 }
 
@@ -195,8 +218,8 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Split off a leading run of word characters (`\w+`), returning it and the
-/// rest, or `None` when there is none.
+/// Split off a leading run of letters, digits and `_` (`char::is_alphanumeric`),
+/// returning it and the rest, or `None` when there is none.
 fn take_word(s: &str) -> Option<(&str, &str)> {
     let end = s.find(|c: char| !is_word(c)).unwrap_or(s.len());
     (end > 0).then(|| s.split_at(end))
@@ -260,16 +283,19 @@ fn parse_labels(s: &str) -> Option<(Vec<(String, String)>, &str)> {
     let mut rest = s.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix('}') {
+            // A repeated name is invalid exposition; the last value wins, as
+            // it did when labels were collected into a map. Reversed, then a
+            // stable sort, puts each name's last occurrence first, and
+            // `dedup_by` keeps the first of each run.
+            labels.reverse();
             labels.sort_by(|a, b| a.0.cmp(&b.0));
+            labels.dedup_by(|a, b| a.0 == b.0);
             return Some((labels, after));
         }
         let (name, after) = take_word(rest)?;
         let after = after.trim_start().strip_prefix('=')?;
         let after = after.trim_start().strip_prefix('"')?;
         let (value, after) = parse_quoted(after)?;
-        // A repeated name is invalid exposition; the last value wins, as it
-        // did when labels were collected into a map.
-        labels.retain(|(k, _)| k != name);
         labels.push((name.to_string(), value));
         rest = after.trim_start();
         if let Some(after) = rest.strip_prefix(',') {
@@ -382,9 +408,87 @@ mod tests {
             r#"m{op="a" 1"#,
             r#"m{op="a\"} 1"#,
             r#"m{op="a"}1"#,
+            r#"m{a="b"c="d"} 1"#,
         ] {
             assert_eq!(labels_of(line), None, "{line}");
         }
+    }
+
+    #[test]
+    fn a_repeated_label_name_keeps_its_last_value() {
+        assert_eq!(labels_of(r#"m{a="1",b="x",a="2"} 3"#), {
+            Some(vec![
+                ("a".to_string(), "2".to_string()),
+                ("b".to_string(), "x".to_string()),
+            ])
+        });
+    }
+
+    /// The last occurrence of a name wins wherever it falls among many
+    /// labels, which an unstable sort would not guarantee.
+    #[test]
+    fn a_name_repeated_among_many_labels_keeps_its_last_value() {
+        // Several names each repeated many times, interleaved with distinct
+        // ones: enough equal keys that an unstable sort reorders them.
+        let mut block = String::new();
+        for i in 0..1000 {
+            block.push_str(&format!("l{i:04}=\"{i}\","));
+            block.push_str(&format!("dup{}=\"{i}\",", i % 3));
+        }
+        let labels = labels_of(&format!("m{{{block}}} 1")).expect("the line parses");
+        assert_eq!(labels.len(), 1003);
+        let dups: Vec<_> = labels
+            .iter()
+            .filter(|(k, _)| k.starts_with("dup"))
+            .collect();
+        assert_eq!(
+            dups,
+            vec![
+                &("dup0".to_string(), "999".to_string()),
+                &("dup1".to_string(), "997".to_string()),
+                &("dup2".to_string(), "998".to_string()),
+            ]
+        );
+    }
+
+    /// prometheus-parse kept each of these lines under the pairs it could
+    /// split. They are skipped now, and counted so the converter can say so.
+    #[test]
+    fn skipped_lines_are_counted_and_the_first_is_kept() {
+        let scrape = Scrape::parse(
+            "ok 1\n\
+             m{a.b=\"1\"} 1\n\
+             m{a=1} 1\n\
+             m{a='1'} 1\n\
+             m{\"a\"=\"1\"} 1\n\
+             m{a=\"1\",,b=\"2\"} 1\n\
+             m nope\n\
+             # TYPE h histogram\n\
+             h_bucket{op=\"x\"} 1\n\
+             h_bucket{le=\"abc\"} 1\n\
+             # TYPE s summary\n\
+             s{op=\"x\"} 1\n",
+        );
+        assert_eq!(scrape.samples.len(), 1);
+        assert_eq!(scrape.skipped, 9);
+        assert_eq!(scrape.first_skipped.as_deref(), Some("m{a.b=\"1\"} 1"));
+        assert_eq!(Scrape::parse("ok 1\n").skipped, 0);
+    }
+
+    /// A histogram bucket line without labels cannot carry `le`, and is
+    /// kept as a plain sample under its own name, as prometheus-parse kept it.
+    #[test]
+    fn an_unlabeled_bucket_line_is_a_plain_sample() {
+        let scrape = Scrape::parse("# TYPE h histogram\nh_bucket 4\n");
+        assert_eq!(
+            scrape.samples,
+            vec![Sample {
+                metric: "h_bucket".into(),
+                labels: vec![],
+                value: Value::Untyped(4.0),
+            }]
+        );
+        assert_eq!(scrape.skipped, 0);
     }
 
     #[test]

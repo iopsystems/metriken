@@ -8,6 +8,7 @@ use metriken_model::{
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tracing::{debug, warn};
 
 /// Converts Prometheus text format responses into snapshots the archive
 /// writer stages.
@@ -24,6 +25,10 @@ pub struct PrometheusConverter {
     /// A name was added to `descriptions` since the recording last stored
     /// them: see [`pending_descriptions`](Self::pending_descriptions).
     descriptions_changed: bool,
+    /// A scrape with skipped lines has been logged at `warn`. Later ones are
+    /// logged at `debug`, so an exporter that always serves a bad line warns
+    /// once per converter (one endpoint's recording) rather than every tick.
+    skips_warned: bool,
 }
 
 impl Default for PrometheusConverter {
@@ -48,6 +53,7 @@ impl PrometheusConverter {
             next_id: 0,
             descriptions: BTreeMap::new(),
             descriptions_changed: false,
+            skips_warned: false,
         }
     }
 
@@ -98,6 +104,20 @@ impl PrometheusConverter {
         metadata
     }
 
+    fn log_skipped(&mut self, count: usize, first: &str) {
+        let (cut, more) = shown_line(first);
+        let more = if more { " (cut)" } else { "" };
+        if self.skips_warned {
+            debug!("skipped {count} unparseable exposition line(s); the first: {cut:?}{more}");
+        } else {
+            self.skips_warned = true;
+            warn!(
+                "skipped {count} unparseable exposition line(s) (later scrapes log at debug); \
+                 the first: {cut:?}{more}"
+            );
+        }
+    }
+
     /// Convert one scrape, bracketed by the round trip that produced it.
     ///
     /// `request_ns`/`response_ns` are when the request went out and when the
@@ -107,6 +127,9 @@ impl PrometheusConverter {
     /// not used.
     pub fn convert(&mut self, text: &str, request_ns: u64, response_ns: u64) -> Snapshot {
         let scrape = Scrape::parse(&sanitize_metric_names(text));
+        if let Some(first) = &scrape.first_skipped {
+            self.log_skipped(scrape.skipped, first);
+        }
 
         for (name, doc) in &scrape.docs {
             if !self.descriptions.contains_key(name) {
@@ -242,6 +265,18 @@ impl PrometheusConverter {
             metadata: HashMap::new(),
             groups: vec![group],
         })
+    }
+}
+
+/// The characters of a skipped line that are logged.
+const SHOWN_CHARS: usize = 200;
+
+/// The first [`SHOWN_CHARS`] characters of `line`, cut on a character
+/// boundary, and whether anything was cut.
+fn shown_line(line: &str) -> (&str, bool) {
+    match line.char_indices().nth(SHOWN_CHARS) {
+        Some((end, _)) => (&line[..end], true),
+        None => (line, false),
     }
 }
 
@@ -395,10 +430,11 @@ fn compute_generic_scale(buckets: &[&HistogramCount]) -> f64 {
 
 /// Replace colons with underscores in metric names.
 ///
-/// The exposition parser reads a metric name as `\w+`, which does not
-/// include colons. Prometheus allows colons in metric names (commonly
-/// used by recording rules and namespaced exporters like vLLM), so we
-/// normalize them to underscores before parsing.
+/// The exposition parser reads a metric name as letters, digits and `_`
+/// (`char::is_alphanumeric`), which does not include colons. Prometheus
+/// allows colons in metric names (commonly used by recording rules and
+/// namespaced exporters like vLLM), so we normalize them to underscores
+/// before parsing.
 ///
 /// Only the metric name portion of each line is modified - label values and
 /// HELP descriptions are left untouched.
@@ -624,6 +660,37 @@ b{k=\"v\"} -3
         assert_eq!(gauges.len(), 1);
         assert_eq!(gauges[0].value, -3);
         assert_eq!(gauges[0].metadata.get("k").map(String::as_str), Some("v"));
+    }
+
+    /// A long skipped line is logged cut at 200 characters, on a character
+    /// boundary.
+    #[test]
+    fn a_long_skipped_line_is_cut_at_200_characters() {
+        let line = format!("m{{a=1}} {}", "€".repeat(300));
+        let (cut, more) = shown_line(&line);
+        assert!(more);
+        assert_eq!(cut.chars().count(), 200);
+        assert!(line.starts_with(cut));
+        assert!(
+            cut.ends_with('€'),
+            "the cut falls after a multibyte character"
+        );
+        let short = "m{a=1} 1";
+        assert_eq!(shown_line(short), (short, false));
+        let exact = "x".repeat(200);
+        assert_eq!(shown_line(&exact), (exact.as_str(), false));
+    }
+
+    /// A skipped line is logged at `warn` once per converter; a clean scrape
+    /// does not count.
+    #[test]
+    fn a_skipped_line_warns_once_per_converter() {
+        let mut conv = PrometheusConverter::new();
+        conv.convert("ok 1\n", 1_000, 2_000);
+        assert!(!conv.skips_warned);
+        let mut snap = conv.convert("ok 1\nm{a=1} 2\n", 1_000, 2_000);
+        assert!(conv.skips_warned);
+        assert_eq!(snap.gauges().len(), 1, "the good line is still converted");
     }
 
     /// A label value is stored as the exposition text spells it, `=`, `,`,

@@ -18,11 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newline. The converter now reads exposition text with its own parser
   (`exposition.rs`), and `prometheus-parse` and `chrono` are no longer
   dependencies. Series whose labels became identical after the loss (two
-  `op` values that each contain `=`) are now told apart, and a value with an escape is stored unescaped, so it no
-  longer matches a recording made before this release. A line whose label
-  block does not parse is skipped; `prometheus-parse` kept such a line
-  under whatever pairs it could split. Archives already written are read
-  unchanged.
+  `op` values that each contain `=`) are now told apart, and a value with
+  an escape is stored unescaped, so it no longer matches a recording made
+  before this release. Archives already written are read unchanged.
+- A sample line that does not parse is skipped. `prometheus-parse` kept
+  some of these under whatever pairs it could split: a label name with
+  `.`, `-` or `:` or in quotes, an unquoted or single-quoted value, an
+  unescaped `"` in a value, an empty pair. Each scrape with skipped lines
+  is logged with the count and the first line (up to 200 characters,
+  quoted) inside a `scrape` span naming the endpoint: at `warn` the first
+  time for each endpoint in a run, at `debug` after that.
 
 ### metriken-exposition 0.23.2
 

@@ -53,12 +53,19 @@ metriken-storage = { path = "../metriken-storage", features = ["write"] }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
+# `scrape_log`: what a scrape's warning reads like in tracing-subscriber's
+# default format, the one a binary such as rezolus installs.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [package.metadata.docs.rs]
 all-features = true
 
 [[test]]
 name = "recorder"
+required-features = ["http"]
+
+[[test]]
+name = "scrape_log"
 required-features = ["http"]
 
 [[test]]
