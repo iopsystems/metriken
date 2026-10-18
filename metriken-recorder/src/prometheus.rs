@@ -1,13 +1,13 @@
 //! Prometheus text as the snapshots a recording stages.
 
+use crate::exposition::{HistogramCount, Scrape, Value};
 use metriken_model::{
     Counter, Gauge, GroupSchema, GroupSnapshot, Histogram as SnapshotHistogram, MetricDesc,
-    Snapshot, SnapshotV2, SnapshotV3,
+    Snapshot, SnapshotV3,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tracing::warn;
 
 /// Converts Prometheus text format responses into snapshots the archive
 /// writer stages.
@@ -106,17 +106,7 @@ impl PrometheusConverter {
     /// optional trailing timestamp on a sample is a staleness marker and is
     /// not used.
     pub fn convert(&mut self, text: &str, request_ns: u64, response_ns: u64) -> Snapshot {
-        let fetch_ns = response_ns;
-        let sanitized = sanitize_metric_names(text);
-        let lines = sanitized.lines().map(|l| Ok(l.to_string()));
-        let fetch_time = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(fetch_ns as i64);
-        let scrape = match prometheus_parse::Scrape::parse_at(lines, fetch_time) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("failed to parse prometheus metrics: {e}");
-                return empty_snapshot();
-            }
-        };
+        let scrape = Scrape::parse(&sanitize_metric_names(text));
 
         for (name, doc) in &scrape.docs {
             if !self.descriptions.contains_key(name) {
@@ -134,15 +124,11 @@ impl PrometheusConverter {
         let window = sample_window(request_ns, response_ns);
 
         for sample in scrape.samples {
-            let mut labels: Vec<(String, String)> = sample
-                .labels
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            labels.sort();
+            // Sorted by name, which `MetricKey` relies on.
+            let labels = sample.labels;
 
             match sample.value {
-                prometheus_parse::Value::Counter(v) => {
+                Value::Counter(v) => {
                     if !v.is_finite() {
                         continue;
                     }
@@ -152,7 +138,7 @@ impl PrometheusConverter {
                             .with_window(window),
                     );
                 }
-                prometheus_parse::Value::Gauge(v) => {
+                Value::Gauge(v) => {
                     if !v.is_finite() {
                         continue;
                     }
@@ -162,7 +148,7 @@ impl PrometheusConverter {
                             .with_window(window),
                     );
                 }
-                prometheus_parse::Value::Untyped(v) => {
+                Value::Untyped(v) => {
                     if !v.is_finite() {
                         continue;
                     }
@@ -182,7 +168,7 @@ impl PrometheusConverter {
                         gauges.push(Gauge::new(id, v as i64, metadata).with_window(window));
                     }
                 }
-                prometheus_parse::Value::Histogram(ref buckets) => {
+                Value::Histogram(ref buckets) => {
                     if let Some((h, metadata)) = convert_histogram(buckets, &sample.metric, &labels)
                     {
                         let id = self.get_or_assign_id(&sample.metric, &labels);
@@ -190,7 +176,7 @@ impl PrometheusConverter {
                             .push(SnapshotHistogram::new(id, h, metadata).with_window(window));
                     }
                 }
-                prometheus_parse::Value::Summary(ref quantiles) => {
+                Value::Summary(ref quantiles) => {
                     for quantile in quantiles {
                         if !quantile.count.is_finite() {
                             continue;
@@ -325,7 +311,7 @@ has_name_and_metadata!(Counter, Gauge, SnapshotHistogram);
 /// nanoseconds, the unit metriken's latency histograms use. Other metrics use a
 /// generic power-of-10 scale that makes the smallest le boundary >= 1.
 fn convert_histogram(
-    buckets: &[prometheus_parse::HistogramCount],
+    buckets: &[HistogramCount],
     metric_name: &str,
     labels: &[(String, String)],
 ) -> Option<(histogram::Histogram, HashMap<String, String>)> {
@@ -389,7 +375,7 @@ fn convert_histogram(
 
 /// Compute a power-of-10 scale factor that makes the smallest positive le
 /// boundary >= 1, preserving precision when converting float boundaries to u64.
-fn compute_generic_scale(buckets: &[&prometheus_parse::HistogramCount]) -> f64 {
+fn compute_generic_scale(buckets: &[&HistogramCount]) -> f64 {
     let min_le = buckets
         .iter()
         .map(|b| b.less_than)
@@ -409,8 +395,8 @@ fn compute_generic_scale(buckets: &[&prometheus_parse::HistogramCount]) -> f64 {
 
 /// Replace colons with underscores in metric names.
 ///
-/// The prometheus-parse crate uses `\w+` regexes for metric names, which
-/// doesn't include colons. Prometheus allows colons in metric names (commonly
+/// The exposition parser reads a metric name as `\w+`, which does not
+/// include colons. Prometheus allows colons in metric names (commonly
 /// used by recording rules and namespaced exporters like vLLM), so we
 /// normalize them to underscores before parsing.
 ///
@@ -457,9 +443,9 @@ fn sanitize_metric_names(text: &str) -> String {
 /// The acquisition window for every sample in one scrape: the round trip,
 /// `[request_sent, response_received]`, on the recorder's clock.
 ///
-/// Not `sample.timestamp`. Prometheus exposition allows an optional trailing
+/// Not the sample's own timestamp. Prometheus exposition allows an optional trailing
 /// timestamp in milliseconds since the epoch, a federation or pushgateway
-/// staleness marker, and `Scrape::parse_at` puts it there when present.
+/// staleness marker, which the parser skips.
 /// Taken as the window, `m_total 3 1000` would begin one second after the
 /// Unix epoch, decades before the row holding it, and a recording would mix
 /// two meanings of the window.
@@ -480,17 +466,6 @@ fn sample_window(request_ns: u64, response_ns: u64) -> Option<metriken_types::Wi
         return Some(metriken_types::Window::new(response_ns, response_ns));
     }
     Some(metriken_types::Window::new(request_ns, response_ns))
-}
-
-fn empty_snapshot() -> Snapshot {
-    Snapshot::V2(SnapshotV2 {
-        systemtime: SystemTime::now(),
-        duration: Duration::ZERO,
-        metadata: HashMap::new(),
-        counters: Vec::new(),
-        gauges: Vec::new(),
-        histograms: Vec::new(),
-    })
 }
 
 #[cfg(test)]
@@ -649,6 +624,51 @@ b{k=\"v\"} -3
         assert_eq!(gauges.len(), 1);
         assert_eq!(gauges[0].value, -3);
         assert_eq!(gauges[0].metadata.get("k").map(String::as_str), Some("v"));
+    }
+
+    /// A label value is stored as the exposition text spells it, `=`, `,`,
+    /// `}` and escapes included. prometheus-parse split the label block on
+    /// every `,` and `=`, so `op="a=b"` reached the archive with no `op`,
+    /// `op="a,b"` as `op="a"`, and the `a}b` line not at all.
+    #[test]
+    fn a_label_value_with_format_punctuation_reaches_the_metadata() {
+        let mut conv = PrometheusConverter::new();
+        let text = "\
+# TYPE xss_total counter
+xss_total{case=\"eq\",op=\"a=b\"} 1
+xss_total{case=\"comma\",op=\"x=1,y=2\"} 2
+xss_total{case=\"brace\",op=\"a}b\"} 3
+xss_total{case=\"escapes\",op=\"q\\\"b\\\\s\\nn\"} 4
+";
+        let mut snap = conv.convert(text, 1_000, 2_000);
+        let mut got: Vec<(String, Option<String>, u64)> = snap
+            .counters()
+            .iter()
+            .map(|c| {
+                (
+                    c.metadata["case"].clone(),
+                    c.metadata.get("op").cloned(),
+                    c.value,
+                )
+            })
+            .collect();
+        got.sort();
+        let want = |case: &str, op: &str, v| (case.to_string(), Some(op.to_string()), v);
+        assert_eq!(
+            got,
+            vec![
+                want("brace", "a}b", 3),
+                want("comma", "x=1,y=2", 2),
+                want("eq", "a=b", 1),
+                want("escapes", "q\"b\\s\nn", 4),
+            ]
+        );
+        assert!(
+            snap.counters()
+                .iter()
+                .all(|c| !c.metadata.contains_key("y")),
+            "no label is invented from a value"
+        );
     }
 
     /// A scrape is ONE acquisition, so it is one group with one window — not a

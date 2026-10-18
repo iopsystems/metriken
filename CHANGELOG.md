@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-recorder 0.3.1
+
+- **Fixed:** a scraped Prometheus label value is stored as the exposition
+  text spells it. The `prometheus-parse` crate split each label block on
+  every `,` and each pair on every `=`, so `op="a=b"` and `op="a="` were
+  stored with no `op` label, `op="a,b"` as `op="a"`, `op="x=1,y=2"` as a
+  label `y="2"` with no `op`, a line whose value held `}` was dropped, and
+  `\"`, `\\` and `\n` were stored as written instead of as `"`, `\` and a
+  newline. The converter now reads exposition text with its own parser
+  (`exposition.rs`), and `prometheus-parse` and `chrono` are no longer
+  dependencies. Series whose labels became identical after the loss (two
+  `op` values that each contain `=`) are now told apart, and a value with an escape is stored unescaped, so it no
+  longer matches a recording made before this release. A line whose label
+  block does not parse is skipped; `prometheus-parse` kept such a line
+  under whatever pairs it could split. Archives already written are read
+  unchanged.
+
 ### metriken-exposition 0.23.2
 
 - `RegistryPasses` reuses a pass for three quarters of its floor, where it

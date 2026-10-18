@@ -56,6 +56,7 @@
 mod answer;
 #[cfg(feature = "http")]
 mod detect;
+mod exposition;
 mod frames;
 mod identity;
 #[cfg(feature = "registry")]
