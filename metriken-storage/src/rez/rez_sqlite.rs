@@ -1410,6 +1410,31 @@ impl RezDb {
         Ok(())
     }
 
+    /// Replace one recording's labels.
+    ///
+    /// In place, as [`update_recording_metadata`](Self::update_recording_metadata)
+    /// is: an assembly that copied recordings from several archives tags each
+    /// copy (`arm=baseline`) without rewriting its segments.
+    pub fn update_recording_labels(
+        &self,
+        recording_id: i64,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let encoded = serde_json::to_string(labels)
+            .map_err(|e| format!("failed to encode recording labels: {e}"))?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE recordings SET labels = ?1 WHERE id = ?2",
+                rusqlite::params![encoded, recording_id],
+            )
+            .map_err(|e| format!("failed to update recording labels: {e}"))?;
+        if changed == 0 {
+            return Err(format!("no recording with id {recording_id}"));
+        }
+        Ok(())
+    }
+
     pub fn pragma_u32(&self, name: &str) -> Result<u32, String> {
         let value = self.pragma_i64(name)?;
         u32::try_from(value).map_err(|_| format!("pragma {name} is {value}, not a u32"))
@@ -2134,6 +2159,40 @@ mod tests {
                 "{which}: FULL (3 is EXTRA)"
             );
         }
+    }
+
+    /// A recording's labels are replaced in place, its metadata and the
+    /// other recordings untouched; an unknown id is an error.
+    #[test]
+    fn a_recordings_labels_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RezDb::create(&dir.path().join("t.rez")).unwrap();
+        let meta = |host: &str| RecordingMeta {
+            labels: [("host".to_string(), host.to_string())]
+                .into_iter()
+                .collect(),
+            metadata: [("source".to_string(), "rezolus".to_string())]
+                .into_iter()
+                .collect(),
+            clock_anchor_wall_ns: 1,
+        };
+        let a = db.insert_recording(&meta("h1")).unwrap();
+        let b = db.insert_recording(&meta("h2")).unwrap();
+        let labels: BTreeMap<String, String> = [
+            ("host".to_string(), "h1".to_string()),
+            ("arm".to_string(), "baseline".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        db.update_recording_labels(a, &labels).unwrap();
+        let got = db.read_recordings().unwrap();
+        assert_eq!(got[0].id, a);
+        assert_eq!(got[0].meta.labels, labels);
+        assert_eq!(got[0].meta.metadata["source"], "rezolus");
+        assert_eq!(got[1].id, b);
+        assert_eq!(got[1].meta.labels["host"], "h2");
+        assert!(!got[1].meta.labels.contains_key("arm"));
+        assert!(db.update_recording_labels(b + 1, &labels).is_err());
     }
 
     #[test]
