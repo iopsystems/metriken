@@ -1414,7 +1414,9 @@ impl RezDb {
     ///
     /// In place, as [`update_recording_metadata`](Self::update_recording_metadata)
     /// is: an assembly that copied recordings from several archives tags each
-    /// copy (`arm=baseline`) without rewriting its segments.
+    /// copy (`arm=baseline`) without rewriting its segments. This takes no
+    /// lock: a writer still recording the archive keeps running, and readers
+    /// see the new labels when they reopen.
     pub fn update_recording_labels(
         &self,
         recording_id: i64,
@@ -2178,6 +2180,7 @@ mod tests {
         };
         let a = db.insert_recording(&meta("h1")).unwrap();
         let b = db.insert_recording(&meta("h2")).unwrap();
+        let before = db.read_recordings().unwrap();
         let labels: BTreeMap<String, String> = [
             ("host".to_string(), "h1".to_string()),
             ("arm".to_string(), "baseline".to_string()),
@@ -2188,10 +2191,16 @@ mod tests {
         let got = db.read_recordings().unwrap();
         assert_eq!(got[0].id, a);
         assert_eq!(got[0].meta.labels, labels);
-        assert_eq!(got[0].meta.metadata["source"], "rezolus");
+        for (got, before) in got.iter().zip(&before) {
+            assert_eq!(got.complete, before.complete);
+            assert_eq!(
+                got.meta.clock_anchor_wall_ns,
+                before.meta.clock_anchor_wall_ns
+            );
+            assert_eq!(got.meta.metadata, before.meta.metadata);
+        }
         assert_eq!(got[1].id, b);
-        assert_eq!(got[1].meta.labels["host"], "h2");
-        assert!(!got[1].meta.labels.contains_key("arm"));
+        assert_eq!(got[1].meta.labels, before[1].meta.labels);
         assert!(db.update_recording_labels(b + 1, &labels).is_err());
     }
 

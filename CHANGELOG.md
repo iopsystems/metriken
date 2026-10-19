@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.3.2
+
+- `RezDb::update_recording_labels`, which replaces one recording's labels in
+  place, as `update_recording_metadata` replaces its metadata. An assembly of
+  several `.rez` archives uses it to tag each copied recording (an A/B arm)
+  without rewriting segments.
+
 ### metriken-recorder 0.3.1
 
 - **Fixed:** a scraped Prometheus label value is stored as the exposition
