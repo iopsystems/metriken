@@ -1,6 +1,6 @@
 [package]
 name = "metriken-query"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -16,7 +16,7 @@ foldhash = "0.2.0"
 arrow.workspace = true
 bytes = "1"
 histogram.workspace = true
-metriken-storage = { version = "0.3.0", path = "../metriken-storage", default-features = false }
+metriken-storage = { version = "0.4.0", path = "../metriken-storage", default-features = false }
 metriken-model = { version = "0.1.1", path = "../metriken-model", optional = true }
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 promql-parser = "0.8"
