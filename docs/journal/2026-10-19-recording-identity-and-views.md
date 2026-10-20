@@ -395,10 +395,11 @@ contradicts; the list below is the merged result.
     for one epoch, plain span overlap otherwise); for example a continuous
     daemon recording beside one recording per day. By this rule the middle
     source of a chain (09:00–11:00, 10:00–12:00, 11:30–13:00) is a bridge.
-  - Bridges are found and sliced only among recordings that are
-    time-clustered: over the whole archive when level 1 is time clusters,
-    and within each arm under A9. When level 1 is `arm`, a source is not a
-    bridge across arms.
+  - Bridges are found and sliced over the whole archive when no source
+    carries `arm`, and among each arm's members when some do; the clusters
+    that decide level 1 and A9 are formed after this. A source is never a
+    bridge across arms, and a source without `arm` (shared context) is
+    never a bridge.
   - Order: uuid groups first; then bridges; then process groups from the
     other uuid groups by the union rule; then clusters, across all kinds
     (A1), from the presented recordings those give, by transitively
@@ -706,9 +707,9 @@ evidence disagree.
 
 1. Find each source's kind and `service_kind` (data model; unidentified
    sources count as one kind, P9).
-2. Take sources sharing a uuid as one, set bridges aside (only among
-   time-clustered recordings: the whole archive when level 1 is time
-   clusters, each arm under A9; never across arms), form process groups and
+2. Take sources sharing a uuid as one, set bridges aside (over the whole
+   archive when no source carries `arm`, else within each arm; never across
+   arms), form process groups and
    presented recordings, then slice the bridges (data model, P6; Q39).
 3. Navigation: one top-level group per kind when there are two or more
    kinds (case 2); within a kind, one sub-group per `service_kind` value
@@ -2151,6 +2152,11 @@ Views:
   - The three-arm chain (arms at 09:00–11:00, 10:00–12:00, 11:30–13:00):
     no bridge across arms (P6); check it against the expected absolute
     alignment.
+  - An unarmed continuous recording of one epoch beside armed per-day
+    recordings of the same agent: it is shared context and not a bridge, so
+    the union rule would join the days through it; decide whether it is
+    sliced at the arms' clusters or kept out of the union. Also which part
+    of an `arm`-split group such a recording joins.
   - A presented recording whose span has internal gaps. Candidate: its span
     runs from its first row to its last.
   - Detection in one pass against every source, bridges included, with
