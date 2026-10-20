@@ -138,7 +138,11 @@ fn a_registry_streams_into_an_archive_that_reads_back() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("svc.dendro");
     let mut subscriber = Subscriber::new(
-        Writer::create(&path, Box::new(Encoder::for_streams(std::iter::empty()))).unwrap(),
+        Writer::create(
+            &path,
+            Box::new(Encoder::for_sources(Vec::<(i64, Vec<&str>)>::new())),
+        )
+        .unwrap(),
     );
     let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
     let (mut applied, mut skipped) = (0, 0);

@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place of the stream name. A caller driving the encoder itself builds one
   with `EncodeContext::new(source_id, stream)`. `DendroCatalog` wraps a
   dendro 0.6 `Archive`.
+- **Breaking:** `Encoder::for_streams` is replaced by
+  `Encoder::for_sources`, which takes each source's id with that source's
+  stream list (`Archive::all_streams(id)`), and `Encoder::for_archive`,
+  which builds the same from every source of an `Archive`. The ids are those
+  of the archive the rows are read from, a copy's input included, since
+  dendro passes that archive's id to the encoder. A caller that built one
+  stream list from every source passes `Encoder::for_archive(&archive)?`
+  instead.
+- **Fixed:** whether a stream is long is decided per source. The writer and
+  `for_streams` kept one set of long stream names for every source, so when
+  one source recorded a group long and another recorded a group of the same
+  name wide, the wide source's rows were sealed as long, the seal failed
+  with `failed to decode a WAL long row: array had incorrect length,
+  expected 4`, and that source's `sync` returned the error, which stopped
+  the recording. A copy or dump of such an archive with `for_streams` failed
+  the same way on the wide source's unsealed rows. Present in 0.3.2.
 
 ### metriken-exposition 0.24.0
 
@@ -44,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-query 0.41.0
 
-- Takes metriken-storage 0.4, whose types (`BufferPool`) appear in this
+- **Breaking:** takes metriken-storage 0.4. Its `BufferPool`,
+  `CompositionSource`, `UnionChild` and `ArchiveReader` appear in this
   crate's API. With `archive`, it reads dendro archives of schema versions 4
   and 5.
 

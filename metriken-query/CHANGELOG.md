@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Takes metriken-storage 0.4, whose types (`BufferPool`) appear in this
+- **Breaking:** takes metriken-storage 0.4. Its `BufferPool`,
+  `CompositionSource`, `UnionChild` and `ArchiveReader` appear in this
   crate's API. With `archive`, it reads dendro archives of schema versions 4
   and 5.
 

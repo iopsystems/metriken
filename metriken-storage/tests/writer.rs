@@ -517,11 +517,7 @@ fn an_encoder_for_an_archives_streams_copies_a_live_long_table() {
     record(&src, true, false, None);
 
     let archive = Archive::open(&src).unwrap();
-    let mut streams = Vec::new();
-    for s in archive.read_sources().unwrap() {
-        streams.extend(archive.all_streams(s.id).unwrap());
-    }
-    let encoder = Encoder::for_streams(streams.iter().map(String::as_str));
+    let encoder = Encoder::for_archive(&archive).unwrap();
     let dst = dir.path().join("copy.dendro");
     let mut out = ArchiveMut::create(&dst).unwrap();
     out.transaction(|tx| copy_sources_into(&archive, tx, &CopySpec::everything(), &encoder))
@@ -614,10 +610,6 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
     let src_path = dir.path().join("src.dendro");
     record(&src_path, true, true, None);
     let src = Archive::open(&src_path).unwrap();
-    let mut names = Vec::new();
-    for s in src.read_sources().unwrap() {
-        names.extend(src.all_streams(s.id).unwrap());
-    }
     let copy = |metrics: &[&str], dest: &Path| {
         let metrics: BTreeSet<String> = metrics.iter().map(|m| m.to_string()).collect();
         let keep = KeepMetrics::new(&metrics);
@@ -626,7 +618,7 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
             writer_props: Some(segment_props(default_compression())),
             ..CopySpec::everything()
         };
-        let encoder = Encoder::for_streams(names.iter().map(String::as_str));
+        let encoder = Encoder::for_archive(&src).unwrap();
         let mut dst = ArchiveMut::create(dest).unwrap();
         dst.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
             .unwrap();
@@ -1333,10 +1325,6 @@ fn a_long_table_lists_only_the_series_it_has() {
 
     // A projection keeps every row, so each kept column's list holds.
     let src = Archive::open(&sealed).unwrap();
-    let mut names = Vec::new();
-    for s in src.read_sources().unwrap() {
-        names.extend(src.all_streams(s.id).unwrap());
-    }
     let metrics: BTreeSet<String> = ["threads_total", "latency"]
         .iter()
         .map(|m| m.to_string())
@@ -1347,7 +1335,7 @@ fn a_long_table_lists_only_the_series_it_has() {
         writer_props: Some(segment_props(default_compression())),
         ..CopySpec::everything()
     };
-    let encoder = Encoder::for_streams(names.iter().map(String::as_str));
+    let encoder = Encoder::for_archive(&src).unwrap();
     let trimmed = dir.path().join("trimmed.dendro");
     let mut dst = ArchiveMut::create(&trimmed).unwrap();
     dst.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
@@ -1788,4 +1776,229 @@ fn eviction_into_an_open_segment_answers_as_without_it() {
     let a = answer(&open(&evicted), q, 8);
     assert_eq!(a.as_ref().map(|a| a.0.len()).ok(), Some(2), "{a:?}");
     assert_eq!(a, answer(&open(&kept), q, 8));
+}
+
+/// A source's name and the snapshot it records at each tick.
+type Named = (&'static str, fn(u64) -> Snapshot);
+
+/// `snapshot(t)` with `threads/tasks` reduced to its unslotted gauge, which
+/// a writer records wide.
+fn unslotted(t: u64) -> Snapshot {
+    let Snapshot::V3(mut s) = snapshot(t) else {
+        unreachable!()
+    };
+    for g in &mut s.groups {
+        if g.name == "threads/tasks" {
+            let schema = GroupSchema {
+                counters: Vec::new(),
+                gauges: vec![MetricDesc {
+                    name: "8".to_string(),
+                    metadata: [("metric", "threads_total"), ("sampler", "threads")]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                }],
+                histograms: Vec::new(),
+            };
+            g.schema_hash = schema.hash();
+            g.schema = Some(Arc::new(schema));
+            g.counters = Vec::new();
+            g.histograms = Vec::new();
+            g.gauges = vec![Some(7_000 + t as i64)];
+        }
+    }
+    Snapshot::V3(s)
+}
+
+/// `snapshot(t)` with every `comm` prefixed `b-`, so labels that cross
+/// from one source to another show.
+fn renamed(t: u64) -> Snapshot {
+    let Snapshot::V3(mut s) = snapshot(t) else {
+        unreachable!()
+    };
+    for g in &mut s.groups {
+        if let Some(schema) = &g.schema {
+            let mut schema = (**schema).clone();
+            for d in schema
+                .counters
+                .iter_mut()
+                .chain(&mut schema.gauges)
+                .chain(&mut schema.histograms)
+            {
+                if let Some(c) = d.metadata.get_mut("comm") {
+                    *c = format!("b-{c}");
+                }
+            }
+            g.schema_hash = schema.hash();
+            g.schema = Some(Arc::new(schema));
+        }
+    }
+    Snapshot::V3(s)
+}
+
+/// Record one source per entry of `snapshots`, labelled `source=<name>`,
+/// every tick committed together, as [`record`] records one.
+fn record_sources(path: &Path, snapshots: &[Named], finalize: bool) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 5,
+            ..SealPolicy::default()
+        },
+        restate_every_ns: 6 * S,
+        long_groups: true,
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let mut sources: Vec<_> = snapshots
+        .iter()
+        .map(|(name, _)| {
+            let labels = [("source".to_string(), name.to_string())]
+                .into_iter()
+                .collect();
+            writer.add_source(labels, BTreeMap::new(), BASE).unwrap()
+        })
+        .collect();
+    for t in 0..TICKS {
+        let staged = sources
+            .iter_mut()
+            .zip(snapshots)
+            .map(|(source, (_, f))| source.stage(&f(t), BASE + t * S, 0).unwrap())
+            .collect();
+        writer.commit(staged).unwrap();
+        for source in &mut sources {
+            source.maybe_seal().unwrap();
+            source.sync().unwrap();
+        }
+    }
+    for mut source in sources {
+        if finalize {
+            source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+        } else {
+            source.sync().unwrap();
+            std::mem::forget(source);
+        }
+    }
+    writer.join().unwrap();
+}
+
+/// Each source of the archive at `path`, by its `source` label.
+fn open_sources(path: &Path) -> BTreeMap<String, ArchiveReader> {
+    let catalog = DendroCatalog::open(path).unwrap();
+    ArchiveReader::from_catalog(
+        Box::new(catalog),
+        None,
+        BufferPool::new(64 * 1024 * 1024),
+        None,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|(labels, reader)| {
+        let source = labels
+            .into_iter()
+            .find(|(k, _)| k == "source")
+            .map(|(_, v)| v)
+            .unwrap();
+        (source, reader)
+    })
+    .collect()
+}
+
+/// Every source of `together` answers each query as the same snapshots
+/// recorded alone do.
+fn assert_sources_answer_as_alone(together: &Path, snapshots: &[Named], finalize: bool) {
+    let readers = open_sources(together);
+    assert_eq!(readers.len(), snapshots.len());
+    for (name, f) in snapshots {
+        let dir = tempfile::tempdir().unwrap();
+        let alone = dir.path().join("alone.dendro");
+        record_sources(&alone, &[(*name, *f)], finalize);
+        let alone = open_sources(&alone).remove(*name).unwrap();
+        let reader = &readers[*name];
+        for q in QUERIES {
+            let (x, y) = (answer(reader, q, 0), answer(&alone, q, 0));
+            assert_eq!(
+                x.as_ref().map(|a| &a.0),
+                y.as_ref().map(|a| &a.0),
+                "source {name}, finalize {finalize}: {q}"
+            );
+        }
+    }
+}
+
+/// Two sources recording a group of the same name, one long (slotted
+/// members) and one wide (no slots), each seal and read back as when
+/// recorded alone. Whether a stream is long is each source's decision: a
+/// set keyed by stream name alone sealed the wide source's rows as long,
+/// and its `sync` failed to decode them.
+#[test]
+fn a_stream_long_in_one_source_and_wide_in_another_seals_both() {
+    let snapshots: [Named; 2] = [("a", snapshot), ("b", unslotted)];
+    for finalize in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.dendro");
+        record_sources(&path, &snapshots, finalize);
+        let catalog = DendroCatalog::open(&path).unwrap();
+        let tables: BTreeMap<String, Vec<String>> = catalog
+            .sources()
+            .unwrap()
+            .into_iter()
+            .map(|s| {
+                let name = s.labels["source"].clone();
+                (name, catalog.tables(s.id).unwrap())
+            })
+            .collect();
+        assert!(tables["a"].contains(&"threads/tasks/occupants".to_string()));
+        assert!(!tables["b"].iter().any(|t| t.ends_with("/occupants")));
+        assert_sources_answer_as_alone(&path, &snapshots, finalize);
+    }
+}
+
+/// Two sources recording the same long group keep their occupants'
+/// labels apart.
+#[test]
+fn two_sources_of_one_long_stream_keep_their_labels_apart() {
+    let snapshots: [Named; 2] = [("a", snapshot), ("b", renamed)];
+    for finalize in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twins.dendro");
+        record_sources(&path, &snapshots, finalize);
+        assert_sources_answer_as_alone(&path, &snapshots, finalize);
+    }
+}
+
+/// A copy of a live archive whose sources record one stream long and wide
+/// encodes each source's unsealed rows as that source wrote them, with the
+/// encoder `Encoder::for_archive` builds from the archive's per-source
+/// stream lists.
+#[test]
+fn a_copy_encodes_each_sources_tail_as_that_source_wrote_it() {
+    use dendro::archive::{Archive, ArchiveMut};
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    use metriken_storage::writer::Encoder;
+
+    let snapshots: [Named; 2] = [("a", snapshot), ("b", unslotted)];
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("live.dendro");
+    record_sources(&src, &snapshots, false);
+
+    let archive = Archive::open(&src).unwrap();
+    let encoder = Encoder::for_archive(&archive).unwrap();
+    let dst = dir.path().join("copy.dendro");
+    let mut out = ArchiveMut::create(&dst).unwrap();
+    out.transaction(|tx| copy_sources_into(&archive, tx, &CopySpec::everything(), &encoder))
+        .unwrap();
+    drop(out);
+
+    let (a, b) = (open_sources(&src), open_sources(&dst));
+    assert_eq!(b.len(), 2);
+    for (name, reader) in &a {
+        for q in QUERIES {
+            let (x, y) = (answer(reader, q, 0), answer(&b[name], q, 0));
+            assert_eq!(
+                x.as_ref().map(|r| &r.0),
+                y.as_ref().map(|r| &r.0),
+                "{name}: {q}"
+            );
+        }
+    }
 }

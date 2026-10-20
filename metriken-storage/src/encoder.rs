@@ -24,9 +24,11 @@ pub const ENCODER_VERSION: &str = "metriken-archive/1";
 /// archive written before the key) is not checked.
 pub const READABLE_ENCODERS: &[&str] = &[ENCODER_VERSION];
 
-/// The streams written long, shared between the recorders (which decide)
-/// and the encoder (which seals them on dendro's writer thread).
-pub(crate) type LongStreams = Arc<Mutex<HashSet<String>>>;
+/// The streams written long, as `(source id, stream)`, shared between the
+/// recorders (which decide) and the encoder (which seals them on dendro's
+/// writer thread). Keyed by source because each source decides for itself:
+/// two sources can record a group of the same name, one long and one wide.
+pub(crate) type LongStreams = Arc<Mutex<HashSet<(i64, String)>>>;
 
 /// The segment encoder: a long table's rows become a long segment, an
 /// occupant stream's rows an occupant segment, anything else a wide table.
@@ -54,23 +56,44 @@ impl Encoder {
     }
 
     /// The encoder for an archive this process is not writing: a copy, a
-    /// ranged dump, a compaction. `streams` is the archive's stream list
-    /// (`Archive::all_streams`, every source's); a stream is long when its
-    /// occupant stream is among them, which is how a reader decides too.
+    /// ranged dump, a compaction. `sources` is each source's id in that
+    /// archive with its stream list (`Archive::all_streams(id)`); a stream
+    /// of a source is long when its occupant stream is among that source's
+    /// streams, which is how a reader decides too. dendro names the source
+    /// of the rows it encodes by its id in the archive they are read from,
+    /// a copy's input included, so these are the input archive's ids.
     ///
     /// The writer's own encoder learns which streams are long from its
     /// recorders; a second process has only the archive to go on.
-    pub fn for_streams<'a>(streams: impl IntoIterator<Item = &'a str>) -> Self {
-        let long = streams
+    pub fn for_sources<'a, S>(sources: impl IntoIterator<Item = (i64, S)>) -> Self
+    where
+        S: IntoIterator<Item = &'a str>,
+    {
+        let long = sources
             .into_iter()
-            .filter_map(occupants::table_of)
-            .map(str::to_string)
+            .flat_map(|(id, streams)| {
+                streams
+                    .into_iter()
+                    .filter_map(occupants::table_of)
+                    .map(move |s| (id, s.to_string()))
+            })
             .collect();
         Self {
             long: Arc::new(Mutex::new(long)),
             sort_long: false,
             props: sealed_props(default_compression()),
         }
+    }
+
+    /// [`for_sources`](Self::for_sources) over every source of `archive`.
+    pub fn for_archive(archive: &dendro::archive::Archive) -> dendro::Result<Self> {
+        let mut sources = Vec::new();
+        for source in archive.read_sources()? {
+            sources.push((source.id, archive.all_streams(source.id)?));
+        }
+        Ok(Self::for_sources(sources.iter().map(|(id, streams)| {
+            (*id, streams.iter().map(String::as_str))
+        })))
     }
 }
 
@@ -127,7 +150,7 @@ impl SegmentEncoder for Encoder {
             .long
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(stream);
+            .contains(&(ctx.source_id, stream.to_string()));
         let tail = if long {
             wal::materialize_long_wal_tail_with(
                 stream,
@@ -193,7 +216,7 @@ impl SegmentEncoder for Encoder {
             .long
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(stream);
+            .contains(&(ctx.source_id, stream.to_string()));
         let anchored = if long {
             anchor_long(before, rows)
         } else if wal::is_group_table_key(stream) {
@@ -387,7 +410,7 @@ mod encode_after_tests {
             row(3, 1, None, 1),
         ];
         let part = vec![row(4, 1, None, 1), row(5, 1, None, 1)];
-        let encoder = Encoder::for_streams(["s/g"]);
+        let encoder = Encoder::for_sources([(1, ["s/g"])]);
         let segment = encoder
             .encode_after(&EncodeContext::new(1, "s/g"), &before, &part)
             .unwrap()
