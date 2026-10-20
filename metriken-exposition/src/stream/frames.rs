@@ -939,7 +939,11 @@ mod tests {
 
         struct NoSegments;
         impl SegmentEncoder for NoSegments {
-            fn encode(&self, _: &str, _: &[WalRow]) -> dendro::segment::EncodeResult {
+            fn encode(
+                &self,
+                _: &dendro::segment::EncodeContext<'_>,
+                _: &[WalRow],
+            ) -> dendro::segment::EncodeResult {
                 Ok(None)
             }
             fn version(&self) -> Option<&str> {

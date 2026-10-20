@@ -1247,7 +1247,7 @@ impl SourceRecorder {
         self.long
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string());
+            .insert((self.writer.source_id(), name.to_string()));
         let state = self
             .groups
             .get_mut(name)

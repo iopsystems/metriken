@@ -256,7 +256,7 @@ fn renumbered_segment_after_listing_returns_no_row_twice() {
 
     // A writer reopened on the file continues the source and seals its WAL:
     // the stream has no segment, so this one is numbered 0 again.
-    let encoder = metriken_storage::Encoder::for_streams([STREAM]);
+    let encoder = metriken_storage::Encoder::for_sources([(source_id, [STREAM])]);
     let mut reopened = dendro::writer::Writer::open(&path, Box::new(encoder)).unwrap();
     let (mut resumed, _) = reopened
         .resume_source(source_id, (BASE + 20 * S) as i64)

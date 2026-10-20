@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** dendro is 0.6 (was 0.5). Archives this release creates are
+  dendro schema version 5, which releases built on dendro 0.5.1 or earlier
+  (metriken-storage 0.3.x) refuse with `unsupported archive schema version
+  5`. That covers `ArchiveWriter`, which always creates a new file, and the
+  `.rez` to dendro conversion (`rez::to_dendro`). Schema 4 archives still
+  read, sealed segments and a live WAL tail alike. On schema 5 a segment's
+  index (the metric-name fingerprint `Encoder` writes) is a row of the
+  `segment_indexes` table rather than the `segments.caller_index` column;
+  `Catalog::segment_indexes` reads either.
+- **Breaking:** `Encoder`'s `SegmentEncoder` implementation follows dendro
+  0.6: `encode` and `encode_after` take `&dendro::segment::EncodeContext` in
+  place of the stream name. A caller driving the encoder itself builds one
+  with `EncodeContext::new(source_id, stream)`. `DendroCatalog` wraps a
+  dendro 0.6 `Archive`.
+- **Breaking:** `Encoder::for_streams` is replaced by
+  `Encoder::for_sources`, which takes each source's id with that source's
+  stream list (`Archive::all_streams(id)`), and `Encoder::for_archive`,
+  which builds the same from every source of an `Archive`. The ids are those
+  of the archive the rows are read from, a copy's input included, since
+  dendro passes that archive's id to the encoder. A caller that built one
+  stream list from every source passes `Encoder::for_archive(&archive)?`
+  instead. For a copy of an archive still being written, build it inside
+  the read snapshot the copy reads, as `for_archive`'s documentation shows;
+  a long stream that appears between the two is otherwise encoded wide and
+  the copy fails.
+
+### Fixed
+
+- Whether a stream is long is decided per source. The writer and
+  `for_streams` kept one set of long stream names for every source, so when
+  one source recorded a group long and another recorded a group of the same
+  name wide, the wide source's rows were sealed as long, the seal failed
+  with `failed to decode a WAL long row: array had incorrect length,
+  expected 4`, and that source's `sync` returned the error, which stopped
+  the recording. A copy or dump of such an archive with `for_streams` failed
+  the same way on the wide source's unsealed rows. Present since
+  metriken-storage 0.1.0, and in metriken-archive's writer before it moved
+  (0.3.5 has it).
+
 ## [0.3.2] - 2026-10-19
 
 ### Added
