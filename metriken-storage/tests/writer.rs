@@ -1837,8 +1837,12 @@ fn renamed(t: u64) -> Snapshot {
 }
 
 /// Record one source per entry of `snapshots`, labelled `source=<name>`,
-/// every tick committed together, as [`record`] records one.
-fn record_sources(path: &Path, snapshots: &[Named], finalize: bool) {
+/// every tick committed together, as [`record`] records one. With
+/// `seal_each_tick` each source seals when its policy says so after every
+/// tick; without it nothing seals before `finalize`, so a stream's rows
+/// are sealed then as several capped parts, each after the first through
+/// `encode_after`.
+fn record_sources(path: &Path, snapshots: &[Named], finalize: bool, seal_each_tick: bool) {
     let config = WriterConfig {
         seal: SealPolicy {
             max_rows: 5,
@@ -1866,7 +1870,9 @@ fn record_sources(path: &Path, snapshots: &[Named], finalize: bool) {
             .collect();
         writer.commit(staged).unwrap();
         for source in &mut sources {
-            source.maybe_seal().unwrap();
+            if seal_each_tick {
+                source.maybe_seal().unwrap();
+            }
             source.sync().unwrap();
         }
     }
@@ -1905,13 +1911,18 @@ fn open_sources(path: &Path) -> BTreeMap<String, ArchiveReader> {
 
 /// Every source of `together` answers each query as the same snapshots
 /// recorded alone do.
-fn assert_sources_answer_as_alone(together: &Path, snapshots: &[Named], finalize: bool) {
+fn assert_sources_answer_as_alone(
+    together: &Path,
+    snapshots: &[Named],
+    finalize: bool,
+    seal_each_tick: bool,
+) {
     let readers = open_sources(together);
     assert_eq!(readers.len(), snapshots.len());
     for (name, f) in snapshots {
         let dir = tempfile::tempdir().unwrap();
         let alone = dir.path().join("alone.dendro");
-        record_sources(&alone, &[(*name, *f)], finalize);
+        record_sources(&alone, &[(*name, *f)], finalize, seal_each_tick);
         let alone = open_sources(&alone).remove(*name).unwrap();
         let reader = &readers[*name];
         for q in QUERIES {
@@ -1919,7 +1930,7 @@ fn assert_sources_answer_as_alone(together: &Path, snapshots: &[Named], finalize
             assert_eq!(
                 x.as_ref().map(|a| &a.0),
                 y.as_ref().map(|a| &a.0),
-                "source {name}, finalize {finalize}: {q}"
+                "source {name}, finalize {finalize}, seal_each_tick {seal_each_tick}: {q}"
             );
         }
     }
@@ -1933,10 +1944,10 @@ fn assert_sources_answer_as_alone(together: &Path, snapshots: &[Named], finalize
 #[test]
 fn a_stream_long_in_one_source_and_wide_in_another_seals_both() {
     let snapshots: [Named; 2] = [("a", snapshot), ("b", unslotted)];
-    for finalize in [true, false] {
+    for (finalize, seal_each_tick) in [(true, true), (false, true), (true, false)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mixed.dendro");
-        record_sources(&path, &snapshots, finalize);
+        record_sources(&path, &snapshots, finalize, seal_each_tick);
         let catalog = DendroCatalog::open(&path).unwrap();
         let tables: BTreeMap<String, Vec<String>> = catalog
             .sources()
@@ -1949,7 +1960,7 @@ fn a_stream_long_in_one_source_and_wide_in_another_seals_both() {
             .collect();
         assert!(tables["a"].contains(&"threads/tasks/occupants".to_string()));
         assert!(!tables["b"].iter().any(|t| t.ends_with("/occupants")));
-        assert_sources_answer_as_alone(&path, &snapshots, finalize);
+        assert_sources_answer_as_alone(&path, &snapshots, finalize, seal_each_tick);
     }
 }
 
@@ -1961,8 +1972,8 @@ fn two_sources_of_one_long_stream_keep_their_labels_apart() {
     for finalize in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("twins.dendro");
-        record_sources(&path, &snapshots, finalize);
-        assert_sources_answer_as_alone(&path, &snapshots, finalize);
+        record_sources(&path, &snapshots, finalize, true);
+        assert_sources_answer_as_alone(&path, &snapshots, finalize, true);
     }
 }
 
@@ -1979,7 +1990,7 @@ fn a_copy_encodes_each_sources_tail_as_that_source_wrote_it() {
     let snapshots: [Named; 2] = [("a", snapshot), ("b", unslotted)];
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("live.dendro");
-    record_sources(&src, &snapshots, false);
+    record_sources(&src, &snapshots, false, true);
 
     let archive = Archive::open(&src).unwrap();
     let encoder = Encoder::for_archive(&archive).unwrap();
@@ -2001,4 +2012,87 @@ fn a_copy_encodes_each_sources_tail_as_that_source_wrote_it() {
             );
         }
     }
+}
+
+/// A copy of a live archive builds its encoder in the snapshot the copy
+/// reads. Built outside it, an encoder misses a long source that appears
+/// before the copy takes its own snapshot, encodes that source's unsealed
+/// rows as wide, and the copy fails; built inside it, the copy holds what
+/// the snapshot saw and succeeds.
+#[test]
+fn a_live_copy_builds_its_encoder_in_the_copys_snapshot() {
+    use dendro::archive::{Archive, ArchiveMut};
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    use metriken_storage::writer::Encoder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("live.dendro");
+    let mut writer = ArchiveWriter::create(
+        &src,
+        WriterConfig {
+            long_groups: true,
+            ..WriterConfig::default()
+        },
+    )
+    .unwrap();
+    let labels = |v: &str| {
+        [("source".to_string(), v.to_string())]
+            .into_iter()
+            .collect()
+    };
+    let mut ticks = 0..TICKS;
+    let mut record = |writer: &mut ArchiveWriter, source: &mut SourceRecorder, n: usize| {
+        for t in ticks.by_ref().take(n) {
+            let staged = source.stage(&snapshot(t), BASE + t * S, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+            source.sync().unwrap();
+        }
+    };
+    let mut a = writer
+        .add_source(labels("a"), BTreeMap::new(), BASE)
+        .unwrap();
+    record(&mut writer, &mut a, 4);
+    let archive = Archive::open(&src).unwrap();
+
+    // Outside: `b` arrives after the encoder was built.
+    let encoder = Encoder::for_archive(&archive).unwrap();
+    let mut b = writer
+        .add_source(labels("b"), BTreeMap::new(), BASE)
+        .unwrap();
+    record(&mut writer, &mut b, 4);
+    let mut out = ArchiveMut::create(&dir.path().join("outside.dendro")).unwrap();
+    let outside =
+        out.transaction(|tx| copy_sources_into(&archive, tx, &CopySpec::everything(), &encoder));
+    assert!(
+        matches!(&outside, Err(dendro::Error::Encoder { stream, .. }) if stream == "threads/tasks"),
+        "the hazard did not occur: {outside:?}"
+    );
+    drop(out);
+
+    // Inside: `c` arrives after the snapshot, so neither the encoder nor
+    // the copy sees it.
+    let inside = dir.path().join("inside.dendro");
+    let mut out = ArchiveMut::create(&inside).unwrap();
+    let mut c = None;
+    archive
+        .read_snapshot(|archive| {
+            let encoder = Encoder::for_archive(archive)?;
+            let mut source = writer
+                .add_source(labels("c"), BTreeMap::new(), BASE)
+                .unwrap();
+            record(&mut writer, &mut source, 4);
+            c = Some(source);
+            out.transaction(|tx| copy_sources_into(archive, tx, &CopySpec::everything(), &encoder))
+        })
+        .unwrap();
+    drop(out);
+    let copied = open_sources(&inside);
+    assert_eq!(
+        copied.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    for source in [a, b, c.unwrap()] {
+        std::mem::forget(source);
+    }
+    writer.join().unwrap();
 }

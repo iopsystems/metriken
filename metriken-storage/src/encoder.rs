@@ -85,15 +85,32 @@ impl Encoder {
         }
     }
 
-    /// [`for_sources`](Self::for_sources) over every source of `archive`.
+    /// [`for_sources`](Self::for_sources) over every source of `archive`,
+    /// read in one snapshot.
+    ///
+    /// For a copy of an archive that is still being written, build the
+    /// encoder inside the snapshot the copy reads. A source or long stream
+    /// that appears between this call and a copy taking its own snapshot is
+    /// unknown to the encoder, which encodes its unsealed rows as wide, and
+    /// the copy fails. dendro's `read_snapshot` is re-entrant, so this
+    /// call and the copy share the outer one:
+    ///
+    /// ```ignore
+    /// src.read_snapshot(|src| {
+    ///     let encoder = Encoder::for_archive(src)?;
+    ///     dst.transaction(|tx| copy_sources_into(src, tx, &spec, &encoder))
+    /// })?;
+    /// ```
     pub fn for_archive(archive: &dendro::archive::Archive) -> dendro::Result<Self> {
-        let mut sources = Vec::new();
-        for source in archive.read_sources()? {
-            sources.push((source.id, archive.all_streams(source.id)?));
-        }
-        Ok(Self::for_sources(sources.iter().map(|(id, streams)| {
-            (*id, streams.iter().map(String::as_str))
-        })))
+        archive.read_snapshot(|archive| {
+            let mut sources = Vec::new();
+            for source in archive.read_sources()? {
+                sources.push((source.id, archive.all_streams(source.id)?));
+            }
+            Ok(Self::for_sources(sources.iter().map(|(id, streams)| {
+                (*id, streams.iter().map(String::as_str))
+            })))
+        })
     }
 }
 
