@@ -1,6 +1,6 @@
 [package]
 name = "metriken-storage"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 authors = [
     "Brian Martin <brian@iop.systems>",
@@ -19,7 +19,7 @@ bytes = "1"
 dendro = { version = "0.6.0", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
 lru = "0.18.5"
-metriken-exposition = { version = "0.23.0", path = "../metriken-exposition", default-features = false, features = ["stream"], optional = true }
+metriken-exposition = { version = "0.24.0", path = "../metriken-exposition", default-features = false, features = ["stream"], optional = true }
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 histogram.workspace = true
 metriken = { version = "0.11.3", path = "../metriken", optional = true }
