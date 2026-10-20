@@ -31,7 +31,11 @@ mod tests {
     struct NoSegments;
 
     impl SegmentEncoder for NoSegments {
-        fn encode(&self, _stream: &str, _rows: &[WalRow]) -> dendro::segment::EncodeResult {
+        fn encode(
+            &self,
+            _: &dendro::segment::EncodeContext<'_>,
+            _rows: &[WalRow],
+        ) -> dendro::segment::EncodeResult {
             Ok(None)
         }
         fn version(&self) -> Option<&str> {

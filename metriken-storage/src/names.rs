@@ -1,6 +1,8 @@
-//! A sealed segment's names fingerprint, kept in dendro's per-segment
-//! `caller_index` so a reader can learn a table's metric names from one
-//! segment footer per distinct fingerprint rather than every footer.
+//! A sealed segment's names fingerprint, kept as dendro's per-segment
+//! caller index (`SegmentRow::caller_index`: a row of `segment_indexes` in
+//! a schema 5 archive, the `segments.caller_index` column in a schema 4
+//! one) so a reader can learn a table's metric names from one segment
+//! footer per distinct fingerprint rather than every footer.
 //!
 //! The fingerprint covers each column's data type and metric name (its
 //! `metric` metadata, else its column name). Two segments with the same

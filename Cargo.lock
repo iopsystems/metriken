@@ -512,14 +512,15 @@ dependencies = [
 
 [[package]]
 name = "dendro"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f229f61b56b797b5468155ed829a44a7049f19cc75954eea387b277124f8bf19"
+checksum = "dc41a9db544dd17270120f0dbfe06c434caa56c12c09655dd4949333b73aebd7"
 dependencies = [
  "arrow",
  "bytes",
  "parquet",
  "rusqlite",
+ "serde_core",
  "serde_json",
  "tracing",
 ]

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** dendro is 0.6 (was 0.5). Archives this release creates are
+  dendro schema version 5, which releases built on dendro 0.5.1 or earlier
+  (metriken-storage 0.3.x) refuse with `unsupported archive schema version
+  5`. That covers `ArchiveWriter`, which always creates a new file, and the
+  `.rez` to dendro conversion (`rez::to_dendro`). Schema 4 archives still
+  read, sealed segments and a live WAL tail alike. On schema 5 a segment's
+  index (the metric-name fingerprint `Encoder` writes) is a row of the
+  `segment_indexes` table rather than the `segments.caller_index` column;
+  `Catalog::segment_indexes` reads either.
+- **Breaking:** `Encoder`'s `SegmentEncoder` implementation follows dendro
+  0.6: `encode` and `encode_after` take `&dendro::segment::EncodeContext` in
+  place of the stream name. A caller driving the encoder itself builds one
+  with `EncodeContext::new(source_id, stream)`. `DendroCatalog` wraps a
+  dendro 0.6 `Archive`.
+
 ## [0.3.2] - 2026-10-19
 
 ### Added

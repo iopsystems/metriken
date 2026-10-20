@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::occupants::{self, Occupant};
 use crate::wal::{self, WalRowSource};
 use dendro::archive::WalRow as DWalRow;
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 
 use crate::{default_compression, segment_props as sealed_props};
 
@@ -96,7 +96,8 @@ pub(crate) fn boxed(e: impl std::fmt::Display) -> Box<dyn std::error::Error + Se
 }
 
 impl SegmentEncoder for Encoder {
-    fn encode(&self, stream: &str, rows: &[DWalRow]) -> EncodeResult {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[DWalRow]) -> EncodeResult {
+        let stream = ctx.stream;
         let Some(last) = rows.last() else {
             return Ok(None);
         };
@@ -177,10 +178,16 @@ impl SegmentEncoder for Encoder {
     /// with no schema (its rows skipped) or with columns that lost their
     /// labels. The part is anchored as the writer would have anchored it
     /// had it sealed there, from what `before` carried, and then encoded.
-    fn encode_after(&self, stream: &str, before: &[DWalRow], rows: &[DWalRow]) -> EncodeResult {
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[DWalRow],
+        rows: &[DWalRow],
+    ) -> EncodeResult {
+        let stream = ctx.stream;
         // An occupant stream's rows each carry their own labels.
         if occupants::table_of(stream).is_some() {
-            return self.encode(stream, rows);
+            return self.encode(ctx, rows);
         }
         let long = self
             .long
@@ -196,8 +203,8 @@ impl SegmentEncoder for Encoder {
         }
         .map_err(boxed)?;
         match anchored {
-            Some(rows) => self.encode(stream, &rows),
-            None => self.encode(stream, rows),
+            Some(rows) => self.encode(ctx, &rows),
+            None => self.encode(ctx, rows),
         }
     }
 }
@@ -382,12 +389,15 @@ mod encode_after_tests {
         let part = vec![row(4, 1, None, 1), row(5, 1, None, 1)];
         let encoder = Encoder::for_streams(["s/g"]);
         let segment = encoder
-            .encode_after("s/g", &before, &part)
+            .encode_after(&EncodeContext::new(1, "s/g"), &before, &part)
             .unwrap()
             .unwrap();
         assert_eq!(shape(&segment), (vec!["a".to_string()], 2));
         // With nothing before it, the part has no anchor and decodes to
         // nothing: the rows the anchoring recovered.
-        assert!(encoder.encode("s/g", &part).unwrap().is_none());
+        assert!(encoder
+            .encode(&EncodeContext::new(1, "s/g"), &part)
+            .unwrap()
+            .is_none());
     }
 }

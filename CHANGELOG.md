@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.4.0
+
+- **Breaking:** dendro is 0.6 (was 0.5). Archives this release creates are
+  dendro schema version 5, which releases built on dendro 0.5.1 or earlier
+  (metriken-storage 0.3.x, metriken-recorder 0.3.x) refuse with `unsupported
+  archive schema version 5`. That covers `ArchiveWriter`, which always
+  creates a new file, and the `.rez` to dendro conversion
+  (`rez::to_dendro`). Schema 4 archives still read, sealed segments and a
+  live WAL tail alike. On schema 5 a segment's index (the metric-name
+  fingerprint `Encoder` writes) is a row of the `segment_indexes` table
+  rather than the `segments.caller_index` column; `Catalog::segment_indexes`
+  reads either.
+- **Breaking:** `Encoder`'s `SegmentEncoder` implementation follows dendro
+  0.6: `encode` and `encode_after` take `&dendro::segment::EncodeContext` in
+  place of the stream name. A caller driving the encoder itself builds one
+  with `EncodeContext::new(source_id, stream)`. `DendroCatalog` wraps a
+  dendro 0.6 `Archive`.
+
+### metriken-exposition 0.24.0
+
+- **Breaking:** with `stream`, dendro is 0.6 (was 0.5).
+  `FrameProducer::handshake`, `interval` and `empty_interval` return dendro
+  0.6's `replicate::Frame`, and `FrameProducer::opening` its `Result`, so a
+  caller naming those types must use dendro 0.6. The frames on the wire are
+  unchanged, so 0.23 and 0.24 producers serve the same bytes to any
+  subscriber.
+
+### metriken-recorder 0.4.0
+
+- **Breaking:** dendro is 0.6 (was 0.5), and the re-exported `WalRow` and
+  `Frame` are dendro 0.6's. The archive a `Recorder` writes is dendro schema
+  version 5, which metriken-recorder 0.3.x and other readers on dendro 0.5.1
+  or earlier refuse. Takes metriken-storage 0.4 and metriken-exposition
+  0.24.
+
+### metriken-query 0.41.0
+
+- Takes metriken-storage 0.4, whose types (`BufferPool`) appear in this
+  crate's API. With `archive`, it reads dendro archives of schema versions 4
+  and 5.
+
 ### metriken-storage 0.3.2
 
 - `RezDb::update_recording_labels`, which replaces one recording's labels in
