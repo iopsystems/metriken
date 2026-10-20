@@ -390,11 +390,15 @@ contradicts; the list below is the merged result.
   - Two sources of one epoch overlap when the intersection of their spans
     is non-empty and holds at least one row of each (R3).
     - Sources sharing a uuid are first taken as one (copies): a uuid group.
-  - A bridge is a uuid group whose span overlaps two sources that do not
-    overlap each other and covers the gap between them (R3 overlap for one
-    epoch, plain span overlap otherwise); for example a continuous daemon
-    recording beside one recording per day. By this rule the middle source
-    of a chain (09:00–11:00, 10:00–12:00, 11:30–13:00) is a bridge.
+  - A bridge is a uuid group whose span overlaps two other uuid groups that
+    do not overlap each other and covers the gap between them (R3 overlap
+    for one epoch, plain span overlap otherwise); for example a continuous
+    daemon recording beside one recording per day. By this rule the middle
+    source of a chain (09:00–11:00, 10:00–12:00, 11:30–13:00) is a bridge.
+  - Bridges are found and sliced only among recordings that are
+    time-clustered: over the whole archive when level 1 is time clusters,
+    and within each arm under A9. When level 1 is `arm`, a source is not a
+    bridge across arms.
   - Order: uuid groups first; then bridges; then process groups from the
     other uuid groups by the union rule; then clusters, across all kinds
     (A1), from the presented recordings those give, by transitively
@@ -667,7 +671,8 @@ Names:
   the second case.
 - A scope names a set of sources. It resolves to the process groups of the
   presented recordings it names, restricted to that presented recording's
-  sources when the group is split. Within each process group the engine
+  sources when the group is split, and for a bridge piece to the piece's
+  span. Within each process group the engine
   unions only the sources the scope names (S1).
 - Both viewers' query APIs take the scope as a request parameter,
   replacing the section's `metadata.scope` and the frontend's `applyScope`
@@ -701,9 +706,10 @@ evidence disagree.
 
 1. Find each source's kind and `service_kind` (data model; unidentified
    sources count as one kind, P9).
-2. Take sources sharing a uuid as one, set bridges aside, form process
-   groups and presented recordings, then slice the bridges (data model, P6;
-   Q39).
+2. Take sources sharing a uuid as one, set bridges aside (only among
+   time-clustered recordings: the whole archive when level 1 is time
+   clusters, each arm under A9; never across arms), form process groups and
+   presented recordings, then slice the bridges (data model, P6; Q39).
 3. Navigation: one top-level group per kind when there are two or more
    kinds (case 2); within a kind, one sub-group per `service_kind` value
    when it has two or more; a flat list otherwise.
@@ -2135,7 +2141,16 @@ Views:
   before the prototype runs:
   - Cross-arm cluster identity under A9: arm `a` in two clusters, arm `b`
     in three; and concurrent arms started 30 s apart. Candidate: clusters
-    formed over the whole archive, with the same start for every arm.
+    formed over the whole archive, with the same start for every arm (this
+    would amend step 5 and case 4's Alignment).
+  - Two process groups of one epoch in one cluster through another kind's
+    overlap (P1 09:00–10:00, an llm-perf run 09:50–11:00, P2 10:30–11:00)
+    with a bridge C of that epoch: whether C's 10:00–10:30 part, which joins
+    nothing, is drawn; and the cut when the two groups' spans overlap
+    without an R3 overlap.
+  - The three-arm chain (arms at 09:00–11:00, 10:00–12:00, 11:30–13:00):
+    no bridge across arms (P6); check it against the expected absolute
+    alignment.
   - A presented recording whose span has internal gaps. Candidate: its span
     runs from its first row to its last.
   - Detection in one pass against every source, bridges included, with
