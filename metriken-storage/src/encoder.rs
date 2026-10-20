@@ -89,11 +89,12 @@ impl Encoder {
     /// read in one snapshot.
     ///
     /// For a copy of an archive that is still being written, build the
-    /// encoder inside the snapshot the copy reads. A source or long stream
-    /// that appears between this call and a copy taking its own snapshot is
-    /// unknown to the encoder, which encodes its unsealed rows as wide, and
-    /// the copy fails. dendro's `read_snapshot` is re-entrant, so this
-    /// call and the copy share the outer one:
+    /// encoder inside the snapshot the copy reads. A long stream that
+    /// appears between this call and a copy taking its own snapshot, in a
+    /// new source or an existing one, is unknown to the encoder, which
+    /// encodes its unsealed rows as wide, and the copy fails. dendro's
+    /// `read_snapshot` is re-entrant, so this call and the copy share the
+    /// outer one:
     ///
     /// ```ignore
     /// src.read_snapshot(|src| {

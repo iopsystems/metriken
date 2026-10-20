@@ -32,8 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream list from every source passes `Encoder::for_archive(&archive)?`
   instead. For a copy of an archive still being written, build it inside
   the read snapshot the copy reads, as `for_archive`'s documentation shows;
-  a stream that appears between the two is otherwise encoded wide and the
-  copy fails.
+  a long stream that appears between the two is otherwise encoded wide and
+  the copy fails.
 
 ### Fixed
 
@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expected 4`, and that source's `sync` returned the error, which stopped
   the recording. A copy or dump of such an archive with `for_streams` failed
   the same way on the wide source's unsealed rows. Present since
-  metriken-storage 0.1.0.
+  metriken-storage 0.1.0, and in metriken-archive's writer before it moved
+  (0.3.5 has it).
 
 ## [0.3.2] - 2026-10-19
 

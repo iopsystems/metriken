@@ -2091,6 +2091,7 @@ fn a_live_copy_builds_its_encoder_in_the_copys_snapshot() {
         copied.keys().map(String::as_str).collect::<Vec<_>>(),
         ["a", "b"]
     );
+    // Left unfinalized so the archive keeps its live tails.
     for source in [a, b, c.unwrap()] {
         std::mem::forget(source);
     }
