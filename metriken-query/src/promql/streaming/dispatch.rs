@@ -1291,6 +1291,21 @@ impl<'e> Leaf<'e> {
         }
     }
 
+    /// Whether `source` holds `name` as the kind the leaf reads, so reading
+    /// it can give series rather than "not found" or "wrong kind".
+    fn held_by(self, source: &dyn DataSource, name: &str) -> bool {
+        let counter = || source.counter_names().iter().any(|n| n == name);
+        let gauge = || source.gauge_names().iter().any(|n| n == name);
+        match self {
+            Leaf::Call(call) => match call.func.name {
+                "rate" | "irate" => counter(),
+                "deriv" => counter() || gauge(),
+                _ => gauge(),
+            },
+            Leaf::Selector(_) => gauge(),
+        }
+    }
+
     fn build<'a>(self, ctx: &'a Ctx<'a>) -> Result<Built<'a>, QueryError>
     where
         'e: 'a,
@@ -1342,8 +1357,17 @@ where
         }
     };
     let mut out: Vec<(crate::labels::Labels, Vec<super::Point>)> = Vec::new();
-    if let Some(singles) = &groups.singles {
-        out.extend(collect(leaf.build(&ctx.over(singles.as_ref()))?));
+    // A recording that does not hold the leaf's metric as the kind it reads
+    // adds no series and is not read: read alone, it would answer "not
+    // found" for a name other recordings hold. When none holds it, the
+    // whole source answers, with the error a single source would give.
+    let held = |source: &dyn DataSource| leaf.held_by(source, name);
+    let any = groups.parts.iter().any(|p| match p {
+        per_source::Part::Single(s) => held(s.as_ref()),
+        per_source::Part::Group(members) => members.iter().any(|m| held(m.source.as_ref())),
+    });
+    if !any {
+        out.extend(collect(leaf.build(&ctx.over(ctx.source))?));
     }
     let window = leaf.window(ctx.rate_mode);
     let step_ns = ctx.step_ns;
@@ -1362,7 +1386,21 @@ where
             Window::Point => 0,
         }
     };
-    for members in &groups.groups {
+    for part in groups.parts.iter().filter(|_| any) {
+        let members: Vec<&per_source::Member> = match part {
+            per_source::Part::Single(source) => {
+                if held(source.as_ref()) {
+                    out.extend(collect(leaf.build(&ctx.over(source.as_ref()))?));
+                }
+                continue;
+            }
+            per_source::Part::Group(members) => {
+                members.iter().filter(|m| held(m.source.as_ref())).collect()
+            }
+        };
+        if members.is_empty() {
+            continue;
+        }
         let interval_ns = |m: &per_source::Member| -> u64 {
             let s = if leaf.reads_counter(m.source.as_ref(), name) {
                 m.source.counter_interval(name)
@@ -1373,23 +1411,68 @@ where
         };
         // S3's rank: finest first, then the lowest uuid, then catalog order.
         let mut ranked: Vec<(u64, &per_source::Member)> =
-            members.iter().map(|m| (interval_ns(m), m)).collect();
+            members.iter().map(|m| (interval_ns(m), *m)).collect();
         ranked.sort_by(|(ia, a), (ib, b)| {
             ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo))
         });
+        // On the grid, a member ranked after the first can answer only at
+        // the grid times where the first does not cover the window, so it is
+        // read over those runs of grid times alone, or not at all, unless it
+        // holds a series the first does not list. Each grid point reads its
+        // own window, so a narrower range changes none of them; a run is read
+        // one step past its end, because a source is held past its last row
+        // at the end of a range.
+        let lazy = matches!(ctx.rate_mode, RateMode::Grid)
+            && ctx.eval_timestamps.is_none()
+            && ctx.step_ns > 0;
+        let listing = |m: &per_source::Member| -> std::collections::HashSet<_> {
+            let mut l = m.source.counter_labels(name);
+            l.extend(m.source.gauge_labels(name));
+            l.into_iter().collect()
+        };
+        let first_listing = ranked.first().filter(|_| lazy).map(|(_, m)| listing(m));
+        let mut need: Vec<(u64, u64)> = Vec::new();
         let mut evaluated = Vec::with_capacity(ranked.len());
-        for (interval_ns, m) in ranked {
+        for (i, (interval_ns, m)) in ranked.into_iter().enumerate() {
+            let narrow = lazy
+                && i > 0
+                && !first_listing
+                    .as_ref()
+                    .is_some_and(|first| !listing(m).is_subset(first));
+            let ranges: Vec<(u64, u64)> = if narrow {
+                need.iter()
+                    .map(|&(a, b)| (a, (b + ctx.step_ns).min(ctx.end_ns)))
+                    .collect()
+            } else {
+                vec![(ctx.start_ns, ctx.end_ns)]
+            };
             let tap = Tap::new(m.source.clone(), m.lo, m.hi);
-            let mut sub = ctx.over(&tap);
-            // The tap records the rows it hands out, which the batched scan
-            // does not go through.
-            sub.per_series_rates = true;
-            let series = collect(leaf.build(&sub)?);
-            evaluated.push(MemberSeries {
-                series,
-                rows: tap.take_rows(),
-                interval_ns,
-            });
+            let mut series: Vec<(crate::labels::Labels, Vec<super::Point>)> = Vec::new();
+            for (k, &(a, b)) in ranges.iter().enumerate() {
+                let mut sub = ctx.over(&tap);
+                sub.start_ns = a;
+                sub.end_ns = b;
+                for (labels, mut points) in collect(leaf.build(&sub)?) {
+                    if narrow {
+                        let (lo, hi) = need[k];
+                        points.retain(|p| lo <= p.t && p.t <= hi);
+                    }
+                    match series.iter_mut().find(|(l, _)| *l == labels) {
+                        Some((_, all)) => all.extend(points),
+                        None => series.push((labels, points)),
+                    }
+                }
+            }
+            evaluated.push(MemberSeries::new(series, tap.take_rows(), interval_ns));
+            if lazy && i == 0 {
+                need = per_source::uncovered_runs(
+                    &evaluated[0],
+                    &window_ns,
+                    ctx.start_ns,
+                    ctx.end_ns,
+                    ctx.step_ns,
+                );
+            }
         }
         out.extend(per_source::combine(
             evaluated,

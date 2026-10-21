@@ -21,9 +21,9 @@
 //! and binary operators run on the combined series, so `sum(rate(x[1m]))`
 //! counts each process once.
 //!
-//! Histogram functions do not combine yet: over a group they read the
-//! finest source alone ([`GroupSource`]), which counts it once and leaves
-//! the other sources' spans out.
+//! Histogram functions do not combine yet: over a group they read one source
+//! alone, the one covering the most of the read ([`GroupSource`]), which
+//! counts the process once and leaves the other sources' spans out.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -71,11 +71,18 @@ impl Member {
 /// The sources of a query, as the engine reads them when some of them form
 /// process groups of more than one member.
 pub(crate) struct SourceGroups {
-    /// Every recording that is a group of one member, as one source; `None`
-    /// when there is none.
-    pub singles: Option<Arc<dyn DataSource>>,
-    /// Each process group of more than one member.
-    pub groups: Vec<Vec<Member>>,
+    /// The recordings the query reaches, in catalog order: each a source of
+    /// one member, or a process group of several.
+    pub parts: Vec<Part>,
+}
+
+/// One recording of [`SourceGroups`].
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+pub(crate) enum Part {
+    /// A source that is a group of one member, read as before.
+    Single(Arc<dyn DataSource>),
+    /// The members of a process group.
+    Group(Vec<Member>),
 }
 
 /// What a leaf's point at `t` reads, for the coverage rule.
@@ -96,6 +103,7 @@ pub(crate) enum Window {
 
 /// The rows a member's series hold, as runs without a hole (S3), with the
 /// member's interval.
+#[derive(Clone)]
 struct Coverage {
     runs: Vec<(u64, u64)>,
     interval_ns: u64,
@@ -167,11 +175,47 @@ pub(crate) fn runs(timestamps: &[u64]) -> Vec<(u64, u64)> {
     out
 }
 
-/// One member's evaluated series, with the rows it read.
+/// One member's evaluated series, with the runs of rows each read.
 pub(crate) struct MemberSeries {
     pub series: Vec<(Labels, Vec<Point>)>,
-    pub rows: HashMap<Labels, Vec<u64>>,
-    pub interval_ns: u64,
+    coverage: HashMap<Labels, Coverage>,
+    interval_ns: u64,
+}
+
+impl MemberSeries {
+    /// `series` with the rows each was read from (`Tap::take_rows`), kept as
+    /// runs (S3), and the member's interval.
+    pub(crate) fn new(
+        series: Vec<(Labels, Vec<Point>)>,
+        rows: HashMap<Labels, Vec<u64>>,
+        interval_ns: u64,
+    ) -> Self {
+        let coverage = rows
+            .into_iter()
+            .map(|(labels, mut ts)| {
+                // Rows arrive in time order from one table; a series read
+                // from several (a union of group tables) is sorted here.
+                if !ts.is_sorted() {
+                    ts.sort_unstable();
+                }
+                ts.dedup();
+                let runs = runs(&ts);
+                (labels, Coverage { runs, interval_ns })
+            })
+            .collect();
+        Self {
+            series,
+            coverage,
+            interval_ns,
+        }
+    }
+
+    fn coverage(&self, labels: &Labels) -> Coverage {
+        self.coverage.get(labels).cloned().unwrap_or(Coverage {
+            runs: Vec::new(),
+            interval_ns: self.interval_ns,
+        })
+    }
 }
 
 /// Combine the members' results per series (S3, S9). `members` are in rank
@@ -191,17 +235,14 @@ pub(crate) fn combine(
     for m in members {
         let MemberSeries {
             series,
-            mut rows,
+            mut coverage,
             interval_ns,
         } = m;
         for (labels, points) in series {
-            let mut ts = rows.remove(&labels).unwrap_or_default();
-            ts.sort_unstable();
-            ts.dedup();
-            let coverage = Coverage {
-                runs: runs(&ts),
+            let coverage = coverage.remove(&labels).unwrap_or(Coverage {
+                runs: Vec::new(),
                 interval_ns,
-            };
+            });
             let entry = by_series.entry(labels.clone()).or_insert_with(|| {
                 order.push(labels.clone());
                 Vec::new()
@@ -213,55 +254,99 @@ pub(crate) fn combine(
         .into_iter()
         .map(|labels| {
             let members = by_series.remove(&labels).expect("listed");
-            (labels, combine_series(&members, window, raw))
+            (labels, combine_series(members, window, raw))
         })
         .collect()
 }
 
 fn combine_series(
-    members: &[(Vec<Point>, Coverage)],
+    mut members: Vec<(Vec<Point>, Coverage)>,
     window: &dyn Fn(u64, u64) -> u64,
     raw: bool,
 ) -> Vec<Point> {
-    let mut times: Vec<u64> = members
-        .iter()
-        .flat_map(|(p, _)| p.iter().map(|p| p.t))
-        .collect();
-    times.sort_unstable();
-    times.dedup();
-    let mut cursor = vec![0usize; members.len()];
-    let mut out = Vec::with_capacity(times.len());
-    for t in times {
-        // Each member's point at `t`, advancing its cursor.
-        let at: Vec<Option<&Point>> = members
-            .iter()
-            .zip(cursor.iter_mut())
-            .map(|((points, _), c)| {
-                while *c < points.len() && points[*c].t < t {
-                    *c += 1;
-                }
-                points.get(*c).filter(|p| p.t == t)
-            })
-            .collect();
+    // Which member answers each point, by a merge over the members' points
+    // in time order; then the answer is built, or, when one member answers
+    // every point it holds and no other answers anything, that member's
+    // points are the answer as they are.
+    let n = members.len();
+    let mut cursor = vec![0usize; n];
+    let mut at: Vec<Option<usize>> = vec![None; n];
+    let mut chosen: Vec<(usize, usize)> = Vec::new();
+    while let Some(t) = (0..n)
+        .filter_map(|i| members[i].0.get(cursor[i]).map(|p| p.t))
+        .min()
+    {
+        for i in 0..n {
+            let points = &members[i].0;
+            at[i] = (points.get(cursor[i]).map(|p| p.t) == Some(t)).then_some(cursor[i]);
+        }
         let holds = |i: usize| members[i].1.holds(t);
         let covers = |i: usize| {
             let c = &members[i].1;
             c.covers(t, window(t, c.interval_ns))
         };
-        let chosen = if raw {
+        let pick = if raw {
             // The member answering at `t`; its point, if it has one there.
-            (0..members.len())
+            (0..n)
                 .find(|&i| covers(i))
-                .or_else(|| (0..members.len()).find(|&i| holds(i)))
-                .and_then(|i| at[i])
+                .or_else(|| (0..n).find(|&i| holds(i)))
+                .filter(|&i| at[i].is_some())
         } else {
-            (0..members.len())
+            (0..n)
                 .find(|&i| at[i].is_some() && covers(i))
-                .or_else(|| (0..members.len()).find(|&i| at[i].is_some() && holds(i)))
-                .and_then(|i| at[i])
+                .or_else(|| (0..n).find(|&i| at[i].is_some() && holds(i)))
         };
-        if let Some(p) = chosen {
-            out.push(*p);
+        if let Some(i) = pick {
+            chosen.push((i, at[i].expect("has a point")));
+        }
+        for i in 0..n {
+            if at[i].is_some() {
+                cursor[i] += 1;
+            }
+        }
+    }
+    if let Some(&(only, _)) = chosen.first() {
+        if chosen.len() == members[only].0.len() && chosen.iter().all(|&(i, _)| i == only) {
+            return std::mem::take(&mut members[only].0);
+        }
+    }
+    chosen.into_iter().map(|(i, k)| members[i].0[k]).collect()
+}
+
+/// The grid times in `[start, end]` (every `step`) at which some series of
+/// `m` has no point whose rows cover the window, as runs `(first, last)` of
+/// consecutive grid times, in order. A member ranked after `m` can answer
+/// only there (and for series `m` lacks, which the caller checks).
+pub(crate) fn uncovered_runs(
+    m: &MemberSeries,
+    window: &dyn Fn(u64, u64) -> u64,
+    start: u64,
+    end: u64,
+    step: u64,
+) -> Vec<(u64, u64)> {
+    let n = ((end.saturating_sub(start)) / step + 1) as usize;
+    let mut need = vec![m.series.is_empty(); n];
+    for (labels, points) in &m.series {
+        let coverage = m.coverage(labels);
+        let mut p = points.iter().peekable();
+        for (k, need) in need.iter_mut().enumerate() {
+            let t = start + k as u64 * step;
+            while p.next_if(|q| q.t < t).is_some() {}
+            let has = p.peek().is_some_and(|q| q.t == t);
+            if !(has && coverage.covers(t, window(t, coverage.interval_ns))) {
+                *need = true;
+            }
+        }
+    }
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (k, &need) in need.iter().enumerate() {
+        if !need {
+            continue;
+        }
+        let t = start + k as u64 * step;
+        match out.last_mut() {
+            Some(last) if last.1 + step == t => last.1 = t,
+            _ => out.push((t, t)),
         }
     }
     out
@@ -337,7 +422,92 @@ fn retain_by<T>(keep: &[bool], v: &mut Vec<T>) {
     v.retain(|_| *k.next().unwrap_or(&false));
 }
 
+/// A scan's chunk reader that records, per matched series, the stamp of
+/// every row holding a value, as the batched rate path will read them.
+struct RecordingChunks<'a> {
+    inner: Box<dyn crate::scan::ChunkReader + 'a>,
+    sinks: Vec<Arc<Mutex<Vec<u64>>>>,
+}
+
+impl crate::scan::ChunkReader for RecordingChunks<'_> {
+    fn next_chunk(
+        &mut self,
+        n: usize,
+    ) -> Result<Option<crate::scan::ScanChunk>, crate::scan::ScanError> {
+        use arrow::array::Array;
+        let Some(chunk) = self.inner.next_chunk(n)? else {
+            return Ok(None);
+        };
+        let mut rows: Vec<Vec<u64>> = vec![Vec::new(); self.sinks.len()];
+        for seg in &chunk.segments {
+            let columns = &seg.columns;
+            for (batch, series) in columns.batches.iter().zip(&seg.series) {
+                let Some(ts) = columns.u64s(batch, columns.ts) else {
+                    continue;
+                };
+                for (col, series) in seg.cols.iter().zip(series) {
+                    let Some(values) = columns.u64s(batch, col.values) else {
+                        continue;
+                    };
+                    let mut push = |r: usize, s: usize| {
+                        if !ts.is_null(r) && !values.is_null(r) {
+                            if let Some(v) = rows.get_mut(s) {
+                                v.push(ts.value(r));
+                            }
+                        }
+                    };
+                    match series {
+                        crate::scan::RowSeries::One(s) => {
+                            for r in 0..batch.num_rows() {
+                                push(r, *s as usize);
+                            }
+                        }
+                        crate::scan::RowSeries::PerRow(v) => {
+                            for (r, s) in v.iter().enumerate() {
+                                if *s != u32::MAX {
+                                    push(r, *s as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (sink, mut r) in self.sinks.iter().zip(rows) {
+            if !r.is_empty() {
+                sink.lock().expect("not poisoned").append(&mut r);
+            }
+        }
+        Ok(Some(chunk))
+    }
+}
+
 impl DataSource for Tap {
+    /// The source's scan, its rows recorded as they are read; `None` for a
+    /// member clipped to an epoch (a scan cannot be clipped), which then
+    /// takes the per-series path.
+    fn counter_scan(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::scan::CounterScan<'_>> {
+        if self.lo != 0 || self.hi != u64::MAX {
+            return None;
+        }
+        let scan = self.inner.counter_scan(name, filter, start_ns, end_ns)?;
+        let sinks: Vec<_> = scan.series.iter().map(|s| self.sink(&s.labels)).collect();
+        let (series, reader) = scan.into_parts();
+        Some(crate::scan::CounterScan::new(
+            series,
+            Box::new(RecordingChunks {
+                inner: reader,
+                sinks,
+            }),
+        ))
+    }
+
     fn counters(
         &self,
         name: &str,
@@ -480,7 +650,8 @@ impl DataSource for Tap {
 
 /// A process group as one source, for what a query asks of the whole: its
 /// names, label sets, intervals and span; and, until histograms combine per
-/// source, a histogram read, which the finest of its sources answers alone.
+/// source, a histogram read, which the source covering the most of the read
+/// answers alone.
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 pub(crate) struct GroupSource {
     /// One per source of the group, unclipped, in S3's rank order.
@@ -568,7 +739,26 @@ impl DataSource for GroupSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        self.finest_holding(|s| s.histogram_names().iter().any(|n| n == name))
+        // Until histograms combine per source: the source holding the
+        // histogram whose span covers the most of the read, ties to the
+        // finest, so the group counts once and the range is read whole where
+        // one source holds it.
+        let overlap = |s: &dyn DataSource| {
+            s.time_range()
+                .map_or(0, |(a, b)| b.min(end_ns).saturating_sub(a.max(start_ns)))
+        };
+        let mut best: Option<(&dyn DataSource, u64)> = None;
+        for s in &self.sources {
+            let s = s.as_ref();
+            if !s.histogram_names().iter().any(|n| n == name) {
+                continue;
+            }
+            let o = overlap(s);
+            if best.is_none_or(|(_, b)| o > b) {
+                best = Some((s, o));
+            }
+        }
+        best.map_or(self.sources[0].as_ref(), |(s, _)| s)
             .histogram_stream(name, filter, start_ns, end_ns)
     }
     fn interval(&self) -> f64 {
@@ -662,11 +852,11 @@ mod tests {
 
     fn member(points: Vec<Point>, rows: Vec<u64>, interval_ns: u64) -> MemberSeries {
         let labels = Labels::default();
-        MemberSeries {
-            series: vec![(labels.clone(), points)],
-            rows: [(labels, rows)].into(),
+        MemberSeries::new(
+            vec![(labels.clone(), points)],
+            [(labels, rows)].into(),
             interval_ns,
-        }
+        )
     }
 
     /// The finer member answers where its rows cover the window, the coarser

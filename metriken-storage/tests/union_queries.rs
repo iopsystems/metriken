@@ -1247,3 +1247,294 @@ fn a_metric_one_source_holds_is_read_by_the_group_rules() {
         .collect();
     assert_eq!(d.points, outside);
 }
+
+/// A series' labels and points.
+type Points = (Labels, Vec<(f64, f64)>);
+
+fn two_metrics(ts: u64) -> Read {
+    Read {
+        counters: vec![("c", (ts - BASE) / MS), ("d", 2 * (ts - BASE) / MS)],
+        gauges: vec![("g", ((ts - BASE) / S) as i64)],
+        histograms: Vec::new(),
+        window: MS,
+    }
+}
+
+fn c_only(ts: u64) -> Read {
+    Read {
+        counters: vec![("c", (ts - BASE) / MS)],
+        gauges: Vec::new(),
+        histograms: Vec::new(),
+        window: MS,
+    }
+}
+
+/// The series of `query` on the batched and the per-series path, unsorted
+/// (as the engine orders them), or the error.
+fn as_ordered(
+    reader: &ArchiveReader,
+    query: &str,
+    (start, end, step): (u64, u64, f64),
+    per_series: bool,
+) -> Result<Vec<Points>, String> {
+    let opts = QueryOptions::default().with_per_series_rates(per_series);
+    match reader.query_range_opts(query, start as f64 / 1e9, end as f64 / 1e9, step, &opts) {
+        Ok(QueryResult::Matrix { result }) => Ok(result
+            .into_iter()
+            .map(|m| {
+                let labels = m
+                    .metric
+                    .into_iter()
+                    .filter(|(k, _)| k != "__name__")
+                    .collect();
+                (labels, m.values)
+            })
+            .collect()),
+        Ok(other) => Err(format!("not a matrix: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A recording that does not hold a metric a query names adds no series and
+/// no error, beside a process group as beside a single source: a source of
+/// host a and its copy, and a source of host b holding `c` only.
+#[test]
+fn a_recording_lacking_a_metric_is_left_out_of_its_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.dendro");
+    write(
+        &a,
+        &[spec(
+            &[("host", "a")],
+            &[("e1", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 5, 0), S),
+            two_metrics,
+        )],
+    );
+    let b = dir.path().join("b.dendro");
+    write(
+        &b,
+        &[spec(
+            &[("host", "b")],
+            &[("e2", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 5, 0), S),
+            c_only,
+        )],
+    );
+    let with_copy = dir.path().join("with_copy.dendro");
+    combine(&with_copy, &[(&a, None), (&a, None), (&b, None)]);
+    let without = dir.path().join("without.dendro");
+    combine(&without, &[(&a, None), (&b, None)]);
+    let (with_copy, without) = (open(&with_copy), open(&without));
+    assert_eq!(with_copy.read_groups().len(), 2);
+    let window = (at(10, 1, 0), at(10, 4, 0), 1.0);
+    for query in [
+        "sum(rate(d[1m])) + sum(rate(c[1m]))",
+        "rate(d[1m])",
+        "sum(rate(c[1m]))",
+        "g",
+    ] {
+        for per_series in [false, true] {
+            let want = as_ordered(&without, query, window, per_series);
+            let got = as_ordered(&with_copy, query, window, per_series);
+            assert!(want.is_ok(), "{query}: {want:?}");
+            assert_eq!(got, want, "{query} (per series {per_series})");
+        }
+        assert_eq!(
+            one_series_or_none(&with_copy, query, window),
+            one_series_or_none(&without, query, window),
+            "{query} (display)"
+        );
+    }
+    let sum = as_ordered(
+        &with_copy,
+        "sum(rate(d[1m])) + sum(rate(c[1m]))",
+        window,
+        false,
+    )
+    .unwrap();
+    assert!(
+        sum[0].1.iter().all(|p| (p.1 - 4000.0).abs() < 1e-6),
+        "{sum:?}"
+    );
+}
+
+/// The display path's series, sorted by labels, as `(labels, points)`.
+fn one_series_or_none(reader: &ArchiveReader, query: &str, window: (u64, u64, f64)) -> Vec<Points> {
+    range(reader, query, window, Path_::Display)
+        .into_iter()
+        .map(|s| (s.labels, s.points))
+        .collect()
+}
+
+/// A process group whose filtered copy lacks `d` and `g` answers binary
+/// queries over them as the source alone does.
+#[test]
+fn a_filtered_copy_lacking_a_metric_leaves_binary_queries_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 5, 0), S),
+                two_metrics,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 5, 0), S),
+                c_only,
+            ),
+        ],
+    );
+    let alone = dir.path().join("alone.dendro");
+    write(
+        &alone,
+        &[spec(
+            &[("host", "a")],
+            &[("e", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 5, 0), S),
+            two_metrics,
+        )],
+    );
+    let (union, alone) = (open(&path), open(&alone));
+    assert_eq!(union.read_groups().len(), 1);
+    let window = (at(10, 1, 0), at(10, 4, 0), 1.0);
+    for query in [
+        "rate(d[1m]) / rate(c[1m])",
+        "sum(rate(d[1m])) / sum(rate(c[1m]))",
+        "g + rate(c[1m])",
+    ] {
+        for per_series in [false, true] {
+            let want = as_ordered(&alone, query, window, per_series);
+            assert!(
+                want.as_ref().is_ok_and(|w| !w.is_empty()),
+                "{query}: {want:?}"
+            );
+            assert_eq!(
+                as_ordered(&union, query, window, per_series),
+                want,
+                "{query} (per series {per_series})"
+            );
+        }
+        assert_eq!(
+            one_series_or_none(&union, query, window),
+            one_series_or_none(&alone, query, window),
+            "{query} (display)"
+        );
+    }
+}
+
+/// Series come in catalog order whether or not a recording is a group:
+/// host a (with a copy) before host b.
+#[test]
+fn series_keep_catalog_order_beside_a_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.dendro");
+    write(
+        &a,
+        &[spec(
+            &[("host", "a")],
+            &[("e1", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 5, 0), S),
+            cycles,
+        )],
+    );
+    let b = dir.path().join("b.dendro");
+    write(
+        &b,
+        &[spec(
+            &[("host", "b")],
+            &[("e2", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 5, 0), S),
+            cycles,
+        )],
+    );
+    let with_copy = dir.path().join("with_copy.dendro");
+    combine(
+        &with_copy,
+        &[
+            (&a, None),
+            (&a, Some((at(10, 1, 0), at(10, 3, 0)))),
+            (&b, None),
+        ],
+    );
+    let without = dir.path().join("without.dendro");
+    combine(&without, &[(&a, None), (&b, None)]);
+    let (with_copy, without) = (open(&with_copy), open(&without));
+    let window = (at(10, 1, 0), at(10, 4, 0), 1.0);
+    for query in ["rate(cpu_cycles[1m])", "g", "irate(cpu_cycles[5s]) * 2"] {
+        for per_series in [false, true] {
+            let got = as_ordered(&with_copy, query, window, per_series).unwrap();
+            let hosts: Vec<&str> = got.iter().map(|(l, _)| l["host"].as_str()).collect();
+            assert_eq!(hosts, ["a", "b"], "{query}");
+            assert_eq!(
+                got,
+                as_ordered(&without, query, window, per_series).unwrap(),
+                "{query}"
+            );
+        }
+    }
+}
+
+/// Until histograms combine per source, a group's histogram is read from
+/// the source covering the most of the range: a record over 10:00 to 11:00
+/// and a dump of another recording of the process over 10:20 to 10:25 give
+/// the record's every point, whichever uuid sorts first.
+#[test]
+fn a_groups_histogram_reads_the_source_covering_the_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.dendro");
+    write(
+        &record,
+        &[spec(
+            &[("host", "a")],
+            &[("e", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(11, 0, 0), S),
+            cycles,
+        )],
+    );
+    let buffer = dir.path().join("buffer.dendro");
+    write(
+        &buffer,
+        &[spec(
+            &[("host", "a")],
+            &[("e", at(10, 0, 0))],
+            rows(at(10, 15, 0), at(10, 30, 0), S),
+            cycles,
+        )],
+    );
+    let window = (at(10, 0, 0), at(11, 0, 0), 1.0);
+    let want_alone = open(&record);
+    // Both catalog orders, so the uuid tie cannot pick the record by luck.
+    for order in [[0, 1], [1, 0]] {
+        let path = dir
+            .path()
+            .join(format!("rd{}{}.dendro", order[0], order[1]));
+        let inputs: [(&Path, Option<(u64, u64)>); 2] = [
+            (&record, None),
+            (&buffer, Some((at(10, 20, 0), at(10, 25, 0)))),
+        ];
+        combine(&path, &[inputs[order[0]], inputs[order[1]]]);
+        let union = open(&path);
+        assert_eq!(union.read_groups().len(), 1);
+        for query in [
+            "histogram_count(latency)",
+            "histogram_quantiles([0.5, 0.99], latency)",
+            "histogram_count(latency, 10)",
+        ] {
+            let (s, e) = (window.0 as f64 / 1e9, window.1 as f64 / 1e9);
+            let want = from_matrix(want_alone.query_range(query, s, e, 1.0).unwrap());
+            let got = from_matrix(union.query_range(query, s, e, 1.0).unwrap());
+            assert!(
+                want[0].points.len() >= 360,
+                "{query}: {}",
+                want[0].points.len()
+            );
+            assert_eq!(got, want, "{query} order {order:?}");
+        }
+    }
+}

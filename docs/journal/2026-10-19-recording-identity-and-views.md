@@ -1400,8 +1400,9 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
 - 2a: S1, S2, S3, S5 to S9 for counters and gauges (`rate`, `irate`, a
   gauge read, `avg_over_time`, `idelta`, `deriv`), with each producer
   epoch's `from_ts` as the start of a new run of rows. Histograms read one
-  source of a group (the finest; ties by S3's rule), which counts a process
-  once and leaves the other sources' spans out.
+  source of a group (the one covering the most of the query's range, ties
+  to the finest), which counts a process once and leaves the other sources'
+  spans out.
 - 2b: histograms per source (the per-row and per-stride deltas combined per
   series per span).
 - 2c: S4: conflict detection, the warnings channel on query results (an
@@ -1422,17 +1423,28 @@ alternative, a combinator inside each producer (the batched
 source identity on every sample and a separate implementation on each of
 three paths; evaluating the leaf per member reuses the one-recording code,
 so "evaluated alone, as one recording is evaluated today" holds by
-construction. Its cost is one evaluation per member per leaf, and the
-batched counter scan is not used for a member (the wrapper cannot record
-its rows), so a group pays the per-series path. Measured on the 9.6 h
-recording with a copy of itself, against the same archive read twice by
-metriken-query 0.41.0: 52 ms against 16 to 18 ms for `sum(rate(cpu_usage[1m]))`
-over 9.6 h at a 60 s step, 25 ms against 4.7 to 4.9 ms for `rate` over 1 h
-at 1 s, 192 ms against 22 to 24 ms for a display query over 9.6 h; the
-one-source per-series path alone costs 19, 9.5 and 59 ms there. Using the
-batched scan per member (row timestamps from the table) is the next cost
-step if it matters. Queries reaching no multi-member group take the code
-path they took before, and cost the same within noise.
+construction. A member that is a whole source reads the batched counter
+scan, the wrapper recording each row the scan decodes; a member clipped to
+an epoch takes the per-series path, since a scan cannot be clipped. On the
+grid, the first-ranked member is read over the whole range and every other
+member only over the runs of grid times where the first does not cover the
+window (and over the whole range when it lists a series the first does
+not): elsewhere the first answers whatever the others hold, and a grid
+point reads only its own window, so the narrower read changes no point
+(each run is read one step past its end, because a source is held past its
+last row only at the end of a range). Measured on the 9.6 h recording with a copy of itself, against the same
+archive read twice by metriken-query 0.41.0, medians of three interleaved
+rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at
+1 s 211 ms against 59 ms (546 ms before the batched scan and the narrowed
+reads), `rate(cgroup_cpu_usage[1m])` over 1 h 19 ms against 12 ms,
+`sum(irate(...))` over 1 h 18 ms against 6.1 ms, `sum(rate(...[1m]))` over
+9.6 h at 60 s 55 ms against 36 ms. Peak memory on that display query is
+1.1 GB against 193 MB, because each member's series are materialized before
+they are combined; streaming the combination needs each series' rows ahead
+of its points (a read-ahead of nine rows answers S3's hole test), which the
+batched scan does not give, so it is the open cost item. Queries
+reaching no multi-member group take the code path they took before, and
+cost the same within noise.
 
 Readings of the rules where the text left a choice:
 
@@ -1461,6 +1473,9 @@ Readings of the rules where the text left a choice:
   of the group holds (a filtered copy lacks it): a hole in it is a gap, as
   for a series every source holds, where the source alone interpolates a
   rate across the hole as before.
+- A recording that does not hold the metric a leaf reads, as the kind it
+  reads, is not read for that leaf (a filtered copy, another host), so it
+  adds neither series nor a "not found".
 - A gauge's staleness window and S9's "within one interval of its last row"
   use the member's interval for that metric; the rank uses the same
   interval.

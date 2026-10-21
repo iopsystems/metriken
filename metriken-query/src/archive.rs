@@ -11,7 +11,7 @@ use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
 use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
-use crate::promql::streaming::per_source::{GroupSource, Member, SourceGroups};
+use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups};
 use crate::promql::QueryEngine;
 use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 
@@ -338,8 +338,9 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             None => units.push((group, vec![tables])),
         }
     }
-    let mut singles: Vec<Arc<dyn DataSource>> = Vec::new();
-    let mut groups: Vec<(Vec<Member>, Vec<Ranked>)> = Vec::new();
+    // The recordings in catalog order: a source alone, or a group's members
+    // and its sources ranked.
+    let mut parts: Vec<Result<Arc<dyn DataSource>, Grouped>> = Vec::new();
     for (group, unit) in units {
         // A source whose process group has other sources is read by the
         // group's rules even where it alone holds the metric, so a series
@@ -386,11 +387,15 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         }
         match members.len() {
             0 => {}
-            1 if !grouped => singles.push(members.pop().expect("one").source),
-            _ => groups.push((members, whole)),
+            1 if !grouped => parts.push(Ok(members.pop().expect("one").source)),
+            _ => parts.push(Err((members, whole))),
         }
     }
-    if groups.is_empty() {
+    if parts.iter().all(|p| p.is_ok()) {
+        let mut singles: Vec<Arc<dyn DataSource>> = parts
+            .into_iter()
+            .map(|p| p.ok().expect("all single"))
+            .collect();
         let source: Arc<dyn DataSource> = match singles.len() {
             // A table whose segments have gone since the probe is absent, so
             // its metrics are too: the same error a query naming a metric
@@ -406,21 +411,25 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         };
         return Ok(Some(QueryEngine::new(source)));
     }
-    let mut children: Vec<Arc<dyn DataSource>> = singles.clone();
-    let singles: Option<Arc<dyn DataSource>> = match singles.len() {
-        0 => None,
-        1 => singles.pop(),
-        _ => Some(Arc::new(RecordingsSource::new(singles))),
-    };
-    let mut members_of = Vec::with_capacity(groups.len());
-    for (members, mut whole) in groups {
-        // A group as the whole sees it, its sources finest first (S3's tie
-        // rule after the interval).
-        whole.sort_by(|(ia, _, a), (ib, _, b)| ia.total_cmp(ib).then_with(|| a.cmp_ties(b)));
-        children.push(Arc::new(GroupSource::new(
-            whole.into_iter().map(|(_, s, _)| s).collect(),
-        )));
-        members_of.push(members);
+    let mut children: Vec<Arc<dyn DataSource>> = Vec::with_capacity(parts.len());
+    let mut ordered: Vec<Part> = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            Ok(source) => {
+                children.push(Arc::clone(&source));
+                ordered.push(Part::Single(source));
+            }
+            Err((members, mut whole)) => {
+                // A group as the whole sees it, its sources finest first
+                // (S3's tie rule after the interval).
+                whole
+                    .sort_by(|(ia, _, a), (ib, _, b)| ia.total_cmp(ib).then_with(|| a.cmp_ties(b)));
+                children.push(Arc::new(GroupSource::new(
+                    whole.into_iter().map(|(_, s, _)| s).collect(),
+                )));
+                ordered.push(Part::Group(members));
+            }
+        }
     }
     let source: Arc<dyn DataSource> = match children.len() {
         1 => children.pop().expect("one"),
@@ -428,16 +437,16 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     };
     Ok(Some(QueryEngine::with_groups(
         source,
-        SourceGroups {
-            singles,
-            groups: members_of,
-        },
+        SourceGroups { parts: ordered },
     )))
 }
 
 /// A source of a process group with what ranks it: its finest table
 /// interval and its tie-breaking facts.
 type Ranked = (f64, Arc<dyn DataSource>, Member);
+
+/// A process group's members, and its sources ranked.
+type Grouped = (Vec<Member>, Vec<Ranked>);
 
 /// Refuse a result in which two series share a label set. Two recordings'
 /// series can: one recording carries `host` as a recording label and the
