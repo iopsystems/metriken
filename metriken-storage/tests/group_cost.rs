@@ -1,8 +1,14 @@
 //! What forming process groups costs on a real archive, beside what opening
 //! it costs. Ignored; needs a recording:
 //! `GROUP_COST_ARCHIVE=path.dendro cargo test --release -p metriken-storage
-//! --test group_cost -- --ignored --nocapture`. `GROUP_COST_RUNS` sets the
-//! number of runs (default 5); each opens a fresh reader.
+//! --test group_cost group_cost -- --ignored --nocapture`. `GROUP_COST_RUNS`
+//! sets the number of runs (default 5); each opens a fresh reader.
+//!
+//! `form_scale` times `process::form` alone on synthetic sources, 1000 and
+//! 3000 of each shape (`GROUP_COST_N` for one count): a fleet (one shared
+//! span, an epoch each), one agent recorded n times at once (one epoch, every
+//! pair checked by R3), and a staircase (each overlapping the next,
+//! epochless).
 
 use std::time::{Duration, Instant};
 
@@ -103,5 +109,52 @@ fn build_copies() {
     for _ in 0..copies {
         out.transaction(|tx| copy_sources_into(&from, tx, &spec, &encoder))
             .unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn form_scale() {
+    use std::collections::BTreeMap;
+
+    use metriken_storage::process::{form, SourceInfo};
+
+    let source = |i: usize, span: (u64, u64), epoch: Option<String>| {
+        let metadata: BTreeMap<String, String> = epoch
+            .map(|e| ("producer_epoch".to_string(), e))
+            .into_iter()
+            .collect();
+        let labels = [("host".to_string(), format!("h{i}"))].into();
+        SourceInfo::new(labels, i, Some(format!("u{i}")), Some(span), &metadata)
+    };
+    let counts: Vec<usize> = match std::env::var("GROUP_COST_N")
+        .ok()
+        .and_then(|n| n.parse().ok())
+    {
+        Some(n) => vec![n],
+        None => vec![1000, 3000],
+    };
+    for n in counts {
+        for shape in ["fleet", "one epoch", "staircase"] {
+            let sources: Vec<SourceInfo> = (0..n)
+                .map(|i| match shape {
+                    "fleet" => source(i, (0, 1_000), Some(format!("e{i}"))),
+                    "one epoch" => source(i, (0, 1_000), Some("e".to_string())),
+                    _ => source(i, (i as u64 * 10, i as u64 * 10 + 15), None),
+                })
+                .collect();
+            let mut calls = 0u64;
+            let start = Instant::now();
+            let g = form(&sources, &mut |_, _, _| {
+                calls += 1;
+                Some(true)
+            });
+            println!(
+                "n={n} {shape}: form {:.1} ms, {} process groups, {} bridges, {calls} row checks",
+                start.elapsed().as_secs_f64() * 1e3,
+                g.groups.len(),
+                g.bridges.len(),
+            );
+        }
     }
 }

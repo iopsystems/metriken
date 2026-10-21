@@ -11,12 +11,18 @@
 //!    gap between them (a continuous recording beside one recording per
 //!    day). Two uuid groups that share a producer epoch overlap when they
 //!    overlap within it (rule 3); other pairs overlap when their spans
-//!    intersect. When any source carries `arm`, bridges are found among each
-//!    arm's members only, and a source without `arm` is never a bridge.
+//!    intersect, from the first row of any member to the last. When any
+//!    source carries `arm`, an armed uuid group bridges groups of its own
+//!    arm only, and an unarmed one (shared context) bridges armed groups,
+//!    so it joins no two of them that do not overlap each other (owner
+//!    decision on Q39); a uuid group carrying two arms is never a bridge.
 //! 3. The other uuid groups join one [`ProcessGroup`] when they share a
 //!    producer epoch and the intersection of their spans in that epoch holds
 //!    at least one row of each (R3); the relation is closed transitively.
-//!    Groups are formed regardless of the producer's kind.
+//!    Groups are formed regardless of the producer's kind, and the key is
+//!    the epoch alone (Q9's first candidate, until a producer identity
+//!    exists): two in-process sources of one process, which share its
+//!    epoch, join.
 //!
 //! What happens to a bridge afterwards (slicing it at the clusters the
 //! presented recordings form, and joining its pieces) depends on
@@ -52,7 +58,8 @@ pub struct EpochSpan {
 pub struct SourceInfo {
     /// The source's labels, as the catalog holds them.
     pub labels: BTreeMap<String, String>,
-    /// The source's index in its archive's catalog.
+    /// The source's position among its archive's catalog sources, in id
+    /// order.
     pub catalog_index: usize,
     /// The source's uuid, kept by every dendro copy; `None` where the
     /// container has none (a `.rez`, a source built in memory).
@@ -97,10 +104,13 @@ pub const PRODUCER_EPOCHS: &str = "producer_epochs";
 /// The epochs a source's rows belong to, clipped to `span`.
 ///
 /// Each `producer_epochs` entry runs from its `from_ts` to the next entry's,
-/// exclusive, and the last to the source's last row. The first entry also
-/// covers any rows before its `from_ts`: the recorder seeds the list with the
-/// epoch the source opened with, so nothing earlier belongs to another epoch.
-/// Without a list that parses, `producer_epoch` covers the whole span. An
+/// exclusive, and the last to the source's last row. Entries are taken in
+/// `from_ts` order rather than list order: restart stamps come from clocks
+/// that need not agree, and an entry stamped before the one listed ahead of
+/// it would otherwise cover nothing. The first entry also covers any rows
+/// before its `from_ts`: the recorder seeds the list with the epoch the
+/// source opened with, so nothing earlier belongs to another epoch. Without
+/// a list that parses (logged), `producer_epoch` covers the whole span. An
 /// entry with no rows in the span is left out.
 pub fn epoch_spans(
     metadata: &BTreeMap<String, String>,
@@ -109,11 +119,17 @@ pub fn epoch_spans(
     let Some((first, last)) = span else {
         return Vec::new();
     };
-    let listed: Option<Vec<(String, u64)>> = metadata
-        .get(PRODUCER_EPOCHS)
-        .and_then(|s| listed_epochs(s))
-        .filter(|l| !l.is_empty());
-    let Some(listed) = listed else {
+    let listed = metadata.get(PRODUCER_EPOCHS).and_then(|s| {
+        let parsed = listed_epochs(s);
+        if parsed.is_none() {
+            tracing::warn!(
+                "{PRODUCER_EPOCHS} does not parse ({s:?}); taking {PRODUCER_EPOCH} as the \
+                 source's only epoch"
+            );
+        }
+        parsed
+    });
+    let Some(mut listed) = listed.filter(|l| !l.is_empty()) else {
         return match metadata.get(PRODUCER_EPOCH) {
             Some(epoch) if !epoch.is_empty() => vec![EpochSpan {
                 epoch: epoch.clone(),
@@ -123,6 +139,8 @@ pub fn epoch_spans(
             _ => Vec::new(),
         };
     };
+    // Stable, so entries with one stamp keep their listed order.
+    listed.sort_by_key(|(_, from)| *from);
     let mut out = Vec::new();
     for (i, (epoch, from)) in listed.iter().enumerate() {
         let begin = if i == 0 { first } else { (*from).max(first) };
@@ -187,8 +205,8 @@ pub struct ProcessGroup {
     pub uuid_groups: Vec<usize>,
     /// Positions in the source list, ascending.
     pub sources: Vec<usize>,
-    /// Why the uuid groups were joined; empty for a group of one uuid
-    /// group.
+    /// The joins that connected its uuid groups, one fewer than there are
+    /// uuid groups; other pairs of them may overlap as well.
     pub joins: Vec<EpochJoin>,
 }
 
@@ -199,9 +217,10 @@ pub struct ProcessGroup {
 pub struct Bridge {
     /// Index into [`ProcessGroups::uuid_groups`].
     pub uuid_group: usize,
-    /// The pairs of uuid groups it bridges: each overlaps the bridge and not
-    /// the other.
-    pub between: Vec<[usize; 2]>,
+    /// One pair of uuid groups it bridges: each overlaps the bridge and not
+    /// the other. Where their spans are disjoint, the earliest-ending and the
+    /// latest-starting group the bridge overlaps.
+    pub between: [usize; 2],
 }
 
 /// Something a consumer should tell the user.
@@ -220,6 +239,13 @@ pub enum Notice {
         epoch: String,
         uuid_groups: [usize; 2],
         intersection_ns: (u64, u64),
+    },
+    /// Two uuid groups share a producer epoch, and whether their spans in it
+    /// hold a row of each could not be read (a read failed, or the rows
+    /// moved since the reader opened). They were not joined.
+    RowsUnread {
+        epoch: String,
+        uuid_groups: [usize; 2],
     },
 }
 
@@ -258,29 +284,40 @@ impl ProcessGroups {
     }
 }
 
-/// How two uuid groups relate in time.
-#[derive(Clone, Debug, Default)]
-struct Relation {
-    /// A source of each holds a row inside the intersection of their spans
-    /// in an epoch they share (R3).
-    join: Option<EpochJoin>,
-    /// They carry an epoch in common.
-    share_epoch: bool,
-    /// A shared epoch's spans intersected without a row of each.
-    near_miss: Option<(String, (u64, u64))>,
-    /// Some pair of their sources' spans intersects.
-    plain: bool,
+/// The root of `i` in a union-find forest, halving the path.
+fn root(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
 }
 
-impl Relation {
-    /// Overlap as the bridge rule reads it: by R3 when the groups share an
-    /// epoch, by span otherwise.
-    fn overlaps(&self) -> bool {
-        match self.share_epoch {
-            true => self.join.is_some(),
-            false => self.plain,
-        }
-    }
+/// An epoch (by number) and an intersection in it, or `None`.
+type NearMiss = Option<(usize, (u64, u64))>;
+
+/// What is known about two uuid groups whose spans intersect.
+enum Relation {
+    /// They share no epoch, so they overlap by span.
+    Plain,
+    /// They share an epoch, and a source of each has a row inside the
+    /// intersection of their spans in it (R3).
+    Join(EpochJoin),
+    /// They share an epoch and no such row was found; the intersection is
+    /// the first one checked, `None` when their spans in the shared epochs
+    /// do not intersect at all.
+    Apart(NearMiss),
+    /// They share an epoch and a row check could not tell.
+    Unknown(usize),
+}
+
+/// A uuid group's arm, from the sources of it that carry one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arm<'a> {
+    None,
+    One(&'a str),
+    /// Two or more values; the label rule splits such a group later.
+    Mixed,
 }
 
 fn intersect(a: (u64, u64), b: (u64, u64)) -> Option<(u64, u64)> {
@@ -289,33 +326,80 @@ fn intersect(a: (u64, u64), b: (u64, u64)) -> Option<(u64, u64)> {
     (lo <= hi).then_some((lo, hi))
 }
 
+/// The earliest-ending and the latest-starting uuid group seen, with their
+/// end and start.
+#[derive(Clone, Copy, Default)]
+struct Extremes {
+    earliest_end: Option<(u64, usize)>,
+    latest_start: Option<(u64, usize)>,
+}
+
+impl Extremes {
+    fn add(&mut self, group: usize, hull: (u64, u64)) {
+        if self.earliest_end.is_none_or(|(end, _)| hull.1 < end) {
+            self.earliest_end = Some((hull.1, group));
+        }
+        if self.latest_start.is_none_or(|(start, _)| hull.0 > start) {
+            self.latest_start = Some((hull.0, group));
+        }
+    }
+
+    /// Two groups whose spans do not intersect, if any were seen.
+    fn disjoint(&self) -> Option<[usize; 2]> {
+        match (self.earliest_end, self.latest_start) {
+            (Some((end, x)), Some((start, y))) if end < start => Some([x, y]),
+            _ => None,
+        }
+    }
+}
+
+/// Every pair of uuid groups whose spans intersect, `(i, j)` with `i < j`,
+/// in one sweep over the spans in start order.
+fn intersecting_pairs(hulls: &[Option<(u64, u64)>], mut visit: impl FnMut(usize, usize)) {
+    let mut order: Vec<usize> = (0..hulls.len()).filter(|&i| hulls[i].is_some()).collect();
+    order.sort_by_key(|&i| hulls[i].map(|h| h.0));
+    let mut active: Vec<usize> = Vec::new();
+    for g in order {
+        let (start, _) = hulls[g].expect("filtered");
+        active.retain(|&a| hulls[a].is_some_and(|h| h.1 >= start));
+        for &a in &active {
+            visit(a.min(g), a.max(g));
+        }
+        active.push(g);
+    }
+}
+
 /// Group `sources` by producer process. `has_row(position, lo, hi)` answers
-/// whether source `position` has a row with a timestamp in `[lo, hi]`.
+/// whether source `position` has a row with a timestamp in `[lo, hi]`:
+/// `Some(true)` or `Some(false)`, or `None` when it could not tell (a read
+/// failed, or the rows moved since the reader opened). A pair whose rows
+/// could not be told is left unjoined and reported as
+/// [`Notice::RowsUnread`].
+///
+/// Time is linear in the number of pairs of uuid groups whose spans
+/// intersect, and memory in the number of uuid groups, apart from the pairs
+/// that share an epoch without a row (kept for the notices).
 pub fn form(
     sources: &[SourceInfo],
-    has_row: &mut dyn FnMut(usize, u64, u64) -> bool,
+    has_row: &mut dyn FnMut(usize, u64, u64) -> Option<bool>,
 ) -> ProcessGroups {
     // 1. Uuid groups, in order of their first source.
     let mut uuid_groups: Vec<UuidGroup> = Vec::new();
     let mut by_uuid: HashMap<&str, usize> = HashMap::new();
     for (position, source) in sources.iter().enumerate() {
-        let slot = match source.uuid.as_deref() {
-            Some(uuid) => match by_uuid.get(uuid) {
-                Some(&i) => Some(i),
-                None => {
-                    by_uuid.insert(uuid, uuid_groups.len());
-                    None
-                }
-            },
-            None => None,
-        };
-        match slot {
+        let known = source.uuid.as_deref().and_then(|u| by_uuid.get(u).copied());
+        match known {
             Some(i) => uuid_groups[i].sources.push(position),
-            None => uuid_groups.push(UuidGroup {
-                uuid: source.uuid.clone(),
-                sources: vec![position],
-                span_ns: None,
-            }),
+            None => {
+                if let Some(uuid) = source.uuid.as_deref() {
+                    by_uuid.insert(uuid, uuid_groups.len());
+                }
+                uuid_groups.push(UuidGroup {
+                    uuid: source.uuid.clone(),
+                    sources: vec![position],
+                    span_ns: None,
+                });
+            }
         }
     }
     for g in &mut uuid_groups {
@@ -325,6 +409,8 @@ pub fn form(
             .filter_map(|&s| sources[s].span_ns)
             .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
     }
+    let n = uuid_groups.len();
+    let hulls: Vec<Option<(u64, u64)>> = uuid_groups.iter().map(|g| g.span_ns).collect();
 
     let mut notices = Vec::new();
     for (i, g) in uuid_groups.iter().enumerate() {
@@ -341,83 +427,222 @@ pub fn form(
         }
     }
 
-    // 2. How every pair of uuid groups relates.
-    let n = uuid_groups.len();
-    let mut relation: Vec<Vec<Relation>> = vec![vec![Relation::default(); n]; n];
-    for (i, j) in pairs(n) {
-        let r = relate(sources, &uuid_groups, i, j, has_row);
-        relation[j][i] = r.clone();
-        relation[i][j] = r;
+    // Epochs by number, and each uuid group's, sorted.
+    let mut epoch_ids: HashMap<&str, usize> = HashMap::new();
+    let mut epoch_names: Vec<&str> = Vec::new();
+    let mut source_epochs: Vec<Vec<(usize, u64, u64)>> = Vec::with_capacity(sources.len());
+    for s in sources {
+        let mut epochs = Vec::with_capacity(s.epochs.len());
+        for e in &s.epochs {
+            let id = *epoch_ids.entry(e.epoch.as_str()).or_insert_with(|| {
+                epoch_names.push(e.epoch.as_str());
+                epoch_names.len() - 1
+            });
+            epochs.push((id, e.first_ns, e.last_ns));
+        }
+        source_epochs.push(epochs);
     }
-    let overlaps = |i: usize, j: usize| i != j && relation[i][j].overlaps();
-
-    // 3. Bridges, within each arm when any source carries one.
-    let armed = sources.iter().any(|s| s.labels.contains_key(ARM_LABEL));
-    let arm_of: Vec<Option<&str>> = uuid_groups
+    let group_epochs: Vec<Vec<usize>> = uuid_groups
         .iter()
         .map(|g| {
-            let arms: BTreeSet<Option<&str>> = g
+            let mut e: Vec<usize> = g
                 .sources
                 .iter()
-                .map(|&s| sources[s].labels.get(ARM_LABEL).map(String::as_str))
+                .flat_map(|&s| source_epochs[s].iter().map(|e| e.0))
                 .collect();
-            match arms.into_iter().collect::<Vec<_>>().as_slice() {
-                [Some(arm)] => Some(*arm),
-                _ => None,
-            }
+            e.sort_unstable();
+            e.dedup();
+            e
         })
         .collect();
-    let same_partition = |i: usize, j: usize| match armed {
-        false => true,
-        true => arm_of[i].is_some() && arm_of[i] == arm_of[j],
-    };
-    let mut bridges = Vec::new();
-    for (b, arm) in arm_of.iter().enumerate() {
-        if armed && arm.is_none() {
-            continue;
+    let share_epoch = |i: usize, j: usize| {
+        let (a, b) = (&group_epochs[i], &group_epochs[j]);
+        let (mut x, mut y) = (0, 0);
+        while x < a.len() && y < b.len() {
+            match a[x].cmp(&b[y]) {
+                std::cmp::Ordering::Less => x += 1,
+                std::cmp::Ordering::Greater => y += 1,
+                std::cmp::Ordering::Equal => return true,
+            }
         }
-        // The bridge must also cover the gap between the two. Overlapping
-        // both implies it: its span runs from its first row to its last, and
-        // holds a point of each, so it holds everything between them.
-        let near: Vec<usize> = (0..n)
-            .filter(|&x| same_partition(b, x) && overlaps(b, x))
-            .collect();
-        let mut between = Vec::new();
-        for (k, &x) in near.iter().enumerate() {
-            for &y in &near[k + 1..] {
-                if !overlaps(x, y) {
-                    between.push([x, y]);
+        false
+    };
+    // R3, source pair by source pair, for two groups that share an epoch.
+    let mut relate = |i: usize, j: usize| -> Relation {
+        if !share_epoch(i, j) {
+            return Relation::Plain;
+        }
+        let mut near_miss = None;
+        let mut unknown = None;
+        for &a in &uuid_groups[i].sources {
+            for &b in &uuid_groups[j].sources {
+                for &(ea, a0, a1) in &source_epochs[a] {
+                    for &(_, b0, b1) in source_epochs[b].iter().filter(|e| e.0 == ea) {
+                        let Some(both) = intersect((a0, a1), (b0, b1)) else {
+                            continue;
+                        };
+                        let row = match has_row(a, both.0, both.1) {
+                            Some(true) => has_row(b, both.0, both.1),
+                            other => other,
+                        };
+                        match row {
+                            Some(true) => {
+                                return Relation::Join(EpochJoin {
+                                    epoch: epoch_names[ea].to_string(),
+                                    uuid_groups: [i, j],
+                                    sources: [a, b],
+                                    overlap_ns: both,
+                                })
+                            }
+                            Some(false) => {
+                                near_miss.get_or_insert((ea, both));
+                            }
+                            None => {
+                                unknown.get_or_insert(ea);
+                            }
+                        }
+                    }
                 }
             }
         }
-        if !between.is_empty() {
+        match unknown {
+            Some(e) => Relation::Unknown(e),
+            None => Relation::Apart(near_miss),
+        }
+    };
+
+    // 2. Arms, from the sources that carry one.
+    let armed = sources.iter().any(|s| s.labels.contains_key(ARM_LABEL));
+    let arm_of: Vec<Arm> = uuid_groups
+        .iter()
+        .map(|g| {
+            let arms: BTreeSet<&str> = g
+                .sources
+                .iter()
+                .filter_map(|&s| sources[s].labels.get(ARM_LABEL).map(String::as_str))
+                .collect();
+            let mut arms = arms.into_iter();
+            match (arms.next(), arms.next()) {
+                (None, _) => Arm::None,
+                (Some(arm), None) => Arm::One(arm),
+                (Some(_), Some(_)) => Arm::Mixed,
+            }
+        })
+        .collect();
+    // Whether `b` can bridge `x`: within an arm; an unarmed group (shared
+    // context) between armed ones (owner decision on Q39); a mixed group
+    // never.
+    let bridges_over = |b: usize, x: usize| match (armed, arm_of[b]) {
+        (false, _) => true,
+        (true, Arm::One(arm)) => arm_of[x] == Arm::One(arm),
+        (true, Arm::None) => arm_of[x] != Arm::None,
+        (true, Arm::Mixed) => false,
+    };
+
+    // 3. One sweep over the intersecting pairs: for each group, the
+    // earliest-ending and latest-starting group it overlaps and could
+    // bridge; and the pairs of one epoch that do not overlap.
+    // The joins that connect the join graph's components, bridges
+    // included, kept so the union below reads no row twice for them.
+    let mut extremes = vec![Extremes::default(); n];
+    let mut apart: Vec<(usize, usize, NearMiss)> = Vec::new();
+    let mut unread: Vec<(usize, usize, usize)> = Vec::new();
+    let mut forest: HashMap<(usize, usize), EpochJoin> = HashMap::new();
+    let mut everyone: Vec<usize> = (0..n).collect();
+    intersecting_pairs(&hulls, |i, j| {
+        let relation = relate(i, j);
+        if let Relation::Plain | Relation::Join(_) = relation {
+            for (b, x) in [(i, j), (j, i)] {
+                if bridges_over(b, x) {
+                    extremes[b].add(x, hulls[x].expect("intersects"));
+                }
+            }
+        }
+        match relation {
+            Relation::Plain => {}
+            Relation::Join(join) => {
+                let (a, b) = (root(&mut everyone, i), root(&mut everyone, j));
+                if a != b {
+                    everyone[a.max(b)] = a.min(b);
+                    forest.insert((i, j), join);
+                }
+            }
+            Relation::Apart(miss) => apart.push((i, j, miss)),
+            Relation::Unknown(e) => unread.push((i, j, e)),
+        }
+    });
+
+    // 4. Bridges: a group overlapping two that do not overlap each other.
+    // Covering the gap between them follows: its span runs from its first
+    // row to its last and holds a point of each. Two groups whose spans do
+    // not intersect never overlap; when all a group's overlapping groups
+    // intersect pairwise (they then share a point), only a pair of one epoch
+    // without a shared row can be the pair, and such a pair is taken as not
+    // overlapping even though their spans intersect (this module's reading
+    // of Q39's open case). A pair whose rows could not be read is taken as
+    // overlapping, so it makes no bridge.
+    let mut bridges = Vec::new();
+    for b in 0..n {
+        if armed && arm_of[b] == Arm::Mixed {
+            continue;
+        }
+        let pair = extremes[b].disjoint().or_else(|| {
+            let hb = hulls[b]?;
+            apart.iter().find_map(|&(x, y, _)| {
+                let usable = |x: usize| {
+                    x != b
+                        && bridges_over(b, x)
+                        && hulls[x].and_then(|h| intersect(h, hb)).is_some()
+                };
+                if !usable(x) || !usable(y) {
+                    return None;
+                }
+                let near = |r: Relation| matches!(r, Relation::Plain | Relation::Join(_));
+                (near(relate(b, x)) && near(relate(b, y))).then_some([x, y])
+            })
+        });
+        if let Some(between) = pair {
             bridges.push(Bridge {
                 uuid_group: b,
                 between,
             });
         }
     }
-    let is_bridge: Vec<bool> = (0..n)
-        .map(|i| bridges.iter().any(|b| b.uuid_group == i))
-        .collect();
+    let mut is_bridge = vec![false; n];
+    for b in &bridges {
+        is_bridge[b.uuid_group] = true;
+    }
 
-    // 4. Process groups: the other uuid groups, joined by a shared epoch.
+    // 5. Process groups: the other uuid groups, joined by a shared epoch.
+    // A second sweep; a pair already connected, or known not to join, is
+    // not checked again.
     let mut parent: Vec<usize> = (0..n).collect();
-    fn root(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
+    let settled: std::collections::HashSet<(usize, usize)> = apart
+        .iter()
+        .map(|&(i, j, _)| (i, j))
+        .chain(unread.iter().map(|&(i, j, _)| (i, j)))
+        .collect();
+    let mut joins: Vec<EpochJoin> = Vec::new();
+    intersecting_pairs(&hulls, |i, j| {
+        if is_bridge[i] || is_bridge[j] || settled.contains(&(i, j)) || !share_epoch(i, j) {
+            return;
         }
-        i
-    }
-    for (i, j) in pairs(n) {
-        if !is_bridge[i] && !is_bridge[j] && relation[i][j].join.is_some() {
-            let (a, b) = (root(&mut parent, i), root(&mut parent, j));
-            if a != b {
-                parent[a.max(b)] = a.min(b);
-            }
+        let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+        if a == b {
+            return;
         }
-    }
+        let join = match forest.remove(&(i, j)) {
+            Some(join) => Some(join),
+            None => match relate(i, j) {
+                Relation::Join(join) => Some(join),
+                _ => None,
+            },
+        };
+        if let Some(join) = join {
+            parent[a.max(b)] = a.min(b);
+            joins.push(join);
+        }
+    });
     let mut groups: Vec<ProcessGroup> = Vec::new();
     let mut group_of_root: HashMap<usize, usize> = HashMap::new();
     for i in (0..n).filter(|&i| !is_bridge[i]) {
@@ -433,38 +658,37 @@ pub fn form(
         groups[g].uuid_groups.push(i);
         groups[g].sources.extend(&uuid_groups[i].sources);
     }
+    for join in joins {
+        let r = root(&mut parent, join.uuid_groups[0]);
+        groups[group_of_root[&r]].joins.push(join);
+    }
     for g in &mut groups {
         g.sources.sort_unstable();
-        for (k, &i) in g.uuid_groups.iter().enumerate() {
-            for &j in &g.uuid_groups[k + 1..] {
-                if let Some(join) = &relation[i][j].join {
-                    g.joins.push(join.clone());
-                }
-            }
-        }
     }
     // Uuid groups are numbered by first source, so groups built in that
     // order are already in order of their first source.
 
-    // 5. One epoch, spans intersecting, no shared row, left apart.
-    for (i, j) in pairs(n) {
-        if is_bridge[i] || is_bridge[j] {
-            continue;
-        }
-        let r = &relation[i][j];
-        if r.join.is_some() {
-            continue;
-        }
-        let Some((epoch, intersection)) = &r.near_miss else {
+    // 6. Pairs of one epoch left apart.
+    for (i, j, miss) in apart {
+        let Some((epoch, intersection)) = miss else {
             continue;
         };
-        if root(&mut parent, i) == root(&mut parent, j) {
+        if is_bridge[i] || is_bridge[j] || root(&mut parent, i) == root(&mut parent, j) {
             continue;
         }
         notices.push(Notice::EpochWithoutSharedRow {
-            epoch: epoch.clone(),
+            epoch: epoch_names[epoch].to_string(),
             uuid_groups: [i, j],
-            intersection_ns: *intersection,
+            intersection_ns: intersection,
+        });
+    }
+    for (i, j, epoch) in unread {
+        if is_bridge[i] || is_bridge[j] || root(&mut parent, i) == root(&mut parent, j) {
+            continue;
+        }
+        notices.push(Notice::RowsUnread {
+            epoch: epoch_names[epoch].to_string(),
+            uuid_groups: [i, j],
         });
     }
 
@@ -474,56 +698,6 @@ pub fn form(
         bridges,
         notices,
     }
-}
-
-/// Every `(i, j)` with `i < j < n`.
-fn pairs(n: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..n).flat_map(move |i| (i + 1..n).map(move |j| (i, j)))
-}
-
-/// How uuid groups `i` and `j` relate, source pair by source pair.
-fn relate(
-    sources: &[SourceInfo],
-    uuid_groups: &[UuidGroup],
-    i: usize,
-    j: usize,
-    has_row: &mut dyn FnMut(usize, u64, u64) -> bool,
-) -> Relation {
-    let mut r = Relation::default();
-    for &a in &uuid_groups[i].sources {
-        for &b in &uuid_groups[j].sources {
-            if let (Some(sa), Some(sb)) = (sources[a].span_ns, sources[b].span_ns) {
-                r.plain |= intersect(sa, sb).is_some();
-            }
-            if r.join.is_some() {
-                continue;
-            }
-            for ea in &sources[a].epochs {
-                for eb in sources[b].epochs.iter().filter(|e| e.epoch == ea.epoch) {
-                    r.share_epoch = true;
-                    let Some(both) =
-                        intersect((ea.first_ns, ea.last_ns), (eb.first_ns, eb.last_ns))
-                    else {
-                        continue;
-                    };
-                    if has_row(a, both.0, both.1) && has_row(b, both.0, both.1) {
-                        r.join = Some(EpochJoin {
-                            epoch: ea.epoch.clone(),
-                            uuid_groups: [i, j],
-                            sources: [a, b],
-                            overlap_ns: both,
-                        });
-                        break;
-                    }
-                    r.near_miss.get_or_insert((ea.epoch.clone(), both));
-                }
-                if r.join.is_some() {
-                    break;
-                }
-            }
-        }
-    }
-    r
 }
 
 #[cfg(test)]
@@ -557,13 +731,13 @@ mod tests {
     }
 
     /// Every source has a row at every whole minute of its span.
-    fn minutely(sources: &[SourceInfo]) -> impl FnMut(usize, u64, u64) -> bool + '_ {
+    fn minutely(sources: &[SourceInfo]) -> impl FnMut(usize, u64, u64) -> Option<bool> + '_ {
         |s, lo, hi| {
             let Some((a, b)) = sources[s].span_ns else {
-                return false;
+                return Some(false);
             };
             let first = lo.max(a).div_ceil(M) * M;
-            first <= hi.min(b)
+            Some(first <= hi.min(b))
         }
     }
 
@@ -672,7 +846,7 @@ mod tests {
             g.bridges,
             vec![Bridge {
                 uuid_group: 1,
-                between: vec![[0, 2]]
+                between: [0, 2]
             }]
         );
         assert_eq!(g.groups.len(), 2);
@@ -693,13 +867,13 @@ mod tests {
         ];
         // Sources 0 and 1 intersect over minutes 5..10 and have no row of
         // each there; 2 shares rows with both.
-        let mut rows = |s: usize, lo: u64, hi: u64| s == 2 || !(lo >= 5 * M && hi <= 10 * M);
+        let mut rows = |s: usize, lo: u64, hi: u64| Some(s == 2 || !(lo >= 5 * M && hi <= 10 * M));
         let g = form(&s, &mut rows);
         assert_eq!(
             g.bridges,
             vec![Bridge {
                 uuid_group: 2,
-                between: vec![[0, 1]]
+                between: [0, 1]
             }]
         );
         assert_eq!(g.groups.len(), 2);
@@ -713,20 +887,158 @@ mod tests {
         );
     }
 
-    /// In an armed archive an unarmed source is never a bridge, so it can
-    /// join two sources of its epoch that share no row with each other.
-    /// They end in one process group, and the pair gets no notice.
+    /// In an armed archive an unarmed source overlapping two armed sources
+    /// that do not overlap each other is a bridge between them (owner
+    /// decision on Q39), so it joins neither, and the pair's notice stands.
     #[test]
-    fn a_near_miss_joined_through_shared_context_is_not_reported() {
+    fn shared_context_does_not_join_two_armed_sources() {
         let s = vec![
             source(&[("arm", "a")], None, Some((0, 10)), Some("e")),
             source(&[("arm", "a")], None, Some((5, 20)), Some("e")),
             source(&[], None, Some((0, 30)), Some("e")),
         ];
-        let mut rows = |s: usize, lo: u64, hi: u64| s == 2 || !(lo >= 5 * M && hi <= 10 * M);
+        let mut rows = |s: usize, lo: u64, hi: u64| Some(s == 2 || !(lo >= 5 * M && hi <= 10 * M));
+        let g = form(&s, &mut rows);
+        assert_eq!(g.bridges.len(), 1);
+        assert_eq!(g.bridges[0].uuid_group, 2);
+        assert_eq!(g.groups.len(), 2);
+        assert_eq!(g.notices.len(), 1, "{:?}", g.notices);
+    }
+
+    /// Two armed sources that share no row, joined through a source of
+    /// another arm (which cannot bridge them): one process group, no notice.
+    #[test]
+    fn a_near_miss_joined_through_another_arm_is_not_reported() {
+        let s = vec![
+            source(&[("arm", "a")], None, Some((0, 10)), Some("e")),
+            source(&[("arm", "a")], None, Some((5, 20)), Some("e")),
+            source(&[("arm", "b")], None, Some((0, 30)), Some("e")),
+        ];
+        let mut rows = |s: usize, lo: u64, hi: u64| Some(s == 2 || !(lo >= 5 * M && hi <= 10 * M));
         let g = form(&s, &mut rows);
         assert!(g.bridges.is_empty());
         assert_eq!(g.groups.len(), 1);
         assert!(g.notices.is_empty(), "{:?}", g.notices);
+    }
+
+    /// The reviewer's case: a continuous `arm=a` recording and a filtered
+    /// copy of it without `arm` (one uuid), beside two `arm=a` attempts of
+    /// one epoch. The uuid group carries `a`, so it is a bridge and the
+    /// attempts stay apart.
+    #[test]
+    fn a_copy_without_arm_keeps_its_group_a_bridge() {
+        let s = vec![
+            source(
+                &[("arm", "a")],
+                Some("c"),
+                Some((9 * 60, 18 * 60)),
+                Some("e"),
+            ),
+            source(&[], Some("c"), Some((9 * 60, 18 * 60)), Some("e")),
+            source(
+                &[("arm", "a")],
+                Some("x"),
+                Some((9 * 60, 10 * 60)),
+                Some("e"),
+            ),
+            source(
+                &[("arm", "a")],
+                Some("y"),
+                Some((17 * 60, 18 * 60)),
+                Some("e"),
+            ),
+        ];
+        let g = form(&s, &mut minutely(&s));
+        assert_eq!(g.bridges.len(), 1);
+        assert_eq!(g.uuid_groups[g.bridges[0].uuid_group].sources, vec![0, 1]);
+        assert_eq!(
+            g.groups
+                .iter()
+                .map(|g| g.sources.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![2], vec![3]]
+        );
+    }
+
+    /// Restart clocks need not agree: an entry listed after another but
+    /// stamped before it keeps its rows.
+    #[test]
+    fn out_of_order_producer_epochs_keep_every_epoch() {
+        let metadata: BTreeMap<String, String> = [(
+            PRODUCER_EPOCHS.to_string(),
+            format!(
+                r#"[{{"epoch":"e1","from_ts":{}}},{{"epoch":"e3","from_ts":{}}},{{"epoch":"e2","from_ts":{}}}]"#,
+                0,
+                30 * M,
+                20 * M
+            ),
+        )]
+        .into();
+        let spans = epoch_spans(&metadata, Some((0, 40 * M)));
+        let got: Vec<(&str, u64, u64)> = spans
+            .iter()
+            .map(|e| (e.epoch.as_str(), e.first_ns, e.last_ns))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("e1", 0, 20 * M - 1),
+                ("e2", 20 * M, 30 * M - 1),
+                ("e3", 30 * M, 40 * M)
+            ]
+        );
+    }
+
+    /// A group that shares an epoch with X but no row of it does not overlap
+    /// X, so it is no bridge between X and a Y it does overlap.
+    #[test]
+    fn a_source_sharing_no_row_with_one_of_two_is_not_a_bridge() {
+        let s = vec![
+            source(&[], None, Some((0, 30)), Some("e")),
+            source(&[], None, Some((5, 10)), Some("e")),
+            source(&[], None, Some((20, 40)), None),
+        ];
+        // 0 and 1 share epoch e with no row of 1 inside their intersection.
+        let mut rows = |s: usize, _: u64, _: u64| Some(s != 1);
+        let g = form(&s, &mut rows);
+        assert!(g.bridges.is_empty(), "{:?}", g.bridges);
+        assert_eq!(g.groups.len(), 3);
+    }
+
+    /// The copy-without-arm case with attempts of another arm: the group
+    /// carries `a`, and a source is never a bridge across arms, so the
+    /// attempts join through it.
+    #[test]
+    fn a_copy_without_arm_does_not_bridge_another_arm() {
+        let s = vec![
+            source(
+                &[("arm", "a")],
+                Some("c"),
+                Some((9 * 60, 18 * 60)),
+                Some("e"),
+            ),
+            source(&[], Some("c"), Some((9 * 60, 18 * 60)), Some("e")),
+            source(
+                &[("arm", "b")],
+                Some("x"),
+                Some((9 * 60, 10 * 60)),
+                Some("e"),
+            ),
+            source(
+                &[("arm", "b")],
+                Some("y"),
+                Some((17 * 60, 18 * 60)),
+                Some("e"),
+            ),
+        ];
+        let g = form(&s, &mut minutely(&s));
+        assert!(g.bridges.is_empty(), "{:?}", g.bridges);
+        assert_eq!(
+            g.groups
+                .iter()
+                .map(|g| g.sources.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1, 2, 3]]
+        );
     }
 }

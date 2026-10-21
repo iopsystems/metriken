@@ -261,7 +261,23 @@ impl DbHandle {
 /// segment's `(seq, entry)`, and the live WAL's span.
 struct RowIndex {
     segments: Vec<(u64, crate::catalog::SegmentMeta)>,
+    /// Whether the segments' first and last rows both ascend, so a search
+    /// can skip to the range.
+    ordered: bool,
     wal: crate::catalog::Span,
+}
+
+impl RowIndex {
+    fn new(segments: Vec<(u64, crate::catalog::SegmentMeta)>, wal: crate::catalog::Span) -> Self {
+        let ordered = segments
+            .windows(2)
+            .all(|w| w[0].1.first_ts <= w[1].1.first_ts && w[0].1.last_ts <= w[1].1.last_ts);
+        Self {
+            segments,
+            ordered,
+            wal,
+        }
+    }
 }
 
 /// The row timestamps of one sealed segment, from its `timestamp` column
@@ -970,31 +986,45 @@ impl SamplerReader {
         })
     }
 
-    /// Whether this table has a row with a timestamp in `[lo, hi]`.
+    /// Whether this table has a row with a timestamp in `[lo, hi]`: `None`
+    /// when it cannot tell.
     ///
     /// Answered from the catalog entries listed at open: a segment (or the
     /// live WAL) with its first or last row inside the range has a row in
     /// it. Only a segment that starts before the range and ends after it is
-    /// read, and only its timestamp column; the WAL's rows likewise. A table
-    /// opened from bytes reads its row timestamps. A segment that has gone
-    /// since open counts as holding no row.
-    pub fn has_row_in(&self, lo: u64, hi: u64) -> bool {
+    /// read, and only its timestamp column; the WAL's rows likewise. A read
+    /// that fails, a segment gone since open, and a WAL whose rows were
+    /// sealed or evicted since open give `None`. A table opened from bytes
+    /// reads its row timestamps.
+    pub fn has_row_in(&self, lo: u64, hi: u64) -> Option<bool> {
         if lo > hi {
-            return false;
+            return Some(false);
         }
         let inside = |t: u64| (lo..=hi).contains(&t);
         let Some(index) = &self.row_index else {
+            self.reader()?;
             let ts = self.row_timestamps();
             let at = ts.partition_point(|&t| t < lo);
-            return ts.get(at).is_some_and(|&t| t <= hi);
+            return Some(ts.get(at).is_some_and(|&t| t <= hi));
+        };
+        // Segments are in time order: skip those ending before the range.
+        let from = match index.ordered {
+            true => index.segments.partition_point(|(_, m)| m.last_ts < lo),
+            false => 0,
         };
         let mut straddling = Vec::new();
-        for (seq, meta) in &index.segments {
-            if meta.last_ts < lo || meta.first_ts > hi {
+        for (seq, meta) in &index.segments[from..] {
+            if meta.first_ts > hi {
+                if index.ordered {
+                    break;
+                }
+                continue;
+            }
+            if meta.last_ts < lo {
                 continue;
             }
             if inside(meta.first_ts) || inside(meta.last_ts) {
-                return true;
+                return Some(true);
             }
             straddling.push((*seq, *meta));
         }
@@ -1002,27 +1032,35 @@ impl SamplerReader {
         if let (Some(first), Some(last)) = (index.wal.first_ts, index.wal.last_ts) {
             if last >= lo && first <= hi {
                 if inside(first) || inside(last) {
-                    return true;
+                    return Some(true);
                 }
                 wal_straddles = true;
             }
         }
         if straddling.is_empty() && !wal_straddles {
-            return false;
+            return Some(false);
         }
         let read = self.segments.with_catalog(|db, source_id, table| {
             for (seq, meta) in &straddling {
                 let Some(bytes) = db.segment_bytes_matching(source_id, table, *seq, meta)? else {
-                    continue;
+                    return Ok(None);
                 };
                 if segment_timestamps(bytes)?.into_iter().any(inside) {
-                    return Ok(true);
+                    return Ok(Some(true));
                 }
             }
             if wal_straddles {
-                return Ok(db.live_wal(source_id, table)?.iter().any(|r| inside(r.ts)));
+                let rows = db.live_wal(source_id, table)?;
+                if rows.iter().any(|r| inside(r.ts)) {
+                    return Ok(Some(true));
+                }
+                // Rows sealed or evicted since open are no longer in the
+                // WAL, so their absence says nothing.
+                if rows.first().map(|r| r.ts) != index.wal.first_ts {
+                    return Ok(None);
+                }
             }
-            Ok(false)
+            Ok(Some(false))
         });
         match read {
             Some(Ok(found)) => found,
@@ -1031,9 +1069,9 @@ impl SamplerReader {
                     "reading the row timestamps of {} between {lo} and {hi}: {e}",
                     self.sampler
                 );
-                false
+                None
             }
-            None => false,
+            None => None,
         }
     }
 }
@@ -1521,13 +1559,7 @@ impl ArchiveReader {
                             (gap_ns / 1e6).round().max(1.0) / 1e3
                         });
                         measured_intervals.insert(sampler.clone(), measured);
-                        row_indexes.insert(
-                            sampler.clone(),
-                            RowIndex {
-                                segments: metas,
-                                wal,
-                            },
-                        );
+                        row_indexes.insert(sampler.clone(), RowIndex::new(metas, wal));
 
                         pending.push((sampler, probes, span));
                     }
@@ -1864,10 +1896,12 @@ impl ArchiveReader {
     /// The sources grouped by producer process: copies (one uuid) taken as
     /// one, bridges set aside, and the rest joined where they share a
     /// producer epoch and overlap in it by a row of each (see
-    /// [`crate::process`]). Worked out on first use and kept. Reading which
-    /// rows a source holds uses the catalog entries listed at open; a source
-    /// whose rows inside an intersection all lie within one segment has that
-    /// segment's timestamp column read.
+    /// [`crate::process`]). Worked out on first use and kept. Which rows a
+    /// source holds is read from the catalog entries listed at open, and a
+    /// segment's timestamp column when that segment straddles a whole
+    /// intersection ([`SamplerReader::has_row_in`]); a source holds a row
+    /// when any of its tables does, and cannot tell when none does and one
+    /// cannot tell.
     ///
     /// Queries are not affected: a process group's sources are still read as
     /// separate recordings.
@@ -1887,7 +1921,15 @@ impl ArchiveReader {
                 }
             }
             crate::process::form(&self.sources, &mut |source, lo, hi| {
-                tables[source].iter().any(|t| t.has_row_in(lo, hi))
+                let mut unknown = false;
+                for t in &tables[source] {
+                    match t.has_row_in(lo, hi) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
+                }
+                (!unknown).then_some(false)
             })
         })
     }

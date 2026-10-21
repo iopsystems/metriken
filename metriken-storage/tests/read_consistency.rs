@@ -123,6 +123,9 @@ impl Catalog for BeforeLiveWal {
     fn sources(&self) -> Result<Vec<Source>, String> {
         self.inner.sources()
     }
+    fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
+        self.inner.sources_with_uuids()
+    }
     fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {
         self.inner.tables(source_id)
     }

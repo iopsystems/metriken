@@ -272,7 +272,7 @@ fn a_continuous_recording_beside_two_attempts_is_a_bridge() {
     );
     let g = open(&path).process_groups().clone();
     assert_eq!(bridges(&g), vec![vec![0]]);
-    assert_eq!(g.bridges[0].between, vec![[1, 2]]);
+    assert_eq!(g.bridges[0].between, [1, 2]);
     assert_eq!(groups(&g), vec![vec![1], vec![2]]);
     assert_eq!(g.group_of(0), None);
     // Same epoch, disjoint spans: apart, and no notice (O2).
@@ -536,13 +536,13 @@ fn the_middle_of_a_chain_is_a_bridge() {
     );
     let g = open(&path).process_groups().clone();
     assert_eq!(bridges(&g), vec![vec![1]]);
-    assert_eq!(g.bridges[0].between, vec![[0, 2]]);
+    assert_eq!(g.bridges[0].between, [0, 2]);
 }
 
 /// P6 with arms: an unarmed continuous recording of one agent beside its
-/// armed attempts is shared context, never a bridge, so the union joins the
-/// attempts through it (the Q39 scenario this leaves open). An armed one is
-/// a bridge within its arm; a pair it overlaps in another arm is not bridged.
+/// armed attempts is kept out of a join between them (owner decision on the
+/// Q39 scenario) and reported as a bridge. An armed one is a bridge within
+/// its arm; a pair it overlaps in another arm is not bridged.
 #[test]
 fn bridges_are_found_within_an_arm() {
     let dir = tempfile::tempdir().unwrap();
@@ -558,8 +558,8 @@ fn bridges_are_found_within_an_arm() {
         100,
     );
     let g = open(&path).process_groups().clone();
-    assert!(g.bridges.is_empty());
-    assert_eq!(groups(&g), vec![vec![0, 1, 2]]);
+    assert_eq!(bridges(&g), vec![vec![0]]);
+    assert_eq!(groups(&g), vec![vec![1], vec![2]]);
 
     let path = dir.path().join("armed.dendro");
     write(
@@ -757,4 +757,107 @@ fn grouping_fetches_a_segment_only_when_one_straddles_the_intersection() {
     let (fetched, g) = fetches_to_group(&path);
     assert_eq!(groups(&g), vec![vec![0, 1]]);
     assert_eq!(fetched, 1);
+}
+
+/// A catalog whose segment reads fail once `failing` is set, as an
+/// unreadable segment does.
+struct Failing(DendroCatalog, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Catalog for Failing {
+    fn sources(&self) -> Result<Vec<Source>, String> {
+        self.0.sources()
+    }
+    fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
+        self.0.sources_with_uuids()
+    }
+    fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {
+        self.0.tables(source_id)
+    }
+    fn segment_meta(&self, source_id: i64, table: &str) -> Result<Vec<(u64, SegmentMeta)>, String> {
+        self.0.segment_meta(source_id, table)
+    }
+    fn segment_bytes(
+        &self,
+        source_id: i64,
+        table: &str,
+        seq: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("injected read failure".to_string());
+        }
+        self.0.segment_bytes(source_id, table, seq)
+    }
+    fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String> {
+        self.0.live_wal(source_id, table)
+    }
+    fn segment_span(&self, source_id: i64, table: &str) -> Result<(u64, Span), String> {
+        self.0.segment_span(source_id, table)
+    }
+    fn live_wal_span(&self, source_id: i64, table: &str) -> Result<Span, String> {
+        self.0.live_wal_span(source_id, table)
+    }
+    fn caller_row_streams(&self, source_id: i64) -> Result<Vec<String>, String> {
+        self.0.caller_row_streams(source_id)
+    }
+    fn caller_rows(
+        &self,
+        source_id: i64,
+        stream: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.0.caller_rows(source_id, stream, from, to)
+    }
+    fn last_caller_row_at_or_before(
+        &self,
+        source_id: i64,
+        stream: &str,
+        upto: u64,
+        pred: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<Option<u64>, String> {
+        self.0
+            .last_caller_row_at_or_before(source_id, stream, upto, pred)
+    }
+}
+
+/// A row check that cannot read the segment it needs leaves the pair
+/// unjoined and says so, rather than reporting that the sources share no
+/// row. Reads fail only after open, so only the grouping's read of the
+/// straddling segment fails.
+#[test]
+fn an_unreadable_segment_is_unknown_not_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("straddle.dendro");
+    let start = at(10, 0);
+    let e = &[("e", start)];
+    write(
+        &path,
+        &[
+            spec(&[], e, rows(start, start + 60 * S, S)),
+            spec(&[], e, rows(start + 4050 * MS, start + 5050 * MS, 100 * MS)),
+        ],
+        1000,
+    );
+    let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recordings = ArchiveReader::from_catalog(
+        Box::new(Failing(
+            DendroCatalog::open(&path).unwrap(),
+            std::sync::Arc::clone(&failing),
+        )),
+        None,
+        BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    let reader = ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None);
+    failing.store(true, std::sync::atomic::Ordering::Relaxed);
+    let g = reader.process_groups().clone();
+    assert_eq!(groups(&g), vec![vec![0], vec![1]]);
+    assert_eq!(
+        g.notices,
+        vec![Notice::RowsUnread {
+            epoch: "e".into(),
+            uuid_groups: [0, 1],
+        }]
+    );
 }
