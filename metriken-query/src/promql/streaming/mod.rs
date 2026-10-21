@@ -41,6 +41,7 @@ mod binary;
 pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod histogram;
+pub(crate) mod per_source;
 mod rate;
 
 #[cfg(test)]

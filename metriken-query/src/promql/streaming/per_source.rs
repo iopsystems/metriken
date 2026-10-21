@@ -1,0 +1,713 @@
+//! The S9 per-source union: a query over a process group reads each of the
+//! group's sources alone and combines the results per series.
+//!
+//! A process group is the set of sources of one producer process (copies, a
+//! recording and a hindsight dump of it, two recorders of one agent at once;
+//! metriken-storage's `process` module). Each source is evaluated up to the
+//! per-series function (`rate`, `irate`, a gauge read, a windowed gauge
+//! function) as one recording is evaluated, with its own rows, interval and
+//! acquisition windows, and the results are combined per series: at each
+//! point the finest source whose rows cover the function's whole window
+//! answers, ties going to the lowest uuid and then to catalog order; where
+//! none covers the window, the finest source holding rows there; where no
+//! source holds rows (S3's hole rule), nothing (S5). No value is a
+//! difference between rows of two sources, so a counter reset is always
+//! within one source's rows. A source holding several producer epochs is
+//! one member per epoch, so each epoch's first row starts a new run of rows
+//! and no pair of rows spans a restart.
+//!
+//! The rules are S1 to S9 of
+//! `docs/journal/2026-10-19-recording-identity-and-views.md`. Aggregation
+//! and binary operators run on the combined series, so `sum(rate(x[1m]))`
+//! counts each process once.
+//!
+//! Histogram functions do not combine yet: over a group they read the
+//! finest source alone ([`GroupSource`]), which counts it once and leaves
+//! the other sources' spans out.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+
+use super::Point;
+use crate::histogram_stream::HistogramStream;
+use crate::labels::Labels;
+use crate::types::{CounterStream, Counters, Gauges};
+use crate::DataSource;
+
+/// One member of a process group: one source, or one producer epoch of one
+/// source, with what orders it among the others.
+pub(crate) struct Member {
+    /// The source's series, carrying the group's labels.
+    pub source: Arc<dyn DataSource>,
+    /// The rows this member holds: `[lo, hi]`, both inclusive. The whole
+    /// source, or one epoch of it, from its `from_ts` to the next epoch's.
+    pub lo: u64,
+    pub hi: u64,
+    /// S3's tie rule: lowest uuid (a source with none after every source
+    /// with one), then catalog order, then the position among the reader's
+    /// sources (readers joined by `flatten` repeat catalog indices).
+    pub uuid: Option<String>,
+    pub catalog_index: usize,
+    pub position: usize,
+}
+
+impl Member {
+    /// S3's tie rule between two members of equal spacing: the lowest uuid
+    /// (a source without one after those with one), then catalog order, then
+    /// the position among the reader's sources.
+    pub(crate) fn cmp_ties(&self, other: &Member) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (&self.uuid, &other.uuid) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+        .then(self.catalog_index.cmp(&other.catalog_index))
+        .then(self.position.cmp(&other.position))
+    }
+}
+
+/// The sources of a query, as the engine reads them when some of them form
+/// process groups of more than one member.
+pub(crate) struct SourceGroups {
+    /// Every recording that is a group of one member, as one source; `None`
+    /// when there is none.
+    pub singles: Option<Arc<dyn DataSource>>,
+    /// Each process group of more than one member.
+    pub groups: Vec<Vec<Member>>,
+}
+
+/// What a leaf's point at `t` reads, for the coverage rule.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Window {
+    /// `[t - range, t]`: `rate`, `avg_over_time`, `idelta`, `deriv`.
+    Range(u64),
+    /// `[t - step, t]`: `irate` on the grid, or the gap from the previous
+    /// explicit evaluation timestamp.
+    Step,
+    /// `[t - s, t]`, `s` the step or the member's interval when that is
+    /// longer: a gauge read.
+    Stale,
+    /// The point itself: `irate` and gauge reads in raw mode, whose value at
+    /// a row is that member's own pair or row.
+    Point,
+}
+
+/// The rows a member's series hold, as runs without a hole (S3), with the
+/// member's interval.
+struct Coverage {
+    runs: Vec<(u64, u64)>,
+    interval_ns: u64,
+}
+
+impl Coverage {
+    /// The run holding `t`: from its first row to one interval past its
+    /// last.
+    fn run_at(&self, t: u64) -> Option<(u64, u64)> {
+        let i = self.runs.partition_point(|r| r.0 <= t);
+        let run = *self.runs.get(i.checked_sub(1)?)?;
+        (t <= run.1.saturating_add(self.interval_ns)).then_some(run)
+    }
+
+    /// Whether a run holds `t`.
+    fn holds(&self, t: u64) -> bool {
+        self.run_at(t).is_some()
+    }
+
+    /// Whether one run holds the whole window `[t - window, t]`.
+    fn covers(&self, t: u64, window: u64) -> bool {
+        self.run_at(t)
+            .is_some_and(|(first, _)| t.checked_sub(window).is_some_and(|w| w >= first))
+    }
+}
+
+/// The runs of `timestamps` (sorted): a hole is a gap longer than twice the
+/// larger of the median of the up to eight gaps before it and the median of
+/// the up to eight gaps after it, with only one side's median where the
+/// other side has no gap (S3).
+pub(crate) fn runs(timestamps: &[u64]) -> Vec<(u64, u64)> {
+    const SIDE: usize = 8;
+    let Some(&first) = timestamps.first() else {
+        return Vec::new();
+    };
+    let gaps: Vec<u64> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
+    let median = |side: &[u64]| -> Option<u64> {
+        if side.is_empty() {
+            return None;
+        }
+        let mut s = [0u64; SIDE];
+        let s = &mut s[..side.len()];
+        s.copy_from_slice(side);
+        s.sort_unstable();
+        Some(s[s.len() / 2])
+    };
+    // Every median is at least the smallest gap, so a gap within twice it
+    // is no hole, and most gaps are decided without a median.
+    let floor = gaps.iter().copied().min().unwrap_or(0).saturating_mul(2);
+    let mut out = Vec::new();
+    let mut start = first;
+    for (i, &gap) in gaps.iter().enumerate() {
+        if gap <= floor {
+            continue;
+        }
+        let before = median(&gaps[i.saturating_sub(SIDE)..i]);
+        let after = median(&gaps[(i + 1).min(gaps.len())..(i + 1 + SIDE).min(gaps.len())]);
+        let typical = match (before, after) {
+            (Some(b), Some(a)) => b.max(a),
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => continue,
+        };
+        if gap > typical.saturating_mul(2) {
+            out.push((start, timestamps[i]));
+            start = timestamps[i + 1];
+        }
+    }
+    out.push((start, *timestamps.last().expect("not empty")));
+    out
+}
+
+/// One member's evaluated series, with the rows it read.
+pub(crate) struct MemberSeries {
+    pub series: Vec<(Labels, Vec<Point>)>,
+    pub rows: HashMap<Labels, Vec<u64>>,
+    pub interval_ns: u64,
+}
+
+/// Combine the members' results per series (S3, S9). `members` are in rank
+/// order, finest first. `window(t, interval_ns)` is the length of the window
+/// a point at `t` reads; `raw` selects raw placement, where each member's
+/// points fall at its own rows and a point is kept where its member is the
+/// one chosen at its time.
+pub(crate) fn combine(
+    members: Vec<MemberSeries>,
+    window: &dyn Fn(u64, u64) -> u64,
+    raw: bool,
+) -> Vec<(Labels, Vec<Point>)> {
+    // Each series' points and coverage per member, in rank order, series in
+    // the order they first appear.
+    let mut order: Vec<Labels> = Vec::new();
+    let mut by_series: HashMap<Labels, Vec<(Vec<Point>, Coverage)>> = HashMap::new();
+    for m in members {
+        let MemberSeries {
+            series,
+            mut rows,
+            interval_ns,
+        } = m;
+        for (labels, points) in series {
+            let mut ts = rows.remove(&labels).unwrap_or_default();
+            ts.sort_unstable();
+            ts.dedup();
+            let coverage = Coverage {
+                runs: runs(&ts),
+                interval_ns,
+            };
+            let entry = by_series.entry(labels.clone()).or_insert_with(|| {
+                order.push(labels.clone());
+                Vec::new()
+            });
+            entry.push((points, coverage));
+        }
+    }
+    order
+        .into_iter()
+        .map(|labels| {
+            let members = by_series.remove(&labels).expect("listed");
+            (labels, combine_series(&members, window, raw))
+        })
+        .collect()
+}
+
+fn combine_series(
+    members: &[(Vec<Point>, Coverage)],
+    window: &dyn Fn(u64, u64) -> u64,
+    raw: bool,
+) -> Vec<Point> {
+    let mut times: Vec<u64> = members
+        .iter()
+        .flat_map(|(p, _)| p.iter().map(|p| p.t))
+        .collect();
+    times.sort_unstable();
+    times.dedup();
+    let mut cursor = vec![0usize; members.len()];
+    let mut out = Vec::with_capacity(times.len());
+    for t in times {
+        // Each member's point at `t`, advancing its cursor.
+        let at: Vec<Option<&Point>> = members
+            .iter()
+            .zip(cursor.iter_mut())
+            .map(|((points, _), c)| {
+                while *c < points.len() && points[*c].t < t {
+                    *c += 1;
+                }
+                points.get(*c).filter(|p| p.t == t)
+            })
+            .collect();
+        let holds = |i: usize| members[i].1.holds(t);
+        let covers = |i: usize| {
+            let c = &members[i].1;
+            c.covers(t, window(t, c.interval_ns))
+        };
+        let chosen = if raw {
+            // The member answering at `t`; its point, if it has one there.
+            (0..members.len())
+                .find(|&i| covers(i))
+                .or_else(|| (0..members.len()).find(|&i| holds(i)))
+                .and_then(|i| at[i])
+        } else {
+            (0..members.len())
+                .find(|&i| at[i].is_some() && covers(i))
+                .or_else(|| (0..members.len()).find(|&i| at[i].is_some() && holds(i)))
+                .and_then(|i| at[i])
+        };
+        if let Some(p) = chosen {
+            out.push(*p);
+        }
+    }
+    out
+}
+
+/// A member's source as a leaf reads it: its rows clipped to `[lo, hi]`, the
+/// timestamps of every row it hands out recorded per series, and no batched
+/// counter scan (whose rows it could not record), so the per-series path
+/// answers.
+pub(crate) struct Tap {
+    inner: Arc<dyn DataSource>,
+    lo: u64,
+    hi: u64,
+    rows: Mutex<HashMap<Labels, Arc<Mutex<Vec<u64>>>>>,
+}
+
+impl Tap {
+    pub(crate) fn new(inner: Arc<dyn DataSource>, lo: u64, hi: u64) -> Self {
+        Self {
+            inner,
+            lo,
+            hi,
+            rows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn sink(&self, labels: &Labels) -> Arc<Mutex<Vec<u64>>> {
+        let mut rows = self.rows.lock().expect("not poisoned");
+        Arc::clone(rows.entry(labels.clone()).or_default())
+    }
+
+    fn record(&self, labels: &Labels, timestamps: &[u64]) {
+        self.sink(labels)
+            .lock()
+            .expect("not poisoned")
+            .extend_from_slice(timestamps);
+    }
+
+    fn keeps(&self, ts: u64) -> bool {
+        self.lo <= ts && ts <= self.hi
+    }
+
+    /// Every row handed out, per series.
+    pub(crate) fn take_rows(&self) -> HashMap<Labels, Vec<u64>> {
+        let rows = std::mem::take(&mut *self.rows.lock().expect("not poisoned"));
+        rows.into_iter()
+            .map(|(labels, ts)| {
+                let ts = std::mem::take(&mut *ts.lock().expect("not poisoned"));
+                (labels, ts)
+            })
+            .collect()
+    }
+
+    fn clip_gauges(&self, mut gauges: Gauges) -> Gauges {
+        for g in &mut gauges.series {
+            if !g.timestamps.iter().all(|&t| self.keeps(t)) {
+                let keep: Vec<bool> = g.timestamps.iter().map(|&t| self.keeps(t)).collect();
+                retain_by(&keep, &mut g.timestamps);
+                retain_by(&keep, &mut g.values);
+                if let Some(w) = &mut g.windows {
+                    retain_by(&keep, w);
+                }
+            }
+            self.record(&g.labels, &g.timestamps);
+        }
+        gauges
+    }
+}
+
+/// Keep the elements of `v` whose `keep` is set.
+fn retain_by<T>(keep: &[bool], v: &mut Vec<T>) {
+    let mut k = keep.iter();
+    v.retain(|_| *k.next().unwrap_or(&false));
+}
+
+impl DataSource for Tap {
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Counters> {
+        let mut counters = self.inner.counters(name, filter, start_ns, end_ns)?;
+        for c in &mut counters.series {
+            if !c.timestamps.iter().all(|&t| self.keeps(t)) {
+                let keep: Vec<bool> = c.timestamps.iter().map(|&t| self.keeps(t)).collect();
+                retain_by(&keep, &mut c.timestamps);
+                retain_by(&keep, &mut c.values);
+                if let Some(w) = &mut c.windows {
+                    retain_by(&keep, w);
+                }
+            }
+            self.record(&c.labels, &c.timestamps);
+        }
+        Some(counters)
+    }
+
+    fn counter_streams<'s>(
+        &'s self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<CounterStream<'s>>> {
+        let streams = self.inner.counter_streams(name, filter, start_ns, end_ns)?;
+        let (lo, hi) = (self.lo, self.hi);
+        Some(
+            streams
+                .into_iter()
+                .map(|s| {
+                    let sink = self.sink(&s.labels);
+                    CounterStream {
+                        labels: s.labels,
+                        windowed: s.windowed,
+                        interval: s.interval,
+                        samples: Box::new(
+                            s.samples
+                                .filter(move |x| lo <= x.ts && x.ts <= hi)
+                                .inspect(move |x| sink.lock().expect("not poisoned").push(x.ts)),
+                        ),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        let gauges = self.inner.gauges(name, filter, start_ns, end_ns)?;
+        Some(self.clip_gauges(gauges))
+    }
+
+    fn gauge_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+    ) -> Option<Vec<(Gauges, f64)>> {
+        let parts = self
+            .inner
+            .gauge_parts(name, filter, start_ns, end_ns, step_ns)?;
+        Some(
+            parts
+                .into_iter()
+                .map(|(g, i)| (self.clip_gauges(g), i))
+                .collect(),
+        )
+    }
+
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.inner
+            .histogram_stream(name, filter, start_ns.max(self.lo), end_ns.min(self.hi))
+    }
+
+    fn interval(&self) -> f64 {
+        self.inner.interval()
+    }
+    fn counter_interval(&self, name: &str) -> f64 {
+        self.inner.counter_interval(name)
+    }
+    fn gauge_interval(&self, name: &str) -> f64 {
+        self.inner.gauge_interval(name)
+    }
+    fn histogram_interval(&self, name: &str) -> f64 {
+        self.inner.histogram_interval(name)
+    }
+    fn time_range(&self) -> Option<(u64, u64)> {
+        let (a, b) = self.inner.time_range()?;
+        let (a, b) = (a.max(self.lo), b.min(self.hi));
+        (a <= b).then_some((a, b))
+    }
+    fn counter_names(&self) -> Vec<String> {
+        self.inner.counter_names()
+    }
+    fn gauge_names(&self) -> Vec<String> {
+        self.inner.gauge_names()
+    }
+    fn histogram_names(&self) -> Vec<String> {
+        self.inner.histogram_names()
+    }
+    fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.counter_labels(name)
+    }
+    fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.gauge_labels(name)
+    }
+    fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.histogram_labels(name)
+    }
+    fn file_metadata(&self) -> HashMap<String, String> {
+        self.inner.file_metadata()
+    }
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.inner.metadata_get(key)
+    }
+    fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+        self.inner.column_map()
+    }
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let mut ts = self.inner.sample_timestamps();
+        ts.retain(|&t| self.keeps(t));
+        ts
+    }
+    fn recording_label_keys(&self) -> Vec<String> {
+        self.inner.recording_label_keys()
+    }
+}
+
+/// A process group as one source, for what a query asks of the whole: its
+/// names, label sets, intervals and span; and, until histograms combine per
+/// source, a histogram read, which the finest of its sources answers alone.
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+pub(crate) struct GroupSource {
+    /// One per source of the group, unclipped, in S3's rank order.
+    sources: Vec<Arc<dyn DataSource>>,
+}
+
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+impl GroupSource {
+    pub(crate) fn new(sources: Vec<Arc<dyn DataSource>>) -> Self {
+        Self { sources }
+    }
+
+    fn names(&self, of: impl Fn(&dyn DataSource) -> Vec<String>) -> Vec<String> {
+        let names: std::collections::BTreeSet<String> =
+            self.sources.iter().flat_map(|s| of(s.as_ref())).collect();
+        names.into_iter().collect()
+    }
+
+    fn listing(
+        &self,
+        of: impl Fn(&dyn DataSource) -> Vec<BTreeMap<String, String>>,
+    ) -> Vec<BTreeMap<String, String>> {
+        let mut out: Vec<BTreeMap<String, String>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for s in &self.sources {
+            for set in of(s.as_ref()) {
+                if seen.insert(set.clone()) {
+                    out.push(set);
+                }
+            }
+        }
+        out
+    }
+
+    /// The finest source holding histogram `name`, else the first.
+    fn finest_holding(&self, held: impl Fn(&dyn DataSource) -> bool) -> &dyn DataSource {
+        self.sources
+            .iter()
+            .find(|s| held(s.as_ref()))
+            .unwrap_or(&self.sources[0])
+            .as_ref()
+    }
+}
+
+impl DataSource for GroupSource {
+    fn counters(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Counters> {
+        self.finest_holding(|s| s.counter_names().iter().any(|n| n == name))
+            .counters(name, filter, start_ns, end_ns)
+    }
+    fn counter_streams<'s>(
+        &'s self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<CounterStream<'s>>> {
+        self.finest_holding(|s| s.counter_names().iter().any(|n| n == name))
+            .counter_streams(name, filter, start_ns, end_ns)
+    }
+    fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
+        self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
+            .gauges(name, filter, start_ns, end_ns)
+    }
+    fn gauge_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+    ) -> Option<Vec<(Gauges, f64)>> {
+        self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
+            .gauge_parts(name, filter, start_ns, end_ns, step_ns)
+    }
+    fn histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.finest_holding(|s| s.histogram_names().iter().any(|n| n == name))
+            .histogram_stream(name, filter, start_ns, end_ns)
+    }
+    fn interval(&self) -> f64 {
+        self.sources
+            .iter()
+            .map(|s| s.interval())
+            .fold(f64::INFINITY, f64::min)
+    }
+    fn counter_interval(&self, name: &str) -> f64 {
+        self.finest_holding(|s| s.counter_names().iter().any(|n| n == name))
+            .counter_interval(name)
+    }
+    fn gauge_interval(&self, name: &str) -> f64 {
+        self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
+            .gauge_interval(name)
+    }
+    fn histogram_interval(&self, name: &str) -> f64 {
+        self.finest_holding(|s| s.histogram_names().iter().any(|n| n == name))
+            .histogram_interval(name)
+    }
+    fn time_range(&self) -> Option<(u64, u64)> {
+        self.sources
+            .iter()
+            .filter_map(|s| s.time_range())
+            .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
+    }
+    fn counter_names(&self) -> Vec<String> {
+        self.names(|s| s.counter_names())
+    }
+    fn gauge_names(&self) -> Vec<String> {
+        self.names(|s| s.gauge_names())
+    }
+    fn histogram_names(&self) -> Vec<String> {
+        self.names(|s| s.histogram_names())
+    }
+    fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.counter_labels(name))
+    }
+    fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.gauge_labels(name))
+    }
+    fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.histogram_labels(name))
+    }
+    fn file_metadata(&self) -> HashMap<String, String> {
+        self.sources[0].file_metadata()
+    }
+    fn metadata_get(&self, key: &str) -> Option<String> {
+        self.sources[0].metadata_get(key)
+    }
+    fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+        self.sources[0].column_map()
+    }
+    fn recording_label_keys(&self) -> Vec<String> {
+        self.names(|s| s.recording_label_keys())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: u64 = 1_000_000_000;
+
+    /// S3: a 5 s gap among 1 s rows is a hole (5 s against a 2 s threshold);
+    /// a change of spacing is not, because the larger side's median counts.
+    #[test]
+    fn a_gap_is_a_hole_against_twice_the_larger_median() {
+        let mut ts: Vec<u64> = (0..10).map(|i| i * S).collect();
+        ts.extend((0..10).map(|i| 14 * S + i * S));
+        assert_eq!(runs(&ts), vec![(0, 9 * S), (14 * S, 23 * S)]);
+
+        // 100 ms rows, then 1 s rows: no hole at the change.
+        let mut ts: Vec<u64> = (0..20).map(|i| i * S / 10).collect();
+        ts.extend((1..10).map(|i| 19 * S / 10 + i * S));
+        assert_eq!(runs(&ts).len(), 1);
+
+        // One side only: three rows 1 s apart, then one 3 s later.
+        assert_eq!(
+            runs(&[0, S, 2 * S, 5 * S]),
+            vec![(0, 2 * S), (5 * S, 5 * S)]
+        );
+        // Two rows: no gap to compare with.
+        assert_eq!(runs(&[0, 9 * S]), vec![(0, 9 * S)]);
+        assert!(runs(&[]).is_empty());
+    }
+
+    fn pt(t: u64, v: f64) -> Point {
+        Point::at(t, v)
+    }
+
+    fn member(points: Vec<Point>, rows: Vec<u64>, interval_ns: u64) -> MemberSeries {
+        let labels = Labels::default();
+        MemberSeries {
+            series: vec![(labels.clone(), points)],
+            rows: [(labels, rows)].into(),
+            interval_ns,
+        }
+    }
+
+    /// The finer member answers where its rows cover the window, the coarser
+    /// elsewhere; a point is never taken from a member whose rows start
+    /// inside the window while another covers it.
+    #[test]
+    fn the_finer_member_answers_where_it_covers_the_window() {
+        let coarse_rows: Vec<u64> = (0..=60).map(|i| i * S).collect();
+        let fine_rows: Vec<u64> = (200..=400).map(|i| i * S / 10).collect();
+        let grid: Vec<u64> = (0..=60).map(|i| i * S).collect();
+        let coarse = member(grid.iter().map(|&t| pt(t, 1.0)).collect(), coarse_rows, S);
+        let fine = member(
+            grid.iter()
+                .filter(|&&t| (20 * S..=40 * S).contains(&t))
+                .map(|&t| pt(t, 2.0))
+                .collect(),
+            fine_rows,
+            S / 10,
+        );
+        let out = combine(vec![fine, coarse], &|_, _| 5 * S, false);
+        let values: Vec<(u64, f64)> = out[0].1.iter().map(|p| (p.t / S, p.v)).collect();
+        for (t, v) in values {
+            let want = if (25..=40).contains(&t) { 2.0 } else { 1.0 };
+            assert_eq!(v, want, "at {t} s");
+        }
+    }
+
+    /// S5: where no member holds rows, there is no point, even where a
+    /// member's own evaluation gave one.
+    #[test]
+    fn a_span_no_member_holds_has_no_point() {
+        let rows: Vec<u64> = (0..10).chain(15..25).map(|i| i * S).collect();
+        let grid: Vec<u64> = (0..25).map(|i| i * S).collect();
+        let a = member(grid.iter().map(|&t| pt(t, 1.0)).collect(), rows.clone(), S);
+        let b = member(grid.iter().map(|&t| pt(t, 1.0)).collect(), rows, S);
+        let out = combine(vec![a, b], &|_, _| 0, false);
+        let times: Vec<u64> = out[0].1.iter().map(|p| p.t / S).collect();
+        assert_eq!(
+            times,
+            (0..=10).chain(15..25).collect::<Vec<_>>(),
+            "11 to 14 s are in the hole (one interval past the last row is held)"
+        );
+    }
+}

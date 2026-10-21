@@ -30,7 +30,7 @@ use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
 
 use crate::occupants::Occupant;
-use crate::process::{ProcessGroups, SourceInfo};
+use crate::process::{ProcessGroups, ReadGroup, SourceInfo};
 
 /// Each occupant's first row, in the order the rows came.
 fn first_per_occupant(rows: impl IntoIterator<Item = Occupant>) -> Vec<Occupant> {
@@ -1120,6 +1120,9 @@ pub struct ArchiveReader {
     series_labels: std::sync::OnceLock<SeriesLabels>,
     /// [`process_groups`](Self::process_groups), worked out on first use.
     process_groups: std::sync::OnceLock<ProcessGroups>,
+    /// [`read_groups`](Self::read_groups), and each member's read group,
+    /// worked out on first use.
+    read_groups: std::sync::OnceLock<ReadGroupIndex>,
 }
 
 /// One `ArchiveReader` per recording, paired with that recording's label set.
@@ -1431,6 +1434,7 @@ impl ArchiveReader {
             sources,
             series_labels: std::sync::OnceLock::new(),
             process_groups: std::sync::OnceLock::new(),
+            read_groups: std::sync::OnceLock::new(),
         }
     }
 
@@ -1638,6 +1642,7 @@ impl ArchiveReader {
                     sources: vec![info],
                     series_labels: std::sync::OnceLock::new(),
                     process_groups: std::sync::OnceLock::new(),
+                    read_groups: std::sync::OnceLock::new(),
                 },
             ));
         }
@@ -1792,6 +1797,7 @@ impl ArchiveReader {
             sources,
             series_labels: std::sync::OnceLock::new(),
             process_groups: std::sync::OnceLock::new(),
+            read_groups: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1866,17 +1872,31 @@ impl ArchiveReader {
         list: impl Fn(&TableReader) -> Vec<BTreeMap<String, String>>,
     ) -> Vec<BTreeMap<String, String>> {
         let extras = self.series_labels();
-        self.tables
-            .iter()
-            .filter(|t| holds(t))
-            .filter_map(|t| t.reader().map(|r| (extras.of(t), list(r))))
-            .flat_map(|(extra, sets)| {
-                sets.into_iter().map(move |mut set| {
-                    crate::labeled::add_labels_map(&mut set, extra);
-                    set
-                })
-            })
-            .collect()
+        let index = self.read_group_index();
+        // A label set one table of a read group lists, by group and table
+        // key: the sources of one process group list each series once.
+        let mut seen: HashSet<(usize, &str, BTreeMap<String, String>)> = HashSet::new();
+        let mut out = Vec::new();
+        for t in self.tables.iter().filter(|t| holds(t)) {
+            let Some(r) = t.reader() else {
+                continue;
+            };
+            let extra = extras.of(t);
+            let group = self
+                .source_position(t)
+                .filter(|&p| index.groups[index.of[p]].sources.len() > 1)
+                .map(|p| index.of[p]);
+            for mut set in list(r) {
+                crate::labeled::add_labels_map(&mut set, extra);
+                if let Some(g) = group {
+                    if !seen.insert((g, t.sampler.as_str(), set.clone())) {
+                        continue;
+                    }
+                }
+                out.push(set);
+            }
+        }
+        out
     }
 
     /// How many recordings this reader holds, tables or not.
@@ -1903,8 +1923,8 @@ impl ArchiveReader {
     /// when any of its tables does, and cannot tell when none does and one
     /// cannot tell.
     ///
-    /// Queries are not affected: a process group's sources are still read as
-    /// separate recordings.
+    /// Queries read each process group as one recording, through
+    /// [`read_groups`](Self::read_groups).
     pub fn process_groups(&self) -> &ProcessGroups {
         self.process_groups.get_or_init(|| {
             // Each source's tables, by the address of its shared label map.
@@ -1934,47 +1954,118 @@ impl ArchiveReader {
         })
     }
 
-    /// The labels each recording's series carry: the recording's labels, and
-    /// for recordings whose label sets are identical,
-    /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
-    /// recording's index in its catalog, so their series stay apart. Twins
-    /// are found among every recording, tables or not, and the index does
-    /// not change when a live archive is reopened. Recordings of readers
-    /// joined by [`flatten`](Self::flatten) can share an index; a group of
-    /// twins in which two do is numbered by position instead.
+    /// What a query reads as one recording: each process group, or each part
+    /// of one whose sources carry different values of a label, with the
+    /// labels its series carry (see [`crate::process::read_groups`]). A
+    /// source in no multi-source process group is a read group of one,
+    /// labelled with its own labels. Worked out on first use and kept.
+    pub fn read_groups(&self) -> &[ReadGroup] {
+        &self.read_group_index().groups
+    }
+
+    /// The read group of `table`'s source, as an index into
+    /// [`read_groups`](Self::read_groups); `None` for a table of another
+    /// reader.
+    pub fn read_group_of(&self, table: &SamplerReader) -> Option<usize> {
+        let position = self.source_position(table)?;
+        Some(self.read_group_index().of[position])
+    }
+
+    /// The position of `table`'s source in [`sources`](Self::sources);
+    /// `None` for a table of another reader.
+    pub fn source_position(&self, table: &SamplerReader) -> Option<usize> {
+        self.read_group_index()
+            .positions
+            .get(&(Arc::as_ptr(&table.recording_labels) as usize))
+            .copied()
+    }
+
+    fn read_group_index(&self) -> &ReadGroupIndex {
+        self.read_groups.get_or_init(|| {
+            // A reader of one source has nothing to group, and is not made
+            // to read any rows to find that out.
+            let groups = if self.members.len() < 2 {
+                crate::process::read_groups(&self.sources, &ProcessGroups::default())
+            } else {
+                crate::process::read_groups(&self.sources, self.process_groups())
+            };
+            let mut of = vec![0; self.members.len()];
+            for (g, group) in groups.iter().enumerate() {
+                for &s in &group.sources {
+                    of[s] = g;
+                }
+            }
+            let positions = self
+                .members
+                .iter()
+                .enumerate()
+                .map(|(i, (labels, _))| (Arc::as_ptr(labels) as usize, i))
+                .collect();
+            ReadGroupIndex {
+                groups,
+                of,
+                positions,
+            }
+        })
+    }
+
+    /// The labels each recording's series carry: its read group's labels
+    /// ([`read_groups`](Self::read_groups)), so the sources of one process
+    /// group carry one label set and their series union; and for read groups
+    /// whose label sets are identical (two processes recorded with equal
+    /// labels), [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
+    /// catalog index of the group's first source, so their series stay
+    /// apart. Twins are found among every read group, tables or not, and the
+    /// index does not change when a live archive is reopened. Recordings of
+    /// readers joined by [`flatten`](Self::flatten) can share an index; a set
+    /// of twins in which two do is numbered by the position of each group's
+    /// first source instead.
     pub fn series_labels(&self) -> &SeriesLabels {
         self.series_labels.get_or_init(|| {
-            // Recordings by label set, so twins are found in one pass.
+            let ReadGroupIndex { groups, of, .. } = self.read_group_index();
+            // Read groups by label set, so twins are found in one pass.
             let mut twins: HashMap<&BTreeMap<String, String>, Vec<usize>> = HashMap::new();
-            for (position, (labels, _)) in self.members.iter().enumerate() {
-                twins.entry(labels.as_ref()).or_default().push(position);
+            for (g, group) in groups.iter().enumerate() {
+                twins.entry(&group.labels).or_default().push(g);
             }
-            let mut by_recording = HashMap::with_capacity(self.members.len());
-            for (position, (labels, index)) in self.members.iter().enumerate() {
-                let mut extra = Labels {
-                    inner: labels.as_ref().clone(),
-                };
-                let group = &twins[labels.as_ref()];
-                if group.len() > 1 {
-                    // Catalog indices, unless two twins share one (readers
-                    // of different archives joined by `flatten`): then the
-                    // whole group is numbered by position, so no two collide.
-                    let mut indices: Vec<usize> =
-                        group.iter().map(|p| self.members[*p].1).collect();
-                    indices.sort_unstable();
-                    indices.dedup();
-                    let value = if indices.len() == group.len() {
-                        *index
-                    } else {
-                        position
+            let first = |g: usize| groups[g].sources[0];
+            let labelled: Vec<Labels> = groups
+                .iter()
+                .enumerate()
+                .map(|(g, group)| {
+                    let mut extra = Labels {
+                        inner: group.labels.clone(),
                     };
-                    extra.inner.insert(
-                        crate::labeled::RECORDING_LABEL.to_string(),
-                        value.to_string(),
-                    );
-                }
-                by_recording.insert(Arc::as_ptr(labels) as usize, extra);
-            }
+                    let set = &twins[&group.labels];
+                    if set.len() > 1 {
+                        // Catalog indices, unless two twins share one (readers
+                        // of different archives joined by `flatten`): then the
+                        // whole set is numbered by position, so no two collide.
+                        let mut indices: Vec<usize> =
+                            set.iter().map(|t| self.members[first(*t)].1).collect();
+                        indices.sort_unstable();
+                        indices.dedup();
+                        let value = if indices.len() == set.len() {
+                            self.members[first(g)].1
+                        } else {
+                            first(g)
+                        };
+                        extra.inner.insert(
+                            crate::labeled::RECORDING_LABEL.to_string(),
+                            value.to_string(),
+                        );
+                    }
+                    extra
+                })
+                .collect();
+            let by_recording = self
+                .members
+                .iter()
+                .enumerate()
+                .map(|(position, (labels, _))| {
+                    (Arc::as_ptr(labels) as usize, labelled[of[position]].clone())
+                })
+                .collect();
             SeriesLabels { by_recording }
         })
     }
@@ -2027,6 +2118,14 @@ fn union_sorted(iters: impl Iterator<Item = Vec<String>>) -> Vec<String> {
         set.extend(v);
     }
     set.into_iter().collect()
+}
+
+/// [`ArchiveReader::read_groups`], each member's read group, and each
+/// member's position by the address of its shared label map.
+struct ReadGroupIndex {
+    groups: Vec<ReadGroup>,
+    of: Vec<usize>,
+    positions: HashMap<usize, usize>,
 }
 
 /// The labels each recording's series carry, from

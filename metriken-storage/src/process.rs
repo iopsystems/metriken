@@ -29,7 +29,12 @@
 //! presentation, so it is left to the caller: [`ProcessGroups::bridges`]
 //! lists them with the pairs they bridge.
 //!
-//! Nothing here changes how a query is answered.
+//! [`read_groups`] turns the result into what a query reads as one
+//! recording: each process group, or each part of one whose sources carry
+//! different values of a label. `ArchiveReader::series_labels` labels a read
+//! group's series with the group's labels, so the sources of one group are
+//! not told apart by `__recording__`; metriken-query evaluates each source
+//! of a group alone and combines the results per series (S9).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -719,6 +724,112 @@ pub fn form(
     }
 }
 
+/// The sources a query reads as one recording: a process group, a bridge's
+/// uuid group, or the part of one whose sources agree on every label (S1, S2
+/// and the data model's "Labels of a process group").
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadGroup {
+    /// Positions in the source list, ascending.
+    pub sources: Vec<usize>,
+    /// The labels its series carry: each key some of its sources carry, with
+    /// the value they carry.
+    pub labels: BTreeMap<String, String>,
+}
+
+/// The read groups of `sources`, grouped as `groups` says, in order of their
+/// first source.
+///
+/// Each process group, and each bridge's uuid group (until a bridge's pieces
+/// join their clusters, which is the caller's), is one read group, labelled
+/// with every key some of its sources carry. Where two of its sources carry
+/// one key with different values, the group is split by the values of those
+/// keys: one recorder run with `--label arm=a` and one with `arm=b` of one
+/// agent are two read groups. A source that lacks such a key takes the value
+/// its uuid group's sources carry, when they carry one (an annotated or
+/// filtered copy keeps its original's), and is otherwise a part of its own
+/// for that key. A source in no group (a position `groups` does not name) is
+/// a read group of one.
+pub fn read_groups(sources: &[SourceInfo], groups: &ProcessGroups) -> Vec<ReadGroup> {
+    let mut units: Vec<Vec<usize>> = groups.groups.iter().map(|g| g.sources.clone()).collect();
+    units.extend(
+        groups
+            .bridges
+            .iter()
+            .map(|b| groups.uuid_groups[b.uuid_group].sources.clone()),
+    );
+    let mut placed = vec![false; sources.len()];
+    for unit in &units {
+        for &s in unit {
+            if let Some(p) = placed.get_mut(s) {
+                *p = true;
+            }
+        }
+    }
+    units.extend((0..sources.len()).filter(|&s| !placed[s]).map(|s| vec![s]));
+
+    let mut out: Vec<ReadGroup> = Vec::new();
+    for unit in units {
+        // The keys whose values differ among the unit's sources.
+        let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for &s in &unit {
+            for (k, v) in &sources[s].labels {
+                values.entry(k).or_default().insert(v);
+            }
+        }
+        let split: Vec<&str> = values
+            .iter()
+            .filter(|(_, v)| v.len() > 1)
+            .map(|(k, _)| *k)
+            .collect();
+        // Each source's values of those keys, a missing one filled from its
+        // uuid group when that carries exactly one value.
+        let fill = |s: usize, key: &str| -> Option<String> {
+            if let Some(v) = sources[s].labels.get(key) {
+                return Some(v.clone());
+            }
+            let uuid = sources[s].uuid.as_deref()?;
+            let carried: BTreeSet<&String> = unit
+                .iter()
+                .filter(|&&o| sources[o].uuid.as_deref() == Some(uuid))
+                .filter_map(|&o| sources[o].labels.get(key))
+                .collect();
+            match carried.len() {
+                1 => carried.into_iter().next().cloned(),
+                _ => None,
+            }
+        };
+        let mut parts: Vec<(Vec<Option<String>>, Vec<usize>)> = Vec::new();
+        for &s in &unit {
+            let key: Vec<Option<String>> = split.iter().map(|k| fill(s, k)).collect();
+            match parts.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, members)) => members.push(s),
+                None => parts.push((key, vec![s])),
+            }
+        }
+        for (key, members) in parts {
+            let mut labels: BTreeMap<String, String> = BTreeMap::new();
+            for &s in &members {
+                for (k, v) in &sources[s].labels {
+                    labels.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            for (k, v) in split.iter().zip(key) {
+                match v {
+                    Some(v) => labels.insert(k.to_string(), v),
+                    None => labels.remove(*k),
+                };
+            }
+            out.push(ReadGroup {
+                sources: members,
+                labels,
+            });
+        }
+    }
+    out.sort_by_key(|g| g.sources[0]);
+    out
+}
+
 #[cfg(test)]
 mod equiv_tests;
 
@@ -1062,5 +1173,102 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![0, 1, 2, 3]]
         );
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn read(s: &[SourceInfo]) -> Vec<(Vec<usize>, BTreeMap<String, String>)> {
+        let g = form(s, &mut minutely(s));
+        read_groups(s, &g)
+            .into_iter()
+            .map(|r| (r.sources, r.labels))
+            .collect()
+    }
+
+    /// A key some sources of a group carry takes the carried value; a group
+    /// whose sources agree on every key is one read group.
+    #[test]
+    fn a_carried_label_fills_a_gap() {
+        let s = vec![
+            source(
+                &[("host", "a"), ("arm", "x")],
+                Some("u1"),
+                Some((0, 10)),
+                Some("e"),
+            ),
+            source(&[("host", "a")], Some("u2"), Some((5, 20)), Some("e")),
+        ];
+        assert_eq!(
+            read(&s),
+            vec![(vec![0, 1], labels(&[("arm", "x"), ("host", "a")]))]
+        );
+    }
+
+    /// Two values of one key split the group by value; a copy lacking the
+    /// key takes its uuid group's value and goes with it.
+    #[test]
+    fn two_values_of_a_label_split_the_group() {
+        let s = vec![
+            source(
+                &[("host", "a"), ("arm", "x")],
+                Some("u1"),
+                Some((0, 10)),
+                Some("e"),
+            ),
+            source(
+                &[("host", "a"), ("arm", "y")],
+                Some("u2"),
+                Some((5, 20)),
+                Some("e"),
+            ),
+            // A filtered copy of u1 without `arm`.
+            source(&[("host", "a")], Some("u1"), Some((0, 10)), Some("e")),
+            // A third uuid without `arm`: a part of its own.
+            source(&[("host", "a")], Some("u3"), Some((8, 12)), Some("e")),
+        ];
+        assert_eq!(
+            read(&s),
+            vec![
+                (vec![0, 2], labels(&[("arm", "x"), ("host", "a")])),
+                (vec![1], labels(&[("arm", "y"), ("host", "a")])),
+                (vec![3], labels(&[("host", "a")])),
+            ]
+        );
+    }
+
+    /// Sources in no group of several, and bridges, are read groups of their
+    /// own sources, with their own labels.
+    #[test]
+    fn singles_and_bridges_are_their_own_read_groups() {
+        let s = vec![
+            source(
+                &[("host", "a")],
+                Some("c"),
+                Some((9 * 60, 18 * 60)),
+                Some("e"),
+            ),
+            source(
+                &[("host", "a")],
+                Some("x"),
+                Some((9 * 60, 10 * 60)),
+                Some("e"),
+            ),
+            source(
+                &[("host", "a")],
+                Some("y"),
+                Some((17 * 60, 18 * 60)),
+                Some("e"),
+            ),
+            source(&[("host", "b")], Some("z"), Some((0, 5)), Some("f")),
+        ];
+        let g = form(&s, &mut minutely(&s));
+        assert_eq!(g.bridges.len(), 1);
+        let r: Vec<Vec<usize>> = read_groups(&s, &g).into_iter().map(|r| r.sources).collect();
+        assert_eq!(r, vec![vec![0], vec![1], vec![2], vec![3]]);
     }
 }

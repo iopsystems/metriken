@@ -466,6 +466,9 @@ pub(crate) fn range_end_ns(end: f64) -> u64 {
 /// The PromQL query engine, backed by any `DataSource`.
 pub(crate) struct QueryEngine {
     source: Arc<dyn DataSource>,
+    /// The process groups among `source`'s recordings that a leaf reads per
+    /// member (`streaming::per_source`); `None` when there are none.
+    groups: Option<Arc<streaming::per_source::SourceGroups>>,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -805,7 +808,23 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
 
 impl QueryEngine {
     pub(crate) fn new(source: Arc<dyn DataSource>) -> Self {
-        Self { source }
+        Self {
+            source,
+            groups: None,
+        }
+    }
+
+    /// An engine over `source`, some of whose recordings form the process
+    /// groups `groups` lists.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    pub(crate) fn with_groups(
+        source: Arc<dyn DataSource>,
+        groups: streaming::per_source::SourceGroups,
+    ) -> Self {
+        Self {
+            source,
+            groups: Some(Arc::new(groups)),
+        }
     }
 
     /// The underlying `DataSource` this engine queries against — an `Arc`
@@ -961,7 +980,15 @@ impl QueryEngine {
         step: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        streaming::dispatch::try_streaming(&*self.source, expr, start, end, step, opts)
+        streaming::dispatch::try_streaming(
+            &*self.source,
+            self.groups.as_deref(),
+            expr,
+            start,
+            end,
+            step,
+            opts,
+        )
     }
 
     fn handle_histogram_quantiles(
@@ -1226,6 +1253,7 @@ impl QueryEngine {
             |expr| {
                 streaming::dispatch::try_streaming_display(
                     &*self.source,
+                    self.groups.as_deref(),
                     expr,
                     start,
                     end,
