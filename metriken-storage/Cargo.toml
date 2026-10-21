@@ -52,7 +52,7 @@ default = ["lz4", "archive"]
 # The dendro archive: its catalog, `ArchiveReader`, the segment encoder and
 # the column filter. Off, nothing here compiles SQLite: the segment format,
 # the column readers and, with `convert`, the parquet conversion.
-archive = ["dep:dendro"]
+archive = ["dep:dendro", "dep:serde_json"]
 # The `.rez` archive format: reading it, and with `write` its writers.
 rez = ["archive", "dep:rusqlite", "dep:serde_json", "dep:tar", "dep:tempfile"]
 # Fixture builders other crates' tests use (the tar `.rez` writer).

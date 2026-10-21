@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.4.1
+
+- **Added:** process groups. `ArchiveReader::process_groups()` groups an
+  archive's sources by producer process, by the rules of
+  `docs/journal/2026-10-19-recording-identity-and-views.md`: sources that
+  share a uuid (dendro copies, hindsight dumps of one buffer) are taken as
+  one; a bridge, a uuid group that overlaps two others which do not overlap
+  each other, is set aside (within each `arm` when any source carries one);
+  the remaining uuid groups join where they share a producer epoch and the
+  intersection of their spans in it holds a row of each, closed
+  transitively. Each `producer_epochs` entry covers its source from its
+  `from_ts` to the next entry's. The result names sources by their position
+  in `ArchiveReader::sources()`, which gives each one's labels, catalog
+  index, uuid, span and epoch spans, and says why each group was joined.
+  It carries notices for copies whose `host` differs and for two sources of
+  one epoch whose spans intersect without a row of each. The pure rules are
+  `process::form`, over `SourceInfo`. Queries are unchanged: a process
+  group's sources are still read as separate recordings, so a source and its
+  copy still count twice until the per-source union lands.
+- **Added:** `Catalog::sources_with_uuids`, defaulting to `sources` with no
+  uuid; `DendroCatalog` reads the uuid in the same query. A `Catalog`
+  wrapper that forwards `sources` and not this method loses the uuids, so
+  its copies are not grouped.
+- **Added:** `SamplerReader::has_row_in(lo, hi)`, answered from the
+  catalog's segment spans listed at open, reading a segment's timestamp
+  column only when that segment starts before the range and ends after it.
+  On the 9.6 h single-source archive opening is unchanged (median 11.8 to
+  12.4 ms before, 12.0 to 12.1 ms after, three sets of 11 opens each) and
+  grouping takes 6 µs; on 64 copies of a 30-minute slice, grouping takes
+  0.12 ms (one uuid) to 0.55 ms (64 uuids sharing one epoch) against a
+  335 ms open.
+
 ### metriken-storage 0.4.0
 
 - **Breaking:** dendro is 0.6 (was 0.5). Archives this release creates are
