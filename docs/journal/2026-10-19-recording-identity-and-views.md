@@ -621,24 +621,20 @@ Names:
   say who set its `source`: metriken-recorder reports `inferred` in
   `Event::Active` only (`recorder.rs:201-207`), and nothing in the archive
   records it. So `__producer__` is taken from evidence other than `source`.
-  The evidence, first match wins:
-  1. The stream handshake's `dashboard` template, whose `revision` the agent
-     sets to `rezolus <version>`
-     (`src/agent/exposition/http/mod.rs:283-301`): `__producer__` is
-     `rezolus`.
+  The evidence, first match wins: 1. The stream handshake's `dashboard`
+  template, whose `revision` the agent sets to `rezolus <version>`
+  (`src/agent/exposition/http/mod.rs:283-301`): `__producer__` is `rezolus`.
   2. A `version` the probe hook wrote, together with one of the self-metric
-     names in `REZOLUS_SELF_ANCHORS` (`crates/dashboard/src/source_kind.rs:32`):
-     `rezolus`.
-  3. `sampler_status` under `per_source_metadata`, which v5.15.0 to v5.28.0
-     recorders wrote one level deep in the parquet of an agent that answered
-     `/samplers` (`build_per_source_metadata`, v5.28.0
-     `src/recorder/mod.rs:1796-1840`) and a combined parquet carries two
-     levels deep (`source_kind.rs:116-121` reads only the latter): `rezolus`
-     for that source.
-  4. A carried `service_queries`: its `service_name`. This is weak:
-     `template=` and `annotate --queries` write the same key, and an old
-     recording cannot say whether the user replaced the producer's.
-  5. Otherwise none.
+  names in `REZOLUS_SELF_ANCHORS`
+  (`crates/dashboard/src/source_kind.rs:32`): `rezolus`. 3. `sampler_status`
+  under `per_source_metadata`, which v5.15.0 to v5.28.0 recorders wrote one
+  level deep in the parquet of an agent that answered `/samplers`
+  (`build_per_source_metadata`, v5.28.0 `src/recorder/mod.rs:1796-1840`) and
+  a combined parquet carries two levels deep (`source_kind.rs:116-121` reads
+  only the latter): `rezolus` for that source. 4. A carried
+  `service_queries`: its `service_name`. This is weak: `template=` and
+  `annotate --queries` write the same key, and an old recording cannot say
+  whether the user replaced the producer's. 5. Otherwise none.
 
   Then `source`, when it differs from `__producer__`: a value that names a
   known producer (a registry entry) reads as that producer, refined by the
@@ -1151,8 +1147,8 @@ check`, systemslab through the `dashboard` crate).
   1 s source covering 10:00 to 10:10 and a 100 ms source covering 10:04 to
   10:05; `rate(c[10s])` at a 100 ms step returns the 100 ms source's results
   from 10:04:10 (the first point whose window starts at or after its first
-  row) to 10:05, and the 1 s source's elsewhere. Test: a 1 s source with one 5 s gap; the gap is a hole (5 s
-  against a 2 s threshold).
+  row) to 10:05, and the 1 s source's elsewhere. Test: a 1 s source with
+  one 5 s gap; the gap is a hole (5 s against a 2 s threshold).
 - **S4. Conflicts are reported.** Two sources of one group holding a read
   of one series at one timestamp with one acquisition window must hold one
   value. When they differ, the query returns the finer source's value and
@@ -1160,7 +1156,8 @@ check`, systemslab through the `dashboard` crate).
   first timestamp (Q16 for the value used). Two stream recorders of one
   rezolus agent share reads: ticks of two subscriptions that fall within
   three quarters of one pass's TTL are answered from that pass
-  (`src/agent/exposition/http/mod.rs:194-197`, read from the comment), so
+  (`src/agent/exposition/http/mod.rs:194-197` at rezolus upstream/main
+  7add8f06, read from the comment), so
   equal stamps carry equal values. The skew case is scraped
   sources, whose rows interleave. Test: a copy with one value edited; the
   chart renders, and one conflict notice names the edited timestamp.
@@ -1175,9 +1172,9 @@ check`, systemslab through the `dashboard` crate).
 - **S7. Windows travel with rows.** Each row keeps its own acquisition
   window, and a rate's band uses the windows of the pair of rows that
   supplied the increase.
-- **S8. Groups of several process groups.** A group of several process groups is
-  aggregated across them by plot type (P3), each process group counted
-  once by S1.
+- **S8. Groups of several process groups.** A group of several process
+  groups is aggregated across them by plot type (P3), each process group
+  counted once by S1.
 
 #### Query engine support (measured)
 
@@ -1312,66 +1309,65 @@ not needed while each source keeps one cadence; S12 is done.
   the grid, the staleness window for a gauge (`[t − s, t]`, `s` the step or
   the interval when that is longer), and for an unstrided histogram function
   the pair of rows its per-row delta is taken between. No value is a
-  difference between a row of one source and a row of another; at a
-  junction the incoming source's own pair of rows supplies the increase,
-  which its own evaluation already holds. No pair of rows spans two
-  sources, so every counter reset is within one source's rows. At each
-  epoch's `from_ts` a series has a counter reset, whether or not its values
-  decrease there. This keeps the engine's assumption of
-  one cadence per series: three bounds (the rate reach, gauge staleness and
-  raw `irate`'s maximum gap) come from the table's interval and the band's
-  hole test from the series' first nine samples (`SPACING_PROBE`,
-  `promql/streaming/rate.rs`); with one cadence per source both are that
-  cadence. Test: the interleaved fixture (a coarse source with rows every
-  1 s from 1000 to 1180 s, read 80 ms before its stamps; a fine source with
-  rows every 100 ms from 1060.05 to 1119.95 s, read at its stamps);
-  `irate(c[5s])` at step 0.1 and `rate(c[10s])` read 1000/s within 1e-3
-  everywhere, junctions included. Test: the same fixture with a counter
-  `c2` growing 1000/s, then 3000/s from 1060 to 1120 s, then 1000/s, and
-  `rate(c2[10s])` at step 0.1. The fine source's result is used from 1070.1
-  s (the first point whose window starts at or after its first row, 1060.05
-  s) to 1119.9 s (the last point its rows bracket), and the coarse source's
-  elsewhere. The reference at each point is computed from the rows of the
-  source used, each row's value the true counter at its stamp less that
-  source's staleness (80 ms for the coarse source, none for the fine),
+  difference between a row of one source and a row of another; at a junction
+  the incoming source's own pair of rows supplies the increase, which its
+  own evaluation already holds. No pair of rows spans two sources, so every
+  counter reset is within one source's rows. At each epoch's `from_ts` a
+  series has a counter reset, whether or not its values decrease there. This
+  keeps the engine's assumption of one cadence per series: three bounds (the
+  rate reach, gauge staleness and raw `irate`'s maximum gap) come from the
+  table's interval and the band's hole test from the series' first nine
+  samples (`SPACING_PROBE`, `promql/streaming/rate.rs`); with one cadence
+  per source both are that cadence. Test: the interleaved fixture (a coarse
+  source with rows every 1 s from 1000 to 1180 s, read 80 ms before its
+  stamps; a fine source with rows every 100 ms from 1060.05 to 1119.95 s,
+  read at its stamps); `irate(c[5s])` at step 0.1 and `rate(c[10s])` read
+  1000/s within 1e-3 everywhere, junctions included. Test: the same fixture
+  with a counter `c2` growing 1000/s, then 3000/s from 1060 to 1120 s, then
+  1000/s, and `rate(c2[10s])` from 1010 to 1170 s at step 0.1. The fine
+  source's result is used from 1070.1 s (the first point whose window starts
+  at or after its first row, 1060.05 s) to 1119.9 s (its last point: a
+  source is held past its last row only at the query's end), and the coarse
+  source's elsewhere. The reference at each point is computed from the rows
+  of the source used, each row's value the true counter at its stamp less
+  that source's staleness (80 ms for the coarse source, none for the fine),
   interpolated at `t − 10 s` and `t`; tolerance 1e-6. At 1065 s the coarse
   rows give `(C(1064.92) − C(1054.92)) / 10` = (14,760 + 5,080) / 10 =
   1984/s, where the true counter's rate is 2000/s; from 1070.1 to 1119.9 s
   the fine rows give 3000/s.
-- **S10. Bounds from local spacing.** Not needed while each source keeps
-  one cadence. Three bounds come from the table's interval and the band's
-  hole test from the series' first nine samples, which is wrong only for a
-  series whose rows change spacing (measured above): with a 100 ms interval
-  over a table whose rows are also 1 s apart, `rate(c2[10s])` was wrong at
-  70 of 140 points near the change, the gauge kept 96 of 480 points in a
-  coarse span, and raw `irate` gave no value for any coarse pair; with fine
-  first rows, `irate` had no band on any point of the coarse span. Under S9
-  no series the engine evaluates mixes cadences. The branch
-  `fix/local-spacing` on brayniac/metriken (44a5b0c, unmerged) took each
-  bound from the spacing of the rows near the point, capped by the longest
-  row gap the segments record in their footers. It was shelved for its cost
-  (on a 9.6 h archive, the batched `rate(x[1m])` path slower and a gauge
-  over 600 s at a 0.1 s step slower: the branch's CHANGELOG states 9% and
-  29% (40 µs); two later runs at 44a5b0c measured 6 to 9% and 25 to 27%
-  (30 to 37 µs)) and
-  because reviews found that it changed answers: for instant queries (a
-  gauge held into a pause and past its own last row, no instant `irate` at
-  the end of a table with a pause), for cross-cadence evaluation past a slow
-  table's last row, and for a range that crosses between segments, all fixed
-  in 44a5b0c; and, found in review of 44a5b0c and not fixed, for a series
-  with too few samples to have a spacing of its own (a gauge with one sample
-  in a table that paused for 600 s was held for up to 600 s). Reopens if
-  a single source changes cadence partway: a recorder whose interval
-  changes during a recording, or, plausibly and not verified, a `.dendro`
-  source spanning an agent restart after which the agent's snapshot TTL
-  changed (a subscription is served at the larger of the requested
-  interval and the snapshot TTL, rezolus
-  `src/agent/exposition/http/mod.rs:188-197` at upstream/main 7add8f06, so
-  a larger TTL after the restart changes the rows' spacing; whether a
-  restarted agent stays in one source was not checked). The tests that belong to it
-  then: one source whose rows go from 100 ms to 1 s apart at 10:05, with no
-  hole reported after 10:05 (the reason S3 takes the larger median), and
-  the coarse-fine-coarse and fine-first fixtures with each interval above.
+- **S10. Bounds from local spacing.** Not needed while each source keeps one
+  cadence. Three bounds come from the table's interval and the band's hole
+  test from the series' first nine samples, which is wrong only for a series
+  whose rows change spacing (measured above): with a 100 ms interval over a
+  table whose rows are also 1 s apart, `rate(c2[10s])` was wrong at 70 of
+  140 points near the change, the gauge kept 96 of 480 points in a coarse
+  span, and raw `irate` gave no value for any coarse pair; with fine first
+  rows, `irate` had no band on any point of the coarse span. Under S9 no
+  series the engine evaluates mixes cadences. The branch `fix/local-spacing`
+  on brayniac/metriken (44a5b0c, unmerged) took each bound from the spacing
+  of the rows near the point, capped by the longest row gap the segments
+  record in their footers. It was shelved for its cost (on a 9.6 h archive,
+  the batched `rate(x[1m])` path slower and a gauge over 600 s at a 0.1 s
+  step slower: the branch's CHANGELOG states 9% and 29% (40 µs); two later
+  runs at 44a5b0c measured 6 to 9% and 25 to 27% (30 to 37 µs)) and because
+  reviews found that it changed answers: for instant queries (a gauge held
+  into a pause and past its own last row, no instant `irate` at the end of a
+  table with a pause), for cross-cadence evaluation past a slow table's last
+  row, and for a range that crosses between segments, all fixed in 44a5b0c;
+  and, found in review of 44a5b0c and not fixed, for a series with too few
+  samples to have a spacing of its own (a gauge with one sample in a table
+  that paused for 600 s was held for up to 600 s). Reopens if a single
+  source changes cadence partway: a recorder whose interval changes during a
+  recording, or, plausibly and not verified, a `.dendro` source spanning an
+  agent restart after which the agent's snapshot TTL changed (a subscription
+  is served at the larger of the requested interval and the snapshot TTL,
+  rezolus `src/agent/exposition/http/mod.rs:188-197` at upstream/main
+  7add8f06, so a TTL raised above the requested interval changes the rows'
+  spacing; whether a restarted agent stays in one source was not checked).
+  The tests that belong to it then: one source whose rows go from 100 ms to
+  1 s apart at 10:05, with no hole reported after 10:05 (the reason S3 takes
+  the larger median), and the coarse-fine-coarse and fine-first fixtures
+  with each interval above.
 - **S11. Cross-cadence evaluation per span.** Not needed while each source
   keeps one cadence. `cross_cadence` (`archive.rs:210-273`) compares one
   median gap per table, which is wrong only for a table whose cadence
@@ -1865,8 +1861,8 @@ gets an alias, a deprecation warning, or a refusal:
   unioned.
 - systemslab picks service templates by `source` today; once it renders
   through the shared `dashboard` crate it follows that crate's lookup (the
-  kind refined by `service_kind`; a legacy `source` through D2). Its query-time
-  `job` and `experiment_id` labels need no rename.
+  kind refined by `service_kind`; a legacy `source` through D2). Its
+  query-time `job` and `experiment_id` labels need no rename.
 - hindsight's config key `source` (the agent's address): renamed (for
   example `endpoint`), with `source` accepted and warned about.
 
