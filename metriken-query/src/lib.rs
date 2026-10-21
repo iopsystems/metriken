@@ -23,6 +23,61 @@
 //! queries; attach it to any source with `.with_pool(...)`. The pool
 //! is process-wide and LRU-evicted by byte budget.
 //!
+//! # Functions that do not give one point per step
+//!
+//! * `avg_over_time(g[r])` at `t` is the mean of the gauge's samples stamped
+//!   in `[t − r, t]`, each counted once, as in Prometheus. It is not
+//!   weighted by how long each value held: over a window holding rows 100 ms
+//!   apart and rows 1 s apart, each fine row weighs as much as each coarse
+//!   one.
+//! * An unstrided histogram function (`histogram_quantile(q, h)`,
+//!   `histogram_quantiles([..], h)`, `histogram_count(h)`, `histogram_sum(h)`,
+//!   `histogram_mean(h)`, `histogram_irate(h)`) gives one point per row, at
+//!   the row's time, from each series' delta since its previous row; the
+//!   query's step does not place them. A count or a sum per point therefore
+//!   scales with the rows' spacing: a histogram observing 110 a second reads
+//!   110 per point over rows 1 s apart and 11 per point over rows 100 ms
+//!   apart. (`histogram_irate` divides by the rows' spacing; it takes no
+//!   stride.)
+//! * A strided form, with the stride in seconds as the trailing argument
+//!   (`histogram_count(h, 15)`, `histogram_quantiles([..], h, 15)`), gives one
+//!   point per stride window instead, the windows at multiples of the stride,
+//!   each row's delta shared among the windows its interval overlaps. A chart
+//!   uses the strided form with the stride at the chart's step: its points
+//!   are then one per step whatever the rows' spacing.
+//!
+//! ```
+//! use metriken_query::{MemoryStore, MetricsSource, QueryResult};
+//! use metriken_storage::{HistogramSnapshot, Labels};
+//!
+//! // Rows 1 s apart for ten seconds, then 100 ms apart for ten more; one
+//! // bucket, 10 observations a second.
+//! let s = 1_000_000_000u64;
+//! let mut ts: Vec<u64> = (0..10).map(|i| 1000 * s + i * s).collect();
+//! ts.extend((0..=100).map(|i| 1010 * s + i * s / 10));
+//! let snaps = ts
+//!     .iter()
+//!     .map(|t| HistogramSnapshot { index: vec![100], count: vec![(t - 1000 * s) / (s / 10)] })
+//!     .collect();
+//! let store = MemoryStore::builder().sampling_interval_ms(1000).build();
+//! let config = histogram::Config::new(3, 64).unwrap();
+//! store.insert_histogram_series("h", Labels::default(), config, ts.clone(), snaps).unwrap();
+//!
+//! let points = |q: &str| match store.query_range(q, 1001.0, 1020.0, 1.0).unwrap() {
+//!     QueryResult::Matrix { result } => result[0].values.clone(),
+//!     _ => unreachable!(),
+//! };
+//! // Unstrided: a point per row after the first, 10 per point over the 1 s
+//! // rows and 1 per point over the 100 ms rows.
+//! let unstrided = points("histogram_count(h)");
+//! assert_eq!(unstrided.len(), ts.len() - 1);
+//! assert_eq!((unstrided[0].1, unstrided.last().unwrap().1), (10.0, 1.0));
+//! // Strided at the step: a point per second, 10 in each.
+//! let strided = points("histogram_count(h, 1)");
+//! assert_eq!(strided.len(), 20);
+//! assert!(strided.iter().all(|(_, v)| *v == 10.0));
+//! ```
+//!
 //! # Example
 //!
 //! ```no_run

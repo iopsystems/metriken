@@ -1291,40 +1291,62 @@ override coarser than the native interval is set (rezolus
 The templates' `histogram_mean`, `histogram_sum` and `histogram_irate` were
 not measured.
 
-Rules that follow, each a prerequisite for case 3:
+Rules that follow. S9 is a prerequisite for case 3; S10 and S11 are not
+needed while each source keeps one cadence; S12 is done.
 
-- **S9. No delta between sources.** A union of sources of one process group
-  never takes a difference between a row of one source and a row of
-  another. Each source's own increments are used. At a junction the
-  incoming source's own pair of rows supplies the increase, or its values
-  are rebased to the union's cumulative total at the junction. Within a span
-  both cover, the finer source's rows are used (S3). At each epoch's
-  `from_ts` the union has a counter reset, whichever source supplies the
-  rows on either side, and rebasing does not cross it. Test: the
+- **S9. Per-source evaluation, combined per span.** Decided 2026-10-21. A
+  union of sources of one process group is not one series to the engine.
+  Each source is evaluated alone, with its own cadence: its own rows,
+  interval and acquisition windows, as one recording is evaluated today.
+  The results are combined per span (S3's spans): where only one source
+  covers a span, its results are used; in a span both cover, the finer
+  source's results are used, and the other's at a point the finer has no
+  result for (its first point, which has no row of its own before it). No
+  value is a difference between a row of one source and a row of another.
+  At a junction, where the source supplying the results changes, the
+  incoming source's own pair of rows supplies the increase, which its own
+  evaluation already holds. At each epoch's `from_ts` the union has a
+  counter reset, whichever source supplies the rows on either side. This
+  keeps the engine's assumption that a series has one interval: the rate
+  reach, gauge staleness, raw `irate`'s maximum gap and the band's hole
+  test all come from the series' table interval, and every series the
+  engine evaluates comes from one source with one cadence. Test: the
   interleaved fixture with the coarse source 80 ms stale; `irate(c[5s])` at
   step 0.1 and `rate(c[10s])` read 1000/s within tolerance everywhere,
   junctions included.
-- **S10. Bounds from local spacing.** The rate reach, gauge staleness, raw
-  irate's maximum gap and the band's hole test come from the spacing of the
-  samples near each evaluation point, not one hint per table. Until that is
-  built, the hint for a table whose cadence changes is the coarsest
-  constituent interval. In the probe the values are then exact. Inferred,
-  not measured: gauges are then held 1 s past a missing row inside the fine
-  span. Bands are still lost when the first nine samples are fine (460 of
-  460 `irate` points, 414 of 460 `rate`), and a gap shorter than 1 s inside
-  the fine span is not detected. Test: the coarse-fine-coarse and fine-first
-  fixtures with each hint above; every value is exact, the gauge keeps every
-  point, and every rate point has a band.
-- **S11. Cross-cadence evaluation per span.** Evaluation timestamps are
-  chosen per span of constant cadence, not per table. Test: the
-  fine-in-the-middle table beside a steady 1 s table at step 0.1 returns
-  100 ms points in the fine span.
-- **S12. Per-sample and per-row functions are documented.**
-  `avg_over_time` stays a mean over samples (Prometheus semantics) and is
-  documented as such; unstrided histogram functions emit one point per row,
-  documented, and a chart over a source whose cadence changes uses the
-  strided form at the step (step 3.5). Test: the documentation states both;
-  a percentile chart over the fixture has one point per step.
+- **S10. Bounds from local spacing.** Not needed while each source keeps
+  one cadence. The four bounds come from one interval per table, which is
+  wrong only for a table whose rows change spacing (measured above): with a
+  100 ms interval over a table whose rows are also 1 s apart,
+  `rate(c2[10s])` was wrong at 70 of 140 points near the change, the gauge
+  kept 96 of 480 points in a coarse span, and raw `irate` gave no value for
+  any coarse pair; with fine first rows, `irate` had no band on any point of
+  the coarse span. Under S9 no series the engine evaluates mixes cadences.
+  The branch `fix/local-spacing` on brayniac/metriken (44a5b0c, unmerged)
+  took each bound from the spacing of the rows near the point, capped by
+  the longest row gap the segments record in their footers. It was
+  shelved for its cost (on a 9.6 h archive, batched `rate` 9% slower and
+  gauges at a fine step 27%) and because reviews found it changed answers
+  for instant queries, cross-cadence evaluation and sparse series. Reopens
+  if a single source changes cadence partway, such as a recorder whose
+  interval changes during a recording.
+- **S11. Cross-cadence evaluation per span.** Not needed while each source
+  keeps one cadence. `cross_cadence` (`archive.rs:210-273`) compares one
+  median gap per table, which is wrong only for a table whose cadence
+  changes partway, and under S9 there is none. The test first written here
+  described the shelved design and had the result the wrong way round: per
+  span, the fine-in-the-middle table beside a steady 1 s table at step 0.1
+  is evaluated at the steady table's rows (1 s points) in the fine span,
+  where the cadences differ tenfold, and on the step's grid (100 ms points)
+  where both tables read every second. 44a5b0c on `fix/local-spacing`
+  implements and tests that. Reopens with S10.
+- **S12. Per-sample and per-row functions are documented.** Done: the
+  metriken-query crate docs ("Functions that do not give one point per
+  step") state that `avg_over_time` is a mean over samples (Prometheus
+  semantics, so fine rows weigh more), that an unstrided histogram function
+  gives one point per row and a strided form one point per stride, and that
+  a chart uses the strided form with the stride at its step (step 3.5), with
+  a doctest of both histogram forms over rows 1 s and then 100 ms apart.
 
 ### What is stored where
 
@@ -2206,18 +2228,16 @@ written by the new dendro.
      metriken-recorder and metriken-storage. Needs: Q1, Q2, Q3, Q7, Q8.
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`. Needs: Q1.
-   - In metriken-query, interval-derived bounds from local spacing (S10),
-     with the coarsest constituent interval as the hint for a table whose
-     cadence changes until then. Needs: none; prerequisite for case 3.
-   - In metriken-query, cross-cadence evaluation per span (S11). Needs:
-     none; prerequisite for case 3.
-   - In metriken-query, the per-sample `avg_over_time` and per-row unstrided
-     histogram behaviour documented (S12). Needs: none; prerequisite for
+   - ~~In metriken-query, the per-sample `avg_over_time` and per-row
+     unstrided histogram behaviour documented (S12).~~ Done in the
+     metriken-query crate docs.
+   - In metriken-storage and metriken-query, process groups and S1 to S8:
+     the union per series, finest rows per span and conflicts. Needs: Q9
+     and Q16 for the grouping key and the conflict value; prerequisite for
      case 3.
-   - In metriken-storage and metriken-query, process groups and S1 to S9:
-     the union per series, finest rows per span, conflicts, and no delta
-     between rows of different sources. Needs: none for S9; Q9 and Q16 for
-     the grouping key and the conflict value; prerequisite for case 3.
+   - In metriken-query, S9 per-source union: each source evaluated alone
+     and the results combined per span, never a delta across sources.
+     Needs: the process groups above; prerequisite for case 3.
    - In metriken-query the open-time label overlay (O5), a generic caller
      API. Needs: Q37.
    - In metriken-query the scope input (D1), resolving to process groups,
