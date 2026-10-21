@@ -621,24 +621,20 @@ Names:
   say who set its `source`: metriken-recorder reports `inferred` in
   `Event::Active` only (`recorder.rs:201-207`), and nothing in the archive
   records it. So `__producer__` is taken from evidence other than `source`.
-  The evidence, first match wins:
-  1. The stream handshake's `dashboard` template, whose `revision` the agent
-     sets to `rezolus <version>`
-     (`src/agent/exposition/http/mod.rs:283-301`): `__producer__` is
-     `rezolus`.
+  The evidence, first match wins: 1. The stream handshake's `dashboard`
+  template, whose `revision` the agent sets to `rezolus <version>`
+  (`src/agent/exposition/http/mod.rs:283-301`): `__producer__` is `rezolus`.
   2. A `version` the probe hook wrote, together with one of the self-metric
-     names in `REZOLUS_SELF_ANCHORS` (`crates/dashboard/src/source_kind.rs:32`):
-     `rezolus`.
-  3. `sampler_status` under `per_source_metadata`, which v5.15.0 to v5.28.0
-     recorders wrote one level deep in the parquet of an agent that answered
-     `/samplers` (`build_per_source_metadata`, v5.28.0
-     `src/recorder/mod.rs:1796-1840`) and a combined parquet carries two
-     levels deep (`source_kind.rs:116-121` reads only the latter): `rezolus`
-     for that source.
-  4. A carried `service_queries`: its `service_name`. This is weak:
-     `template=` and `annotate --queries` write the same key, and an old
-     recording cannot say whether the user replaced the producer's.
-  5. Otherwise none.
+  names in `REZOLUS_SELF_ANCHORS`
+  (`crates/dashboard/src/source_kind.rs:32`): `rezolus`. 3. `sampler_status`
+  under `per_source_metadata`, which v5.15.0 to v5.28.0 recorders wrote one
+  level deep in the parquet of an agent that answered `/samplers`
+  (`build_per_source_metadata`, v5.28.0 `src/recorder/mod.rs:1796-1840`) and
+  a combined parquet carries two levels deep (`source_kind.rs:116-121` reads
+  only the latter): `rezolus` for that source. 4. A carried
+  `service_queries`: its `service_name`. This is weak: `template=` and
+  `annotate --queries` write the same key, and an old recording cannot say
+  whether the user replaced the producer's. 5. Otherwise none.
 
   Then `source`, when it differs from `__producer__`: a value that names a
   known producer (a registry entry) reads as that producer, refined by the
@@ -856,9 +852,10 @@ evidence default, with a notice naming the label.
   recorders of one agent running at the same time at different intervals,
   and a systemslab job's automatic recording beside a recording started by
   a separate record invocation against the same agent.
-- **Default.** One presented recording: the union of the group's rows
-  (S1 to S12), with the group's labels (data model). The notice names the
-  sources unioned and why.
+- **Default.** One presented recording: the group's sources, each
+  evaluated alone and combined per span, the finest source's results in each
+  span (S1 to S9), with the group's labels (data model). The notice names
+  the sources unioned and why.
 - **Alternatives.** Split by source: each source becomes its own presented
   recording, compared with absolute or elapsed alignment. A query whose
   scope names several of the split sources still reads their process group
@@ -869,8 +866,9 @@ evidence default, with a notice naming the label.
   (A2). A split names this archive's sources, so it does not transfer to
   another archive, and the export says so (Views).
 - **Edge cases.**
-  - Different time resolutions: the finest rows available in each span,
-    gaps filled from coarser ones (S3).
+  - Different time resolutions: in each span the finest source's results,
+    and a coarser source's where the finest has none or its rows do not
+    cover the whole window (S3, S9).
   - Both sources hold a read at one timestamp with one acquisition window
     and the values differ: a conflict (S4).
   - A filtered copy holds fewer series: the union is per series, so the
@@ -927,8 +925,8 @@ evidence default, with a notice naming the label.
   (another uuid, one epoch). Expected: the uuid group {D1, D2, L} and R are
   two uuid groups; neither is a bridge (each overlaps only the other); they
   share the epoch and overlap, so they form one process group and one
-  presented recording from 09:00 to 11:00, with the finest rows per span
-  (S3).
+  presented recording from 09:00 to 11:00, with the finest source's
+  results per span (S3, S9).
 
 ### Case 4: different processes of the same software
 
@@ -1137,23 +1135,19 @@ check`, systemslab through the `dashboard` crate).
   by its own labels and the group's labels; members of one group are not
   told apart by `__recording__`. Test: two copies of one source with equal
   label sets; `count(cpu_cycles)` equals the count for one copy.
-- **S3. Finest rows per span.** For each series, the time axis is cut into
-  spans in which the set of sources holding that series is constant. A
+- **S3. Finest source per span.** For each series, the time axis is cut
+  into spans in which the set of sources holding that series is constant. A
   source has no row at `t` when its rows on either side of `t` are further
   apart than twice the larger of the median of its gaps before that pair and
   the median of its gaps after it, each over up to eight gaps; with none on
-  one side, the other side's median is used. Taking the larger keeps a
-  source that slows down (100 ms rows, then 1 s rows) from showing holes
-  after the change: across the change the bracketing gap is 1 s, the median
-  after it is 1 s, and 1 s is under the 2 s threshold. In each span the rows
-  come from the source with the finest spacing there, ties going to the
-  lowest uuid, then to catalog order; where that source has no row, the next
-  finest fills the gap. Equal timestamps with different acquisition windows
-  are two reads, and this rule picks one. Test: a 1 s source covering 10:00
-  to 10:10 and a 100 ms source covering 10:04 to 10:05; a range query at a
-  100 ms step returns 100 ms points from 10:04 to 10:05 and values from the
-  1 s rows elsewhere. Test: one source whose rows go from 100 ms to 1 s
-  apart at 10:05; no hole is reported after 10:05. Test: a 1 s source with
+  one side, the other side's median is used. In each span the results come
+  from the source with the finest spacing there (S9), ties going to the
+  lowest uuid, then to catalog order; where it has no result, or its rows
+  do not cover the whole window (S9), the next finest's is used. Test: a
+  1 s source covering 10:00 to 10:10 and a 100 ms source covering 10:04 to
+  10:05; `rate(c[10s])` at a 100 ms step returns the 100 ms source's results
+  from 10:04:10 (the first point whose window starts at or after its first
+  row) to 10:05, and the 1 s source's elsewhere. Test: a 1 s source with
   one 5 s gap; the gap is a hole (5 s against a 2 s threshold).
 - **S4. Conflicts are reported.** Two sources of one group holding a read
   of one series at one timestamp with one acquisition window must hold one
@@ -1162,7 +1156,8 @@ check`, systemslab through the `dashboard` crate).
   first timestamp (Q16 for the value used). Two stream recorders of one
   rezolus agent share reads: ticks of two subscriptions that fall within
   three quarters of one pass's TTL are answered from that pass
-  (`src/agent/exposition/http/mod.rs:194-197`, read from the comment), so
+  (`src/agent/exposition/http/mod.rs:194-197` at rezolus upstream/main
+  7add8f06, read from the comment), so
   equal stamps carry equal values. The skew case is scraped
   sources, whose rows interleave. Test: a copy with one value edited; the
   chart renders, and one conflict notice names the edited timestamp.
@@ -1171,14 +1166,15 @@ check`, systemslab through the `dashboard` crate).
 - **S6. Counter decreases.** A decrease within one source's own rows is a
   counter reset, as today: the epoch says nothing about a counter that
   wrapped or that a sampler zeroes on read (rezolus `CLAUDE.md`,
-  `producer_epoch`). A notice is given only when the epoch history does not
-  explain a decrease between sources at a junction.
+  `producer_epoch`). A decrease between two sources' values at a junction
+  never enters a value (S9); it is compared only as a diagnostic, and a
+  notice is given when the epoch history does not explain it.
 - **S7. Windows travel with rows.** Each row keeps its own acquisition
   window, and a rate's band uses the windows of the pair of rows that
   supplied the increase.
-- **S8. Groups of several process groups.** A group of several process groups is
-  aggregated across them by plot type (P3), each process group counted
-  once by S1.
+- **S8. Groups of several process groups.** A group of several process
+  groups is aggregated across them by plot type (P3), each process group
+  counted once by S1.
 
 #### Query engine support (measured)
 
@@ -1280,8 +1276,9 @@ A union of two sources of one counter growing 1000/s:
   s, step 1) and 1800 (at 1060.1 s, step 0.1), and at 1120 s, where the
   first coarse row is below the last fine row, `irate` reads 120,870 at
   step 1 and 1,199,700 at step 0.1 (`rate[10s]` 12,987). Choosing the
-  finest rows (S3) is not enough alone, because each junction still
-  compares values from two recorders.
+  finest rows per span is not enough alone, because each junction still
+  compares values from two recorders; S9 evaluates each source alone for
+  this reason.
 
 The viewer's charts: a percentile or heatmap chart builds the unstrided
 `histogram_quantiles(…)` or `histogram_heatmap(…)` unless a Granularity
@@ -1291,40 +1288,104 @@ override coarser than the native interval is set (rezolus
 The templates' `histogram_mean`, `histogram_sum` and `histogram_irate` were
 not measured.
 
-Rules that follow, each a prerequisite for case 3:
+The rules that follow: S9 is a prerequisite for case 3; S10 and S11 are
+not needed while each source keeps one cadence; S12 is done.
 
-- **S9. No delta between sources.** A union of sources of one process group
-  never takes a difference between a row of one source and a row of
-  another. Each source's own increments are used. At a junction the
-  incoming source's own pair of rows supplies the increase, or its values
-  are rebased to the union's cumulative total at the junction. Within a span
-  both cover, the finer source's rows are used (S3). At each epoch's
-  `from_ts` the union has a counter reset, whichever source supplies the
-  rows on either side, and rebasing does not cross it. Test: the
-  interleaved fixture with the coarse source 80 ms stale; `irate(c[5s])` at
-  step 0.1 and `rate(c[10s])` read 1000/s within tolerance everywhere,
-  junctions included.
-- **S10. Bounds from local spacing.** The rate reach, gauge staleness, raw
-  irate's maximum gap and the band's hole test come from the spacing of the
-  samples near each evaluation point, not one hint per table. Until that is
-  built, the hint for a table whose cadence changes is the coarsest
-  constituent interval. In the probe the values are then exact. Inferred,
-  not measured: gauges are then held 1 s past a missing row inside the fine
-  span. Bands are still lost when the first nine samples are fine (460 of
-  460 `irate` points, 414 of 460 `rate`), and a gap shorter than 1 s inside
-  the fine span is not detected. Test: the coarse-fine-coarse and fine-first
-  fixtures with each hint above; every value is exact, the gauge keeps every
-  point, and every rate point has a band.
-- **S11. Cross-cadence evaluation per span.** Evaluation timestamps are
-  chosen per span of constant cadence, not per table. Test: the
-  fine-in-the-middle table beside a steady 1 s table at step 0.1 returns
-  100 ms points in the fine span.
-- **S12. Per-sample and per-row functions are documented.**
-  `avg_over_time` stays a mean over samples (Prometheus semantics) and is
-  documented as such; unstrided histogram functions emit one point per row,
-  documented, and a chart over a source whose cadence changes uses the
-  strided form at the step (step 3.5). Test: the documentation states both;
-  a percentile chart over the fixture has one point per step.
+- **S9. Per-source evaluation, combined per span.** Decided 2026-10-21. A
+  union of sources of one process group is not one series to the engine.
+  Each source is evaluated alone, with its own cadence (its own rows,
+  interval and acquisition windows, as one recording is evaluated today), up
+  to the per-series function: `rate`, `irate`, a histogram's per-row or
+  per-stride delta. The results are combined per series per span (S3's
+  spans), and aggregation across series and across process groups (S8)
+  applies after the combination: `sum(rate(x[1m]))` sums the combined
+  series, and `histogram_quantiles` across hosts merges the combined deltas.
+  Where only one source covers a span, its results are used. In a span both
+  cover, the finer source's result at `t` is used where its rows cover the
+  whole window, its start at or after the source's first row and `t` within
+  one interval of its last row, and the other source's result elsewhere, so
+  a point is never answered from part of a window. The window is the
+  function's: `[t − r, t]` for `rate(x[r])`, `[t − step, t]` for `irate` on
+  the grid, the staleness window for a gauge (`[t − s, t]`, `s` the step or
+  the interval when that is longer), and for an unstrided histogram function
+  the pair of rows its per-row delta is taken between. No value is a
+  difference between a row of one source and a row of another; at a junction
+  the incoming source's own pair of rows supplies the increase, which its
+  own evaluation already holds. No pair of rows spans two sources, so every
+  counter reset is within one source's rows. At each epoch's `from_ts` a
+  series has a counter reset, whether or not its values decrease there. This
+  keeps the engine's assumption of one cadence per series: three bounds (the
+  rate reach, gauge staleness and raw `irate`'s maximum gap) come from the
+  table's interval and the band's hole test from the series' first nine
+  samples (`SPACING_PROBE`, `promql/streaming/rate.rs`); with one cadence
+  per source both are that cadence. Test: the interleaved fixture (a coarse
+  source with rows every 1 s from 1000 to 1180 s, read 80 ms before its
+  stamps; a fine source with rows every 100 ms from 1060.05 to 1119.95 s,
+  read at its stamps); `irate(c[5s])` at step 0.1 and `rate(c[10s])` read
+  1000/s within 1e-3 everywhere, junctions included. Test: the same fixture
+  with a counter `c2` growing 1000/s, then 3000/s from 1060 to 1120 s, then
+  1000/s, and `rate(c2[10s])` from 1010 to 1170 s at step 0.1. The fine
+  source's result is used from 1070.1 s (the first point whose window starts
+  at or after its first row, 1060.05 s) to 1119.9 s (its last point: a
+  source is held past its last row only at the query's end), and the coarse
+  source's elsewhere. The reference at each point is computed from the rows
+  of the source used, each row's value the true counter at its stamp less
+  that source's staleness (80 ms for the coarse source, none for the fine),
+  interpolated at `t − 10 s` and `t`; tolerance 1e-6. At 1065 s the coarse
+  rows give `(C(1064.92) − C(1054.92)) / 10` = (14,760 + 5,080) / 10 =
+  1984/s, where the true counter's rate is 2000/s; from 1070.1 to 1119.9 s
+  the fine rows give 3000/s.
+- **S10. Bounds from local spacing.** Not needed while each source keeps one
+  cadence. Three bounds come from the table's interval and the band's hole
+  test from the series' first nine samples, which is wrong only for a series
+  whose rows change spacing (measured above): with a 100 ms interval over a
+  table whose rows are also 1 s apart, `rate(c2[10s])` was wrong at 70 of
+  140 points near the change, the gauge kept 96 of 480 points in a coarse
+  span, and raw `irate` gave no value for any coarse pair; with fine first
+  rows, `irate` had no band on any point of the coarse span. Under S9 no
+  series the engine evaluates mixes cadences. The branch `fix/local-spacing`
+  on brayniac/metriken (44a5b0c, unmerged) took each bound from the spacing
+  of the rows near the point, capped by the longest row gap the segments
+  record in their footers. It was shelved for its cost (on a 9.6 h archive,
+  the batched `rate(x[1m])` path slower and a gauge over 600 s at a 0.1 s
+  step slower: the branch's CHANGELOG states 9% and 29% (40 µs); two later
+  runs at 44a5b0c measured 6 to 9% and 25 to 27% (30 to 37 µs)) and because
+  reviews found that it changed answers: for instant queries (a gauge held
+  into a pause and past its own last row, no instant `irate` at the end of a
+  table with a pause), for cross-cadence evaluation past a slow table's last
+  row, and for a range that crosses between segments, all fixed in 44a5b0c;
+  and, found in review of 44a5b0c and not fixed, for a series with too few
+  samples to have a spacing of its own (a gauge with one sample in a table
+  that paused for 600 s was held for up to 600 s). Reopens if a single
+  source changes cadence partway: a recorder whose interval changes during a
+  recording, or, plausibly and not verified, a `.dendro` source spanning an
+  agent restart after which the agent's snapshot TTL changed (a subscription
+  is served at the larger of the requested interval and the snapshot TTL,
+  rezolus `src/agent/exposition/http/mod.rs:188-197` at upstream/main
+  7add8f06, so a TTL raised above the requested interval changes the rows'
+  spacing; whether a restarted agent stays in one source was not checked).
+  The tests that belong to it then: one source whose rows go from 100 ms to
+  1 s apart at 10:05, with no hole reported after 10:05 (the reason S3 takes
+  the larger median), and the coarse-fine-coarse and fine-first fixtures
+  with each interval above.
+- **S11. Cross-cadence evaluation per span.** Not needed while each source
+  keeps one cadence. `cross_cadence` (`archive.rs:210-273`) compares one
+  median gap per table, which is wrong only for a table whose cadence
+  changes partway, and under S9 there is none. The test first written here
+  described the shelved design and had the result the wrong way round: per
+  span, the fine-in-the-middle table beside a steady 1 s table at step 0.1
+  is evaluated at the steady table's rows (1 s points) in the fine span,
+  where the cadences differ tenfold, and on the step's grid (100 ms points)
+  where both tables read every second. 44a5b0c on `fix/local-spacing`
+  implements and tests that. Reopens with S10.
+- **S12. Per-sample and per-row functions are documented.** Done: the
+  metriken-query crate docs ("Functions whose values depend on row
+  spacing") state that `avg_over_time` is a mean over samples (Prometheus
+  semantics, so fine rows weigh more), that an unstrided histogram function
+  gives one point per row that holds observations and a strided form one
+  point per stride window that holds observations, and that
+  a chart uses the strided form with the stride at its step (step 3.5), with
+  a doctest of both histogram forms over rows 1 s and then 100 ms apart.
 
 ### What is stored where
 
@@ -1800,8 +1861,8 @@ gets an alias, a deprecation warning, or a refusal:
   unioned.
 - systemslab picks service templates by `source` today; once it renders
   through the shared `dashboard` crate it follows that crate's lookup (the
-  kind refined by `service_kind`; a legacy `source` through D2). Its query-time
-  `job` and `experiment_id` labels need no rename.
+  kind refined by `service_kind`; a legacy `source` through D2). Its
+  query-time `job` and `experiment_id` labels need no rename.
 - hindsight's config key `source` (the agent's address): renamed (for
   example `endpoint`), with `source` accepted and warned about.
 
@@ -2206,18 +2267,17 @@ written by the new dendro.
      metriken-recorder and metriken-storage. Needs: Q1, Q2, Q3, Q7, Q8.
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`. Needs: Q1.
-   - In metriken-query, interval-derived bounds from local spacing (S10),
-     with the coarsest constituent interval as the hint for a table whose
-     cadence changes until then. Needs: none; prerequisite for case 3.
-   - In metriken-query, cross-cadence evaluation per span (S11). Needs:
-     none; prerequisite for case 3.
-   - In metriken-query, the per-sample `avg_over_time` and per-row unstrided
-     histogram behaviour documented (S12). Needs: none; prerequisite for
-     case 3.
-   - In metriken-storage and metriken-query, process groups and S1 to S9:
-     the union per series, finest rows per span, conflicts, and no delta
-     between rows of different sources. Needs: none for S9; Q9 and Q16 for
-     the grouping key and the conflict value; prerequisite for case 3.
+   - ~~In metriken-query, the per-sample `avg_over_time` and per-row
+     unstrided histogram behaviour documented (S12).~~ Done in the
+     metriken-query crate docs.
+   - In metriken-storage and metriken-query, process groups (S1, S2) and
+     conflicts (S4). Needs: Q9 and Q16 for the grouping key and the
+     conflict value; prerequisite for case 3.
+   - In metriken-query, the S9 per-source union, with S3's span selection
+     (which source's results are used in each span, which needs S9's
+     coverage rule) and S5 to S8: each source evaluated alone and the
+     results combined per series per span, never a delta across sources.
+     Needs: the process groups above; prerequisite for case 3.
    - In metriken-query the open-time label overlay (O5), a generic caller
      API. Needs: Q37.
    - In metriken-query the scope input (D1), resolving to process groups,
