@@ -56,3 +56,10 @@ metriken-core  <──  metriken-derive
 - **metriken**: UI compile-failure tests via `trybuild` (tests/ui/), integration tests for naming, description, dynamic metrics, formatters.
 - **metriken-query**: Tests build a TSDB from programmatic snapshots via `create_test_tsdb()` helper, then assert query results.
 - **metriken-exposition**: Uses `tempfile` for snapshot serialization round-trip tests.
+
+## Pull Requests
+
+- Feature PRs do not bump crate versions; versions are bumped per crate in release PRs.
+- A user-facing change adds a bullet to `CHANGELOG.md` under `## Unreleased`, inside the affected crate's `### <crate> <next-version>` sub-section (created if absent).
+- Commit subjects are conventional, `type(scope): description`, with the crate area as the scope (`feat(query): …`, `fix(storage): …`).
+- Open PRs as drafts.
