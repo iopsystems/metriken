@@ -871,7 +871,8 @@ evidence default, with a notice naming the label.
   another archive, and the export says so (Views).
 - **Edge cases.**
   - Different time resolutions: in each span the finest source's results,
-    and a coarser source's where it has none (S3, S9).
+    and a coarser source's where the finest has none or its rows do not
+    cover the whole window (S3, S9).
   - Both sources hold a read at one timestamp with one acquisition window
     and the values differ: a conflict (S4).
   - A filtered copy holds fewer series: the union is per series, so the
@@ -1145,11 +1146,12 @@ check`, systemslab through the `dashboard` crate).
   the median of its gaps after it, each over up to eight gaps; with none on
   one side, the other side's median is used. In each span the results come
   from the source with the finest spacing there (S9), ties going to the
-  lowest uuid, then to catalog order; where it has no result, the next
-  finest's is used. Test: a 1 s source covering 10:00 to 10:10 and a
-  100 ms source covering 10:04 to 10:05; a range query at a 100 ms step
-  returns 100 ms points from 10:04 to 10:05 and values from the 1 s source
-  elsewhere. Test: a 1 s source with one 5 s gap; the gap is a hole (5 s
+  lowest uuid, then to catalog order; where it has no result, or its rows
+  do not cover the whole window (S9), the next finest's is used. Test: a
+  1 s source covering 10:00 to 10:10 and a 100 ms source covering 10:04 to
+  10:05; `rate(c[10s])` at a 100 ms step returns the 100 ms source's results
+  from 10:04:10 (the first point whose window starts at or after its first
+  row) to 10:05, and the 1 s source's elsewhere. Test: a 1 s source with one 5 s gap; the gap is a hole (5 s
   against a 2 s threshold).
 - **S4. Conflicts are reported.** Two sources of one group holding a read
   of one series at one timestamp with one acquisition window must hold one
@@ -1303,25 +1305,39 @@ not needed while each source keeps one cadence; S12 is done.
   series, and `histogram_quantiles` across hosts merges the combined deltas.
   Where only one source covers a span, its results are used. In a span both
   cover, the finer source's result at `t` is used where its rows cover the
-  whole window, `t − r` at or after its first row, and the other source's
-  result elsewhere, so a window that starts before the finer source's
-  first row is never answered by a partial window. No value is a
+  whole window, its start at or after the source's first row and `t` within
+  one interval of its last row, and the other source's result elsewhere, so
+  a point is never answered from part of a window. The window is the
+  function's: `[t − r, t]` for `rate(x[r])`, `[t − step, t]` for `irate` on
+  the grid, the staleness window for a gauge (`[t − s, t]`, `s` the step or
+  the interval when that is longer), and for an unstrided histogram function
+  the pair of rows its per-row delta is taken between. No value is a
   difference between a row of one source and a row of another; at a
   junction the incoming source's own pair of rows supplies the increase,
   which its own evaluation already holds. No pair of rows spans two
-  sources, so a counter reset, at an epoch's `from_ts` or otherwise, is
-  always within one source's rows. This keeps the engine's assumption of
+  sources, so every counter reset is within one source's rows. At each
+  epoch's `from_ts` a series has a counter reset, whether or not its values
+  decrease there. This keeps the engine's assumption of
   one cadence per series: three bounds (the rate reach, gauge staleness and
   raw `irate`'s maximum gap) come from the table's interval and the band's
   hole test from the series' first nine samples (`SPACING_PROBE`,
   `promql/streaming/rate.rs`); with one cadence per source both are that
-  cadence. Test: the interleaved fixture with the coarse source 80 ms
-  stale; `irate(c[5s])` at step 0.1 and `rate(c[10s])` read 1000/s within
-  tolerance everywhere, junctions included. Test: the same fixture with
-  `c2`, whose rate changes inside the fine span; `rate(c2[60s])` at step 0.1
-  matches the reference computed from the true counter everywhere,
-  including the 60 s after the fine source's first row, where the window
-  starts before it and the coarse source's result is used.
+  cadence. Test: the interleaved fixture (a coarse source with rows every
+  1 s from 1000 to 1180 s, read 80 ms before its stamps; a fine source with
+  rows every 100 ms from 1060.05 to 1119.95 s, read at its stamps);
+  `irate(c[5s])` at step 0.1 and `rate(c[10s])` read 1000/s within 1e-3
+  everywhere, junctions included. Test: the same fixture with a counter
+  `c2` growing 1000/s, then 3000/s from 1060 to 1120 s, then 1000/s, and
+  `rate(c2[10s])` at step 0.1. The fine source's result is used from 1070.1
+  s (the first point whose window starts at or after its first row, 1060.05
+  s) to 1119.9 s (the last point its rows bracket), and the coarse source's
+  elsewhere. The reference at each point is computed from the rows of the
+  source used, each row's value the true counter at its stamp less that
+  source's staleness (80 ms for the coarse source, none for the fine),
+  interpolated at `t − 10 s` and `t`; tolerance 1e-6. At 1065 s the coarse
+  rows give `(C(1064.92) − C(1054.92)) / 10` = (14,760 + 5,080) / 10 =
+  1984/s, where the true counter's rate is 2000/s; from 1070.1 to 1119.9 s
+  the fine rows give 3000/s.
 - **S10. Bounds from local spacing.** Not needed while each source keeps
   one cadence. Three bounds come from the table's interval and the band's
   hole test from the series' first nine samples, which is wrong only for a
@@ -1334,8 +1350,10 @@ not needed while each source keeps one cadence; S12 is done.
   `fix/local-spacing` on brayniac/metriken (44a5b0c, unmerged) took each
   bound from the spacing of the rows near the point, capped by the longest
   row gap the segments record in their footers. It was shelved for its cost
-  (on a 9.6 h archive at 44a5b0c, the batched `rate(x[1m])` path 6 to 9%
-  slower and a gauge over 600 s at a 0.1 s step 25 to 27%, about 37 µs) and
+  (on a 9.6 h archive, the batched `rate(x[1m])` path slower and a gauge
+  over 600 s at a 0.1 s step slower: the branch's CHANGELOG states 9% and
+  29% (40 µs); two later runs at 44a5b0c measured 6 to 9% and 25 to 27%
+  (30 to 37 µs)) and
   because reviews found that it changed answers: for instant queries (a
   gauge held into a pause and past its own last row, no instant `irate` at
   the end of a table with a pause), for cross-cadence evaluation past a slow
@@ -1346,10 +1364,11 @@ not needed while each source keeps one cadence; S12 is done.
   a single source changes cadence partway: a recorder whose interval
   changes during a recording, or, plausibly and not verified, a `.dendro`
   source spanning an agent restart after which the agent's snapshot TTL
-  changed (the stream's frames come at the interval the recorder asks for,
-  and the TTL is the floor on how often a frame carries a new reading;
-  rezolus `src/agent/exposition/http/mod.rs:146-159`; whether a restarted
-  agent stays in one source was not checked). The tests that belong to it
+  changed (a subscription is served at the larger of the requested
+  interval and the snapshot TTL, rezolus
+  `src/agent/exposition/http/mod.rs:188-197` at upstream/main 7add8f06, so
+  a larger TTL after the restart changes the rows' spacing; whether a
+  restarted agent stays in one source was not checked). The tests that belong to it
   then: one source whose rows go from 100 ms to 1 s apart at 10:05, with no
   hole reported after 10:05 (the reason S3 takes the larger median), and
   the coarse-fine-coarse and fine-first fixtures with each interval above.
@@ -1367,7 +1386,8 @@ not needed while each source keeps one cadence; S12 is done.
   metriken-query crate docs ("Functions whose values depend on row
   spacing") state that `avg_over_time` is a mean over samples (Prometheus
   semantics, so fine rows weigh more), that an unstrided histogram function
-  gives one point per row and a strided form one point per stride, and that
+  gives one point per row that holds observations and a strided form one
+  point per stride window that holds observations, and that
   a chart uses the strided form with the stride at its step (step 3.5), with
   a doctest of both histogram forms over rows 1 s and then 100 ms apart.
 
@@ -2254,13 +2274,13 @@ written by the new dendro.
    - ~~In metriken-query, the per-sample `avg_over_time` and per-row
      unstrided histogram behaviour documented (S12).~~ Done in the
      metriken-query crate docs.
-   - In metriken-storage and metriken-query, process groups and S1 to S8:
-     the union per series, span selection (which source's results are used
-     in each span) and conflicts. Needs: Q9
-     and Q16 for the grouping key and the conflict value; prerequisite for
-     case 3.
-   - In metriken-query, S9 per-source union: each source evaluated alone
-     and the results combined per span, never a delta across sources.
+   - In metriken-storage and metriken-query, process groups (S1, S2) and
+     conflicts (S4). Needs: Q9 and Q16 for the grouping key and the
+     conflict value; prerequisite for case 3.
+   - In metriken-query, the S9 per-source union, with S3's span selection
+     (which source's results are used in each span, which needs S9's
+     coverage rule) and S5 to S8: each source evaluated alone and the
+     results combined per series per span, never a delta across sources.
      Needs: the process groups above; prerequisite for case 3.
    - In metriken-query the open-time label overlay (O5), a generic caller
      API. Needs: Q37.

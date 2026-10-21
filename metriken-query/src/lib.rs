@@ -37,13 +37,16 @@
 //!   which returns a heatmap rather than a matrix) gives one point per row
 //!   that holds observations since the previous row, at the row's time, from
 //!   each series' delta since its previous row; a row with none gives no
-//!   point (`histogram_irate` gives 0). The query's step does not place the
-//!   points. A count or a sum per point therefore scales with the rows'
-//!   spacing: a histogram observing 110 a second reads 110 per point over
-//!   rows 1 s apart and 11 per point over rows 100 ms apart. A point is per
-//!   distinct timestamp across every selected series and holds only the
+//!   point (`histogram_irate` gives 0, and no point for the first row with a
+//!   delta). The query's step does not place the points. A count or a sum
+//!   per point therefore scales with the rows' spacing: a histogram
+//!   observing 110 a second reads 110 per point over rows 1 s apart and 11
+//!   per point over rows 100 ms apart. A point is per
+//!   distinct timestamp across the series it pools and holds only the
 //!   series with a row at that timestamp, so series whose rows are not
-//!   aligned give alternating points, each holding only some of them.
+//!   aligned, pooled into one result, give alternating points, each holding
+//!   only some of them; with `by (…)` each group's points are at its own
+//!   series' rows.
 //! * A strided form, with the stride in seconds as the trailing argument
 //!   (`histogram_count(h, 15)`, `histogram_quantiles([..], h, 15)`,
 //!   `histogram_heatmap(h, 15)`), gives one point per stride window that
