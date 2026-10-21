@@ -69,6 +69,14 @@ pub trait Catalog: Send {
     /// Every source, in id order.
     fn sources(&self) -> Result<Vec<Source>, String>;
 
+    /// Every source, in id order, each with its uuid: the id a dendro copy
+    /// keeps, so two sources that carry one uuid are copies of one source.
+    /// The default is [`sources`](Self::sources) with no uuid, for a
+    /// container that keeps none.
+    fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
+        Ok(self.sources()?.into_iter().map(|s| (s, None)).collect())
+    }
+
     /// Every table of a source that has sealed segments or WAL rows.
     fn tables(&self, source_id: i64) -> Result<Vec<String>, String>;
 
@@ -232,18 +240,29 @@ fn err(e: dendro::Error) -> String {
 
 impl Catalog for DendroCatalog {
     fn sources(&self) -> Result<Vec<Source>, String> {
+        Ok(self
+            .sources_with_uuids()?
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect())
+    }
+
+    fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
         self.0
             .read_sources()
             .map_err(err)?
             .into_iter()
             .map(|s| {
-                Ok(Source {
-                    id: s.id,
-                    labels: s.meta.labels,
-                    metadata: s.meta.metadata,
-                    clock_anchor_wall_ns: ts(s.meta.clock_anchor_wall_ns)?,
-                    complete: s.complete,
-                })
+                Ok((
+                    Source {
+                        id: s.id,
+                        labels: s.meta.labels,
+                        metadata: s.meta.metadata,
+                        clock_anchor_wall_ns: ts(s.meta.clock_anchor_wall_ns)?,
+                        complete: s.complete,
+                    },
+                    s.uuid,
+                ))
             })
             .collect()
     }

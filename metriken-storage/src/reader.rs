@@ -30,6 +30,7 @@ use crate::catalog::Catalog;
 use crate::{InMemorySource, IndexRelabel, Reopen};
 
 use crate::occupants::Occupant;
+use crate::process::{ProcessGroups, SourceInfo};
 
 /// Each occupant's first row, in the order the rows came.
 fn first_per_occupant(rows: impl IntoIterator<Item = Occupant>) -> Vec<Occupant> {
@@ -254,6 +255,58 @@ impl DbHandle {
             }
         }
     }
+}
+
+/// Where a table's rows lie in time, from the catalog: each sealed
+/// segment's `(seq, entry)`, and the live WAL's span.
+struct RowIndex {
+    segments: Vec<(u64, crate::catalog::SegmentMeta)>,
+    /// Whether the segments' first and last rows both ascend, so a search
+    /// can skip to the range.
+    ordered: bool,
+    wal: crate::catalog::Span,
+}
+
+impl RowIndex {
+    fn new(segments: Vec<(u64, crate::catalog::SegmentMeta)>, wal: crate::catalog::Span) -> Self {
+        let ordered = segments
+            .windows(2)
+            .all(|w| w[0].1.first_ts <= w[1].1.first_ts && w[0].1.last_ts <= w[1].1.last_ts);
+        Self {
+            segments,
+            ordered,
+            wal,
+        }
+    }
+}
+
+/// The row timestamps of one sealed segment, from its `timestamp` column
+/// alone.
+fn segment_timestamps(bytes: Vec<u8>) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    use arrow::array::{Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))?;
+    let schema = builder.parquet_schema();
+    let column = schema
+        .root_schema()
+        .get_fields()
+        .iter()
+        .position(|f| f.name() == "timestamp")
+        .ok_or("the segment has no timestamp column")?;
+    let mask = ProjectionMask::roots(schema, [column]);
+    let mut out = Vec::new();
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("the timestamp column is not UInt64")?;
+        out.extend(ts.iter().flatten());
+    }
+    Ok(out)
 }
 
 /// One table's segments, fetched from the archive as a query needs them —
@@ -662,6 +715,11 @@ pub struct SamplerReader {
     /// The occupant stream's sealed segments this table's reader was built
     /// from, decoded, for a reader that replaces this one.
     occupant_segments: std::sync::Mutex<OccupantSegments>,
+    /// The table's sealed segments' catalog entries and its live WAL's span,
+    /// as the catalog listed them at open, for
+    /// [`has_row_in`](SamplerReader::has_row_in). `None` for a table opened
+    /// from bytes.
+    row_index: Option<RowIndex>,
     /// Row timestamps, read once.
     ///
     /// Reading them means decoding a whole column, and the cross-cadence
@@ -927,6 +985,95 @@ impl SamplerReader {
                 .unwrap_or_default()
         })
     }
+
+    /// Whether this table has a row with a timestamp in `[lo, hi]`: `None`
+    /// when it cannot tell.
+    ///
+    /// Answered from the catalog entries listed at open: a segment (or the
+    /// live WAL) with its first or last row inside the range has a row in
+    /// it. Only a segment that starts before the range and ends after it is
+    /// read, and only its timestamp column; the WAL's rows likewise. A read
+    /// that fails, a segment gone since open, and a WAL whose rows were
+    /// sealed or evicted since open give `None`. A table opened from bytes
+    /// reads its row timestamps.
+    pub fn has_row_in(&self, lo: u64, hi: u64) -> Option<bool> {
+        if lo > hi {
+            return Some(false);
+        }
+        let inside = |t: u64| (lo..=hi).contains(&t);
+        let Some(index) = &self.row_index else {
+            self.reader()?;
+            let ts = self.row_timestamps();
+            let at = ts.partition_point(|&t| t < lo);
+            return Some(ts.get(at).is_some_and(|&t| t <= hi));
+        };
+        // Segments are in time order: skip those ending before the range.
+        let from = match index.ordered {
+            true => index.segments.partition_point(|(_, m)| m.last_ts < lo),
+            false => 0,
+        };
+        let mut straddling = Vec::new();
+        for (seq, meta) in &index.segments[from..] {
+            if meta.first_ts > hi {
+                if index.ordered {
+                    break;
+                }
+                continue;
+            }
+            if meta.last_ts < lo {
+                continue;
+            }
+            if inside(meta.first_ts) || inside(meta.last_ts) {
+                return Some(true);
+            }
+            straddling.push((*seq, *meta));
+        }
+        let mut wal_straddles = false;
+        if let (Some(first), Some(last)) = (index.wal.first_ts, index.wal.last_ts) {
+            if last >= lo && first <= hi {
+                if inside(first) || inside(last) {
+                    return Some(true);
+                }
+                wal_straddles = true;
+            }
+        }
+        if straddling.is_empty() && !wal_straddles {
+            return Some(false);
+        }
+        let read = self.segments.with_catalog(|db, source_id, table| {
+            for (seq, meta) in &straddling {
+                let Some(bytes) = db.segment_bytes_matching(source_id, table, *seq, meta)? else {
+                    return Ok(None);
+                };
+                if segment_timestamps(bytes)?.into_iter().any(inside) {
+                    return Ok(Some(true));
+                }
+            }
+            if wal_straddles {
+                let rows = db.live_wal(source_id, table)?;
+                if rows.iter().any(|r| inside(r.ts)) {
+                    return Ok(Some(true));
+                }
+                // Rows sealed or evicted since open are no longer in the
+                // WAL, so their absence says nothing.
+                if rows.first().map(|r| r.ts) != index.wal.first_ts {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(false))
+        });
+        match read {
+            Some(Ok(found)) => found,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "reading the row timestamps of {} between {lo} and {hi}: {e}",
+                    self.sampler
+                );
+                None
+            }
+            None => None,
+        }
+    }
 }
 
 /// An archive's tables: one recording's, or several recordings' flattened
@@ -965,9 +1112,14 @@ pub struct ArchiveReader {
     /// recording's `__recording__` does not come and go as a twin gains or
     /// loses tables.
     members: Vec<(Arc<BTreeMap<String, String>>, usize)>,
+    /// What [`process_groups`](Self::process_groups) groups: one entry per
+    /// member, in `members` order.
+    sources: Vec<SourceInfo>,
     /// [`series_labels`](Self::series_labels), worked out on first use:
     /// `members` is fixed once the reader is built.
     series_labels: std::sync::OnceLock<SeriesLabels>,
+    /// [`process_groups`](Self::process_groups), worked out on first use.
+    process_groups: std::sync::OnceLock<ProcessGroups>,
 }
 
 /// One `ArchiveReader` per recording, paired with that recording's label set.
@@ -1258,9 +1410,11 @@ impl ArchiveReader {
         let mut complete = true;
         let mut recordings = 0usize;
         let mut members = Vec::new();
+        let mut sources = Vec::new();
         for (i, reader) in readers.into_iter().enumerate() {
             recordings += reader.recordings;
             members.extend(reader.members);
+            sources.extend(reader.sources);
             if i == 0 {
                 metadata = reader.metadata;
             }
@@ -1274,7 +1428,9 @@ impl ArchiveReader {
             complete,
             recordings,
             members,
+            sources,
             series_labels: std::sync::OnceLock::new(),
+            process_groups: std::sync::OnceLock::new(),
         }
     }
 
@@ -1302,7 +1458,7 @@ impl ArchiveReader {
         let db = shared.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
 
-        for (recording, rec) in db.sources()?.into_iter().enumerate() {
+        for (recording, (rec, uuid)) in db.sources_with_uuids()?.into_iter().enumerate() {
             if let Some(wrote) = rec.metadata.get(dendro::keys::ENCODER) {
                 if !crate::encoder::READABLE_ENCODERS.contains(&wrote.as_str()) {
                     return Err(format!(
@@ -1332,10 +1488,11 @@ impl ArchiveReader {
             // committed between a table's segment list (empty) and its WAL
             // read (emptied by the seal) would leave the table with no probe,
             // and the reader would not list it for as long as it is open.
-            let (pending, measured_intervals, indexed, occupant_streams) =
+            let (pending, measured_intervals, indexed, occupant_streams, mut row_indexes) =
                 in_snapshot(&**db, || {
                     let mut pending: Vec<PendingProbe> = Vec::new();
                     let mut measured_intervals: BTreeMap<String, Option<f64>> = BTreeMap::new();
+                    let mut row_indexes: HashMap<String, RowIndex> = HashMap::new();
                     // The streams the identity index describes. One catalog query per
                     // recording; a table named here is read through the index.
                     let indexed: HashSet<String> =
@@ -1402,6 +1559,7 @@ impl ArchiveReader {
                             (gap_ns / 1e6).round().max(1.0) / 1e3
                         });
                         measured_intervals.insert(sampler.clone(), measured);
+                        row_indexes.insert(sampler.clone(), RowIndex::new(metas, wal));
 
                         pending.push((sampler, probes, span));
                     }
@@ -1410,6 +1568,7 @@ impl ArchiveReader {
                         measured_intervals,
                         indexed,
                         occupant_streams,
+                        row_indexes,
                     ))
                 })?;
 
@@ -1434,6 +1593,7 @@ impl ArchiveReader {
                     span,
                     interval,
                     indexed: indexed.contains(&sampler),
+                    row_index: row_indexes.remove(&sampler),
                     occupants: occupant_streams
                         .contains(&crate::occupants::stream_of(&sampler))
                         .then(|| crate::occupants::stream_of(&sampler)),
@@ -1459,6 +1619,13 @@ impl ArchiveReader {
                 }));
             }
 
+            let info = SourceInfo::new(
+                rec.labels.clone(),
+                recording,
+                uuid,
+                tables_span(&tables),
+                &rec.metadata,
+            );
             out.push((
                 rec.labels.clone(),
                 Self {
@@ -1468,7 +1635,9 @@ impl ArchiveReader {
                     complete: rec.complete,
                     recordings: 1,
                     members: vec![(recording_labels, recording)],
+                    sources: vec![info],
                     series_labels: std::sync::OnceLock::new(),
+                    process_groups: std::sync::OnceLock::new(),
                 },
             ));
         }
@@ -1492,10 +1661,12 @@ impl ArchiveReader {
         let mut tables = Vec::new();
         let mut members = Vec::new();
         let mut complete = true;
+        let mut sources = Vec::new();
         for (recording, rec) in recordings.into_iter().enumerate() {
             complete &= rec.complete;
             let recording_labels = Arc::new(rec.labels.clone());
             members.push((Arc::clone(&recording_labels), recording));
+            let first_table = tables.len();
             if !rec.complete {
                 tracing::warn!(
                     "recording {} was not cleanly finalized; it was recovered up to its \
@@ -1591,6 +1762,7 @@ impl ArchiveReader {
                     span,
                     interval,
                     indexed: false,
+                    row_index: None,
                     occupants: None,
                     index: None,
                     segments: SegmentSource::Bytes(segments),
@@ -1602,6 +1774,13 @@ impl ArchiveReader {
                     row_timestamps: std::sync::OnceLock::new(),
                 }));
             }
+            sources.push(SourceInfo::new(
+                rec.labels.clone(),
+                recording,
+                None,
+                tables_span(&tables[first_table..]),
+                &rec.metadata,
+            ));
         }
         Ok(Self {
             tables,
@@ -1610,7 +1789,9 @@ impl ArchiveReader {
             complete,
             recordings: recording_count,
             members,
+            sources,
             series_labels: std::sync::OnceLock::new(),
+            process_groups: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1703,6 +1884,56 @@ impl ArchiveReader {
         self.members.len()
     }
 
+    /// Every source behind this reader, tables or not: its labels, catalog
+    /// index, uuid, span and producer epochs. In catalog order, and for
+    /// readers joined by [`flatten`](Self::flatten) in the order they were
+    /// joined. [`process_groups`](Self::process_groups) names sources by
+    /// their position here.
+    pub fn sources(&self) -> &[SourceInfo] {
+        &self.sources
+    }
+
+    /// The sources grouped by producer process: copies (one uuid) taken as
+    /// one, bridges set aside, and the rest joined where they share a
+    /// producer epoch and overlap in it by a row of each (see
+    /// [`crate::process`]). Worked out on first use and kept. Which rows a
+    /// source holds is read from the catalog entries listed at open, and a
+    /// segment's timestamp column when that segment straddles a whole
+    /// intersection ([`SamplerReader::has_row_in`]); a source holds a row
+    /// when any of its tables does, and cannot tell when none does and one
+    /// cannot tell.
+    ///
+    /// Queries are not affected: a process group's sources are still read as
+    /// separate recordings.
+    pub fn process_groups(&self) -> &ProcessGroups {
+        self.process_groups.get_or_init(|| {
+            // Each source's tables, by the address of its shared label map.
+            let mut tables: Vec<Vec<&SamplerReader>> = vec![Vec::new(); self.members.len()];
+            let position: HashMap<usize, usize> = self
+                .members
+                .iter()
+                .enumerate()
+                .map(|(i, (labels, _))| (Arc::as_ptr(labels) as usize, i))
+                .collect();
+            for t in &self.tables {
+                if let Some(&i) = position.get(&(Arc::as_ptr(&t.recording_labels) as usize)) {
+                    tables[i].push(t);
+                }
+            }
+            crate::process::form(&self.sources, &mut |source, lo, hi| {
+                let mut unknown = false;
+                for t in &tables[source] {
+                    match t.has_row_in(lo, hi) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
+                }
+                (!unknown).then_some(false)
+            })
+        })
+    }
+
     /// The labels each recording's series carry: the recording's labels, and
     /// for recordings whose label sets are identical,
     /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
@@ -1752,10 +1983,7 @@ impl ArchiveReader {
     /// probe, not the readers: this is asked before any query runs, and
     /// opening every table to answer it would undo the lazy build.
     pub fn time_range_ns(&self) -> Option<(u64, u64)> {
-        self.tables
-            .iter()
-            .filter_map(|t| t.span)
-            .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
+        tables_span(&self.tables)
     }
 
     /// The finest probed table interval in seconds, or 1.0 when no table
@@ -1783,6 +2011,14 @@ impl ArchiveReader {
     pub fn filename(&self) -> Option<String> {
         self.filename.clone()
     }
+}
+
+/// The union of `tables`' probed spans.
+fn tables_span(tables: &[Arc<SamplerReader>]) -> Option<(u64, u64)> {
+    tables
+        .iter()
+        .filter_map(|t| t.span)
+        .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
 }
 
 fn union_sorted(iters: impl Iterator<Item = Vec<String>>) -> Vec<String> {

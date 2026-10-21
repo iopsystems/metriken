@@ -35,6 +35,9 @@
 //! - `catalog`: what a reader needs from a container, and dendro's
 //!   implementation. `reader`: `ArchiveReader`, one source per table of a
 //!   recording. `writer` (feature `write`): `ArchiveWriter`.
+//! - `process`: an archive's sources grouped by producer process (copies
+//!   by uuid, bridges set aside, the rest joined by a shared producer
+//!   epoch), which `ArchiveReader::process_groups` returns.
 //! - `rez` (feature `rez`): the `.rez` format.
 //!
 //! Without the archive:
@@ -67,6 +70,8 @@ pub mod memory_store;
 mod names;
 pub mod occupants;
 pub mod parquet;
+#[cfg(feature = "archive")]
+pub mod process;
 #[cfg(feature = "archive")]
 pub mod reader;
 pub mod recordings;
