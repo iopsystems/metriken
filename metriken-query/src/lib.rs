@@ -23,31 +23,43 @@
 //! queries; attach it to any source with `.with_pool(...)`. The pool
 //! is process-wide and LRU-evicted by byte budget.
 //!
-//! # Functions that do not give one point per step
+//! # Functions whose values depend on row spacing
 //!
 //! * `avg_over_time(g[r])` at `t` is the mean of the gauge's samples stamped
-//!   in `[t − r, t]`, each counted once, as in Prometheus. It is not
+//!   in `[t − r, t]`, both ends included (Prometheus 3 leaves out a sample
+//!   at exactly `t − r`), each counted once, as in Prometheus. It is not
 //!   weighted by how long each value held: over a window holding rows 100 ms
 //!   apart and rows 1 s apart, each fine row weighs as much as each coarse
 //!   one.
 //! * An unstrided histogram function (`histogram_quantile(q, h)`,
 //!   `histogram_quantiles([..], h)`, `histogram_count(h)`, `histogram_sum(h)`,
-//!   `histogram_mean(h)`, `histogram_irate(h)`) gives one point per row, at
-//!   the row's time, from each series' delta since its previous row; the
-//!   query's step does not place them. A count or a sum per point therefore
-//!   scales with the rows' spacing: a histogram observing 110 a second reads
-//!   110 per point over rows 1 s apart and 11 per point over rows 100 ms
-//!   apart. (`histogram_irate` divides by the rows' spacing; it takes no
-//!   stride.)
+//!   `histogram_mean(h)`, `histogram_irate(h)`, and `histogram_heatmap(h)`,
+//!   which returns a heatmap rather than a matrix) gives one point per row
+//!   that holds observations since the previous row, at the row's time, from
+//!   each series' delta since its previous row; a row with none gives no
+//!   point (`histogram_irate` gives 0). The query's step does not place the
+//!   points. A count or a sum per point therefore scales with the rows'
+//!   spacing: a histogram observing 110 a second reads 110 per point over
+//!   rows 1 s apart and 11 per point over rows 100 ms apart. A point is per
+//!   distinct timestamp across every selected series and holds only the
+//!   series with a row at that timestamp, so series whose rows are not
+//!   aligned give alternating points, each holding only some of them.
 //! * A strided form, with the stride in seconds as the trailing argument
-//!   (`histogram_count(h, 15)`, `histogram_quantiles([..], h, 15)`), gives one
-//!   point per stride window instead, the windows at multiples of the stride,
-//!   each row's delta shared among the windows its interval overlaps. A chart
-//!   uses the strided form with the stride at the chart's step: its points
-//!   are then one per step whatever the rows' spacing.
+//!   (`histogram_count(h, 15)`, `histogram_quantiles([..], h, 15)`,
+//!   `histogram_heatmap(h, 15)`), gives one point per stride window that
+//!   holds observations, each row's delta shared among the windows its
+//!   interval overlaps. Windows end at multiples of the stride and a point
+//!   is stamped at its window's end (the last at its last row), so with the
+//!   stride at the step and a start that is not a multiple of the step, the
+//!   points are one per step but at multiples of the step rather than at
+//!   `start + k·step`. (`histogram_irate` and `histogram_quantile` take no
+//!   stride; `histogram_quantiles([q], h, s)` is the strided quantile.)
+//!
+//! A chart over rows whose spacing varies, or over several series with
+//! unaligned rows, should use the strided form with the stride at its step.
 //!
 //! ```
-//! use metriken_query::{MemoryStore, MetricsSource, QueryResult};
+//! use metriken_query::{MemoryStore, QueryResult};
 //! use metriken_storage::{HistogramSnapshot, Labels};
 //!
 //! // Rows 1 s apart for ten seconds, then 100 ms apart for ten more; one
