@@ -158,3 +158,50 @@ fn form_scale() {
         }
     }
 }
+
+/// The bridge search's slow case: one epoch, nested spans (source i covers
+/// `[i, 2n - i]`), rows only at each source's ends, so every pair intersects
+/// and none shares a row. Each such pair is kept for the notices and tried
+/// against every uuid group in the bridge search, so time grows with
+/// (groups × pairs) here rather than with pairs.
+#[test]
+#[ignore]
+fn form_nested_apart() {
+    use std::collections::BTreeMap;
+
+    use metriken_storage::process::{form, SourceInfo};
+
+    for n in [100usize, 200, 400, 800] {
+        let total = 2 * n as u64;
+        let sources: Vec<SourceInfo> = (0..n)
+            .map(|i| {
+                let metadata: BTreeMap<String, String> =
+                    [("producer_epoch".to_string(), "e".to_string())].into();
+                let span = (i as u64, total - i as u64);
+                SourceInfo::new(
+                    BTreeMap::new(),
+                    i,
+                    Some(format!("u{i}")),
+                    Some(span),
+                    &metadata,
+                )
+            })
+            .collect();
+        let spans: Vec<(u64, u64)> = sources.iter().map(|s| s.span_ns.unwrap()).collect();
+        let mut calls = 0u64;
+        let start = Instant::now();
+        let g = form(&sources, &mut |s, lo, hi| {
+            calls += 1;
+            let (a, b) = spans[s];
+            Some((lo..=hi).contains(&a) || (lo..=hi).contains(&b))
+        });
+        println!(
+            "n={n} nested apart: form {:.1} ms, {} groups, {} bridges, {} notices, {calls} row \
+             checks",
+            start.elapsed().as_secs_f64() * 1e3,
+            g.groups.len(),
+            g.bridges.len(),
+            g.notices.len()
+        );
+    }
+}

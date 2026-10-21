@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index, uuid, span and epoch spans, says which joins connected each group,
   and carries notices: copies whose `host` differs, two sources of one
   epoch whose spans intersect without a row of each, and pairs whose rows
-  could not be read. The pure rules are `process::form`, over `SourceInfo`.
+  could not be read (a pair is known to share no row when either source is
+  known to have none in the intersection). The pure rules are `process::form`, over `SourceInfo`.
   Queries are unchanged: a process group's sources are still read as
   separate recordings, so a source and its copy still count twice until the
   per-source union lands.
@@ -40,10 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spans listed at open, reading a segment's timestamp column only when that
   segment starts before the range and ends after it.
 - Cost: `process::form` visits only the pairs of uuid groups whose spans
-  intersect and keeps memory linear in the sources (1000 sources: 4 ms for
-  a fleet of one span and distinct epochs, 14 ms for one epoch recorded
-  1000 times; 3000 sources: 32 ms and 120 ms; peak RSS 14 MB for all of
-  them, `tests/group_cost.rs` `form_scale`). Opening the 9.6 h
+  intersect, plus up to (uuid groups × pairs of one epoch without a shared
+  row) for the bridge search those pairs need, and keeps memory linear in
+  the uuid groups plus those pairs (1000 sources: 4 ms for a fleet of one
+  span and distinct epochs, 14 ms for one epoch recorded 1000 times; 3000
+  sources: 32 ms and 120 ms; peak RSS 14 MB for all of them,
+  `tests/group_cost.rs` `form_scale`). The worst case is many sources of one
+  epoch that intersect pairwise and share no row: nested spans with rows only
+  at their ends take 42 ms at 200 sources, 332 ms at 400 and 2.94 s at 800,
+  with a notice per pair (`form_nested_apart`). Opening the 9.6 h
   single-source archive is unchanged (median 11.8 to 12.4 ms before, 12.0 to
   12.1 ms after, three sets of 11 opens each), and grouping 64 sources that
   share one epoch takes 0.25 to 0.6 ms beside an open of 335 ms or more.

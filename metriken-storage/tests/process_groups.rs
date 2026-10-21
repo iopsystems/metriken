@@ -759,11 +759,28 @@ fn grouping_fetches_a_segment_only_when_one_straddles_the_intersection() {
     assert_eq!(fetched, 1);
 }
 
-/// A catalog whose segment reads fail once `failing` is set, as an
-/// unreadable segment does.
-struct Failing(DendroCatalog, std::sync::Arc<std::sync::atomic::AtomicBool>);
+/// What a [`Tampered`] catalog does to reads after open.
+#[derive(Clone, Copy, PartialEq)]
+enum Tamper {
+    None,
+    /// Segment reads fail.
+    Fail,
+    /// Segments are gone (retention took them since open).
+    Gone,
+    /// The WAL's oldest row is gone from it (sealed since open).
+    Sealed,
+}
 
-impl Catalog for Failing {
+/// A catalog that answers as dendro's does until `tamper` is set.
+struct Tampered(DendroCatalog, std::sync::Arc<std::sync::Mutex<Tamper>>);
+
+impl Tampered {
+    fn mode(&self) -> Tamper {
+        *self.1.lock().unwrap()
+    }
+}
+
+impl Catalog for Tampered {
     fn sources(&self) -> Result<Vec<Source>, String> {
         self.0.sources()
     }
@@ -782,13 +799,18 @@ impl Catalog for Failing {
         table: &str,
         seq: u64,
     ) -> Result<Option<Vec<u8>>, String> {
-        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("injected read failure".to_string());
+        match self.mode() {
+            Tamper::Fail => Err("injected read failure".to_string()),
+            Tamper::Gone => Ok(None),
+            _ => self.0.segment_bytes(source_id, table, seq),
         }
-        self.0.segment_bytes(source_id, table, seq)
     }
     fn live_wal(&self, source_id: i64, table: &str) -> Result<Vec<WalRow>, String> {
-        self.0.live_wal(source_id, table)
+        let mut rows = self.0.live_wal(source_id, table)?;
+        if self.mode() == Tamper::Sealed && !rows.is_empty() {
+            rows.remove(0);
+        }
+        Ok(rows)
     }
     fn segment_span(&self, source_id: i64, table: &str) -> Result<(u64, Span), String> {
         self.0.segment_span(source_id, table)
@@ -820,14 +842,29 @@ impl Catalog for Failing {
     }
 }
 
-/// A row check that cannot read the segment it needs leaves the pair
-/// unjoined and says so, rather than reporting that the sources share no
-/// row. Reads fail only after open, so only the grouping's read of the
-/// straddling segment fails.
-#[test]
-fn an_unreadable_segment_is_unknown_not_absent() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("straddle.dendro");
+/// Group the archive at `path` with reads tampered with after open.
+fn group_tampered(path: &Path, tamper: Tamper) -> ProcessGroups {
+    let mode = std::sync::Arc::new(std::sync::Mutex::new(Tamper::None));
+    let recordings = ArchiveReader::from_catalog(
+        Box::new(Tampered(
+            DendroCatalog::open(path).unwrap(),
+            std::sync::Arc::clone(&mode),
+        )),
+        None,
+        BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    let reader = ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None);
+    *mode.lock().unwrap() = tamper;
+    reader.process_groups().clone()
+}
+
+/// The straddle fixture: a 1 s source whose rows are all in one sealed
+/// segment, and a 100 ms source of the same epoch that reaches its row at
+/// 5 s, so joining them reads that segment.
+fn straddle(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("straddle.dendro");
     let start = at(10, 0);
     let e = &[("e", start)];
     write(
@@ -838,26 +875,69 @@ fn an_unreadable_segment_is_unknown_not_absent() {
         ],
         1000,
     );
-    let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let recordings = ArchiveReader::from_catalog(
-        Box::new(Failing(
-            DendroCatalog::open(&path).unwrap(),
-            std::sync::Arc::clone(&failing),
-        )),
-        None,
-        BufferPool::new(64 << 20),
-        None,
-    )
-    .unwrap();
-    let reader = ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None);
-    failing.store(true, std::sync::atomic::Ordering::Relaxed);
-    let g = reader.process_groups().clone();
+    path
+}
+
+/// The notice for the fixtures' two sources when their rows cannot be told.
+fn unread() -> Vec<Notice> {
+    vec![Notice::RowsUnread {
+        epoch: "e".into(),
+        uuid_groups: [0, 1],
+    }]
+}
+
+/// A row check that cannot read the segment it needs leaves the pair
+/// unjoined and says so, rather than reporting that the sources share no
+/// row. Reads fail only after open, so only the grouping's read of the
+/// straddling segment fails.
+#[test]
+fn an_unreadable_segment_is_unknown_not_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = group_tampered(&straddle(dir.path()), Tamper::Fail);
     assert_eq!(groups(&g), vec![vec![0], vec![1]]);
-    assert_eq!(
-        g.notices,
-        vec![Notice::RowsUnread {
-            epoch: "e".into(),
-            uuid_groups: [0, 1],
-        }]
-    );
+    assert_eq!(g.notices, unread());
+}
+
+/// The same when the straddling segment is gone since open (retention).
+#[test]
+fn a_segment_gone_since_open_is_unknown_not_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = group_tampered(&straddle(dir.path()), Tamper::Gone);
+    assert_eq!(groups(&g), vec![vec![0], vec![1]]);
+    assert_eq!(g.notices, unread());
+}
+
+/// WAL rows sealed since open are no longer in the WAL, so not finding one
+/// there says nothing: the live fixture, whose short source lies between two
+/// rows of the long one, with the long one's oldest WAL row moved out.
+/// Untampered it gets the shared-no-row notice (`rows_in_the_live_wal_count`).
+#[test]
+fn wal_rows_sealed_since_open_are_unknown_not_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.dendro");
+    let start = at(10, 0);
+    let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
+    let mut add = |rows: &[u64]| {
+        let metadata = [("producer_epoch".to_string(), "e".to_string())].into();
+        let mut source = writer.add_source(BTreeMap::new(), metadata, BASE).unwrap();
+        let staged: Vec<_> = rows
+            .iter()
+            .map(|&ts| source.stage(&snapshot(ts), ts, 0).unwrap())
+            .collect();
+        (source, staged)
+    };
+    let (mut long, a) = add(&rows(start, start + 60 * S, S));
+    let (mut short, b) = add(&rows(start + 4050 * MS, start + 4950 * MS, 100 * MS));
+    for s in a.into_iter().chain(b) {
+        writer.commit(vec![s]).unwrap();
+    }
+    long.sync().unwrap();
+    short.sync().unwrap();
+    writer.join().unwrap();
+    std::mem::forget(long);
+    std::mem::forget(short);
+
+    let g = group_tampered(&path, Tamper::Sealed);
+    assert_eq!(groups(&g), vec![vec![0], vec![1]]);
+    assert_eq!(g.notices, unread());
 }

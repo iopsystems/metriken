@@ -219,7 +219,7 @@ pub struct Bridge {
     pub uuid_group: usize,
     /// One pair of uuid groups it bridges: each overlaps the bridge and not
     /// the other. Where their spans are disjoint, the earliest-ending and the
-    /// latest-starting group the bridge overlaps.
+    /// latest-starting group the bridge overlaps and can bridge (by its arm).
     pub between: [usize; 2],
 }
 
@@ -373,12 +373,14 @@ fn intersecting_pairs(hulls: &[Option<(u64, u64)>], mut visit: impl FnMut(usize,
 /// whether source `position` has a row with a timestamp in `[lo, hi]`:
 /// `Some(true)` or `Some(false)`, or `None` when it could not tell (a read
 /// failed, or the rows moved since the reader opened). A pair whose rows
-/// could not be told is left unjoined and reported as
-/// [`Notice::RowsUnread`].
+/// could not be told is left unjoined, and reported as
+/// [`Notice::RowsUnread`] unless either uuid group is a bridge or both end
+/// in one process group.
 ///
 /// Time is linear in the number of pairs of uuid groups whose spans
-/// intersect, and memory in the number of uuid groups, apart from the pairs
-/// that share an epoch without a row (kept for the notices).
+/// intersect, plus up to (uuid groups × pairs of one epoch without a shared
+/// row) for the bridge search those pairs need; memory is linear in the
+/// uuid groups plus those pairs, which are kept for the notices.
 pub fn form(
     sources: &[SourceInfo],
     has_row: &mut dyn FnMut(usize, u64, u64) -> Option<bool>,
@@ -481,9 +483,15 @@ pub fn form(
                         let Some(both) = intersect((a0, a1), (b0, b1)) else {
                             continue;
                         };
+                        // A row of each, as a three-valued AND: one source
+                        // known to have no row decides it whatever the other.
                         let row = match has_row(a, both.0, both.1) {
-                            Some(true) => has_row(b, both.0, both.1),
-                            other => other,
+                            Some(false) => Some(false),
+                            ra => match (ra, has_row(b, both.0, both.1)) {
+                                (_, Some(false)) => Some(false),
+                                (Some(true), Some(true)) => Some(true),
+                                _ => None,
+                            },
                         };
                         match row {
                             Some(true) => {
@@ -631,11 +639,22 @@ pub fn form(
         if a == b {
             return;
         }
+        // A pair checked again can answer differently (a live archive
+        // sealed or evicted rows between the sweeps); what it answers now is
+        // kept, so a pair left apart is still reported.
         let join = match forest.remove(&(i, j)) {
             Some(join) => Some(join),
             None => match relate(i, j) {
                 Relation::Join(join) => Some(join),
-                _ => None,
+                Relation::Plain => None,
+                Relation::Apart(miss) => {
+                    apart.push((i, j, miss));
+                    None
+                }
+                Relation::Unknown(e) => {
+                    unread.push((i, j, e));
+                    None
+                }
             },
         };
         if let Some(join) = join {
@@ -699,6 +718,9 @@ pub fn form(
         notices,
     }
 }
+
+#[cfg(test)]
+mod equiv_tests;
 
 #[cfg(test)]
 mod tests {
