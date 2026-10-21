@@ -471,6 +471,7 @@ fn rows_in_the_live_wal_count() {
     let g = open(&path).process_groups().clone();
     assert_eq!(groups(&g), vec![vec![0], vec![1]]);
     assert_eq!(g.notices.len(), 1);
+    assert!(matches!(g.notices[0], Notice::EpochWithoutSharedRow { .. }));
 }
 
 /// Case 4: agent A 09:00–18:00, B 09:00–10:00, C 17:00–18:00, no epochs, no

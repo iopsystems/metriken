@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and carries notices: copies whose `host` differs, two sources of one
   epoch whose spans intersect without a row of each, and pairs whose rows
   could not be read (a pair is known to share no row when either source is
-  known to have none in the intersection). The pure rules are `process::form`, over `SourceInfo`.
+  known to have none in the intersection). The pure rules are
+  `process::form`, over `SourceInfo`.
   Queries are unchanged: a process group's sources are still read as
   separate recordings, so a source and its copy still count twice until the
   per-source union lands.
@@ -48,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sources: 32 ms and 120 ms; peak RSS 14 MB for all of them,
   `tests/group_cost.rs` `form_scale`). The worst case is many sources of one
   epoch that intersect pairwise and share no row: nested spans with rows only
-  at their ends take 42 ms at 200 sources, 332 ms at 400 and 2.94 s at 800,
+  at their ends take 42 ms at 200 sources, 332 ms at 400 and 2.94 s at 800
+  with a row check that reads nothing (425 M checks at 800),
   with a notice per pair (`form_nested_apart`). Opening the 9.6 h
   single-source archive is unchanged (median 11.8 to 12.4 ms before, 12.0 to
   12.1 ms after, three sets of 11 opens each), and grouping 64 sources that
