@@ -1334,13 +1334,15 @@ not needed while each source keeps one cadence; S12 is done.
   `fix/local-spacing` on brayniac/metriken (44a5b0c, unmerged) took each
   bound from the spacing of the rows near the point, capped by the longest
   row gap the segments record in their footers. It was shelved for its cost
-  (on a 9.6 h archive, the batched `rate(x[1m])` path 9% slower and a gauge
-  over 600 s at a 0.1 s step 29%, 40 µs) and because reviews found that it
-  changed answers: for instant queries (a gauge held into a pause and past
-  its own last row, no instant `irate` at the end of a table with a pause),
-  for cross-cadence evaluation past a slow table's last row, and for a
-  range that crosses between segments. 44a5b0c fixed each of these after
-  review found it, and the risk of more was part of the reason. Reopens if
+  (on a 9.6 h archive at 44a5b0c, the batched `rate(x[1m])` path 6 to 9%
+  slower and a gauge over 600 s at a 0.1 s step 25 to 27%, about 37 µs) and
+  because reviews found that it changed answers: for instant queries (a
+  gauge held into a pause and past its own last row, no instant `irate` at
+  the end of a table with a pause), for cross-cadence evaluation past a slow
+  table's last row, and for a range that crosses between segments, all fixed
+  in 44a5b0c; and, found in review of 44a5b0c and not fixed, for a series
+  with too few samples to have a spacing of its own (a gauge with one sample
+  in a table that paused for 600 s was held for up to 600 s). Reopens if
   a single source changes cadence partway: a recorder whose interval
   changes during a recording, or, plausibly and not verified, a `.dendro`
   source spanning an agent restart after which the agent's snapshot TTL
