@@ -1390,9 +1390,9 @@ pub(crate) fn grid_rates(
     // series that can still return is left open: its points across the
     // silence interpolate to its next sample, as the per-series path's do,
     // so it holds back its own group's flush (and its unit's, in a union)
-    // until that sample arrives. A scan that does not
-    // say ends the series anyway; if it is then pushed a sample, the read
-    // returns `None` and the caller evaluates the query per series.
+    // until that sample arrives. A scan that does not say ends the series
+    // anyway; if it is then pushed a sample, the read returns `None` and the
+    // caller evaluates the query per series.
     let mut flush = match (&groups, request.display) {
         (Some((op, (glabels, _))), Some(display)) => {
             Some(GroupFlush::new(*op, glabels.len(), display))

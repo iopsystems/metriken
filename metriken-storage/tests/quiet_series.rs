@@ -25,13 +25,13 @@ const BASE: u64 = 1_700_000_000 * S;
 const ROWS: u64 = 2200;
 const RANGE: u64 = 2000;
 
-/// A series of `c`: its `g` label and the seconds it has no rows in.
 /// Group labels for generated series.
 const GROUPS: [&str; 20] = [
     "g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10", "g11", "g12", "g13", "g14",
     "g15", "g16", "g17", "g18", "g19",
 ];
 
+/// A series of `c`: its `g` label and the seconds it has no rows in.
 struct Series {
     g: &'static str,
     silent: Vec<(u64, u64)>,
