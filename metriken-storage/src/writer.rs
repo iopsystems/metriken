@@ -216,16 +216,15 @@ impl StreamDecoder {
 /// Which row type an encoded stream payload is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowForm {
-    /// A [`WalGroupRow`](crate::wal::WalGroupRow): six fields, seven when it
-    /// carries gauge histograms.
+    /// A [`WalGroupRow`](crate::wal::WalGroupRow): six fields.
     Group,
     /// A [`WalLongRow`]: four fields.
     Long,
 }
 
 /// The form of an encoded row, from the length of the msgpack array its
-/// struct is encoded as. `None` for a payload that is not an array of 6, 7
-/// or 4 elements.
+/// struct is encoded as. `None` for a payload that is not an array of 6 or 4
+/// elements.
 fn row_form(payload: &[u8]) -> Option<RowForm> {
     let len = match *payload.first()? {
         b @ 0x90..=0x9f => usize::from(b & 0x0f),
@@ -234,14 +233,13 @@ fn row_form(payload: &[u8]) -> Option<RowForm> {
         _ => return None,
     };
     match len {
-        GROUP_ROW_FIELDS | GROUP_ROW_FIELDS_WITH_GAUGE_HISTOGRAMS => Some(RowForm::Group),
+        GROUP_ROW_FIELDS => Some(RowForm::Group),
         LONG_ROW_FIELDS => Some(RowForm::Long),
         _ => None,
     }
 }
 
 const GROUP_ROW_FIELDS: usize = 6;
-const GROUP_ROW_FIELDS_WITH_GAUGE_HISTOGRAMS: usize = 7;
 const LONG_ROW_FIELDS: usize = 4;
 
 impl ArchiveWriter {
@@ -599,6 +597,9 @@ const WARN_ANCHOR: u8 = 2;
 const WARN_WIDTH: u8 = 4;
 /// An occupant arrived with a key no occupants row described.
 const WARN_LABELS: u8 = 8;
+/// Gauge histograms arrived in a group written long, which has no columns
+/// for them.
+const WARN_GAUGE_HISTOGRAMS: u8 = 16;
 
 impl GroupState {
     /// Whether warning `flag` is to be logged: true the first time only.
@@ -859,20 +860,22 @@ impl SourceRecorder {
         // The columns are taken before the dedup below: the producer sends
         // them once, and a row skipped as a repeat would otherwise lose them
         // for the rest of the connection.
-        // The long layout has no gauge histogram columns, and dropping the
-        // values would lose them without a word. A producer sends a group
+        // The long layout has no gauge histogram columns: their values are
+        // dropped, with a warning once per group, and the rest of the row is
+        // written, as the other cases a long row cannot be written are
+        // skipped rather than ending the recording. A producer sends a group
         // holding one wide (`GroupBuilder` never makes it long).
-        if row
+        if (row
             .schema
             .as_ref()
             .is_some_and(|s| !s.gauge_histograms.is_empty())
-            || row.occupants.iter().any(|o| !o.gauge_histograms.is_empty())
+            || row.occupants.iter().any(|o| !o.gauge_histograms.is_empty()))
+            && state.first_warning(WARN_GAUGE_HISTOGRAMS)
         {
-            return Err(format!(
-                "group {name}: a long row carries gauge histograms, which a long table \
-                 cannot hold; the producer must send the group wide"
-            )
-            .into());
+            tracing::warn!(
+                "group {name}: a long row carries gauge histograms, which a long table cannot \
+                 hold; their values are dropped (warned once)"
+            );
         }
         if let Some(schema) = &row.schema {
             if state.wire.as_ref().map(|(h, _)| *h) != Some(row.schema_hash) {
@@ -1192,17 +1195,18 @@ impl SourceRecorder {
         let gauge_histograms = match layout.as_ref() {
             Layout::Wide(s) => s.gauge_histograms.len(),
             // A group is made long on its first schema, which held no gauge
-            // histogram; one that gains one later cannot be written long,
-            // and is refused rather than written without it.
-            Layout::Long(_) if !g.gauge_histograms.is_empty() => {
-                return Err(format!(
-                    "group {}: gauge histograms arrived in a group written long, which a \
-                     long table cannot hold",
-                    g.name
-                )
-                .into());
+            // histogram; one that gains one later is written long without
+            // its gauge histogram values, warned once per group.
+            Layout::Long(_) => {
+                if !g.gauge_histograms.is_empty() && state.first_warning(WARN_GAUGE_HISTOGRAMS) {
+                    tracing::warn!(
+                        "group {}: gauge histograms arrived in a group written long, which \
+                         has no columns for them; their values are dropped (warned once)",
+                        g.name
+                    );
+                }
+                g.gauge_histograms.len()
             }
-            Layout::Long(_) => 0,
         };
         if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len())
             || gauge_histograms != g.gauge_histograms.len()

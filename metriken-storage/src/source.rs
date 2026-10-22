@@ -147,6 +147,24 @@ pub trait DataSource: Send + Sync {
         let _ = name;
         self.interval()
     }
+    /// Gauge histogram `name`'s rows as parts whose rows share one row
+    /// interval, each with that interval in seconds: a reader holds each
+    /// row for its own part's interval (or the step when longer), as
+    /// [`gauge_parts`](Self::gauge_parts) does for a gauge. A source joining
+    /// sources of different intervals (recordings, a process group's
+    /// sources) gives each its own part; series of the same labels in two
+    /// parts are one series. The default is one part at
+    /// [`gauge_histogram_interval`](Self::gauge_histogram_interval).
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let stream = self.gauge_histogram_stream(name, filter, start_ns, end_ns)?;
+        Some(vec![(stream, self.gauge_histogram_interval(name))])
+    }
     /// Sampling interval in seconds.
     fn interval(&self) -> f64;
     /// The row spacing, in seconds, of the table holding histogram `name`,

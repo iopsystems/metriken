@@ -244,12 +244,13 @@ fn write_histogram(
 /// are a `gauge` family `<name>{quantile=..}` rather than a `summary`, whose
 /// `_count` and `_sum` would be counters.
 ///
-/// `_gsum` counts each item at its bucket's upper edge, as this renderer's
-/// counting `_sum` does, so the two kinds' sums mean the same thing in one
-/// scrape. It is the upper end of the query engine's `histogram_sum` band
-/// (`[Σ count·start, Σ count·end]`), whose nominal value is the midpoint
-/// sum: a bucketed value is known only to its bucket, and the text format
-/// has room for one number.
+/// `_gsum` values each item as this renderer's counting `_sum` does in the
+/// same mode: at its bucket's upper edge in the full-bucket mode, and at the
+/// bucket's midpoint (rounded down) in the percentile mode, so a gauge and a
+/// counting histogram's sums mean the same thing in one scrape. The query
+/// engine's `histogram_sum` reports the midpoint sum with the band
+/// `[Σ count·start, Σ count·end]`, whose upper end is the full-bucket mode's
+/// `_gsum`.
 fn write_gauge_histogram(
     output: &mut String,
     name: &str,
@@ -257,13 +258,19 @@ fn write_gauge_histogram(
     metric: &MetricEntry,
     options: &PrometheusOptions,
 ) {
+    let summary = !options.percentiles.is_empty();
     let mut count: u64 = 0;
     let mut sum: u128 = 0;
     for bucket in snapshot {
         count += bucket.count();
-        sum += bucket.count() as u128 * bucket.end() as u128;
+        let value = if summary {
+            (bucket.start() as u128 + bucket.end() as u128) / 2
+        } else {
+            bucket.end() as u128
+        };
+        sum += bucket.count() as u128 * value;
     }
-    if !options.percentiles.is_empty() {
+    if summary {
         write_type_help(output, name, "gauge", metric, options);
         if let Ok(Some(results)) =
             histogram::SampleQuantiles::quantiles(snapshot, &options.percentiles)

@@ -132,12 +132,36 @@ fn a_gauge_histogram_is_recorded_off_the_stream() {
     }
 }
 
+/// `depth`'s points in the archive at `path`, one recording.
+fn depth_points(path: &std::path::Path, ticks: u64) -> Vec<f64> {
+    let mut recordings = ArchiveReader::from_catalog(
+        Box::new(DendroCatalog::open(path).unwrap()),
+        None,
+        BufferPool::new(16 << 20),
+        None,
+    )
+    .unwrap();
+    let reader = recordings.remove(0).1;
+    assert!(ArchiveReader::gauge_histogram_names(&reader).is_empty());
+    let start = BASE as f64 / 1e9;
+    let QueryResult::Matrix { result } = reader
+        .query_range("depth", start, start + (ticks - 1) as f64, 1.0)
+        .unwrap()
+    else {
+        panic!("a matrix")
+    };
+    result[0].values.iter().map(|p| p.1).collect()
+}
+
 /// A long row carrying gauge histograms (which `GroupBuilder` never sends:
-/// a group holding one goes wide) is refused with an error naming the
-/// group, not written without them.
+/// a group holding one goes wide) is written without their values, with a
+/// warning once per group, rather than ending the recording: a long table
+/// has no gauge histogram columns. The row's other values are written.
 #[test]
-fn a_long_row_with_gauge_histograms_is_refused() {
+fn a_long_row_with_gauge_histograms_drops_them() {
+    use metriken_storage::occupants::Occupant;
     use metriken_storage::wal::{LongOccupant, WalLongRow};
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("long.dendro");
     let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
@@ -148,65 +172,67 @@ fn a_long_row_with_gauge_histograms_is_refused() {
             BASE,
         )
         .unwrap();
-    let row = |gauge: bool| WalLongRow {
-        schema_hash: (1, 2),
-        schema: Some(metriken_exposition::GroupSchema {
+    // Tick 0: an occupant with a gauge histogram value. Tick 1: columns that
+    // name a gauge histogram, no value. Tick 2: neither.
+    let row = |t: u64| {
+        let mut schema = metriken_exposition::GroupSchema {
             gauges: vec![metriken_exposition::MetricDesc {
                 name: "0".to_string(),
                 metadata: [("metric".to_string(), "depth".to_string())].into(),
             }],
             ..Default::default()
-        }),
-        window: None,
-        occupants: vec![LongOccupant {
-            occupant: 0,
-            counters: Vec::new(),
-            gauges: vec![Some(1)],
-            histograms: Vec::new(),
-            gauge_histograms: if gauge {
-                vec![Some((0, 8, vec![0; 9]))]
-            } else {
-                Vec::new()
-            },
-        }],
-    };
-    let long = |gauge: bool| {
-        vec![StreamedGroup::Long {
-            name: "t/queues".to_string(),
-            row: row(gauge),
-        }]
-    };
-    let err = source.stage_streamed(long(true), BASE, 0).err().unwrap();
-    assert!(err.to_string().contains("group t/queues"), "{err}");
-    assert!(err.to_string().contains("gauge histograms"), "{err}");
-    // Columns that name a gauge histogram, with no value this row.
-    let mut described = row(false);
-    described.schema.as_mut().unwrap().gauge_histograms = vec![metriken_exposition::MetricDesc {
-        name: "1".to_string(),
-        metadata: [("metric".to_string(), "free".to_string())].into(),
-    }];
-    let err = source
-        .stage_streamed(
-            vec![StreamedGroup::Long {
-                name: "t/queues".to_string(),
-                row: described,
+        };
+        if t == 1 {
+            schema.gauge_histograms = vec![metriken_exposition::MetricDesc {
+                name: "1".to_string(),
+                metadata: [("metric".to_string(), "free".to_string())].into(),
+            }];
+        }
+        WalLongRow {
+            schema_hash: (1, t),
+            schema: Some(schema),
+            window: None,
+            occupants: vec![LongOccupant {
+                occupant: 7,
+                counters: Vec::new(),
+                gauges: vec![Some(t as i64 + 1)],
+                histograms: Vec::new(),
+                gauge_histograms: if t == 0 {
+                    vec![Some((0, 8, vec![0; 9]))]
+                } else {
+                    Vec::new()
+                },
             }],
-            BASE,
-            0,
-        )
-        .err()
-        .unwrap();
-    assert!(err.to_string().contains("group t/queues"), "{err}");
-    // The same row without them is staged.
-    let staged = source.stage_streamed(long(false), BASE + S, 0).unwrap();
-    writer.commit(vec![staged]).unwrap();
+        }
+    };
+    for t in 0..3u64 {
+        let mut groups = Vec::new();
+        if t == 0 {
+            groups.push(StreamedGroup::Occupants {
+                table: "t/queues".to_string(),
+                occupants: vec![Occupant {
+                    occupant: 7,
+                    labels: [("id".to_string(), "0".to_string())].into(),
+                }],
+            });
+        }
+        groups.push(StreamedGroup::Long {
+            name: "t/queues".to_string(),
+            row: row(t),
+        });
+        let staged = source.stage_streamed(groups, BASE + t * S, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+    }
+    source.finalize((BASE + 2 * S, 0)).unwrap();
+    writer.join().unwrap();
+    assert_eq!(depth_points(&path, 3), [1.0, 2.0, 3.0]);
 }
 
 /// A group the writer made long (its first schema was slotted and held no
-/// gauge histogram) that later carries one is refused, not written without
-/// it.
+/// gauge histogram) that later carries one is written long without the
+/// gauge histogram's values, warned once, rather than ending the recording.
 #[test]
-fn a_long_written_group_that_gains_a_gauge_histogram_is_refused() {
+fn a_long_written_group_that_gains_a_gauge_histogram_drops_it() {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
@@ -256,7 +282,7 @@ fn a_long_written_group_that_gains_a_gauge_histogram_is_refused() {
                 schema: Some(Arc::new(schema)),
                 window: None,
                 counters: Vec::new(),
-                gauges: vec![Some(1)],
+                gauges: vec![Some(t as i64 + 1)],
                 histograms: Vec::new(),
                 gauge_histograms: if gauge {
                     vec![Some(histogram::Histogram::new(0, 8).unwrap())]
@@ -266,9 +292,11 @@ fn a_long_written_group_that_gains_a_gauge_histogram_is_refused() {
             }],
         })
     };
-    let staged = source.stage(&snapshot(0, false), BASE, 0).unwrap();
-    writer.commit(vec![staged]).unwrap();
-    let err = source.stage(&snapshot(1, true), BASE + S, 0).err().unwrap();
-    assert!(err.to_string().contains("group t/queues"), "{err}");
-    assert!(err.to_string().contains("written long"), "{err}");
+    for t in 0..3u64 {
+        let staged = source.stage(&snapshot(t, t > 0), BASE + t * S, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+    }
+    source.finalize((BASE + 2 * S, 0)).unwrap();
+    writer.join().unwrap();
+    assert_eq!(depth_points(&path, 3), [1.0, 2.0, 3.0]);
 }

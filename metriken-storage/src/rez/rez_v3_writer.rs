@@ -3716,6 +3716,61 @@ mod tests {
             );
         }
 
+        /// A V3 group's gauge histogram reaches the `.rez` segment as a
+        /// `gauge_histogram` column in a format 2 segment, through the same
+        /// WAL rows and `materialize_wal_tail` a `.dendro` uses.
+        #[test]
+        fn v3_group_gauge_histogram_reaches_the_segment() {
+            use parquet::file::reader::FileReader;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("out.rez");
+            let (_archive, mut rec, rid) = recorder(&path, seals_immediately());
+            let schema = GroupSchema {
+                gauge_histograms: vec![MetricDesc {
+                    name: "7".to_string(),
+                    metadata: [("metric".to_string(), "free".to_string())].into(),
+                }],
+                ..Default::default()
+            };
+            let mut h = histogram::Histogram::new(0, 8).unwrap();
+            h.as_mut_slice()[1] = 3;
+            let g = GroupSnapshot {
+                name: "ext4/free".to_string(),
+                schema_hash: schema.hash(),
+                schema: Some(std::sync::Arc::new(schema)),
+                window: None,
+                counters: Vec::new(),
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+                gauge_histograms: vec![Some(h)],
+            };
+            let ts = 1_000_000_000u64;
+            rec.ingest(&v3_snap(ts, vec![g]), ts, 0).unwrap();
+            rec.maybe_seal().unwrap();
+            rec.sync().unwrap();
+            let db = RezDb::open(&path).unwrap();
+            let segs = db.read_segments(rid, "ext4/free").unwrap();
+            assert_eq!(segs.len(), 1);
+            let file = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(
+                segs[0].bytes.clone(),
+            ))
+            .unwrap();
+            let kv = file
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .cloned()
+                .unwrap_or_default();
+            assert!(kv
+                .iter()
+                .any(|e| e.key == crate::format::FORMAT_KEY && e.value.as_deref() == Some("2")));
+            let table =
+                crate::rez::rez::read_table_parquet("ext4/free".to_string(), segs[0].bytes.clone())
+                    .unwrap();
+            let col = table.columns.iter().find(|c| c.name == "7").unwrap();
+            assert_eq!(col.metadata["metric_type"], "gauge_histogram");
+        }
+
         #[test]
         fn window_advance_dedup_skips_an_unchanged_group() {
             let dir = tempfile::tempdir().unwrap();

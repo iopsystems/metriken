@@ -202,6 +202,23 @@ impl DataSource for RecordingsSource {
         )
     }
 
+    /// Each recording's parts, at its own intervals.
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let parts: Vec<(HistogramStream, f64)> = self
+            .children
+            .iter()
+            .filter_map(|c| c.gauge_histogram_parts(name, filter, start_ns, end_ns))
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then_some(parts)
+    }
+
     /// The longest of the intervals of the recordings holding `name`.
     fn gauge_histogram_interval(&self, name: &str) -> f64 {
         self.children

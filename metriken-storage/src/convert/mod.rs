@@ -6,10 +6,11 @@
 //! [`ArchiveWriter`] a recorder uses.
 //!
 //! This replaced `MsgpackToParquet`, which wrote one standalone parquet file.
-//! metriken writes no standalone parquet: a parquet file carries no format
-//! version a reader checks, so a reader from before a new column kind (a
-//! gauge histogram) would read the new kind with nothing to stop it. An
-//! archive's segments carry `metriken.format`, which those readers check.
+//! metriken writes no standalone parquet. A standalone file is opened by
+//! readers that do not check its `metriken.format` key (pyarrow, DuckDB, a
+//! script over its columns), so nothing stops one of them reading a new
+//! column kind (a gauge histogram) as the kind it knows; an archive is read
+//! through metriken's readers, which refuse a format newer than theirs.
 //! Parquet files written before keep reading (`parquet`, `MultiParquetSource`,
 //! and metriken-query's `ParquetReader`).
 
@@ -83,10 +84,33 @@ impl MsgpackToArchive {
     }
 
     /// Convert concatenated msgpack snapshots read from `reader` into a new
-    /// archive at `output`. A snapshot that does not decode ends the
-    /// conversion with an error naming its position; an input with no
-    /// snapshot is an error, and no archive is created.
+    /// archive at `output`.
+    ///
+    /// The source's metadata is the first snapshot metadata that is not
+    /// empty (the producer's `version`, `sampling_interval_ms`,
+    /// `producer_epoch` and the like), with the entries given to
+    /// [`metadata`](Self::metadata) replacing those of the same key.
+    ///
+    /// An input with no snapshot is an error, and no archive is created. A
+    /// snapshot that does not decode, or a write that fails, ends the
+    /// conversion with an error naming the snapshot's position, and the
+    /// archive written so far is removed, so `output` holds a finished
+    /// archive or nothing.
     pub fn convert_reader(self, reader: impl Read, output: impl AsRef<Path>) -> Result<u64, Error> {
+        let output = output.as_ref();
+        let existed = output.exists();
+        let result = self.convert_into(reader, output);
+        if result.is_err() && !existed {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let mut path = output.as_os_str().to_owned();
+                path.push(suffix);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        result
+    }
+
+    fn convert_into(self, reader: impl Read, output: &Path) -> Result<u64, Error> {
         let mut reader = BufReader::new(reader);
         let mut next = |index: u64| -> Result<Option<Snapshot>, Error> {
             if reader.fill_buf()?.is_empty() {
@@ -102,15 +126,32 @@ impl MsgpackToArchive {
         let ts = |s: &Snapshot| -> Result<u64, Error> {
             Ok(s.systemtime().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
         };
-        let mut writer = ArchiveWriter::create(output.as_ref(), self.config)?;
-        let mut source = writer.add_source(self.labels, self.metadata, ts(&first)?)?;
+        let mut writer = ArchiveWriter::create(output, self.config)?;
+        let mut source = writer.add_source(self.labels, self.metadata.clone(), ts(&first)?)?;
+        let mut carried = false;
         let mut written = 0u64;
         let mut last = 0u64;
         let mut snapshot = Some(first);
         while let Some(s) = snapshot {
+            if !carried {
+                let found = snapshot_metadata(&s);
+                if !found.is_empty() {
+                    let patch: BTreeMap<String, String> = found
+                        .iter()
+                        .filter(|(k, _)| !self.metadata.contains_key(*k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    if !patch.is_empty() {
+                        source.update_metadata(patch)?;
+                    }
+                    carried = true;
+                }
+            }
             let at = ts(&s)?;
             last = last.max(at);
-            let staged = source.stage(&s, at, 0)?;
+            let staged = source
+                .stage(&s, at, 0)
+                .map_err(|e| format!("snapshot {written}: {e}"))?;
             writer.commit(vec![staged])?;
             source.maybe_seal()?;
             written += 1;
@@ -119,5 +160,14 @@ impl MsgpackToArchive {
         source.finalize((last, 0))?;
         writer.join()?;
         Ok(written)
+    }
+}
+
+/// A snapshot's metadata, any version.
+fn snapshot_metadata(s: &Snapshot) -> &std::collections::HashMap<String, String> {
+    match s {
+        Snapshot::V1(s) => &s.metadata,
+        Snapshot::V2(s) => &s.metadata,
+        Snapshot::V3(s) => &s.metadata,
     }
 }

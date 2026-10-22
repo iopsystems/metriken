@@ -97,23 +97,31 @@ pub(crate) fn reads_gauge_histogram(
 }
 
 /// Gauge histogram `name`'s rows for evaluation from `start_ns` (snapped as
-/// the gauge grid is) to `end_ns` at `step_ns`, with the times to evaluate
-/// at and the staleness: the step, or the metric's row interval when that
-/// is longer. `None` when nothing is read.
+/// the gauge grid is) to `end_ns` at `step_ns`, as parts each with its
+/// staleness (the step, or the part's row interval when that is longer),
+/// and the times to evaluate at. `None` when nothing is read.
 pub(crate) fn read_gauge_histogram(
     source: &dyn DataSource,
     name: &str,
     filter: &Labels,
     (start_ns, end_ns, step_ns): (u64, u64, u64),
     eval: Option<&[u64]>,
-) -> Option<(crate::histogram_stream::HistogramStream, Vec<u64>, u64)> {
+) -> Option<(Vec<streaming::gauge_histogram::Part>, Vec<u64>)> {
     let times = streaming::gauge_histogram::times(start_ns, end_ns, step_ns, eval);
     let (first, last) = (*times.first()?, *times.last()?);
-    let interval_ns = (source.gauge_histogram_interval(name).max(0.0) * 1e9) as u64;
-    let staleness_ns = step_ns.max(interval_ns);
-    let stream =
-        source.gauge_histogram_stream(name, filter, first.saturating_sub(staleness_ns), last)?;
-    Some((stream, times, staleness_ns))
+    // Read back far enough for the longest hold among the parts; each part
+    // then holds its rows for its own interval.
+    let longest_ns = (source.gauge_histogram_interval(name).max(0.0) * 1e9) as u64;
+    let from = first.saturating_sub(step_ns.max(longest_ns));
+    let parts = source
+        .gauge_histogram_parts(name, filter, from, last)?
+        .into_iter()
+        .map(|(stream, interval_s)| {
+            let staleness_ns = step_ns.max((interval_s.max(0.0) * 1e9) as u64);
+            (stream, staleness_ns)
+        })
+        .collect();
+    Some((parts, times))
 }
 
 /// A range's `(start_ns, end_ns, step_ns)` as the gauge grid lays it: the
@@ -1165,7 +1173,7 @@ impl QueryEngine {
                 grid,
                 opts.eval_timestamps.as_deref(),
             );
-            let Some((stream, times, staleness_ns)) = read else {
+            let Some((parts, times)) = read else {
                 nothing_read(
                     self.source.as_ref(),
                     &metric_name,
@@ -1173,13 +1181,8 @@ impl QueryEngine {
                 )?;
                 return Ok(QueryResult::Matrix { result: vec![] });
             };
-            let result = streaming::gauge_histogram::quantiles(
-                stream,
-                &quantiles,
-                &times,
-                staleness_ns,
-                &metric_name,
-            );
+            let result =
+                streaming::gauge_histogram::quantiles(parts, &quantiles, &times, &metric_name);
             return Ok(QueryResult::Matrix { result });
         }
 
@@ -1237,7 +1240,7 @@ impl QueryEngine {
                 grid,
                 opts.eval_timestamps.as_deref(),
             );
-            let Some((stream, times, staleness_ns)) = read else {
+            let Some((parts, times)) = read else {
                 nothing_read(
                     self.source.as_ref(),
                     &metric_name,
@@ -1245,12 +1248,10 @@ impl QueryEngine {
                 )?;
                 return Ok(QueryResult::Matrix { result: vec![] });
             };
-            return Ok(
-                match streaming::gauge_histogram::heatmap(stream, &times, staleness_ns) {
-                    Some(result) => QueryResult::HistogramHeatmap { result },
-                    None => QueryResult::Matrix { result: vec![] },
-                },
-            );
+            return Ok(match streaming::gauge_histogram::heatmap(parts, &times) {
+                Some(result) => QueryResult::HistogramHeatmap { result },
+                None => QueryResult::Matrix { result: vec![] },
+            });
         }
 
         let start_ns = range_read_start_ns(start);
@@ -1345,7 +1346,7 @@ impl QueryEngine {
                 grid,
                 opts.eval_timestamps.as_deref(),
             );
-            let Some((stream, times, staleness_ns)) = read else {
+            let Some((parts, times)) = read else {
                 nothing_read(
                     self.source.as_ref(),
                     &metric_name,
@@ -1359,11 +1360,10 @@ impl QueryEngine {
                 _ => streaming::gauge_histogram::Reduce::Count,
             };
             let result = streaming::gauge_histogram::reduce(
-                stream,
+                parts,
                 reduce,
                 group_by.as_ref(),
                 &times,
-                staleness_ns,
                 &metric_name,
             );
             return Ok(QueryResult::Matrix { result });

@@ -160,7 +160,8 @@ fn prometheus_text_writes_a_gauge_histogram_as_gauges() {
             "# TYPE gh_free_extents_gcount gauge",
             "gh_free_extents_gcount 6",
             "# TYPE gh_free_extents_gsum gauge",
-            "gh_free_extents_gsum 16",
+            // Midpoints, as the summary's `_sum`: 3·1 + 2·2 + 1·5.
+            "gh_free_extents_gsum 12",
         ],
         "{body}"
     );

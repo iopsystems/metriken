@@ -767,6 +767,25 @@ mod table_sampler_tests {
 /// when the label is absent). Shared by the in-memory `RezRecorder` and the
 /// streaming `StreamRecorder` so the two ingest paths cannot drift apart.
 pub fn group_by_sampler(snapshot: &Snapshot) -> BTreeMap<&str, Vec<Entry<'_>>> {
+    let gauge_histograms = match snapshot {
+        Snapshot::V1(s) => s.gauge_histograms.len(),
+        Snapshot::V2(s) => s.gauge_histograms.len(),
+        Snapshot::V3(_) => 0,
+    };
+    if gauge_histograms > 0 {
+        // A V1/V2 `.rez` table has no gauge histogram cells (`Entry` has no
+        // such kind), so they are left out, said once per process. The v3
+        // writer's V3 path (`ingest_v3`) records a group's gauge histograms.
+        static WARNED_GAUGE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !WARNED_GAUGE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "a V1/V2 snapshot holds {gauge_histograms} gauge histogram(s), which a `.rez` \
+                 table of V1/V2 entries cannot hold; they are not recorded (warned once). \
+                 Record to `.dendro`, or from V3 snapshots, to keep them"
+            );
+        }
+    }
     let (counters, gauges, histograms) = match snapshot {
         Snapshot::V1(s) => (&s.counters, &s.gauges, &s.histograms),
         Snapshot::V2(s) => (&s.counters, &s.gauges, &s.histograms),

@@ -246,7 +246,11 @@ fn v2_snapshot(t: u64) -> Snapshot {
     Snapshot::V2(SnapshotV2 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
         duration: Duration::from_millis(1),
-        metadata: HashMap::new(),
+        metadata: [
+            ("version".to_string(), "9.9.9".to_string()),
+            ("producer_epoch".to_string(), "epoch-a".to_string()),
+        ]
+        .into(),
         counters: Vec::new(),
         gauges: Vec::new(),
         histograms: vec![entry("8", "io_latency")],
@@ -270,9 +274,19 @@ fn convert_writes_a_gauge_histogram_to_an_archive() {
     let path = dir.path().join("converted.dendro");
     let written = MsgpackToArchive::new()
         .label("source", "raw")
-        .convert_reader(std::io::Cursor::new(msgpack), &path)
+        .metadata("version", "given")
+        .convert_reader(std::io::Cursor::new(msgpack.clone()), &path)
         .unwrap();
     assert_eq!(written, 3);
+    // The snapshots' metadata is the source's, the caller's entries first.
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let meta = catalog.sources().unwrap().remove(0).metadata;
+    assert_eq!(meta.get("version").map(String::as_str), Some("given"));
+    assert_eq!(
+        meta.get("producer_epoch").map(String::as_str),
+        Some("epoch-a")
+    );
+    drop(catalog);
     let reader = open(&path);
     assert_eq!(reader.gauge_histogram_names(), ["free_extents"]);
     assert_eq!(reader.histogram_names(), ["io_latency"]);
@@ -296,6 +310,16 @@ fn convert_writes_a_gauge_histogram_to_an_archive() {
         .convert_reader(std::io::Cursor::new(Vec::new()), &empty)
         .is_err());
     assert!(!empty.exists());
+    // A snapshot that does not decode, after some that do: an error naming
+    // it, and no partial archive.
+    let mut broken = msgpack;
+    broken.extend([0xc1, 0x00]);
+    let partial = dir.path().join("partial.dendro");
+    let err = MsgpackToArchive::new()
+        .convert_reader(std::io::Cursor::new(broken), &partial)
+        .unwrap_err();
+    assert!(err.to_string().contains("snapshot 3"), "{err}");
+    assert!(!partial.exists());
 }
 
 /// A V2 snapshot's `gauge_histograms` entry (what `Snapshotter` writes for
@@ -655,4 +679,85 @@ fn a_group_reads_its_coarse_source_after_the_fine_one_ends() {
         })
         .collect();
     assert_eq!(got[0], want);
+}
+
+/// An archive of one producer epoch, one source per `ticks` list (so the
+/// sources form one process group), each row holding gauge histogram
+/// `free` with `t + 1` items and gauge `g` = `t + 1`.
+fn write_group(path: &Path, sources: &[Vec<u64>]) {
+    let mut writer = ArchiveWriter::create(path, WriterConfig::default()).unwrap();
+    for ticks in sources {
+        let mut source = writer
+            .add_source(
+                [("source".to_string(), "agent".to_string())].into(),
+                [("producer_epoch".to_string(), "e1".to_string())].into(),
+                BASE,
+            )
+            .unwrap();
+        let mut last = BASE;
+        for &t in ticks {
+            let ts = BASE + t * S;
+            last = ts;
+            let mut h = histogram::Histogram::new(0, 16).unwrap();
+            h.as_mut_slice()[1] = t + 1;
+            let md = |metric: &str, histogram: bool| -> HashMap<String, String> {
+                let mut m: HashMap<String, String> = [("metric", metric), ("sampler", "ext4")]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                if histogram {
+                    m.insert("grouping_power".to_string(), "0".to_string());
+                    m.insert("max_value_power".to_string(), "16".to_string());
+                }
+                m
+            };
+            let snap = Snapshot::V2(SnapshotV2 {
+                systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+                duration: Duration::from_millis(1),
+                metadata: HashMap::new(),
+                counters: Vec::new(),
+                gauges: vec![metriken_exposition::Gauge::new(
+                    "8".to_string(),
+                    t as i64 + 1,
+                    md("g", false),
+                )],
+                histograms: Vec::new(),
+                gauge_histograms: vec![metriken_exposition::Histogram::new(
+                    "7".to_string(),
+                    h,
+                    md("free", true),
+                )],
+            });
+            let staged = source.stage(&snap, ts, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+        }
+        source.finalize((last, 0)).unwrap();
+    }
+    writer.join().unwrap();
+}
+
+/// The reviewer's probe: a fine source (1 s) with a gap from 20 to 28 s
+/// and a coarse one (10 s) holding only 40 to 60 s, one process group. A
+/// fine row is held for the fine source's 1 s, not the coarse source's
+/// 10 s, so in the gap there is no point, as there is none for the gauge
+/// `g` beside it.
+#[test]
+fn a_group_holds_each_row_for_its_own_sources_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.dendro");
+    let fine: Vec<u64> = (0..=19).chain(29..=60).collect();
+    let coarse: Vec<u64> = (40..=60).step_by(10).collect();
+    write_group(&path, &[fine, coarse]);
+    let reader = open_flat(&path);
+    let times = |q: &str| -> Vec<i64> {
+        let got = query_matrix(&reader, q, 0, 60, 1.0);
+        assert_eq!(got.len(), 1, "{q}: {got:?}");
+        got[0]
+            .iter()
+            .map(|(t, _)| (t - BASE as f64 / 1e9).round() as i64)
+            .collect()
+    };
+    let want: Vec<i64> = (0..=20).chain(29..=60).collect();
+    assert_eq!(times("histogram_count(free)"), want);
+    assert_eq!(times("g"), want);
 }

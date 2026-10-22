@@ -133,9 +133,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (defaulted to empty; `label_values` includes them), implemented by every
   reader here, and `MemoryStore` gains `insert_gauge_histogram_series`,
   with `ingest_snapshot` storing a snapshot's `gauge_histograms` as gauge
-  histograms. Within a process group, a gauge histogram is the
-  merge of every source's rows read as the latest row at each step, so a
-  source and its copy count once.
+  histograms. Within a process group (and across recordings), each
+  source's rows are held for that source's own interval and a series
+  several sources hold is one series, answered by the latest of its rows
+  still held, so a source and its copy count once.
 - **Changed:** takes metriken-model 0.2 (`gauge_histograms` fields on the
   snapshot types `MemoryStore::ingest_snapshot` takes). Parquet files and
   archives written by earlier releases, whose counting histograms say
@@ -183,6 +184,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching) instead of reading the state as counts.
   `Snapshot::histograms` returns the counting histograms only;
   `Snapshot::gauge_histograms` returns the others.
+  This break is deliberate: recording is mostly local, so a producer and
+  its recorder are upgraded together. An older recorder (metriken-recorder
+  0.4.0, and `rezolus record` and hindsight, which record through it)
+  connected to a producer that emits a gauge histogram ends the whole
+  recording on the first frame holding one: `StreamDecoder::decode` refuses
+  the row, and the recorder fails, aborting every endpoint's task and
+  dropping the archive. Reconnecting does not help. Upgrade producers and
+  recorders together.
 - **Added:** `METRIC_TYPE` (`"metric_type"`), `COUNTER_HISTOGRAM`
   (`"counter_histogram"`), `GAUGE_HISTOGRAM` (`"gauge_histogram"`),
   `LEGACY_HISTOGRAM` (`"histogram"`, the counting kind's string before
@@ -290,7 +299,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a lazy child's. `ArchiveReader` gains `gauge_histogram_names`,
   `gauge_histogram_labels` and `SamplerReader::holds_gauge_histogram`;
   `Memory` gains `push_gauge_histogram_series` and, with `ingest`,
-  `upsert_gauge_histogram_sample`.
+  `upsert_gauge_histogram_sample`. `DataSource::gauge_histogram_parts`
+  gives a read as parts of one row interval each, defaulting to one part.
+  `StreamDecoder::decode` keeps a group row's gauge histogram slots. A long
+  table has no gauge histogram columns: a long row carrying gauge
+  histograms, or a group written long that gains one, is written without
+  their values, with a warning once per group. A `.rez` written from V1/V2
+  snapshots leaves their gauge histograms out, with a warning once per
+  process; the `.rez` v3 writer's V3 path records them.
 - **Added:** segment format 2. A segment holding a gauge histogram column is
   written with `metriken.format = 2`, which readers from 0.3.0 to 0.4.0
   refuse: opening such an archive with metriken-storage 0.4.0 fails with
@@ -310,7 +326,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists write `counter_histogram`, replacing any `metric_type` the
   producer's metadata carried. A group holding a gauge histogram is written
   wide.
-- **Changed:** new segments and parquet files name the counting histogram
+- **Changed:** new segments name the counting histogram
   `metric_type = counter_histogram` (was `histogram`). Readers take
   `histogram`, `counter_histogram` and an absent `metric_type` as counting
   (`metriken_model::is_counter_histogram`), so every archive and file
@@ -325,16 +341,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `convert_file_path`, `convert_reader`) through `ArchiveWriter`, and the
   `convert` feature now turns on `write`. `MsgpackToParquet`,
   `ParquetOptions`, `ParquetCompression`, `ParquetHistogramType` (with the
-  sparse layout), `ParquetSchema` and `ParquetWriter` are removed. A parquet
-  file carries no format version its readers check, so a reader from
-  before a column kind would read a new kind with nothing to stop it; an
-  archive's segments do. Parquet files written before are read as they
-  were.
-- **Fixed:** `StreamDecoder::decode` keeps a group row's gauge histogram
-  slots; a group row carrying gauge histograms (seven fields) is decoded
-  as a group row. A long row, or a group written long, that carries gauge
-  histograms is refused with an error naming the group, since a long table
-  cannot hold them.
+  sparse layout), `ParquetSchema` and `ParquetWriter` are removed. A
+  standalone parquet file is opened by readers that do not check
+  `metriken.format` (pyarrow, DuckDB, scripts), which nothing stops reading
+  a new column kind as one they know; an archive is read through metriken's
+  readers, which refuse a newer format. `MsgpackToArchive` carries the first
+  non-empty snapshot metadata into the source's metadata (the caller's
+  entries first) and removes a partial archive when the conversion fails.
+  Parquet files written before are read as they were.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in
   one coarser bucket had their cumulative counts summed, so 3 observations

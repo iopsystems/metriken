@@ -225,9 +225,12 @@ Reading:
   parquet stays. metriken-query's `fixtures` feature still writes parquet
   in the legacy layout (`metric_type = histogram`, no gauge histograms), to
   test reading it.
-- `.rez` writers (`RezStream`, the v3 writer) take a snapshot's counting
-  histograms only, so a gauge histogram is left out of a `.rez`; nothing in
-  6.0 writes `.rez`.
+- `.rez`: `record -o out.rez` and a hindsight `.rez` buffer still write
+  one. The `.rez` v3 writer's V3 path records a group's gauge histograms (a
+  `gauge_histogram` column in a format 2 segment, through the same WAL rows
+  and `materialize_wal_tail`); a `.rez` written from V1/V2 snapshots
+  (`RezStream`, the v3 writer's flat path) leaves them out, warning once
+  per process (`rez::group_by_sampler`).
 
 ### Query semantics (metriken-query)
 
@@ -267,13 +270,15 @@ Per-source union (S9 of
 S9 exists because a value computed from rows of two sources (a rate across a
 junction) is wrong; a gauge histogram's value is one row, so no combination
 of sources can produce that error. A process group's gauge histogram is
-therefore the merge of every source's rows (`GroupSource::gauge_histogram_stream`,
-`HistogramStream::merge`, which makes a series held by several sources one
-series), read as the latest row at each step. A source and its copy count
-once. This differs from S9's rule for a gauge in one case: where two sources
-both hold a row in the staleness window, the later row answers rather than
-the finer source's. Both are readings of the same state; the later one is the
-more recent.
+read as one part per source (`GroupSource::gauge_histogram_parts`), each
+source's rows held for that source's own interval (or the step), and a
+series several sources hold is one series, answered at each step by the
+latest of its rows still held. A source and its copy count once; a fine
+source's row is not held into a gap past its own interval (as a gauge's is
+not), and a coarse source's rows answer after a fine one ends. This differs
+from S9's rule for a gauge in one case: where two sources both hold a row,
+the later row answers rather than the finer source's. Both are readings of
+the same state; the later one is the more recent.
 
 ### Grouping power 0
 
@@ -294,9 +299,12 @@ writes it with `GaugeHistogram::set_with_window` (the window brackets the
 read) into a dynamic metric per device, labelled `device`. The sampler sits
 in its own acquisition group, so only that table's segments are format 2.
 It belongs in a separate rezolus PR after these crates are released, with
-its own sampler review (`docs/principles.md`); rezolus ships agent, recorder
-and viewer in one binary, so a fleet on one rezolus release has no old
-consumer of its own wire.
+its own sampler review (`docs/principles.md`). Producers and recorders must
+be upgraded together: a recorder from before this change ends the whole
+recording when the agent emits a gauge histogram (see "What the published
+releases do"), and rezolus records through metriken-recorder
+(`src/recorder/mod.rs`, `src/hindsight/mod.rs`), so an agent with the
+sampler needs a rezolus `record` and hindsight built on these releases.
 
 ## Open decisions
 
@@ -334,19 +342,21 @@ consumer of its own wire.
 
 Branches, both local, on upstream main 8172a5a (after #306):
 
-- `fix/rebucket-merge` (worktree `metriken-wt-rebucket`): one commit,
-  `HistogramStream::merge` summed cumulative bucket counts when it
-  rebucketed. Found by this work's mixed-configuration test; ships first.
+- The rebucket fix (`HistogramStream::merge` summed cumulative bucket
+  counts when it rebucketed), found by this work's mixed-configuration
+  test, merged on its own as #308.
 - `feat/gauge-histogram`, on top of it: the design note; (a) producer and
   exposition; (b) storage; the counting histogram rename; the wire fields
   and `counter_histogram`; (c) the query engine; the legacy-artifact tests.
   The first three are the tag-based build, which the wire commit reworks.
-- Review fixes, one commit: the stream decoder kept a group's gauge
-  histogram slots (it dropped them, and with them the whole group, for
-  every `/metrics/stream` recording); a long row carrying gauge histograms
-  is refused rather than dropped; a process group's gauge histogram is held
-  for its coarsest source's interval; an empty gauge histogram read is
-  empty rather than `MetricNotFound`; `convert` writes an archive.
+- Review fixes: the stream decoder keeps a group's gauge histogram slots
+  (it dropped them, and with them the whole group, for every
+  `/metrics/stream` recording); a long row or long-written group carrying
+  gauge histograms is written without their values, warned once; a read is
+  parts (`gauge_histogram_parts`), each row held for its own source's
+  interval; an empty gauge histogram read is empty rather than
+  `MetricNotFound`; `convert` writes an archive, carrying the snapshots'
+  metadata and leaving no partial archive on failure.
 
 Query (c): `promql/streaming/gauge_histogram.rs` (the state evaluator), the
 handlers in `promql/mod.rs`, `histogram_quantile` in
@@ -371,7 +381,7 @@ apart, a seal every 5 rows).
 | archive without a gauge histogram (counter, gauge, `counter_histogram`; sealed and live tail) | opens; `histogram_count(io_latency)` 1 a tick, `mem_free`, `rate(ops)` 10/s: correct |
 | archive with no histogram at all | opens; `mem_free` and `rate(ops)` correct |
 | V3 msgpack snapshots without a gauge histogram | decoded (12 of 12); the 0.4.0 writer records them and its reader answers correctly |
-| `/metrics/stream` passes from `GroupBuilder::build_stream` (groups `fs/ext4` with a gauge histogram, `fs/lat`, `fs/mem`) through the 0.4.0 `StreamDecoder` | every pass refused: "stream fs/ext4: failed to decode a group WAL row: array had incorrect length, expected 3", so the 0.4.0 recorder writes no row of the pass, the other groups' included |
+| `/metrics/stream` passes from `GroupBuilder::build_stream` (groups `fs/ext4` with a gauge histogram, `fs/lat`, `fs/mem`) through the 0.4.0 `StreamDecoder` | every pass refused: "stream fs/ext4: failed to decode a group WAL row: array had incorrect length, expected 3". In metriken-recorder 0.4.0 (and `rezolus record` and hindsight, built on it) that error ends the whole recording on the first such frame: `on_stream_event` returns it (`recorder.rs:2025`), and `fail` (`:1195`, `:1285`) aborts every endpoint's task and drops the archive. Reconnecting does not help. Upgrade producers and recorders together; the owner kept this break (2026-10-22), since recording is mostly local |
 | the same passes without `fs/ext4` | decoded (12 of 12); recorded and read back correctly |
 | a standalone parquet file | none written: `convert` writes an archive |
 
@@ -427,3 +437,11 @@ caught unless noted:
   arms, and the long-written-group refusal, removed: the refusal tests fail
   (the schema arm survived until the test sent columns naming a gauge
   histogram with no value).
+- Delta review: a long row, or a long-written group, carrying gauge
+  histograms skipped whole instead of written without them: the two
+  long-row tests fail; a group read as one merged part at its longest
+  interval: the gap test fails; the evaluator holding every part's rows
+  20 s: 4 tests fail; `MsgpackToArchive` not carrying the snapshots'
+  metadata, and keeping a partial archive: the convert test fails each
+  time; `_gsum` at upper edges in the percentile mode: the Prometheus test
+  fails.

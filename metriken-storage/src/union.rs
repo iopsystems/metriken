@@ -195,6 +195,17 @@ impl DataSource for UnionSource {
         self.children[i].gauge_histogram_stream(name, filter, start_ns, end_ns)
     }
 
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let i = *self.gauge_histogram_index.get(name)?;
+        self.children[i].gauge_histogram_parts(name, filter, start_ns, end_ns)
+    }
+
     /// The holding table's interval.
     fn gauge_histogram_interval(&self, name: &str) -> f64 {
         match self.gauge_histogram_index.get(name) {

@@ -65,6 +65,26 @@ impl HistogramStream {
     pub fn merge_on_clock(streams: Vec<HistogramStream>, clock: usize) -> Option<HistogramStream> {
         merge_streams(streams, Some(clock))
     }
+
+    /// This stream with every row's buckets under `to`, which must be
+    /// [`common_config`] of this stream's configuration and others (no
+    /// coarser bucket of `to` splits one of this stream's).
+    pub fn rebucketed(self, to: ::histogram::Config) -> HistogramStream {
+        let from = self.meta.config;
+        if from == to {
+            return self;
+        }
+        HistogramStream {
+            meta: HistogramStreamMeta {
+                config: to,
+                series: self.meta.series,
+            },
+            rows: Box::new(self.rows.map(move |mut row| {
+                row.snapshot = rebucket(row.snapshot, &from, &to);
+                row
+            })),
+        }
+    }
 }
 
 /// The bucket configuration a merge decodes every stream under: the

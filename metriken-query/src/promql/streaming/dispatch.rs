@@ -1290,13 +1290,9 @@ where
             ctx.eval_timestamps.as_deref(),
         );
         let result = match read {
-            Some((stream, times, staleness_ns)) => super::gauge_histogram::quantiles(
-                stream,
-                &[quantile],
-                &times,
-                staleness_ns,
-                metric_name,
-            ),
+            Some((parts, times)) => {
+                super::gauge_histogram::quantiles(parts, &[quantile], &times, metric_name)
+            }
             None => {
                 nothing_read(ctx.source, metric_name, MetricKind::GaugeHistogram)?;
                 Vec::new()

@@ -376,6 +376,31 @@ impl DataSource for LabeledSource {
             .unwrap_or_else(|| self.inner.histogram_interval(name))
     }
 
+    /// With an interval set, one part at that interval; else the source's
+    /// parts, relabelled.
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        if let Some(interval) = self.interval {
+            let stream = self.gauge_histogram_stream(name, filter, start_ns, end_ns)?;
+            return Some(vec![(stream, interval)]);
+        }
+        let inner_filter = translate_filter(&self.extra, filter)?;
+        let parts: Vec<(HistogramStream, f64)> = self
+            .inner
+            .gauge_histogram_parts(name, &inner_filter, start_ns, end_ns)?
+            .into_iter()
+            .filter_map(|(stream, interval)| {
+                self.relabel_stream(stream, filter).map(|s| (s, interval))
+            })
+            .collect();
+        (!parts.is_empty()).then_some(parts)
+    }
+
     fn gauge_histogram_interval(&self, name: &str) -> f64 {
         self.interval
             .unwrap_or_else(|| self.inner.gauge_histogram_interval(name))

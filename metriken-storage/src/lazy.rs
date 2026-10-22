@@ -186,6 +186,20 @@ impl DataSource for LazySource {
             .gauge_histogram_stream(name, filter, start_ns, end_ns)
     }
 
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        if !self.catalog.gauge_histograms.contains(name) {
+            return None;
+        }
+        self.loaded()?
+            .gauge_histogram_parts(name, filter, start_ns, end_ns)
+    }
+
     fn interval(&self) -> f64 {
         self.catalog.interval_s
     }
