@@ -28,9 +28,12 @@ use crate::{parquet, scan};
 /// The prefix a series' own value of an added key moves under.
 pub const EXPORTED_PREFIX: &str = "exported_";
 
-/// The label added, with the recording's index in its catalog, to the
-/// series of recordings whose label sets are identical, so their series stay
-/// apart. Internal under the `__` rule ([`crate::is_internal_label`]).
+/// The label added, with a catalog index, to the series of read groups
+/// (`ArchiveReader::read_groups`: the sources of one process) whose label
+/// sets are identical, so the series of two processes recorded with equal
+/// labels stay apart. The sources of one process group share their group's
+/// labels and do not carry it. Internal under the `__` rule
+/// ([`crate::is_internal_label`]).
 pub const RECORDING_LABEL: &str = "__recording__";
 
 /// `labels` with `extra` added: a key the series already carries keeps its

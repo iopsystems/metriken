@@ -78,6 +78,12 @@ impl<'a> CounterScan<'a> {
         Self { series, reader }
     }
 
+    /// The matched series and the chunk reader, for a caller that wraps
+    /// the reader.
+    pub fn into_parts(self) -> (Vec<ScanSeries>, Box<dyn ChunkReader + 'a>) {
+        (self.series, self.reader)
+    }
+
     /// Decodes up to `n` of the remaining segments.
     pub fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError> {
         self.reader.next_chunk(n)
