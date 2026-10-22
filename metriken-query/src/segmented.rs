@@ -323,6 +323,17 @@ impl MetricsSource for SegmentedParquetReader {
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.histogram_labels(name)
     }
+
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.engine.gauge_histogram_names()
+    }
+
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.gauge_histogram_labels(name)
+    }
 }
 
 #[cfg(test)]

@@ -62,8 +62,8 @@ mod tests {
             complete: false,
         };
 
-        // Rows in exactly the shape `stage_rows` already produces: a group
-        // name as the stream, an opaque msgpack payload.
+        // Rows in the shape the `.rez` v3 writer's WAL holds: a group name as
+        // the stream, an opaque msgpack payload.
         let rows = Frame::Rows {
             source: 0,
             seq: 0,

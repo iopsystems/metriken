@@ -7,5 +7,12 @@ pub(crate) mod windows;
 
 pub use counter::CounterGroup;
 pub use gauge::GaugeGroup;
-pub use histogram::HistogramGroup;
+pub use histogram::CounterHistogramGroup;
+
+/// The former name of [`CounterHistogramGroup`].
+#[deprecated(
+    since = "0.11.4",
+    note = "renamed `CounterHistogramGroup`, the counting kind beside `GaugeHistogram`"
+)]
+pub type HistogramGroup = CounterHistogramGroup;
 pub use identity::{SlotIdentity, SlotMetadata, UID_LABEL};

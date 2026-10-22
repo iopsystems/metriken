@@ -18,7 +18,11 @@ use crate::window::Window;
 pub enum CellValue<'a> {
     Counter(u64),
     Gauge(i64),
+    /// A counting histogram.
     Histogram(&'a histogram::Histogram),
+    /// A gauge histogram: stored as a histogram column whose `metric_type` is
+    /// `gauge_histogram`.
+    GaugeHistogram(&'a histogram::Histogram),
 }
 
 /// One reading in one row, as the archive stores it: a name, the producer's
@@ -47,7 +51,8 @@ impl Cell<'_> {
         match self.value {
             CellValue::Counter(_) => "counter",
             CellValue::Gauge(_) => "gauge",
-            CellValue::Histogram(_) => "histogram",
+            CellValue::Histogram(_) => metriken_model::COUNTER_HISTOGRAM,
+            CellValue::GaugeHistogram(_) => metriken_model::GAUGE_HISTOGRAM,
         }
     }
 }
@@ -83,7 +88,7 @@ pub fn cells_approx_bytes(cells: &[Cell<'_>]) -> usize {
         .iter()
         .map(|c| match c.value {
             CellValue::Counter(_) | CellValue::Gauge(_) => CELL_OVERHEAD_BYTES,
-            CellValue::Histogram(h) => {
+            CellValue::Histogram(h) | CellValue::GaugeHistogram(h) => {
                 CELL_OVERHEAD_BYTES + h.as_slice().len() * HISTOGRAM_BUCKET_BYTES
             }
         })
@@ -195,12 +200,12 @@ impl TableBuilder {
                 let values = match e.value {
                     CellValue::Counter(_) => Values::Counter(Vec::new()),
                     CellValue::Gauge(_) => Values::Gauge(Vec::new()),
-                    CellValue::Histogram(_) => Values::Histogram(Vec::new()),
+                    CellValue::Histogram(_) | CellValue::GaugeHistogram(_) => {
+                        Values::Histogram(Vec::new())
+                    }
                 };
                 let mut metadata = e.metadata.clone();
-                metadata
-                    .entry("metric_type".to_string())
-                    .or_insert_with(|| e.metric_type().to_string());
+                stamp_metric_type(&mut metadata, e.metric_type());
                 Column {
                     name,
                     metadata,
@@ -224,7 +229,15 @@ impl TableBuilder {
                     v.push(Some(*g));
                     Some(CELL_OVERHEAD_BYTES)
                 }
-                (CellValue::Histogram(h), Values::Histogram(v)) => {
+                (CellValue::Histogram(h) | CellValue::GaugeHistogram(h), Values::Histogram(v))
+                    // A cell of the other histogram kind is skipped, as a
+                    // counter cell in a gauge column is.
+                    if col
+                        .metadata
+                        .get(metriken_model::METRIC_TYPE)
+                        .is_some_and(|t| metriken_model::is_gauge_histogram(t))
+                        == matches!(e.value, CellValue::GaugeHistogram(_)) =>
+                {
                     // The clone below copies the whole bucket `Box<[u64]>` —
                     // 496 buckets ≈ 4 KB at the `HISTOGRAM_GROUPING_POWER` = 3
                     // that `docs/principles.md` standardizes on. One histogram
@@ -298,6 +311,30 @@ impl TableBuilder {
             columns,
             table_window: None,
         }
+    }
+}
+
+/// A group row's counter, gauge and counting histogram slots, as
+/// [`GroupTableBuilder::push_row`] takes them.
+pub type RowValues<'a> = (
+    &'a [Option<u64>],
+    &'a [Option<i64>],
+    &'a [Option<(u8, u8, Vec<u64>)>],
+);
+
+/// Set a column's `metric_type` to `kind`, the kind of the value that
+/// created it. A histogram's kind is the list its value arrived in (a
+/// counting or a gauge histogram), so it replaces whatever `metric_type` the
+/// producer's metadata carried; a counter's or gauge's leaves a producer's
+/// value in place, as it always has.
+pub(crate) fn stamp_metric_type(metadata: &mut HashMap<String, String>, kind: &str) {
+    let key = metriken_model::METRIC_TYPE;
+    if kind == metriken_model::COUNTER_HISTOGRAM || kind == metriken_model::GAUGE_HISTOGRAM {
+        metadata.insert(key.to_string(), kind.to_string());
+    } else {
+        metadata
+            .entry(key.to_string())
+            .or_insert_with(|| kind.to_string());
     }
 }
 
@@ -424,9 +461,7 @@ impl GroupTableBuilder {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        metadata
-            .entry("metric_type".to_string())
-            .or_insert_with(|| metric_type.to_string());
+        stamp_metric_type(&mut metadata, metric_type);
 
         // The live column for this descriptor name, if its labels still match.
         // Compared on the FULL metadata map, `metric_type` included: the map is
@@ -502,6 +537,28 @@ impl GroupTableBuilder {
         // lower-level format module does not depend on the writer module.
         histograms: &[Option<(u8, u8, Vec<u64>)>],
     ) {
+        self.push_row_with_gauge_histograms(
+            ts,
+            wall_offset_ns,
+            window,
+            schema,
+            (counters, gauges, histograms),
+            &[],
+        );
+    }
+
+    /// [`push_row`](Self::push_row) with the row's gauge histogram slots,
+    /// aligned with `schema.gauge_histograms`. Each becomes a histogram
+    /// column whose `metric_type` is `gauge_histogram`.
+    pub fn push_row_with_gauge_histograms(
+        &mut self,
+        ts: u64,
+        wall_offset_ns: i64,
+        window: Option<Window>,
+        schema: &crate::schema::GroupSchema,
+        (counters, gauges, histograms): RowValues<'_>,
+        gauge_histograms: &[Option<(u8, u8, Vec<u64>)>],
+    ) {
         let row = self.timestamps.len();
         self.timestamps.push(ts);
         self.wall_offsets.push(wall_offset_ns);
@@ -521,8 +578,30 @@ impl GroupTableBuilder {
                 vs.push(*v);
             }
         }
+        self.push_histograms(
+            row,
+            &schema.histograms,
+            histograms,
+            metriken_model::COUNTER_HISTOGRAM,
+        );
+        self.push_histograms(
+            row,
+            &schema.gauge_histograms,
+            gauge_histograms,
+            metriken_model::GAUGE_HISTOGRAM,
+        );
+    }
+
+    /// One row's histogram slots of one kind (`metric_type`).
+    fn push_histograms(
+        &mut self,
+        row: usize,
+        descs: &[crate::schema::MetricDesc],
+        histograms: &[Option<(u8, u8, Vec<u64>)>],
+        metric_type: &'static str,
+    ) {
         let table_name = self.name.clone();
-        for (desc, v) in schema.histograms.iter().zip(histograms) {
+        for (desc, v) in descs.iter().zip(histograms) {
             let member_name = desc.name.clone();
 
             // Decoded BEFORE `get_or_create` borrows the column, because
@@ -577,7 +656,7 @@ impl GroupTableBuilder {
                 }
                 _ => desc,
             };
-            let col = self.get_or_create(desc, "histogram", Values::Histogram(Vec::new()));
+            let col = self.get_or_create(desc, metric_type, Values::Histogram(Vec::new()));
             Self::pad(col, row);
             if let Some((_, gp, mvp)) = &decoded {
                 col.metadata

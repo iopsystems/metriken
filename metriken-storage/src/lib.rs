@@ -40,8 +40,11 @@
 //!   epoch), which `ArchiveReader::process_groups` returns.
 //! - `rez` (feature `rez`): the `.rez` format.
 //!
+//! - `convert` (feature `convert`): a raw msgpack recording into a `.dendro`
+//!   archive. metriken writes no standalone parquet; parquet files written
+//!   before are read by `parquet`.
+//!
 //! Without the archive:
-//! - `convert` (feature `convert`): msgpack snapshots into one parquet file.
 //! - `stream` (feature `stream`): `metriken_exposition::stream`, re-exported
 //!   at this path until the next breaking release.
 

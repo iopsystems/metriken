@@ -182,17 +182,20 @@ impl StreamDecoder {
                     continue;
                 }
             }
-            let histograms = decoded
-                .histograms
-                .into_iter()
-                .map(|h| {
-                    h.map(|(gp, mvp, buckets)| {
-                        histogram::Histogram::from_buckets(gp, mvp, buckets)
-                            .map_err(|e| format!("stream {stream}: histogram: {e}"))
+            let rebuild = |slots: Vec<Option<(u8, u8, Vec<u64>)>>, kind: &str| {
+                slots
+                    .into_iter()
+                    .map(|h| {
+                        h.map(|(gp, mvp, buckets)| {
+                            histogram::Histogram::from_buckets(gp, mvp, buckets)
+                                .map_err(|e| format!("stream {stream}: {kind}: {e}"))
+                        })
+                        .transpose()
                     })
-                    .transpose()
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+                    .collect::<Result<Vec<_>, String>>()
+            };
+            let histograms = rebuild(decoded.histograms, "histogram")?;
+            let gauge_histograms = rebuild(decoded.gauge_histograms, "gauge histogram")?;
             out.push(StreamedGroup::Wide(GroupSnapshot {
                 name: stream,
                 schema_hash: decoded.schema_hash,
@@ -203,6 +206,7 @@ impl StreamDecoder {
                 counters: decoded.counters,
                 gauges: decoded.gauges,
                 histograms,
+                gauge_histograms,
             }));
         }
         Ok(out)
@@ -593,6 +597,9 @@ const WARN_ANCHOR: u8 = 2;
 const WARN_WIDTH: u8 = 4;
 /// An occupant arrived with a key no occupants row described.
 const WARN_LABELS: u8 = 8;
+/// Gauge histograms arrived in a group written long, which has no columns
+/// for them.
+const WARN_GAUGE_HISTOGRAMS: u8 = 16;
 
 impl GroupState {
     /// Whether warning `flag` is to be logged: true the first time only.
@@ -657,9 +664,11 @@ impl GroupState {
             return Some(Arc::clone(l));
         }
         let schema = g.schema.as_ref()?;
-        let long = *self
-            .long
-            .get_or_insert_with(|| long_groups && slotted(schema));
+        // A group holding a gauge histogram is written wide: the long layout
+        // has no gauge histogram columns.
+        let long = *self.long.get_or_insert_with(|| {
+            long_groups && slotted(schema) && schema.gauge_histograms.is_empty()
+        });
         let layout = Arc::new(if long {
             Layout::Long(Arc::new(LongLayout::of(schema, &mut self.columns)))
         } else {
@@ -759,7 +768,7 @@ impl SourceRecorder {
             Snapshot::V1(s) => self.stage_flat(
                 &s.counters,
                 &s.gauges,
-                &s.histograms,
+                (&s.histograms, &s.gauge_histograms),
                 ts,
                 wall_offset,
                 &mut rows,
@@ -767,7 +776,7 @@ impl SourceRecorder {
             Snapshot::V2(s) => self.stage_flat(
                 &s.counters,
                 &s.gauges,
-                &s.histograms,
+                (&s.histograms, &s.gauge_histograms),
                 ts,
                 wall_offset,
                 &mut rows,
@@ -851,6 +860,23 @@ impl SourceRecorder {
         // The columns are taken before the dedup below: the producer sends
         // them once, and a row skipped as a repeat would otherwise lose them
         // for the rest of the connection.
+        // The long layout has no gauge histogram columns: their values are
+        // dropped, with a warning once per group, and the rest of the row is
+        // written, as the other cases a long row cannot be written are
+        // skipped rather than ending the recording. A producer sends a group
+        // holding one wide (`GroupBuilder` never makes it long).
+        if (row
+            .schema
+            .as_ref()
+            .is_some_and(|s| !s.gauge_histograms.is_empty())
+            || row.occupants.iter().any(|o| !o.gauge_histograms.is_empty()))
+            && state.first_warning(WARN_GAUGE_HISTOGRAMS)
+        {
+            tracing::warn!(
+                "group {name}: a long row carries gauge histograms, which a long table cannot \
+                 hold; their values are dropped (warned once)"
+            );
+        }
         if let Some(schema) = &row.schema {
             if state.wire.as_ref().map(|(h, _)| *h) != Some(row.schema_hash) {
                 let shared = shared_keys(schema);
@@ -961,6 +987,7 @@ impl SourceRecorder {
                 counters: vec![None; widths.0],
                 gauges: vec![None; widths.1],
                 histograms: vec![None; widths.2],
+                gauge_histograms: Vec::new(),
             };
             for (i, v) in o.counters.into_iter().enumerate() {
                 occ.counters[wire.counters[i]] = v;
@@ -988,7 +1015,10 @@ impl SourceRecorder {
         &mut self,
         counters: &[metriken_model::Counter],
         gauges: &[metriken_model::Gauge],
-        histograms: &[metriken_model::Histogram],
+        (histograms, gauge_histograms): (
+            &[metriken_model::Histogram],
+            &[metriken_model::Histogram],
+        ),
         ts: u64,
         wall_offset: i64,
         rows: &mut Vec<DWalRow>,
@@ -1041,6 +1071,17 @@ impl SourceRecorder {
                     value: CellValue::Histogram(&h.value),
                 });
         }
+        for h in gauge_histograms {
+            by_sampler
+                .entry(sampler_of(&h.metadata))
+                .or_default()
+                .push(Entry {
+                    name: &h.name,
+                    metadata: &h.metadata,
+                    window: h.window.map(|w| (w.begin_ns, w.end_ns)),
+                    value: CellValue::GaugeHistogram(&h.value),
+                });
+        }
 
         for (sampler, entries) in by_sampler {
             // A `/` would make the table look like a group's to a reader.
@@ -1076,6 +1117,11 @@ impl SourceRecorder {
                             h.config().max_value_power(),
                             h.as_slice().to_vec(),
                         ),
+                        CellValue::GaugeHistogram(h) => WalValue::GaugeHistogram(
+                            h.config().grouping_power(),
+                            h.config().max_value_power(),
+                            h.as_slice().to_vec(),
+                        ),
                     },
                     window: e.window,
                 })
@@ -1093,6 +1139,7 @@ impl SourceRecorder {
                             CellValue::Counter(v) => CellValue::Counter(v),
                             CellValue::Gauge(v) => CellValue::Gauge(v),
                             CellValue::Histogram(h) => CellValue::Histogram(h),
+                            CellValue::GaugeHistogram(h) => CellValue::GaugeHistogram(h),
                         },
                     })
                     .collect::<Vec<_>>(),
@@ -1124,7 +1171,11 @@ impl SourceRecorder {
         let key = g.window.map(|w| w.end_ns).unwrap_or(ts);
         // A group with no members has no values to record, and its schema
         // must not decide whether the group is long.
-        if g.counters.is_empty() && g.gauges.is_empty() && g.histograms.is_empty() {
+        if g.counters.is_empty()
+            && g.gauges.is_empty()
+            && g.histograms.is_empty()
+            && g.gauge_histograms.is_empty()
+        {
             state.last_key = Some(key);
             return Ok(());
         }
@@ -1141,7 +1192,25 @@ impl SourceRecorder {
             );
             return Ok(());
         };
-        if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len()) {
+        let gauge_histograms = match layout.as_ref() {
+            Layout::Wide(s) => s.gauge_histograms.len(),
+            // A group is made long on its first schema, which held no gauge
+            // histogram; one that gains one later is written long without
+            // its gauge histogram values, warned once per group.
+            Layout::Long(_) => {
+                if !g.gauge_histograms.is_empty() && state.first_warning(WARN_GAUGE_HISTOGRAMS) {
+                    tracing::warn!(
+                        "group {}: gauge histograms arrived in a group written long, which \
+                         has no columns for them; their values are dropped (warned once)",
+                        g.name
+                    );
+                }
+                g.gauge_histograms.len()
+            }
+        };
+        if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len())
+            || gauge_histograms != g.gauge_histograms.len()
+        {
             tracing::warn!(
                 "group {} does not match its cached schema; skipped this tick",
                 g.name
@@ -1189,6 +1258,7 @@ impl SourceRecorder {
                         counters: vec![None; widths.0],
                         gauges: vec![None; widths.1],
                         histograms: vec![None; widths.2],
+                        gauge_histograms: Vec::new(),
                     };
                     for &(m, c) in &slot.counters {
                         occ.counters[c] = g.counters[m];
@@ -1439,6 +1509,7 @@ mod row_form_tests {
             counters: Vec::new(),
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
         .unwrap();
         let long = wal::encode_wal_long_row(&WalLongRow {

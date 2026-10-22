@@ -49,6 +49,19 @@ impl DataSource for MemoryStoreInner {
             .histogram_stream(name, filter, start_ns, end_ns)
     }
 
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.memory
+            .read()
+            .unwrap()
+            .gauge_histogram_stream(name, filter, start_ns, end_ns)
+    }
+
     fn interval(&self) -> f64 {
         self.memory.read().unwrap().interval()
     }
@@ -69,6 +82,10 @@ impl DataSource for MemoryStoreInner {
         self.memory.read().unwrap().histogram_names()
     }
 
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.memory.read().unwrap().gauge_histogram_names()
+    }
+
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.memory.read().unwrap().counter_labels(name)
     }
@@ -79,6 +96,10 @@ impl DataSource for MemoryStoreInner {
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.memory.read().unwrap().histogram_labels(name)
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.memory.read().unwrap().gauge_histogram_labels(name)
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {

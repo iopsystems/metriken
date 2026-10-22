@@ -299,6 +299,7 @@ fn stream(
         }],
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     });
     let mut cache = SchemaCache::new();
     let mut count = 0u64;
@@ -316,6 +317,7 @@ fn stream(
             counters: vec![Some(count * 10)],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         };
         let encoded = EncodedGroup::encode(&group, &mut cache).unwrap();
         let pass = (

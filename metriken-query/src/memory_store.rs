@@ -125,6 +125,35 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Add a whole gauge histogram series: each snapshot is the state at its
+    /// timestamp (cumulative sparse, as a histogram's), read as it is by the
+    /// histogram functions, never differenced. See
+    /// [`insert_histogram_series`](Self::insert_histogram_series).
+    pub fn insert_gauge_histogram_series(
+        &self,
+        name: &str,
+        labels: impl Into<Labels>,
+        config: ::histogram::Config,
+        timestamps: Vec<u64>,
+        snapshots: Vec<HistogramSnapshot>,
+    ) -> Result<(), String> {
+        check_series(name, timestamps.len(), snapshots.len(), None)?;
+        self.state
+            .memory
+            .write()
+            .unwrap()
+            .push_gauge_histogram_series(
+                name,
+                Histogram {
+                    labels: labels.into(),
+                    config,
+                    timestamps,
+                    snapshots,
+                },
+            );
+        Ok(())
+    }
+
     /// Declare the row timestamps this store stands for, for a caller that
     /// assembled it from a table and knows its rows. Without this a store
     /// reports the union of its series' timestamps, which cannot include a
@@ -294,6 +323,21 @@ impl MemoryStore {
     /// All label combinations for the named histogram metric. Empty if unknown.
     pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.state.memory.read().unwrap().histogram_labels(name)
+    }
+
+    /// Names of all gauge histogram metrics (sorted, deduplicated).
+    pub fn gauge_histogram_names(&self) -> Vec<String> {
+        self.state.memory.read().unwrap().gauge_histogram_names()
+    }
+
+    /// All label combinations for the named gauge histogram metric. Empty if
+    /// unknown.
+    pub fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.state
+            .memory
+            .read()
+            .unwrap()
+            .gauge_histogram_labels(name)
     }
 }
 
@@ -474,6 +518,14 @@ impl MetricsSource for MemoryStore {
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         MemoryStore::histogram_labels(self, name)
     }
+
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        MemoryStore::gauge_histogram_names(self)
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        MemoryStore::gauge_histogram_labels(self, name)
+    }
 }
 
 // ─── Ingest feature ──────────────────────────────────────────────────────────
@@ -488,7 +540,9 @@ impl MemoryStore {
     ///
     /// For histograms: a `HistogramSnapshot` is stored representing the
     /// cumulative (running) bucket counts. Quantile/rate computations are
-    /// performed at query time against pairs of consecutive snapshots.
+    /// performed at query time against pairs of consecutive snapshots. A
+    /// snapshot's gauge histograms (`Snapshot::gauge_histograms`) are stored
+    /// as gauge histograms, whose snapshots are read one at a time.
     pub fn ingest_snapshot(&self, mut snapshot: metriken_model::Snapshot) {
         use crate::memory::extract_name_labels;
 
@@ -516,6 +570,13 @@ impl MemoryStore {
             let config = histogram.value.config();
             let snap = histogram_to_snapshot(&histogram.value);
             memory.upsert_histogram_sample(&name, labels, config, ts, snap);
+        }
+
+        for histogram in snapshot.gauge_histograms() {
+            let (name, labels) = extract_name_labels(&histogram.metadata, &histogram.name);
+            let config = histogram.value.config();
+            let snap = histogram_to_snapshot(&histogram.value);
+            memory.upsert_gauge_histogram_sample(&name, labels, config, ts, snap);
         }
     }
 }
@@ -639,6 +700,7 @@ mod ingest_tests {
             )],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         })
     }
 
@@ -673,6 +735,7 @@ mod ingest_tests {
                 h,
                 metadata,
             )],
+            gauge_histograms: Vec::new(),
         });
         store.ingest_snapshot(snap);
 
@@ -742,6 +805,7 @@ mod ingest_tests {
                 metadata,
             )],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         })
     }
 

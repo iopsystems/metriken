@@ -111,9 +111,7 @@ impl LongTableBuilder {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            metadata
-                .entry("metric_type".to_string())
-                .or_insert_with(|| metric_type.to_string());
+            crate::builder::stamp_metric_type(&mut metadata, metric_type);
             self.order.push(desc.name.clone());
             self.columns.insert(
                 desc.name.clone(),
@@ -159,7 +157,11 @@ impl LongTableBuilder {
                 }
             }
             for (desc, v) in schema.histograms.iter().zip(&occ.histograms) {
-                let col = self.column(desc, "histogram", LongValues::Histogram(Vec::new()));
+                let col = self.column(
+                    desc,
+                    metriken_model::COUNTER_HISTOGRAM,
+                    LongValues::Histogram(Vec::new()),
+                );
                 if let Some((gp, mvp, _)) = v {
                     col.metadata
                         .entry("grouping_power".to_string())
@@ -282,11 +284,12 @@ impl LongTableBuilder {
                 kv.push(KeyValue::new(column_occupants_key(&col.field_name()), has));
             }
         }
-        let props = crate::format::stamped(
+        let props = crate::format::stamped_for(
             props
                 .into_builder()
                 .set_key_value_metadata(Some(kv))
                 .build(),
+            &schema,
         );
         let mut buf = Vec::new();
         let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
@@ -318,6 +321,7 @@ mod tests {
             counters: vec![d("7", "cpu")],
             gauges: vec![d("8", "depth")],
             histograms: vec![d("9", "lat")],
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -327,6 +331,7 @@ mod tests {
             counters: vec![Some(v)],
             gauges: vec![n.is_multiple_of(2).then_some(v as i64)],
             histograms: vec![Some((2, 8, vec![v, 0, 1]))],
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -408,7 +413,7 @@ mod tests {
         let f = batch.schema();
         let lat = f.field_with_name("9:buckets").unwrap();
         assert_eq!(lat.metadata()["grouping_power"], "2");
-        assert_eq!(lat.metadata()["metric_type"], "histogram");
+        assert_eq!(lat.metadata()["metric_type"], "counter_histogram");
     }
 
     #[test]

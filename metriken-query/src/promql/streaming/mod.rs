@@ -40,6 +40,7 @@ mod aggregate;
 mod binary;
 pub(crate) mod dispatch;
 mod gauge;
+pub(crate) mod gauge_histogram;
 pub(crate) mod histogram;
 pub(crate) mod per_source;
 mod rate;

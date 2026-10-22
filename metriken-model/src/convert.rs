@@ -12,18 +12,23 @@ pub fn wal_group_row(g: &GroupSnapshot, schema: Option<GroupSchema>) -> WalGroup
         window: g.window.map(|w| (w.begin_ns, w.end_ns)),
         counters: g.counters.clone(),
         gauges: g.gauges.clone(),
-        histograms: g
-            .histograms
-            .iter()
-            .map(|h| {
-                h.as_ref().map(|h| {
-                    (
-                        h.config().grouping_power(),
-                        h.config().max_value_power(),
-                        h.as_slice().to_vec(),
-                    )
-                })
-            })
-            .collect(),
+        histograms: cells(&g.histograms),
+        gauge_histograms: cells(&g.gauge_histograms),
     }
+}
+
+/// Histogram values as WAL row slots.
+fn cells(values: &[Option<histogram::Histogram>]) -> Vec<Option<(u8, u8, Vec<u64>)>> {
+    values
+        .iter()
+        .map(|h| {
+            h.as_ref().map(|h| {
+                (
+                    h.config().grouping_power(),
+                    h.config().max_value_power(),
+                    h.as_slice().to_vec(),
+                )
+            })
+        })
+        .collect()
 }

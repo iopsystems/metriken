@@ -41,7 +41,7 @@
 //!   slot space managed by [`metriken::group::SlotIdentity`] is, and what a
 //!   family ([`metriken::CounterFamily`], [`metriken::GaugeFamily`]) is.
 //!
-//! A histogram group ([`metriken::HistogramGroup`]) takes the same members
+//! A histogram group ([`metriken::CounterHistogramGroup`]) takes the same members
 //! under every membership: each index its metadata store lists whose
 //! histogram loads, as [`Snapshotter`](crate::Snapshotter) does. Each member
 //! carries the slot's metadata, `id`, and the group's `grouping_power` and
@@ -551,6 +551,7 @@ fn build_wide<R: Router, N: MemberNames>(
             metadata.remove(GROUP_METADATA_KEY);
 
             let metric_id_u64 = metric_id as u64;
+            let gauge_histogram = matches!(value, Value::GaugeHistogram(_));
 
             match value {
                 Value::Counter(v) => {
@@ -648,7 +649,7 @@ fn build_wide<R: Router, N: MemberNames>(
                     }
                     group.mark_end();
                 }
-                Value::Histogram(h) => {
+                Value::Histogram(h) | Value::GaugeHistogram(h) => {
                     // `config()` needs no loaded value.
                     let mut metadata = metadata;
                     metadata.insert(
@@ -666,15 +667,23 @@ fn build_wide<R: Router, N: MemberNames>(
                     // exactly the event (a histogram not yet loaded)
                     // registered membership exists to ignore.
                     if registered || hv.is_some() {
-                        group.walk_identity.histograms = identity_fold(
+                        group.walk_identity.histograms = histogram_identity_fold(
                             group.walk_identity.histograms,
-                            &metric_id_u64.to_le_bytes(),
+                            gauge_histogram,
+                            metric_id_u64,
                         );
-                        group.histogram_descs.push(MetricDesc {
+                        let desc = MetricDesc {
                             name: names.metric(metric_id, metric),
                             metadata,
-                        });
-                        group.histogram_values.push(hv);
+                        };
+                        // The kind is the list the slot is in.
+                        if gauge_histogram {
+                            group.gauge_histogram_descs.push(desc);
+                            group.gauge_histogram_values.push(hv);
+                        } else {
+                            group.histogram_descs.push(desc);
+                            group.histogram_values.push(hv);
+                        }
                     }
                 }
                 Value::HistogramGroup(g) => {
@@ -744,6 +753,12 @@ fn build_wide<R: Router, N: MemberNames>(
                         group.histogram_values.push(hv);
                     }
                 }
+                Value::GaugeHistogram(h) => {
+                    let hv = h.load();
+                    if registered || hv.is_some() {
+                        group.gauge_histogram_values.push(hv);
+                    }
+                }
                 Value::HistogramGroup(g) => {
                     for &idx in histogram_members(&mut idx_scratch, g) {
                         if let Some(h) = g.load_histogram(idx) {
@@ -794,6 +809,7 @@ fn build_wide<R: Router, N: MemberNames>(
         if group.counter_values.is_empty()
             && group.gauge_values.is_empty()
             && group.histogram_values.is_empty()
+            && group.gauge_histogram_values.is_empty()
         {
             continue;
         }
@@ -814,6 +830,7 @@ fn build_wide<R: Router, N: MemberNames>(
                 counters: group.counter_descs,
                 gauges: group.gauge_descs,
                 histograms: group.histogram_descs,
+                gauge_histograms: group.gauge_histogram_descs,
             };
             let hash = schema.hash();
             let schema = Arc::new(schema);
@@ -834,7 +851,9 @@ fn build_wide<R: Router, N: MemberNames>(
                 Some(cached)
                     if cached.schema.counters.len() == group.counter_values.len()
                         && cached.schema.gauges.len() == group.gauge_values.len()
-                        && cached.schema.histograms.len() == group.histogram_values.len() =>
+                        && cached.schema.histograms.len() == group.histogram_values.len()
+                        && cached.schema.gauge_histograms.len()
+                            == group.gauge_histogram_values.len() =>
                 {
                     (cached.schema.clone(), cached.hash)
                 }
@@ -863,6 +882,7 @@ fn build_wide<R: Router, N: MemberNames>(
             counters: group.counter_values,
             gauges: group.gauge_values,
             histograms: group.histogram_values,
+            gauge_histograms: group.gauge_histogram_values,
         });
     }
 
@@ -1076,6 +1096,7 @@ fn build_long<R: Router, N: MemberNames>(
                         desc
                     })
                     .collect(),
+                gauge_histograms: Vec::new(),
             });
             acc.state.hash = columns.hash();
             acc.state.columns = columns;
@@ -1411,6 +1432,8 @@ struct Group<G> {
     gauge_values: Vec<Option<i64>>,
     histogram_descs: Vec<MetricDesc>,
     histogram_values: Vec<Option<histogram::Histogram>>,
+    gauge_histogram_descs: Vec<MetricDesc>,
+    gauge_histogram_values: Vec<Option<histogram::Histogram>>,
 }
 
 impl<G: ReadGuard> Group<G> {
@@ -1425,6 +1448,8 @@ impl<G: ReadGuard> Group<G> {
             gauge_values: Vec::new(),
             histogram_descs: Vec::new(),
             histogram_values: Vec::new(),
+            gauge_histogram_descs: Vec::new(),
+            gauge_histogram_values: Vec::new(),
         }
     }
 
@@ -1593,6 +1618,19 @@ fn members<'a>(set: Option<&'a [usize]>, bound: Option<usize>, entries: usize) -
 const IDENTITY_FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const IDENTITY_FNV_PRIME: u128 = 0x0000000001000000000000000000013b;
 
+/// Fold a single histogram metric into a group identity. A gauge histogram
+/// folds a marker first, so a dynamic metric replaced at the same position
+/// by one of the other kind changes the identity and the cached schema (whose
+/// descriptor says which kind it is) is rebuilt.
+fn histogram_identity_fold(identity: u128, gauge: bool, metric_id: u64) -> u128 {
+    let identity = if gauge {
+        identity_fold(identity, b"g")
+    } else {
+        identity
+    };
+    identity_fold(identity, &metric_id.to_le_bytes())
+}
+
 #[inline]
 fn identity_fold(mut acc: u128, bytes: &[u8]) -> u128 {
     for &b in bytes {
@@ -1722,7 +1760,10 @@ fn fold_group_identities<'a, R: Router>(
                 }
             }
             Value::Histogram(h) if registered || h.load().is_some() => {
-                accum.histograms = identity_fold(accum.histograms, &metric_id.to_le_bytes());
+                accum.histograms = histogram_identity_fold(accum.histograms, false, metric_id);
+            }
+            Value::GaugeHistogram(h) if registered || h.load().is_some() => {
+                accum.histograms = histogram_identity_fold(accum.histograms, true, metric_id);
             }
             Value::HistogramGroup(g) => {
                 accum.histograms =

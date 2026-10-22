@@ -67,6 +67,11 @@ pub fn prometheus_text(options: &PrometheusOptions) -> String {
                     write_histogram(&mut output, &name, None, &snapshot, metric, options);
                 }
             }
+            Some(Value::GaugeHistogram(h)) => {
+                if let Some(snapshot) = h.load() {
+                    write_gauge_histogram(&mut output, &name, &snapshot, metric, options);
+                }
+            }
             Some(Value::CounterGroup(g)) => {
                 let base_metadata = entry_metadata(metric);
                 let active = g.metadata_snapshot();
@@ -224,6 +229,86 @@ fn write_histogram(
         );
         write_metric_line(output, &format!("{name}_count"), labels, &count.to_string());
         write_metric_line(output, &format!("{name}_sum"), labels, &sum.to_string());
+    }
+}
+
+/// A gauge histogram, as the series Prometheus stores for an OpenMetrics
+/// `gaugehistogram`, each its own `gauge` family: `<name>_bucket{le=..}`
+/// (cumulative, as a histogram's), `<name>_gcount` and `<name>_gsum`.
+///
+/// The 0.0.4 text format has no gauge histogram type, and a Prometheus
+/// scrape fails on a `# TYPE` it does not know, so the type is not written.
+/// Written as gauges, every line reads correctly in a scraper that knows
+/// nothing of gauge histograms: each is a current value, which nothing
+/// should `rate()`. With [`PrometheusOptions::percentiles`] the quantiles
+/// are a `gauge` family `<name>{quantile=..}` rather than a `summary`, whose
+/// `_count` and `_sum` would be counters.
+///
+/// `_gsum` values each item as this renderer's counting `_sum` does in the
+/// same mode: at its bucket's upper edge in the full-bucket mode, and at the
+/// bucket's midpoint (rounded down) in the percentile mode, so a gauge and a
+/// counting histogram's sums mean the same thing in one scrape. The query
+/// engine's `histogram_sum` reports the midpoint sum with the band
+/// `[Σ count·start, Σ count·end]`, whose upper end is the full-bucket mode's
+/// `_gsum`.
+fn write_gauge_histogram(
+    output: &mut String,
+    name: &str,
+    snapshot: &histogram::Histogram,
+    metric: &MetricEntry,
+    options: &PrometheusOptions,
+) {
+    let summary = !options.percentiles.is_empty();
+    let mut count: u64 = 0;
+    let mut sum: u128 = 0;
+    for bucket in snapshot {
+        count += bucket.count();
+        let value = if summary {
+            (bucket.start() as u128 + bucket.end() as u128) / 2
+        } else {
+            bucket.end() as u128
+        };
+        sum += bucket.count() as u128 * value;
+    }
+    if summary {
+        write_type_help(output, name, "gauge", metric, options);
+        if let Ok(Some(results)) =
+            histogram::SampleQuantiles::quantiles(snapshot, &options.percentiles)
+        {
+            for (quantile, bucket) in results.entries() {
+                let quantile_label = format!("quantile=\"{}\"", quantile.as_f64());
+                write_metric_line(
+                    output,
+                    name,
+                    Some(&quantile_label),
+                    &bucket.end().to_string(),
+                );
+            }
+        }
+    } else {
+        let bucket_name = format!("{name}_bucket");
+        write_type_help(output, &bucket_name, "gauge", metric, options);
+        let mut running: u64 = 0;
+        for bucket in snapshot {
+            running += bucket.count();
+            let le_label = format!("le=\"{}\"", bucket.end());
+            write_metric_line(output, &bucket_name, Some(&le_label), &running.to_string());
+        }
+        write_metric_line(
+            output,
+            &bucket_name,
+            Some("le=\"+Inf\""),
+            &count.to_string(),
+        );
+    }
+    let no_help = PrometheusOptions {
+        help_text: false,
+        percentiles: Vec::new(),
+    };
+    for (suffix, value) in [("gcount", count as u128), ("gsum", sum)] {
+        let family = format!("{name}_{suffix}");
+        write_type_help(output, &family, "gauge", metric, &no_help);
+        write_metric_line(output, &family, None, &value.to_string());
     }
 }
 

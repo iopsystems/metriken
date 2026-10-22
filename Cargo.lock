@@ -1372,6 +1372,7 @@ dependencies = [
  "metriken-storage",
  "parquet",
  "promql-parser",
+ "rmp-serde",
  "serde",
  "serde_json",
  "sysinfo",

@@ -184,6 +184,51 @@ impl DataSource for RecordingsSource {
         HistogramStream::merge_on_clock(streams, clock)
     }
 
+    /// Each recording's rows at their own times. A gauge histogram's row is
+    /// read as the state at its time, not pooled with rows of other
+    /// recordings, so nothing is re-stamped onto a clock.
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        HistogramStream::merge(
+            self.children
+                .iter()
+                .filter_map(|c| c.gauge_histogram_stream(name, filter, start_ns, end_ns))
+                .collect(),
+        )
+    }
+
+    /// Each recording's parts, at its own intervals.
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let parts: Vec<(HistogramStream, f64)> = self
+            .children
+            .iter()
+            .filter_map(|c| c.gauge_histogram_parts(name, filter, start_ns, end_ns))
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then_some(parts)
+    }
+
+    /// The longest of the intervals of the recordings holding `name`.
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.children
+            .iter()
+            .filter(|c| c.gauge_histogram_names().iter().any(|n| n == name))
+            .map(|c| c.gauge_histogram_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+
     /// The longest of the intervals of the recordings holding `name`.
     fn histogram_interval(&self, name: &str) -> f64 {
         self.children
@@ -243,6 +288,10 @@ impl DataSource for RecordingsSource {
         self.names(|c| c.histogram_names())
     }
 
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.names(|c| c.gauge_histogram_names())
+    }
+
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.listing(|c| c.counter_labels(name))
     }
@@ -253,6 +302,10 @@ impl DataSource for RecordingsSource {
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.listing(|c| c.histogram_labels(name))
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|c| c.gauge_histogram_labels(name))
     }
 
     fn recording_label_keys(&self) -> Vec<String> {

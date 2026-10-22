@@ -73,7 +73,7 @@ pub trait Metric: Send + Sync + 'static {
     /// The acquisition window is the interval over which the metric's value
     /// was read. Default: `None` — most metrics do not record a window. The
     /// windowed scalar wrappers (`WindowedLazyCounter`, `WindowedLazyGauge`)
-    /// and the base `RwLockHistogram` override this to return the window
+    /// and the base `RwLockCounterHistogram` override this to return the window
     /// recorded by `set_with_window`.
     fn load_window(&self) -> Option<Window> {
         None
@@ -86,7 +86,7 @@ pub trait Metric: Send + Sync + 'static {
     /// `load_window()` reads, which can tear under a concurrent
     /// `set_with_window`. Default: `(self.value(), None)`. The windowed scalar
     /// wrappers (`WindowedLazyCounter`, `WindowedLazyGauge`) and the base
-    /// `RwLockHistogram` override this to read both the value and the window
+    /// `RwLockCounterHistogram` override this to read both the value and the window
     /// under a single acquisition of their window lock, so the pair is never
     /// torn.
     fn value_with_window(&self) -> (Option<Value<'_>>, Option<Window>) {
@@ -118,7 +118,10 @@ pub enum Value<'a> {
     /// A gauge value.
     Gauge(i64),
 
-    /// A histogram metric that can produce snapshots.
+    /// A counting histogram: each bucket counts the events recorded since
+    /// the histogram was created (metriken's `AtomicCounterHistogram` and
+    /// `RwLockCounterHistogram`), so a reader differences two readings.
+    #[doc(alias = "CounterHistogram")]
     Histogram(&'a dyn HistogramMetric),
 
     /// A group of counter metrics with per-entry metadata.
@@ -129,6 +132,18 @@ pub enum Value<'a> {
 
     /// A group of histogram metrics with per-entry metadata.
     HistogramGroup(&'a dyn HistogramGroupMetric),
+
+    /// A histogram whose buckets are the current state of something (how
+    /// many items of each size exist now), not a count of events since the
+    /// histogram was created. Each write replaces every bucket, so a bucket
+    /// can go down, and a reader must not take a difference between two
+    /// readings.
+    ///
+    /// A separate variant rather than a property of [`HistogramMetric`]: a
+    /// consumer that predates it reaches its wildcard arm and skips the
+    /// metric, where a property it does not know would be ignored and the
+    /// state read as cumulative counts.
+    GaugeHistogram(&'a dyn HistogramMetric),
 
     /// The value of the metric could not be represented using the other `Value`
     /// variants.

@@ -118,6 +118,7 @@ fn snapshot(t: u64) -> Snapshot {
         counters,
         gauges,
         histograms,
+        gauge_histograms: Vec::new(),
     };
     let fixed_schema = GroupSchema {
         counters: Vec::new(),
@@ -129,6 +130,7 @@ fn snapshot(t: u64) -> Snapshot {
                 .collect(),
         }],
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     };
     let fixed = GroupSnapshot {
         name: "memory/meminfo".to_string(),
@@ -139,6 +141,7 @@ fn snapshot(t: u64) -> Snapshot {
         counters: Vec::new(),
         gauges: vec![Some(1_000_000 - t as i64)],
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     };
     Snapshot::V3(SnapshotV3 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
@@ -418,6 +421,7 @@ fn a_v2_snapshot_is_written_one_table_per_sampler() {
                 Gauge::new("3".into(), window_tick as i64, meta("free", "mem", &[])).with_window(w),
             ],
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
     };
 
@@ -674,7 +678,7 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
 /// rather than misread.
 #[test]
 fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
-    use metriken_storage::format::{FORMAT_KEY, FORMAT_VERSION};
+    use metriken_storage::format::FORMAT_KEY;
     use metriken_storage::Catalog;
 
     let dir = tempfile::tempdir().unwrap();
@@ -711,7 +715,9 @@ fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
                 .into_iter()
                 .find(|e| e.key == FORMAT_KEY)
                 .and_then(|e| e.value);
-            assert_eq!(version, Some(FORMAT_VERSION.to_string()), "{table} #{seq}");
+            // Format 1: this recording holds no gauge histogram, the one
+            // column kind that needs format 2.
+            assert_eq!(version, Some("1".to_string()), "{table} #{seq}");
             segments += 1;
         }
     }
@@ -787,6 +793,7 @@ fn growing(t: u64) -> Snapshot {
         counters,
         gauges,
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     };
     Snapshot::V3(SnapshotV3 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
@@ -1484,6 +1491,7 @@ fn a_v2_backlog_seals_within_the_row_cap_with_its_labels() {
             ],
             gauges: vec![Gauge::new("2".into(), t as i64, meta("free", "none")).with_window(w)],
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
     };
     let dir = tempfile::tempdir().unwrap();
@@ -1542,6 +1550,7 @@ fn members_snapshot(t: u64, members: &[&str]) -> Snapshot {
             counters: Vec::new(),
             gauges,
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         }],
     })
 }
@@ -1769,6 +1778,7 @@ fn eviction_into_an_open_segment_answers_as_without_it() {
             ],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
     };
     let (evicted, kept) = (
@@ -1804,6 +1814,7 @@ fn unslotted(t: u64) -> Snapshot {
                         .collect(),
                 }],
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             };
             g.schema_hash = schema.hash();
             g.schema = Some(Arc::new(schema));

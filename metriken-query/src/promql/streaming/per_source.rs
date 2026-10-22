@@ -909,6 +909,36 @@ impl DataSource for Tap {
             .histogram_stream(name, filter, start_ns.max(self.lo), end_ns.min(self.hi))
     }
 
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.inner
+            .gauge_histogram_stream(name, filter, start_ns.max(self.lo), end_ns.min(self.hi))
+    }
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.inner.gauge_histogram_interval(name)
+    }
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        self.inner
+            .gauge_histogram_parts(name, filter, start_ns.max(self.lo), end_ns.min(self.hi))
+    }
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.inner.gauge_histogram_names()
+    }
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.gauge_histogram_labels(name)
+    }
+
     fn interval(&self) -> f64 {
         self.inner.interval()
     }
@@ -1075,6 +1105,64 @@ impl DataSource for GroupSource {
         }
         best.map_or(self.sources[0].as_ref(), |(s, _)| s)
             .histogram_stream(name, filter, start_ns, end_ns)
+    }
+    /// Every source's rows, merged: a series held by several sources is one
+    /// series, and a gauge histogram is read as the latest row at each time
+    /// (`super::gauge_histogram`), so the group counts once and no value
+    /// is a difference between rows of two sources. A reader evaluates
+    /// [`gauge_histogram_parts`](DataSource::gauge_histogram_parts), which
+    /// holds each source's rows for that source's interval; this merged
+    /// stream is for a caller that reads one stream.
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        HistogramStream::merge(
+            self.sources
+                .iter()
+                .filter_map(|s| s.gauge_histogram_stream(name, filter, start_ns, end_ns))
+                .collect(),
+        )
+    }
+    /// Every source's parts, each at its source's own interval: a series
+    /// two sources hold is one series, answered at each time by the latest
+    /// row of either that its own source still holds
+    /// (`super::gauge_histogram`). So a fine source's row is not held past
+    /// its own interval into a gap where a coarse source has no row, and a
+    /// coarse source's rows reach every step after a fine one ends.
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let parts: Vec<(HistogramStream, f64)> = self
+            .sources
+            .iter()
+            .filter_map(|s| s.gauge_histogram_parts(name, filter, start_ns, end_ns))
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then_some(parts)
+    }
+    /// The longest interval among the sources holding `name`: how far back
+    /// a read of the group's parts starts.
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.sources
+            .iter()
+            .filter(|s| s.gauge_histogram_names().iter().any(|n| n == name))
+            .map(|s| s.gauge_histogram_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.names(|s| s.gauge_histogram_names())
+    }
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.gauge_histogram_labels(name))
     }
     fn interval(&self) -> f64 {
         self.sources

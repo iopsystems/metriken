@@ -2461,6 +2461,7 @@ fn test_memory_store_label_values_ingest() {
             )],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         })
     }
 

@@ -14,6 +14,7 @@ pub struct CompositionCatalog {
     counters: BTreeSet<String>,
     gauges: BTreeSet<String>,
     histograms: BTreeSet<String>,
+    gauge_histograms: BTreeSet<String>,
     time_range_ns: Option<(u64, u64)>,
     interval_s: f64,
     metadata: HashMap<String, String>,
@@ -27,6 +28,7 @@ impl CompositionCatalog {
             counters: BTreeSet::new(),
             gauges: BTreeSet::new(),
             histograms: BTreeSet::new(),
+            gauge_histograms: BTreeSet::new(),
             time_range_ns: None,
             interval_s,
             metadata: HashMap::new(),
@@ -61,6 +63,18 @@ impl CompositionCatalog {
         S: Into<String>,
     {
         self.histograms.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Gauge histogram metric names the source holds. A child whose catalog
+    /// does not name them reads none of its gauge histograms.
+    pub fn gauge_histograms<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.gauge_histograms
+            .extend(names.into_iter().map(Into::into));
         self
     }
 
@@ -158,6 +172,34 @@ impl DataSource for LazySource {
             .histogram_stream(name, filter, start_ns, end_ns)
     }
 
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        if !self.catalog.gauge_histograms.contains(name) {
+            return None;
+        }
+        self.loaded()?
+            .gauge_histogram_stream(name, filter, start_ns, end_ns)
+    }
+
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        if !self.catalog.gauge_histograms.contains(name) {
+            return None;
+        }
+        self.loaded()?
+            .gauge_histogram_parts(name, filter, start_ns, end_ns)
+    }
+
     fn interval(&self) -> f64 {
         self.catalog.interval_s
     }
@@ -176,6 +218,10 @@ impl DataSource for LazySource {
 
     fn histogram_names(&self) -> Vec<String> {
         self.catalog.histograms.iter().cloned().collect()
+    }
+
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.catalog.gauge_histograms.iter().cloned().collect()
     }
 
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
@@ -202,6 +248,15 @@ impl DataSource for LazySource {
         }
         self.loaded()
             .map(|s| s.histogram_labels(name))
+            .unwrap_or_default()
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        if !self.catalog.gauge_histograms.contains(name) {
+            return Vec::new();
+        }
+        self.loaded()
+            .map(|s| s.gauge_histogram_labels(name))
             .unwrap_or_default()
     }
 

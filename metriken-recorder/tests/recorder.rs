@@ -1074,6 +1074,7 @@ impl LocalSource for Counting {
                 .into_iter()
                 .collect(),
             }],
+            gauge_histograms: Vec::new(),
         };
         let mut h = histogram::Histogram::new(4, 20).unwrap();
         h.add(1000, self.n).unwrap();
@@ -1085,6 +1086,7 @@ impl LocalSource for Counting {
             counters: Vec::new(),
             gauges: Vec::new(),
             histograms: vec![Some(h)],
+            gauge_histograms: Vec::new(),
         };
         Some((
             Snapshot::V3(SnapshotV3 {
@@ -1281,6 +1283,7 @@ impl LocalSource for Tiny {
             }],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         };
         let group = GroupSnapshot {
             name: format!("{}/g", self.name),
@@ -1290,6 +1293,7 @@ impl LocalSource for Tiny {
             counters: vec![Some(t)],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         };
         Some((
             Snapshot::V3(SnapshotV3 {

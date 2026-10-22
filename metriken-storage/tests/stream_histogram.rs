@@ -1,5 +1,5 @@
 //! GO check 6 of `docs/journal/2026-10-11-stream-route.md`, the long half: a
-//! `HistogramGroup` sent long by `GroupBuilder::build_stream` and decoded by
+//! `CounterHistogramGroup` sent long by `GroupBuilder::build_stream` and decoded by
 //! `StreamDecoder` gives each member's buckets, under its labels; the writer
 //! stages the decoded rows. The wide half is metriken-exposition's
 //! `histogram_group` test.
@@ -17,7 +17,7 @@ use metriken_storage::{
 };
 
 #[metric(name = "stream_hg_latency", metadata = { acq_group = "latency" })]
-static LATENCY: metriken::HistogramGroup = metriken::HistogramGroup::new(4, 4, 10);
+static LATENCY: metriken::CounterHistogramGroup = metriken::CounterHistogramGroup::new(4, 4, 10);
 
 #[test]
 fn a_histogram_group_sent_long_decodes_to_the_same_buckets() {

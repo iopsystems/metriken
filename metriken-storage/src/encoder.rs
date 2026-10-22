@@ -379,6 +379,7 @@ mod encode_after_tests {
                 .collect(),
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -394,6 +395,7 @@ mod encode_after_tests {
                 counters: vec![Some(ts as u64); n],
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             })
             .unwrap(),
         }

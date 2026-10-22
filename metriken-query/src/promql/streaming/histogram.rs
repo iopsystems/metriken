@@ -30,7 +30,7 @@ use crate::promql::{HistogramHeatmapResult, MatrixSample};
 use crate::types::HistogramSnapshot;
 
 /// One `apply_quantiles` output row: `(t_sec, value, optional bucket band)`.
-type QuantileRow = (f64, f64, Option<Band>);
+pub(super) type QuantileRow = (f64, f64, Option<Band>);
 
 /// Per-group value-uncertainty bands, parallel to a group's values. Aliased to
 /// keep `Option<GroupBands>` readable (clears clippy's `type_complexity`).
@@ -491,7 +491,7 @@ fn total_count(snap: &HistogramSnapshot) -> u64 {
 /// the true sum lies within `[Σ count·start, Σ count·end]`. The nominal sum
 /// (`total_count · mean`, where `mean` uses bucket midpoints) sits inside this
 /// band by construction. Returns `(lo, hi)`.
-fn bucket_weighted_sum(r: &CumulativeROHistogramRef<'_>) -> (f64, f64) {
+pub(super) fn bucket_weighted_sum(r: &CumulativeROHistogramRef<'_>) -> (f64, f64) {
     let mut lo = 0.0f64;
     let mut hi = 0.0f64;
     for bucket in r.iter() {
@@ -506,14 +506,14 @@ fn bucket_weighted_sum(r: &CumulativeROHistogramRef<'_>) -> (f64, f64) {
 /// the buckets added to since the last flush, so a flush costs the buckets
 /// touched rather than every bucket of the histogram. Indices at or past the
 /// histogram's bucket count belong to no bucket and are ignored.
-struct Accum {
+pub(super) struct Accum {
     counts: Vec<u64>,
     touched: Vec<u32>,
     buckets: usize,
 }
 
 impl Accum {
-    fn new(config: Config) -> Self {
+    pub(super) fn new(config: Config) -> Self {
         Self {
             counts: Vec::new(),
             touched: Vec::new(),
@@ -521,7 +521,7 @@ impl Accum {
         }
     }
 
-    fn add(&mut self, idx: u32, c: u64) {
+    pub(super) fn add(&mut self, idx: u32, c: u64) {
         let i = idx as usize;
         if i >= self.buckets {
             return;
@@ -577,6 +577,20 @@ fn delta_walk(prev: &HistogramSnapshot, curr: &HistogramSnapshot, mut f: impl Fn
 
 // ─── Internal implementations ────────────────────────────────────────────────
 
+/// The quantiles that parse, each with its position in `quantiles_in`, and
+/// their values in that order.
+pub(super) type QuantileKeys = (Vec<(usize, f64, Quantile)>, Vec<f64>);
+
+pub(super) fn quantile_keys(quantiles_in: &[f64]) -> QuantileKeys {
+    let keys: Vec<(usize, f64, Quantile)> = quantiles_in
+        .iter()
+        .enumerate()
+        .filter_map(|(i, q)| Quantile::new(*q).ok().map(|qk| (i, *q, qk)))
+        .collect();
+    let floats = keys.iter().map(|(_, q, _)| *q).collect();
+    (keys, floats)
+}
+
 fn quantiles_impl(
     stream: HistogramStream,
     quantiles_in: &[f64],
@@ -592,15 +606,10 @@ fn quantiles_impl(
         return vec![];
     }
 
-    let quantile_keys: Vec<(usize, f64, Quantile)> = quantiles_in
-        .iter()
-        .enumerate()
-        .filter_map(|(i, q)| Quantile::new(*q).ok().map(|qk| (i, *q, qk)))
-        .collect();
+    let (quantile_keys, quantile_floats) = quantile_keys(quantiles_in);
     if quantile_keys.is_empty() {
         return vec![];
     }
-    let quantile_floats: Vec<f64> = quantile_keys.iter().map(|(_, q, _)| *q).collect();
 
     // Per point: (ts_sec, value, Some([bucket.start, bucket.end])) — the value
     // quantization band from the bucket the quantile lands in.
@@ -694,6 +703,16 @@ fn quantiles_impl(
         }
     }
 
+    quantile_samples(quantiles_in, outputs, metric_name)
+}
+
+/// The quantiles' points as one `MatrixSample` per quantile with points,
+/// labelled `quantile`, each point's bucket band as its interval.
+pub(super) fn quantile_samples(
+    quantiles_in: &[f64],
+    mut outputs: Vec<Vec<QuantileRow>>,
+    metric_name: &str,
+) -> Vec<MatrixSample> {
     let mut samples = Vec::with_capacity(outputs.len());
     for (i, q) in quantiles_in.iter().enumerate() {
         let rows = std::mem::take(&mut outputs[i]);
@@ -1178,7 +1197,11 @@ fn heatmap_impl(
 /// The cumulative is `u64`: one tick or stride summed over several series
 /// can exceed `u32::MAX` observations, and a `u32` cumulative would have to
 /// clip it, which moves every quantile above the clip point down.
-fn flush_accum(accum: &mut Accum, scratch_idx: &mut Vec<u32>, scratch_cnt: &mut Vec<u64>) -> bool {
+pub(super) fn flush_accum(
+    accum: &mut Accum,
+    scratch_idx: &mut Vec<u32>,
+    scratch_cnt: &mut Vec<u64>,
+) -> bool {
     scratch_idx.clear();
     scratch_cnt.clear();
     accum.touched.sort_unstable();
@@ -1196,7 +1219,7 @@ fn flush_accum(accum: &mut Accum, scratch_idx: &mut Vec<u32>, scratch_cnt: &mut 
     !scratch_idx.is_empty()
 }
 
-fn apply_quantiles(
+pub(super) fn apply_quantiles(
     config: Config,
     idx: &[u32],
     cnt: &[u64],
@@ -1220,7 +1243,7 @@ fn apply_quantiles(
     }
 }
 
-fn assign_group_index(group_keys: &mut Vec<Labels>, key: Labels) -> usize {
+pub(super) fn assign_group_index(group_keys: &mut Vec<Labels>, key: Labels) -> usize {
     match group_keys.iter().position(|k| k == &key) {
         Some(i) => i,
         None => {
@@ -1230,7 +1253,7 @@ fn assign_group_index(group_keys: &mut Vec<Labels>, key: Labels) -> usize {
     }
 }
 
-fn build_grouped_output(
+pub(super) fn build_grouped_output(
     metric_name: &str,
     group_keys: Vec<Labels>,
     values_per_group: Vec<Vec<(f64, f64)>>,

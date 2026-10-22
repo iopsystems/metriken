@@ -29,21 +29,13 @@ use tracing::warn;
 use super::rez::{dedup_key, entries_approx_bytes, group_approx_bytes, group_by_sampler};
 use super::rez_sqlite::{RecordingMeta, RezDb, SegmentMeta, TickBatch, WalRow};
 use super::seal_policy::{SealPolicy, SegmentAccount};
-use super::wal::{
-    decode_wal_group_row, encode_wal_group_row, encode_wal_row, materialize_wal_tail,
-    wal_group_row, WalCell,
-};
-use super::wire::AgentRows;
+#[cfg(test)]
+use super::wal::materialize_wal_tail;
+use super::wal::{encode_wal_group_row, encode_wal_row, wal_group_row, WalCell};
 
-/// A schema's `(counters, gauges, histograms)` slot counts — what
-/// [`AgentRow`](crate::rez::wire::AgentRow)'s `arity` is compared against.
-fn schema_arity(s: &crate::schema::GroupSchema) -> (u32, u32, u32) {
-    (
-        s.counters.len() as u32,
-        s.gauges.len() as u32,
-        s.histograms.len() as u32,
-    )
-}
+/// A group's schema without its gauge histograms: the producer hash it was
+/// made from, the schema, and its own hash.
+type Stripped = ((u64, u64), Arc<crate::schema::GroupSchema>, (u64, u64));
 
 /// Everything known when the recording starts. v3 has no manifest and no
 /// per-recording tar directory — a recording IS a row in `recordings` — so the
@@ -923,7 +915,7 @@ fn seal_batch(
         // removes a prefix, never punches a hole), so the last row is never
         // itself skipped. `first_ts`/`rows` are NOT this simple — see below.
         let (last_ts, wall_offset) = (last.ts, last.wall_offset);
-        let Some(tail) = materialize_wal_tail(&sampler, &rows)
+        let Some(tail) = crate::wal::materialize_rez_wal_tail(&sampler, &rows)
             .map_err(|e| format!("failed to encode a {sampler} segment: {e}"))?
         else {
             continue;
@@ -1065,6 +1057,10 @@ pub struct StreamRecorderV3 {
     /// each, keyed by an arbitrary distinguishing string built from the group
     /// name and the reason.
     warned: HashSet<String>,
+    /// Per V3 group holding gauge histograms: the producer schema hash, and
+    /// the schema without its gauge histograms with that schema's own hash,
+    /// which is what the `.rez` records (see `ingest_v3`).
+    stripped: HashMap<String, Stripped>,
     /// Schema-hash cache hit/miss counts, exposed for tests.
     schema_stats: SchemaCacheStats,
     handle: RecordingWriter,
@@ -1109,6 +1105,7 @@ impl StreamRecorderV3 {
             schemas: HashMap::new(),
             segment_schema: BTreeMap::new(),
             warned: HashSet::new(),
+            stripped: HashMap::new(),
             schema_stats: SchemaCacheStats::default(),
             handle,
             policy,
@@ -1430,16 +1427,51 @@ impl StreamRecorderV3 {
             // cache hit. This is what keeps a group's WAL rows self-sufficient
             // for `materialize_wal_tail`, called by a reader process with no
             // access to this cache at all.
-            let need_anchor = self.segment_schema.get(g.name.as_str()) != Some(&g.schema_hash);
+            // `.rez` is frozen at its pre-6.0 shape, which has no gauge
+            // histogram: a group's gauge histograms are left out (the schema
+            // without them, under its own hash, and no values), warned once
+            // per process. A group holding nothing else is not written. The
+            // stripped schema and its hash are kept per group, for the
+            // producer hash they were made from, so a tick with an unchanged
+            // schema pays neither the clone nor the hash again.
+            let (schema, schema_hash) =
+                if g.gauge_histograms.is_empty() && schema.gauge_histograms.is_empty() {
+                    (schema, g.schema_hash)
+                } else {
+                    crate::rez::rez::gauge_histograms_left_out();
+                    if g.counters.is_empty() && g.gauges.is_empty() && g.histograms.is_empty() {
+                        continue;
+                    }
+                    match self.stripped.get(g.name.as_str()) {
+                        Some((from, stripped, hash)) if *from == g.schema_hash => {
+                            (std::sync::Arc::clone(stripped), *hash)
+                        }
+                        _ => {
+                            let mut without = schema.as_ref().clone();
+                            without.gauge_histograms.clear();
+                            let hash = without.hash();
+                            let without = std::sync::Arc::new(without);
+                            self.stripped.insert(
+                                g.name.clone(),
+                                (g.schema_hash, std::sync::Arc::clone(&without), hash),
+                            );
+                            (without, hash)
+                        }
+                    }
+                };
+            let need_anchor = self.segment_schema.get(g.name.as_str()) != Some(&schema_hash);
             if need_anchor {
-                self.segment_schema.insert(g.name.clone(), g.schema_hash);
+                self.segment_schema.insert(g.name.clone(), schema_hash);
             }
 
             // The ingest boundary: the producer's schema becomes the
-            // archive's on the way into the WAL. `wal_group_row` is shared
-            // with the row-format wire so the two cannot drift on what a
-            // row's values are — see its doc.
-            let row = wal_group_row(g, need_anchor.then(|| schema.as_ref().clone()));
+            // archive's on the way into the WAL. `wal_group_row` builds the
+            // row from the snapshot; for a group with gauge histograms the
+            // hash becomes the stripped schema's and the gauge-histogram
+            // slots are dropped, since `.rez` has none.
+            let mut row = wal_group_row(g, need_anchor.then(|| schema.as_ref().clone()));
+            row.schema_hash = schema_hash;
+            row.gauge_histograms.clear();
             wal_rows.push(WalRow {
                 sampler: g.name.clone(),
                 ts: anchored_ts,
@@ -1463,195 +1495,6 @@ impl StreamRecorderV3 {
         Ok(wal_rows)
     }
 
-    /// Ingest one scrape's worth of pre-encoded rows, committing the tick —
-    /// the row-format wire's [`ingest`](Self::ingest).
-    pub fn ingest_rows(
-        &mut self,
-        rows: &AgentRows,
-        anchored_ts: u64,
-        wall_offset_ns: i64,
-    ) -> Result<(), String> {
-        let rows = self.stage_rows(rows, anchored_ts, wall_offset_ns)?;
-        self.handle.wal(rows)
-    }
-
-    /// Build this tick's WAL rows from a producer that already encoded them.
-    ///
-    /// **Decision for decision, this is `ingest_v3`**: the
-    /// same duplicate-in-tick rule, the same window-advance dedup in the same
-    /// position, the same validation, the same schema ring (literally the
-    /// same — see `resolve_schema`), the same
-    /// per-segment re-anchor, and the same two-pass split between what can
-    /// fail and what advances state. It has to be: pointing a recorder at the
-    /// row endpoint rather than the snapshot endpoint changes a TRANSPORT,
-    /// and a transport that changed what landed in the archive would be a
-    /// trap. `a_row_recording_and_a_snapshot_recording_agree` pins the two
-    /// against each other over a run that exercises dedup, a schema change
-    /// and a segment rotation.
-    ///
-    /// What differs is only where each decision reads from: `ingest_v3` holds
-    /// a decoded [`GroupSnapshot`] and builds a payload out of it, while here
-    /// the payload arrived already built and every decision is made against
-    /// `AgentRow`'s cleartext fields instead. [`crate::rez::wire`] documents why
-    /// each of those fields is in the clear; the short version is that a pipe
-    /// which had to decode each row to route it would not be a pipe.
-    ///
-    /// **The one thing this path does that the producer could not.** A row
-    /// arrives carrying no schema, because the producer has no idea when THIS
-    /// archive last rotated a segment — segments are the consumer's business,
-    /// and two recorders scraping one agent rotate independently. So on the
-    /// rare tick where a group must re-anchor, the payload is decoded and
-    /// re-encoded with its schema attached. That is the entire cost of the
-    /// indirection, and it is metered by the seal policy rather than by the
-    /// scrape interval: once per group per segment, against a 300 s default
-    /// `max_age`. Every other tick moves a `Vec<u8>` into a [`WalRow`].
-    pub fn stage_rows(
-        &mut self,
-        rows: &AgentRows,
-        anchored_ts: u64,
-        wall_offset_ns: i64,
-    ) -> Result<Vec<WalRow>, String> {
-        let mut wal_rows = Vec::new();
-        let mut accepted: Vec<(&str, u64, usize)> = Vec::new();
-        // `ingest_v3`'s guard, for `ingest_v3`'s reason: two rows sharing a
-        // stream name in one tick would both clear the dedup below (which
-        // compares against the PREVIOUS tick, not this one) and then collide
-        // on the `wal` primary key, failing the whole tick and killing the
-        // writer. First occurrence wins.
-        let mut seen_this_tick: HashSet<&str> = HashSet::new();
-        for r in &rows.rows {
-            debug_assert!(
-                r.stream.contains('/'),
-                "stream {:?} contains no '/', which materialize_wal_tail's \
-                 is_group_table_key requires to route a V3 acquisition-group table to the \
-                 group decode path — this row would be misrouted to the V1/V2 cell path",
-                r.stream
-            );
-            if !seen_this_tick.insert(r.stream.as_str()) {
-                if self
-                    .warned
-                    .insert(format!("{}#duplicate-in-tick", r.stream))
-                {
-                    warn!(
-                        "stream {} appears more than once in one tick; keeping the first \
-                         occurrence and skipping the rest (warned once)",
-                        r.stream
-                    );
-                }
-                continue;
-            }
-            // Dedup FIRST — before validation, before any schema work — so a
-            // window that has not advanced costs one comparison and nothing
-            // else, not even a look at the payload.
-            let key = r.window.map(|(_, end)| end).unwrap_or(anchored_ts);
-            if let Some(&last) = self.last_keys.get(r.stream.as_str()) {
-                if key <= last {
-                    continue;
-                }
-            }
-
-            // `GroupSnapshot::validate`, read off the cleartext. It checks a
-            // TRANSMITTED schema only — returning `Ok` outright when there is
-            // none — so this does too, and the resolved-schema case is caught
-            // by the arity check below, exactly as on the snapshot path.
-            if let Some(s) = &r.schema {
-                if schema_arity(s) != r.arity || s.hash() != r.schema_hash {
-                    if self.warned.insert(format!("{}#invalid", r.stream)) {
-                        warn!(
-                            "stream {} sent a schema that does not describe its own row (arity \
-                             or hash mismatch); skipping until it recovers (warned once)",
-                            r.stream
-                        );
-                    }
-                    continue;
-                }
-            }
-
-            let Some(schema) = self.resolve_schema(&r.stream, r.schema_hash, {
-                r.schema
-                    .as_ref()
-                    .map(|s| move || crate::schema::GroupSchema::clone(s))
-            }) else {
-                continue;
-            };
-
-            // The check `validate()` structurally cannot make: a schema
-            // resolved from the ring was never compared against THIS row.
-            if schema_arity(&schema) != r.arity {
-                if self.warned.insert(format!("{}#arity", r.stream)) {
-                    warn!(
-                        "stream {} values do not match its resolved schema's arity; skipping \
-                         (warned once)",
-                        r.stream
-                    );
-                }
-                continue;
-            }
-
-            let need_anchor = self.segment_schema.get(r.stream.as_str()) != Some(&r.schema_hash);
-            if need_anchor {
-                self.segment_schema.insert(r.stream.clone(), r.schema_hash);
-            }
-
-            // The only place this path touches a payload at all.
-            //
-            // The decode is also the one chance to check that the payload's
-            // own `schema_hash` agrees with the cleartext one every decision
-            // above was made against. It cannot be checked on a passthrough
-            // tick without decoding — which is the whole point of the wire —
-            // but a group re-anchors at least once per segment, so a producer
-            // whose two hashes disagree is caught within a segment rather than
-            // never. Left undetected it would be quietly corrosive: the row
-            // would carry a schema resolved for one hash and a `schema_hash`
-            // naming another, and `materialize_group_wal_tail` would then read
-            // every following row as unanchored and drop it.
-            let row = if need_anchor {
-                let mut decoded = decode_wal_group_row(&r.row)?;
-                if decoded.schema_hash != r.schema_hash {
-                    if self
-                        .warned
-                        .insert(format!("{}#hash-disagreement", r.stream))
-                    {
-                        warn!(
-                            "stream {} declares schema hash {:?} but its payload carries {:?}; \
-                             skipping (warned once)",
-                            r.stream, r.schema_hash, decoded.schema_hash
-                        );
-                    }
-                    // Undo the anchor claim: nothing was written, so the next
-                    // well-formed row for this group must still anchor.
-                    self.segment_schema.remove(r.stream.as_str());
-                    continue;
-                }
-                decoded.schema = Some(schema.as_ref().clone());
-                encode_wal_group_row(&decoded)?
-            } else {
-                r.row.clone()
-            };
-
-            wal_rows.push(WalRow {
-                sampler: r.stream.clone(),
-                ts: anchored_ts,
-                wall_offset: wall_offset_ns,
-                row,
-            });
-            accepted.push((r.stream.as_str(), key, r.approx_bytes as usize));
-        }
-
-        // Pass 2: infallible, same shape as `ingest_v3`'s.
-        let stagger_key = self.handle.stagger_key().to_string();
-        for (name, key, bytes) in accepted {
-            self.last_keys.insert(name.to_string(), key);
-            let policy = &self.policy;
-            let stagger_key = stagger_key.as_str();
-            self.accounts
-                .entry(name.to_string())
-                .or_insert_with(|| SegmentAccount::open_first(name, stagger_key, policy))
-                .add_row(bytes);
-        }
-        Ok(wal_rows)
-    }
-
     /// Resolve one group's schema through the ring: `transmitted` either
     /// teaches the ring a generation or confirms one it holds, and a row that
     /// transmitted nothing must find its hash already there.
@@ -1660,14 +1503,6 @@ impl StreamRecorderV3 {
     /// schema this recorder has never been taught, which the doc on
     /// [`schemas`](Self::schemas) calls a producer bug, a truncated payload,
     /// or a generation older than the ring, not steady state.
-    ///
-    /// **Shared by both transports on purpose.** `ingest_v3` reaches it with
-    /// a schema decoded out of a snapshot and `stage_rows` with one off the
-    /// row wire, and they must populate ONE ring: a recorder that resolved
-    /// row-wire hashes against a separate cache would re-learn every schema
-    /// it already knew, and the two would disagree about which generations
-    /// are live. The ring is keyed by group name and hash, neither of which
-    /// depends on how the schema arrived.
     ///
     /// **`transmitted` is a closure, not a schema.** Materializing the
     /// producer's schema into the archive's own type costs a full deep clone
@@ -3222,6 +3057,7 @@ mod tests {
                 m.insert("max_value_power".to_string(), "8".to_string());
                 ExpHistogram::new("2".to_string(), h, m).with_window(w)
             }],
+            gauge_histograms: Vec::new(),
         })
     }
 
@@ -3486,6 +3322,7 @@ mod tests {
                 counters: members.iter().map(|n| desc(n)).collect(),
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3494,6 +3331,7 @@ mod tests {
                 counters: Vec::new(),
                 gauges: members.iter().map(|n| desc(n)).collect(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3511,6 +3349,7 @@ mod tests {
                 counters: Vec::new(),
                 gauges,
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3529,6 +3368,7 @@ mod tests {
                 counters,
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3709,6 +3549,200 @@ mod tests {
                  (no `<m>:window_begin`/`<m>:window_width` columns exist to \
                  decode, so every per-column window slot stays `None`)"
             );
+        }
+
+        /// `.rez` records no gauge histogram: a V3 group's gauge histogram is
+        /// left out (no `gauge_histogram` column, the segment format 1, with
+        /// a warning), and the rest of the group is recorded, its counting
+        /// histogram as `histogram`, the string every pre-6.0 `.rez` holds.
+        /// A V1/V2 snapshot's counting histogram seals into the `.rez` as
+        /// `histogram`, the pre-6.0 string.
+        #[test]
+        fn a_v2_counting_histogram_seals_as_histogram() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("out.rez");
+            let (_archive, mut rec, rid) = recorder(&path, seals_immediately());
+            let h = metriken_model::Histogram::new(
+                "5".to_string(),
+                histogram::Histogram::new(0, 8).unwrap(),
+                [
+                    ("sampler".to_string(), "io".to_string()),
+                    ("metric".to_string(), "lat".to_string()),
+                    ("grouping_power".to_string(), "0".to_string()),
+                    ("max_value_power".to_string(), "8".to_string()),
+                ]
+                .into(),
+            );
+            let ts = 1_000_000_000u64;
+            let snapshot = Snapshot::V2(metriken_model::SnapshotV2 {
+                systemtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ts),
+                duration: std::time::Duration::from_millis(1),
+                metadata: Default::default(),
+                counters: Vec::new(),
+                gauges: Vec::new(),
+                histograms: vec![h],
+                gauge_histograms: Vec::new(),
+            });
+            rec.ingest(&snapshot, ts, 0).unwrap();
+            rec.maybe_seal().unwrap();
+            rec.sync().unwrap();
+            let db = RezDb::open(&path).unwrap();
+            let segs = db.read_segments(rid, "io").unwrap();
+            assert_eq!(segs.len(), 1);
+            let table =
+                crate::rez::rez::read_table_parquet("io".to_string(), segs[0].bytes.clone())
+                    .unwrap();
+            assert_eq!(
+                table.columns[0]
+                    .metadata
+                    .get("metric_type")
+                    .map(String::as_str),
+                Some("histogram")
+            );
+        }
+
+        /// The stripped schema is made once per producer schema: a second
+        /// tick reuses it (the same allocation), its rows carry the stripped
+        /// schema's hash with no gauge histogram slots, only the first row of
+        /// the segment anchors it, and a schema change replaces it.
+        #[test]
+        fn the_stripped_schema_is_made_once_per_producer_schema() {
+            use crate::wal::decode_wal_group_row;
+            let dir = tempfile::tempdir().unwrap();
+            let (_archive, mut rec, _rid) = recorder(&dir.path().join("out.rez"), never_seals());
+            let schema = |gauges: usize| GroupSchema {
+                gauges: (0..gauges)
+                    .map(|i| MetricDesc {
+                        name: format!("{}", 10 + i),
+                        metadata: [("metric".to_string(), format!("g{i}"))].into(),
+                    })
+                    .collect(),
+                gauge_histograms: vec![MetricDesc {
+                    name: "7".to_string(),
+                    metadata: [("metric".to_string(), "free".to_string())].into(),
+                }],
+                ..Default::default()
+            };
+            let group = |s: &GroupSchema, end: u64| GroupSnapshot {
+                name: "ext4/free".to_string(),
+                schema_hash: s.hash(),
+                schema: Some(std::sync::Arc::new(s.clone())),
+                window: Some(Window::new(end - 10, end)),
+                counters: Vec::new(),
+                gauges: vec![Some(1); s.gauges.len()],
+                histograms: Vec::new(),
+                gauge_histograms: vec![Some(histogram::Histogram::new(0, 8).unwrap())],
+            };
+            let one = schema(1);
+            let mut without = one.clone();
+            without.gauge_histograms.clear();
+            let rows1 = rec.ingest_v3(&[group(&one, 1_000)], 1_000, 0).unwrap();
+            let held = std::sync::Arc::clone(&rec.stripped["ext4/free"].1);
+            let rows2 = rec.ingest_v3(&[group(&one, 2_000)], 2_000, 0).unwrap();
+            assert!(
+                std::sync::Arc::ptr_eq(&held, &rec.stripped["ext4/free"].1),
+                "the second tick reuses the stripped schema"
+            );
+            let (r1, r2) = (
+                decode_wal_group_row(&rows1[0].row).unwrap(),
+                decode_wal_group_row(&rows2[0].row).unwrap(),
+            );
+            for r in [&r1, &r2] {
+                assert_eq!(r.schema_hash, without.hash());
+                assert!(r.gauge_histograms.is_empty());
+                assert_eq!(r.gauges, [Some(1)]);
+            }
+            assert_eq!(r1.schema.as_ref().map(|s| s.hash()), Some(without.hash()));
+            assert!(r2.schema.is_none(), "anchored once per segment");
+            // A schema change: a new entry, still one per group.
+            let two = schema(2);
+            rec.ingest_v3(&[group(&two, 3_000)], 3_000, 0).unwrap();
+            assert_eq!(rec.stripped.len(), 1);
+            assert_eq!(rec.stripped["ext4/free"].0, two.hash());
+            assert!(!std::sync::Arc::ptr_eq(&held, &rec.stripped["ext4/free"].1));
+        }
+
+        #[test]
+        fn v3_group_gauge_histogram_is_left_out() {
+            use parquet::file::reader::FileReader;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("out.rez");
+            let (_archive, mut rec, rid) = recorder(&path, seals_immediately());
+            let schema = GroupSchema {
+                gauges: vec![MetricDesc {
+                    name: "6".to_string(),
+                    metadata: [("metric".to_string(), "mem".to_string())].into(),
+                }],
+                histograms: vec![MetricDesc {
+                    name: "8".to_string(),
+                    metadata: [("metric".to_string(), "lat".to_string())].into(),
+                }],
+                gauge_histograms: vec![MetricDesc {
+                    name: "7".to_string(),
+                    metadata: [("metric".to_string(), "free".to_string())].into(),
+                }],
+                ..Default::default()
+            };
+            let mut h = histogram::Histogram::new(0, 8).unwrap();
+            h.as_mut_slice()[1] = 3;
+            let g = GroupSnapshot {
+                name: "ext4/free".to_string(),
+                schema_hash: schema.hash(),
+                schema: Some(std::sync::Arc::new(schema)),
+                window: None,
+                counters: Vec::new(),
+                gauges: vec![Some(42)],
+                histograms: vec![Some(h.clone())],
+                gauge_histograms: vec![Some(h)],
+            };
+            let left_out = || {
+                crate::rez::rez::GAUGE_HISTOGRAMS_LEFT_OUT
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let before = left_out();
+            let ts = 1_000_000_000u64;
+            rec.ingest(&v3_snap(ts, vec![g]), ts, 0).unwrap();
+            rec.maybe_seal().unwrap();
+            rec.sync().unwrap();
+            assert!(left_out() > before, "the writer said it left them out");
+            let db = RezDb::open(&path).unwrap();
+            let segs = db.read_segments(rid, "ext4/free").unwrap();
+            assert_eq!(segs.len(), 1);
+            let file = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(
+                segs[0].bytes.clone(),
+            ))
+            .unwrap();
+            let kv = file
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !kv.iter()
+                    .any(|e| e.key == crate::format::FORMAT_KEY && e.value.as_deref() != Some("1")),
+                "no format 2 segment: {kv:?}"
+            );
+            let table =
+                crate::rez::rez::read_table_parquet("ext4/free".to_string(), segs[0].bytes.clone())
+                    .unwrap();
+            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["6", "8"],
+                "the gauge and the counting histogram are recorded, the gauge histogram is not"
+            );
+            let lat = table.columns.iter().find(|c| c.name == "8").unwrap();
+            assert_eq!(
+                lat.metadata.get("metric_type").map(String::as_str),
+                Some("histogram"),
+                "a counting histogram keeps the pre-6.0 `histogram` string in a .rez"
+            );
+            assert!(table.columns.iter().all(|c| c
+                .metadata
+                .get("metric_type")
+                .map(String::as_str)
+                != Some("gauge_histogram")));
         }
 
         #[test]
@@ -3945,6 +3979,7 @@ mod tests {
                     counters: vec![Some(1)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
                 .unwrap(),
             };
@@ -3959,6 +3994,7 @@ mod tests {
                     counters: vec![Some(2)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
                 .unwrap(),
             };
@@ -4001,6 +4037,7 @@ mod tests {
                     counters: vec![Some(1)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
                 .unwrap(),
             };
@@ -4225,512 +4262,10 @@ mod tests {
             );
         }
 
-        /// The row-format wire (`crate::rez::wire`) is a TRANSPORT, and the claim
-        /// it makes is that choosing it changes nothing about the archive.
-        ///
-        /// These tests are the enforcement. They drive two recorders in
-        /// lockstep over the same producer ticks — one fed snapshots, one fed
-        /// the same ticks encoded as rows — and require the staged WAL rows to
-        /// be equal as BYTES, along with the seal accounting that decides
-        /// where segments break. Comparing the decoded values would miss
-        /// exactly the failures worth catching: a schema anchored on a
-        /// different tick, a window dropped in transcription, a field
-        /// reordered.
+        /// The row-format wire's encoder (`crate::rez::wire`).
         mod row_wire {
             use super::*;
             use crate::rez::wire;
-
-            /// Stage one tick through both transports and require the result
-            /// to be identical.
-            fn both(
-                snap_rec: &mut StreamRecorderV3,
-                row_rec: &mut StreamRecorderV3,
-                groups: Vec<GroupSnapshot>,
-                ts: u64,
-            ) -> Vec<WalRow> {
-                let snapshot = v3_snap(ts, groups);
-                let rows =
-                    wire::encode_snapshot(&snapshot, 0, 0, &mut crate::stream::SchemaCache::new())
-                        .unwrap();
-                // Through the wire, not merely through the conversion: an
-                // `AgentRows` that failed to round-trip would still compare
-                // equal if we never encoded it.
-                let wire_bytes = wire::encode(&rows).unwrap();
-                let rows = wire::decode(&wire_bytes).unwrap();
-
-                let from_snapshot = snap_rec.stage(&snapshot, ts, 0).unwrap();
-                let from_rows = row_rec.stage_rows(&rows, ts, 0).unwrap();
-                assert_eq!(
-                    from_snapshot, from_rows,
-                    "the two transports staged different WAL rows at ts={ts}"
-                );
-                from_snapshot
-            }
-
-            /// The whole claim, over a run that exercises every decision the
-            /// two paths make independently: a first anchor, steady ticks that
-            /// must NOT re-anchor, a window that does not advance (dedup), a
-            /// schema change mid-run, and a segment rotation that forces a
-            /// re-anchor of a schema the producer did not resend.
-            #[test]
-            fn a_row_recording_and_a_snapshot_recording_agree() {
-                let dir = tempfile::tempdir().unwrap();
-                // `max_rows = 4`: small enough that the run below rotates,
-                // large enough that the rotation lands mid-run rather than on
-                // every tick, so the "steady tick does not re-anchor" case is
-                // actually exercised.
-                let (_a1, mut snap_rec, _) = recorder(&dir.path().join("snap.rez"), policy(4));
-                let (_a2, mut row_rec, _) = recorder(&dir.path().join("rows.rez"), policy(4));
-
-                let v1 = group_schema(&["cpu/0", "cpu/1"]);
-                let v2 = group_schema(&["cpu/0", "cpu/1", "cpu/2"]);
-                let gauges = gauge_group_schema(&["mem/free"]);
-
-                let mut anchored = 0u64;
-                let mut window_end = 1_000u64;
-                let mut staged = 0usize;
-
-                for tick in 0..12u64 {
-                    anchored += 1_000;
-                    // Tick 5 repeats the previous window: the producer read
-                    // nothing new, and BOTH paths must drop it.
-                    if tick != 5 {
-                        window_end += 1_000;
-                    }
-                    let w = Some(Window::new(window_end - 500, window_end));
-                    // The schema changes at tick 7, and from tick 8 the
-                    // producer stops resending it (its own cache is warm) —
-                    // which is precisely when the consumer's per-segment
-                    // re-anchor has to supply one the wire did not carry.
-                    let (schema, counters) = if tick < 7 {
-                        (&v1, vec![Some(tick), Some(tick * 2)])
-                    } else {
-                        (&v2, vec![Some(tick), Some(tick * 2), Some(tick * 3)])
-                    };
-                    let rows = both(
-                        &mut snap_rec,
-                        &mut row_rec,
-                        vec![
-                            group_snapshot(
-                                "cpu/usage",
-                                schema,
-                                counters,
-                                w,
-                                tick != 8 && tick != 9,
-                            ),
-                            gauge_group_snapshot("mem/stats", &gauges, vec![Some(tick as i64)], w),
-                        ],
-                        anchored,
-                    );
-                    staged += rows.len();
-
-                    // Seal together, so the two recorders' segment_schema maps
-                    // rotate on the same tick and the next row has to
-                    // re-anchor on both.
-                    snap_rec.maybe_seal().unwrap();
-                    row_rec.maybe_seal().unwrap();
-                }
-
-                // Guard the scenario itself: a test that silently stopped
-                // staging rows would pass vacuously.
-                assert_eq!(
-                    staged, 22,
-                    "expected 2 groups x 12 ticks less the 2 deduped at tick 5"
-                );
-            }
-
-            /// A steady tick is a passthrough: the bytes the producer encoded
-            /// are the bytes that reach the WAL, with no decode and re-encode
-            /// in between. This is the performance claim, so it is asserted
-            /// rather than assumed.
-            #[test]
-            fn only_an_anchoring_tick_rewrites_the_payload() {
-                let dir = tempfile::tempdir().unwrap();
-                let (_a, mut rec, _) = recorder(&dir.path().join("rows.rez"), policy(1_000));
-                let schema = group_schema(&["cpu/0"]);
-
-                let mut payloads = Vec::new();
-                for tick in 0..3u64 {
-                    let w = Some(Window::new(tick * 1_000, tick * 1_000 + 500));
-                    let snapshot = v3_snap(
-                        (tick + 1) * 1_000,
-                        vec![group_snapshot(
-                            "cpu/usage",
-                            &schema,
-                            vec![Some(tick)],
-                            w,
-                            true,
-                        )],
-                    );
-                    let rows = wire::encode_snapshot(
-                        &snapshot,
-                        0,
-                        0,
-                        &mut crate::stream::SchemaCache::new(),
-                    )
-                    .unwrap();
-                    let staged = rec.stage_rows(&rows, (tick + 1) * 1_000, 0).unwrap();
-                    payloads.push((rows.rows[0].row.clone(), staged[0].row.clone()));
-                }
-
-                assert_ne!(
-                    payloads[0].0, payloads[0].1,
-                    "the first row of a segment must be rewritten to carry the schema \
-                     the producer left out"
-                );
-                for (tick, (sent, staged)) in payloads.iter().enumerate().skip(1) {
-                    assert_eq!(
-                        sent, staged,
-                        "tick {tick} is already anchored, so its payload must reach the \
-                         WAL untouched"
-                    );
-                }
-            }
-
-            /// The producer's payload never carries a schema, whatever its own
-            /// cache chose to transmit. Anchoring belongs to the consumer,
-            /// which is the invariant that lets two recorders with different
-            /// segment boundaries share one agent — so it is pinned here
-            /// rather than left to the prose.
-            #[test]
-            fn the_producer_never_anchors() {
-                let schema = group_schema(&["cpu/0"]);
-                for include_schema in [true, false] {
-                    let snapshot = v3_snap(
-                        1_000,
-                        vec![group_snapshot(
-                            "cpu/usage",
-                            &schema,
-                            vec![Some(1)],
-                            Some(Window::new(0, 500)),
-                            include_schema,
-                        )],
-                    );
-                    let rows = wire::encode_snapshot(
-                        &snapshot,
-                        0,
-                        0,
-                        &mut crate::stream::SchemaCache::new(),
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        rows.rows[0].schema.is_some(),
-                        include_schema,
-                        "the wire passes the producer's own cache decision through"
-                    );
-                    assert!(
-                        decode_wal_group_row(&rows.rows[0].row)
-                            .unwrap()
-                            .schema
-                            .is_none(),
-                        "the PAYLOAD must never carry a schema, transmitted or not"
-                    );
-                }
-            }
-
-            /// A row whose declared arity disagrees with its schema is
-            /// dropped, not written — the same disposition `validate()` gives
-            /// it on the snapshot path. Without the cleartext `arity` field
-            /// this check would require decoding every row, and skipping it
-            /// would make a recording's contents depend on its transport.
-            #[test]
-            fn a_row_that_disagrees_with_its_schema_is_dropped() {
-                let dir = tempfile::tempdir().unwrap();
-                let (_a, mut rec, _) = recorder(&dir.path().join("rows.rez"), policy(1_000));
-                let schema = group_schema(&["cpu/0", "cpu/1"]);
-                let snapshot = v3_snap(
-                    1_000,
-                    vec![group_snapshot(
-                        "cpu/usage",
-                        &schema,
-                        vec![Some(1), Some(2)],
-                        Some(Window::new(0, 500)),
-                        true,
-                    )],
-                );
-                let mut rows =
-                    wire::encode_snapshot(&snapshot, 0, 0, &mut crate::stream::SchemaCache::new())
-                        .unwrap();
-                rows.rows[0].arity = (3, 0, 0);
-
-                assert!(
-                    rec.stage_rows(&rows, 1_000, 0).unwrap().is_empty(),
-                    "a row that does not match its own schema must be skipped"
-                );
-            }
-
-            /// A row referencing a schema generation nobody ever transmitted
-            /// cannot be decoded by anything downstream, so it is skipped
-            /// rather than written — `ingest_v3`'s disposition for the same
-            /// input, reached through the shared `resolve_schema`.
-            #[test]
-            fn a_row_for_an_unknown_schema_is_dropped() {
-                let dir = tempfile::tempdir().unwrap();
-                let (_a, mut rec, _) = recorder(&dir.path().join("rows.rez"), policy(1_000));
-                let schema = group_schema(&["cpu/0"]);
-                let snapshot = v3_snap(
-                    1_000,
-                    vec![group_snapshot(
-                        "cpu/usage",
-                        &schema,
-                        vec![Some(1)],
-                        Some(Window::new(0, 500)),
-                        false,
-                    )],
-                );
-                let rows =
-                    wire::encode_snapshot(&snapshot, 0, 0, &mut crate::stream::SchemaCache::new())
-                        .unwrap();
-                assert!(rows.rows[0].schema.is_none());
-                assert!(
-                    rec.stage_rows(&rows, 1_000, 0).unwrap().is_empty(),
-                    "nothing taught this recorder the schema, so the row is undecodable"
-                );
-            }
-
-            /// A payload whose own `schema_hash` disagrees with the cleartext
-            /// one every routing decision was made against is dropped, and the
-            /// group is left un-anchored so a well-formed row can still claim
-            /// the segment. Caught on the anchoring tick — which every group
-            /// reaches at least once per segment — because checking it on a
-            /// passthrough would mean decoding the payload this wire exists
-            /// not to decode.
-            #[test]
-            fn a_payload_that_contradicts_its_own_header_is_dropped() {
-                let dir = tempfile::tempdir().unwrap();
-                let (_a, mut rec, _) = recorder(&dir.path().join("rows.rez"), policy(1_000));
-                let schema = group_schema(&["cpu/0"]);
-                let snapshot = v3_snap(
-                    1_000,
-                    vec![group_snapshot(
-                        "cpu/usage",
-                        &schema,
-                        vec![Some(1)],
-                        Some(Window::new(0, 500)),
-                        true,
-                    )],
-                );
-                let mut rows =
-                    wire::encode_snapshot(&snapshot, 0, 0, &mut crate::stream::SchemaCache::new())
-                        .unwrap();
-                // Rewrite the PAYLOAD's hash, leaving the cleartext intact.
-                let mut payload = decode_wal_group_row(&rows.rows[0].row).unwrap();
-                payload.schema_hash = (1, 2);
-                rows.rows[0].row = encode_wal_group_row(&payload).unwrap();
-
-                assert!(
-                    rec.stage_rows(&rows, 1_000, 0).unwrap().is_empty(),
-                    "a payload contradicting its header must be skipped"
-                );
-
-                // ...and the group must not be left holding an anchor it never
-                // wrote: a good row at the next tick still anchors.
-                let good = wire::encode_snapshot(
-                    &v3_snap(
-                        2_000,
-                        vec![group_snapshot(
-                            "cpu/usage",
-                            &schema,
-                            vec![Some(2)],
-                            Some(Window::new(1_000, 1_500)),
-                            true,
-                        )],
-                    ),
-                    0,
-                    0,
-                    &mut crate::stream::SchemaCache::new(),
-                )
-                .unwrap();
-                let staged = rec.stage_rows(&good, 2_000, 0).unwrap();
-                assert_eq!(staged.len(), 1);
-                assert!(
-                    decode_wal_group_row(&staged[0].row)
-                        .unwrap()
-                        .schema
-                        .is_some(),
-                    "the recovering row must carry the schema the dropped one never anchored"
-                );
-            }
-
-            /// Not a test — the measurement behind this wire's existence, kept
-            /// runnable so the numbers in
-            /// `docs/journal/2026-09-16-row-endpoint-schema-resend.md` can be
-            /// reproduced rather than taken on faith:
-            ///
-            /// ```text
-            /// cargo test -p rez --release row_transport_cost -- --ignored --nocapture
-            /// ```
-            ///
-            /// It reports two things, and the second is the point. Holding the
-            /// schema policy fixed, the row transport is worth little — it
-            /// trades one large encode for many small ones. Holding the
-            /// TRANSPORT fixed and changing only whether the producer resends
-            /// schemas is worth an order of magnitude. `#[ignore]` because it
-            /// prints timings rather than asserting, and a timing assertion on
-            /// CI hardware is a flake generator.
-            #[test]
-            #[ignore]
-            fn row_transport_cost() {
-                use std::time::Instant;
-
-                // A population shaped like a real host: a few wide groups
-                // (cgroups, per-CPU) carrying most of the members, plus a long
-                // tail of narrow ones. `delta` measures 45 groups / 3,560
-                // members; this is deliberately smaller so the test stays
-                // quick, which makes it CONSERVATIVE — the schema share grows
-                // with member count.
-                let mut pop: Vec<(String, GroupSchema, usize)> = Vec::new();
-                for (name, members) in [
-                    ("cgroup_cpu_usage/usage", 400usize),
-                    ("cpu_usage/usage", 128),
-                    ("cpu_perf/cycles", 128),
-                    ("scheduler_runqueue/latency", 64),
-                    ("network_traffic/traffic", 32),
-                    ("blockio_requests/requests", 32),
-                ] {
-                    let counters = (0..members)
-                        .map(|i| MetricDesc {
-                            name: format!("{i}"),
-                            metadata: [
-                                ("metric".to_string(), name.replace('/', "_")),
-                                (
-                                    "name".to_string(),
-                                    format!("/sys/fs/cgroup/system.slice/unit-{i}.service"),
-                                ),
-                                ("sampler".to_string(), "cgroup_cpu_usage".to_string()),
-                            ]
-                            .into_iter()
-                            .collect(),
-                        })
-                        .collect();
-                    pop.push((
-                        name.to_string(),
-                        GroupSchema {
-                            counters,
-                            gauges: Vec::new(),
-                            histograms: Vec::new(),
-                        },
-                        members,
-                    ));
-                }
-                for i in 0..20 {
-                    pop.push((
-                        format!("sampler_{i}/group"),
-                        group_schema(&["a", "b", "c", "d", "e", "f", "g", "h"]),
-                        8,
-                    ));
-                }
-                let total: usize = pop.iter().map(|(_, _, m)| m).sum();
-
-                const TICKS: u64 = 200;
-                let build = |tick: u64, resend: bool| -> Snapshot {
-                    let end = 1_000 + tick * 1_000;
-                    v3_snap(
-                        end,
-                        pop.iter()
-                            .map(|(name, schema, members)| GroupSnapshot {
-                                name: name.clone(),
-                                schema_hash: schema.hash(),
-                                schema: (resend || tick == 0).then(|| Arc::new(schema.clone())),
-                                window: Some(Window::new(end - 500, end)),
-                                counters: (0..*members)
-                                    .map(|i| Some(tick * 7 + i as u64))
-                                    .collect(),
-                                gauges: Vec::new(),
-                                histograms: Vec::new(),
-                            })
-                            .collect(),
-                    )
-                };
-
-                println!(
-                    "\n{total} metrics across {} groups, {TICKS} ticks",
-                    pop.len()
-                );
-                for resend in [true, false] {
-                    let dir = tempfile::tempdir().unwrap();
-                    println!(
-                        "\n-- producer resends every schema every tick: {resend} {}",
-                        if resend {
-                            "(what the agent does today)"
-                        } else {
-                            ""
-                        }
-                    );
-
-                    let (_a, mut rec, _) = recorder(&dir.path().join("s.rez"), policy(1_000));
-                    let (mut sa, mut sr, mut sb) = (0u128, 0u128, 0usize);
-                    for tick in 0..TICKS {
-                        let snap = build(tick, resend);
-                        let t = Instant::now();
-                        let body = rmp_serde::to_vec(&snap).unwrap();
-                        sa += t.elapsed().as_nanos();
-                        sb += body.len();
-                        let t = Instant::now();
-                        // `from_msgpack`, not a bare `from_slice`: it is what
-                        // the recorder actually calls (depth-cap and
-                        // trailing-byte hardening), and it is materially more
-                        // expensive than `from_slice` because `Snapshot` is an
-                        // untagged enum — so measuring the cheap one would
-                        // flatter the snapshot path against production.
-                        let decoded = Snapshot::from_msgpack(&body).unwrap();
-                        let staged = rec.stage(&decoded, 1_000 + tick * 1_000, 0).unwrap();
-                        sr += t.elapsed().as_nanos();
-                        std::hint::black_box(staged);
-                    }
-
-                    let (_a2, mut rec2, _) = recorder(&dir.path().join("r.rez"), policy(1_000));
-                    let (mut ra, mut rr, mut rb) = (0u128, 0u128, 0usize);
-                    for tick in 0..TICKS {
-                        let snap = build(tick, resend);
-                        let t = Instant::now();
-                        let rows = crate::rez::wire::encode_snapshot(
-                            &snap,
-                            0,
-                            0,
-                            &mut crate::stream::SchemaCache::new(),
-                        )
-                        .unwrap();
-                        let body = crate::rez::wire::encode(&rows).unwrap();
-                        ra += t.elapsed().as_nanos();
-                        rb += body.len();
-                        let t = Instant::now();
-                        let decoded = crate::rez::wire::decode(&body).unwrap();
-                        let staged = rec2.stage_rows(&decoded, 1_000 + tick * 1_000, 0).unwrap();
-                        rr += t.elapsed().as_nanos();
-                        std::hint::black_box(staged);
-                    }
-
-                    let per = |n: u128| n as f64 / TICKS as f64 / 1000.0;
-                    let kib = |n: usize| n as f64 / TICKS as f64 / 1024.0;
-                    println!(
-                        "   snapshot: agent {:>6.0} us  recorder {:>6.0} us  body {:>6.0} KiB",
-                        per(sa),
-                        per(sr),
-                        kib(sb)
-                    );
-                    println!(
-                        "   rows    : agent {:>6.0} us  recorder {:>6.0} us  body {:>6.0} KiB",
-                        per(ra),
-                        per(rr),
-                        kib(rb)
-                    );
-                    // NOTE: the row path's decode is `rmp_serde::from_slice`,
-                    // which is NOT hardened the way `Snapshot::from_msgpack`
-                    // is. Part of the recorder-side gap below is that
-                    // difference rather than the format, and hardening the row
-                    // decode would give some of it back.
-                    println!(
-                        "   transport alone: recorder {:.2}x, TOTAL CPU {:.2}x",
-                        sr as f64 / rr as f64,
-                        (sa + sr) as f64 / (ra + rr) as f64
-                    );
-                }
-                println!(
-                    "\nThe gap between the two blocks above — not the gap between the two \
-                     rows within a block — is what this wire is for.\n"
-                );
-            }
 
             /// A V2 snapshot has no acquisition groups, so it has no rows to
             /// serve. Returning an empty body would be indistinguishable to a

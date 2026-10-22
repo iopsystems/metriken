@@ -1,5 +1,5 @@
 //! GO check 6 of `docs/journal/2026-10-11-stream-route.md`, the wide half: a
-//! `HistogramGroup` through `GroupBuilder::build_groups` gives the members
+//! `CounterHistogramGroup` through `GroupBuilder::build_groups` gives the members
 //! and buckets `Snapshotter` gives. The long half, decoded by
 //! metriken-storage's `StreamDecoder`, is storage's `stream_histogram` test.
 //!
@@ -15,14 +15,15 @@ use metriken_exposition::group_builder::{DefaultRouter, GroupBuilder, StreamGrou
 use metriken_exposition::{Snapshot, Snapshotter};
 
 #[metric(name = "hg_latency", metadata = { acq_group = "latency" })]
-static LATENCY: metriken::HistogramGroup = metriken::HistogramGroup::new(4, 4, 10);
+static LATENCY: metriken::CounterHistogramGroup = metriken::CounterHistogramGroup::new(4, 4, 10);
 
 #[metric(name = "hg_long_latency", metadata = { acq_group = "long" })]
-static LONG_LATENCY: metriken::HistogramGroup = metriken::HistogramGroup::new(4, 4, 10);
+static LONG_LATENCY: metriken::CounterHistogramGroup =
+    metriken::CounterHistogramGroup::new(4, 4, 10);
 
 /// Indices 0 and 2 carry metadata and hold values; index 1 holds values and
 /// no metadata, so neither path makes it a member; index 3 is empty.
-fn record(group: &metriken::HistogramGroup) {
+fn record(group: &metriken::CounterHistogramGroup) {
     group.set_metadata(0, HashMap::from([("op".to_string(), "read".to_string())]));
     group.set_metadata(2, HashMap::from([("op".to_string(), "write".to_string())]));
     for v in [1, 5, 9, 200] {

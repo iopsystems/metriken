@@ -25,37 +25,11 @@
 //! the two reasons it is 2.6x rather than the 8x that removing schemas
 //! outright would give.
 //!
-//! [`WalGroupRow`](crate::rez::wal::WalGroupRow) was built for a producer that
-//! does not do that: `schema` is optional, `schema_hash` identifies the
-//! generation, and [`StreamRecorderV3`]'s ring resolves a reference. That
-//! machinery has never had a producer — the recorder's own comments note
-//! that the `schema: None` path is reached only by malformed input.
-//!
-//! This wire is that producer. It is worth having precisely because its
-//! consumer is a recorder, the one consumer that keeps state across scrapes
-//! and can therefore be told "the same schema as last time". Every other
-//! endpoint must keep resending, which is why this is a new endpoint rather
-//! than a change to an existing one.
-//!
-//! # The part that is not obvious
-//!
-//! A `WalGroupRow` is *almost* a pure function of the producer's
-//! `GroupSnapshot`, but not quite: its `schema` field is `Some` only on the
-//! row that re-anchors a group's schema for **the segment currently
-//! accumulating in the consumer's archive**. Segments are the consumer's
-//! business — a recorder's rotations have nothing to do with when an agent
-//! was scraped, and two consumers of the same agent rotate independently. The
-//! agent cannot know when a row needs to carry a schema, so it never decides:
-//! every [`AgentRow`] carries a payload with `schema: None`, and the anchoring
-//! stays exactly where it was, in [`StreamRecorderV3`].
-//!
-//! [`StreamRecorderV3`]: crate::rez::rez_v3_writer::StreamRecorderV3
-//!
-//! That is why the consumer still has to be able to *produce* an anchored row
-//! — and it can, by decoding the payload and re-encoding it with a schema
-//! attached. The cost is bounded by how often that happens: once per group
-//! per segment, against a default seal policy of 300 s. At a 1 s interval,
-//! 299 rows out of 300 are copied to the WAL untouched.
+//! The payload is a [`WalGroupRow`](crate::rez::wal::WalGroupRow) with
+//! `schema: None`; `schema_hash` identifies the schema generation. metriken
+//! has no `.rez` consumer of it since `StreamRecorderV3::ingest_rows` was
+//! removed (a row-wire recorder writes `.dendro`). [`AgentRows`] is the wide
+//! pass type `StreamSubscription` carries.
 //!
 //! # What travels in the clear, and why each field does
 //!
@@ -73,19 +47,11 @@
 //! | `arity` | the validation `GroupSnapshot::validate` does, undecoded |
 //! | `approx_bytes` | the seal policy's size accounting, undecoded |
 //!
-//! `arity` is the one that looks redundant and is not. The snapshot path
-//! rejects a group whose value vectors disagree with its schema, and a row
-//! path that skipped that check would write WAL rows the snapshot path would
-//! have refused — so a recording's contents would depend on which endpoint
-//! made it. Three integers keep the two paths agreeing on what is
-//! well-formed, with no decode.
-//!
-//! `approx_bytes` is there for a narrower reason: it is what the seal policy
-//! meters segments by, and computing it from the payload would mean decoding
-//! the payload. Letting the producer compute it — with the same function the
-//! snapshot path uses — is what makes a recording taken over this wire
-//! segment at the same boundaries as one taken over the snapshot endpoint,
-//! rather than merely containing the same values.
+//! `arity` lets a consumer reject a group whose value vectors disagree with
+//! its schema without decoding the payload; it counts counters, gauges and
+//! counting histograms. `approx_bytes` is the size a consumer's seal policy
+//! meters segments by, computed by the producer with the same function the
+//! snapshot path uses.
 
 use std::sync::Arc;
 

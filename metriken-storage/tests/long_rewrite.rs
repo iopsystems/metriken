@@ -60,6 +60,7 @@ fn rewrite(src: &DendroCatalog, table: &str, out: &Path, long_groups: bool) {
                 counters: values.iter().map(|v| v[row]).collect(),
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             };
             previous_hash = Some(hash);
             let snapshot = Snapshot::V3(SnapshotV3 {

@@ -45,9 +45,9 @@ use super::seal_policy::SINGLE_RECORDING_KEY;
 use super::seal_policy::{SealPolicy, SegmentAccount};
 
 use super::rez::{
-    append_tar_entry, dedup_key, entries_approx_bytes, group_by_sampler, write_table_parquet,
-    Entry, PushEntries, RezManifest, RezRecording, RezTable, RezTableIndex, TableBuilder,
-    REZ_MANIFEST_NAME, REZ_SCHEMA_VERSION,
+    append_tar_entry, dedup_key, entries_approx_bytes, group_by_sampler, Entry, PushEntries,
+    RezManifest, RezRecording, RezTable, RezTableIndex, TableBuilder, REZ_MANIFEST_NAME,
+    REZ_SCHEMA_VERSION,
 };
 
 /// The fixed parts of the recording's manifest entry, known at recording start.
@@ -423,7 +423,7 @@ fn seal_segments(
 ) -> Result<Option<(u64, i64)>, String> {
     let mut observation: Option<(u64, i64)> = None;
     for job in batch {
-        let bytes = write_table_parquet(&job.table)
+        let bytes = crate::table::write_rez_table_parquet(&job.table)
             .map_err(|e| format!("failed to encode a {} segment: {e}", job.sampler))?;
         let state = tables.entry(job.sampler.clone()).or_default();
         let name = format!("{}/{:04}.parquet", job.sampler, state.files.len());
@@ -911,6 +911,53 @@ mod tests {
         assert!(recordings[0].tables.is_empty());
 
         handle.abort();
+    }
+
+    /// The tar writer seals a counting histogram column as `histogram`, the
+    /// pre-6.0 string, though the builder names it `counter_histogram`.
+    #[test]
+    fn a_counting_histogram_seals_as_histogram() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.rez");
+        let h = metriken_model::Histogram::new(
+            "5".to_string(),
+            histogram::Histogram::new(0, 8).unwrap(),
+            [
+                ("sampler".to_string(), "io".to_string()),
+                ("metric".to_string(), "lat".to_string()),
+                ("grouping_power".to_string(), "0".to_string()),
+                ("max_value_power".to_string(), "8".to_string()),
+            ]
+            .into(),
+        );
+        let mut b = TableBuilder::new("io".to_string());
+        b.push_entries(1_000, 0, &[Entry::Histogram(&h)]);
+        let table = b.finish();
+        assert_eq!(
+            table.columns[0]
+                .metadata
+                .get("metric_type")
+                .map(String::as_str),
+            Some("counter_histogram")
+        );
+        let mut handle = RezWriterHandle::create(&out, seed()).unwrap();
+        handle
+            .seal(vec![SealJob {
+                sampler: "io".to_string(),
+                table,
+            }])
+            .unwrap();
+        handle.finalize(Vec::new(), (1_000, 0)).unwrap();
+        let (_, recordings) = crate::rez::rez::read_archive_bytes(&out).unwrap();
+        let blob = recordings[0].tables[0].1[0].clone();
+        let sealed = crate::rez::rez::read_table_parquet("io".to_string(), blob).unwrap();
+        assert_eq!(
+            sealed.columns[0]
+                .metadata
+                .get("metric_type")
+                .map(String::as_str),
+            Some("histogram")
+        );
     }
 
     #[test]

@@ -653,8 +653,8 @@ fn a_group_nothing_routes_to_is_absent() {
 static UNHANDLED_GROUP: TestGroup = TestGroup::new("unhandled_probe");
 
 #[metric(name = "snapshot_v3_unhandled_probe", metadata = { acq_group = "unhandled_probe" })]
-static UNHANDLED_HISTOGRAM_GROUP: metriken::HistogramGroup =
-    metriken::HistogramGroup::new(2, 7, 32);
+static UNHANDLED_HISTOGRAM_GROUP: metriken::CounterHistogramGroup =
+    metriken::CounterHistogramGroup::new(2, 7, 32);
 
 /// A group whose only routed metric reads no member (a histogram group whose
 /// metadata lists no index) is absent, not an empty group hashed and sent

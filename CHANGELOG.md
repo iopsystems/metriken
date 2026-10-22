@@ -117,11 +117,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which two runs of 0.41.0 also show. A source holding several producer
   epochs is now read per epoch, which changes its answers only across each
   restart.
+- **Added:** gauge histograms (`docs/journal/2026-10-21-gauge-histogram.md`).
+  `histogram_quantile`, `histogram_quantiles`/`histogram_percentiles`,
+  `histogram_count`, `histogram_sum`, `histogram_mean` (with `by`,
+  `without` and `sum by (..)`) and `histogram_heatmap` read a gauge
+  histogram as a gauge is read: a point per step at `start + k·step`, from
+  each series' latest row within the step or its row interval, summed
+  bucket by bucket across series (rebucketed to the coarsest
+  configuration), and never a difference between rows. An empty state
+  counts 0 and has no quantile or mean. `histogram_irate`, the strided
+  forms, and `rate`, `irate` or a bare selector given a gauge histogram
+  return `QueryError::Unsupported` naming the metric as a gauge histogram
+  and the functions that read it; a name held as both kinds is refused.
+  `MetricsSource` gains `gauge_histogram_names` and `gauge_histogram_labels`
+  (defaulted to empty; `label_values` includes them), implemented by every
+  reader here, and `MemoryStore` gains `insert_gauge_histogram_series`,
+  with `ingest_snapshot` storing a snapshot's `gauge_histograms` as gauge
+  histograms. Within a process group (and across recordings), each
+  source's rows are held for that source's own interval and a series
+  several sources hold is one series, answered by the latest of its rows
+  still held, so a source and its copy count once.
+- **Changed:** takes metriken-model 0.2 (`gauge_histograms` fields on the
+  snapshot types `MemoryStore::ingest_snapshot` takes). Parquet files and
+  archives written by earlier releases, whose counting histograms say
+  `metric_type = histogram`, read as before.
 
 ### metriken-recorder 0.5.0
 
 - **Changed:** takes metriken-storage 0.5, whose `WriterConfig` it
   re-exports.
+- **Changed:** takes metriken-model 0.2 and metriken-exposition 0.25, whose
+  snapshot and WAL row types gained `gauge_histograms` fields.
+
+### metriken-core 0.3.4
+
+- **Added:** `Value::GaugeHistogram`, a histogram whose buckets are current
+  state rather than counts since start. `Value` is `#[non_exhaustive]`, so a
+  consumer built before the variant reaches its wildcard arm and skips the
+  metric instead of exposing it as a counting histogram
+  (`docs/journal/2026-10-21-gauge-histogram.md`).
+
+### metriken 0.11.4
+
+- **Added:** `GaugeHistogram`: `set` and `set_with_window` replace every
+  bucket, there is no `increment`, and it reports
+  `Value::GaugeHistogram`. For distributions of state (free extents per
+  size, queue lengths across queues), which readers must not difference.
+- **Deprecated:** the counting histograms are renamed for their kind,
+  beside `GaugeHistogram`: `AtomicHistogram` is `AtomicCounterHistogram`,
+  `RwLockHistogram` is `RwLockCounterHistogram`, `HistogramGroup` is
+  `CounterHistogramGroup`. The old names stay as `#[deprecated]` type
+  aliases, so existing code builds with a warning. `metriken_core::Value`
+  keeps `Histogram` and `HistogramGroup` for the counting kind.
+
+### metriken-model 0.2.0
+
+- **Breaking:** a gauge histogram's kind is on the wire. `GroupSchema`,
+  `GroupSnapshot`, `WalGroupRow`, `LongOccupant`, `SnapshotV1` and
+  `SnapshotV2` gain a last field, `gauge_histograms`, and `WalValue` a last
+  variant, `GaugeHistogram`. A struct literal of these types needs the new
+  field. Each field is left out of the encoding when empty, so a row,
+  schema or snapshot without a gauge histogram encodes (and a schema
+  hashes) exactly as in 0.1.x and 0.1.x decoders read it; one with a gauge
+  histogram is one element longer, which 0.1.x decoders refuse
+  (rmp-serde's `LengthMismatch`, or no variant of the untagged `Snapshot`
+  matching) instead of reading the state as counts.
+  `Snapshot::histograms` returns the counting histograms only;
+  `Snapshot::gauge_histograms` returns the others.
+  This break is deliberate: recording is mostly local, so a producer and
+  its recorder are upgraded together. An older recorder (metriken-recorder
+  0.4.0, and `rezolus record` and hindsight, which record through it)
+  connected to a producer that emits a gauge histogram ends the whole
+  recording on the first frame holding one: `StreamDecoder::decode` refuses
+  the row, and the recorder fails, aborting every endpoint's task and
+  dropping the archive. Reconnecting does not help. Upgrade producers and
+  recorders together.
+- **Added:** `METRIC_TYPE` (`"metric_type"`), `COUNTER_HISTOGRAM`
+  (`"counter_histogram"`), `GAUGE_HISTOGRAM` (`"gauge_histogram"`),
+  `LEGACY_HISTOGRAM` (`"histogram"`, the counting kind's string before
+  this release), and `is_counter_histogram` (either spelling) and
+  `is_gauge_histogram`.
+
+### metriken-exposition 0.25.0
+
+- **Breaking:** takes metriken-model 0.2, whose snapshot types it
+  re-exports (new `gauge_histograms` fields).
+- **Added:** gauge histograms. `Snapshotter` writes a `GaugeHistogram` to
+  the snapshot's `gauge_histograms` list and `GroupBuilder` to the group's
+  `gauge_histograms` slots (the schema's `gauge_histograms` descriptors), so
+  a consumer built on metriken-model 0.1 refuses the snapshot, frame or row
+  rather than reading the state as counts; producers without gauge
+  histograms send what they sent before.
+  `prometheus_text` writes one as the series Prometheus stores for an
+  OpenMetrics `gaugehistogram`, each a `gauge` family: `<name>_bucket{le}`,
+  `<name>_gcount` and `<name>_gsum` (with `percentiles`, a `gauge` family
+  `<name>{quantile}` in place of the buckets). The 0.0.4 text format has no
+  gauge histogram type, and a scrape fails on an unknown `# TYPE`.
 
 ### metriken-storage 0.5.0
 
@@ -198,6 +289,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-source archive is unchanged (median 11.8 to 12.4 ms before, 12.0 to
   12.1 ms after, three sets of 11 opens each), and grouping 64 sources that
   share one epoch takes 0.25 to 0.6 ms beside an open of 335 ms or more.
+- **Added:** gauge histograms. A histogram column whose field metadata has
+  `metric_type = gauge_histogram` is listed by
+  `DataSource::gauge_histogram_names` and read by `gauge_histogram_stream`
+  (with `gauge_histogram_labels` and `gauge_histogram_interval`), and never
+  by the histogram methods, so a caller that differences histogram rows does
+  not see one. The new methods default to empty and `None`; every source in
+  the crate forwards them, and `CompositionCatalog::gauge_histograms` names
+  a lazy child's. `ArchiveReader` gains `gauge_histogram_names`,
+  `gauge_histogram_labels` and `SamplerReader::holds_gauge_histogram`;
+  `Memory` gains `push_gauge_histogram_series` and, with `ingest`,
+  `upsert_gauge_histogram_sample`. `DataSource::gauge_histogram_parts`
+  gives a read as parts of one row interval each, defaulting to one part;
+  `MultiParquetSource` gives each file's parts under its injected labels.
+  `StreamDecoder::decode` keeps a group row's gauge histogram slots. A long
+  table has no gauge histogram columns: a long row carrying gauge
+  histograms, or a group written long that gains one, is written without
+  their values, with a warning once per group.
+- **Changed:** gauge histograms are recorded in `.dendro` only. `.rez` stays
+  at its pre-6.0 shape: every `.rez` writer path that remains (V1/V2
+  snapshots through `group_by_sampler`, which the tar writer and the v3
+  writer's flat path share; the v3 writer's V3 group path; parquet ingest)
+  leaves gauge histograms out, with the rest of the group or table
+  recorded, and warns once per process ("gauge histograms are recorded in
+  .dendro only; this .rez recording leaves them out"). A `.rez` segment is
+  never format 2, and its counting histogram columns keep
+  `metric_type = histogram` (parquet ingest maps an input's
+  `counter_histogram` to it). Reading `.rez` is unchanged.
+- **Breaking:** `rez::rez_v3_writer::StreamRecorderV3::ingest_rows` and
+  `stage_rows`, the `.rez` writer fed by the row-format wire, are removed.
+  They passed a gauge histogram row into the `.rez` WAL unchanged, and the
+  first seal then refused it and ended the recording. Nothing in metriken
+  or rezolus called them; a recorder of a row-wire producer writes
+  `.dendro`.
+- **Added:** segment format 2. A segment holding a gauge histogram column is
+  written with `metriken.format = 2`, which metriken-storage 0.4.0 refuses
+  (earlier releases refuse any archive dendro 0.6 writes when opening it,
+  on its schema version): opening such an archive with 0.4.0 fails with
+  "probing table fs/ext4: segment format 2 is newer than this reader, which
+  reads up to 1". Segments without one are still format 1.
+  `format::FORMAT_VERSION` is now 2 and means the newest format this crate
+  reads; a writer stamps `format::stamped_for(props, &schema)` (or
+  `stamped_if_newer`), not `FORMAT_VERSION`. `format::format_of` gives a
+  schema's format. A live WAL tail holding a gauge histogram is refused by
+  0.4.0 too, through metriken-model 0.2's longer rows; the published
+  releases' answers are in `docs/journal/2026-10-21-gauge-histogram.md`.
+- **Breaking:** a column's histogram kind comes from the list its value
+  arrived in: `CellValue::GaugeHistogram` (V1/V2 snapshots'
+  `gauge_histograms`, `WalValue::GaugeHistogram` cells) and
+  `GroupTableBuilder::push_row_with_gauge_histograms` (a group's
+  `gauge_histograms` slots) write a `gauge_histogram` column; the counting
+  lists write `counter_histogram`, replacing any `metric_type` the
+  producer's metadata carried. A group holding a gauge histogram is written
+  wide.
+- **Changed:** new archive segments name the counting histogram
+  `metric_type = counter_histogram` (was `histogram`); `.rez` segments keep
+  `histogram`. Readers take
+  `histogram`, `counter_histogram` and an absent `metric_type` as counting
+  (`metriken_model::is_counter_histogram`), so every archive and file
+  written before reads as it did; 0.4.0 also reads a new `counter_histogram`
+  column as counting, since it classifies list columns by Arrow type. A list
+  column whose `metric_type` names another kind (the sparse layout's
+  `sparse_histogram` halves, which were read as garbage buckets, or a kind
+  from a later release) is no longer read.
+- **Breaking:** metriken writes no standalone parquet. `convert` is
+  `MsgpackToArchive`, which writes a raw msgpack recording into a new
+  `.dendro` archive (one source; `label`, `metadata`, `writer_config`,
+  `convert_file_path`, `convert_reader`) through `ArchiveWriter`, and the
+  `convert` feature now turns on `write`. `MsgpackToParquet`,
+  `ParquetOptions`, `ParquetCompression`, `ParquetHistogramType` (with the
+  sparse layout), `ParquetSchema` and `ParquetWriter` are removed. A
+  standalone parquet file is opened by readers that do not check
+  `metriken.format` (pyarrow, DuckDB, scripts), which nothing stops reading
+  a new column kind as one they know. Older metriken readers refuse an
+  archive: every reader before metriken-storage 0.4.0 (metriken-storage
+  0.1.0 to 0.3.2, and rezolus 5.21 to 5.28: dendro 0.2.1 or 0.3.3, 5.23 onward on metriken-archive 0.2.7) runs
+  on a dendro up to 0.5.1, which opens only schema 4, and dendro 0.6
+  writes schema 5, so they refuse it when opening it; metriken-storage
+  0.4.0 opens it and refuses a format 2 segment by its `metriken.format`
+  key.
+  `MsgpackToArchive` carries the first non-empty snapshot metadata into the
+  source's metadata (the caller's entries first), writes `producer_epochs`
+  when the snapshots' `producer_epoch` changes (a raw recording that spans
+  a producer restart) and then takes the newest process's `version`
+  (unless the caller set `version`, in which case no entry carries one).
+  When the conversion fails it removes the files it created (the archive,
+  and sidecars that did not exist before), never a file that was already
+  there. Parquet files written before are read as
+  they were.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in
   one coarser bucket had their cumulative counts summed, so 3 observations

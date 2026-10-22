@@ -4,8 +4,8 @@ use crate::Window;
 
 /// Trait for histogram metrics that can produce snapshots.
 ///
-/// Implemented by both `AtomicHistogram` (for recording individual events)
-/// and `RwLockHistogram` (for bulk updates from pre-aggregated data).
+/// Implemented by both `AtomicCounterHistogram` (for recording individual events)
+/// and `RwLockCounterHistogram` (for bulk updates from pre-aggregated data).
 /// Exposition code can use this trait without knowing which variant it has.
 pub trait HistogramMetric: Send + Sync + 'static {
     /// Return the histogram configuration.

@@ -12,8 +12,9 @@ Features:
   SQLite.
 - `rez`: the `.rez` format; implies `archive`.
 - `write`: the archive writers; implies `archive`.
-- `convert`: `MsgpackToParquet`, msgpack snapshots into one parquet file.
-  Needs neither dendro nor the archive.
+- `convert`: `MsgpackToArchive`, a raw msgpack recording into a new
+  `.dendro` archive; implies `write`. This crate writes no standalone
+  parquet file, and reads those written before.
 - `stream`: `metriken_exposition::stream` re-exported at
   `metriken_storage::stream` until the next breaking release, and the `StreamRow` and `Pass`
   impls for `rez`'s `AgentRow` and `AgentRows`, which stay.

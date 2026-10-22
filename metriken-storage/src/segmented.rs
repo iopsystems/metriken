@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use lru::LruCache;
 
-use crate::histogram_stream::{HistogramStream, HistogramStreamMeta};
+use crate::histogram_stream::{HistKind, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::parquet::MultiParquetSource;
 
@@ -273,6 +273,10 @@ struct OpenState {
     /// Cross-segment histogram config-conflict resolution (see
     /// [`HistogramRunIndex`]).
     histogram_runs: HistogramRunIndex,
+    /// The same two for gauge histograms, which are spliced as histograms
+    /// are and never listed or read with them.
+    gauge_histogram_identity: SeriesIdentity,
+    gauge_histogram_runs: HistogramRunIndex,
     /// Merged across segments at open, last wins.
     file_metadata: HashMap<String, String>,
     /// Built at open from every segment's columns; see `column_map`.
@@ -295,7 +299,8 @@ impl OpenState {
         relabel: Option<&Arc<dyn ColumnRelabel>>,
         memo: &mut IdentityMemo,
     ) -> Result<(), Box<dyn Error>> {
-        check_histogram_configs(idx, seg)?;
+        check_histogram_configs(idx, seg, HistKind::Counting)?;
+        check_histogram_configs(idx, seg, HistKind::Gauge)?;
         let mut unresolved = false;
         // Each counter and gauge column's identities, registered once per
         // open.
@@ -351,21 +356,34 @@ impl OpenState {
             }
         }
         // Histograms are tracked per segment (their runs), so their sets
-        // are listed every time.
-        let histogram_columns: Vec<(String, Labels)> = seg
-            .histogram_columns()
-            .into_iter()
-            .flat_map(|(name, labels)| {
-                let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
-                sets.of(&labels)
-                    .iter()
-                    .map(|l| (name.clone(), l.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        self.histogram_runs.observe(idx, seg.histogram_configs());
-        self.histogram_runs.observe_labels(idx, &histogram_columns);
-        self.histogram_identity.extend(histogram_columns);
+        // are listed every time. Gauge histograms the same way, apart.
+        for (kind, runs, identity) in [
+            (
+                HistKind::Counting,
+                &mut self.histogram_runs,
+                &mut self.histogram_identity,
+            ),
+            (
+                HistKind::Gauge,
+                &mut self.gauge_histogram_runs,
+                &mut self.gauge_histogram_identity,
+            ),
+        ] {
+            let histogram_columns: Vec<(String, Labels)> = seg
+                .histogram_columns_of(kind)
+                .into_iter()
+                .flat_map(|(name, labels)| {
+                    let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
+                    sets.of(&labels)
+                        .iter()
+                        .map(|l| (name.clone(), l.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            runs.observe(idx, seg.histogram_configs_of(kind));
+            runs.observe_labels(idx, &histogram_columns);
+            identity.extend(histogram_columns);
+        }
         for (metric, cols) in seg.column_map() {
             // Mirror the run tagging `histogram_stream` and
             // `histogram_labels` apply. `QueryEngine::columns` requires
@@ -383,7 +401,10 @@ impl OpenState {
             // run 0 in the single-run case. These labels are routing keys,
             // never user-visible series labels (that is `histogram_labels`,
             // which still only tags an actual conflict).
-            let run = self.histogram_runs.segment_run(&metric, idx);
+            let run = self
+                .histogram_runs
+                .segment_run(&metric, idx)
+                .or_else(|| self.gauge_histogram_runs.segment_run(&metric, idx));
             let entry = self.column_map.entry(metric.clone()).or_default();
             for (labels, col) in cols {
                 let sets = memo.presents(relabel, &metric, &labels, &mut unresolved);
@@ -510,8 +531,12 @@ impl SegmentCache {
 ///
 /// Reads parquet field metadata only (via
 /// [`MultiParquetSource::histogram_config_variants`]) — no row-group decode.
-fn check_histogram_configs(idx: usize, segment: &MultiParquetSource) -> Result<(), Box<dyn Error>> {
-    for (name, configs) in segment.histogram_config_variants() {
+fn check_histogram_configs(
+    idx: usize,
+    segment: &MultiParquetSource,
+    kind: HistKind,
+) -> Result<(), Box<dyn Error>> {
+    for (name, configs) in segment.histogram_config_variants_of(kind) {
         if configs.len() > 1 {
             let detail = configs
                 .iter()
@@ -905,6 +930,7 @@ impl SegmentedSource {
                     );
                 }
                 state.histogram_runs.report();
+                state.gauge_histogram_runs.report();
                 let state = Arc::new(state);
                 if !keys.is_empty() && keys.len() == store.len() {
                     sealed = Some(Arc::clone(&state));
@@ -1407,6 +1433,113 @@ fn splice_histogram_streams(
     })
 }
 
+impl SegmentedSource {
+    /// The run index and series identity of the histograms of `kind`.
+    fn histogram_state(&self, kind: HistKind) -> (&HistogramRunIndex, &SeriesIdentity) {
+        match kind {
+            HistKind::Counting => (&self.state.histogram_runs, &self.state.histogram_identity),
+            HistKind::Gauge => (
+                &self.state.gauge_histogram_runs,
+                &self.state.gauge_histogram_identity,
+            ),
+        }
+    }
+
+    /// [`DataSource::histogram_stream`] for the histograms of `kind`.
+    fn histogram_stream_of(
+        &self,
+        kind: HistKind,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let (runs, identity) = self.histogram_state(kind);
+        if runs.run_count(name) <= 1 {
+            // No conflict, so the segments' own labels carry no `__run__` and
+            // `Labels::matches` would fail closed on one. A dashboard can
+            // legitimately pin `__run__="0"` to keep one query working across
+            // an A/B pair where only the other side drifted, and run 0 IS this
+            // single run — strip it. Any other run genuinely has no data here.
+            let mut effective = filter.clone();
+            match effective.inner.remove("__run__") {
+                None => {}
+                Some(v) if v == "0" => {}
+                Some(_) => return None,
+            }
+            let seg_filter = self.segment_filter(name, &effective);
+            let streams: Vec<HistogramStream> = self
+                .touched(start_ns, end_ns)
+                .filter_map(|(_, seg)| match kind {
+                    HistKind::Counting => seg.histogram_stream(name, &seg_filter, start_ns, end_ns),
+                    HistKind::Gauge => {
+                        seg.gauge_histogram_stream(name, &seg_filter, start_ns, end_ns)
+                    }
+                })
+                .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &effective, s))
+                .collect();
+            return splice_histogram_streams(name, identity, streams);
+        }
+
+        // Cross-segment histogram config conflict: `name` carries more than
+        // one distinct (grouping_power, max_value_power) across segments
+        // (a `.rez` agent restart retuned the sampler mid-recording). Each
+        // config is its own run, disambiguated by a `__run__` label; an
+        // unqualified selector (no explicit `__run__`) resolves to the
+        // FIRST run rather than mixing configs — split, warn, never coerce.
+        let (want_run, inner_filter) = match filter.inner.get("__run__") {
+            Some(v) => {
+                let want: usize = v.parse().ok()?;
+                let mut f = filter.clone();
+                f.inner.remove("__run__");
+                (want, f)
+            }
+            None => (0usize, filter.clone()),
+        };
+
+        let seg_filter = self.segment_filter(name, &inner_filter);
+        let streams: Vec<HistogramStream> = self
+            .touched(start_ns, end_ns)
+            .filter(|(idx, _)| runs.segment_run(name, *idx) == Some(want_run))
+            .filter_map(|(_, seg)| match kind {
+                HistKind::Counting => seg.histogram_stream(name, &seg_filter, start_ns, end_ns),
+                HistKind::Gauge => seg.gauge_histogram_stream(name, &seg_filter, start_ns, end_ns),
+            })
+            .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &inner_filter, s))
+            .collect();
+
+        let spliced = splice_histogram_streams(name, identity, streams)?;
+        Some(relabel_with_run(spliced, want_run))
+    }
+
+    /// [`DataSource::histogram_labels`] for the histograms of `kind`.
+    fn histogram_labels_of(&self, kind: HistKind, name: &str) -> Vec<BTreeMap<String, String>> {
+        let (runs, identity) = self.histogram_state(kind);
+        if runs.run_count(name) <= 1 {
+            return identity.labels(name);
+        }
+        // Conflict: surface each run's label sets tagged with `__run__` so
+        // the split is addressable (`histogram_mean(latency{__run__="1"})`).
+        // `__run__` is a RESERVED label name (see `relabel_with_run`) — a
+        // real user label with this name would otherwise be silently
+        // overwritten below.
+        let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
+        for (run, labels) in runs.run_labels.get(name).map(Vec::as_slice).unwrap_or(&[]) {
+            let mut labels = labels.clone();
+            debug_assert!(
+                !labels.contains_key("__run__"),
+                "'__run__' is a reserved label name; a real label with this name would be \
+                 silently overwritten by the run-disambiguation policy"
+            );
+            labels.insert("__run__".to_string(), run.to_string());
+            sets.push(labels);
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+}
+
 impl DataSource for SegmentedSource {
     fn counter_scan(
         &self,
@@ -1603,53 +1736,17 @@ impl DataSource for SegmentedSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        if self.state.histogram_runs.run_count(name) <= 1 {
-            // No conflict, so the segments' own labels carry no `__run__` and
-            // `Labels::matches` would fail closed on one. A dashboard can
-            // legitimately pin `__run__="0"` to keep one query working across
-            // an A/B pair where only the other side drifted, and run 0 IS this
-            // single run — strip it. Any other run genuinely has no data here.
-            let mut effective = filter.clone();
-            match effective.inner.remove("__run__") {
-                None => {}
-                Some(v) if v == "0" => {}
-                Some(_) => return None,
-            }
-            let seg_filter = self.segment_filter(name, &effective);
-            let streams: Vec<HistogramStream> = self
-                .touched(start_ns, end_ns)
-                .filter_map(|(_, seg)| seg.histogram_stream(name, &seg_filter, start_ns, end_ns))
-                .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &effective, s))
-                .collect();
-            return splice_histogram_streams(name, &self.state.histogram_identity, streams);
-        }
+        self.histogram_stream_of(HistKind::Counting, name, filter, start_ns, end_ns)
+    }
 
-        // Cross-segment histogram config conflict: `name` carries more than
-        // one distinct (grouping_power, max_value_power) across segments
-        // (a `.rez` agent restart retuned the sampler mid-recording). Each
-        // config is its own run, disambiguated by a `__run__` label; an
-        // unqualified selector (no explicit `__run__`) resolves to the
-        // FIRST run rather than mixing configs — split, warn, never coerce.
-        let (want_run, inner_filter) = match filter.inner.get("__run__") {
-            Some(v) => {
-                let want: usize = v.parse().ok()?;
-                let mut f = filter.clone();
-                f.inner.remove("__run__");
-                (want, f)
-            }
-            None => (0usize, filter.clone()),
-        };
-
-        let seg_filter = self.segment_filter(name, &inner_filter);
-        let streams: Vec<HistogramStream> = self
-            .touched(start_ns, end_ns)
-            .filter(|(idx, _)| self.state.histogram_runs.segment_run(name, *idx) == Some(want_run))
-            .filter_map(|(_, seg)| seg.histogram_stream(name, &seg_filter, start_ns, end_ns))
-            .map(|s| relabel_histogram_stream(self.relabel.clone(), name, &inner_filter, s))
-            .collect();
-
-        let spliced = splice_histogram_streams(name, &self.state.histogram_identity, streams)?;
-        Some(relabel_with_run(spliced, want_run))
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.histogram_stream_of(HistKind::Gauge, name, filter, start_ns, end_ns)
     }
 
     fn interval(&self) -> f64 {
@@ -1684,6 +1781,10 @@ impl DataSource for SegmentedSource {
         self.state.histogram_identity.names()
     }
 
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.state.gauge_histogram_identity.names()
+    }
+
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.state.counter_identity.labels(name)
     }
@@ -1693,35 +1794,11 @@ impl DataSource for SegmentedSource {
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        if self.state.histogram_runs.run_count(name) <= 1 {
-            return self.state.histogram_identity.labels(name);
-        }
-        // Conflict: surface each run's label sets tagged with `__run__` so
-        // the split is addressable (`histogram_mean(latency{__run__="1"})`).
-        // `__run__` is a RESERVED label name (see `relabel_with_run`) — a
-        // real user label with this name would otherwise be silently
-        // overwritten below.
-        let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
-        for (run, labels) in self
-            .state
-            .histogram_runs
-            .run_labels
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-        {
-            let mut labels = labels.clone();
-            debug_assert!(
-                !labels.contains_key("__run__"),
-                "'__run__' is a reserved label name; a real label with this name would be \
-                 silently overwritten by the run-disambiguation policy"
-            );
-            labels.insert("__run__".to_string(), run.to_string());
-            sets.push(labels);
-        }
-        sets.sort();
-        sets.dedup();
-        sets
+        self.histogram_labels_of(HistKind::Counting, name)
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.histogram_labels_of(HistKind::Gauge, name)
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {

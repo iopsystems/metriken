@@ -14,23 +14,23 @@ use crate::{HistogramGroupMetric, Metric, Value};
 ///
 /// # Example
 /// ```
-/// use metriken::{metric, HistogramGroup};
+/// use metriken::{metric, CounterHistogramGroup};
 ///
 /// #[metric(name = "latency")]
-/// static LATENCY: HistogramGroup = HistogramGroup::new(4, 7, 64);
+/// static LATENCY: CounterHistogramGroup = CounterHistogramGroup::new(4, 7, 64);
 ///
 /// // Index 0 = reads, 1 = writes, etc.
 /// let _ = LATENCY.increment(0, 1200);
 /// let _ = LATENCY.increment(1, 500);
 /// ```
-pub struct HistogramGroup {
+pub struct CounterHistogramGroup {
     inner: OnceLock<RwLock<Vec<histogram::AtomicHistogram>>>,
     metadata: GroupMetadata,
     config: Config,
     entries: usize,
 }
 
-impl HistogramGroup {
+impl CounterHistogramGroup {
     /// Create a new histogram group.
     ///
     /// All histograms share the same `grouping_power` and `max_value_power`
@@ -157,7 +157,7 @@ impl HistogramGroup {
     }
 }
 
-impl HistogramGroupMetric for HistogramGroup {
+impl HistogramGroupMetric for CounterHistogramGroup {
     fn entries(&self) -> usize {
         self.entries
     }
@@ -183,7 +183,7 @@ impl HistogramGroupMetric for HistogramGroup {
     }
 
     fn metadata_version(&self) -> u64 {
-        HistogramGroup::metadata_version(self)
+        CounterHistogramGroup::metadata_version(self)
     }
 
     fn with_metadata(&self, idx: usize, f: &mut dyn FnMut(Option<&HashMap<String, String>>)) {
@@ -195,7 +195,7 @@ impl HistogramGroupMetric for HistogramGroup {
     }
 }
 
-impl Metric for HistogramGroup {
+impl Metric for CounterHistogramGroup {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn basic_operations() {
-        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(4, 7, 64);
 
         assert!(GROUP.load(0).is_none()); // not initialized yet
         assert!(GROUP.increment(0, 100).unwrap());
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn load_all() {
-        static GROUP: HistogramGroup = HistogramGroup::new(2, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(2, 7, 64);
 
         let _ = GROUP.increment(0, 100);
         let _ = GROUP.increment(1, 200);
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn metadata() {
-        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(4, 7, 64);
 
         GROUP.insert_metadata(0, "op".into(), "read".into());
         let meta = GROUP.load_metadata(0).unwrap();
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn with_metadata_borrows_without_cloning() {
-        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(4, 7, 64);
 
         GROUP.insert_metadata(0, "op".into(), "read".into());
 
@@ -272,7 +272,7 @@ mod tests {
         // HistogramGroupMetric`, distinct from the inherent generic
         // `with_metadata<R>` above since inherent methods shadow same-named
         // trait methods on the concrete type).
-        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(4, 7, 64);
         GROUP.insert_metadata(0, "op".into(), "read".into());
 
         let dyn_group: &dyn HistogramGroupMetric = &GROUP;
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn trait_for_each_metadata_matches_metadata_snapshot() {
-        static GROUP: HistogramGroup = HistogramGroup::new(4, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(4, 7, 64);
         GROUP.insert_metadata(0, "op".into(), "read".into());
         GROUP.insert_metadata(2, "op".into(), "write".into());
 
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn config() {
-        static GROUP: HistogramGroup = HistogramGroup::new(2, 7, 64);
+        static GROUP: CounterHistogramGroup = CounterHistogramGroup::new(2, 7, 64);
         let config = GROUP.config();
         assert_eq!(config, Config::new(7, 64).unwrap());
     }

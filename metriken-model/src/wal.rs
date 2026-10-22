@@ -27,8 +27,10 @@ pub struct WalCell {
     /// The snapshot **entry's** metadata, verbatim — NOT the parquet column's.
     ///
     /// The difference matters to a reader. `metric_type` is **not** in here:
-    /// `TableBuilder::push_row` injects it (`metriken-storage`'s `builder.rs`, the `or_insert_with` that
-    /// builds a `Column`) and `metriken-exposition` never carries it. A
+    /// `TableBuilder::push_row` injects it (`metriken-storage`'s `builder.rs`,
+    /// where a `Column` is built), from the [`WalValue`]: a
+    /// [`WalValue::GaugeHistogram`] cell makes a `gauge_histogram` column, a
+    /// [`WalValue::Histogram`] cell a `counter_histogram` one. A
     /// recovery path that built `Column { metadata: cell.metadata, .. }`
     /// directly would produce a column a natively sealed segment does not
     /// match, and `read_table_parquet` would then read every gauge back as a
@@ -79,6 +81,11 @@ pub enum WalValue {
     /// two bytes against a 7,424-bucket payload, and it keeps the cell decodable
     /// without consulting the metadata row.
     Histogram(u8, u8, Vec<u64>),
+    /// A gauge histogram's state, in [`Histogram`](Self::Histogram)'s shape.
+    /// The last variant, so the others keep their encoding; a decoder from
+    /// before it refuses the cell (an unknown variant index) rather than
+    /// read the state as counts.
+    GaugeHistogram(u8, u8, Vec<u64>),
 }
 
 /// One V3 acquisition-group's WAL payload for one tick: values + ONE shared
@@ -108,9 +115,16 @@ pub struct WalGroupRow {
     pub window: Option<(u64, u64)>,
     pub counters: Vec<Option<u64>>,
     pub gauges: Vec<Option<i64>>,
-    /// `(grouping_power, max_value_power, buckets)` per histogram slot — the
-    /// same shape `WalValue::Histogram` carries.
+    /// `(grouping_power, max_value_power, buckets)` per counting histogram
+    /// slot — the same shape `WalValue::Histogram` carries.
     pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
+    /// Gauge histograms: the last field, and left out of the encoding when
+    /// empty, so a row without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (rmp-serde's `LengthMismatch`) rather than read the state as counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gauge_histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
 }
 
 pub fn encode_wal_group_row(row: &WalGroupRow) -> Result<Vec<u8>, String> {
@@ -150,7 +164,8 @@ pub fn encode_wal_group_row_with_schema(
 /// start that way.
 fn schema_nil_offset(payload: &[u8]) -> Option<usize> {
     let mut rest = payload;
-    if rmp::decode::read_array_len(&mut rest).ok()? != 6 {
+    // 7 when the row carries gauge histograms.
+    if !matches!(rmp::decode::read_array_len(&mut rest).ok()?, 6 | 7) {
         return None;
     }
     if rmp::decode::read_array_len(&mut rest).ok()? != 2 {
@@ -200,8 +215,15 @@ pub struct LongOccupant {
     pub occupant: u64,
     pub counters: Vec<Option<u64>>,
     pub gauges: Vec<Option<i64>>,
-    /// `(grouping_power, max_value_power, buckets)`.
+    /// `(grouping_power, max_value_power, buckets)` per counting histogram.
     pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
+    /// Gauge histograms: the last field, and left out of the encoding when
+    /// empty, so an occupant without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (rmp-serde's `LengthMismatch`, which refuses the whole long row) rather than read the state as counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gauge_histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
 }
 
 pub fn encode_wal_long_row(row: &WalLongRow) -> Result<Vec<u8>, String> {
@@ -237,6 +259,7 @@ mod with_schema_tests {
                 name: "h".to_string(),
                 metadata: [("metric".to_string(), "latency".to_string())].into(),
             }],
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -248,6 +271,7 @@ mod with_schema_tests {
             counters: vec![Some(0), None, Some(u64::MAX)],
             gauges: vec![Some(-5)],
             histograms: vec![Some((3, 8, vec![0, 1, 2]))],
+            gauge_histograms: Vec::new(),
         }
     }
 

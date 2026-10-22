@@ -14,6 +14,9 @@ pub struct Memory {
     counters: HashMap<String, Vec<Counter>>,
     gauges: HashMap<String, Vec<Gauge>>,
     histograms: HashMap<String, Vec<Histogram>>,
+    /// Gauge histogram series: stored as histograms are, listed and read
+    /// apart (`DataSource::gauge_histogram_stream`).
+    gauge_histograms: HashMap<String, Vec<Histogram>>,
     interval_ms: u64,
     /// The row timestamps a caller declared, if it did. See
     /// [`DataSource::sample_timestamps`]; a source assembled from a table
@@ -28,6 +31,7 @@ impl Memory {
             counters: HashMap::new(),
             gauges: HashMap::new(),
             histograms: HashMap::new(),
+            gauge_histograms: HashMap::new(),
             interval_ms,
             sample_timestamps: None,
         }
@@ -49,6 +53,15 @@ impl Memory {
 
     pub fn push_histogram_series(&mut self, name: &str, histogram: Histogram) {
         self.histograms
+            .entry(name.to_string())
+            .or_default()
+            .push(histogram);
+    }
+
+    /// Add a whole gauge histogram series: each snapshot is the state at its
+    /// timestamp (stored in the cumulative sparse form a histogram's is).
+    pub fn push_gauge_histogram_series(&mut self, name: &str, histogram: Histogram) {
+        self.gauge_histograms
             .entry(name.to_string())
             .or_default()
             .push(histogram);
@@ -133,19 +146,112 @@ impl Memory {
         ts: u64,
         snapshot: HistogramSnapshot,
     ) {
-        let series = self.histograms.entry(name.to_string()).or_default();
-        if let Some(h) = series.iter_mut().find(|h| h.labels == labels) {
-            h.timestamps.push(ts);
-            h.snapshots.push(snapshot);
-        } else {
-            series.push(Histogram {
-                labels,
-                config,
-                timestamps: vec![ts],
-                snapshots: vec![snapshot],
+        upsert_histogram(
+            self.histograms.entry(name.to_string()).or_default(),
+            labels,
+            config,
+            ts,
+            snapshot,
+        );
+    }
+
+    /// [`upsert_histogram_sample`](Self::upsert_histogram_sample) for a
+    /// gauge histogram: `snapshot` is the state at `ts`.
+    #[cfg(feature = "ingest")]
+    pub fn upsert_gauge_histogram_sample(
+        &mut self,
+        name: &str,
+        labels: Labels,
+        config: ::histogram::Config,
+        ts: u64,
+        snapshot: HistogramSnapshot,
+    ) {
+        upsert_histogram(
+            self.gauge_histograms.entry(name.to_string()).or_default(),
+            labels,
+            config,
+            ts,
+            snapshot,
+        );
+    }
+}
+
+#[cfg(feature = "ingest")]
+fn upsert_histogram(
+    series: &mut Vec<Histogram>,
+    labels: Labels,
+    config: ::histogram::Config,
+    ts: u64,
+    snapshot: HistogramSnapshot,
+) {
+    if let Some(h) = series.iter_mut().find(|h| h.labels == labels) {
+        h.timestamps.push(ts);
+        h.snapshots.push(snapshot);
+    } else {
+        series.push(Histogram {
+            labels,
+            config,
+            timestamps: vec![ts],
+            snapshots: vec![snapshot],
+        });
+    }
+}
+
+/// The rows of `stored` (one metric's series) in `[start_ns, end_ns]` whose
+/// labels match `filter`.
+fn histogram_rows(
+    stored: &[Histogram],
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+) -> Option<HistogramStream> {
+    let mut series_labels: Vec<crate::labels::Labels> = Vec::new();
+    let mut config: Option<::histogram::Config> = None;
+    let mut rows: Vec<HistogramRow> = Vec::new();
+
+    for hist in stored
+        .iter()
+        .filter(|h| filter.inner.is_empty() || h.labels.matches(filter))
+    {
+        debug_assert!(
+            config.is_none_or(|c| c == hist.config),
+            "histogram series within one metric must share the same config"
+        );
+        config = config.or(Some(hist.config));
+        let r = slice_range(&hist.timestamps, start_ns, end_ns);
+        if r.is_empty() {
+            continue;
+        }
+        let series_idx = series_labels.len();
+        series_labels.push(hist.labels.clone());
+        for (ts, snap) in hist.timestamps[r.clone()]
+            .iter()
+            .zip(hist.snapshots[r].iter())
+        {
+            rows.push(HistogramRow {
+                series_idx,
+                timestamp: *ts,
+                snapshot: crate::types::HistogramSnapshot {
+                    index: snap.index.clone(),
+                    count: snap.count.clone(),
+                },
             });
         }
     }
+
+    let config = config?;
+    if series_labels.is_empty() {
+        return None;
+    }
+    rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
+
+    Some(HistogramStream {
+        meta: HistogramStreamMeta {
+            config,
+            series: series_labels,
+        },
+        rows: Box::new(rows.into_iter()),
+    })
 }
 
 /// Extract metric name and label set from snapshot metadata.
@@ -231,54 +337,17 @@ impl DataSource for Memory {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        let stored = self.histograms.get(name)?;
-        let mut series_labels: Vec<crate::labels::Labels> = Vec::new();
-        let mut config: Option<::histogram::Config> = None;
-        let mut rows: Vec<HistogramRow> = Vec::new();
+        histogram_rows(self.histograms.get(name)?, filter, start_ns, end_ns)
+    }
 
-        for hist in stored
-            .iter()
-            .filter(|h| filter.inner.is_empty() || h.labels.matches(filter))
-        {
-            debug_assert!(
-                config.is_none_or(|c| c == hist.config),
-                "histogram series within one metric must share the same config"
-            );
-            config = config.or(Some(hist.config));
-            let r = slice_range(&hist.timestamps, start_ns, end_ns);
-            if r.is_empty() {
-                continue;
-            }
-            let series_idx = series_labels.len();
-            series_labels.push(hist.labels.clone());
-            for (ts, snap) in hist.timestamps[r.clone()]
-                .iter()
-                .zip(hist.snapshots[r].iter())
-            {
-                rows.push(HistogramRow {
-                    series_idx,
-                    timestamp: *ts,
-                    snapshot: crate::types::HistogramSnapshot {
-                        index: snap.index.clone(),
-                        count: snap.count.clone(),
-                    },
-                });
-            }
-        }
-
-        let config = config?;
-        if series_labels.is_empty() {
-            return None;
-        }
-        rows.sort_unstable_by_key(|r| (r.timestamp, r.series_idx));
-
-        Some(HistogramStream {
-            meta: HistogramStreamMeta {
-                config,
-                series: series_labels,
-            },
-            rows: Box::new(rows.into_iter()),
-        })
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        histogram_rows(self.gauge_histograms.get(name)?, filter, start_ns, end_ns)
     }
 
     fn interval(&self) -> f64 {
@@ -299,6 +368,12 @@ impl DataSource for Memory {
 
     fn histogram_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.histograms.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.gauge_histograms.keys().cloned().collect();
         names.sort();
         names
     }
@@ -324,6 +399,16 @@ impl DataSource for Memory {
             .unwrap_or_default()
     }
 
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.gauge_histograms
+            .get(name)
+            .map(|series| series.iter().map(|h| h.labels.inner.clone()).collect())
+            .unwrap_or_default()
+    }
+
     fn time_range(&self) -> Option<(u64, u64)> {
         let mut min_ns: Option<u64> = None;
         let mut max_ns: Option<u64> = None;
@@ -343,7 +428,12 @@ impl DataSource for Memory {
         for series in self.gauges.values().flatten() {
             update(&mut min_ns, &mut max_ns, &series.timestamps);
         }
-        for series in self.histograms.values().flatten() {
+        for series in self
+            .histograms
+            .values()
+            .chain(self.gauge_histograms.values())
+            .flatten()
+        {
             update(&mut min_ns, &mut max_ns, &series.timestamps);
         }
         min_ns.zip(max_ns)
@@ -363,7 +453,12 @@ impl DataSource for Memory {
         for series in self.gauges.values().flatten() {
             out.extend_from_slice(&series.timestamps);
         }
-        for series in self.histograms.values().flatten() {
+        for series in self
+            .histograms
+            .values()
+            .chain(self.gauge_histograms.values())
+            .flatten()
+        {
             out.extend_from_slice(&series.timestamps);
         }
         out.sort_unstable();
@@ -387,7 +482,7 @@ impl DataSource for Memory {
                     .insert(s.labels.clone(), name.clone());
             }
         }
-        for (name, series) in &self.histograms {
+        for (name, series) in self.histograms.iter().chain(&self.gauge_histograms) {
             for s in series {
                 out.entry(name.clone())
                     .or_default()

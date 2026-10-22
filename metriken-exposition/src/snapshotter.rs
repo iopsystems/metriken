@@ -60,6 +60,7 @@ impl Snapshotter {
         let mut counters: Vec<Counter> = Vec::new();
         let mut gauges: Vec<Gauge> = Vec::new();
         let mut histograms: Vec<Histogram> = Vec::new();
+        let mut gauge_histograms: Vec<Histogram> = Vec::new();
 
         // Iterate through metrics using numeric IDs as column names to avoid
         // collisions between same-name metrics with different labels. The base
@@ -99,9 +100,15 @@ impl Snapshotter {
                             .with_window(window),
                     );
                 }
-                (Some(Value::Histogram(h)), window) => {
+                (Some(v @ (Value::Histogram(_) | Value::GaugeHistogram(_))), window) => {
+                    let (h, gauge) = match v {
+                        Value::GaugeHistogram(h) => (h, true),
+                        Value::Histogram(h) => (h, false),
+                        _ => unreachable!("matched above"),
+                    };
                     if let Some(histogram) = h.load() {
                         let mut metadata = build_metadata(metric);
+
                         metadata.insert(
                             "grouping_power".to_string(),
                             histogram.config().grouping_power().to_string(),
@@ -111,10 +118,14 @@ impl Snapshotter {
                             histogram.config().max_value_power().to_string(),
                         );
 
-                        histograms.push(
-                            Histogram::new(column_name.clone(), histogram, metadata)
-                                .with_window(window),
-                        );
+                        let entry = Histogram::new(column_name.clone(), histogram, metadata)
+                            .with_window(window);
+                        // The kind is the list the entry is in.
+                        if gauge {
+                            gauge_histograms.push(entry);
+                        } else {
+                            histograms.push(entry);
+                        }
                     }
                 }
                 (Some(Value::CounterGroup(g)), _) => {
@@ -177,6 +188,7 @@ impl Snapshotter {
             counters,
             gauges,
             histograms,
+            gauge_histograms,
         })
     }
 }

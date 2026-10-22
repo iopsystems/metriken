@@ -138,7 +138,7 @@ pub fn copy_recordings_into(
             // tail's span would claim a start the bytes do not contain.
             // `last_ts` stays the raw tail's own last row — a skip is always a
             // leading run, so that one is always right.
-            let materialized = crate::rez::wal::materialize_wal_tail(&table, &tail)
+            let materialized = crate::wal::materialize_rez_wal_tail(&table, &tail)
                 .map_err(|e| format!("failed to seal the {table} tail: {e}"))?;
             if let Some(materialized) = materialized {
                 let meta = SegmentMeta {

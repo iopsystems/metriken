@@ -3,6 +3,15 @@ use std::collections::BinaryHeap;
 use crate::labels::Labels;
 use crate::types::HistogramSnapshot;
 
+/// Which reading convention a histogram column has: cumulative counts that a
+/// reader differences, or a gauge histogram's state that it must not.
+/// Selects the column set a reader's histogram plumbing works over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistKind {
+    Counting,
+    Gauge,
+}
+
 pub struct HistogramStreamMeta {
     pub config: ::histogram::Config,
     /// Labels for each series, indexed by `HistogramRow::series_idx`.
@@ -55,6 +64,26 @@ impl HistogramStream {
     /// alone), and rows after that keep their own times.
     pub fn merge_on_clock(streams: Vec<HistogramStream>, clock: usize) -> Option<HistogramStream> {
         merge_streams(streams, Some(clock))
+    }
+
+    /// This stream with every row's buckets under `to`, which must be
+    /// [`common_config`] of this stream's configuration and others (no
+    /// coarser bucket of `to` splits one of this stream's).
+    pub fn rebucketed(self, to: ::histogram::Config) -> HistogramStream {
+        let from = self.meta.config;
+        if from == to {
+            return self;
+        }
+        HistogramStream {
+            meta: HistogramStreamMeta {
+                config: to,
+                series: self.meta.series,
+            },
+            rows: Box::new(self.rows.map(move |mut row| {
+                row.snapshot = rebucket(row.snapshot, &from, &to);
+                row
+            })),
+        }
     }
 }
 

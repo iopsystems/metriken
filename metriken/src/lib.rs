@@ -95,7 +95,11 @@ pub use crate::counter::Counter;
 pub use crate::dynmetrics::{DynBoxedMetric, DynPinnedMetric, MetricBuilder};
 pub use crate::family::{CounterFamily, CounterMember, GaugeFamily, GaugeMember};
 pub use crate::gauge::Gauge;
-pub use crate::group::{CounterGroup, GaugeGroup, HistogramGroup};
+#[allow(deprecated)]
+pub use crate::group::HistogramGroup;
+pub use crate::group::{CounterGroup, CounterHistogramGroup, GaugeGroup};
+pub use crate::histogram::{AtomicCounterHistogram, GaugeHistogram, RwLockCounterHistogram};
+#[allow(deprecated)]
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};
 pub use crate::lazy::Lazy;
 pub use crate::sharded::{set_thread_shard, ShardedCounterGroup};

@@ -74,6 +74,7 @@ pub struct UnionSource {
     counter_index: Index,
     gauge_index: Index,
     histogram_index: Index,
+    gauge_histogram_index: Index,
 }
 
 impl UnionSource {
@@ -109,11 +110,13 @@ impl UnionSource {
         let counter_index = build_index(&children, |c| c.counter_names());
         let gauge_index = build_index(&children, |c| c.gauge_names());
         let histogram_index = build_index(&children, |c| c.histogram_names());
+        let gauge_histogram_index = build_index(&children, |c| c.gauge_histogram_names());
         Self {
             children,
             counter_index,
             gauge_index,
             histogram_index,
+            gauge_histogram_index,
         }
     }
 }
@@ -179,6 +182,36 @@ impl DataSource for UnionSource {
     ) -> Option<HistogramStream> {
         let i = *self.histogram_index.get(name)?;
         self.children[i].histogram_stream(name, filter, start_ns, end_ns)
+    }
+
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let i = *self.gauge_histogram_index.get(name)?;
+        self.children[i].gauge_histogram_stream(name, filter, start_ns, end_ns)
+    }
+
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let i = *self.gauge_histogram_index.get(name)?;
+        self.children[i].gauge_histogram_parts(name, filter, start_ns, end_ns)
+    }
+
+    /// The holding table's interval.
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        match self.gauge_histogram_index.get(name) {
+            Some(i) => self.children[*i].gauge_histogram_interval(name),
+            None => self.interval(),
+        }
     }
 
     /// The holding table's interval.
@@ -247,6 +280,10 @@ impl DataSource for UnionSource {
         union_names(self.children.iter().map(|c| c.histogram_names()))
     }
 
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        union_names(self.children.iter().map(|c| c.gauge_histogram_names()))
+    }
+
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         match self.counter_index.get(name) {
             Some(&i) => self.children[i].counter_labels(name),
@@ -264,6 +301,13 @@ impl DataSource for UnionSource {
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         match self.histogram_index.get(name) {
             Some(&i) => self.children[i].histogram_labels(name),
+            None => Vec::new(),
+        }
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        match self.gauge_histogram_index.get(name) {
+            Some(&i) => self.children[i].gauge_histogram_labels(name),
             None => Vec::new(),
         }
     }
@@ -335,6 +379,7 @@ fn duplicate_names(children: &[Arc<dyn DataSource>]) -> BTreeSet<String> {
         DataSource::counter_names,
         DataSource::gauge_names,
         DataSource::histogram_names,
+        DataSource::gauge_histogram_names,
     ] {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for child in children {

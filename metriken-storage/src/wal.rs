@@ -55,7 +55,9 @@ impl<T: WalRowSource + ?Sized> WalRowSource for &T {
 /// **This replays the rows through `TableBuilder::push_row`, the same call
 /// `ingest` makes, rather than assembling columns directly.** That is not
 /// stylistic. `WalCell::metadata` is the snapshot *entry's* metadata and does
-/// not carry `metric_type` — `push_row` injects it. A tail built by copying
+/// not carry `metric_type` — `push_row` injects it, from the cell's
+/// `WalValue` (a `GaugeHistogram` cell makes a `gauge_histogram` column). A
+/// tail built by copying
 /// that metadata into a `Column` yields a segment a natively sealed one
 /// does not match, and `read_table_parquet` then reads every gauge back as a
 /// counter. Going through the writer's own call makes the two shapes identical
@@ -70,6 +72,7 @@ fn materialize_sampler_wal_tail(
     sampler: &str,
     rows: &[impl WalRowSource],
     props: WriterProperties,
+    rez: bool,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Ok(None);
@@ -91,7 +94,9 @@ fn materialize_sampler_wal_tail(
         // Scalars are copied out; histograms are rebuilt (and thereby
         // VALIDATED) into a side vector the cells borrow from.
         let mut scalars: Vec<Option<WalValue>> = Vec::with_capacity(decoded.len());
-        let mut hists: Vec<Option<histogram::Histogram>> = Vec::with_capacity(decoded.len());
+        // Each histogram with whether it is a gauge histogram.
+        let mut hists: Vec<Option<(histogram::Histogram, bool)>> =
+            Vec::with_capacity(decoded.len());
         for cell in decoded {
             names.push(cell.name.clone());
             metas.push(
@@ -100,8 +105,10 @@ fn materialize_sampler_wal_tail(
                     .unwrap_or_default(),
             );
             windows.push(cell.window.map(|(begin, end)| Window::new(begin, end)));
+            let gauge = matches!(cell.value, WalValue::GaugeHistogram(..));
             match cell.value {
-                WalValue::Histogram(grouping_power, max_value_power, buckets) => {
+                WalValue::Histogram(grouping_power, max_value_power, buckets)
+                | WalValue::GaugeHistogram(grouping_power, max_value_power, buckets) => {
                     // The H2 config travels with the buckets, so nothing has to
                     // be recovered from the metadata row.
                     let h = histogram::Histogram::from_buckets(
@@ -116,7 +123,7 @@ fn materialize_sampler_wal_tail(
                         )
                     })?;
                     scalars.push(None);
-                    hists.push(Some(h));
+                    hists.push(Some((h, gauge)));
                 }
                 v => {
                     scalars.push(Some(v));
@@ -132,7 +139,8 @@ fn materialize_sampler_wal_tail(
                 value: match (&scalars[i], &hists[i]) {
                     (Some(WalValue::Counter(v)), _) => CellValue::Counter(*v),
                     (Some(WalValue::Gauge(v)), _) => CellValue::Gauge(*v),
-                    (_, Some(h)) => CellValue::Histogram(h),
+                    (_, Some((h, false))) => CellValue::Histogram(h),
+                    (_, Some((h, true))) => CellValue::GaugeHistogram(h),
                     // `scalars[i]` and `hists[i]` are filled as a pair above:
                     // exactly one of them is `Some` for every index.
                     _ => unreachable!("every decoded WAL cell is a scalar or a histogram"),
@@ -142,7 +150,7 @@ fn materialize_sampler_wal_tail(
         builder.push_row(row.ts(), row.wall_offset(), &cells);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet_with(&builder.finish(), props)?,
+        bytes: encode_tail(&builder.finish(), props, rez)?,
         rows: row_count,
         first_ts,
     }))
@@ -279,10 +287,40 @@ pub fn materialize_wal_tail_with(
     props: WriterProperties,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if is_group_table_key(table_key) {
-        materialize_group_wal_tail(table_key, rows, props)
+        materialize_group_wal_tail(table_key, rows, props, false)
     } else {
-        materialize_sampler_wal_tail(table_key, rows, props)
+        materialize_sampler_wal_tail(table_key, rows, props, false)
     }
+}
+
+/// [`materialize_wal_tail`] for a `.rez` writer sealing a segment: written
+/// by [`write_rez_table_parquet_with`](crate::table::write_rez_table_parquet_with),
+/// so the segment has the pre-6.0 shape.
+#[cfg(feature = "rez")]
+pub(crate) fn materialize_rez_wal_tail(
+    table_key: &str,
+    rows: &[impl WalRowSource],
+) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
+    if is_group_table_key(table_key) {
+        materialize_group_wal_tail(table_key, rows, segment_writer_props(), true)
+    } else {
+        materialize_sampler_wal_tail(table_key, rows, segment_writer_props(), true)
+    }
+}
+
+/// The segment bytes of a materialized tail.
+fn encode_tail(
+    table: &crate::table::Table,
+    props: WriterProperties,
+    rez: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "rez")]
+    if rez {
+        return crate::table::write_rez_table_parquet_with(table, props);
+    }
+    #[cfg(not(feature = "rez"))]
+    let _ = rez;
+    write_table_parquet_with(table, props)
 }
 
 /// Encode a V3 acquisition-group's live WAL rows as one parquet segment —
@@ -315,6 +353,7 @@ fn materialize_group_wal_tail(
     table_key: &str,
     rows: &[impl WalRowSource],
     props: WriterProperties,
+    rez: bool,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Ok(None);
@@ -357,14 +396,13 @@ fn materialize_group_wal_tail(
             }
         };
         let window = decoded.window.map(|(begin, end)| Window::new(begin, end));
-        builder.push_row(
+        builder.push_row_with_gauge_histograms(
             row.ts(),
             row.wall_offset(),
             window,
             schema,
-            &decoded.counters,
-            &decoded.gauges,
-            &decoded.histograms,
+            (&decoded.counters, &decoded.gauges, &decoded.histograms),
+            &decoded.gauge_histograms,
         );
         first_ts.get_or_insert(row.ts());
     }
@@ -373,7 +411,7 @@ fn materialize_group_wal_tail(
         return Ok(None);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet_with(&builder.finish(), props)?,
+        bytes: encode_tail(&builder.finish(), props, rez)?,
         rows: row_count,
         // `row_count > 0` implies the loop pushed at least one row, which is
         // exactly when `first_ts` gets set — never `None` here.
@@ -479,6 +517,7 @@ mod schema_rows_tests {
                 .collect(),
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -491,6 +530,7 @@ mod schema_rows_tests {
             counters: vec![Some(u64::MAX); n],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         };
         Row(ts, encode_wal_group_row(&row).unwrap())
     }
@@ -522,6 +562,7 @@ mod schema_rows_tests {
                     counters: vec![Some(1)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 }],
             };
             Row(ts, encode_wal_long_row(&row).unwrap())
@@ -550,6 +591,7 @@ mod schema_rows_tests {
                 counters: vec![Some(ts)],
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             };
             Row(ts, encode_wal_group_row(&row).unwrap())
         };
@@ -572,6 +614,7 @@ mod schema_rows_tests {
                     counters: vec![Some(ts)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 }],
             };
             Row(ts, encode_wal_long_row(&row).unwrap())

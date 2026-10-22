@@ -61,6 +61,15 @@
 //! A chart over rows whose spacing varies, or over several series with
 //! unaligned rows, should use the strided form with the stride at its step.
 //!
+//! A gauge histogram ([`MetricsSource::gauge_histogram_names`]), whose rows
+//! are a state rather than counts since start, is read as a gauge is: the
+//! unstrided functions above give one point per step, at `start + k·step`
+//! (the start snapped down to a step boundary), from each series' latest
+//! row at most the step, or its row interval when longer, before the point,
+//! summed bucket by bucket across series. An empty state counts 0 and has
+//! no quantile or mean. `histogram_irate`, the strided forms, and `rate`,
+//! `irate` or a bare selector given a gauge histogram are refused.
+//!
 //! ```
 //! use metriken_query::{MemoryStore, QueryResult};
 //! use metriken_storage::{HistogramSnapshot, Labels};
@@ -383,8 +392,17 @@ pub trait MetricsSource: Send + Sync {
     /// Names of all gauge metrics (sorted, deduplicated).
     fn gauge_names(&self) -> Vec<String>;
 
-    /// Names of all histogram metrics (sorted, deduplicated).
+    /// Names of all histogram metrics (sorted, deduplicated). Gauge
+    /// histograms are listed by
+    /// [`gauge_histogram_names`](Self::gauge_histogram_names) instead.
     fn histogram_names(&self) -> Vec<String>;
+
+    /// Names of all gauge histogram metrics (sorted, deduplicated): histograms
+    /// whose rows are a state, which the histogram functions read as it is
+    /// at each step rather than differencing rows. Empty by default.
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// All label combinations for the named counter metric. Empty if unknown.
     fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
@@ -394,6 +412,16 @@ pub trait MetricsSource: Send + Sync {
 
     /// All label combinations for the named histogram metric. Empty if unknown.
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
+
+    /// All label combinations for the named gauge histogram metric. Empty if
+    /// unknown, and by default.
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        let _ = name;
+        Vec::new()
+    }
 
     /// Distinct values of `key` across all series for `metric`. Walks counter,
     /// gauge, and histogram series and returns the union. Returns empty if the
@@ -411,6 +439,11 @@ pub trait MetricsSource: Send + Sync {
             }
         }
         for labels in self.histogram_labels(metric) {
+            if let Some(v) = labels.get(key) {
+                out.insert(v.clone());
+            }
+        }
+        for labels in self.gauge_histogram_labels(metric) {
             if let Some(v) = labels.get(key) {
                 out.insert(v.clone());
             }

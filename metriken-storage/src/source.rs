@@ -119,6 +119,52 @@ pub trait DataSource: Send + Sync {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream>;
+    /// Gauge histogram `name`'s rows: each row is the state of the series at
+    /// its timestamp, not a count since start, so a reader must take each
+    /// row as it is and never difference two. Not listed by
+    /// [`histogram_names`](Self::histogram_names), and never returned by
+    /// [`histogram_stream`](Self::histogram_stream): a caller that reads
+    /// histograms as cumulative does not see one. A column is a gauge
+    /// histogram when its field metadata has `metric_type =
+    /// gauge_histogram` (`metriken_model::GAUGE_HISTOGRAM`).
+    ///
+    /// The default is `None`. A source that wraps others forwards this and
+    /// the other `gauge_histogram_*` methods, or its gauge histograms are
+    /// lost (never misread).
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let _ = (name, filter, start_ns, end_ns);
+        None
+    }
+    /// The row spacing, in seconds, of the table holding gauge histogram
+    /// `name`, answered as [`counter_interval`](Self::counter_interval) is.
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        let _ = name;
+        self.interval()
+    }
+    /// Gauge histogram `name`'s rows as parts whose rows share one row
+    /// interval, each with that interval in seconds: a reader holds each
+    /// row for its own part's interval (or the step when longer), as
+    /// [`gauge_parts`](Self::gauge_parts) does for a gauge. A source joining
+    /// sources of different intervals (recordings, a process group's
+    /// sources) gives each its own part; series of the same labels in two
+    /// parts are one series. The default is one part at
+    /// [`gauge_histogram_interval`](Self::gauge_histogram_interval).
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let stream = self.gauge_histogram_stream(name, filter, start_ns, end_ns)?;
+        Some(vec![(stream, self.gauge_histogram_interval(name))])
+    }
     /// Sampling interval in seconds.
     fn interval(&self) -> f64;
     /// The row spacing, in seconds, of the table holding histogram `name`,
@@ -152,14 +198,30 @@ pub trait DataSource: Send + Sync {
     fn counter_names(&self) -> Vec<String>;
     /// Names of all gauge metrics (sorted, deduplicated).
     fn gauge_names(&self) -> Vec<String>;
-    /// Names of all histogram metrics (sorted, deduplicated).
+    /// Names of all histogram metrics (sorted, deduplicated). Gauge
+    /// histograms are not among them; see
+    /// [`gauge_histogram_names`](Self::gauge_histogram_names).
     fn histogram_names(&self) -> Vec<String>;
+    /// Names of all gauge histogram metrics (sorted, deduplicated). Empty by
+    /// default.
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// All label combinations for the named counter metric. Empty if unknown.
     fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
     /// All label combinations for the named gauge metric. Empty if unknown.
     fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
     /// All label combinations for the named histogram metric. Empty if unknown.
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>>;
+    /// All label combinations for the named gauge histogram metric. Empty if
+    /// unknown, and by default.
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        let _ = name;
+        Vec::new()
+    }
     /// Key-value metadata from the file footer. Default returns empty.
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
@@ -251,6 +313,9 @@ pub fn label_walk_series_count<S: DataSource + ?Sized>(source: &S) -> usize {
     }
     for name in source.histogram_names() {
         count += source.histogram_labels(&name).len();
+    }
+    for name in source.gauge_histogram_names() {
+        count += source.gauge_histogram_labels(&name).len();
     }
     count
 }
