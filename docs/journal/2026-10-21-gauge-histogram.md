@@ -1,8 +1,11 @@
 # Gauge histograms: a distribution that is current state
 
-**Status:** OPEN. Design 2026-10-21; layers (a) to (c) built on
-`feat/gauge-histogram` on 2026-10-22 (see "As built"), not reviewed, not
-merged, not released.
+**Status:** OPEN. Design 2026-10-21; built on `feat/gauge-histogram`
+2026-10-22 (see "As built"). Owner decisions 2026-10-22: the kind is on the
+wire (open decision 1, option b), the counting histogram types and stored
+string are renamed (`CounterHistogram`, `counter_histogram`), and the
+rebucket fix ships on its own branch first. Not reviewed, not merged, not
+released.
 
 ## Goal
 
@@ -82,23 +85,55 @@ renderer, `Snapshotter`, `GroupBuilder`) reaches `_ => {}` or
 additive, but an old exposition ignores it and exposes the metric as a
 counting histogram, which is the misread this design exists to prevent.
 
-`GaugeHistogram` is `RwLockHistogram`'s storage with replace semantics:
-`set(&[u64])` and `set_with_window(&[u64], Window)` replace every bucket, and
-there is no `increment`. `load`, `load_with_window`, `config` as on
-`RwLockHistogram`. It implements `HistogramMetric` (the trait is unchanged)
-and returns `Value::GaugeHistogram(self)`. A group form
+`GaugeHistogram` is `RwLockCounterHistogram`'s storage with replace
+semantics: `set(&[u64])` and `set_with_window(&[u64], Window)` replace every
+bucket, and there is no `increment`. `load`, `load_with_window`, `config` as
+on the counting types. It implements `HistogramMetric` (the trait is
+unchanged) and returns `Value::GaugeHistogram(self)`. A group form
 (`GaugeHistogramGroup`, `Value::GaugeHistogramGroup`) is left out; see open
 decisions.
 
-### Wire and exposition (metriken-exposition)
+Names. metriken names a metric type by how it is stored and then what it
+is (`AtomicHistogram`, `RwLockHistogram`; `CounterGroup`, `GaugeGroup`,
+`HistogramGroup`), and pairs `Counter` with `Gauge`. The counting types
+become `AtomicCounterHistogram`, `RwLockCounterHistogram` and
+`CounterHistogramGroup`, which keeps the storage prefix (both counting
+types exist, for per-event and bulk writes) and says the kind as
+Prometheus's counter and gauge histograms do. The gauge kind needs one
+storage form (a state is replaced whole, so there is nothing to make
+atomic), so it is `GaugeHistogram`, as `Gauge` is. The old names stay as
+`#[deprecated]` type aliases. metriken-core keeps `Value::Histogram` and
+`Value::HistogramGroup` for the counting kind, with a doc alias; renaming a
+variant would break every consumer's match.
 
-Snapshots and WAL rows keep their shapes. A gauge histogram travels as a
-histogram entry (`SnapshotV2::histograms`, a group's `histograms` slots, a
-`WalValue::Histogram` or a group row's histogram tuple) whose metadata
-carries `metric_type = gauge_histogram`. `Snapshotter` and `GroupBuilder`
-add the key; nothing else changes on the wire. A new wire variant (a fourth
-slot list in `GroupSchema`, a `WalValue::GaugeHistogram`) is the alternative
-weighed under open decisions.
+### Wire and exposition (metriken-model, metriken-exposition)
+
+A gauge histogram's kind is the list it travels in. `GroupSchema`,
+`GroupSnapshot`, `WalGroupRow`, `LongOccupant`, `SnapshotV1` and `SnapshotV2`
+gain a last field, `gauge_histograms`, and `WalValue` a last variant,
+`GaugeHistogram`. Each field has `#[serde(default, skip_serializing_if =
+"Vec::is_empty")]`:
+
+- without a gauge histogram it is left out, so the encoding is the 0.1.x
+  one (the schema hash's known-answer test is unchanged) and 0.1.x
+  decoders read it;
+- with one the array is an element longer. rmp-serde refuses an array
+  longer than the struct (`LengthMismatch`), and under the untagged
+  `Snapshot` no variant matches, so an 0.1.x consumer refuses the row,
+  frame or snapshot instead of reading the state as counts. A
+  `WalValue::GaugeHistogram` cell is an unknown variant index to it.
+
+The untagged `Snapshot` still tells versions apart: `SnapshotV1` with the
+field (6 elements) is tried as V1 first and decodes; a V2 (6 or 7) fails V1
+at `metadata` (a `Duration` is not a map); a group's arity does not change
+`SnapshotV3`'s. `tests/gauge_histogram_wire.rs` decodes every carrier with
+copies of the 0.1.3 types, with and without a gauge histogram.
+
+`Snapshotter` puts a `GaugeHistogram` in the snapshot's `gauge_histograms`
+and `GroupBuilder` in the group's `gauge_histograms` slots. No entry carries
+a `metric_type`; the list is the kind. This is a breaking change to
+metriken-model (new public fields; struct literals across the workspace
+gained the field) and so to every crate above it.
 
 Prometheus text (format 0.0.4, the only one `prometheus_text` writes) has no
 gauge histogram type, and the Prometheus text parser rejects a `# TYPE` it
@@ -129,28 +164,34 @@ family with a `quantile` label, beside `_gcount` and `_gsum`, rather than as a
 
 A gauge histogram column is a histogram column (`List<UInt64>`,
 `<name>:buckets`, `grouping_power` and `max_value_power` in the field
-metadata) whose field metadata has `metric_type = gauge_histogram`. The
-builders already keep a producer's `metric_type`, so `TableBuilder`,
-`GroupTableBuilder`, the long table builder and WAL replay need no new
-value shape. `parse_schema` classifies a list column as a gauge histogram
-when `metric_type` is `gauge_histogram`, and as a histogram otherwise, as
-today.
+metadata) whose field metadata has `metric_type = gauge_histogram`. A
+counting histogram column is written with `metric_type =
+counter_histogram`; releases up to metriken-storage 0.4 wrote `histogram`.
+One constant per kind lives in metriken-model (`COUNTER_HISTOGRAM`,
+`GAUGE_HISTOGRAM`, and `LEGACY_HISTOGRAM` for the old string), with
+`is_counter_histogram` accepting both counting spellings.
 
-Old readers classify by Arrow type and ignore `metric_type`, so the tag alone
-would be read as a counting histogram by metriken-storage 0.4.0 and every
-metriken-query release on it. A segment holding a gauge histogram column is
-therefore written with `metriken.format = 2` in its key-value metadata
-(`format.rs`; segments without one stay format 1, so archives without gauge
-histograms read in old releases as before). `format::check` in
-metriken-storage 0.3.0 and later refuses a segment whose format is newer than
-it reads, with "segment format 2 is newer than this reader, which reads up to
-1; read it with a newer release". That is the documented use of the key:
-"Change `FORMAT_VERSION` when a reader of the previous version would misread
-a segment the new writer produces."
+The builders take the kind from the value: `CellValue::GaugeHistogram`
+(V1/V2 `gauge_histograms`, `WalValue::GaugeHistogram` cells) and
+`GroupTableBuilder::push_row_with_gauge_histograms` (a group's
+`gauge_histograms` slots) write `gauge_histogram`; the counting lists write
+`counter_histogram`, replacing any `metric_type` a producer's metadata
+carried. A group holding a gauge histogram is written wide, since the long
+layout has no gauge histogram columns.
 
-What an old reader does with such an archive is verified under "As built"
-against the published crates (metriken-storage 0.4.0, metriken-query
-0.41.0), not inferred from this source.
+`parse_schema` classifies a list column by its `metric_type`: absent,
+`histogram` or `counter_histogram` is counting; `gauge_histogram` is a gauge
+histogram; anything else (the sparse layout's halves, which were read as
+garbage buckets, or a later kind) is not read.
+
+Old readers classify list columns by Arrow type and ignore `metric_type`, so
+a gauge histogram column alone would be read as counting by
+metriken-storage 0.4.0. A segment holding one is therefore written with
+`metriken.format = 2` (`format.rs`; segments without one stay format 1).
+`format::check` in metriken-storage 0.3.0 and later refuses a newer format,
+with "segment format 2 is newer than this reader, which reads up to 1". A
+`counter_histogram` column is read correctly by those readers, since they
+never look at the string.
 
 The rejected alternative is a different physical type (`List<Int64>`, which
 old `parse_schema` skips). It needs a second value shape in every builder,
@@ -170,11 +211,15 @@ Reading:
   says how to read it. `HistogramStream::merge` (rebucketing to
   `common_config`) applies to gauge histograms as it does to counting ones.
 - `MemoryStore` holds gauge histogram series apart from histogram series
-  (`insert_gauge_histogram_series`); ingesting a snapshot routes an entry by
-  its `metric_type`.
+  (`insert_gauge_histogram_series`); `ingest_snapshot` stores a snapshot's
+  `gauge_histograms` as gauge histograms.
 - `ArchiveReader`'s per-table name catalog gets a gauge histogram list.
-- `convert` (msgpack to parquet) keeps a gauge histogram's tag and stamps
-  format 2, rather than overwriting `metric_type` with `histogram`.
+- `convert` (msgpack to parquet) writes a snapshot's gauge histograms as
+  `gauge_histogram` columns in the standard layout and stamps format 2;
+  counting histograms are `counter_histogram`.
+- `.rez` writers (`RezStream`, the v3 writer) take a snapshot's counting
+  histograms only, so a gauge histogram is left out of a `.rez`; nothing in
+  6.0 writes `.rez`.
 
 ### Query semantics (metriken-query)
 
@@ -247,23 +292,11 @@ consumer of its own wire.
 
 ## Open decisions
 
-1. **Wire refusal for old consumers.** With the tag on the wire, three paths
-   still read a gauge histogram as a counting one: an old recorder
-   (metriken-storage 0.4 or older) writes the tagged column as format 1; an
-   old reader materializing a live WAL tail builds the column itself; an old
-   `MemoryStore::ingest_snapshot` strips `metric_type` as a storage key. A
-   new reader reads the first two correctly, because the tag survives. The
-   closure is a wire shape old decoders reject: trailing
-   `#[serde(default, skip_serializing_if = "Vec::is_empty")]` fields
-   (`GroupSchema::gauge_histograms`, `WalGroupRow::gauge_histograms`,
-   `LongOccupant::gauge_histograms`) leave every existing encoding and schema
-   hash unchanged, and rmp-serde 1.3 refuses an array longer than the struct
-   (`Error::LengthMismatch`, `decode.rs:571`), so old consumers refuse the
-   row, not misread it. It is a breaking change to metriken-model (new public
-   fields; 78 struct literals of the three in this workspace), forcing breaking releases
-   of every crate above it. Recommendation: ship the tag now, and add the
-   trailing fields before any producer that is not rezolus (whose binary
-   carries its own consumers) emits a gauge histogram.
+1. **Wire refusal for old consumers.** Decided 2026-10-22: option (b), the
+   trailing `gauge_histograms` fields (see "Wire and exposition"). The tag
+   alone left three paths misreading (an old recorder, an old reader of a
+   live WAL tail, an old `MemoryStore` ingest), measured below under the
+   first build.
 2. **Groups.** `GaugeHistogramGroup` / `Value::GaugeHistogramGroup` for one
    gauge histogram per member (per device, per cgroup). Recommendation:
    add it when the first sampler needs per-member state from one registry
@@ -276,10 +309,8 @@ consumer of its own wire.
    what the counting form computes, so the same expression would mean two
    things. Recommendation: refuse until someone needs a downsampled state,
    then add a named function (`histogram_avg_over_time`).
-5. **Unknown future `metric_type` on a list column.** Read as a counting
-   histogram, as today (`convert` writes `sparse_histogram` on list columns
-   that are already misread). Recommendation: leave; the segment format
-   version is the mechanism for the next kind.
+5. **Unknown future `metric_type` on a list column.** Decided with the
+   string change: not read.
 
 ## Order of work
 
@@ -293,64 +324,80 @@ consumer of its own wire.
 
 ## As built
 
-On `feat/gauge-histogram`, rebased onto upstream main 8172a5a (after #306,
-the per-source union), one commit per layer:
+Branches, both local, on upstream main 8172a5a (after #306):
 
-- (a) metriken-core `Value::GaugeHistogram`; metriken `GaugeHistogram`;
-  metriken-model `METRIC_TYPE`, `GAUGE_HISTOGRAM`; metriken-exposition
-  `Snapshotter`, `GroupBuilder` (the descriptor carries the tag, and the
-  group identity folds a marker for a gauge histogram so a dynamic metric
-  replaced by one of the other kind rebuilds the schema) and
-  `prometheus_text`. Tests: `metriken-exposition/tests/gauge_histogram.rs`,
-  `metriken/src/histogram.rs`.
-- (b) metriken-storage: `ColKind::GaugeHistogram` from `metric_type`,
-  `DataSource::gauge_histogram_*` through every source, segment format 2
-  (`format::format_of`, `stamped_for`, `stamped_if_newer`; the table, long
-  table, `convert`, `.rez` parquet ingest and projection writers stamp),
-  `convert` keeps the tag. Tests: `metriken-storage/tests/gauge_histogram.rs`
-  (sealed, live WAL tail, V2 entry, `convert` in both layouts).
-- A fix found by the mixed-configuration test: `HistogramStream::merge`
-  summed cumulative counts of buckets that rebucket into one, so 3 + 1
-  observations read as 7. It affected counting histograms merged across
-  configurations too. Separate commit.
-- (c) metriken-query: `promql/streaming/gauge_histogram.rs` (the state
-  evaluator), the handlers in `promql/mod.rs`, `histogram_quantile` in
-  `promql/streaming/dispatch.rs`, forwarding in
-  `promql/streaming/per_source.rs` (`Tap`, `GroupSource`), the
-  `MetricsSource` listings, `MemoryStore`. Tests:
-  `metriken-query/tests/gauge_histogram.rs` (`MemoryStore`), the evaluator's
-  unit tests, and the archive tests in `metriken-storage/tests/gauge_histogram.rs`
-  (`ArchiveReader`, a source and its copy, mixed configurations). Raw rate
-  mode evaluates at the same grid with the start unsnapped.
+- `fix/rebucket-merge` (worktree `metriken-wt-rebucket`): one commit,
+  `HistogramStream::merge` summed cumulative bucket counts when it
+  rebucketed. Found by this work's mixed-configuration test; ships first.
+- `feat/gauge-histogram`, on top of it: the design note; (a) producer and
+  exposition; (b) storage; the counting histogram rename; the wire fields
+  and `counter_histogram`; (c) the query engine; the legacy-artifact tests.
+  The first three are the tag-based build, which the wire commit reworks;
+  the history keeps both.
 
-What the published releases do, measured 2026-10-22 with metriken-storage
-0.4.0 and metriken-query 0.41.0 from crates.io against archives this branch
-wrote (`free_extents`, grouping power 0, 12 ticks, a seal every 5 rows; the
-state at tick 1 holds 111 items):
+Query (c): `promql/streaming/gauge_histogram.rs` (the state evaluator), the
+handlers in `promql/mod.rs`, `histogram_quantile` in
+`promql/streaming/dispatch.rs`, forwarding in
+`promql/streaming/per_source.rs` (`Tap`, `GroupSource`). Raw rate mode
+evaluates at the same grid with the start unsnapped.
 
-| archive | 0.4.0 / 0.41.0 | this branch |
-|---|---|---|
-| sealed, finalized | open refused: "probing table fs/ext4: segment format 2 is newer than this reader, which reads up to 1" (the whole archive, other tables included) | gauge histogram, 12 rows |
-| 3 ticks, all in the live WAL tail | read as a counting histogram: `histogram_count` 2 at each step, `histogram_quantile(0.5)` 7 | gauge histogram, 3 rows |
-| recorded by the 0.4.0 writer from tagged snapshots | read as a counting histogram, as above | gauge histogram, 12 rows (the tag survives) |
+### What the published releases do
 
-The second and third rows are open decision 1. The scratch projects are not
-in the repository.
+Measured 2026-10-22 with metriken-storage 0.4.0, metriken-query 0.41.0 and
+metriken-exposition 0.24.0 (metriken-model 0.1.3) from crates.io, against
+artifacts this branch wrote (`free_extents` a gauge histogram, `io_latency`
+a counting one, `mem_free` a gauge, `ops` a counter; 12 ticks a second
+apart, a seal every 5 rows).
 
-Mutation checks, each one foreground run with the file restored and its hash
-compared (all caught unless noted):
+| artifact (this branch) | published releases |
+|---|---|
+| archive with a gauge histogram, sealed | open refused: "probing table fs/ext4: segment format 2 is newer than this reader, which reads up to 1" (the whole archive) |
+| archive with a gauge histogram, 3 ticks all in the live WAL tail | open refused: "failed to decode a group WAL row: array had incorrect length, expected 3" |
+| V3 msgpack snapshots from `GroupBuilder` with a gauge histogram | decode refused: "data did not match any variant of untagged enum Snapshot", so the 0.4.0 writer records nothing |
+| V1 msgpack snapshots from `Snapshotter` with one | the same refusal |
+| archive without a gauge histogram (counter, gauge, `counter_histogram`; sealed and live tail) | opens; `histogram_count(io_latency)` 1 a tick, `mem_free`, `rate(ops)` 10/s: correct |
+| archive with no histogram at all | opens; `mem_free` and `rate(ops)` correct |
+| V3 msgpack snapshots without a gauge histogram | decoded (12 of 12); the 0.4.0 writer records them and its reader answers correctly |
 
-- the `GroupBuilder` tag removed: the group builder test fails;
-- `parse_schema` ignoring `metric_type`: the four storage round-trip tests
+Every row is a refusal or a correct read. What the published releases still
+read: any archive, live tail, snapshot or row from this branch that holds
+no gauge histogram, counting histogram columns included. What they refuse:
+a sealed archive with a gauge histogram anywhere (the whole archive, since
+the open probes every table), a live tail or stream row of a group holding
+one, and any snapshot holding one.
+
+This branch against artifacts the published releases wrote
+(`tests/fixtures/legacy/`, `metric_type = histogram`): the archive through
+`ArchiveReader`, the parquet file through the parquet reader and
+`ParquetReader`, msgpack snapshots through `MemoryStore::ingest_snapshot`,
+and `convert` of a raw recording (writing `counter_histogram`) all read
+`lat` as a counting histogram with one observation a tick.
+
+The first, tag-based build was measured the same way and misread two paths:
+an archive whose gauge histogram was still in the live WAL tail
+(`histogram_count` 2 where the state held 111) and one the 0.4.0 writer
+recorded from tagged snapshots.
+
+### Mutation checks
+
+One foreground run each, the file restored and its hash compared; all were
+caught unless noted:
+
+- `GroupBuilder` writing the gauge histogram to the counting list: 5 tests
   fail;
-- `format_of` always 1: the format test, the sealed round trip, the V2 and
-  `convert` tests fail;
-- the rebucket fix reverted: its unit test and the mixed-configuration test
-  fail;
+- `parse_schema` reading a `gauge_histogram` column as counting: 8 fail;
+  `format_of` always 1: 4; the rebucket fix reverted: 1;
+- `skip_serializing_if` removed from `GroupSchema::gauge_histograms`: the
+  schema hash known-answer test and two wire tests fail;
+- `is_counter_histogram` without the legacy spelling: four legacy tests fail;
+- the builder keeping a producer's `metric_type` for histograms: the V2 test
+  (a counting entry claiming `gauge_histogram`) fails;
+- WAL replay reading `WalValue::GaugeHistogram` as counting: two archive
+  tests fail;
+- an unknown `metric_type` on a list column read as counting: the kind test
+  fails;
 - `reads_gauge_histogram` always false (gauge histograms read on the
-  counting path): 9 of the query and archive tests fail;
-- staleness never applied: the two staleness tests fail;
-- the gauge histogram arm of `nothing_read` removed: the refusal test fails;
-- the `histogram_irate` refusal removed: survived at first, because
-  `nothing_read` refuses the read as well; the test now asserts each
-  refusal's own wording, and fails.
+  counting path): 10 fail; staleness never applied: 2; the gauge-histogram
+  arm of `nothing_read` removed: 1; the `histogram_irate` refusal removed: 1
+  (in the first build this survived, because `nothing_read` refuses the
+  read too, until the test asserted each refusal's own wording).

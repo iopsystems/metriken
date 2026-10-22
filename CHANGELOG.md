@@ -136,6 +136,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   histograms. Within a process group, a gauge histogram is the
   merge of every source's rows read as the latest row at each step, so a
   source and its copy count once.
+- **Changed:** takes metriken-model 0.2 (`gauge_histograms` fields on the
+  snapshot types `MemoryStore::ingest_snapshot` takes). Parquet files and
+  archives written by earlier releases, whose counting histograms say
+  `metric_type = histogram`, read as before.
 
 ### metriken-recorder 0.5.0
 
