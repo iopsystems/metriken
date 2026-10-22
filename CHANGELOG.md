@@ -132,6 +132,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-source archive is unchanged (median 11.8 to 12.4 ms before, 12.0 to
   12.1 ms after, three sets of 11 opens each), and grouping 64 sources that
   share one epoch takes 0.25 to 0.6 ms beside an open of 335 ms or more.
+- **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
+  they rebucketed a stream to a coarser configuration: buckets that land in
+  one coarser bucket had their cumulative counts summed, so 3 observations
+  of 5 and 1 of 6 at grouping power 2 read as 7 observations at grouping
+  power 0. The merged bucket now takes the last cumulative count. Only
+  merges of streams of different configurations (several files or
+  recordings of one metric) were affected.
 
 ### metriken-storage 0.4.0
 

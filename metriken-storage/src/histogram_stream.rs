@@ -108,8 +108,9 @@ fn bucket_of(config: &::histogram::Config, value: u64) -> u32 {
     (lower_bin_count + log_bin * divisions + offset as u32).min(last)
 }
 
-/// `snapshot`'s buckets under `to`, from `from`. Indices stay ascending;
-/// buckets that land in one are summed.
+/// `snapshot`'s buckets under `to`, from `from`. Indices stay ascending.
+/// A snapshot's counts are cumulative over its buckets, so buckets that land
+/// in one take the last one's count, which already includes the others.
 fn rebucket(
     snapshot: HistogramSnapshot,
     from: &::histogram::Config,
@@ -122,7 +123,7 @@ fn rebucket(
     for (i, c) in snapshot.index.into_iter().zip(snapshot.count) {
         let j = bucket_of(to, lower_bound(from, i));
         match out.index.last() {
-            Some(&last) if last == j => *out.count.last_mut().expect("parallel") += c,
+            Some(&last) if last == j => *out.count.last_mut().expect("parallel") = c,
             _ => {
                 out.index.push(j);
                 out.count.push(c);
@@ -327,6 +328,28 @@ mod tests {
                 assert_eq!(got.index, vec![crate_index(to.0, to.1, v)], "{v} to {to:?}");
             }
         }
+    }
+
+    /// Buckets that land in one coarser bucket hold the observations of all
+    /// of them, once: the counts are cumulative over the buckets, so the
+    /// merged bucket's count is the last one's, not their sum.
+    #[test]
+    fn buckets_that_merge_count_their_observations_once() {
+        let from = ::histogram::Config::new(2, 16).unwrap();
+        let to = ::histogram::Config::new(0, 16).unwrap();
+        // 3 observations of 5 and 1 of 6, in two buckets at grouping power
+        // 2 and one ([4, 7]) at 0; then 2 of 9, in [8, 15] at both.
+        let snapshot = HistogramSnapshot {
+            index: vec![
+                crate_index(2, 16, 5),
+                crate_index(2, 16, 6),
+                crate_index(2, 16, 9),
+            ],
+            count: vec![3, 4, 6],
+        };
+        let got = rebucket(snapshot, &from, &to);
+        assert_eq!(got.index, [crate_index(0, 16, 5), crate_index(0, 16, 9)]);
+        assert_eq!(got.count, [4, 6]);
     }
 
     #[test]
