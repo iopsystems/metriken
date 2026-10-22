@@ -1023,6 +1023,7 @@ impl DataSource for FileSource {
                     begin_col: c.begin_col.map(|i| i as u32),
                     width_col: c.width_col.map(|i| i as u32),
                     occupant: c.occupant,
+                    holds_values: self.0.column_holds_values(c.col_idx),
                 },
             })
             .collect()
@@ -1279,6 +1280,27 @@ impl ParquetSource {
                 .index_of("timestamp")
                 .unwrap_or(usize::MAX);
             parse_schema(self, ts)
+        })
+    }
+
+    /// Whether the arrow column `col_idx` can hold a non-null cell, from
+    /// the footer's statistics: false only when every row group's chunk of
+    /// it reports as many nulls as the row group has rows. A chunk without
+    /// a null count, or a column with no leaf of its own, answers true.
+    fn column_holds_values(&self, col_idx: usize) -> bool {
+        let meta = self.meta.metadata();
+        let descr = meta.file_metadata().schema_descr();
+        let Some(leaf) =
+            (0..descr.num_columns()).find(|l| descr.get_column_root_idx(*l) == col_idx)
+        else {
+            return true;
+        };
+        (0..meta.num_row_groups()).any(|rg| {
+            let rg = meta.row_group(rg);
+            rg.column(leaf)
+                .statistics()
+                .and_then(|s| s.null_count_opt())
+                .is_none_or(|nulls| (nulls as i64) < rg.num_rows())
         })
     }
 

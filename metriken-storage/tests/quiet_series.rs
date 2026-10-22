@@ -26,6 +26,12 @@ const ROWS: u64 = 2200;
 const RANGE: u64 = 2000;
 
 /// A series of `c`: its `g` label and the seconds it has no rows in.
+/// Group labels for generated series.
+const GROUPS: [&str; 20] = [
+    "g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10", "g11", "g12", "g13", "g14",
+    "g15", "g16", "g17", "g18", "g19",
+];
+
 struct Series {
     g: &'static str,
     silent: Vec<(u64, u64)>,
@@ -67,18 +73,38 @@ fn shapes(many: u64) -> Vec<Series> {
     v
 }
 
+/// How the series are stored: wide snapshots (a column per series, absent
+/// from a segment where it has no row), one acquisition group in a wide
+/// table (every series' column in every segment, null where it has no
+/// row), or that group in the long layout (a row per series present, by
+/// occupant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    V2,
+    V3Wide,
+    Long,
+}
+
+const LAYOUTS: [Layout; 3] = [Layout::V2, Layout::V3Wide, Layout::Long];
+
 /// One source per entry of `members`, each of producer epoch `e0` (one
 /// process group when there are several), with the series of `shapes`;
-/// member `k` is also silent for `members[k]`. Segments of 20 rows. With
-/// `long`, the series are one acquisition group stored in the long layout
-/// (a row per series present, by occupant); otherwise wide snapshots.
-fn write(path: &Path, shapes: &[Series], members: &[Vec<(usize, Range<u64>)>], long: bool) {
+/// member `k` is also silent for `members[k]`; `rows` rows a second,
+/// segments of `max_rows`. The layouts: [`Layout`].
+fn write(
+    path: &Path,
+    layout: Layout,
+    shapes: &[Series],
+    members: &[Vec<(usize, Range<u64>)>],
+    rows: u64,
+    max_rows: usize,
+) {
     let config = WriterConfig {
         seal: SealPolicy {
-            max_rows: 20,
+            max_rows,
             ..SealPolicy::default()
         },
-        long_groups: long,
+        long_groups: layout == Layout::Long,
         ..WriterConfig::default()
     };
     let mut writer = ArchiveWriter::create(path, config).unwrap();
@@ -109,7 +135,7 @@ fn write(path: &Path, shapes: &[Series], members: &[Vec<(usize, Range<u64>)>], l
         let metadata: BTreeMap<String, String> =
             [("producer_epoch".to_string(), "e0".to_string())].into();
         let mut source = writer.add_source(labels, metadata, BASE).unwrap();
-        for k in 0..ROWS {
+        for k in 0..rows {
             let ts = BASE + k * S;
             let w = Some(metriken::Window::new(ts - MS, ts));
             let values: Vec<Option<u64>> = shapes
@@ -124,7 +150,7 @@ fn write(path: &Path, shapes: &[Series], members: &[Vec<(usize, Range<u64>)>], l
                 })
                 .collect();
             let systemtime = SystemTime::UNIX_EPOCH + Duration::from_nanos(ts);
-            let snapshot = if long {
+            let snapshot = if layout != Layout::V2 {
                 Snapshot::V3(SnapshotV3 {
                     systemtime,
                     duration: Duration::ZERO,
@@ -161,7 +187,7 @@ fn write(path: &Path, shapes: &[Series], members: &[Vec<(usize, Range<u64>)>], l
             writer.commit(vec![staged]).unwrap();
             source.maybe_seal().unwrap();
         }
-        source.finalize((BASE + (ROWS - 1) * S, 0)).unwrap();
+        source.finalize((BASE + (rows - 1) * S, 0)).unwrap();
     }
     writer.join().unwrap();
 }
@@ -275,10 +301,10 @@ fn check(name: &str, reader: &ArchiveReader) {
 #[test]
 fn one_recording() {
     let dir = tempfile::tempdir().unwrap();
-    for long in [false, true] {
-        let path = dir.path().join(format!("one-{long}.dendro"));
-        write(&path, &shapes(30), &[vec![]], long);
-        check(&format!("one long={long}"), &open(&path));
+    for layout in LAYOUTS {
+        let path = dir.path().join(format!("one-{layout:?}.dendro"));
+        write(&path, layout, &shapes(30), &[vec![]], ROWS, 20);
+        check(&format!("one {layout:?}"), &open(&path));
     }
 }
 
@@ -288,18 +314,71 @@ fn one_recording() {
 #[test]
 fn a_process_group() {
     let dir = tempfile::tempdir().unwrap();
-    for long in [false, true] {
-        let same = dir.path().join(format!("same-{long}.dendro"));
-        write(&same, &shapes(30), &[vec![], vec![]], long);
-        check(&format!("copies long={long}"), &open(&same));
-        let apart = dir.path().join(format!("apart-{long}.dendro"));
+    for layout in LAYOUTS {
+        let same = dir.path().join(format!("same-{layout:?}.dendro"));
+        write(&same, layout, &shapes(30), &[vec![], vec![]], ROWS, 20);
+        check(&format!("copies {layout:?}"), &open(&same));
+        let apart = dir.path().join(format!("apart-{layout:?}.dendro"));
         let extra = vec![
             (0, 500..800),
             (6, 1000..1400),
             (8, 50..1960),
             (11, 300..600),
         ];
-        write(&apart, &shapes(30), &[vec![], extra], long);
-        check(&format!("apart long={long}"), &open(&apart));
+        write(&apart, layout, &shapes(30), &[vec![], extra], ROWS, 20);
+        check(&format!("apart {layout:?}"), &open(&apart));
+    }
+}
+
+/// Series that fall silent for good at 5% of the range: in a wide table
+/// their columns stay in every later segment with null cells, and the
+/// footer's statistics are what say no row follows, so each is ended and
+/// stops holding its group. Held to the end, no group would be fed before
+/// the last chunk. 40 series in 20 groups, each group with one series
+/// that stops.
+#[test]
+fn a_series_silent_for_good_frees_its_group_in_every_layout() {
+    use metriken_query::fixtures::take_fed_before_end;
+    const ROWS: u64 = 6000;
+    let groups = 20;
+    let shapes: Vec<Series> = (0..40)
+        .map(|i| Series {
+            g: GROUPS[i % groups],
+            silent: if i < groups {
+                vec![(ROWS / 20, u64::MAX)]
+            } else {
+                vec![]
+            },
+            restart: None,
+        })
+        .collect();
+    let blocks = ROWS.div_ceil(1024) as usize;
+    let dir = tempfile::tempdir().unwrap();
+    for layout in LAYOUTS {
+        let path = dir.path().join(format!("dead-{layout:?}.dendro"));
+        write(&path, layout, &shapes, &[vec![]], ROWS, 200);
+        let reader = open(&path);
+        for budget in [0, 500] {
+            let query = "sum by (g) (irate(c[5s]))";
+            let what = format!("{layout:?} budget {budget}");
+            take_batch_abandoned();
+            take_fed_before_end();
+            let got = display(&reader, query, (0, ROWS - 1), budget, false);
+            let fed = take_fed_before_end();
+            assert_eq!(
+                take_batch_abandoned(),
+                0,
+                "{what}: the batched read gave up"
+            );
+            // Every block but the last of each group, less one held by the
+            // chunk still being read.
+            assert!(
+                fed >= groups * (blocks - 2),
+                "{what}: {fed} blocks fed before the end, of {}",
+                groups * blocks
+            );
+            let want = display(&reader, query, (0, ROWS - 1), budget, true);
+            assert_close(&what, &got, &want);
+        }
     }
 }

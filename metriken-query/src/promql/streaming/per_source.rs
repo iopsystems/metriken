@@ -775,10 +775,6 @@ impl crate::scan::ChunkReader for RecordingChunks<'_> {
         }
         Ok(Some(chunk))
     }
-
-    fn later_rows(&self, series: u32) -> crate::scan::LaterRows {
-        self.inner.later_rows(series)
-    }
 }
 
 impl DataSource for Tap {

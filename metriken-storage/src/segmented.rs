@@ -1006,6 +1006,9 @@ impl SegmentedSource {
         // long column) each is.
         let mut series: Vec<ScanSeries> = Vec::new();
         let mut plans: BTreeMap<u32, HashMap<u32, ColPlan>> = BTreeMap::new();
+        // Per series, the last planned segment whose column of it can hold
+        // a value.
+        let mut last_held: Vec<Option<u32>> = Vec::new();
         for (pos, l) in order.iter().enumerate() {
             if !l.matches(filter) {
                 continue;
@@ -1018,9 +1021,13 @@ impl SegmentedSource {
                 .first()
                 .is_some_and(|l| l.position.begin_col.is_some() && l.position.width_col.is_some());
             let mut segments = std::collections::HashSet::new();
+            let mut held = None;
             for l in locations {
                 if !self.state.catalog[l.segment as usize].touches(start, end) {
                     continue;
+                }
+                if l.position.holds_values {
+                    held = held.max(Some(l.segment));
                 }
                 if !segments.insert(l.segment) {
                     return None;
@@ -1043,6 +1050,7 @@ impl SegmentedSource {
                     return None;
                 }
             }
+            last_held.push(held);
             series.push(ScanSeries {
                 labels: l.clone(),
                 windowed,
@@ -1060,14 +1068,10 @@ impl SegmentedSource {
             let span = self.state.catalog[*seg as usize].span.map(|s| s.0);
             rest_from[i] = rest_from[i + 1].zip(span).map(|(a, b)| a.min(b));
         }
-        let mut last_at = vec![0usize; series.len()];
-        for (i, seg) in segments.iter().enumerate() {
-            for plan in plans[seg].values() {
-                for s in plan.wide.iter().chain(plan.long.values()) {
-                    last_at[*s] = i;
-                }
-            }
-        }
+        let last_at: Vec<Option<usize>> = last_held
+            .iter()
+            .map(|seg| seg.and_then(|seg| segments.binary_search(&seg).ok()))
+            .collect();
         Some(CounterScan::new(
             series,
             Box::new(SegmentedScan {
@@ -1761,8 +1765,9 @@ struct SegmentedScan<'a> {
     /// `None` when one of them has no span.
     rest_from: Vec<Option<u64>>,
     /// Per series, the last place in `segments` of a segment planned to
-    /// read it.
-    last_at: Vec<usize>,
+    /// read it whose column of it can hold a value (footer statistics);
+    /// `None` when there is none.
+    last_at: Vec<Option<usize>>,
     next: usize,
     start: u64,
     end: u64,
@@ -1870,11 +1875,11 @@ impl crate::scan::ChunkReader for SegmentedScan<'_> {
     }
 
     /// From the plan: whether a segment not read yet is planned to read
-    /// `series`.
+    /// `series` and its column there can hold a value.
     fn later_rows(&self, series: u32) -> crate::scan::LaterRows {
         use crate::scan::LaterRows;
         match self.last_at.get(series as usize) {
-            Some(last) if *last >= self.next => LaterRows::Possible,
+            Some(Some(last)) if *last >= self.next => LaterRows::Possible,
             Some(_) => LaterRows::None,
             None => LaterRows::Unknown,
         }

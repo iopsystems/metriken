@@ -38,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member has passed it and the rows nine past it decide its coverage; a
   member whose recording ends inside the range is finished when its scan
   ends, and in a display aggregation a member series silent for ten times
-  the larger of its spacing and the step is ended as one recording's is, so
-  neither holds the group's points to the end), and aggregated or reduced
+  the larger of its spacing and the step is ended as one recording's is
+  when no unread segment holds a row of it (otherwise it holds its unit
+  until it returns; see below), so neither holds the group's points to the
+  end), and aggregated or reduced
   for display as the scan reads, as one recording is.
   A member clipped to a producer epoch, raw placement, explicit evaluation
   timestamps, gauges and the per-series rate path read each member alone.
@@ -50,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peaks at 157 MB RSS against 473 MB (one source: 13 ms, 80 MB). On this
   recording a cgroup series that falls silent for ten spacings returns, so
   grouped display queries of `cgroup_cpu_usage` ended the batched read after
-  about 9 ms and were evaluated without the flush (until the next entry);
+  about 9 ms and were evaluated without the flush (before the change below);
   the figures below include that. Against the same archive read twice by
   0.41.0: a display query of
   `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at a 1 s step 86 ms against
@@ -73,30 +75,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rate`/`irate`, reduced for display as the scan reads) no longer gives up
   when a series it ended as silent comes back, which sent the query to the
   path without the flush. A series silent for ten times the larger of its
-  spacing and the step is ended only when no unread segment of the scan is
-  planned to read it (`scan::ChunkReader::later_rows`). One that can still
+  spacing and the step is ended only when no unread segment of the scan
+  holds a row of it (`scan::ChunkReader::later_rows`, answered from the
+  scan's plan and the segment footers' null counts, since a wide table
+  keeps a stopped series' column with every cell null). One that can still
   come back stays open and holds back only its own group's flush (over a
   process group, its unit's), because the per-series path interpolates its
   points across the silence to the sample it comes back with, so its
   group's aggregates there are not final until that sample is read. Answers
   are unchanged: on 200 random churn fixtures (243,200 answers, 2046 display
-  reads that the flush gave up on before) all but 74 are byte-identical, and
-  those 74 differ by at most 3.2e-16 relative (summation order). On the
+  reads that the flush gave up on before) all but 76 are byte-identical, and
+  those 76 differ by at most 3.2e-16 relative (summation order). On the
   9.6 h recording, alone and with a copy, five display queries of
   `cgroup_cpu_usage` (the three below, `sum by (name) (rate(...[1m]))` and
   `count by (name) (irate(...[5s]))`) at full resolution, and the three
-  below at a 500-point budget, are identical apart from 105 values that
-  differ by at most 4.5e-16 relative, and the batched read gives up on
+  below at a 500-point budget, are identical apart from 98 values that
+  differ by at most 3.2e-16 relative, and the batched read gives up on
   none of them. On that recording 10 of 106 `cgroup_cpu_usage` series fall
   silent and come back, 52 times, for 100 s to 8415 s. Display queries over
   9.6 h at a 1 s step, medians of three interleaved rounds against the same
   build without this change (two runs of that build differed by up to 7%):
-  `sum by (name) (irate(cgroup_cpu_usage[5s]))` 97 ms against 61 ms, peak
-  RSS 364 MB against 83 MB; `sum by (state) (...)` 43 against 37 ms, 154
-  against 73 MB; `sum(irate(cgroup_cpu_usage[5s]))` 40 against 36 ms, 109
-  against 69 MB. With a copy of the recording (one process group): 153
-  against 115 ms and 584 against 219 MB, 114 against 93 ms and 287 against
-  218 MB, 103 against 86 ms and 245 against 214 MB. A scan that does not
+  `sum by (name) (irate(cgroup_cpu_usage[5s]))` 93 ms against 59 ms, peak
+  RSS 379 MB against 86 MB; `sum by (state) (...)` 44 against 36 ms, 151
+  against 73 MB; `sum(irate(cgroup_cpu_usage[5s]))` 41 against 35 ms, 110
+  against 69 MB. With a copy of the recording (one process group): 165
+  against 117 ms and 591 against 231 MB, 110 against 93 ms and 280 against
+  212 MB, 106 against 91 ms and 247 against 227 MB. A scan that does not
   say (`LaterRows::Unknown`) keeps the old rule.
 - Histogram functions over a group read one of its sources alone, until
   they are combined per source: the one covering the most of the query's
@@ -121,10 +125,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-storage 0.5.0
 
-- **Added:** `scan::LaterRows` and `scan::ChunkReader::later_rows` (by
-  default `LaterRows::Unknown`): whether a scan's unread segments are
-  planned to read a series. The segmented scan answers from its plan, and
+- **Added:** `scan::LaterRows` (non-exhaustive) and
+  `scan::ChunkReader::later_rows` (by default `LaterRows::Unknown`):
+  whether a scan's unread segments can hold a row of a series. The
+  segmented scan answers from its plan and the footers' null counts, and
   `scan::interleave` from the scan holding the series.
+- **Changed:** `ColumnPosition` has a field `holds_values`: false when the
+  segment footer's statistics say every cell of the column is null.
 - **Added:** `scan::interleave`, several counter scans read as one in time
   order, their series concatenated (what `RecordingsSource` joins its
   recordings' scans with).

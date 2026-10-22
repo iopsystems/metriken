@@ -1085,7 +1085,7 @@ impl<A: Accum> Grouped<A> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fixtures"))]
 thread_local! {
     /// Blocks a grouped display read had fed when its last chunk was read,
     /// on this thread.
@@ -1160,7 +1160,7 @@ impl<'d> GroupFlush<'d> {
     }
 
     /// Blocks fed, over all groups.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn fed(&self) -> usize {
         self.next.iter().sum()
     }
@@ -1385,11 +1385,12 @@ pub(crate) fn grid_rates(
     // no member can emit before them. After each chunk, a series whose last
     // sample is more than ten times the larger of its spacing and the step
     // before the earliest span start of the unread chunks (silent) is ended
-    // early, when the scan says no unread segment is planned to read it; a
-    // series without a spacing yet uses the median of the others'. A silent series that can still return is left open: its
-    // points across the silence interpolate to its next sample, as the
-    // per-series path's do, so it holds back its own group's flush (and its
-    // unit's, in a union) until that sample arrives. A scan that does not
+    // early, when the scan says no unread segment holds a row of it; a
+    // series without a spacing yet uses the median of the others'. A silent
+    // series that can still return is left open: its points across the
+    // silence interpolate to its next sample, as the per-series path's do,
+    // so it holds back its own group's flush (and its unit's, in a union)
+    // until that sample arrives. A scan that does not
     // say ends the series anyway; if it is then pushed a sample, the read
     // returns `None` and the caller evaluates the query per series.
     let mut flush = match (&groups, request.display) {
@@ -1619,7 +1620,7 @@ pub(crate) fn grid_rates(
     Some(match groups {
         Some((_, (glabels, _))) if request.display.is_some() => {
             let mut flush = flush?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fixtures"))]
             FED_BEFORE_END.with(|n| n.set(flush.fed()));
             let mut parts: Vec<Grouped<Compact>> = sinks
                 .into_iter()

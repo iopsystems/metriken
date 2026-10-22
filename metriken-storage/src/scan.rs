@@ -70,12 +70,11 @@ pub struct ScanError;
 /// What a reader knows of one series' rows in the segments it has not
 /// returned yet ([`ChunkReader::later_rows`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LaterRows {
-    /// No unread segment is planned to read the series, so none holds a
-    /// row of it.
+    /// No unread segment holds a row of the series.
     None,
-    /// An unread segment is planned to read the series. It can still hold
-    /// no row of it (a wide column whose cells are null there).
+    /// An unread segment may hold a row of the series.
     Possible,
     /// The reader does not say.
     Unknown,
