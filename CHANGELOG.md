@@ -137,6 +137,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bucket, there is no `increment`, and it reports
   `Value::GaugeHistogram`. For distributions of state (free extents per
   size, queue lengths across queues), which readers must not difference.
+- **Deprecated:** the counting histograms are renamed for their kind,
+  beside `GaugeHistogram`: `AtomicHistogram` is `AtomicCounterHistogram`,
+  `RwLockHistogram` is `RwLockCounterHistogram`, `HistogramGroup` is
+  `CounterHistogramGroup`. The old names stay as `#[deprecated]` type
+  aliases, so existing code builds with a warning. `metriken_core::Value`
+  keeps `Histogram` and `HistogramGroup` for the counting kind.
 
 ### metriken-model 0.1.4
 

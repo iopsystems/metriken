@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use dendro::seal::SealPolicy;
-use metriken::{metric, AtomicHistogram, GaugeHistogram, Window};
+use metriken::{metric, AtomicCounterHistogram, GaugeHistogram, Window};
 use metriken_exposition::group_builder::{DefaultRouter, GroupBuilder};
 use metriken_exposition::{Snapshot, SnapshotV2, SnapshotV3};
 use metriken_storage::format::FORMAT_KEY;
@@ -34,7 +34,7 @@ const TICKS: u64 = 12;
 static FREE_EXTENTS: GaugeHistogram = GaugeHistogram::new(0, 16);
 
 #[metric(name = "io_latency", metadata = { acq_group = "lat" })]
-static IO_LATENCY: AtomicHistogram = AtomicHistogram::new(0, 16);
+static IO_LATENCY: AtomicCounterHistogram = AtomicCounterHistogram::new(0, 16);
 
 /// The state at tick `t`: bucket 1 (size 1) shrinks, bucket 3 (sizes 4 to
 /// 7) grows, so consecutive rows differ in both directions.

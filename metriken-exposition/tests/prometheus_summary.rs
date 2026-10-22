@@ -1,10 +1,10 @@
 //! Summary-style exposition of a histogram through `prometheus_text`.
 
-use metriken::{metric, AtomicHistogram};
+use metriken::{metric, AtomicCounterHistogram};
 use metriken_exposition::{prometheus_text, PrometheusOptions};
 
 #[metric(name = "prometheus_summary_probe")]
-static PROBE: AtomicHistogram = AtomicHistogram::new(7, 64);
+static PROBE: AtomicCounterHistogram = AtomicCounterHistogram::new(7, 64);
 
 #[test]
 fn percentiles_are_written_as_quantile_lines() {

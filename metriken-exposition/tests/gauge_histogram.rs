@@ -6,7 +6,7 @@
 
 #![cfg(feature = "msgpack")]
 
-use metriken::{metric, AtomicHistogram, GaugeHistogram, Window};
+use metriken::{metric, AtomicCounterHistogram, GaugeHistogram, Window};
 use metriken_exposition::group_builder::{DefaultRouter, GroupBuilder};
 use metriken_exposition::{prometheus_text, PrometheusOptions, Snapshot, Snapshotter};
 
@@ -14,7 +14,7 @@ use metriken_exposition::{prometheus_text, PrometheusOptions, Snapshot, Snapshot
 static FREE_EXTENTS: GaugeHistogram = GaugeHistogram::new(0, 8);
 
 #[metric(name = "gh_latency", metadata = { acq_group = "ext4" })]
-static LATENCY: AtomicHistogram = AtomicHistogram::new(0, 8);
+static LATENCY: AtomicCounterHistogram = AtomicCounterHistogram::new(0, 8);
 
 /// 3 extents of size 1, 2 of size 2 or 3, 1 of size 4 to 7.
 fn set_state() -> Vec<u64> {

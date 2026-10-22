@@ -41,7 +41,7 @@
 //!   slot space managed by [`metriken::group::SlotIdentity`] is, and what a
 //!   family ([`metriken::CounterFamily`], [`metriken::GaugeFamily`]) is.
 //!
-//! A histogram group ([`metriken::HistogramGroup`]) takes the same members
+//! A histogram group ([`metriken::CounterHistogramGroup`]) takes the same members
 //! under every membership: each index its metadata store lists whose
 //! histogram loads, as [`Snapshotter`](crate::Snapshotter) does. Each member
 //! carries the slot's metadata, `id`, and the group's `grouping_power` and

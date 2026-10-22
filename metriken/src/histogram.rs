@@ -11,15 +11,15 @@ use crate::{HistogramMetric, Metric, Value};
 /// [`crate::Snapshot`]s of the histogram state which can then be used for
 /// reporting.
 ///
-/// The `AtomicHistogram` should be preferred when individual events are being
-/// recorded. The `RwLockHistogram` should be preferred when bulk-updating the
+/// The `AtomicCounterHistogram` should be preferred when individual events are being
+/// recorded. The `RwLockCounterHistogram` should be preferred when bulk-updating the
 /// histogram from pre-aggregated data with a compatible layout.
-pub struct AtomicHistogram {
+pub struct AtomicCounterHistogram {
     inner: OnceLock<histogram::AtomicHistogram>,
     config: Config,
 }
 
-impl AtomicHistogram {
+impl AtomicCounterHistogram {
     /// Create a new [`::histogram::AtomicHistogram`] with the given parameters.
     ///
     /// # Panics
@@ -61,7 +61,7 @@ impl AtomicHistogram {
     }
 }
 
-impl HistogramMetric for AtomicHistogram {
+impl HistogramMetric for AtomicCounterHistogram {
     fn config(&self) -> Config {
         self.config
     }
@@ -71,7 +71,7 @@ impl HistogramMetric for AtomicHistogram {
     }
 }
 
-impl Metric for AtomicHistogram {
+impl Metric for AtomicCounterHistogram {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -81,7 +81,14 @@ impl Metric for AtomicHistogram {
     }
 }
 
-/// The contents guarded by [`RwLockHistogram`]'s single `RwLock`: the bucket
+/// The former name of [`AtomicCounterHistogram`].
+#[deprecated(
+    since = "0.11.4",
+    note = "renamed `AtomicCounterHistogram`, the counting kind beside `GaugeHistogram`"
+)]
+pub type AtomicHistogram = AtomicCounterHistogram;
+
+/// The contents guarded by [`RwLockCounterHistogram`]'s single `RwLock`: the bucket
 /// histogram and its acquisition window. Colocating them makes the
 /// `(buckets, window)` pair atomic for free — a reader under the read guard
 /// can never pair buckets from one write with a window from another.
@@ -95,15 +102,15 @@ struct HistogramState {
 /// and producing [`crate::Snapshot`]s of the histogram state which can then be
 /// used for reporting.
 ///
-/// The `AtomicHistogram` should be preferred when individual events are being
-/// recorded. The `RwLockHistogram` should be preferred when bulk-updating the
+/// The `AtomicCounterHistogram` should be preferred when individual events are being
+/// recorded. The `RwLockCounterHistogram` should be preferred when bulk-updating the
 /// histogram from pre-aggregated data with a compatible layout.
-pub struct RwLockHistogram {
+pub struct RwLockCounterHistogram {
     inner: OnceLock<RwLock<HistogramState>>,
     config: Config,
 }
 
-impl RwLockHistogram {
+impl RwLockCounterHistogram {
     /// Create a new [`::histogram::AtomicHistogram`] with the given parameters.
     ///
     /// # Panics
@@ -132,7 +139,7 @@ impl RwLockHistogram {
     /// `set_with_window` on the same instance will produce stale or absent
     /// windows for otherwise-valid bucket data.
     ///
-    /// [`set_with_window`]: RwLockHistogram::set_with_window
+    /// [`set_with_window`]: RwLockCounterHistogram::set_with_window
     pub fn update_from(&self, data: &[u64]) -> Result<(), Error> {
         if data.len() != self.config.total_buckets() {
             return Err(Error::IncompatibleParameters);
@@ -171,8 +178,8 @@ impl RwLockHistogram {
     /// (which does not update the window) will produce stale windows for some
     /// snapshots.
     ///
-    /// [`load_with_window`]: RwLockHistogram::load_with_window
-    /// [`update_from`]: RwLockHistogram::update_from
+    /// [`load_with_window`]: RwLockCounterHistogram::load_with_window
+    /// [`update_from`]: RwLockCounterHistogram::update_from
     pub fn set_with_window(&self, data: &[u64], window: Window) -> Result<(), Error> {
         if data.len() != self.config.total_buckets() {
             return Err(Error::IncompatibleParameters);
@@ -191,7 +198,7 @@ impl RwLockHistogram {
     ///
     /// Returns `(None, None)` if the histogram has never been written to.
     ///
-    /// [`set_with_window`]: RwLockHistogram::set_with_window
+    /// [`set_with_window`]: RwLockCounterHistogram::set_with_window
     pub fn load_with_window(&self) -> (Option<Histogram>, Option<Window>) {
         match self.inner.get() {
             Some(lock) => {
@@ -212,7 +219,7 @@ impl RwLockHistogram {
     }
 }
 
-impl HistogramMetric for RwLockHistogram {
+impl HistogramMetric for RwLockCounterHistogram {
     fn config(&self) -> Config {
         self.config
     }
@@ -222,7 +229,7 @@ impl HistogramMetric for RwLockHistogram {
     }
 }
 
-impl Metric for RwLockHistogram {
+impl Metric for RwLockCounterHistogram {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -241,6 +248,13 @@ impl Metric for RwLockHistogram {
     }
 }
 
+/// The former name of [`RwLockCounterHistogram`].
+#[deprecated(
+    since = "0.11.4",
+    note = "renamed `RwLockCounterHistogram`, the counting kind beside `GaugeHistogram`"
+)]
+pub type RwLockHistogram = RwLockCounterHistogram;
+
 /// A histogram whose buckets are the current state of something: how many
 /// items of each size exist now (free extents per size, files per size
 /// class, tasks per queue length), not how many events have been recorded.
@@ -249,7 +263,7 @@ impl Metric for RwLockHistogram {
 /// reads, and there is no `increment`. Exposition marks it as a gauge
 /// histogram (`metric_type = gauge_histogram`), and readers take each
 /// reading as it is instead of differencing consecutive readings. Use
-/// [`AtomicHistogram`] or [`RwLockHistogram`] for a distribution of events.
+/// [`AtomicCounterHistogram`] or [`RwLockCounterHistogram`] for a distribution of events.
 ///
 /// ```
 /// use metriken::{GaugeHistogram, Metric, Value};
@@ -389,7 +403,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let h = RwLockHistogram::new(7, 64);
+        let h = RwLockCounterHistogram::new(7, 64);
         let buckets = vec![0u64; h.config().total_buckets()];
         h.set_with_window(&buckets, Window::new(10, 20)).unwrap();
 
@@ -397,30 +411,30 @@ mod tests {
         assert!(hist.is_some());
         assert_eq!(window, Some(Window::new(10, 20)));
         assert_eq!(
-            <RwLockHistogram as Metric>::load_window(&h),
+            <RwLockCounterHistogram as Metric>::load_window(&h),
             Some(Window::new(10, 20))
         );
     }
 
     #[test]
     fn unset_window_is_none() {
-        let h = RwLockHistogram::new(7, 64);
+        let h = RwLockCounterHistogram::new(7, 64);
         let (hist, window) = h.load_with_window();
         assert!(hist.is_none());
         assert!(window.is_none());
-        assert!(<RwLockHistogram as Metric>::load_window(&h).is_none());
+        assert!(<RwLockCounterHistogram as Metric>::load_window(&h).is_none());
     }
 
     #[test]
     fn wrong_length_is_rejected_and_records_no_window() {
-        let h = RwLockHistogram::new(7, 64);
+        let h = RwLockCounterHistogram::new(7, 64);
         assert!(h.set_with_window(&[1, 2, 3], Window::new(1, 2)).is_err());
-        assert!(<RwLockHistogram as Metric>::load_window(&h).is_none());
+        assert!(<RwLockCounterHistogram as Metric>::load_window(&h).is_none());
     }
 
     #[test]
     fn update_from_is_windowless() {
-        let h = RwLockHistogram::new(7, 64);
+        let h = RwLockCounterHistogram::new(7, 64);
         let buckets = vec![0u64; h.config().total_buckets()];
         h.update_from(&buckets).unwrap();
         assert!(h.load().is_some());
@@ -430,10 +444,10 @@ mod tests {
 
     #[test]
     fn value_with_window_returns_window_with_histogram_ref() {
-        let h = RwLockHistogram::new(7, 64);
+        let h = RwLockCounterHistogram::new(7, 64);
         let buckets = vec![0u64; h.config().total_buckets()];
         h.set_with_window(&buckets, Window::new(10, 20)).unwrap();
-        let (value, window) = <RwLockHistogram as Metric>::value_with_window(&h);
+        let (value, window) = <RwLockCounterHistogram as Metric>::value_with_window(&h);
         assert!(matches!(value, Some(Value::Histogram(_))));
         assert_eq!(window, Some(Window::new(10, 20)));
     }
@@ -490,7 +504,7 @@ mod tests {
         use std::thread;
 
         const ITERS: u64 = 50_000;
-        let h = Arc::new(RwLockHistogram::new(4, 16));
+        let h = Arc::new(RwLockCounterHistogram::new(4, 16));
         let total = h.config().total_buckets();
         {
             let mut buckets = vec![0u64; total];
