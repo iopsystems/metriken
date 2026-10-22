@@ -24,18 +24,25 @@ rustfmt.toml settings: `wrap_comments = true`, `imports_granularity = "module"`,
 
 ## Workspace Crates
 
-Five crates with this dependency flow:
+Nine crates. Each depends (normal dependencies, optional ones included) on the crates after its arrow:
 
 ```
-metriken-core  <──  metriken-derive
-      │                    │
-      └───── metriken ─────┘
-                │
-       metriken-exposition
-                │
-         metriken-query
+metriken-types
+metriken-derive
+metriken-core        -> metriken-types
+metriken-model       -> metriken-types
+metriken             -> metriken-core, metriken-derive, metriken-types
+metriken-exposition  -> metriken, metriken-model, metriken-types
+metriken-storage     -> metriken, metriken-exposition, metriken-model, metriken-types
+metriken-query       -> metriken-model, metriken-storage
+metriken-recorder    -> metriken, metriken-exposition, metriken-model, metriken-storage, metriken-types
 ```
 
+`metriken-storage` also has a path-only dev-dependency on `metriken-query`, which `cargo publish` strips. Regenerate the list with `cargo metadata --format-version 1 --no-deps` when a dependency changes.
+
+- **metriken-types** — Types shared by the metriken registry and the readers of what it records.
+- **metriken-model** — The observation model: snapshots, group schemas, the rows a recording stores, and the stream's wire names.
+- **metriken-storage** — Storage for recordings: the segment format, column readers, and the dendro and `.rez` archives.
 - **metriken-core** — `Metric` trait, `Value` enum, `MetricEntry`, global `METRICS` distributed slice (linkme), dynamic metrics registry, type-based request/provide system. Uses `links = "metriken-core"` to enforce single version at compile time.
 - **metriken-derive** — Proc macro for `#[metric]` attribute. Generates `declare_metric_v1!` invocations and PHF static maps for metadata.
 - **metriken** — User-facing crate re-exporting everything. Defines metric types: `Counter` (AtomicU64), `Gauge` (AtomicI64), `AtomicHistogram` (OnceLock-backed), `RwLockHistogram`, `Lazy<T>`.
@@ -63,3 +70,11 @@ metriken-core  <──  metriken-derive
 - A user-facing change adds a bullet to `CHANGELOG.md` under `## Unreleased`, inside the affected crate's `### <crate> <next-version>` sub-section (created if absent).
 - Commit subjects are conventional, `type(scope): description`, with the crate area as the scope (`feat(query): …`, `fix(storage): …`).
 - Open PRs as drafts.
+
+## Releases
+
+Cut releases with `/cs:release`. What it cannot read from the repository:
+
+- Each crate is versioned, tagged and released on its own. Tags are `<crate>-v<version>` (`metriken-query-v0.41.0`). Release one crate per PR, titled `release: <crate> v<version>`, and release a crate's workspace dependencies before it, in the order of the list under Workspace Crates.
+- A release PR moves the crate's `### <crate> <version>` block out of `## Unreleased` into a dated section, bumps that crate's version and any workspace requirement on it, and updates `Cargo.lock`.
+- Nothing is automated: CI (`cargo.yml`) builds and tests only. After the PR merges, tag the merge commit `<crate>-v<version>` by hand and push the tag to `origin`. Then stop and ask before `cargo publish -p <crate>`; a crates.io publish cannot be undone, only yanked.
