@@ -983,3 +983,114 @@ fn a_composition_gives_each_files_own_interval() {
     assert_eq!(only_b.len(), 1);
     assert_eq!(only_b[0].1, 10.0);
 }
+
+/// A gauge histogram that stops while its group goes on: the wide table
+/// keeps its column in later segments with every cell null, the case the
+/// counter scan's `holds_values` / `later_rows` rule is about. That rule
+/// covers counter columns only; a gauge histogram is read through its
+/// stream, which holds each row for its staleness and then reads nothing,
+/// so the read ends one step after the last row, and the counter beside
+/// it rates as before.
+#[test]
+fn a_gauge_histogram_that_stops_reads_to_its_last_row() {
+    use parquet::file::reader::FileReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stops.dendro");
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 5,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(&path, config).unwrap();
+    let labels = [("source".to_string(), "test".to_string())].into();
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    // One V3 group: the schema keeps the gauge histogram's slot after it
+    // stops, so the wide table keeps its column with null cells.
+    let desc = |id: &str, metric: &str| metriken_exposition::MetricDesc {
+        name: id.to_string(),
+        metadata: [("metric".to_string(), metric.to_string())].into(),
+    };
+    let schema = std::sync::Arc::new(metriken_exposition::GroupSchema {
+        counters: vec![desc("6", "ops")],
+        gauge_histograms: vec![desc("7", "free")],
+        ..Default::default()
+    });
+    for t in 0..=40u64 {
+        let ts = BASE + t * S;
+        let free = (t < 20).then(|| {
+            let mut h = histogram::Histogram::new(0, 16).unwrap();
+            h.as_mut_slice()[1] = t + 1;
+            h
+        });
+        let snap = Snapshot::V3(SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::from_millis(1),
+            metadata: HashMap::new(),
+            groups: vec![metriken_exposition::GroupSnapshot {
+                name: "ext4/free".to_string(),
+                schema_hash: schema.hash(),
+                schema: Some(std::sync::Arc::clone(&schema)),
+                window: Some(Window::new(ts - S / 2, ts)),
+                counters: vec![Some(10 * t)],
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+                gauge_histograms: vec![free],
+            }],
+        });
+        let staged = source.stage(&snap, ts, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+    }
+    source.finalize((BASE + 40 * S, 0)).unwrap();
+    writer.join().unwrap();
+
+    // The premise: the last segment still has the column, every cell null.
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let src = catalog.sources().unwrap().remove(0);
+    let segments = catalog.segment_meta(src.id, "ext4/free").unwrap();
+    assert!(segments.len() > 2, "{} segments", segments.len());
+    let (seq, _) = *segments.last().unwrap();
+    let bytes = catalog
+        .segment_bytes(src.id, "ext4/free", seq)
+        .unwrap()
+        .unwrap();
+    let file = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+    let descr = file.metadata().file_metadata().schema_descr();
+    assert!(
+        (0..descr.num_columns()).any(|i| descr.column(i).path().string().starts_with("7:buckets")),
+        "the stopped gauge histogram keeps its column"
+    );
+    let leaf = (0..descr.num_columns())
+        .find(|&i| descr.column(i).path().string().starts_with("7:buckets"))
+        .unwrap();
+    for rg in file.metadata().row_groups() {
+        let nulls = rg
+            .column(leaf)
+            .statistics()
+            .and_then(|s| s.null_count_opt())
+            .expect("a null count");
+        assert_eq!(nulls as i64, rg.num_rows(), "every cell is null");
+    }
+    drop(catalog);
+
+    let reader = open_flat(&path);
+    let count = query_matrix(&reader, "histogram_count(free)", 0, 40, 1.0);
+    assert_eq!(count.len(), 1);
+    let got: Vec<(i64, f64)> = count[0]
+        .iter()
+        .map(|(t, v)| ((t - BASE as f64 / 1e9).round() as i64, *v))
+        .collect();
+    let want: Vec<(i64, f64)> = (0..=20).map(|t| (t, (t.min(19) + 1) as f64)).collect();
+    assert_eq!(got, want);
+    let rate = query_matrix(&reader, "sum(irate(ops[5s]))", 1, 40, 1.0);
+    assert_eq!(rate.len(), 1);
+    assert_eq!(rate[0].len(), 40);
+    assert!(
+        rate[0].iter().all(|(_, v)| (*v - 10.0).abs() < 1e-9),
+        "{:?}",
+        rate[0]
+    );
+}

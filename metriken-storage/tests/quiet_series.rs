@@ -163,6 +163,7 @@ fn write(
                         counters: values,
                         gauges: Vec::new(),
                         histograms: Vec::new(),
+                        gauge_histograms: Vec::new(),
                     }],
                 })
             } else {
@@ -181,6 +182,7 @@ fn write(
                     counters,
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
             };
             let staged = source.stage(&snapshot, ts, 0).unwrap();
