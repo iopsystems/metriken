@@ -138,7 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 5 and 1 of 6 at grouping power 2 read as 7 observations at grouping
   power 0. The merged bucket now takes the last cumulative count. Only
   merges of streams of different configurations (several files or
-  recordings of one metric) were affected.
+  recordings of one metric) were affected. In queries,
+  `histogram_count` and `histogram_quantile` over two recordings or files
+  of one metric with different grouping powers counted the finer one's
+  observations more than once; present since metriken-query 0.37.0.
 
 ### metriken-storage 0.4.0
 
