@@ -25,7 +25,7 @@
 //! alone, the one covering the most of the read ([`GroupSource`]), which
 //! counts the process once and leaves the other sources' spans out.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::Point;
@@ -125,6 +125,214 @@ impl Coverage {
 
     /// Whether one run holds the whole window `[t - window, t]`.
     fn covers(&self, t: u64, window: u64) -> bool {
+        self.run_at(t)
+            .is_some_and(|(first, _)| t.checked_sub(window).is_some_and(|w| w >= first))
+    }
+}
+
+/// [`Coverage`] built as rows arrive, for a member read by the batched scan:
+/// the same runs [`runs`] gives for the same rows, decided as soon as the
+/// eight gaps after each gap are known (or the rows end), so a point can be
+/// answered with no more than nine rows read past it, and keeping only the
+/// rows and runs a later answer can still need.
+///
+/// Rows are offered in increasing time (a scan's rows of one series); the
+/// rows read on either side of the scan (`Tap::context_rows`) are merged in
+/// order as rows past them arrive, so the rows are those `runs` would be
+/// given.
+pub(crate) struct RowTrack {
+    interval_ns: u64,
+    before: VecDeque<u64>,
+    after: VecDeque<u64>,
+    /// The latest rows accepted; `rows[0]` is row `base`.
+    rows: VecDeque<u64>,
+    base: usize,
+    count: usize,
+    /// Gaps decided: gap `k` lies between rows `k` and `k + 1`.
+    decided: usize,
+    /// The runs of the rows up to the last decided gap's later row; the last
+    /// is the run still open.
+    runs: VecDeque<(u64, u64)>,
+    finished: bool,
+    /// The smallest gap seen.
+    smallest: u64,
+}
+
+impl RowTrack {
+    /// A track for rows of a member of `interval_ns`, with the rows read
+    /// before (`before`) and after (`after`) its scan, each in increasing
+    /// time.
+    pub(crate) fn new(interval_ns: u64, before: Vec<u64>, after: Vec<u64>) -> Self {
+        Self {
+            interval_ns,
+            before: before.into(),
+            after: after.into(),
+            rows: VecDeque::new(),
+            base: 0,
+            count: 0,
+            decided: 0,
+            runs: VecDeque::new(),
+            finished: false,
+            smallest: u64::MAX,
+        }
+    }
+
+    /// A row of the scan.
+    pub(crate) fn push(&mut self, ts: u64) {
+        while self.before.front().is_some_and(|&b| b < ts) {
+            let b = self.before.pop_front().expect("front");
+            self.accept(b);
+        }
+        while self.after.front().is_some_and(|&a| a < ts) {
+            let a = self.after.pop_front().expect("front");
+            self.accept(a);
+        }
+        self.accept(ts);
+    }
+
+    /// No more rows: the rest of the rows on either side, and every gap
+    /// decided with the gaps there are.
+    pub(crate) fn finish(&mut self) {
+        while let Some(b) = self.before.pop_front() {
+            self.accept(b);
+        }
+        while let Some(a) = self.after.pop_front() {
+            self.accept(a);
+        }
+        self.finished = true;
+        self.decide();
+    }
+
+    fn accept(&mut self, ts: u64) {
+        if let Some(&last) = self.rows.back() {
+            if ts <= last {
+                return;
+            }
+            self.smallest = self.smallest.min(ts - last);
+        }
+        self.rows.push_back(ts);
+        self.count += 1;
+        if self.count == 1 {
+            self.runs.push_back((ts, ts));
+        }
+        self.decide();
+    }
+
+    fn row(&self, k: usize) -> u64 {
+        self.rows[k - self.base]
+    }
+
+    fn gap(&self, k: usize) -> u64 {
+        self.row(k + 1) - self.row(k)
+    }
+
+    fn decide(&mut self) {
+        const SIDE: usize = 8;
+        let median = |gaps: &mut [u64]| -> Option<u64> {
+            if gaps.is_empty() {
+                return None;
+            }
+            gaps.sort_unstable();
+            Some(gaps[gaps.len() / 2])
+        };
+        while self.decided + 1 < self.count {
+            let k = self.decided;
+            let after_available = self.count - 1 - (k + 1);
+            if !self.finished && after_available < SIDE {
+                break;
+            }
+            let gap = self.gap(k);
+            // The median of the gaps before is at least the smallest gap
+            // seen, so a gap within twice that is no hole.
+            if k > 0 && gap <= self.smallest.saturating_mul(2) {
+                self.extend_run(k);
+                continue;
+            }
+            let mut before = [0u64; SIDE];
+            let nb = k.min(SIDE);
+            for (i, g) in before.iter_mut().take(nb).enumerate() {
+                *g = self.gap(k - nb + i);
+            }
+            let mut after = [0u64; SIDE];
+            let na = after_available.min(SIDE);
+            for (i, g) in after.iter_mut().take(na).enumerate() {
+                *g = self.gap(k + 1 + i);
+            }
+            // Each median is at least its side's smallest gap, so a gap
+            // within twice the larger of those is no hole, and most gaps are
+            // decided without sorting.
+            let low = |g: &[u64]| g.iter().copied().min();
+            let bound = low(&before[..nb]).max(low(&after[..na]));
+            let hole = match bound {
+                Some(b) if gap <= b.saturating_mul(2) => false,
+                _ => {
+                    let typical = match (median(&mut before[..nb]), median(&mut after[..na])) {
+                        (Some(b), Some(a)) => Some(b.max(a)),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    };
+                    typical.is_some_and(|t| gap > t.saturating_mul(2))
+                }
+            };
+            if hole {
+                let next = self.row(k + 1);
+                self.runs.push_back((next, next));
+                self.advance();
+            } else {
+                self.extend_run(k);
+            }
+        }
+    }
+
+    /// Gap `k` is no hole: its later row joins the open run.
+    fn extend_run(&mut self, k: usize) {
+        let next = self.row(k + 1);
+        if let Some(run) = self.runs.back_mut() {
+            run.1 = next;
+        }
+        self.advance();
+    }
+
+    fn advance(&mut self) {
+        const SIDE: usize = 8;
+        self.decided += 1;
+        // The rows the next decision's gaps before it need.
+        while self.base + SIDE < self.decided {
+            self.rows.pop_front();
+            self.base += 1;
+        }
+    }
+
+    /// Whether every row up to the first one after `t` is known, with the
+    /// gap before it decided: whether `t` can be answered.
+    pub(crate) fn ready(&self, t: u64) -> bool {
+        self.finished || (self.count > 0 && t < self.row(self.decided))
+    }
+
+    /// Drop the runs that end more than an interval before `t`, which no
+    /// answer at or after `t` reads.
+    pub(crate) fn forget_before(&mut self, t: u64) {
+        while self.runs.len() > 1
+            && self.runs[0].1.saturating_add(self.interval_ns) < t
+            && self.runs[1].0 <= t
+        {
+            self.runs.pop_front();
+        }
+    }
+
+    fn run_at(&self, t: u64) -> Option<(u64, u64)> {
+        let i = self.runs.partition_point(|r| r.0 <= t);
+        let run = *self.runs.get(i.checked_sub(1)?)?;
+        (t <= run.1.saturating_add(self.interval_ns)).then_some(run)
+    }
+
+    /// [`Coverage::holds`], for a `t` that is [`ready`](Self::ready).
+    pub(crate) fn holds(&self, t: u64) -> bool {
+        self.run_at(t).is_some()
+    }
+
+    /// [`Coverage::covers`], for a `t` that is [`ready`](Self::ready).
+    pub(crate) fn covers(&self, t: u64, window: u64) -> bool {
         self.run_at(t)
             .is_some_and(|(first, _)| t.checked_sub(window).is_some_and(|w| w >= first))
     }
@@ -336,8 +544,8 @@ impl Tap {
         Arc::clone(rows.entry(labels.clone()).or_default())
     }
 
-    /// Record, for each of `series` (and any other series the read finds),
-    /// the timestamps of the nine rows nearest `at` on one side of it:
+    /// For each of `series` (and any other series the read finds), the
+    /// timestamps of the nine rows nearest `at` on one side of it:
     /// before it when `before`, else after it. A read starting or ending at
     /// `at` does not return them, and S3's hole test needs the medians of
     /// up to eight gaps on each side of a gap, so without them a series
@@ -355,9 +563,10 @@ impl Tap {
         (at, before): (u64, bool),
         series: &[Labels],
         longest: u64,
-    ) {
+    ) -> HashMap<Labels, Vec<u64>> {
+        let mut out = HashMap::new();
         let Some((first, last)) = self.inner.time_range() else {
-            return;
+            return out;
         };
         let (first, last) = (first.max(self.lo), last.min(self.hi));
         let interval = if counter {
@@ -373,7 +582,7 @@ impl Tap {
                 (at.saturating_add(1), at.saturating_add(span).min(last))
             };
             if from > to {
-                return;
+                return out;
             }
             let mut rows: HashMap<Labels, Vec<u64>> = HashMap::new();
             let read: Vec<(Labels, Vec<u64>)> = if counter {
@@ -411,28 +620,44 @@ impl Tap {
                     ts.dedup();
                     let keep = ts.len().min(CONTEXT_ROWS);
                     let kept = if before {
-                        &ts[ts.len() - keep..]
+                        ts[ts.len() - keep..].to_vec()
                     } else {
-                        &ts[..keep]
+                        ts[..keep].to_vec()
                     };
-                    self.record(&labels, kept);
+                    out.insert(labels, kept);
                 }
-                return;
+                return out;
             }
             span = longest;
         }
     }
 
     /// [`context`](Self::context) on both sides of a read of `[start_ns,
-    /// end_ns]`.
+    /// end_ns]`, recorded with the rows the read hands out.
     fn contexts(
+        &self,
+        counter: bool,
+        name: &str,
+        filter: &Labels,
+        span: (u64, u64),
+        series: &[Labels],
+    ) {
+        let (before, after) = self.context_rows(counter, name, filter, span, series);
+        for (labels, ts) in before.into_iter().chain(after) {
+            self.record(&labels, &ts);
+        }
+    }
+
+    /// [`context`](Self::context) on both sides of a read of `[start_ns,
+    /// end_ns]`: the rows before it and the rows after it, per series.
+    pub(crate) fn context_rows(
         &self,
         counter: bool,
         name: &str,
         filter: &Labels,
         (start_ns, end_ns): (u64, u64),
         series: &[Labels],
-    ) {
+    ) -> (HashMap<Labels, Vec<u64>>, HashMap<Labels, Vec<u64>>) {
         // A series with fewer than nine rows within 64 of the metric's
         // intervals of the read (it ended, or a long hole follows) is taken
         // as having none further.
@@ -442,8 +667,10 @@ impl Tap {
             self.inner.gauge_interval(name)
         };
         let longest = ((interval * 1e9) as u64).max(1).saturating_mul(64);
-        self.context(counter, name, filter, (start_ns, true), series, longest);
-        self.context(counter, name, filter, (end_ns, false), series, longest);
+        (
+            self.context(counter, name, filter, (start_ns, true), series, longest),
+            self.context(counter, name, filter, (end_ns, false), series, longest),
+        )
     }
 
     fn record(&self, labels: &Labels, timestamps: &[u64]) {
@@ -987,5 +1214,80 @@ mod tests {
             (0..=10).chain(15..25).collect::<Vec<_>>(),
             "11 to 14 s are in the hole (one interval past the last row is held)"
         );
+    }
+    /// The streaming track answers as the runs of all the rows do, at every
+    /// time it calls ready, for rows with holes, cadence changes and
+    /// duplicates, offered with rows before and after.
+    #[test]
+    fn a_row_track_answers_as_the_runs_of_every_row() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..300 {
+            let mut ts: Vec<u64> = Vec::new();
+            let mut t = next(5) * S;
+            let mut every = [S / 4, S, 2 * S, 5 * S][next(4) as usize];
+            for _ in 0..(5 + next(120)) {
+                ts.push(t);
+                if next(15) == 0 {
+                    every = [S / 4, S, 2 * S, 5 * S][next(4) as usize];
+                }
+                t += if next(10) == 0 {
+                    every * (2 + next(20))
+                } else {
+                    every
+                };
+            }
+            // Split into rows before, scanned, after, with overlaps.
+            let n = ts.len();
+            let (a, b) = (
+                next(n as u64 / 2 + 1) as usize,
+                n - next(n as u64 / 2 + 1) as usize,
+            );
+            let before: Vec<u64> = ts[..a].to_vec();
+            // The rows after can begin inside the scanned rows, as the
+            // context rows after a read can repeat its last rows.
+            let after: Vec<u64> = ts[b.max(a).saturating_sub(next(3) as usize)..].to_vec();
+            let scanned: Vec<u64> = ts[a.saturating_sub(next(3) as usize)..b.max(a)].to_vec();
+            let interval = [S / 4, S, 2 * S][next(3) as usize];
+            let want = Coverage {
+                runs: runs(&ts),
+                interval_ns: interval,
+            };
+            let mut track = RowTrack::new(interval, before, after);
+            let window = [0, S, 5 * S, 30 * S][next(4) as usize];
+            let probe: Vec<u64> = (0..200).map(|i| i * S / 2).collect();
+            let mut asked = 0;
+            for &x in &scanned {
+                track.push(x);
+                while asked < probe.len() && track.ready(probe[asked]) {
+                    let t = probe[asked];
+                    assert_eq!(track.holds(t), want.holds(t), "holds at {t} of {ts:?}");
+                    assert_eq!(
+                        track.covers(t, window),
+                        want.covers(t, window),
+                        "covers at {t}"
+                    );
+                    // As the stage does once it has answered `t`.
+                    track.forget_before(t);
+                    asked += 1;
+                }
+            }
+            track.finish();
+            for &t in &probe[asked..] {
+                assert!(track.ready(t));
+                assert_eq!(track.holds(t), want.holds(t), "holds at {t} of {ts:?}");
+                assert_eq!(
+                    track.covers(t, window),
+                    want.covers(t, window),
+                    "covers at {t}"
+                );
+                track.forget_before(t);
+            }
+        }
     }
 }

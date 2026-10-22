@@ -1853,6 +1853,7 @@ impl crate::scan::ChunkReader for SegmentedScan<'_> {
         Ok(Some(crate::scan::ScanChunk {
             segments,
             rest_start,
+            ended: Vec::new(),
         }))
     }
 }

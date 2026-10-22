@@ -367,11 +367,8 @@ fn batch_rates<'a>(
     group: Option<(AggOp, GroupBy<'_>)>,
 ) -> Option<(SeriesSet<'a>, String)> {
     let (name, filter, request) = grid_request(ctx, call, group, None)?;
-    let crate::batch_rate::GridRates::Points(results) = crate::batch_rate::grid_rates(
-        ctx.source
-            .counter_scan(name, &filter, request.data_start, request.end_ns)?,
-        &request,
-    )?
+    let crate::batch_rate::GridRates::Points(results) =
+        scan_rates(ctx, call, name, &filter, request)?
     else {
         return None;
     };
@@ -382,6 +379,139 @@ fn batch_rates<'a>(
         .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
         .collect();
     Some((series, name.to_string()))
+}
+
+/// `request` computed over the source's scan of `name`; over process groups,
+/// over every recording's scan at once, each group's members combined per
+/// point (`batch_rate::UnionPlan`). `None` where a scan is not available:
+/// the caller then evaluates the query per series, or per member.
+fn scan_rates(
+    ctx: &Ctx<'_>,
+    call: &parser::Call,
+    name: &str,
+    filter: &crate::labels::Labels,
+    request: crate::batch_rate::GridRateRequest<'_>,
+) -> Option<crate::batch_rate::GridRates> {
+    let Some(groups) = ctx.groups else {
+        let scan = ctx
+            .source
+            .counter_scan(name, filter, request.data_start, request.end_ns)?;
+        return crate::batch_rate::grid_rates(scan, &request);
+    };
+    let range = call.func.name == "rate";
+    let range_ns = match call.args.args.first().map(|a| &**a) {
+        Some(Expr::MatrixSelector(sel)) => sel.range.as_nanos() as u64,
+        _ => return None,
+    };
+    // What a part's read starts at: as `grid_request` computes it over that
+    // part alone.
+    let data_start = |source: &dyn DataSource| -> u64 {
+        let lookback = if range {
+            range_ns.saturating_add(
+                crate::batch_rate::interval_reach(source.counter_interval(name)).saturating_mul(2),
+            )
+        } else {
+            range_ns.max(ctx.step_ns)
+        };
+        ctx.start_ns.saturating_sub(lookback)
+    };
+    let holds = |source: &dyn DataSource| source.counter_names().iter().any(|n| n == name);
+    let mut scans = Vec::new();
+    let mut unit = Vec::new();
+    let mut units: Vec<crate::batch_rate::UnionUnit> = Vec::new();
+    let mut series = Vec::new();
+    for part in &groups.parts {
+        match part {
+            per_source::Part::Single(source) => {
+                if !holds(source.as_ref()) {
+                    continue;
+                }
+                let from = data_start(source.as_ref());
+                let mut scan = source.counter_scan(name, filter, from, request.end_ns)?;
+                let interval = source.counter_interval(name);
+                for s in &mut scan.series {
+                    s.interval.get_or_insert(interval);
+                    unit.push(units.len());
+                    units.push(crate::batch_rate::UnionUnit {
+                        labels: s.labels.clone(),
+                        combine: false,
+                    });
+                    series.push(crate::batch_rate::UnionMember {
+                        data_start: from,
+                        interval_ns: (interval * 1e9) as u64,
+                        rank: 0,
+                        before: Vec::new(),
+                        after: Vec::new(),
+                    });
+                }
+                scans.push(scan);
+            }
+            per_source::Part::Group(members) => {
+                // A member clipped to one epoch cannot be scanned.
+                if members.iter().any(|m| m.lo != 0 || m.hi != u64::MAX) {
+                    return None;
+                }
+                let mut ranked: Vec<(u64, &per_source::Member)> = members
+                    .iter()
+                    .filter(|m| holds(m.source.as_ref()))
+                    .map(|m| ((m.source.counter_interval(name) * 1e9) as u64, m))
+                    .collect();
+                ranked.sort_by(|(ia, a), (ib, b)| {
+                    ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo))
+                });
+                // Each group series' unit, by labels.
+                let mut unit_of: std::collections::HashMap<crate::labels::Labels, usize> =
+                    std::collections::HashMap::new();
+                for (rank, (interval_ns, m)) in ranked.into_iter().enumerate() {
+                    let from = data_start(m.source.as_ref());
+                    let mut scan = m.source.counter_scan(name, filter, from, request.end_ns)?;
+                    let interval = m.source.counter_interval(name);
+                    let labels: Vec<crate::labels::Labels> =
+                        scan.series.iter().map(|s| s.labels.clone()).collect();
+                    let tap = Tap::new(m.source.clone(), 0, u64::MAX);
+                    let (mut before, mut after) =
+                        tap.context_rows(true, name, filter, (from, request.end_ns), &labels);
+                    for s in &mut scan.series {
+                        s.interval.get_or_insert(interval);
+                        let u = *unit_of.entry(s.labels.clone()).or_insert_with(|| {
+                            units.push(crate::batch_rate::UnionUnit {
+                                labels: s.labels.clone(),
+                                combine: true,
+                            });
+                            units.len() - 1
+                        });
+                        unit.push(u);
+                        series.push(crate::batch_rate::UnionMember {
+                            data_start: from,
+                            interval_ns,
+                            rank,
+                            before: before.remove(&s.labels).unwrap_or_default(),
+                            after: after.remove(&s.labels).unwrap_or_default(),
+                        });
+                    }
+                    scans.push(scan);
+                }
+            }
+        }
+    }
+    if scans.is_empty() {
+        return None;
+    }
+    let plan = crate::batch_rate::UnionPlan {
+        unit,
+        units,
+        series,
+        window: if range {
+            crate::batch_rate::UnionWindow::Range(range_ns)
+        } else {
+            crate::batch_rate::UnionWindow::Step(ctx.step_ns)
+        },
+    };
+    let request = crate::batch_rate::GridRateRequest {
+        union: Some(&plan),
+        ..request
+    };
+    crate::batch_rate::grid_rates(metriken_storage::scan::interleave(scans), &request)
 }
 
 /// The metric, filter and request for a batch `rate`/`irate` of `call`, or
@@ -432,6 +562,7 @@ fn grid_request<'c, 'g>(
         reach_ns: rate_reach(ctx, name),
         group,
         display,
+        union: None,
     };
     Some((name, filter, request))
 }
@@ -459,11 +590,6 @@ fn batch_display(
     step: f64,
     display: &crate::DisplayOptions,
 ) -> Result<Option<crate::DisplayResult>, QueryError> {
-    // An aggregate over process groups aggregates the combined series, which
-    // the source cannot compute as it reads.
-    if ctx.groups.is_some() {
-        return Ok(None);
-    }
     let mut ops = Vec::new();
     let mut e = expr;
     let call = loop {
@@ -531,10 +657,8 @@ fn batch_display(
     let Some((name, filter, request)) = grid_request(ctx, call, group, Some(&grid_display)) else {
         return Ok(None);
     };
-    let Some(crate::batch_rate::GridRates::Display(results)) = ctx
-        .source
-        .counter_scan(name, &filter, request.data_start, request.end_ns)
-        .and_then(|scan| crate::batch_rate::grid_rates(scan, &request))
+    let Some(crate::batch_rate::GridRates::Display(results)) =
+        scan_rates(ctx, call, name, &filter, request)
     else {
         return Ok(None);
     };
@@ -650,9 +774,10 @@ where
     while let Expr::Paren(p) = inner {
         inner = &p.expr;
     }
-    // Over process groups the aggregation runs on the combined series.
+    // Over process groups the scan combines each group's members (S9)
+    // before the aggregation (`scan_rates`).
     let batched = match inner {
-        Expr::Call(call) if ctx.groups.is_none() => batch_rates(ctx, call, Some((op, group_by))),
+        Expr::Call(call) => batch_rates(ctx, call, Some((op, group_by))),
         _ => None,
     };
     if let Some((series, name)) = batched {
@@ -1328,6 +1453,15 @@ fn build_per_source<'a, 'e>(
 where
     'e: 'a,
 {
+    if let Leaf::Call(call) = leaf {
+        if let Some((series, _)) = batch_rates(ctx, call, None) {
+            return Ok(Built::Series {
+                series,
+                metric_name: leaf.metric(),
+                metric_name_for_error: leaf.metric().map(str::to_string),
+            });
+        }
+    }
     let Some(name) = leaf.metric() else {
         // The errors the single-source path gives these shapes.
         return Err(match leaf {

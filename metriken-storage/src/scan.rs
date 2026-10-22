@@ -51,6 +51,15 @@ pub struct ScanChunk {
     /// The earliest catalog start of every segment after this chunk; `None`
     /// after the last chunk or when one of them has no span.
     pub rest_start: Option<u64>,
+    /// The series (index ranges into the scan's series) that no later chunk
+    /// holds rows of: those of a scan [`interleave`] joined that has ended.
+    /// Empty for a single scan, whose series all end with its last chunk.
+    /// An interleave of interleaves reports only its own children that
+    /// ended, not the lists of its children's chunks: the series of an
+    /// inner scan that ended early are reported when that whole inner scan
+    /// ends. A late report costs only memory (the batch path holds points
+    /// until then); no answer depends on it.
+    pub ended: Vec<std::ops::Range<u32>>,
 }
 
 /// A segment could not be read. The engine discards the scan and evaluates
@@ -88,4 +97,131 @@ impl<'a> CounterScan<'a> {
     pub fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError> {
         self.reader.next_chunk(n)
     }
+}
+
+/// Where a joined scan's next chunk starts.
+#[derive(Clone, Copy)]
+enum Start {
+    /// No chunk read yet.
+    Unread,
+    /// The earliest catalog start of its unread segments, when known.
+    At(Option<u64>),
+    /// No chunk left.
+    Done,
+}
+
+struct Child<'a> {
+    scan: CounterScan<'a>,
+    /// Its first series' index in the joined scan, and how many it has.
+    offset: u32,
+    len: u32,
+    next_start: Start,
+}
+
+/// Several scans read as one (see [`interleave`]), in time order across
+/// them: each chunk is the next of the scan whose unread segments start
+/// earliest (a scan not read yet first), its series moved to their place in
+/// the joined scan, and the series of the scans that have ended since the
+/// last chunk listed in it (`ScanChunk::ended`). The batch path flushes a
+/// grouped display read up to the earliest start of what is unread
+/// (`ScanChunk::rest_start`); reading one scan to its end before the next
+/// would hold every group until the last scan.
+struct Interleaved<'a> {
+    children: Vec<Child<'a>>,
+    /// Series of scans that have ended, not yet reported in a chunk.
+    ended: Vec<std::ops::Range<u32>>,
+}
+
+impl ChunkReader for Interleaved<'_> {
+    fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError> {
+        loop {
+            let next = self
+                .children
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| match c.next_start {
+                    Start::Done => None,
+                    Start::Unread => Some((i, 0)),
+                    Start::At(at) => Some((i, at.unwrap_or(0))),
+                })
+                .min_by_key(|(_, at)| *at)
+                .map(|(i, _)| i);
+            let Some(i) = next else {
+                return Ok(None);
+            };
+            let child = &mut self.children[i];
+            let Some(mut chunk) = child.scan.next_chunk(n)? else {
+                child.next_start = Start::Done;
+                self.ended.push(child.offset..child.offset + child.len);
+                continue;
+            };
+            // `None` is the last chunk, or a segment without a span; a read
+            // that returns nothing next settles which.
+            child.next_start = Start::At(chunk.rest_start);
+            let offset = child.offset;
+            if offset > 0 {
+                for segment in &mut chunk.segments {
+                    for batch in &mut segment.series {
+                        for rows in batch {
+                            match rows {
+                                RowSeries::One(s) => *s += offset,
+                                RowSeries::PerRow(v) => {
+                                    for s in v.iter_mut().filter(|s| **s != u32::MAX) {
+                                        *s += offset;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            chunk.ended = std::mem::take(&mut self.ended);
+            // The earliest start of anything unread, in every scan; not
+            // known while a scan is unread or does not say.
+            chunk.rest_start = self
+                .children
+                .iter()
+                .map(|c| match c.next_start {
+                    Start::Done => Some(None),
+                    Start::Unread => None,
+                    Start::At(at) => at.map(Some),
+                })
+                .try_fold(None::<u64>, |min, at| {
+                    let at = at?;
+                    Some(match (min, at) {
+                        (Some(m), Some(a)) => Some(m.min(a)),
+                        (m, a) => m.or(a),
+                    })
+                })
+                .flatten();
+            return Ok(Some(chunk));
+        }
+    }
+}
+
+/// `scans` as one scan: their series in order, each scan's after the
+/// previous', and their chunks interleaved in time order, each chunk the
+/// next of the scan whose unread segments start earliest (a scan not read
+/// yet first), its series indices moved to their place in the joined scan.
+pub fn interleave<'a>(scans: Vec<CounterScan<'a>>) -> CounterScan<'a> {
+    let mut series = Vec::new();
+    let mut children = Vec::with_capacity(scans.len());
+    for mut scan in scans {
+        let offset = series.len() as u32;
+        let len = scan.series.len() as u32;
+        series.append(&mut scan.series);
+        children.push(Child {
+            scan,
+            offset,
+            len,
+            next_start: Start::Unread,
+        });
+    }
+    CounterScan::new(
+        series,
+        Box::new(Interleaved {
+            children,
+            ended: Vec::new(),
+        }),
+    )
 }

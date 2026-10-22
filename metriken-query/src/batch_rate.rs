@@ -8,6 +8,12 @@
 //! and writes them to a [`Sink`]: one vector of points per series, or
 //! accumulators per group and grid point that reduce as `MergeReduce` does.
 //!
+//! With a [`UnionPlan`] the scanned series are members of process groups:
+//! each group series' points pass through a [`UnionStage`], which answers a
+//! point from the member S3 and S9 choose once every member has passed it
+//! and the rows after it decide its coverage, so the combination streams
+//! with the scan (`streaming::per_source` has the rules).
+//!
 //! An aggregate's values and bands can differ from the per-series path's in
 //! the last bits of a float: they are summed in the order points are
 //! computed rather than the order of the series. A grouped display read
@@ -47,6 +53,274 @@ pub(crate) struct GridRateRequest<'a> {
     /// Reduce each series for display as its points are computed, or
     /// `None` for the points.
     pub display: Option<&'a GridDisplay>,
+    /// The scanned series as the members of process groups (S9), or `None`
+    /// for one result per scanned series.
+    pub union: Option<&'a UnionPlan>,
+}
+
+/// How a scan of several recordings' series reads as their union: each
+/// scanned series is one member's series of a result series (a unit), and a
+/// unit of a process group answers each grid point from the member chosen by
+/// S3 and S9, as `streaming::per_source::combine` does.
+pub(crate) struct UnionPlan {
+    /// Per scanned series: its unit.
+    pub unit: Vec<usize>,
+    pub units: Vec<UnionUnit>,
+    /// Per scanned series.
+    pub series: Vec<UnionMember>,
+    /// The window a point reads, for the coverage rule.
+    pub window: UnionWindow,
+}
+
+/// A result series of a [`UnionPlan`].
+pub(crate) struct UnionUnit {
+    pub labels: Labels,
+    /// Whether its members are combined: a process group's series. A
+    /// recording that is a group of one is its points as they are.
+    pub combine: bool,
+}
+
+/// A scanned series of a [`UnionPlan`]: its member's read and rank.
+pub(crate) struct UnionMember {
+    /// Its member's first sample time read (the grid's start less its
+    /// member's lookback).
+    pub data_start: u64,
+    /// Its member's interval for the counter.
+    pub interval_ns: u64,
+    /// Its member's place in S3's rank, lowest first.
+    pub rank: usize,
+    /// Its rows read before and after the scan (`Tap::context_rows`).
+    pub before: Vec<u64>,
+    pub after: Vec<u64>,
+}
+
+/// The window a point at `t` reads: `[t - range, t]` for `rate`, one step
+/// for `irate`.
+#[derive(Clone, Copy)]
+pub(crate) enum UnionWindow {
+    Range(u64),
+    Step(u64),
+}
+
+impl UnionWindow {
+    fn ns(self) -> u64 {
+        match self {
+            UnionWindow::Range(r) | UnionWindow::Step(r) => r,
+        }
+    }
+}
+
+/// Where one partition's points go.
+pub(crate) enum PartSink<'d> {
+    Series(PerSeries),
+    Groups(Grouped<Slot>),
+    Display(DisplaySink<'d>),
+    GroupsDisplay(Grouped<Compact>),
+    Union(Box<UnionStage<'d>>),
+}
+
+impl<'d> PartSink<'d> {
+    fn sink(&mut self) -> &mut dyn Sink {
+        match self {
+            PartSink::Series(s) => s,
+            PartSink::Groups(g) => g,
+            PartSink::Display(d) => d,
+            PartSink::GroupsDisplay(g) => g,
+            PartSink::Union(u) => &mut **u,
+        }
+    }
+
+    /// The sink a union's stage passes points to, or this one.
+    fn into_inner(self) -> Self {
+        match self {
+            PartSink::Union(mut u) => std::mem::replace(
+                &mut *u.inner,
+                PartSink::Series(PerSeries { points: Vec::new() }),
+            ),
+            other => other,
+        }
+    }
+
+    fn stage(&mut self) -> Option<&mut UnionStage<'d>> {
+        match self {
+            PartSink::Union(u) => Some(u),
+            _ => None,
+        }
+    }
+}
+
+/// One partition's stage between its members' rates and its sink: each
+/// combined unit's points held until every member of it has passed the
+/// point and its rows decide the coverage there, then the chosen point
+/// passed on.
+pub(crate) struct UnionStage<'d> {
+    inner: Box<PartSink<'d>>,
+    /// Per member series (local to the partition): its unit (local).
+    member_unit: Vec<u32>,
+    /// Per member series: its place among its unit's members.
+    member_slot: Vec<u32>,
+    /// Per member series: the coverage of its rows; `None` for a member of
+    /// a unit that is not combined.
+    tracks: Vec<Option<crate::promql::streaming::per_source::RowTrack>>,
+    /// Per unit (local): its members (local) in rank order, and the grid
+    /// indices with a member's point, each member's point there.
+    units: Vec<StageUnit>,
+    window: UnionWindow,
+    /// Points held now, and the most held at once.
+    #[cfg(any(test, feature = "fixtures"))]
+    held: (usize, usize),
+}
+
+struct StageUnit {
+    combine: bool,
+    members: Vec<usize>,
+    /// Per member (in rank order), its points not yet answered, in grid
+    /// order: a member's points arrive in increasing time, so each is a
+    /// queue, and a member read ahead of another holds only its own points.
+    pending: Vec<VecDeque<(usize, Point)>>,
+}
+
+impl StageUnit {
+    /// The first index a member holds a point at.
+    fn first(&self) -> Option<usize> {
+        self.pending
+            .iter()
+            .filter_map(|q| q.front().map(|(i, _)| *i))
+            .min()
+    }
+
+    /// Member `k`'s point at `index`, the first held, if it has one.
+    fn at(&self, k: usize, index: usize) -> Option<&Point> {
+        self.pending[k]
+            .front()
+            .filter(|(i, _)| *i == index)
+            .map(|(_, p)| p)
+    }
+
+    /// Drop the points at `index`, the first held; how many there were.
+    fn drop_first(&mut self, index: usize) -> usize {
+        let mut dropped = 0;
+        for q in &mut self.pending {
+            if q.front().is_some_and(|(i, _)| *i == index) {
+                q.pop_front();
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+}
+
+impl UnionStage<'_> {
+    /// Member `m`'s series has no more rows: its track decides the rest.
+    fn end_member(&mut self, m: usize) {
+        if let Some(t) = &mut self.tracks[m] {
+            t.finish();
+        }
+    }
+
+    /// A row of member `m`'s series.
+    fn row(&mut self, m: usize, ts: u64) {
+        if let Some(t) = &mut self.tracks[m] {
+            t.push(ts);
+        }
+    }
+
+    /// Pass on every held point that can be answered.
+    fn settle(&mut self, rates: &[SeriesRate], grid: &Grid) {
+        for u in 0..self.units.len() {
+            if !self.units[u].combine {
+                continue;
+            }
+            while let Some(index) = self.units[u].first() {
+                let t = grid.start_ns + index as u64 * grid.step_ns;
+                let unit = &self.units[u];
+                let ready = unit.members.iter().all(|&m| {
+                    rates[m].pending_ns().is_none_or(|p| p > t)
+                        && self.tracks[m].as_ref().is_some_and(|tr| tr.ready(t))
+                });
+                if !ready {
+                    break;
+                }
+                let n = unit.members.len();
+                let at = |k: usize| unit.at(k, index);
+                let covers = |k: usize| {
+                    let m = unit.members[k];
+                    let track = self.tracks[m].as_ref().expect("combined");
+                    track.covers(t, self.window.ns())
+                };
+                let holds = |k: usize| {
+                    let m = unit.members[k];
+                    self.tracks[m].as_ref().expect("combined").holds(t)
+                };
+                let pick = (0..n)
+                    .find(|&k| at(k).is_some() && covers(k))
+                    .or_else(|| (0..n).find(|&k| at(k).is_some() && holds(k)))
+                    .and_then(|k| at(k).copied());
+                let _dropped = self.units[u].drop_first(index);
+                #[cfg(any(test, feature = "fixtures"))]
+                {
+                    self.held.0 -= _dropped;
+                }
+                if let Some(p) = pick {
+                    self.inner.sink().emit(u, index, p);
+                }
+                for &m in &self.units[u].members {
+                    if let Some(tr) = &mut self.tracks[m] {
+                        tr.forget_before(t);
+                    }
+                }
+            }
+        }
+    }
+
+    /// No more rows or points: every track finished and every held point
+    /// passed on.
+    fn finish(&mut self, rates: &[SeriesRate], grid: &Grid) {
+        for t in self.tracks.iter_mut().flatten() {
+            t.finish();
+        }
+        self.settle(rates, grid);
+    }
+
+    /// The earliest grid point unit `u` still holds.
+    fn held_ns(&self, u: usize, grid: &Grid) -> Option<u64> {
+        self.units[u]
+            .first()
+            .map(|i| grid.start_ns + i as u64 * grid.step_ns)
+    }
+}
+
+impl Sink for UnionStage<'_> {
+    fn emit(&mut self, series: usize, index: usize, point: Point) {
+        let u = self.member_unit[series] as usize;
+        if !self.units[u].combine {
+            self.inner.sink().emit(u, index, point);
+            return;
+        }
+        let k = self.member_slot[series] as usize;
+        self.units[u].pending[k].push_back((index, point));
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            self.held.0 += 1;
+            self.held.1 = self.held.1.max(self.held.0);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    /// The most points each union stage dropped on this thread held at once,
+    /// summed over the stages: for one batched read, an upper bound on the
+    /// points its partitions held together.
+    pub(crate) static UNION_HELD_PEAK: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for UnionStage<'_> {
+    fn drop(&mut self) {
+        UNION_HELD_PEAK.with(|p| p.set(p.get() + self.held.1));
+    }
 }
 
 /// A display reduction applied while rates are computed.
@@ -934,10 +1208,22 @@ pub(crate) fn grid_rates(
             SeriesRate::new(s.windowed, request.start_ns, reach)
         })
         .collect();
-    let labels: Vec<Labels> = std::mem::take(&mut scan.series)
+    let scanned: Vec<Labels> = std::mem::take(&mut scan.series)
         .into_iter()
         .map(|s| s.labels)
         .collect();
+    // The result series: the scanned series, or the units of a union.
+    let union = request.union;
+    let (labels, unit_of): (Vec<Labels>, Vec<usize>) = match union {
+        Some(u) => (
+            u.units.iter().map(|x| x.labels.clone()).collect(),
+            u.unit.clone(),
+        ),
+        None => {
+            let n = scanned.len();
+            (scanned, (0..n).collect())
+        }
+    };
 
     let grid = Grid::from_request(request);
     let n = labels.len();
@@ -987,26 +1273,21 @@ pub(crate) fn grid_rates(
         local[s] = members[*p].len() as u32;
         members[*p].push(s);
     }
+    // Each scanned series' partition (its unit's) and place among the
+    // partition's rates.
     let mut part_rates: Vec<Vec<SeriesRate>> = (0..parts).map(|_| Vec::new()).collect();
+    let mut spart: Vec<usize> = Vec::with_capacity(unit_of.len());
+    let mut slocal: Vec<u32> = Vec::with_capacity(unit_of.len());
+    let mut rate_unit: Vec<Vec<usize>> = (0..parts).map(|_| Vec::new()).collect();
     for (s, rate) in rates.into_iter().enumerate() {
-        part_rates[partition[s]].push(rate);
+        let p = partition[unit_of[s]];
+        spart.push(p);
+        slocal.push(part_rates[p].len() as u32);
+        rate_unit[p].push(unit_of[s]);
+        part_rates[p].push(rate);
     }
-    enum PartSink<'d> {
-        Series(PerSeries),
-        Groups(Grouped<Slot>),
-        Display(DisplaySink<'d>),
-        GroupsDisplay(Grouped<Compact>),
-    }
-    impl PartSink<'_> {
-        fn sink(&mut self) -> &mut dyn Sink {
-            match self {
-                PartSink::Series(s) => s,
-                PartSink::Groups(g) => g,
-                PartSink::Display(d) => d,
-                PartSink::GroupsDisplay(g) => g,
-            }
-        }
-    }
+    let data_start = |s: usize| union.map_or(start, |u| u.series[s].data_start);
+
     let mut sinks: Vec<PartSink> = members
         .iter()
         .map(|m| match &groups {
@@ -1033,6 +1314,61 @@ pub(crate) fn grid_rates(
         })
         .collect();
 
+    // A union's members pass their points through a stage per partition.
+    if let Some(plan) = union {
+        let mut stages: Vec<Vec<(usize, usize)>> = (0..parts).map(|_| Vec::new()).collect();
+        for s in 0..unit_of.len() {
+            stages[spart[s]].push((s, unit_of[s]));
+        }
+        sinks = sinks
+            .into_iter()
+            .enumerate()
+            .map(|(p, inner)| {
+                let mut units: Vec<StageUnit> = members[p]
+                    .iter()
+                    .map(|&u| StageUnit {
+                        combine: plan.units[u].combine,
+                        members: Vec::new(),
+                        pending: Vec::new(),
+                    })
+                    .collect();
+                let mut member_unit = Vec::new();
+                let mut tracks = Vec::new();
+                let mut ranked: Vec<(usize, usize, usize)> = Vec::new();
+                for &(s, u) in &stages[p] {
+                    let ul = local[u] as usize;
+                    let m = &plan.series[s];
+                    member_unit.push(ul as u32);
+                    tracks.push(plan.units[u].combine.then(|| {
+                        crate::promql::streaming::per_source::RowTrack::new(
+                            m.interval_ns,
+                            m.before.clone(),
+                            m.after.clone(),
+                        )
+                    }));
+                    ranked.push((ul, m.rank, slocal[s] as usize));
+                }
+                ranked.sort_unstable();
+                let mut member_slot = vec![0u32; member_unit.len()];
+                for (ul, _, ml) in ranked {
+                    member_slot[ml] = units[ul].members.len() as u32;
+                    units[ul].members.push(ml);
+                    units[ul].pending.push(VecDeque::new());
+                }
+                PartSink::Union(Box::new(UnionStage {
+                    inner: Box::new(inner),
+                    member_unit,
+                    member_slot,
+                    tracks,
+                    units,
+                    window: plan.window,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    held: (0, 0),
+                }))
+            })
+            .collect();
+    }
+
     // A grouped display query feeds each group's points to its reducer once
     // no member can emit before them. After each chunk, a series whose last
     // sample is more than ten times the larger of its spacing and the step
@@ -1049,6 +1385,22 @@ pub(crate) fn grid_rates(
     let resumed = std::sync::atomic::AtomicBool::new(false);
     while let Some(chunk) = scan.next_chunk(threads).ok()? {
         let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
+            // A joined scan's series whose scan has ended get no more rows:
+            // finish them now, emitting what the scan's end would, so a
+            // union's stage need not hold its units' points until then.
+            for range in &chunk.ended {
+                for s in range.clone() {
+                    let s = s as usize;
+                    if spart[s] != part {
+                        continue;
+                    }
+                    let l = slocal[s] as usize;
+                    rates[l].finish(&grid, l, sink.sink());
+                    if let Some(stage) = sink.stage() {
+                        stage.end_member(l);
+                    }
+                }
+            }
             let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
                 a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
             };
@@ -1072,7 +1424,19 @@ pub(crate) fn grid_rates(
                             else {
                                 return;
                             };
-                            if base < start || base > end {
+                            if let Some(stage) = sink.stage() {
+                                let l = slocal[series] as usize;
+                                // A row of a series taken as ended (out of
+                                // the range or not) ends the read, as a
+                                // sample does: its coverage was decided
+                                // without it.
+                                if rates[l].ended_early() {
+                                    resumed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return;
+                                }
+                                stage.row(l, base);
+                            }
+                            if base < data_start(series) || base > end {
                                 return;
                             }
                             let window = windowed.then(|| {
@@ -1086,7 +1450,7 @@ pub(crate) fn grid_rates(
                                     get(duration, r),
                                 )
                             });
-                            let s = local[series] as usize;
+                            let s = slocal[series] as usize;
                             if rates[s].ended_early() {
                                 resumed.store(true, std::sync::atomic::Ordering::Relaxed);
                                 return;
@@ -1104,7 +1468,7 @@ pub(crate) fn grid_rates(
                         };
                         match series {
                             RowSeries::One(s) => {
-                                if partition[*s as usize] == part {
+                                if spart[*s as usize] == part {
                                     for r in 0..batch.num_rows() {
                                         push(r, *s as usize);
                                     }
@@ -1112,7 +1476,7 @@ pub(crate) fn grid_rates(
                             }
                             RowSeries::PerRow(v) => {
                                 for (r, s) in v.iter().enumerate() {
-                                    if *s != u32::MAX && partition[*s as usize] == part {
+                                    if *s != u32::MAX && spart[*s as usize] == part {
                                         push(r, *s as usize);
                                     }
                                 }
@@ -1120,6 +1484,9 @@ pub(crate) fn grid_rates(
                         }
                     }
                 }
+            }
+            if let Some(stage) = sink.stage() {
+                stage.settle(rates, &grid);
             }
         };
         run_partitions(&mut part_rates, &mut sinks, &run);
@@ -1146,7 +1513,7 @@ pub(crate) fn grid_rates(
             let mut pending = vec![u64::MAX; group_of.iter().max().map_or(0, |g| g + 1)];
             for (p, (rates, sink)) in part_rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
                 for (s, rate) in rates.iter_mut().enumerate() {
-                    let g = group_of[members[p][s]];
+                    let g = group_of[rate_unit[p][s]];
                     if let Some(last) = rate.last_ts() {
                         let lag = rate
                             .spacing_ns()
@@ -1156,10 +1523,23 @@ pub(crate) fn grid_rates(
                             && lag.is_some_and(|lag| last.saturating_add(lag) < w)
                         {
                             rate.end_early(&grid, s, sink.sink());
+                            // Its rows are taken as ended too; a row after
+                            // this ends the read (`resumed`), as a sample does.
+                            if let Some(stage) = sink.stage() {
+                                stage.end_member(s);
+                            }
                         }
                     }
                     if let Some(t) = earliest_point(rate, w, &grid) {
                         pending[g] = pending[g].min(t);
+                    }
+                }
+                if let Some(stage) = sink.stage() {
+                    for (ul, &u) in members[p].iter().enumerate() {
+                        if let Some(t) = stage.held_ns(ul, &grid) {
+                            let g = group_of[u];
+                            pending[g] = pending[g].min(t);
+                        }
                     }
                 }
             }
@@ -1167,6 +1547,10 @@ pub(crate) fn grid_rates(
                 .iter_mut()
                 .map(|s| match s {
                     PartSink::GroupsDisplay(g) => g,
+                    PartSink::Union(u) => match &mut *u.inner {
+                        PartSink::GroupsDisplay(g) => g,
+                        _ => unreachable!("grouped display sinks"),
+                    },
                     _ => unreachable!("grouped display sinks"),
                 })
                 .collect();
@@ -1182,6 +1566,9 @@ pub(crate) fn grid_rates(
     let finish = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, _p: usize| {
         for (s, rate) in rates.iter_mut().enumerate() {
             rate.finish(&grid, s, sink.sink());
+        }
+        if let Some(stage) = sink.stage() {
+            stage.finish(rates, &grid);
         }
     };
     run_partitions(&mut part_rates, &mut sinks, &finish);
@@ -1205,6 +1592,7 @@ pub(crate) fn grid_rates(
             })
             .collect()
     }
+    let sinks: Vec<PartSink> = sinks.into_iter().map(PartSink::into_inner).collect();
     Some(match groups {
         Some((_, (glabels, _))) if request.display.is_some() => {
             let mut flush = flush?;

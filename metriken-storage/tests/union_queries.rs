@@ -1538,3 +1538,62 @@ fn a_groups_histogram_reads_the_source_covering_the_range() {
         }
     }
 }
+
+/// A recording that is a group of one, read beside a process group, is its
+/// own answers as they are: a rate across a gap in it (which a group's
+/// rules would leave empty) is the recording's alone, on the batched scan
+/// of every recording at once.
+#[test]
+fn a_single_beside_a_group_keeps_its_own_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.dendro");
+    write(
+        &a,
+        &[spec(
+            &[("host", "a")],
+            &[("e1", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 2, 0), S),
+            cycles,
+        )],
+    );
+    let mut gapped = rows(at(10, 0, 0), at(10, 1, 0), S);
+    gapped.extend(rows(at(10, 1, 5), at(10, 2, 0), S));
+    let b = dir.path().join("b.dendro");
+    write(
+        &b,
+        &[spec(
+            &[("host", "b")],
+            &[("e2", at(10, 0, 0))],
+            gapped,
+            cycles,
+        )],
+    );
+    let all = dir.path().join("all.dendro");
+    combine(&all, &[(&a, None), (&a, None), (&b, None)]);
+    let union = open(&all);
+    assert_eq!(union.read_groups().len(), 2);
+    let window = (at(10, 0, 30), at(10, 1, 30), 1.0);
+    let alone = one_series(&open(&b), "rate(cpu_cycles[10s])", window);
+    let got = range(
+        &union,
+        r#"rate(cpu_cycles{host="b"}[10s])"#,
+        window,
+        Path_::Batched,
+    );
+    let inside = |t: f64| (at(10, 1, 2)..at(10, 1, 5)).contains(&ns(t));
+    assert!(alone.points.iter().any(|p| inside(p.0)));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].points, alone.points);
+    // And through the scan of both recordings: the sum over both hosts.
+    let sum = range(
+        &union,
+        "sum by (host) (rate(cpu_cycles[10s]))",
+        window,
+        Path_::Batched,
+    );
+    let b_sum = sum
+        .iter()
+        .find(|s| s.labels.get("host").map(String::as_str) == Some("b"))
+        .unwrap();
+    assert_eq!(b_sum.points, alone.points);
+}
