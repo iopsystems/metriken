@@ -209,13 +209,6 @@ impl MemberSeries {
             interval_ns,
         }
     }
-
-    fn coverage(&self, labels: &Labels) -> Coverage {
-        self.coverage.get(labels).cloned().unwrap_or(Coverage {
-            runs: Vec::new(),
-            interval_ns: self.interval_ns,
-        })
-    }
 }
 
 /// Combine the members' results per series (S3, S9). `members` are in rank
@@ -313,45 +306,6 @@ fn combine_series(
     chosen.into_iter().map(|(i, k)| members[i].0[k]).collect()
 }
 
-/// The grid times in `[start, end]` (every `step`) at which some series of
-/// `m` has no point whose rows cover the window, as runs `(first, last)` of
-/// consecutive grid times, in order. A member ranked after `m` can answer
-/// only there (and for series `m` lacks, which the caller checks).
-pub(crate) fn uncovered_runs(
-    m: &MemberSeries,
-    window: &dyn Fn(u64, u64) -> u64,
-    start: u64,
-    end: u64,
-    step: u64,
-) -> Vec<(u64, u64)> {
-    let n = ((end.saturating_sub(start)) / step + 1) as usize;
-    let mut need = vec![m.series.is_empty(); n];
-    for (labels, points) in &m.series {
-        let coverage = m.coverage(labels);
-        let mut p = points.iter().peekable();
-        for (k, need) in need.iter_mut().enumerate() {
-            let t = start + k as u64 * step;
-            while p.next_if(|q| q.t < t).is_some() {}
-            let has = p.peek().is_some_and(|q| q.t == t);
-            if !(has && coverage.covers(t, window(t, coverage.interval_ns))) {
-                *need = true;
-            }
-        }
-    }
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for (k, &need) in need.iter().enumerate() {
-        if !need {
-            continue;
-        }
-        let t = start + k as u64 * step;
-        match out.last_mut() {
-            Some(last) if last.1 + step == t => last.1 = t,
-            _ => out.push((t, t)),
-        }
-    }
-    out
-}
-
 /// A member's source as a leaf reads it: its rows clipped to `[lo, hi]`, the
 /// timestamps of every row it hands out recorded per series, and no batched
 /// counter scan (whose rows it could not record), so the per-series path
@@ -376,6 +330,43 @@ impl Tap {
     fn sink(&self, labels: &Labels) -> Arc<Mutex<Vec<u64>>> {
         let mut rows = self.rows.lock().expect("not poisoned");
         Arc::clone(rows.entry(labels.clone()).or_default())
+    }
+
+    /// Record the rows of `name` in the ten intervals before `start_ns`,
+    /// which the read starting there does not return: whether a series' rows
+    /// run on before the read or a hole precedes it decides whether a window
+    /// near the read's start is covered (S3). Only the timestamps are kept.
+    fn context(&self, counter: bool, name: &str, filter: &Labels, start_ns: u64) {
+        let margin = (self.inner.interval() * 1e10) as u64;
+        let (from, to) = (start_ns.saturating_sub(margin), start_ns.saturating_sub(1));
+        if from > to {
+            return;
+        }
+        let rows: Vec<(Labels, Vec<u64>)> = if counter {
+            self.inner
+                .counters(name, filter, from, to)
+                .map(|c| {
+                    c.series
+                        .into_iter()
+                        .map(|c| (c.labels, c.timestamps))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.inner
+                .gauges(name, filter, from, to)
+                .map(|g| {
+                    g.series
+                        .into_iter()
+                        .map(|g| (g.labels, g.timestamps))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for (labels, mut ts) in rows {
+            ts.retain(|&t| self.keeps(t) && t < start_ns);
+            self.record(&labels, &ts);
+        }
     }
 
     fn record(&self, labels: &Labels, timestamps: &[u64]) {
@@ -497,6 +488,7 @@ impl DataSource for Tap {
             return None;
         }
         let scan = self.inner.counter_scan(name, filter, start_ns, end_ns)?;
+        self.context(true, name, filter, start_ns);
         let sinks: Vec<_> = scan.series.iter().map(|s| self.sink(&s.labels)).collect();
         let (series, reader) = scan.into_parts();
         Some(crate::scan::CounterScan::new(
@@ -516,6 +508,7 @@ impl DataSource for Tap {
         end_ns: u64,
     ) -> Option<Counters> {
         let mut counters = self.inner.counters(name, filter, start_ns, end_ns)?;
+        self.context(true, name, filter, start_ns);
         for c in &mut counters.series {
             if !c.timestamps.iter().all(|&t| self.keeps(t)) {
                 let keep: Vec<bool> = c.timestamps.iter().map(|&t| self.keeps(t)).collect();
@@ -538,6 +531,7 @@ impl DataSource for Tap {
         end_ns: u64,
     ) -> Option<Vec<CounterStream<'s>>> {
         let streams = self.inner.counter_streams(name, filter, start_ns, end_ns)?;
+        self.context(true, name, filter, start_ns);
         let (lo, hi) = (self.lo, self.hi);
         Some(
             streams
@@ -561,6 +555,7 @@ impl DataSource for Tap {
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let gauges = self.inner.gauges(name, filter, start_ns, end_ns)?;
+        self.context(false, name, filter, start_ns);
         Some(self.clip_gauges(gauges))
     }
 
@@ -575,6 +570,8 @@ impl DataSource for Tap {
         let parts = self
             .inner
             .gauge_parts(name, filter, start_ns, end_ns, step_ns)?;
+        let lookback = step_ns.max((self.inner.gauge_interval(name) * 1e9) as u64);
+        self.context(false, name, filter, start_ns.saturating_sub(lookback));
         Some(
             parts
                 .into_iter()

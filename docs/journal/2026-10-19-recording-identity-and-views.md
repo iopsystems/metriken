@@ -1425,24 +1425,31 @@ three paths; evaluating the leaf per member reuses the one-recording code,
 so "evaluated alone, as one recording is evaluated today" holds by
 construction. A member that is a whole source reads the batched counter
 scan, the wrapper recording each row the scan decodes; a member clipped to
-an epoch takes the per-series path, since a scan cannot be clipped. On the
-grid, the first-ranked member is read over the whole range and every other
-member only over the runs of grid times where the first does not cover the
-window (and over the whole range when it lists a series the first does
-not): elsewhere the first answers whatever the others hold, and a grid
-point reads only its own window, so the narrower read changes no point
-(each run is read one step past its end, because a source is held past its
-last row only at the end of a range). Measured on the 9.6 h recording with a copy of itself, against the same
-archive read twice by metriken-query 0.41.0, medians of three interleaved
-rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at
-1 s 211 ms against 59 ms (546 ms before the batched scan and the narrowed
-reads), `rate(cgroup_cpu_usage[1m])` over 1 h 19 ms against 12 ms,
-`sum(irate(...))` over 1 h 18 ms against 6.1 ms, `sum(rate(...[1m]))` over
-9.6 h at 60 s 55 ms against 36 ms. Peak memory on that display query is
-1.1 GB against 193 MB, because each member's series are materialized before
+an epoch takes the per-series path, since a scan cannot be clipped. Every
+member is read over the whole query range. Reading a later member only over
+the grid times the first does not cover was tried and changed answers: a
+grid rate interpolates between the rows on either side of its window's
+edges, which can be any distance away across a hole, and a gauge read starts
+at its range's start, so a narrower read moves points (a 250 ms source with
+a hole over [200, 210) s beside a 2 s source, `rate(c[1s])` at a 0.25 s
+step: 9360 at 210.25, 210.5 and 210.75 s where the 2 s source alone reads
+9380, 9400 and 9420; 134 of 4360 random grid queries differed, and padding
+the ranges never brought that to 0). The wrapper also reads the rows of the
+ten intervals before each read, timestamps only, so a series whose rows run
+on before the read is not taken to start at the read (S3 needs the row
+before to tell a hole). `metriken-storage/tests/union_oracle.rs` checks the
+union against each source read alone over the whole range and combined
+point by point. Measured on the 9.6 h recording with a copy of itself,
+against the same archive read twice by metriken-query 0.41.0, medians of
+four interleaved rounds: a display query of
+`sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at 1 s 193 ms against 59 ms,
+`rate(cgroup_cpu_usage[1m])` over 1 h 21 ms against 12 ms,
+`sum(irate(...))` over 1 h 19 ms against 5.9 ms, `sum(rate(...[1m]))` over
+9.6 h at 60 s 55 ms against 35 ms. Peak memory on that display query is
+1.15 GB against 193 MB, because each member's series are materialized before
 they are combined; streaming the combination needs each series' rows ahead
 of its points (a read-ahead of nine rows answers S3's hole test), which the
-batched scan does not give, so it is the open cost item. Queries
+batched scan does not give. That is the next PR. Queries
 reaching no multi-member group take the code path they took before, and
 cost the same within noise.
 

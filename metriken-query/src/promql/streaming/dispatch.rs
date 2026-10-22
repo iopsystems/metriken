@@ -1415,64 +1415,14 @@ where
         ranked.sort_by(|(ia, a), (ib, b)| {
             ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo))
         });
-        // On the grid, a member ranked after the first can answer only at
-        // the grid times where the first does not cover the window, so it is
-        // read over those runs of grid times alone, or not at all, unless it
-        // holds a series the first does not list. Each grid point reads its
-        // own window, so a narrower range changes none of them; a run is read
-        // one step past its end, because a source is held past its last row
-        // at the end of a range.
-        let lazy = matches!(ctx.rate_mode, RateMode::Grid)
-            && ctx.eval_timestamps.is_none()
-            && ctx.step_ns > 0;
-        let listing = |m: &per_source::Member| -> std::collections::HashSet<_> {
-            let mut l = m.source.counter_labels(name);
-            l.extend(m.source.gauge_labels(name));
-            l.into_iter().collect()
-        };
-        let first_listing = ranked.first().filter(|_| lazy).map(|(_, m)| listing(m));
-        let mut need: Vec<(u64, u64)> = Vec::new();
+        // Every member is read over the whole range: a grid point
+        // interpolates between rows on either side of its window's edges,
+        // however far apart they are, so a narrower read can change a point.
         let mut evaluated = Vec::with_capacity(ranked.len());
-        for (i, (interval_ns, m)) in ranked.into_iter().enumerate() {
-            let narrow = lazy
-                && i > 0
-                && !first_listing
-                    .as_ref()
-                    .is_some_and(|first| !listing(m).is_subset(first));
-            let ranges: Vec<(u64, u64)> = if narrow {
-                need.iter()
-                    .map(|&(a, b)| (a, (b + ctx.step_ns).min(ctx.end_ns)))
-                    .collect()
-            } else {
-                vec![(ctx.start_ns, ctx.end_ns)]
-            };
+        for (interval_ns, m) in ranked {
             let tap = Tap::new(m.source.clone(), m.lo, m.hi);
-            let mut series: Vec<(crate::labels::Labels, Vec<super::Point>)> = Vec::new();
-            for (k, &(a, b)) in ranges.iter().enumerate() {
-                let mut sub = ctx.over(&tap);
-                sub.start_ns = a;
-                sub.end_ns = b;
-                for (labels, mut points) in collect(leaf.build(&sub)?) {
-                    if narrow {
-                        let (lo, hi) = need[k];
-                        points.retain(|p| lo <= p.t && p.t <= hi);
-                    }
-                    match series.iter_mut().find(|(l, _)| *l == labels) {
-                        Some((_, all)) => all.extend(points),
-                        None => series.push((labels, points)),
-                    }
-                }
-            }
+            let series = collect(leaf.build(&ctx.over(&tap))?);
             evaluated.push(MemberSeries::new(series, tap.take_rows(), interval_ns));
-            if lazy && i == 0 {
-                need = per_source::uncovered_runs(
-                    &evaluated[0],
-                    &window_ns,
-                    ctx.start_ns,
-                    ctx.end_ns,
-                    ctx.step_ns,
-                );
-            }
         }
         out.extend(per_source::combine(
             evaluated,

@@ -32,19 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restarted at half its last value; it now reads the true 1000/s).
   Aggregation and binary operators run on the combined series. Rules S1 to
   S9 of `docs/journal/2026-10-19-recording-identity-and-views.md`.
-- Cost: a member that is a whole source reads the batched counter scan, and
-  on the grid every member after the first-ranked is read only over the
-  grid times the first does not cover. On the 9.6 h recording with a copy of
-  itself (one uuid), against the same archive read twice by 0.41.0 (median
-  of three interleaved rounds): a display query of
-  `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at a 1 s step 211 ms
-  against 59 ms, of `sum(irate(cpu_usage[5s]))` 39 ms against 22 ms,
-  `rate(cgroup_cpu_usage[1m])` over 1 h at 1 s 19 ms against 12 ms,
-  `sum(irate(cgroup_cpu_usage[5s]))` over 1 h 18 ms against 6.1 ms, and
-  `sum(rate(cgroup_cpu_usage[1m]))` over 9.6 h at 60 s 55 ms against 36 ms.
-  Peak memory is higher, since each member's series are materialized before
-  they are combined: 1.1 GB against 193 MB for the 9.6 h display query (one
-  source: 128 MB). Single-source archives are unchanged within noise.
+- Cost: a member that is a whole source reads the batched counter scan
+  (one clipped to a producer epoch, the per-series path), over the whole
+  query range. On the 9.6 h recording with a copy of itself (one uuid),
+  against the same archive read twice by 0.41.0, medians of four interleaved
+  rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h
+  at a 1 s step 193 ms against 59 ms (peak RSS 1.15 GB against 193 MB), of
+  `sum(irate(cpu_usage[5s]))` 56 ms against 21 ms (449 MB against 122 MB),
+  `rate(cgroup_cpu_usage[1m])` over 1 h at 1 s 21 ms against 12 ms,
+  `sum(irate(cgroup_cpu_usage[5s]))` over 1 h 19 ms against 5.9 ms, and
+  `sum(rate(cgroup_cpu_usage[1m]))` over 9.6 h at 60 s 55 ms against 35 ms.
+  Memory is higher because each member's series are materialized before they
+  are combined. Single-source archives are unchanged within noise: 32.6
+  against 31.9 ms for the 9.6 h display query (spreads 29.7 to 33.2 and 30.4
+  to 32.1), 6.06 against 6.08 ms for the 1 h `rate`, 19.2 against 18.4 ms for
+  the 9.6 h `sum(rate)` (16.4 to 20.3 and 17.3 to 18.6), with peak RSS 130
+  against 133 MB.
 - Histogram functions over a group read one of its sources alone, until
   they are combined per source: the one covering the most of the query's
   range, ties to the finest. They count a process once and leave the other
