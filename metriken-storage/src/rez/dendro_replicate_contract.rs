@@ -14,7 +14,7 @@
 //! The producer they describe does not exist yet — that is #1224's Phase 2.
 //! What is pinned here is the contract it will be written against.
 
-#[cfg(all(test, feature = "test-support"))]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use dendro::archive::{Archive, WalRow};
     use dendro::replicate::wire::{self, FrameReader};

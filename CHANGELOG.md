@@ -306,22 +306,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table has no gauge histogram columns: a long row carrying gauge
   histograms, or a group written long that gains one, is written without
   their values, with a warning once per group.
-- **Changed:** gauge histograms are recorded in `.dendro` only. `.rez` stays
-  at its pre-6.0 shape: every `.rez` writer path that remains (V1/V2
-  snapshots through `group_by_sampler`, which the tar writer and the v3
-  writer's flat path share; the v3 writer's V3 group path; parquet ingest)
-  leaves gauge histograms out, with the rest of the group or table
-  recorded, and warns once per process ("gauge histograms are recorded in
-  .dendro only; this .rez recording leaves them out"). A `.rez` segment is
-  never format 2, and its counting histogram columns keep
-  `metric_type = histogram` (parquet ingest maps an input's
-  `counter_histogram` to it). Reading `.rez` is unchanged.
-- **Breaking:** `rez::rez_v3_writer::StreamRecorderV3::ingest_rows` and
-  `stage_rows`, the `.rez` writer fed by the row-format wire, are removed.
-  They passed a gauge histogram row into the `.rez` WAL unchanged, and the
-  first seal then refused it and ended the recording. Nothing in metriken
-  or rezolus called them; a recorder of a row-wire producer writes
-  `.dendro`.
+- **Breaking:** `.rez` writing is removed; reading every `.rez` (v1/v2
+  tar, v3 SQLite, live or finalized) is unchanged, as is `rez::to_dendro`.
+  Recordings are written as dendro archives, which hold gauge histograms
+  (a `.rez` cannot). Removed: the
+  modules `rez::rez_v3_writer` (`RezArchive`, `RecordingWriter`,
+  `StreamRecorderV3`, `CHECKPOINT_INTERVAL`), `rez::rez_stream` (the tar
+  stream writer), `rez::rez_v3_rewrite` (`copy_recordings_into` and the
+  `combine`/`filter`/`upgrade`/report rewrites), `rez::parquet_ingest` and
+  `rez::seal_policy` (use `dendro::seal::SealPolicy::default()` or
+  `metriken_storage::WriterConfig::default().seal`, whose defaults are the
+  same: 8 MiB, 900 rows, 300 s); from `rez::rez`, `RezRecorder`, `write_archive`,
+  `write_archive_bytes`, `append_tar_entry`, `RecordingData`,
+  `RecordingSegments`, `RezArchive`, `read_archive`, `Entry`,
+  `PushEntries`, `entries_approx_bytes`, `group_by_sampler`, `dedup_key`,
+  `build_labels`, the `recorder_tests_support`
+  fixtures, and the re-exports of the segment writer (`TableBuilder`,
+  `GroupTableBuilder`, `Cell`, `CellValue`, `cells_approx_bytes`, the cost
+  constants, `wal_group_row_approx_bytes`, `group_approx_bytes`,
+  `write_table_parquet`, `segment_writer_props`, `table_to_batch`; use
+  `builder`, `table` and `wal`); `rez::wal::wal_value`; from
+  `rez::rez_sqlite::RezDb`, `create`, `create_in_memory`, `serialize`,
+  `remove_archive`, `checkpoint_passive`, `transaction` (and `RezTx`),
+  `insert_recording`, `insert_segment`, `insert_wal_rows`,
+  `insert_wal_rows_batch` (and `TickBatch`), `prune_wal`, `evict_before`
+  (and `Evicted`), `evict_caller_rows_before`, `incremental_vacuum`,
+  `vacuum_into`, `mark_complete`, `update_recording_metadata`,
+  `update_recording_labels` and `commits`; `rez_sqlite::PAGE_SIZE` (now
+  private, test-only); `table::cadence_hint`; and the
+  `test-support` feature. `RezDb::open` and `open_bytes` set only the
+  reader's page cache (the writer's `synchronous` and
+  `wal_autocheckpoint` are gone). `rez::wire` (the row wire,
+  `AgentRow`/`AgentRows`, `encode_group`/`encode_snapshot`) stays: it is
+  the stream path's, not a `.rez` writer.
 - **Added:** segment format 2. A segment holding a gauge histogram column is
   written with `metriken.format = 2`, which metriken-storage 0.4.0 refuses
   (earlier releases refuse any archive dendro 0.6 writes when opening it,
@@ -343,8 +360,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   producer's metadata carried. A group holding a gauge histogram is written
   wide.
 - **Changed:** new archive segments name the counting histogram
-  `metric_type = counter_histogram` (was `histogram`); `.rez` segments keep
-  `histogram`. Readers take
+  `metric_type = counter_histogram` (was `histogram`); `.rez` segments, all
+  written before, say `histogram`. Readers take
   `histogram`, `counter_histogram` and an absent `metric_type` as counting
   (`metriken_model::is_counter_histogram`), so every archive and file
   written before reads as it did; 0.4.0 also reads a new `counter_histogram`

@@ -91,13 +91,14 @@ pub enum WalValue {
 /// One V3 acquisition-group's WAL payload for one tick: values + ONE shared
 /// window, with member names/metadata resolved from a schema rather than
 /// carried per cell — the WAL row shrinks to values + one window, per the
-/// schema-hash cache design (see `StreamRecorderV3`'s `schemas` field).
+/// schema-hash cache design (see `ArchiveWriter` in metriken-storage's
+/// `writer.rs`, and its per-group schema ring).
 ///
 /// **Self-sufficiency, not just bandwidth.** `schema` is `Some` only on the
 /// row that (re-)anchors this group's schema for the segment currently
 /// accumulating in this table's live WAL — mirroring `WalCell::metadata`'s
 /// "first mention in this segment" rule, at group granularity instead of
-/// per-metric (`StreamRecorderV3`'s `segment_schema` map decides this,
+/// per-metric (`ArchiveWriter`'s per-group `anchored` hash decides this,
 /// independently of whether the AGENT'S payload included a schema this
 /// tick). `schema_hash` is always present so a decoder can tell schema drift
 /// from steady state even when `schema` is `None`. This is what lets

@@ -542,7 +542,7 @@ impl LongLayout {
 }
 
 /// A group's schemas seen recently, by hash. Three, as the `.rez` writer
-/// keeps: enough for a schema flipping back and forth.
+/// kept: enough for a schema flipping back and forth.
 const SCHEMA_RING_LEN: usize = 3;
 
 #[derive(Default)]

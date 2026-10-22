@@ -251,6 +251,10 @@ Reading:
   Reading `.rez` is unchanged. Mutations checked: skipping the `ingest_v3`
   strip, writing `counter_histogram` into a `.rez`, keeping the parquet
   ingest column, and dropping the V1/V2 warning each fail a test.
+  Update 2026-10-22: superseded by the owner's rule that 6.0 writes only
+  `.dendro`. metriken-storage 0.5.0 removes every `.rez` writer, these
+  strip paths and `write_rez_table_parquet`/`materialize_rez_wal_tail`
+  with them (`chore/no-rez-writers`); reading `.rez` is unchanged.
 
 ### Query semantics (metriken-query)
 

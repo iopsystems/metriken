@@ -7,83 +7,33 @@
 //! This is the ONLY module that knows SQL. Everything above it speaks in
 //! recordings, segments, and WAL rows.
 //!
-//! The container is built before its writers: the `segments`, `wal`, and
-//! `clock_offsets` tables exist here, but their accessors arrive with the
-//! streaming writer, so the surface is wider than today's callers use.
-#![allow(dead_code)]
+//! Read only: metriken-storage 0.5.0 removed the writer. An archive may still
+//! be live (a 5.x recorder or hindsight buffer appending to it), so the reads
+//! here tolerate rows the writer has not sealed yet; see [`RezDb::live_wal`].
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs::OpenOptions;
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
-/// Fixed at file creation and NOT changeable afterwards without leaving WAL
-/// mode and running a full `VACUUM`, so treat it as permanent.
-///
-/// Larger pages help operations that are not the binding constraint, and cost
-/// where it hurts: every tick commits a small WAL row, so write amplification
-/// scales with the page size. Optimize for the per-tick write, not the bulk
-/// read.
-pub const PAGE_SIZE: u32 = 4096;
-
-/// Cap the `-wal` sidecar by BYTES, not pages. At `PAGE_SIZE` this is close to
-/// SQLite's own ~1000-page default, so it changes nothing today — it exists so
-/// that the sidecar's size, and the checkpoint pause it implies, cannot track a
-/// future page size.
-///
-/// This bounds the sidecar's SIZE. It does not bound its AGE, and the two come
-/// apart badly: a recording slow enough to take an hour to accumulate 4 MiB
-/// leaves the archive an hour behind the sidecar, and a plain copy of it an
-/// hour short. [`crate::rez::rez_v3_writer::CHECKPOINT_INTERVAL`] is the age bound.
-const WAL_AUTOCHECKPOINT_BYTES: u32 = 4 * 1024 * 1024;
-
-/// Page cache for a connection that READS segments back, as a negative
+/// Page cache for a connection that reads segments back, as a negative
 /// (kibibyte-denominated) `cache_size`. Large because a reader replays whole
-/// segments and benefits from holding them; see `WRITER_CACHE_SIZE_KIB` for why
-/// a writing connection must not take this.
+/// segments and benefits from holding them.
 const READER_CACHE_SIZE_KIB: i32 = -262_144;
 
-/// 16 MiB of page cache for a connection that only WRITES.
-///
-/// **Split from the reader's cache because a writer cannot use it.** The
-/// reader's figure buys segment-read throughput; a recording writer inserts
-/// opaque BLOBs and never reads one back, so the only pages it benefits from
-/// caching are catalog b-trees, which are kilobytes.
-///
-/// It is not merely wasted headroom. `cache_size` is an upper bound rather than
-/// an allocation, but a seal batch dirties every overflow page of every segment
-/// it inserts inside one transaction — megabytes of BLOB is thousands of pages
-/// — so a co-seal walks the writer's cache to whatever cap it is given, and
-/// SQLite does not hand it back. On an always-on agent that is permanent
-/// resident memory.
-///
-/// 16 MiB is sized from `SealPolicy::max_bytes`: two segments' worth, so a
-/// single segment's insert fits with room to spare. Overrunning it is safe and
-/// nearly free, which is what makes a small cache the right default — in WAL
-/// mode a full cache spills dirty pages to the `-wal` before the commit, and
-/// segment inserts are append-only pages that are never re-dirtied, so a
-/// spilled page is written once either way.
-const WRITER_CACHE_SIZE_KIB: i32 = -16_384;
+/// The page size the writer created every `.rez` with (tests only).
+#[cfg(test)]
+const PAGE_SIZE: u32 = 4096;
 
-/// These are NEGATIVE kibibytes, so the writer's cap is the GREATER number.
-/// Easy to invert while retuning, and an inversion is silent — it hands the
-/// always-on writer the big cache and the analysis reader the small one, which
-/// is precisely backwards and costs only performance, so nothing else fails.
-/// A compile error rather than a test, because there is no reason to let a
-/// build with the two crossed over exist at all.
-const _: () = assert!(
-    WRITER_CACHE_SIZE_KIB > READER_CACHE_SIZE_KIB,
-    "the writer's page cache must be smaller than the reader's"
-);
-
-/// Written once at creation; a reader that finds anything else should refuse
-/// the file rather than guess.
+/// The schema version the last writer stamped (tests only).
 ///
 /// 4 added `caller_rows`. The container shape is otherwise unchanged and the
 /// addition is purely additive, so a v3 archive still opens: reads of that
 /// table tolerate its absence rather than failing, because an archive written
 /// before it existed genuinely has no caller rows. See `read_caller_rows`.
+#[cfg(test)]
 const SCHEMA_VERSION: i64 = 4;
 
 /// One recording's identity: everything known when the recording starts.
@@ -137,15 +87,6 @@ pub struct WalRow {
     pub row: Vec<u8>,
 }
 
-/// What one retention pass removed. Returned rather than logged so a caller
-/// can tell "the window moved" from "nothing was old enough yet" — and so a
-/// test can assert the WAL rows went with their segments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Evicted {
-    pub segments: usize,
-    pub wal_rows: usize,
-}
-
 /// How many rows a table holds and what time span they cover, answered from
 /// catalog columns alone — no segment or WAL payload is read. `first_ts` and
 /// `last_ts` are `None` when `rows` is 0.
@@ -166,226 +107,24 @@ const LIVE_WAL_PREDICATE: &str = "recording_id = ?1 AND sampler = ?2 \
             WHERE recording_id = ?1 AND sampler = ?2), \
            0)";
 
-/// One recording's contribution to one tick: its rows.
-#[derive(Debug, Default)]
-pub struct TickBatch {
-    pub recording_id: i64,
-    pub rows: Vec<WalRow>,
-}
-
-impl TickBatch {
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-}
-
 /// An open handle on a `.rez` v3 file.
 pub struct RezDb {
     conn: Connection,
-    /// Committed transactions. See [`RezDb::commits`].
-    #[cfg(any(test, feature = "test-support"))]
-    commits: std::cell::Cell<u64>,
 }
 
 impl RezDb {
-    /// Create a new `.rez` at `path`, applying the pragmas that can only be set
-    /// on a database that does not yet exist, then installing the schema.
+    /// Open an existing `.rez`.
     ///
-    /// Fails if `path` already exists: a `.rez` is valid from creation, so there
-    /// is no `.partial` staging file standing between a new recording and a
-    /// previous one.
-    pub fn create(path: &Path) -> Result<Self, String> {
-        Self::create_with_page_size(path, PAGE_SIZE)
-    }
-
-    /// Create a `.rez` that lives only in memory, for a consumer with no
-    /// filesystem to write to — a browser assembling a report `.rez` from
-    /// uploaded bytes. It has NO WAL (an in-memory database cannot have one),
-    /// which is exactly the shape [`serialize`](Self::serialize) then
-    /// [`open_bytes`](Self::open_bytes) expect: the bytes carry the whole
-    /// archive, sidecar-free.
-    ///
-    /// Unlike [`create`](Self::create) it skips the on-disk geometry pragmas
-    /// (`auto_vacuum`, `journal_mode=WAL`) — those bound a long-lived file's
-    /// footprint and durability, neither of which a transient in-memory image
-    /// serialized straight to bytes has any use for.
-    pub fn create_in_memory() -> Result<Self, String> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| format!("failed to open an in-memory database: {e}"))?;
-        let db = RezDb {
-            conn,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
-        };
-        db.set_pragma("page_size", PAGE_SIZE)?;
-        db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
-        db.conn
-            .execute_batch(SCHEMA_SQL)
-            .map_err(|e| format!("failed to create .rez schema: {e}"))?;
-        db.conn
-            .execute(
-                "INSERT INTO schema_version(version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )
-            .map_err(|e| format!("failed to record .rez schema version: {e}"))?;
-        Ok(db)
-    }
-
-    /// Serialize the whole database to bytes — the inverse of
-    /// [`open_bytes`](Self::open_bytes). Used to hand a report `.rez` built in
-    /// memory back to a caller (a browser download) without a filesystem.
-    pub fn serialize(&self) -> Result<Vec<u8>, String> {
-        let data = self
-            .conn
-            .serialize(rusqlite::MAIN_DB)
-            .map_err(|e| format!("failed to serialize .rez: {e}"))?;
-        Ok(data.to_vec())
-    }
-
-    /// A SQLite sidecar's path: the suffix is appended to the whole filename,
-    /// not swapped for the extension — `out.rez` has `out.rez-wal`, not
-    /// `out-wal`.
-    fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        std::path::PathBuf::from(name)
-    }
-
-    /// Remove an archive AND its SQLite sidecars, ignoring what is not there.
-    ///
-    /// **A `.rez` is three files on disk while it is open**, not one: SQLite
-    /// puts recent commits in `<path>-wal` and the shared index in
-    /// `<path>-shm`. It cleans both up on a clean close, but not after an
-    /// unclean one — so anything that removes an archive has to remove them
-    /// too, or the next run finds a `-wal` beside a path it believes is free.
-    /// That is worse than a stale main file: `O_EXCL` catches the main file
-    /// and says so, while a stray sidecar is adopted silently by the newly
-    /// created database and its frames replayed into it.
-    ///
-    /// Best-effort by design: this runs on failure paths, where the error that
-    /// brought us here is the one worth reporting.
-    pub fn remove_archive(path: &Path) {
-        for p in [
-            path.to_path_buf(),
-            Self::sidecar(path, "-wal"),
-            Self::sidecar(path, "-shm"),
-        ] {
-            match std::fs::remove_file(&p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!("failed to remove {}: {e}", p.display()),
-            }
-        }
-    }
-
-    /// `create`, with the page size as a parameter. The parameter exists so a
-    /// test can create at a NON-default page size: SQLite's own default happens
-    /// to equal `PAGE_SIZE`, so asserting 4096 on a normally-created file passes
-    /// even if the `page_size` pragma is never issued or is issued too late.
-    /// Only `create` (and that test) should call this — the page size is not a
-    /// caller's choice.
-    fn create_with_page_size(path: &Path, page_size: u32) -> Result<Self, String> {
-        // Claim the path atomically rather than testing `exists()` — this is
-        // also what stops SQLite from silently adopting a file that appeared
-        // between the check and the open. A zero-length file is a valid empty
-        // database, so SQLite still treats what follows as a fresh creation.
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-
-        // From here the file is OURS, and a failure must not leave it behind:
-        // the writer refuses to overwrite an existing `.rez`, so a half-created
-        // one turns the operator's retry into "the file already exists" — which
-        // reads as a bug in the retry rather than fallout from the error that
-        // actually happened.
-        match Self::init_created(path, page_size) {
-            Ok(db) => Ok(db),
-            Err(e) => {
-                Self::remove_archive(path);
-                Err(e)
-            }
-        }
-    }
-
-    /// Everything `create_with_page_size` does after claiming the path. Split
-    /// out so a failure in any of it has one cleanup site rather than one per
-    /// `?`.
-    fn init_created(path: &Path, page_size: u32) -> Result<Self, String> {
-        // No `SQLITE_OPEN_CREATE`: the file above is the only one this may
-        // adopt. No `SQLITE_OPEN_URI` either, so a path that happens to begin
-        // with `file:` stays a filename.
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let db = RezDb {
-            conn,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
-        };
-
-        // ORDER IS LOAD-BEARING, and a reordering here fails invisibly — the
-        // file is written with the wrong geometry and only a full VACUUM of
-        // every fleet file fixes it. The three tiers, in order:
-        //
-        //  1. `page_size` and `auto_vacuum` take effect only on a database with
-        //     no pages yet: before `journal_mode=WAL` (which writes the header
-        //     and welds the page size in) and before the first CREATE TABLE.
-        //  2. `journal_mode=WAL` is PERSISTENT — stored in the file header, so
-        //     it is set once here and never on open.
-        //  3. `synchronous` and the cache/checkpoint knobs are PER-CONNECTION
-        //     and not persistent, so they are applied on every connection,
-        //     including this one. See `apply_connection_pragmas`.
-        db.set_pragma("page_size", page_size)?;
-        // INCREMENTAL, not NONE: eviction reuses freed pages, but the bound is
-        // the high-water mark, so a burst would permanently inflate a hindsight
-        // file. Free in steady state (8.230 vs 8.807 ms per cycle) and it
-        // CANNOT be turned on later without a full VACUUM.
-        db.set_pragma("auto_vacuum", "INCREMENTAL")?;
-        db.set_journal_mode_wal()?;
-        // Creating a `.rez` means writing one: the recorder's and hindsight's
-        // live buffers both start here, and both are the always-on processes
-        // whose RSS this is protecting. The only other `create` in the tree is
-        // `hindsight::buffer::copy_range`'s dump destination, which is likewise
-        // insert-only.
-        db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
-
-        db.conn
-            .execute_batch(SCHEMA_SQL)
-            .map_err(|e| format!("failed to create .rez schema: {e}"))?;
-        db.conn
-            .execute(
-                "INSERT INTO schema_version(version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )
-            .map_err(|e| format!("failed to record .rez schema version: {e}"))?;
-
-        Ok(db)
-    }
-
-    /// Open an existing `.rez`, reapplying the per-connection pragmas.
+    /// The connection is read-write, as it was when this crate also wrote
+    /// `.rez`, though nothing here writes through it. No `SQLITE_OPEN_CREATE`:
+    /// opening a `.rez` that is not there is an error, not an empty new
+    /// recording.
     pub fn open(path: &Path) -> Result<Self, String> {
-        // No `SQLITE_OPEN_CREATE`: opening a `.rez` that is not there is an
-        // error, not an empty new recording.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let db = RezDb {
-            conn,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
-        };
-        // `page_size`, `auto_vacuum` and `journal_mode` persist in the file;
-        // these do not, and forgetting them silently downgrades durability
-        // (synchronous falls back to NORMAL) on every subsequent write.
-        //
-        // The reader cache, because every bulk segment read in the tree arrives
-        // through `open` — `rez_reader::read_v3_recordings`, and hindsight's
-        // dump source. The two `open` call sites that go on to write
-        // (hindsight's staged dump) take it too, deliberately: they are
-        // short-lived, offline and bounded by the dump, so no long-running
-        // process holds it.
+        let db = RezDb { conn };
         db.refuse_dendro(&path.display().to_string())?;
-        db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
+        db.set_pragma("cache_size", READER_CACHE_SIZE_KIB)?;
         Ok(db)
     }
 
@@ -410,9 +149,7 @@ impl RezDb {
 
     /// Whether `path` is a dendro archive rather than a `.rez`. Both are
     /// SQLite files, told apart by the `application_id` dendro stamps into
-    /// the header. For a caller that reads either through `RezReader` but
-    /// can only write a `.rez`, so it can refuse the write before doing the
-    /// read.
+    /// the header.
     pub fn is_dendro(path: &Path) -> Result<bool, String> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
@@ -471,13 +208,9 @@ impl RezDb {
         // its own copy of the image.
         conn.deserialize_read_exact(rusqlite::MAIN_DB, &mut bytes.as_slice(), len, true)
             .map_err(|e| format!("failed to read the .rez archive: {e}"))?;
-        let db = RezDb {
-            conn,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
-        };
+        let db = RezDb { conn };
         db.refuse_dendro("the uploaded file")?;
-        db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
+        db.set_pragma("cache_size", READER_CACHE_SIZE_KIB)?;
 
         // A `.rez` always has a `recordings` table. Its absence has one
         // overwhelmingly likely cause worth naming: the bytes are a plain copy
@@ -499,98 +232,19 @@ impl RezDb {
             return Err(
                 "not a .rez archive, or a copy taken while it was still being \
                         written — an archive's most recent pages live in a `-wal` sidecar \
-                        that a single copied file does not carry. Take the copy with \
-                        `rezolus recording snapshot <archive> -o out.rez`, which reads \
-                        through the sidecar without stopping the recorder"
+                        that a single copied file does not carry. Open the archive by \
+                        path with its `-wal` file beside it, or copy it after the \
+                        recorder has stopped"
                     .to_string(),
             );
         }
         Ok(db)
     }
 
-    /// Copy what the `-wal` sidecar holds into the archive itself, best-effort.
-    ///
-    /// **PASSIVE, deliberately.** A passive checkpoint moves whatever frames it
-    /// can and returns; it never waits for a reader, and it never blocks the
-    /// writer behind one. `FULL`/`TRUNCATE` would stall until readers finish,
-    /// and this runs on the writer thread with a capacity-1 channel behind it —
-    /// a stall there backpressures the scrape loop, which is the one cost this
-    /// whole container is shaped to avoid.
-    ///
-    /// Best-effort is the right contract: the caller is bounding how STALE a
-    /// copy of the archive can be, not demanding an exact one. `rezolus
-    /// recording snapshot` is the exact one.
-    pub fn checkpoint_passive(&self) -> Result<(), String> {
-        // `execute_batch`, not `pragma_query`: rusqlite QUOTES the pragma name
-        // it is given, so `pragma_query(None, "wal_checkpoint(PASSIVE)", ..)`
-        // asks for a pragma literally named `wal_checkpoint(PASSIVE)`. SQLite
-        // answers an unknown pragma with no rows and no error — the call
-        // returns `Ok` having checkpointed nothing. Found by the test that
-        // asserts a plain copy keeps up; it would otherwise have shipped as a
-        // cadence that silently never ran.
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(|e| format!("failed to checkpoint the WAL: {e}"))
-    }
-
-    /// The pragmas that live on the connection, not in the file. Applied by
-    /// both `create` and `open`.
-    ///
-    /// `cache_size_kib` is the caller's because it is the one per-connection
-    /// knob whose right value depends on what the connection is FOR; see
-    /// `READER_CACHE_SIZE_KIB` and `WRITER_CACHE_SIZE_KIB`. Everything else here
-    /// is a property of the file's durability contract and is identical on
-    /// every connection.
-    fn apply_connection_pragmas(&self, cache_size_kib: i32) -> Result<(), String> {
-        // FULL, not NORMAL: it survives power loss, not merely process death,
-        // and on the combined workload it is no worse at any percentile that
-        // threatens the tick budget — the tail is checkpoint and prune work,
-        // not fsync.
-        self.set_pragma("synchronous", "FULL")?;
-        // Derived from the file's OWN page size rather than the constant, which
-        // is what "denominated in bytes" has to mean: the cap then holds at
-        // 4 MiB for any file this ever opens, not just ones written at
-        // `PAGE_SIZE`.
-        let pages = WAL_AUTOCHECKPOINT_BYTES / self.pragma_u32("page_size")?.max(1);
-        self.set_pragma("wal_autocheckpoint", pages)?;
-        self.set_pragma("cache_size", cache_size_kib)?;
-        // NOT set here, and worth knowing about: `busy_timeout` is 5000 ms —
-        // rusqlite's default, not SQLite's own (which is 0, i.e. fail at
-        // once) and not ours. It never fires for the writer, which owns its
-        // file (the journal makes concurrent writers to one file an explicit
-        // non-goal), and it never fires for a reader either, because WAL mode
-        // lets readers proceed while a write is in flight. The one caller it
-        // can bite is a SECOND connection that writes: it will stall up to 5 s
-        // before `SQLITE_BUSY`, which against a ~46 ms tick reads as a hang.
-        // Left at the default deliberately rather than tuned — no measurement
-        // supports any particular number, and every candidate is a guess about
-        // a caller that does not exist yet. A future one should set its own,
-        // with a value it can justify.
-        Ok(())
-    }
-
-    /// `PRAGMA journal_mode = WAL`. Separate because, unlike the others, it
-    /// answers with a row, which `pragma_update` rejects.
-    fn set_journal_mode_wal(&self) -> Result<(), String> {
-        let mode: String = self
-            .conn
-            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-            .map_err(|e| format!("failed to set journal_mode=WAL: {e}"))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(format!("journal_mode is {mode}, expected wal"));
-        }
-        Ok(())
-    }
-
     fn set_pragma<V: rusqlite::ToSql>(&self, name: &str, value: V) -> Result<(), String> {
         self.conn
             .pragma_update(None, name, value)
             .map_err(|e| format!("failed to set pragma {name}: {e}"))
-    }
-
-    /// Start a recording, returning its id.
-    pub fn insert_recording(&self, meta: &RecordingMeta) -> Result<i64, String> {
-        insert_recording_sql(&self.conn, meta)
     }
 
     /// Every recording in the file, in insertion order. A `.rez` may hold
@@ -634,66 +288,6 @@ impl RezDb {
             });
         }
         Ok(out)
-    }
-
-    /// Run `f` inside ONE transaction: it commits when `f` returns `Ok` and
-    /// rolls back — leaving the database exactly as it was — when `f` returns
-    /// `Err` or the commit itself fails.
-    ///
-    /// This exists because samplers seal in lockstep — a dozen tables at once
-    /// is normal. Without a way to group them, one co-seal is a dozen implicit
-    /// commits, i.e. a dozen fsyncs at `synchronous=FULL`, against a tick
-    /// budget that a single segment insert already eats into.
-    ///
-    /// `f` receives a `RezTx`, not the connection: SQL stays inside this
-    /// module, and `RezTx` deliberately exposes only the *writes that belong
-    /// in a seal batch*. `prune_wal` is NOT among them, which is how "the
-    /// prune runs outside the seal transaction" is made unrepresentable rather
-    /// than merely documented — inside it, a quiet sampler's accumulated rows
-    /// make the delete long enough to threaten the tick.
-    /// How many transactions this connection has COMMITTED.
-    ///
-    /// Exists so "one commit per tick, whatever the endpoint count" is a
-    /// property a test can assert rather than one a comment claims. At
-    /// `synchronous=FULL` a commit is an fsync, and fsyncs are not otherwise
-    /// observable from inside the process.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn commits(&self) -> u64 {
-        self.commits.get()
-    }
-
-    pub fn transaction<T>(
-        &mut self,
-        f: impl FnOnce(&RezTx<'_>) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let tx = RezTx {
-            tx: self
-                .conn
-                .transaction()
-                .map_err(|e| format!("failed to begin transaction: {e}"))?,
-        };
-        // `?` drops `tx` on the error path, and `Transaction`'s drop behavior
-        // is rollback — so a failure partway through leaves nothing behind.
-        let out = f(&tx)?;
-        tx.tx
-            .commit()
-            .map_err(|e| format!("failed to commit transaction: {e}"))?;
-        #[cfg(any(test, feature = "test-support"))]
-        self.commits.set(self.commits.get() + 1);
-        Ok(out)
-    }
-
-    /// Insert one sealed segment's bytes and catalog facts, committing on its
-    /// own. Batch writers should use `transaction` instead.
-    pub fn insert_segment(
-        &self,
-        recording_id: i64,
-        sampler: &str,
-        seq: u64,
-        meta: &SegmentMeta,
-        bytes: &[u8],
-    ) -> Result<(), String> {
-        insert_segment_sql(&self.conn, recording_id, sampler, seq, meta, bytes)
     }
 
     /// Every segment for `(recording_id, sampler)`, in `seq` order.
@@ -982,44 +576,6 @@ impl RezDb {
         Ok(out)
     }
 
-    /// Insert every WAL row for one tick — one sampler each, typically — in a
-    /// single transaction. This is what makes a tick atomic: either every
-    /// sampler's row for this tick lands, or none does.
-    ///
-    /// Takes `&mut self`, unlike every reader in this file: `Connection::
-    /// transaction()` requires `&mut Connection`. An earlier version used
-    /// `unchecked_transaction()` to keep `&self`, on the reasoning that this
-    /// module never nests transactions — but the hazard `&mut` guards
-    /// against is on the CALLER's side, not this function's: the v3 writer
-    /// thread owns this `RezDb` outright (the journal makes "no concurrent
-    /// writers to one file" an explicit non-goal) and does want a transaction
-    /// around a whole co-seal batch — `transaction`, which this now goes
-    /// through. `&mut self` makes "don't open a nested transaction while one
-    /// is outstanding" a compile error for that caller instead of a runtime
-    /// one. Reads stay on `&self`.
-    pub fn insert_wal_rows(&mut self, recording_id: i64, rows: &[WalRow]) -> Result<(), String> {
-        self.transaction(|tx| tx.insert_wal_rows(recording_id, rows))
-    }
-
-    /// One tick's rows for several recordings, in ONE transaction.
-    ///
-    /// **The transaction count is the point, not the row count.** At
-    /// `synchronous=FULL` every commit is an fsync, and the send that carries
-    /// this is a blocking hand-off from inside the scrape tick — so a commit
-    /// per recording made the tick's cost scale linearly with endpoint count.
-    /// Committing the tick once makes it constant. It also makes the tick
-    /// atomic across recordings: a crash cannot leave one endpoint's row for
-    /// tick N present and another's missing, which is the state a reader
-    /// comparing two arms would have to interpret.
-    pub fn insert_wal_rows_batch(&mut self, ticks: &[TickBatch]) -> Result<(), String> {
-        self.transaction(|tx| {
-            for tick in ticks {
-                tx.insert_wal_rows(tick.recording_id, &tick.rows)?;
-            }
-            Ok(())
-        })
-    }
-
     /// Every WAL row for `(recording_id, sampler)`, sealed or not, oldest
     /// first. Recovery should use `live_wal` instead — this is the raw table,
     /// kept for inspection and for the WAL tests to compare against.
@@ -1038,12 +594,12 @@ impl RezDb {
     /// rule, not just a helper for it: **`ts > COALESCE(MAX(last_ts) of that
     /// sampler's segments, 0)`.**
     ///
-    /// The prune (`prune_wal`) deliberately runs OUTSIDE the seal transaction,
-    /// because a quiet sampler accumulates thousands of rows before it seals
-    /// and deleting them in the seal's own commit puts tens of megabytes of
-    /// delete on the tick path. That means a crash between "segment committed"
-    /// and "prune ran" can leave WAL rows whose `ts` is already covered by a
-    /// sealed segment. Rather than prevent that straddle, recovery tolerates
+    /// The writer pruned WAL rows OUTSIDE the seal transaction, because a
+    /// quiet sampler accumulates thousands of rows before it seals and
+    /// deleting them in the seal's own commit put tens of megabytes of delete
+    /// on the tick path. So a crash between "segment committed" and "prune
+    /// ran" can have left WAL rows whose `ts` is already covered by a sealed
+    /// segment. Rather than prevent that straddle, recovery tolerates
     /// it: a row is live iff its `ts` is past the watermark of the sealed
     /// segments for its own sampler, full stop — one idempotent rule that needs
     /// no ordering guarantee between sealing and pruning.
@@ -1153,83 +709,6 @@ impl RezDb {
         Ok(out)
     }
 
-    /// Delete WAL rows at or below `upto_ts` for `(recording_id, sampler)`.
-    /// Runs OUTSIDE the seal transaction — see `live_wal` for why that is
-    /// safe and has no correctness role. Returns the number of rows deleted,
-    /// so callers/tests can assert idempotency (a second prune of the same
-    /// watermark deletes 0).
-    ///
-    /// Bounded to one sampler by construction (the `sampler = ?2` filter):
-    /// that is why WAL rows are per-sampler rather than whole snapshots — a
-    /// slow-sealing table's prune must not touch, or be blocked by, any other
-    /// sampler's tail.
-    pub fn prune_wal(
-        &self,
-        recording_id: i64,
-        sampler: &str,
-        upto_ts: u64,
-    ) -> Result<usize, String> {
-        self.conn
-            .execute(
-                "DELETE FROM wal WHERE recording_id = ?1 AND sampler = ?2 AND ts <= ?3",
-                rusqlite::params![recording_id, sampler, upto_ts as i64],
-            )
-            .map_err(|e| format!("failed to prune WAL for {sampler}: {e}"))
-    }
-
-    /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
-    /// and every WAL row stamped before it. This is what makes a bounded
-    /// rolling buffer possible — hindsight's whole reason to exist — and it is
-    /// the only destructive operation the container has.
-    ///
-    /// Segment granularity is deliberate and visible to the caller: a segment
-    /// goes only when its NEWEST row is out of the window (`last_ts <
-    /// cutoff_ts`), so a straddling segment is kept whole and the buffer holds
-    /// *at least* the lookback, never less. Trimming inside a sealed segment
-    /// would mean rewriting an immutable parquet BLOB, which is exactly what
-    /// this container refuses to do.
-    ///
-    /// `segments_by_time` (`recording_id, sampler, last_ts`) makes the segment
-    /// delete an indexed lookup rather than a scan; that index exists for this
-    /// statement.
-    ///
-    /// ONE transaction, and that is load-bearing rather than tidy. Deleting a
-    /// segment lowers `live_wal`'s watermark for its sampler, so WAL rows the
-    /// segment already covered would become live again — a reader would splice
-    /// them back in as a tail. The same-cutoff WAL delete is what stops that,
-    /// and it only stops it if the two land together: a straddling row has
-    /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
-    /// the segment delete un-shadows.
-    pub fn evict_before(&mut self, recording_id: i64, cutoff_ts: u64) -> Result<Evicted, String> {
-        self.evict(
-            recording_id,
-            "DELETE FROM segments WHERE recording_id = ?1 AND last_ts < ?2",
-            "DELETE FROM wal WHERE recording_id = ?1 AND ts < ?2",
-            cutoff_ts,
-        )
-    }
-
-    fn evict(
-        &mut self,
-        recording_id: i64,
-        segments_sql: &str,
-        wal_sql: &str,
-        cutoff_ts: u64,
-    ) -> Result<Evicted, String> {
-        self.transaction(|tx| {
-            let params = rusqlite::params![recording_id, cutoff_ts as i64];
-            let segments = tx
-                .tx
-                .execute(segments_sql, params)
-                .map_err(|e| format!("failed to evict segments: {e}"))?;
-            let wal_rows = tx
-                .tx
-                .execute(wal_sql, params)
-                .map_err(|e| format!("failed to evict WAL rows: {e}"))?;
-            Ok(Evicted { segments, wal_rows })
-        })
-    }
-
     /// The oldest row `sampler` still holds, segments and WAL together, or
     /// `None` when it holds none.
     ///
@@ -1250,84 +729,6 @@ impl RezDb {
             )
             .map(|ts| ts.map(|ts| ts.max(0) as u64))
             .map_err(|e| format!("failed to find the oldest {sampler} row: {e}"))
-    }
-
-    /// Drop one stream's identity index entries older than `cutoff_ts`.
-    ///
-    /// Separate from [`evict_before`](Self::evict_before), and with its own
-    /// cutoff, because the two cutoffs are not the same number. A row is
-    /// self-contained: once it is older than the lookback it can go. An index
-    /// entry is not — a `Delta` means nothing without the `Full` before it,
-    /// and a retained row's slot may have been described by an entry written
-    /// long before the lookback. So the caller cuts a stream's history at the
-    /// latest `Full` that is not after the row cutoff, which is a fact about
-    /// the blobs (opaque here) that the writer tracks as it stores them.
-    ///
-    /// Strictly older: the entry AT the cutoff is the `Full` everything after
-    /// it depends on.
-    pub fn evict_caller_rows_before(
-        &mut self,
-        recording_id: i64,
-        stream: &str,
-        cutoff_ts: u64,
-    ) -> Result<usize, String> {
-        if !self.has_table("caller_rows")? {
-            return Ok(0);
-        }
-        self.conn
-            .execute(
-                "DELETE FROM caller_rows WHERE recording_id = ?1 AND stream = ?2 AND ts < ?3",
-                rusqlite::params![recording_id, stream, cutoff_ts.min(i64::MAX as u64) as i64],
-            )
-            .map_err(|e| format!("failed to evict caller rows: {e}"))
-    }
-
-    /// Return `pages` freed pages to the filesystem, or as many as the free
-    /// list holds. Requires `auto_vacuum=INCREMENTAL`, which is set at
-    /// creation and cannot be turned on later without a full `VACUUM`.
-    ///
-    /// Eviction alone keeps the file bounded, since freed pages get reused —
-    /// but the bound it keeps is the HIGH-WATER mark, so a transient spike
-    /// parks space on the free list permanently. This is the trickle that gives
-    /// it back, sized (`pages`) to fit inside a tick.
-    ///
-    /// **Stepped to exhaustion, and NOT with `execute_batch`.** This pragma
-    /// reclaims one page per step and `execute_batch` steps a statement once,
-    /// so the obvious spelling silently reclaims exactly ONE page whatever
-    /// `pages` says. That is not a slow reclaim, it is no reclaim at all: at
-    /// one page per retention pass a hindsight buffer would never work off a
-    /// spike.
-    pub fn incremental_vacuum(&self, pages: u32) -> Result<(), String> {
-        let fail = |e| format!("failed to reclaim {pages} pages: {e}");
-        let mut stmt = self
-            .conn
-            .prepare(&format!("PRAGMA incremental_vacuum({pages})"))
-            .map_err(fail)?;
-        let mut rows = stmt.query([]).map_err(fail)?;
-        while rows.next().map_err(fail)?.is_some() {}
-        Ok(())
-    }
-
-    /// Write a consistent, compacted copy of the whole database to `dest`,
-    /// which must not exist.
-    ///
-    /// **This is the dump.** It runs inside a read transaction, so the copy is
-    /// a point-in-time snapshot even while the writer keeps committing — the
-    /// property a ring of slots overwritten in place cannot offer. It also
-    /// rebuilds the destination from scratch, so a dump is where a hindsight
-    /// buffer's free list gets compacted away for free.
-    ///
-    /// A plain file copy is NOT an equivalent: in WAL mode the main database
-    /// file lags every commit since the last checkpoint, so copying it alone
-    /// silently loses the most recent ticks.
-    pub fn vacuum_into(&self, dest: &Path) -> Result<(), String> {
-        let dest = dest
-            .to_str()
-            .ok_or_else(|| format!("dump destination {} is not valid UTF-8", dest.display()))?;
-        self.conn
-            .execute("VACUUM INTO ?1", [dest])
-            .map_err(|e| format!("failed to write the dump to {dest}: {e}"))?;
-        Ok(())
     }
 
     /// The whole recording's time span — every sampler, segments and WAL
@@ -1353,88 +754,6 @@ impl RezDb {
                 },
             )
             .map_err(|e| format!("failed to measure recording {recording_id}: {e}"))
-    }
-
-    /// Mark a recording cleanly finalized, outside any batch. The dump uses
-    /// it: a copy taken at time T is a finished artifact even though the
-    /// buffer it came from is still running.
-    pub fn mark_complete(&mut self, recording_id: i64) -> Result<(), String> {
-        self.transaction(|tx| tx.mark_complete(recording_id))
-    }
-
-    /// Every user table in this database, by name — SQLite's own internal
-    /// tables (`sqlite_*`) excluded.
-    ///
-    /// Exists so `rez_v3_rewrite` can assert that its fixed copy list still
-    /// covers the whole schema: a copy carries only what it is told to, so a
-    /// table added here without being handled there would vanish silently
-    /// from every rewritten archive.
-    #[cfg(test)]
-    pub fn user_table_names(&self) -> Result<Vec<String>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-            )
-            .map_err(|e| format!("failed to list tables: {e}"))?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("failed to list tables: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to list tables: {e}"))
-    }
-
-    /// Replace one recording's metadata map.
-    ///
-    /// In place rather than through a copy because metadata is a catalog
-    /// column: `annotate` changes it and nothing else, and rewriting an
-    /// archive's every segment BLOB to edit one JSON string would make a
-    /// cheap operation cost the size of the recording.
-    pub fn update_recording_metadata(
-        &self,
-        recording_id: i64,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<(), String> {
-        let encoded = serde_json::to_string(metadata)
-            .map_err(|e| format!("failed to encode recording metadata: {e}"))?;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE recordings SET metadata = ?1 WHERE id = ?2",
-                rusqlite::params![encoded, recording_id],
-            )
-            .map_err(|e| format!("failed to update recording metadata: {e}"))?;
-        if changed == 0 {
-            return Err(format!("no recording with id {recording_id}"));
-        }
-        Ok(())
-    }
-
-    /// Replace one recording's labels.
-    ///
-    /// In place, as [`update_recording_metadata`](Self::update_recording_metadata)
-    /// is: an assembly that copied recordings from several archives tags each
-    /// copy (`arm=baseline`) without rewriting its segments. This takes no
-    /// lock: a writer still recording the archive keeps running, and readers
-    /// see the new labels when they reopen.
-    pub fn update_recording_labels(
-        &self,
-        recording_id: i64,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<(), String> {
-        let encoded = serde_json::to_string(labels)
-            .map_err(|e| format!("failed to encode recording labels: {e}"))?;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE recordings SET labels = ?1 WHERE id = ?2",
-                rusqlite::params![encoded, recording_id],
-            )
-            .map_err(|e| format!("failed to update recording labels: {e}"))?;
-        if changed == 0 {
-            return Err(format!("no recording with id {recording_id}"));
-        }
-        Ok(())
     }
 
     pub fn pragma_u32(&self, name: &str) -> Result<u32, String> {
@@ -1598,17 +917,115 @@ impl RezDb {
     }
 }
 
+/// Building a v3 `.rez`, for this crate's tests: nothing ships that writes
+/// one. The schema and inserts are the ones the writer at 0c39b2d (after
+/// 0.4.0; output kept at 0.4.0's shape) used, so a test can lay out exactly the rows a reader is asked about.
+/// Archives the writer itself produced are under `tests/fixtures/rez`.
+#[cfg(test)]
+impl RezDb {
+    /// Create a `.rez` at `path` as the writer did: `page_size`, incremental
+    /// auto-vacuum and `journal_mode=WAL` before the first table, then the
+    /// schema. Fails if `path` exists.
+    pub fn create(path: &Path) -> Result<Self, String> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let db = RezDb { conn };
+        db.set_pragma("page_size", PAGE_SIZE)?;
+        db.set_pragma("auto_vacuum", "INCREMENTAL")?;
+        let mode: String = db
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+            .map_err(|e| format!("failed to set journal_mode=WAL: {e}"))?;
+        assert!(mode.eq_ignore_ascii_case("wal"), "journal_mode is {mode}");
+        db.conn
+            .execute_batch(SCHEMA_SQL)
+            .map_err(|e| format!("failed to create .rez schema: {e}"))?;
+        db.conn
+            .execute(
+                "INSERT INTO schema_version(version) VALUES (?1)",
+                [SCHEMA_VERSION],
+            )
+            .map_err(|e| format!("failed to record .rez schema version: {e}"))?;
+        Ok(db)
+    }
+
+    /// Start a recording, returning its id.
+    pub fn insert_recording(&self, meta: &RecordingMeta) -> Result<i64, String> {
+        insert_recording_sql(&self.conn, meta)
+    }
+
+    /// Run `f` in one transaction: it commits when `f` returns `Ok` and rolls
+    /// back otherwise.
+    pub fn transaction<T>(
+        &mut self,
+        f: impl FnOnce(&RezTx<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let tx = RezTx {
+            tx: self
+                .conn
+                .transaction()
+                .map_err(|e| format!("failed to begin transaction: {e}"))?,
+        };
+        let out = f(&tx)?;
+        tx.tx
+            .commit()
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+        Ok(out)
+    }
+
+    /// Insert one sealed segment's bytes and catalog facts.
+    pub fn insert_segment(
+        &self,
+        recording_id: i64,
+        sampler: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        insert_segment_sql(&self.conn, recording_id, sampler, seq, meta, bytes)
+    }
+
+    /// Insert WAL rows in their own transaction.
+    pub fn insert_wal_rows(&mut self, recording_id: i64, rows: &[WalRow]) -> Result<(), String> {
+        self.transaction(|tx| tx.insert_wal_rows(recording_id, rows))
+    }
+
+    /// Hindsight's retention as the writer ran it: every segment wholly
+    /// before `cutoff_ts` and every WAL row stamped before it, in one
+    /// transaction.
+    pub fn evict_before(&mut self, recording_id: i64, cutoff_ts: u64) -> Result<(), String> {
+        self.transaction(|tx| {
+            let params = rusqlite::params![recording_id, cutoff_ts as i64];
+            tx.tx
+                .execute(
+                    "DELETE FROM segments WHERE recording_id = ?1 AND last_ts < ?2",
+                    params,
+                )
+                .map_err(|e| format!("failed to evict segments: {e}"))?;
+            tx.tx
+                .execute(
+                    "DELETE FROM wal WHERE recording_id = ?1 AND ts < ?2",
+                    params,
+                )
+                .map_err(|e| format!("failed to evict WAL rows: {e}"))?;
+            Ok(())
+        })
+    }
+}
+
 /// The writes that may share one transaction, handed to `RezDb::transaction`'s
-/// closure. Everything here lands or nothing does.
-///
-/// What is absent is as deliberate as what is present: there is no `prune_wal`
-/// and no read accessor. The prune belongs OUTSIDE the seal transaction, where
-/// its cost cannot land on a tick, and `live_wal`'s watermark filter is what
-/// makes a crash between the two harmless — see `live_wal`.
+/// closure (tests only). Everything here lands or nothing does.
+#[cfg(test)]
 pub struct RezTx<'a> {
     tx: rusqlite::Transaction<'a>,
 }
 
+#[cfg(test)]
 impl RezTx<'_> {
     /// Start a recording, returning its id.
     ///
@@ -1720,6 +1137,7 @@ impl RezTx<'_> {
 
 /// Shared by `RezDb::insert_recording` (its own commit) and
 /// `RezTx::insert_recording` (part of a batch).
+#[cfg(test)]
 fn insert_recording_sql(conn: &Connection, meta: &RecordingMeta) -> Result<i64, String> {
     let labels = serde_json::to_string(&meta.labels)
         .map_err(|e| format!("failed to encode recording labels: {e}"))?;
@@ -1737,6 +1155,7 @@ fn insert_recording_sql(conn: &Connection, meta: &RecordingMeta) -> Result<i64, 
 /// Shared by `RezDb::insert_segment` (its own commit) and
 /// `RezTx::insert_segment` (part of a batch): `Transaction` derefs to
 /// `Connection`, so both reach the same statement.
+#[cfg(test)]
 fn insert_segment_sql(
     conn: &Connection,
     recording_id: i64,
@@ -1764,6 +1183,7 @@ fn insert_segment_sql(
 
 /// The catalog. Segment and WAL payloads are opaque BLOBs; everything the
 /// container needs to answer questions about them is a column.
+#[cfg(test)]
 const SCHEMA_SQL: &str = "
 CREATE TABLE recordings(
   id INTEGER PRIMARY KEY,
@@ -1855,41 +1275,6 @@ mod tests {
             .read_caller_rows(rec, "cpu_usage/task", 0, u64::MAX)
             .unwrap();
         assert_eq!(back, entries);
-    }
-
-    /// Eviction of index entries is per stream and strictly before the cut:
-    /// the entry AT the cut is the `Full` the rest depend on, and another
-    /// stream's history is another stream's.
-    #[test]
-    fn caller_rows_evict_per_stream_and_keep_the_entry_at_the_cut() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = RezDb::create(&dir.path().join("t.rez")).unwrap();
-        let rec = seed_recording(&db);
-        let entries: Vec<(u64, Vec<u8>)> = (1..=5u8).map(|n| (n as u64 * 1_000, vec![n])).collect();
-        db.transaction(|tx| {
-            tx.insert_caller_rows(rec, "a", &entries)?;
-            tx.insert_caller_rows(rec, "b", &entries)
-        })
-        .unwrap();
-
-        assert_eq!(db.evict_caller_rows_before(rec, "a", 3_000).unwrap(), 2);
-        let a: Vec<u64> = db
-            .read_caller_rows(rec, "a", 0, u64::MAX)
-            .unwrap()
-            .into_iter()
-            .map(|(ts, _)| ts)
-            .collect();
-        assert_eq!(a, vec![3_000, 4_000, 5_000]);
-        assert_eq!(
-            db.read_caller_rows(rec, "b", 0, u64::MAX).unwrap().len(),
-            5,
-            "the other stream is untouched"
-        );
-        assert_eq!(
-            db.evict_caller_rows_before(rec, "a", 3_000).unwrap(),
-            0,
-            "idempotent"
-        );
     }
 
     /// The newest-first probe stops at the first entry the predicate accepts
@@ -2029,179 +1414,24 @@ mod tests {
     }
 
     #[test]
-    fn create_applies_the_one_way_pragmas() {
-        // JOB (a): prove OUR CODE sets these. That requires values SQLite would
-        // not have arrived at by itself, so both assertions here differ from the
-        // default (auto_vacuum NONE=0, journal_mode "delete") and go red if the
-        // pragma is dropped or issued after the first table exists. They are
-        // baked in at creation: a regression writes the wrong value into every
-        // fleet file, and fixing it later means leaving WAL mode and VACUUMing
-        // every one of them.
-        //
-        // `page_size` and `synchronous` are deliberately NOT asserted here —
-        // ours coincide with SQLite's defaults, so they cannot do job (a). See
-        // `create_honors_the_page_size_it_is_given` for whether we set the page
-        // size, and `effective_config_matches_what_was_measured` for whether it
-        // is still the value we benchmarked.
-        let dir = tempfile::tempdir().unwrap();
-        let db = RezDb::create(&dir.path().join("t.rez")).unwrap();
-        assert_eq!(db.pragma_u32("auto_vacuum").unwrap(), 2, "INCREMENTAL");
-        assert_eq!(db.pragma_string("journal_mode").unwrap(), "wal");
-    }
-
-    #[test]
-    fn create_honors_the_page_size_it_is_given() {
-        // JOB (a) for `page_size`, which the test above cannot do: SQLite's
-        // compiled default is already 4096, so asserting 4096 on a normally
-        // created file stays green even if the pragma is never issued — or is
-        // issued AFTER journal_mode=WAL or a CREATE TABLE, at which point SQLite
-        // silently ignores it. Creating at a non-default size is what makes that
-        // reordering fail loudly here instead of invisibly in the fleet.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.rez");
-        let db = RezDb::create_with_page_size(&path, 8192).unwrap();
-        assert_eq!(db.pragma_u32("page_size").unwrap(), 8192);
-        // And it survives the connection, i.e. it really is welded into the file.
-        drop(db);
-        assert_eq!(
-            RezDb::open(&path).unwrap().pragma_u32("page_size").unwrap(),
-            8192
-        );
-    }
-
-    #[test]
-    fn open_reapplies_the_per_connection_pragmas() {
-        // JOB (a) for the per-connection tier. These pragmas are NOT persistent,
-        // so an open() that forgets them silently downgrades durability on every
-        // subsequent write — and only values that differ from SQLite's defaults
-        // (1000 pages, -2000 KiB) can detect that. Asserting `synchronous` here
-        // would not: SQLite's own default is already FULL(2), so it stays green
-        // with the apply removed. It is asserted in
-        // `effective_config_matches_what_was_measured` instead, for job (b).
+    fn open_and_open_bytes_take_the_reader_cache() {
+        // Only a value that differs from SQLite's -2000 KiB default detects an
+        // open that forgets the pragma.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.rez");
         drop(RezDb::create(&path).unwrap());
         let db = RezDb::open(&path).unwrap();
         assert_eq!(
-            db.pragma_u32("wal_autocheckpoint").unwrap(),
-            WAL_AUTOCHECKPOINT_BYTES / PAGE_SIZE,
-            "byte-denominated cap, not SQLite's 1000-page default"
-        );
-        assert_eq!(
             db.pragma_i64("cache_size").unwrap(),
             READER_CACHE_SIZE_KIB as i64,
             "256 MiB reader cache, not SQLite's -2000 default"
         );
-    }
-
-    #[test]
-    fn a_writing_connection_does_not_get_the_reader_cache() {
-        // A `create` connection is the recorder's and hindsight's live writer;
-        // giving it the reader's cache spends hundreds of MiB of resident
-        // memory on a segment-read optimization it never executes.
-        //
-        // That the two constants are ORDERED is a compile-time assertion beside
-        // them; this is the other half — that `create` reaches for the writer's
-        // one. Both connections are asserted, so a change that applied one
-        // cache everywhere fails here rather than quietly halving read
-        // throughput.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.rez");
-        let created = RezDb::create(&path).unwrap();
+        drop(db);
+        let db = RezDb::open_bytes(std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
-            created.pragma_i64("cache_size").unwrap(),
-            WRITER_CACHE_SIZE_KIB as i64,
-            "a created (writing) connection takes the writer cache"
+            db.pragma_i64("cache_size").unwrap(),
+            READER_CACHE_SIZE_KIB as i64
         );
-        assert_eq!(
-            RezDb::open(&path)
-                .unwrap()
-                .pragma_i64("cache_size")
-                .unwrap(),
-            READER_CACHE_SIZE_KIB as i64,
-            "an opened connection still takes the reader cache"
-        );
-    }
-
-    #[test]
-    fn effective_config_matches_what_was_measured() {
-        // JOB (b), and it is NOT the same question as job (a). This asserts the
-        // effective configuration regardless of who established it — including
-        // where our value happens to equal SQLite's default, which is exactly
-        // the case that looks tautological and is not.
-        //
-        // EVERY performance number in
-        // docs/journal/2026-08-12-rez-sqlite-container.md was measured at
-        // page_size=4096 and synchronous=FULL: the insert latencies, the
-        // eviction plateau, the 3.14× WAL amplification, the tick-budget
-        // analysis. Nothing in our code would notice if those changed under us.
-        // We compile SQLite from source via `bundled`, so a `cargo update`
-        // bumping libsqlite3-sys, a changed compile-time define
-        // (SQLITE_DEFAULT_SYNCHRONOUS, SQLITE_DEFAULT_PAGE_SIZE), or a platform
-        // difference are all live paths to silently invalidating them. This
-        // test is where that fails instead.
-        //
-        // The values below are LITERALS on purpose. Written as `PAGE_SIZE` this
-        // test would follow the constant and stay green when someone retunes it
-        // without re-running the sweep — which is the other regression it is
-        // here to catch.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.rez");
-        let created = RezDb::create(&path).unwrap();
-        let reopened = RezDb::open(&path).unwrap();
-
-        assert_eq!(PAGE_SIZE, 4096, "the swept and measured page size");
-        // Checked on both connections: page_size must also survive the reopen,
-        // and synchronous must hold on a connection that did not create the file.
-        for (which, db) in [("created", &created), ("reopened", &reopened)] {
-            assert_eq!(db.pragma_u32("page_size").unwrap(), 4096, "{which}");
-            assert_eq!(
-                db.pragma_u32("synchronous").unwrap(),
-                2,
-                "{which}: FULL (3 is EXTRA)"
-            );
-        }
-    }
-
-    /// A recording's labels are replaced in place, its metadata and the
-    /// other recordings untouched; an unknown id is an error.
-    #[test]
-    fn a_recordings_labels_are_replaced() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = RezDb::create(&dir.path().join("t.rez")).unwrap();
-        let meta = |host: &str| RecordingMeta {
-            labels: [("host".to_string(), host.to_string())]
-                .into_iter()
-                .collect(),
-            metadata: [("source".to_string(), "rezolus".to_string())]
-                .into_iter()
-                .collect(),
-            clock_anchor_wall_ns: 1,
-        };
-        let a = db.insert_recording(&meta("h1")).unwrap();
-        let b = db.insert_recording(&meta("h2")).unwrap();
-        let before = db.read_recordings().unwrap();
-        let labels: BTreeMap<String, String> = [
-            ("host".to_string(), "h1".to_string()),
-            ("arm".to_string(), "baseline".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        db.update_recording_labels(a, &labels).unwrap();
-        let got = db.read_recordings().unwrap();
-        assert_eq!(got[0].id, a);
-        assert_eq!(got[0].meta.labels, labels);
-        for (got, before) in got.iter().zip(&before) {
-            assert_eq!(got.complete, before.complete);
-            assert_eq!(
-                got.meta.clock_anchor_wall_ns,
-                before.meta.clock_anchor_wall_ns
-            );
-            assert_eq!(got.meta.metadata, before.meta.metadata);
-        }
-        assert_eq!(got[1].id, b);
-        assert_eq!(got[1].meta.labels, before[1].meta.labels);
-        assert!(db.update_recording_labels(b + 1, &labels).is_err());
     }
 
     #[test]
@@ -2430,35 +1660,6 @@ mod tests {
 
         assert_eq!(db.total_rows(r1, "cpu_usage").unwrap(), 1);
         assert_eq!(db.samplers(r1).unwrap(), vec!["cpu_usage"]);
-    }
-
-    #[test]
-    fn create_refuses_an_existing_file() {
-        // A .rez is valid from creation, so there is no .partial to protect a
-        // previous recording — create must not clobber one.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.rez");
-        drop(RezDb::create(&path).unwrap());
-        let err = match RezDb::create(&path) {
-            Ok(_) => panic!("create clobbered an existing .rez"),
-            Err(e) => e,
-        };
-
-        // Pin the MECHANISM, not just the outcome: the refusal must come from
-        // the atomic O_EXCL create, so that swapping in an `exists()` check —
-        // which would reintroduce the TOCTOU window — fails here. Compared
-        // against a live AlreadyExists rather than a hardcoded string, since the
-        // OS wording differs per platform.
-        let already_exists = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap_err();
-        assert_eq!(already_exists.kind(), std::io::ErrorKind::AlreadyExists);
-        assert!(
-            err.contains(&already_exists.to_string()),
-            "{err:?} should carry the AlreadyExists error from create_new"
-        );
     }
 
     /// Shared setup for the WAL tests: a fresh `.rez` with one recording.
@@ -2728,151 +1929,6 @@ mod tests {
         let span = db.live_wal_span(rid, "drivehealth").unwrap();
         assert_eq!(span.rows, 1);
         assert_eq!((span.first_ts, span.last_ts), (Some(5), Some(5)));
-    }
-
-    #[test]
-    fn prune_is_idempotent_and_bounded_to_one_sampler() {
-        let (_dir, mut db, rid) = wal_test_db();
-        db.insert_wal_rows(
-            rid,
-            &[
-                wal_row("cpu_usage", 10),
-                wal_row("cpu_usage", 20),
-                wal_row("blockio", 10),
-                wal_row("blockio", 20),
-            ],
-        )
-        .unwrap();
-
-        let deleted = db.prune_wal(rid, "cpu_usage", 10).unwrap();
-        assert_eq!(deleted, 1, "only cpu_usage's ts<=10 row");
-
-        // Idempotent: pruning the same watermark again deletes nothing.
-        let deleted_again = db.prune_wal(rid, "cpu_usage", 10).unwrap();
-        assert_eq!(deleted_again, 0);
-
-        // Bounded to one sampler: blockio's rows, including one at the same
-        // ts that was just pruned for cpu_usage, are untouched. This is why
-        // WAL rows are per-sampler rather than whole snapshots — one slow
-        // table's prune must not pin, or touch, every other sampler's tail.
-        let blockio = db.read_wal(rid, "blockio").unwrap();
-        assert_eq!(blockio.len(), 2, "blockio untouched by cpu_usage's prune");
-
-        let cpu_usage = db.read_wal(rid, "cpu_usage").unwrap();
-        assert_eq!(cpu_usage.len(), 1, "cpu_usage's ts=10 row is gone");
-        assert_eq!(cpu_usage[0].ts, 20);
-    }
-
-    #[test]
-    fn insert_wal_rows_inserts_every_row_in_the_batch() {
-        let (_dir, mut db, rid) = wal_test_db();
-        let samplers: Vec<WalRow> = (0..26)
-            .map(|i| wal_row(&format!("sampler_{i}"), 100))
-            .collect();
-        db.insert_wal_rows(rid, &samplers).unwrap();
-
-        for i in 0..26 {
-            let sampler = format!("sampler_{i}");
-            let rows = db.read_wal(rid, &sampler).unwrap();
-            assert_eq!(rows.len(), 1, "{sampler} should have its tick's row");
-        }
-    }
-
-    #[test]
-    fn insert_wal_rows_is_one_transaction_for_the_whole_tick() {
-        // Asserting "all N rows present" after a call that succeeds (as
-        // `insert_wal_rows_inserts_every_row_in_the_batch` does) cannot tell
-        // one transaction apart from N independent autocommits — both leave
-        // every row present when nothing fails. The only way to observe
-        // "one transaction" is to make ONE row in the batch fail and check
-        // that the OTHERS, which would have committed fine on their own,
-        // are gone too.
-        //
-        // Two different samplers share ts=10 with a THIRD row that collides
-        // with the first on the primary key `(recording_id, sampler, ts)` —
-        // that collision is what fails the batch.
-        let (_dir, mut db, rid) = wal_test_db();
-        let err = db
-            .insert_wal_rows(
-                rid,
-                &[
-                    wal_row("cpu_usage", 10),
-                    wal_row("blockio", 10),
-                    wal_row("cpu_usage", 10), // duplicate PK: (rid, cpu_usage, 10)
-                ],
-            )
-            .expect_err("a PRIMARY KEY collision must fail the whole call");
-        assert!(
-            err.to_lowercase().contains("unique") || err.to_lowercase().contains("constraint"),
-            "{err:?} should name the PK collision, not some other failure"
-        );
-
-        // If this were N autocommits instead of one transaction, the first
-        // cpu_usage row and the blockio row (both collision-free) would have
-        // landed before the third row failed. One transaction means the
-        // whole tick is gone.
-        assert_eq!(
-            db.read_wal(rid, "cpu_usage").unwrap().len(),
-            0,
-            "a failed tick must leave NO rows, not the one that would have committed alone"
-        );
-        assert_eq!(
-            db.read_wal(rid, "blockio").unwrap().len(),
-            0,
-            "blockio's collision-free row must also be rolled back"
-        );
-    }
-
-    #[test]
-    fn a_transaction_commits_the_whole_batch_or_none_of_it() {
-        // The reason `transaction` exists: the fleet seals 12 tables in
-        // lockstep, and 12 implicit commits at `synchronous=FULL` is 12 fsyncs
-        // against a ~46 ms tick. One commit is the point, and "one commit" is
-        // only observable by making ONE statement in the batch fail and
-        // checking that the others — which would have committed fine on their
-        // own — are gone too.
-        let (_dir, mut db, rid) = wal_test_db();
-        let meta = |first_ts, last_ts| SegmentMeta {
-            rows: 1,
-            first_ts,
-            last_ts,
-        };
-
-        // A batch that succeeds commits every statement in it.
-        db.transaction(|tx| {
-            tx.insert_segment(rid, "cpu_usage", 0, &meta(10, 19), b"cpu-0")?;
-            tx.insert_segment(rid, "blockio", 0, &meta(10, 19), b"blk-0")?;
-            tx.insert_wal_rows(rid, &[wal_row("cpu_usage", 20)])
-        })
-        .unwrap();
-        assert_eq!(db.read_segments(rid, "cpu_usage").unwrap().len(), 1);
-        assert_eq!(db.read_segments(rid, "blockio").unwrap().len(), 1);
-        assert_eq!(db.read_wal(rid, "cpu_usage").unwrap().len(), 1);
-
-        // A batch that fails partway leaves the database untouched — not even
-        // the segment that was inserted before the failing one.
-        let err = db
-            .transaction(|tx| {
-                tx.insert_segment(rid, "cpu_usage", 1, &meta(20, 29), b"cpu-1")?;
-                tx.insert_segment(rid, "blockio", 1, &meta(20, 29), b"blk-1")?;
-                // Duplicate primary key (recording, sampler, seq): fails.
-                tx.insert_segment(rid, "cpu_usage", 1, &meta(20, 29), b"dup")
-            })
-            .expect_err("a PRIMARY KEY collision must fail the whole batch");
-        assert!(
-            err.to_lowercase().contains("unique") || err.to_lowercase().contains("constraint"),
-            "{err:?} should name the PK collision, not some other failure"
-        );
-        assert_eq!(
-            db.read_segments(rid, "cpu_usage").unwrap().len(),
-            1,
-            "seq 1 must be rolled back, leaving only the committed seq 0"
-        );
-        assert_eq!(
-            db.read_segments(rid, "blockio").unwrap().len(),
-            1,
-            "blockio's collision-free insert must be rolled back too"
-        );
     }
 
     #[test]

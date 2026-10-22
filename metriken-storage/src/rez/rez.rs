@@ -1,18 +1,19 @@
-//! The `.rez` per-sampler archive: an uncompressed tar of `manifest.json` plus
-//! one parquet table per sampler. See the Stage-3 plan header for the format
-//! decisions.
+//! The `.rez` per-sampler archive, read only: an uncompressed tar of
+//! `manifest.json` plus one parquet table per sampler (v1/v2), or a SQLite
+//! file (v3, [`super::rez_sqlite`]).
 //!
-//! A table is one or more parquet *segments* (schema v2), so an archive is
-//! either written whole (`manifest.json` first, then `<dir>/<sampler>.parquet`)
-//! or streamed (segments interleaved with checkpoint manifests, the last of
-//! which may be missing entirely on an unclean kill). Reading tolerates a
-//! truncated tail; see `read_archive_reader`.
+//! A table is one or more parquet *segments* (schema v2), so a tar archive
+//! was either written whole (`manifest.json` first, then
+//! `<dir>/<sampler>.parquet`) or streamed (segments interleaved with
+//! checkpoint manifests, the last of which may be missing entirely on an
+//! unclean kill). Reading tolerates a truncated tail; see
+//! `read_archive_reader`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-/// `.rez` manifest schema version written by this build.
+/// The newest `.rez` tar manifest schema version (the last one written).
 pub const REZ_SCHEMA_VERSION: u32 = 2;
 /// Highest manifest schema version this build can read. v1 shipped without a
 /// forward gate (which is what makes a downgraded/compacted v1-shaped manifest
@@ -100,239 +101,18 @@ impl RezTableIndex {
     }
 }
 
-// The wide table, its parquet encoding and decoding are the segment
-// format's (`crate::table`, see metriken's
+// The wide table and its parquet decoding are the segment format's
+// (`crate::table`, see metriken's
 // docs/journal/2026-09-28-high-cardinality-stack.md); re-exported under the
 // names rezolus uses.
 pub use crate::table::{
-    cadence_hint, read_table_parquet, segment_writer_props, table_to_batch, write_table_parquet,
-    Column as RezColumn, Table as RezTable, Values as RezValues,
+    read_table_parquet, Column as RezColumn, Table as RezTable, Values as RezValues,
 };
-
-use std::collections::HashMap;
-
-#[cfg(feature = "write")]
-use crate::window::Window;
 
 type RezError = Box<dyn std::error::Error>;
 
 use std::io::Read;
 use std::path::Path;
-
-/// One recording's data to serialize (borrowed tables).
-#[allow(dead_code)]
-pub struct RecordingData<'a> {
-    pub dir: String,
-    pub labels: BTreeMap<String, String>,
-    pub metadata: BTreeMap<String, String>,
-    pub tables: &'a [RezTable],
-}
-
-/// A decoded `.rez` archive (round-trip / test surface).
-#[cfg(any(test, feature = "test-support"))]
-pub struct RezArchive {
-    pub manifest: RezManifest,
-    /// Decoded tables, one inner `Vec` per `manifest.recordings` entry (parallel order).
-    pub tables: Vec<Vec<RezTable>>,
-}
-
-pub fn append_tar_entry<W: std::io::Write>(
-    builder: &mut tar::Builder<W>,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), RezError> {
-    let mut header = tar::Header::new_gnu();
-    header.set_path(name)?;
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder.append(&header, bytes)?;
-    Ok(())
-}
-
-/// Write `recordings` to an uncompressed `.rez` tar at `path`. Each recording's
-/// tables are nested under `<dir>/<sampler>.parquet`.
-///
-/// Atomic (whole-archive) writer — see the note on `RezRecorder`.
-#[allow(dead_code)]
-pub fn write_archive(path: &Path, recordings: &[RecordingData]) -> Result<(), RezError> {
-    let mut manifest_recordings = Vec::with_capacity(recordings.len());
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for rec in recordings {
-        let mut index = Vec::with_capacity(rec.tables.len());
-        for table in rec.tables {
-            let file = format!("{}.parquet", table.sampler);
-            let bytes = crate::table::write_rez_table_parquet(table)?;
-            index.push(RezTableIndex {
-                sampler: table.sampler.clone(),
-                file: Some(file.clone()),
-                files: vec![file.clone()],
-                columns: table.columns.iter().map(|c| c.name.clone()).collect(),
-                rows: table.timestamps.len() as u64,
-                cadence_ns: cadence_hint(&table.timestamps),
-            });
-            files.push((format!("{}/{}", rec.dir, file), bytes));
-        }
-        manifest_recordings.push(RezRecording {
-            dir: rec.dir.clone(),
-            labels: rec.labels.clone(),
-            metadata: rec.metadata.clone(),
-            // This writer emits the whole archive at once, so its recordings
-            // are complete by construction.
-            complete: true,
-            clock_anchor_wall_ns: None,
-            clock_offsets: Vec::new(),
-            tables: index,
-        });
-    }
-    let manifest = RezManifest {
-        version: REZ_SCHEMA_VERSION,
-        recordings: manifest_recordings,
-    };
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-
-    let out = std::fs::File::create(path)?;
-    let mut builder = tar::Builder::new(out);
-    builder.mode(tar::HeaderMode::Deterministic);
-    append_tar_entry(&mut builder, REZ_MANIFEST_NAME, &manifest_bytes)?;
-    for (name, bytes) in &files {
-        append_tar_entry(&mut builder, name, bytes)?;
-    }
-    builder.into_inner()?.sync_all()?;
-    Ok(())
-}
-
-/// One recording's manifest entry paired with its table bytes: the outer `Vec`
-/// is parallel to `RezRecording::tables`, the inner one holds that table's
-/// segments in order.
-#[cfg(any(test, feature = "test-support"))]
-pub type RecordingSegments = (RezRecording, Vec<Vec<Vec<u8>>>);
-
-/// The names a table's `segments` get inside its recording directory. A single
-/// segment keeps the v1 `<sampler>.parquet` shape so v1 binaries can still open
-/// tool output; multiple segments live under `<sampler>/`, zero-padded in
-/// segment order.
-#[cfg(any(test, feature = "test-support"))]
-fn canonical_segment_names(sampler: &str, segments: usize) -> Vec<String> {
-    if segments == 1 {
-        vec![format!("{sampler}.parquet")]
-    } else {
-        (0..segments)
-            .map(|i| format!("{sampler}/{i:04}.parquet"))
-            .collect()
-    }
-}
-
-/// Write a multi-recording `.rez` from already-encoded per-table parquet bytes
-/// (no re-encode). `recordings` pairs each recording's manifest entry with its
-/// table bytes (parallel to `recording.tables`), each table's segments in order.
-///
-/// The writer **owns the file naming**: every table's index entry is rewritten
-/// to name exactly the files emitted for it (`canonical_segment_names`), and the
-/// incoming `file`/`files` are discarded. This is load-bearing, not cosmetic —
-/// `combine`/`filter`/`annotate` carry the input's `RezTableIndex` verbatim, so
-/// on segmented input a stale entry would name segments the output never writes
-/// and break every downstream reader. Everything else on the entry (`columns`,
-/// `rows`, `cadence_ns`) and on the recording (`complete`, clock fields) copies
-/// through untouched, and segment bytes pass through byte-identical — only the
-/// compactor ever merges segments.
-///
-/// Errors on a duplicate `dir` or duplicate sampler within a recording (the
-/// reader keys tables by `<dir>/<file>`, so either collision would clobber) and
-/// on a table-count/bytes mismatch. All validation runs before the output file
-/// is created. The caller assigns unique dirs.
-#[cfg(any(test, feature = "test-support"))]
-pub fn write_archive_bytes(path: &Path, recordings: &[RecordingSegments]) -> Result<(), RezError> {
-    let mut seen_dirs = std::collections::HashSet::new();
-    // The manifest entries as they will be written, with canonical file names.
-    let mut canonical: Vec<RezRecording> = Vec::with_capacity(recordings.len());
-    for (rec, table_bytes) in recordings {
-        if !seen_dirs.insert(rec.dir.clone()) {
-            return Err(format!("duplicate recording dir {:?}", rec.dir).into());
-        }
-        if table_bytes.len() != rec.tables.len() {
-            return Err(format!(
-                "recording {} has {} table index entries but {} byte blobs",
-                rec.dir,
-                rec.tables.len(),
-                table_bytes.len()
-            )
-            .into());
-        }
-        let mut seen_samplers = std::collections::HashSet::new();
-        let mut rec = rec.clone();
-        for (idx, segments) in rec.tables.iter_mut().zip(table_bytes) {
-            if !seen_samplers.insert(idx.sampler.clone()) {
-                return Err(format!(
-                    "recording {} has two tables named {:?}",
-                    rec.dir, idx.sampler
-                )
-                .into());
-            }
-            let names = canonical_segment_names(&idx.sampler, segments.len());
-            // v1-shaped iff single-segment; `files` is always the full list.
-            idx.file = match names.as_slice() {
-                [one] => Some(one.clone()),
-                _ => None,
-            };
-            idx.files = names;
-        }
-        canonical.push(rec);
-    }
-    let manifest = RezManifest {
-        version: REZ_SCHEMA_VERSION,
-        recordings: canonical,
-    };
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-
-    let out = std::fs::File::create(path)?;
-    let mut builder = tar::Builder::new(out);
-    builder.mode(tar::HeaderMode::Deterministic);
-    append_tar_entry(&mut builder, REZ_MANIFEST_NAME, &manifest_bytes)?;
-    // Names come from the manifest just built, so entries and index agree by
-    // construction — no per-table parity check is possible here.
-    for (rec, (_, table_bytes)) in manifest.recordings.iter().zip(recordings) {
-        for (idx, segments) in rec.tables.iter().zip(table_bytes) {
-            for (name, bytes) in idx.files.iter().zip(segments) {
-                append_tar_entry(&mut builder, &format!("{}/{}", rec.dir, name), bytes)?;
-            }
-        }
-    }
-    builder.into_inner()?.sync_all()?;
-    Ok(())
-}
-
-/// Read a `.rez` archive back into its manifest + decoded tables (per recording).
-/// Test-only eager reader; production uses `read_archive_bytes` → `RezReader`.
-#[cfg(any(test, feature = "test-support"))]
-pub fn read_archive(path: &Path) -> Result<RezArchive, RezError> {
-    let (manifest, recordings) = read_archive_bytes(path)?;
-    let mut all = Vec::with_capacity(recordings.len());
-    for rec in recordings {
-        let mut tables = Vec::with_capacity(rec.tables.len());
-        for (sampler, segments) in rec.tables {
-            // The eager decoder produces one `RezTable` per blob; segmented
-            // tables are the segment-aware source's job, not this test surface.
-            let bytes = match <[Vec<u8>; 1]>::try_from(segments) {
-                Ok([bytes]) => bytes,
-                Err(segs) => {
-                    return Err(format!(
-                        "table {sampler} has {} segments; read_archive decodes \
-                         single-segment tables only",
-                        segs.len()
-                    )
-                    .into());
-                }
-            };
-            tables.push(read_table_parquet(sampler, bytes)?);
-        }
-        all.push(tables);
-    }
-    Ok(RezArchive {
-        manifest,
-        tables: all,
-    })
-}
 
 /// One recording's raw per-sampler parquet bytes (for building readers).
 pub struct RecordingBytes {
@@ -419,7 +199,7 @@ pub fn read_archive_reader<R: std::io::Read>(
     reader: R,
 ) -> Result<(RezManifest, Vec<RecordingBytes>), RezError> {
     let mut archive = tar::Archive::new(reader);
-    // Every manifest in the archive, oldest first: the streaming writer appends
+    // Every manifest in the archive, oldest first: the streaming writer appended
     // a checkpoint manifest after each seal batch (duplicate tar names are
     // legal and this reader is order-agnostic).
     let mut manifests: Vec<RezManifest> = Vec::new();
@@ -473,11 +253,9 @@ pub fn read_archive_reader<R: std::io::Read>(
             Ok(recordings) => {
                 // Normalize `complete` on the manifest too, by the same rule
                 // `resolve` applies to `RecordingBytes` (v1 recordings are
-                // complete by construction; the absent flag is not read). The
-                // tools copy `RezRecording` verbatim into an output stamped
-                // `version: 2`, so without this a clean v1 archive would come
-                // out of `combine`/`filter`/`annotate` as `complete: false` and
-                // read back as "not cleanly finalized".
+                // complete by construction; the absent flag is not read), so a
+                // caller that reads the manifest sees the same answer as one
+                // that reads the recordings.
                 if manifest.version < 2 {
                     for rec in &mut manifest.recordings {
                         rec.complete = true;
@@ -532,13 +310,8 @@ pub fn is_rez_path(path: &Path) -> Result<bool, RezError> {
 
 /// Which container a `.rez` path holds. v1/v2 are tar archives; v3 is SQLite.
 ///
-/// `RezReader` dispatches on this, and so does every other `.rez` front door
-/// (`mcp`, `viewer`, `parquet metadata/annotate/filter/combine`) — all
-/// recognize and rewrite both containers. The two rewrite paths are separate
-/// because the containers are: v2 goes through `read_archive_bytes`/
-/// `write_archive_bytes`, v3 copies segment BLOBs between SQLite catalogs
-/// (`recorder::rez_v3_rewrite`). Only *mixing* the two in one `combine`
-/// errors, since that would mean converting a container mid-assembly.
+/// [`super::open`] dispatches on this: v1/v2 are read eagerly through
+/// `read_archive_bytes`, v3 through its SQLite catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RezFormat {
     V3Sqlite,
@@ -597,102 +370,10 @@ pub fn detect_rez_format(path: &Path) -> Result<RezFormat, RezError> {
     }
 }
 
-// The ingest half's vocabulary. Everything below that mentions these types
-// is gated on `write`; the reader never sees them.
-#[cfg(feature = "write")]
-use metriken_model::{Counter, Gauge, Histogram, Snapshot};
-#[cfg(feature = "write")]
-use tracing::warn;
-
-#[cfg(feature = "write")]
-/// A borrowed snapshot entry, tagged by shape.
-pub enum Entry<'a> {
-    Counter(&'a Counter),
-    Gauge(&'a Gauge),
-    Histogram(&'a Histogram),
-}
-
-// The table builders and their input are the segment format's
-// (`crate::builder`); re-exported under the names rezolus uses.
-pub use crate::builder::{
-    cells_approx_bytes, Cell, CellValue, GroupTableBuilder, TableBuilder, CELL_OVERHEAD_BYTES,
-    HISTOGRAM_BUCKET_BYTES, VALUE_SLOT_BYTES, WINDOW_SLOT_BYTES,
-};
-#[cfg(feature = "write")]
-impl Entry<'_> {
-    pub fn name(&self) -> &str {
-        match self {
-            Entry::Counter(c) => &c.name,
-            Entry::Gauge(g) => &g.name,
-            Entry::Histogram(h) => &h.name,
-        }
-    }
-    pub fn metadata(&self) -> &HashMap<String, String> {
-        match self {
-            Entry::Counter(c) => &c.metadata,
-            Entry::Gauge(g) => &g.metadata,
-            Entry::Histogram(h) => &h.metadata,
-        }
-    }
-    /// The acquisition window, converted to the archive's own [`Window`] —
-    /// the one crossing from the agent's vocabulary into the file format's.
-    pub fn window(&self) -> Option<Window> {
-        match self {
-            Entry::Counter(c) => c.window,
-            Entry::Gauge(g) => g.window,
-            Entry::Histogram(h) => h.window,
-        }
-    }
-
-    /// Borrow this snapshot entry as the builder's neutral [`Cell`].
-    pub fn as_cell(&self) -> Cell<'_> {
-        Cell {
-            name: self.name(),
-            metadata: self.metadata(),
-            window: self.window(),
-            value: match self {
-                Entry::Counter(c) => CellValue::Counter(c.value),
-                Entry::Gauge(g) => CellValue::Gauge(g.value),
-                Entry::Histogram(h) => CellValue::Histogram(&h.value),
-            },
-        }
-    }
-}
-
-#[cfg(feature = "write")]
-/// [`cells_approx_bytes`] for a row still in snapshot form. One rule, borrowed
-/// rather than restated: a second spelling of "what a row costs" is exactly
-/// what the doc above says must not exist.
-pub fn entries_approx_bytes(entries: &[Entry<'_>]) -> usize {
-    let cells: Vec<Cell<'_>> = entries.iter().map(Entry::as_cell).collect();
-    cells_approx_bytes(&cells)
-}
-
-/// Feeding a [`TableBuilder`] from a snapshot. The builder speaks [`Cell`];
-/// this is the ingest path's spelling for a row still in snapshot form.
-#[cfg(feature = "write")]
-pub trait PushEntries {
-    fn push_entries(&mut self, snapshot_ts: u64, wall_offset_ns: i64, entries: &[Entry<'_>]);
-}
-
-#[cfg(feature = "write")]
-impl PushEntries for TableBuilder {
-    fn push_entries(&mut self, snapshot_ts: u64, wall_offset_ns: i64, entries: &[Entry<'_>]) {
-        let cells: Vec<Cell<'_>> = entries.iter().map(Entry::as_cell).collect();
-        self.push_row(snapshot_ts, wall_offset_ns, &cells);
-    }
-}
-pub use crate::wal::wal_group_row_approx_bytes;
-/// A group snapshot's and a decoded WAL group row's cost against the seal
-/// budget: `metriken_model::cost`'s, pinned to agree by a test there.
-#[cfg(feature = "write")]
-pub use metriken_model::cost::group_approx_bytes;
-
 /// The sampler a `.rez` table key belongs to. V3 acquisition-group tables are
 /// keyed `"<sampler>/<group>"`; a V2 (or windowless/default) sampler table's
-/// key never contains `/` for every REGISTERED sampler of this build — see
-/// `group_by_sampler`'s `sampler_of` and
-/// `no_registered_sampler_name_contains_a_slash` — so it is its own sampler.
+/// key never contains `/` for any sampler rezolus registers, so it is its
+/// own sampler.
 /// The manifest and filter unit stay the SAMPLER (the part before `/`), even
 /// though the underlying table key is finer-grained.
 ///
@@ -701,20 +382,9 @@ pub use metriken_model::cost::group_approx_bytes;
 /// sampler, which a query can union, from the same sampler in two
 /// recordings, which it cannot.
 ///
-/// `parquet filter --samplers` uses this on a v3 archive to drop a sampler's
-/// group tables together — naming `cpu_usage` drops every `cpu_usage/<group>`
-/// table, because the sampler is the unit an operator names. Exercised
-/// directly by `table_sampler_tests`, by `rez_v3_writer`'s
-/// `table_sampler_selects_a_samplers_group_tables_out_of_a_mixed_recording`
-/// against a real recording, and end to end by
-/// `filter_rez_v3_keeps_only_named_samplers`.
-///
-/// `parquet metadata` on a v3-native archive is a known, narrower instance of
-/// the same display gap: it lists one line per GROUP table (`describe_v3_string`
-/// in `parquet_tools::metadata`, driven by `RezDb::all_samplers`), so the
-/// user-visible unit there is `cpu_usage/percpu`, not the sampler — this
-/// function is exactly what closing that gap would group by, whenever it
-/// lands; not done here to avoid growing this change further.
+/// A filter that names a sampler selects every `<sampler>/<group>` table of
+/// it, because the sampler is the unit an operator names. Exercised by
+/// `table_sampler_tests`.
 pub fn table_sampler(table_key: &str) -> &str {
     table_key.split('/').next().unwrap_or(table_key)
 }
@@ -762,195 +432,6 @@ mod table_sampler_tests {
     }
 }
 
-/// How many times a `.rez` writer has left gauge histograms out, in this
-/// process.
-pub(crate) static GAUGE_HISTOGRAMS_LEFT_OUT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// The `.rez` format is frozen at its pre-6.0 shape: no writer of it records
-/// a gauge histogram (no `gauge_histogram` column, no format 2 segment).
-/// Every `.rez` writer path that meets one leaves it out and calls this,
-/// which says so once per process.
-pub(crate) fn gauge_histograms_left_out() {
-    let before = GAUGE_HISTOGRAMS_LEFT_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if before == 0 {
-        tracing::warn!(
-            "gauge histograms are recorded in .dendro only; this .rez recording leaves them \
-             out (warned once)"
-        );
-    }
-}
-
-/// Partition a snapshot's metrics by their `sampler` label (`"unattributed"`
-/// when the label is absent). Shared by the in-memory `RezRecorder` and the
-/// streaming `StreamRecorder` so the two ingest paths cannot drift apart.
-#[cfg(feature = "write")]
-pub fn group_by_sampler(snapshot: &Snapshot) -> BTreeMap<&str, Vec<Entry<'_>>> {
-    let gauge_histograms = match snapshot {
-        Snapshot::V1(s) => s.gauge_histograms.len(),
-        Snapshot::V2(s) => s.gauge_histograms.len(),
-        Snapshot::V3(_) => 0,
-    };
-    if gauge_histograms > 0 {
-        gauge_histograms_left_out();
-    }
-    let (counters, gauges, histograms) = match snapshot {
-        Snapshot::V1(s) => (&s.counters, &s.gauges, &s.histograms),
-        Snapshot::V2(s) => (&s.counters, &s.gauges, &s.histograms),
-        Snapshot::V3(_) => {
-            // Native V3 ingest (schema-hash caching, per-group WAL) lands in a
-            // later stage. A V3 payload here means the agent was flipped to
-            // snapshot_format = "v3" ahead of this recorder build. There is
-            // nothing borrowable in this flat (counters, gauges, histograms)
-            // shape for V3's grouped layout, so warn once and record nothing
-            // for this snapshot rather than fabricate an empty-but-wrong split.
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            // Relaxed: no data is published alongside the flag, so a racing
-            // pair of threads has nothing to synchronize — worst case is one
-            // duplicate warning line, never a torn read.
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                warn!(
-                    "received a SnapshotV3 payload; this build records v2 only — \
-                     set [general] snapshot_format = \"v2\" on the agent"
-                );
-            }
-            return BTreeMap::new();
-        }
-    };
-
-    fn sampler_of(metadata: &HashMap<String, String>) -> &str {
-        metadata
-            .get("sampler")
-            .map(String::as_str)
-            .unwrap_or("unattributed")
-    }
-
-    let mut groups: BTreeMap<&str, Vec<Entry<'_>>> = BTreeMap::new();
-    for c in counters {
-        groups
-            .entry(sampler_of(&c.metadata))
-            .or_default()
-            .push(Entry::Counter(c));
-    }
-    for g in gauges {
-        groups
-            .entry(sampler_of(&g.metadata))
-            .or_default()
-            .push(Entry::Gauge(g));
-    }
-    for h in histograms {
-        groups
-            .entry(sampler_of(&h.metadata))
-            .or_default()
-            .push(Entry::Histogram(h));
-    }
-    groups
-}
-
-#[cfg(feature = "write")]
-/// One sampler group's dedup key: the representative acquisition window (max
-/// `end_ns` among windowed metrics), or `snapshot_ts` when nothing in the group
-/// carries a window (windowless → one row per poll).
-pub fn dedup_key(entries: &[Entry<'_>], snapshot_ts: u64) -> u64 {
-    entries
-        .iter()
-        .filter_map(|e| e.window())
-        .map(|w| w.end_ns)
-        .max()
-        .unwrap_or(snapshot_ts)
-}
-
-/// Accumulates scraped snapshots into per-sampler tables, deduping by each
-/// sampler's representative acquisition window.
-///
-/// The in-memory, atomic (whole-archive-at-finalize) writer. The recorder loop
-/// no longer uses it — it streams sealed segments through
-/// [`rez_stream::StreamRecorder`](super::rez_stream::StreamRecorder) so
-/// finalization is bounded — but it remains the fixture builder for every
-/// `.rez` test in the tree and the natural base for the deferred offline
-/// compactor. Kept whole (not `#[cfg(test)]`-forked) so the archives tests
-/// exercise stay the archives this crate knows how to write.
-#[allow(dead_code)]
-pub struct RezRecorder {
-    tables: BTreeMap<String, TableBuilder>,
-    metadata: BTreeMap<String, String>,
-    labels: BTreeMap<String, String>,
-    dir: String,
-}
-
-#[allow(dead_code)]
-impl RezRecorder {
-    pub fn new(
-        metadata: BTreeMap<String, String>,
-        labels: BTreeMap<String, String>,
-        dir: String,
-    ) -> Self {
-        Self {
-            tables: BTreeMap::new(),
-            metadata,
-            labels,
-            dir,
-        }
-    }
-
-    /// Partition `snapshot`'s metrics by their `sampler` label; for each sampler
-    /// append a row iff its representative window (max `end_ns` among windowed
-    /// metrics) advanced, else key on `snapshot_ts` (windowless → per-poll row).
-    #[cfg(feature = "write")]
-    pub fn ingest(&mut self, snapshot: &Snapshot, snapshot_ts: u64) {
-        for (sampler, entries) in group_by_sampler(snapshot) {
-            let key = dedup_key(&entries, snapshot_ts);
-            let table = self
-                .tables
-                .entry(sampler.to_string())
-                .or_insert_with(|| TableBuilder::new(sampler.to_string()));
-            if let Some(last) = table.last_key() {
-                if key <= last {
-                    continue; // window unchanged → same observation → skip
-                }
-            }
-            table.set_last_key(key);
-            // `snapshot_ts` is today's raw `SystemTime` reading, so the wall
-            // observation is exactly zero. It becomes meaningful when the
-            // recorder loop switches to monotonic-anchored row stamps and
-            // passes its own per-tick wall reading through.
-            table.push_entries(snapshot_ts, 0, &entries);
-        }
-    }
-
-    /// Test/inspection helper: the current (unpadded) table builder view.
-    #[cfg(test)]
-    pub fn table(&self, sampler: &str) -> Option<&TableBuilder> {
-        self.tables.get(sampler)
-    }
-
-    /// Consume into finalized per-sampler tables.
-    pub fn finalize_tables(self) -> Vec<RezTable> {
-        self.tables
-            .into_values()
-            .map(TableBuilder::finish)
-            .collect()
-    }
-
-    /// Finalize and write the single-recording `.rez` archive at `path`.
-    pub fn finalize(self, path: &Path) -> Result<(), RezError> {
-        let dir = self.dir.clone();
-        let labels = self.labels.clone();
-        let metadata = self.metadata.clone();
-        let tables = self.finalize_tables();
-        write_archive(
-            path,
-            &[RecordingData {
-                dir,
-                labels,
-                metadata,
-                tables: &tables,
-            }],
-        )
-    }
-}
-
 /// Extract the `hostname` string from a systeminfo JSON blob, if present.
 pub fn host_from_systeminfo(systeminfo_json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(systeminfo_json)
@@ -958,25 +439,6 @@ pub fn host_from_systeminfo(systeminfo_json: &str) -> Option<String> {
         .get("hostname")?
         .as_str()
         .map(|s| s.to_string())
-}
-
-/// The recording's label set: `source`, `host` (from systeminfo hostname, when
-/// available), then user `--label k=v` applied last (last-wins, so a user
-/// `--label host=...` overrides the auto value).
-pub fn build_labels(
-    source: &str,
-    systeminfo_json: Option<&str>,
-    user_labels: &[(String, String)],
-) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::new();
-    labels.insert("source".to_string(), source.to_string());
-    if let Some(host) = systeminfo_json.and_then(host_from_systeminfo) {
-        labels.insert("host".to_string(), host);
-    }
-    for (k, v) in user_labels {
-        labels.insert(k.clone(), v.clone());
-    }
-    labels
 }
 
 /// Filesystem-safe directory name for a single recording, derived from its
@@ -1037,8 +499,12 @@ pub fn recording_dir_slug(labels: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod builder_tests {
     use super::*;
+    use crate::builder::{
+        cells_approx_bytes, Cell, CellValue, TableBuilder, CELL_OVERHEAD_BYTES,
+        HISTOGRAM_BUCKET_BYTES, VALUE_SLOT_BYTES, WINDOW_SLOT_BYTES,
+    };
+    use crate::table::{table_to_batch, write_table_parquet};
     use crate::window::Window;
-    use metriken_model::{Counter, Gauge, Histogram};
     use std::collections::HashMap;
 
     fn cmeta(sampler: &str) -> HashMap<String, String> {
@@ -1053,26 +519,40 @@ mod builder_tests {
         h
     }
 
+    fn cell<'a>(
+        name: &'a str,
+        metadata: &'a HashMap<String, String>,
+        window: Option<Window>,
+        value: CellValue<'a>,
+    ) -> Cell<'a> {
+        Cell {
+            name,
+            metadata,
+            window,
+            value,
+        }
+    }
+
     // The seal threshold is byte-first, so `push_row` must maintain the byte
     // count itself: a row's cost is dominated by histogram buckets, which row
     // counts do not see at all (one gp=7/mvp=64 cell is ~58 KB).
     #[test]
     fn push_row_accumulates_approx_bytes() {
+        let md = cmeta("s");
         let mut b = TableBuilder::new("s".to_string());
         assert_eq!(b.approx_bytes(), 0, "a fresh builder accounts nothing");
 
-        let c = Counter::new("0".to_string(), 1, cmeta("s"));
-        b.push_entries(1_000, 0, &[Entry::Counter(&c)]);
+        b.push_row(1_000, 0, &[cell("0", &md, None, CellValue::Counter(1))]);
         let after_scalar = b.approx_bytes();
         assert_eq!(
             after_scalar, CELL_OVERHEAD_BYTES,
             "one scalar cell is its value slot plus its window slot"
         );
 
-        let h = Histogram::new("1".to_string(), hist(7, 64), cmeta("s"));
-        let buckets = h.value.as_slice().len();
-        assert_eq!(buckets, h.value.config().total_buckets());
-        b.push_entries(2_000, 0, &[Entry::Histogram(&h)]);
+        let h = hist(7, 64);
+        let buckets = h.as_slice().len();
+        assert_eq!(buckets, h.config().total_buckets());
+        b.push_row(2_000, 0, &[cell("1", &md, None, CellValue::Histogram(&h))]);
         assert_eq!(
             b.approx_bytes() - after_scalar,
             CELL_OVERHEAD_BYTES + buckets * HISTOGRAM_BUCKET_BYTES,
@@ -1080,22 +560,25 @@ mod builder_tests {
         );
     }
 
-    // `entries_approx_bytes` is what lets a container with no builder seal at
+    // `cells_approx_bytes` is what lets a container with no builder seal at
     // the same row a buffering one does, which is only true if it returns
     // exactly what `push_row` charges. Asserted against the builder itself over
     // a row carrying every cell shape, rather than by restating the arithmetic
     // — a restatement drifts in lockstep with the bug it should catch.
     #[test]
-    fn entries_approx_bytes_matches_what_push_row_accounts() {
-        let c = Counter::new("c".to_string(), 1, cmeta("s"));
-        let g = Gauge::new("g".to_string(), 1, cmeta("s"));
-        let h = Histogram::new("h".to_string(), hist(7, 64), cmeta("s"));
-        let entries = [Entry::Counter(&c), Entry::Gauge(&g), Entry::Histogram(&h)];
+    fn cells_approx_bytes_matches_what_push_row_accounts() {
+        let md = cmeta("s");
+        let h = hist(7, 64);
+        let cells = [
+            cell("c", &md, None, CellValue::Counter(1)),
+            cell("g", &md, None, CellValue::Gauge(1)),
+            cell("h", &md, None, CellValue::Histogram(&h)),
+        ];
 
         let mut b = TableBuilder::new("s".to_string());
-        b.push_entries(1_000, 0, &entries);
+        b.push_row(1_000, 0, &cells);
         assert_eq!(
-            entries_approx_bytes(&entries),
+            cells_approx_bytes(&cells),
             b.approx_bytes(),
             "the builderless estimate must equal what push_row charges"
         );
@@ -1103,8 +586,8 @@ mod builder_tests {
         // Again on a second row, so an estimate that only matches while columns
         // are being created cannot pass.
         let before = b.approx_bytes();
-        b.push_entries(2_000, 0, &entries);
-        assert_eq!(entries_approx_bytes(&entries), b.approx_bytes() - before);
+        b.push_row(2_000, 0, &cells);
+        assert_eq!(cells_approx_bytes(&cells), b.approx_bytes() - before);
     }
 
     // Regression: `approx_bytes` bounds resident memory, and it used to charge
@@ -1121,10 +604,18 @@ mod builder_tests {
         // `Window` is two `u64`s with no niche, so the option tag costs a word.
         assert_eq!(size_of::<Option<Window>>(), WINDOW_SLOT_BYTES);
 
+        let md = cmeta("s");
         let mut b = TableBuilder::new("s".to_string());
-        let c =
-            Counter::new("0".to_string(), 1, cmeta("s")).with_window(Some(Window::new(900, 1_000)));
-        b.push_entries(1_000, 0, &[Entry::Counter(&c)]);
+        b.push_row(
+            1_000,
+            0,
+            &[cell(
+                "0",
+                &md,
+                Some(Window::new(900, 1_000)),
+                CellValue::Counter(1),
+            )],
+        );
 
         // One value slot and one window slot were pushed, so both must be paid
         // for. The strict inequality is the part that catches a revert.
@@ -1152,17 +643,15 @@ mod builder_tests {
     // and segmentation would bake the skew into immutable data.
     #[test]
     fn mismatch_arm_does_not_desync_values_and_windows() {
+        let md = cmeta("s");
         let mut b = TableBuilder::new("s".to_string());
-        let w = |n: u64| Some(metriken_types::Window::new(n, n + 100));
+        let w = |n: u64| Some(Window::new(n, n + 100));
 
-        let c0 = Counter::new("0".to_string(), 1, cmeta("s")).with_window(w(900));
-        b.push_entries(1_000, 0, &[Entry::Counter(&c0)]);
+        b.push_row(1_000, 0, &[cell("0", &md, w(900), CellValue::Counter(1))]);
         // Same column name, now a gauge: shape mismatch against the established
         // counter column.
-        let g = Gauge::new("0".to_string(), -5, cmeta("s")).with_window(w(1_900));
-        b.push_entries(2_000, 0, &[Entry::Gauge(&g)]);
-        let c1 = Counter::new("0".to_string(), 3, cmeta("s")).with_window(w(2_900));
-        b.push_entries(3_000, 0, &[Entry::Counter(&c1)]);
+        b.push_row(2_000, 0, &[cell("0", &md, w(1_900), CellValue::Gauge(-5))]);
+        b.push_row(3_000, 0, &[cell("0", &md, w(2_900), CellValue::Counter(3))]);
 
         let table = b.finish();
         assert_eq!(table.timestamps.len(), 3);
@@ -1196,9 +685,13 @@ mod builder_tests {
     // an NTP step locates to the exact tick; the query engine skips it.
     #[test]
     fn wall_offsets_roundtrip_through_parquet() {
+        let md = cmeta("cpu_usage");
         let mut b = TableBuilder::new("cpu_usage".to_string());
-        let c = Counter::new("0".to_string(), 7, cmeta("cpu_usage"));
-        b.push_entries(1_000, -123_456, &[Entry::Counter(&c)]);
+        b.push_row(
+            1_000,
+            -123_456,
+            &[cell("0", &md, None, CellValue::Counter(7))],
+        );
         let table = b.finish();
         assert_eq!(table.wall_offsets, vec![-123_456]);
 
@@ -1212,321 +705,6 @@ mod builder_tests {
         let back = read_table_parquet("cpu_usage".to_string(), bytes).unwrap();
         assert_eq!(back.wall_offsets, vec![-123_456]);
         assert_eq!(back.timestamps, vec![1_000]);
-    }
-}
-
-/// Fixture builders shared by this crate's tests and the `rezolus` binary's.
-///
-/// Gated on `test-support` rather than `#[cfg(test)]`: a `#[cfg(test)]` module
-/// here is invisible to the crate next door, and the binary's viewer, MCP and
-/// `parquet` tests all build `.rez` fixtures with these.
-#[cfg(any(test, feature = "test-support"))]
-pub mod recorder_tests_support {
-    // The agent's window: these builders make snapshot values, which is the
-    // one place the archive still speaks metriken's vocabulary.
-    use crate::window::Window;
-    use metriken_model::{Counter, Snapshot, SnapshotV2};
-    use std::collections::HashMap;
-    use std::time::SystemTime;
-
-    fn cmeta(metric: &str, sampler: &str) -> HashMap<String, String> {
-        [
-            ("metric".to_string(), metric.to_string()),
-            ("sampler".to_string(), sampler.to_string()),
-        ]
-        .into_iter()
-        .collect()
-    }
-
-    pub fn snap(ts: u64, counters: Vec<Counter>) -> Snapshot {
-        Snapshot::V2(SnapshotV2 {
-            systemtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ts),
-            duration: std::time::Duration::ZERO,
-            metadata: HashMap::new(),
-            counters,
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-            gauge_histograms: Vec::new(),
-        })
-    }
-
-    pub fn counter(name: &str, sampler: &str, value: u64, window: Option<Window>) -> Counter {
-        Counter::new(name.to_string(), value, cmeta(name, sampler)).with_window(window)
-    }
-
-    /// Create a minimal, valid, empty v3 `.rez` at `path` (one recording, no
-    /// sampler tables yet) — the cheapest fixture for tests across the crate
-    /// that just need `detect_rez_format(path)` to see `V3Sqlite`.
-    pub fn empty_v3_rez(path: &std::path::Path) {
-        use crate::rez::rez_v3_writer::{ManifestSeed, RezArchive};
-        let seed = ManifestSeed {
-            labels: [("source".to_string(), "rezolus".to_string())]
-                .into_iter()
-                .collect(),
-            metadata: Default::default(),
-            clock_anchor_wall_ns: 1_700_000_000_000_000_000,
-        };
-        RezArchive::single(path, seed).unwrap();
-    }
-
-    /// A finalized MULTI-recording v3 `.rez`: one recording per `(source,
-    /// host)` pair, each carrying those two labels, `source` also in its
-    /// per-recording metadata, and three rows of a `cpu_usage/cpu_cycles`
-    /// counter whose values are unique to the recording.
-    ///
-    /// The values differ per recording on purpose. A consumer that picks the
-    /// wrong arm still returns *some* series, so a test asserting only that
-    /// data came back would pass either way; distinguishable values make the
-    /// wrong arm fail.
-    pub fn multi_recording_v3_rez(path: &std::path::Path, recordings: &[(&str, &str)]) {
-        use crate::rez::rez_v3_writer::{ManifestSeed, RezArchive, StreamRecorderV3};
-        use crate::window::Window;
-        const ANCHOR: u64 = 1_700_000_000_000_000_000;
-
-        let mut archive = RezArchive::create(path).unwrap();
-        let mut recs: Vec<StreamRecorderV3> = Vec::new();
-        for (source, host) in recordings {
-            let seed = ManifestSeed {
-                labels: [
-                    ("source".to_string(), source.to_string()),
-                    ("host".to_string(), host.to_string()),
-                ]
-                .into_iter()
-                .collect(),
-                // Mirrors `recorder::build_rez_metadata`: the same `source`
-                // appears in the per-recording metadata as in the labels, so
-                // a test can read back WHICH recording it was handed.
-                metadata: [("source".to_string(), source.to_string())]
-                    .into_iter()
-                    .collect(),
-                clock_anchor_wall_ns: ANCHOR,
-            };
-            recs.push(StreamRecorderV3::new(archive.add_recording(seed).unwrap()));
-        }
-        for (i, rec) in recs.iter_mut().enumerate() {
-            for t in 0..3u64 {
-                let ts = ANCHOR + 1_000_000_000 * (t + 1);
-                let w = Some(Window::new(ts - 50_000_000, ts));
-                let v = (i as u64 + 1) * 1_000 + t;
-                rec.ingest(
-                    &snap(ts, vec![counter("cpu_cycles", "cpu_usage", v, w)]),
-                    ts,
-                    0,
-                )
-                .unwrap();
-            }
-        }
-        for rec in recs {
-            rec.finalize((ANCHOR + 4_000_000_000, 0)).unwrap();
-        }
-        archive.join().unwrap();
-    }
-
-    /// A finalized v3 `.rez` holding `ticks` rows of one counter per named
-    /// sampler, labelled `arm=<arm>` so a multi-recording assembly can tell
-    /// its inputs apart.
-    ///
-    /// Real rows, not an empty catalog: the rewrite tools copy segments and
-    /// materialize WAL tails, so a fixture with no data would exercise
-    /// neither.
-    pub fn populated_v3_rez(path: &std::path::Path, arm: &str, samplers: &[&str], ticks: u64) {
-        use crate::rez::rez_v3_writer::{ManifestSeed, RezArchive, StreamRecorderV3};
-        const ANCHOR: u64 = 1_700_000_000_000_000_000;
-        let seed = ManifestSeed {
-            labels: [
-                ("source".to_string(), "rezolus".to_string()),
-                ("arm".to_string(), arm.to_string()),
-            ]
-            .into_iter()
-            .collect(),
-            metadata: [("sampling_interval_ms".to_string(), "1000".to_string())]
-                .into_iter()
-                .collect(),
-            clock_anchor_wall_ns: ANCHOR,
-        };
-        let (archive, writer) = RezArchive::single(path, seed).unwrap();
-        let mut rec = StreamRecorderV3::new(writer);
-        for tick in 0..ticks {
-            let ts = ANCHOR + tick * 1_000_000_000;
-            let counters = samplers
-                .iter()
-                .enumerate()
-                .map(|(i, s)| counter(&format!("{i}"), s, tick + 1, None))
-                .collect();
-            rec.ingest(&snap(ts, counters), ts, 0).unwrap();
-        }
-        archive
-            .finalize_single_rec(rec, (ANCHOR + ticks * 1_000_000_000, 0))
-            .unwrap();
-    }
-}
-
-#[cfg(test)]
-mod recorder_tests {
-    use super::*;
-    use crate::window::Window;
-    use metriken_model::Snapshot;
-    use std::collections::HashMap;
-    use std::time::SystemTime;
-
-    use super::recorder_tests_support::{counter, snap};
-
-    // Interim behavior until native V3 ingest lands: a V3 payload here means
-    // the agent was flipped ahead of this recorder build, so group_by_sampler
-    // must warn and record nothing for it, not panic and not fabricate a
-    // (wrong) split from a shape it can't borrow from.
-    #[test]
-    fn group_by_sampler_leaves_gauge_histograms_out() {
-        use metriken_model::{Histogram, SnapshotV2};
-        let h = |name: &str| {
-            Histogram::new(
-                name.to_string(),
-                histogram::Histogram::new(0, 8).unwrap(),
-                [("sampler".to_string(), "ext4".to_string())].into(),
-            )
-        };
-        let snapshot = Snapshot::V2(SnapshotV2 {
-            systemtime: std::time::SystemTime::UNIX_EPOCH,
-            duration: std::time::Duration::from_millis(1),
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: Vec::new(),
-            histograms: vec![h("lat")],
-            gauge_histograms: vec![h("free")],
-        });
-        let before = GAUGE_HISTOGRAMS_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed);
-        let groups = group_by_sampler(&snapshot);
-        assert!(GAUGE_HISTOGRAMS_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed) > before);
-        let entries = &groups["ext4"];
-        assert_eq!(entries.len(), 1, "the counting histogram alone");
-    }
-
-    #[test]
-    fn group_by_sampler_skips_v3_without_panicking() {
-        use metriken_model::{GroupSchema, GroupSnapshot, MetricDesc, SnapshotV3};
-        use std::collections::BTreeMap as Map;
-
-        let schema = GroupSchema {
-            counters: vec![MetricDesc {
-                name: "cpu_usage".to_string(),
-                metadata: Map::new(),
-            }],
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-            gauge_histograms: Vec::new(),
-        };
-        let group = GroupSnapshot {
-            name: "cpu_usage/percpu".to_string(),
-            schema_hash: schema.hash(),
-            schema: Some(schema.into()),
-            window: None,
-            counters: vec![Some(7)],
-            gauges: Vec::new(),
-            histograms: Vec::new(),
-            gauge_histograms: Vec::new(),
-        };
-        let snapshot = Snapshot::V3(SnapshotV3 {
-            systemtime: SystemTime::now(),
-            duration: std::time::Duration::ZERO,
-            metadata: HashMap::new(),
-            groups: vec![group],
-        });
-
-        let groups = group_by_sampler(&snapshot);
-        assert!(groups.is_empty(), "V3 records nothing in this build");
-    }
-
-    #[test]
-    fn windowless_sampler_writes_one_row_per_poll() {
-        let mut r = RezRecorder::new(BTreeMap::new(), BTreeMap::new(), "test".to_string());
-        for i in 0..3u64 {
-            let ts = 1_000 + i;
-            r.ingest(&snap(ts, vec![counter("0", "cpu_perf", i, None)]), ts);
-        }
-        let t = r.table("cpu_perf").unwrap();
-        assert_eq!(t.rows(), 3);
-    }
-
-    #[test]
-    fn unchanged_window_dedups_to_one_row() {
-        let mut r = RezRecorder::new(BTreeMap::new(), BTreeMap::new(), "test".to_string());
-        let w = Window::new(900, 1_000);
-        for i in 0..3u64 {
-            r.ingest(
-                &snap(1_000 + i, vec![counter("0", "drivehealth", 5, Some(w))]),
-                1_000 + i,
-            );
-        }
-        assert_eq!(r.table("drivehealth").unwrap().rows(), 1);
-    }
-
-    #[test]
-    fn advancing_window_writes_one_row_per_advance() {
-        let mut r = RezRecorder::new(BTreeMap::new(), BTreeMap::new(), "test".to_string());
-        for i in 0..3u64 {
-            let end = 1_000 + i * 100;
-            r.ingest(
-                &snap(
-                    2_000 + i,
-                    vec![counter(
-                        "0",
-                        "cpu_usage",
-                        i,
-                        Some(Window::new(end - 50, end)),
-                    )],
-                ),
-                2_000 + i,
-            );
-        }
-        assert_eq!(r.table("cpu_usage").unwrap().rows(), 3);
-    }
-
-    #[test]
-    fn mixed_sampler_advances_on_windowed_and_carries_packed_column() {
-        let mut r = RezRecorder::new(BTreeMap::new(), BTreeMap::new(), "test".to_string());
-        // metric "0" windowed (advances), metric "1" packed/windowless, same sampler.
-        for i in 0..2u64 {
-            let end = 1_000 + i * 100;
-            r.ingest(
-                &snap(
-                    3_000 + i,
-                    vec![
-                        counter("0", "cpu_usage", i, Some(Window::new(end - 50, end))),
-                        counter("1", "cpu_usage", 42 + i, None),
-                    ],
-                ),
-                3_000 + i,
-            );
-        }
-        let t = r.table("cpu_usage").unwrap();
-        assert_eq!(t.rows(), 2);
-        let packed = t
-            .columns()
-            .find(|c| c.name == "1")
-            .expect("packed column present");
-        match &packed.values {
-            RezValues::Counter(v) => assert_eq!(v, &vec![Some(42), Some(43)]),
-            _ => panic!("expected counter"),
-        }
-    }
-
-    #[test]
-    fn two_samplers_split_into_two_tables() {
-        let mut r = RezRecorder::new(BTreeMap::new(), BTreeMap::new(), "test".to_string());
-        r.ingest(
-            &snap(
-                1_000,
-                vec![
-                    counter("0", "cpu_usage", 1, Some(Window::new(900, 1_000))),
-                    counter("9", "blockio_latency", 2, Some(Window::new(900, 1_000))),
-                ],
-            ),
-            1_000,
-        );
-        let tables = r.finalize_tables();
-        assert_eq!(tables.len(), 2);
-        assert!(tables.iter().any(|t| t.sampler == "cpu_usage"));
-        assert!(tables.iter().any(|t| t.sampler == "blockio_latency"));
     }
 }
 
@@ -1622,6 +800,7 @@ mod manifest_tests {
 #[cfg(test)]
 mod table_tests {
     use super::*;
+    use crate::table::write_table_parquet;
     use crate::window::Window;
     use std::collections::HashMap;
 
@@ -1716,430 +895,148 @@ mod table_tests {
 #[cfg(test)]
 mod archive_tests {
     use super::*;
-    use crate::window::Window;
+    use crate::table::write_table_parquet;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
-    fn counter_col(name: &str, vals: Vec<Option<u64>>, wins: Vec<Option<Window>>) -> RezColumn {
-        RezColumn {
-            name: name.to_string(),
-            metadata: [
-                ("metric".to_string(), name.to_string()),
-                ("metric_type".to_string(), "counter".to_string()),
-            ]
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-            values: RezValues::Counter(vals),
-            windows: wins,
+    /// A fixture written by the `.rez` writers at 0c39b2d (after 0.4.0;
+    /// output kept at 0.4.0's shape); see
+    /// `tests/rez_read.rs` for what each holds.
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rez")
+            .join(name)
+    }
+
+    fn counter_table(sampler: &str, vals: Vec<Option<u64>>) -> RezTable {
+        RezTable {
+            sampler: sampler.to_string(),
+            timestamps: (1..=vals.len() as u64).map(|t| t * 1_000).collect(),
+            wall_offsets: Vec::new(),
+            columns: vec![RezColumn {
+                name: "0".to_string(),
+                metadata: [
+                    ("metric".to_string(), "c".to_string()),
+                    ("metric_type".to_string(), "counter".to_string()),
+                ]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+                windows: vec![None; vals.len()],
+                values: RezValues::Counter(vals),
+            }],
+            table_window: None,
         }
+    }
+
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, bytes) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(name).unwrap();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append(&h, *bytes).unwrap();
+        }
+        b.into_inner().unwrap()
     }
 
     #[test]
     fn read_archive_bytes_returns_manifest_and_per_table_bytes() {
-        let t = RezTable {
-            sampler: "cpu_usage".to_string(),
-            timestamps: vec![1_000, 2_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col("0", vec![Some(1), Some(2)], vec![None, None])],
-            table_window: None,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("r.rez");
-        let tables = [t];
-        write_archive(
-            &out,
-            &[RecordingData {
-                dir: "rezolus".to_string(),
-                labels: [("source".to_string(), "rezolus".to_string())]
-                    .into_iter()
-                    .collect(),
-                metadata: BTreeMap::new(),
-                tables: &tables,
-            }],
-        )
-        .unwrap();
-
-        let (manifest, recordings) = read_archive_bytes(&out).unwrap();
+        let (manifest, recordings) = read_archive_bytes(&fixture("v2.rez")).unwrap();
         assert_eq!(manifest.recordings.len(), 1);
         assert_eq!(recordings.len(), 1);
-        assert_eq!(recordings[0].dir, "rezolus");
-        assert_eq!(recordings[0].tables.len(), 1);
-        let (sampler, segments) = &recordings[0].tables[0];
-        assert_eq!(sampler, "cpu_usage");
-        assert_eq!(segments.len(), 1);
-        let bytes = &segments[0];
-        assert_eq!(&bytes[..4], b"PAR1");
-        assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+        assert_eq!(recordings[0].dir, "rezolus-web-01");
+        let samplers: Vec<&str> = recordings[0]
+            .tables
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect();
+        assert_eq!(samplers, ["a", "b"]);
+        for (_, segments) in &recordings[0].tables {
+            assert_eq!(segments.len(), 1);
+            let bytes = &segments[0];
+            assert_eq!(&bytes[..4], b"PAR1");
+            assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+        }
         // Written whole, so the recording is complete by construction.
         assert!(recordings[0].complete);
     }
 
+    /// Two recordings with a table of the same name each resolve to their
+    /// own bytes: the reader keys tables by `<dir>/<file>`.
     #[test]
-    fn write_archive_bytes_round_trips_multiple_recordings() {
-        let mk = |sampler: &str, arm: &str| -> (tempfile::TempDir, std::path::PathBuf) {
-            let t = RezTable {
-                sampler: sampler.to_string(),
-                timestamps: vec![1_000, 2_000],
-                wall_offsets: Vec::new(),
-                columns: vec![counter_col("0", vec![Some(1), Some(2)], vec![None, None])],
-                table_window: None,
-            };
-            let d = tempfile::tempdir().unwrap();
-            let p = d.path().join("one.rez");
-            let tables = [t];
-            write_archive(
-                &p,
-                &[RecordingData {
-                    dir: "rezolus".to_string(),
-                    labels: [("arm".to_string(), arm.to_string())].into_iter().collect(),
-                    metadata: BTreeMap::new(),
-                    tables: &tables,
-                }],
-            )
-            .unwrap();
-            (d, p)
-        };
-        let (_da, a) = mk("cpu_usage", "redis");
-        let (_db, b) = mk("cpu_usage", "valkey");
-
-        let mut recs: Vec<RecordingSegments> = Vec::new();
-        for (i, p) in [a, b].iter().enumerate() {
-            let (m, rb) = read_archive_bytes(p).unwrap();
-            let mut rec = m.recordings.into_iter().next().unwrap();
-            rec.dir = format!("rec{i}");
-            let bytes = rb
-                .into_iter()
-                .next()
-                .unwrap()
-                .tables
-                .into_iter()
-                .map(|(_, b)| b)
-                .collect();
-            recs.push((rec, bytes));
-        }
-
-        let outdir = tempfile::tempdir().unwrap();
-        let out = outdir.path().join("ab.rez");
-        write_archive_bytes(&out, &recs).unwrap();
-
-        let (m, rb) = read_archive_bytes(&out).unwrap();
-        assert_eq!(m.recordings.len(), 2);
-        assert_eq!(m.recordings[0].dir, "rec0");
-        assert_eq!(m.recordings[1].dir, "rec1");
-        assert_eq!(
-            m.recordings[0].labels.get("arm").map(String::as_str),
-            Some("redis")
-        );
-        assert_eq!(
-            m.recordings[1].labels.get("arm").map(String::as_str),
-            Some("valkey")
-        );
-        assert_eq!(rb.len(), 2);
-        assert_eq!(rb[0].tables[0].0, "cpu_usage");
-    }
-
-    /// The tools carry the input's `RezTableIndex` verbatim, so on segmented
-    /// input a stale index would name files the output never emits. The writer
-    /// owns the naming: it rewrites each entry from the blobs it is handed —
-    /// without parsing them (the blobs here are not parquet at all).
-    #[test]
-    fn write_archive_bytes_canonicalizes_index() {
-        let lying_index = |sampler: &str| RezTableIndex {
-            sampler: sampler.to_string(),
-            file: Some("old.parquet".to_string()),
-            files: vec!["stale/0.parquet".to_string()],
-            columns: vec!["0".to_string()],
-            rows: 2,
-            cadence_ns: Some(1_000),
-        };
-        let rec = RezRecording {
-            dir: "rec0".to_string(),
-            labels: [("arm".to_string(), "redis".to_string())]
-                .into_iter()
-                .collect(),
+    fn the_same_sampler_in_two_recordings_reads_as_two_tables() {
+        let one = write_table_parquet(&counter_table("cpu_usage", vec![Some(1), Some(2)])).unwrap();
+        let two =
+            write_table_parquet(&counter_table("cpu_usage", vec![Some(10), Some(20)])).unwrap();
+        let recording = |dir: &str, arm: &str| RezRecording {
+            dir: dir.to_string(),
+            labels: [("arm".to_string(), arm.to_string())].into_iter().collect(),
             metadata: BTreeMap::new(),
             complete: true,
-            clock_anchor_wall_ns: Some(1_700_000_000_000_000_000),
-            clock_offsets: vec![(1_000, -7)],
-            tables: vec![lying_index("cpu_usage"), lying_index("scheduler")],
+            clock_anchor_wall_ns: None,
+            clock_offsets: Vec::new(),
+            tables: vec![RezTableIndex {
+                sampler: "cpu_usage".to_string(),
+                file: Some("cpu_usage.parquet".to_string()),
+                files: vec!["cpu_usage.parquet".to_string()],
+                columns: vec!["0".to_string()],
+                rows: 2,
+                cadence_ns: None,
+            }],
         };
-        let seg = |s: &str| s.as_bytes().to_vec();
-        let blobs = vec![
-            vec![seg("cpu-segment-0"), seg("cpu-segment-1")],
-            vec![seg("scheduler-only-segment")],
-        ];
+        let manifest = serde_json::to_vec(&RezManifest {
+            version: REZ_SCHEMA_VERSION,
+            recordings: vec![recording("redis", "redis"), recording("valkey", "valkey")],
+        })
+        .unwrap();
+        let tar = tar_bytes(&[
+            (REZ_MANIFEST_NAME, &manifest),
+            ("redis/cpu_usage.parquet", &one),
+            ("valkey/cpu_usage.parquet", &two),
+        ]);
 
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("canon.rez");
-        write_archive_bytes(&out, &[(rec, blobs)]).unwrap();
-
-        let (m, rb) = read_archive_bytes(&out).unwrap();
-        let tables = &m.recordings[0].tables;
-        // Multi-segment: no v1 `file`, segment list in emission order.
-        assert_eq!(tables[0].file, None);
-        assert_eq!(
-            tables[0].files,
-            vec!["cpu_usage/0000.parquet", "cpu_usage/0001.parquet"]
-        );
-        // Single-segment: v1-shaped, so v1 binaries can still open it.
-        assert_eq!(tables[1].file.as_deref(), Some("scheduler.parquet"));
-        assert_eq!(tables[1].files, vec!["scheduler.parquet"]);
-        // Everything else on the entry and the recording copies through.
-        assert_eq!(tables[0].columns, vec!["0".to_string()]);
-        assert_eq!(tables[0].rows, 2);
-        assert!(m.recordings[0].complete);
-        assert_eq!(
-            m.recordings[0].clock_anchor_wall_ns,
-            Some(1_700_000_000_000_000_000)
-        );
-        assert_eq!(m.recordings[0].clock_offsets, vec![(1_000, -7)]);
-        // Segments pass through byte-identical, in order.
-        assert_eq!(rb[0].tables[0].0, "cpu_usage");
-        assert_eq!(
-            rb[0].tables[0].1,
-            vec![seg("cpu-segment-0"), seg("cpu-segment-1")]
-        );
-        assert_eq!(rb[0].tables[1].0, "scheduler");
-        assert_eq!(rb[0].tables[1].1, vec![seg("scheduler-only-segment")]);
+        let (manifest, recordings) = read_archive_reader(std::io::Cursor::new(tar)).unwrap();
+        assert_eq!(manifest.recordings[1].labels["arm"], "valkey");
+        let values = |i: usize| {
+            let (sampler, segments) = recordings[i].tables[0].clone();
+            let table = read_table_parquet(sampler, segments[0].clone()).unwrap();
+            match table.columns[0].values.clone() {
+                RezValues::Counter(v) => v,
+                other => panic!("expected a counter, got {other:?}"),
+            }
+        };
+        assert_eq!(values(0), vec![Some(1), Some(2)]);
+        assert_eq!(values(1), vec![Some(10), Some(20)]);
     }
 
     #[test]
     fn is_rez_distinguishes_rez_from_bare_parquet() {
-        let t = RezTable {
-            sampler: "cpu_usage".to_string(),
-            timestamps: vec![1_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col("0", vec![Some(1)], vec![None])],
-            table_window: None,
-        };
+        assert!(is_rez_path(&fixture("v2.rez")).unwrap());
+
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("r.rez");
-        let tables = [t.clone()];
-        write_archive(
-            &out,
-            &[RecordingData {
-                dir: "rezolus".to_string(),
-                labels: BTreeMap::new(),
-                metadata: BTreeMap::new(),
-                tables: &tables,
-            }],
+        let bare = dir.path().join("plain.parquet");
+        std::fs::write(
+            &bare,
+            write_table_parquet(&counter_table("cpu_usage", vec![Some(1)])).unwrap(),
         )
         .unwrap();
-        assert!(is_rez_path(&out).unwrap());
-
-        let bare = dir.path().join("plain.parquet");
-        std::fs::write(&bare, write_table_parquet(&t).unwrap()).unwrap();
         assert!(!is_rez_path(&bare).unwrap());
     }
 
     #[test]
-    fn archive_round_trips_multiple_tables() {
-        let a = RezTable {
-            sampler: "cpu_usage".to_string(),
-            timestamps: vec![1_000, 2_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col(
-                "0",
-                vec![Some(1), Some(2)],
-                vec![
-                    Some(Window::new(500, 1_000)),
-                    Some(Window::new(1_400, 2_000)),
-                ],
-            )],
-            table_window: None,
-        };
-        let b = RezTable {
-            sampler: "blockio_latency".to_string(),
-            timestamps: vec![1_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col("9", vec![Some(7)], vec![None])],
-            table_window: None,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("rec.rez");
-        let labels: BTreeMap<String, String> = [
-            ("source".to_string(), "rezolus".to_string()),
-            ("host".to_string(), "node0".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let metadata: BTreeMap<String, String> =
-            [("sampling_interval_ms".to_string(), "1000".to_string())]
-                .into_iter()
-                .collect();
-
-        let tables = [a.clone(), b.clone()];
-        write_archive(
-            &out,
-            &[RecordingData {
-                dir: "rezolus".to_string(),
-                labels: labels.clone(),
-                metadata: metadata.clone(),
-                tables: &tables,
-            }],
-        )
-        .unwrap();
-        let archive = read_archive(&out).unwrap();
-
-        assert_eq!(archive.manifest.version, REZ_SCHEMA_VERSION);
-        assert_eq!(archive.manifest.recordings.len(), 1);
-        let rec = &archive.manifest.recordings[0];
-        assert_eq!(rec.dir, "rezolus");
-        assert_eq!(rec.labels, labels);
-        assert_eq!(rec.metadata, metadata);
-        assert_eq!(rec.tables.len(), 2);
-        assert_eq!(archive.tables.len(), 1);
-        assert_eq!(archive.tables[0].len(), 2);
-
-        let cpu = archive.tables[0]
-            .iter()
-            .find(|t| t.sampler == "cpu_usage")
-            .unwrap();
-        assert_eq!(cpu.timestamps, vec![1_000, 2_000]);
-        assert_eq!(
-            cpu.columns[0].windows,
-            vec![
-                Some(Window::new(500, 1_000)),
-                Some(Window::new(1_400, 2_000))
-            ]
-        );
-        let bio = archive.tables[0]
-            .iter()
-            .find(|t| t.sampler == "blockio_latency")
-            .unwrap();
-        assert_eq!(bio.timestamps, vec![1_000]);
-        assert_eq!(bio.columns[0].windows, vec![None]);
-
-        let cpu_idx = rec
-            .tables
-            .iter()
-            .find(|t| t.sampler == "cpu_usage")
-            .unwrap();
-        assert_eq!(cpu_idx.segment_files(), vec!["cpu_usage.parquet"]);
-        assert_eq!(cpu_idx.rows, 2);
-        assert_eq!(cpu_idx.cadence_ns, Some(1_000));
-    }
-
-    // Two recordings with distinct dirs must round-trip independently: the tar
-    // nests each under its own <dir>/, and read_archive returns tables parallel
-    // to manifest.recordings order. This is the multi-recording path Phase C
-    // (`parquet combine`) will exercise; the writer/reader already support it.
-    #[test]
-    fn archive_round_trips_multiple_recordings() {
-        let baseline = RezTable {
-            sampler: "cpu_usage".to_string(),
-            timestamps: vec![1_000, 2_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col("0", vec![Some(1), Some(2)], vec![None, None])],
-            table_window: None,
-        };
-        let experiment = RezTable {
-            sampler: "cpu_usage".to_string(),
-            timestamps: vec![1_000, 2_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col("0", vec![Some(10), Some(20)], vec![None, None])],
-            table_window: None,
-        };
-        let labels = |arm: &str| -> BTreeMap<String, String> {
-            [
-                ("source".to_string(), "rezolus".to_string()),
-                ("arm".to_string(), arm.to_string()),
-            ]
-            .into_iter()
-            .collect()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("ab.rez");
-        let base_tables = [baseline];
-        let exp_tables = [experiment];
-
-        write_archive(
-            &out,
-            &[
-                RecordingData {
-                    dir: "redis".to_string(),
-                    labels: labels("redis"),
-                    metadata: BTreeMap::new(),
-                    tables: &base_tables,
-                },
-                RecordingData {
-                    dir: "valkey".to_string(),
-                    labels: labels("valkey"),
-                    metadata: BTreeMap::new(),
-                    tables: &exp_tables,
-                },
-            ],
-        )
-        .unwrap();
-        let archive = read_archive(&out).unwrap();
-
-        // Two recordings, distinct dirs, tables parallel to recordings order.
-        assert_eq!(archive.manifest.recordings.len(), 2);
-        assert_eq!(archive.tables.len(), 2);
-        assert_eq!(archive.manifest.recordings[0].dir, "redis");
-        assert_eq!(archive.manifest.recordings[1].dir, "valkey");
-        assert_eq!(
-            archive.manifest.recordings[0]
-                .labels
-                .get("arm")
-                .map(String::as_str),
-            Some("redis")
-        );
-        assert_eq!(
-            archive.manifest.recordings[1]
-                .labels
-                .get("arm")
-                .map(String::as_str),
-            Some("valkey")
-        );
-        // Same sampler name in both recordings resolves to each recording's own
-        // values (no cross-recording clobber despite the shared file basename).
-        match &archive.tables[0][0].columns[0].values {
-            RezValues::Counter(v) => assert_eq!(v, &vec![Some(1), Some(2)]),
-            _ => panic!("expected counter"),
-        }
-        match &archive.tables[1][0].columns[0].values {
-            RezValues::Counter(v) => assert_eq!(v, &vec![Some(10), Some(20)]),
-            _ => panic!("expected counter"),
-        }
-    }
-
-    fn write_minimal_v2_archive(path: &Path) {
-        let t = RezTable {
-            sampler: "cpu_usage".to_string(),
-            timestamps: vec![1_000, 2_000],
-            wall_offsets: Vec::new(),
-            columns: vec![counter_col("0", vec![Some(1), Some(2)], vec![None, None])],
-            table_window: None,
-        };
-        let tables = [t];
-        write_archive(
-            path,
-            &[RecordingData {
-                dir: "rezolus".to_string(),
-                labels: [("source".to_string(), "rezolus".to_string())]
-                    .into_iter()
-                    .collect(),
-                metadata: BTreeMap::new(),
-                tables: &tables,
-            }],
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn detects_v3_sqlite_v2_tar_and_neither() {
+        assert_eq!(
+            detect_rez_format(&fixture("v3.rez")).unwrap(),
+            RezFormat::V3Sqlite
+        );
+        assert_eq!(
+            detect_rez_format(&fixture("v2.rez")).unwrap(),
+            RezFormat::V2Tar
+        );
+
         let dir = tempfile::tempdir().unwrap();
-
-        // v3: a SQLite database created by the v3 container module.
-        let v3 = dir.path().join("v3.rez");
-        drop(crate::rez::rez_sqlite::RezDb::create(&v3).unwrap());
-        assert_eq!(detect_rez_format(&v3).unwrap(), RezFormat::V3Sqlite);
-
-        // v2: an actual tar archive, built the way the other tests here do.
-        let v2 = dir.path().join("v2.rez");
-        write_minimal_v2_archive(&v2);
-        assert_eq!(detect_rez_format(&v2).unwrap(), RezFormat::V2Tar);
-
         // Neither: a bare parquet file.
         let pq = dir.path().join("x.parquet");
         std::fs::write(&pq, b"PAR1").unwrap();
@@ -2152,21 +1049,12 @@ mod archive_tests {
         assert_eq!(detect_rez_format(&tiny).unwrap(), RezFormat::NotRez);
     }
 
+    /// `is_rez_path` is the tar sniff: a v3 file is not a tar, so it says
+    /// false, and a caller that must accept both uses `detect_rez_format`.
     #[test]
-    fn detection_does_not_change_is_rez_path() {
-        // Every existing consumer still calls is_rez_path; adding the v3 detector
-        // must not alter what it reports for a v2 archive or a non-archive.
-        let dir = tempfile::tempdir().unwrap();
-        let v2 = dir.path().join("v2.rez");
-        write_minimal_v2_archive(&v2);
-        assert!(is_rez_path(&v2).unwrap());
-
-        let v3 = dir.path().join("v3.rez");
-        drop(crate::rez::rez_sqlite::RezDb::create(&v3).unwrap());
-        // A v3 file is NOT a tar, so the legacy sniff correctly says false.
-        // This is why callers must migrate to detect_rez_format rather than
-        // having is_rez_path silently start returning true for SQLite files.
-        assert!(!is_rez_path(&v3).unwrap());
+    fn is_rez_path_is_true_for_a_tar_only() {
+        assert!(is_rez_path(&fixture("v2.rez")).unwrap());
+        assert!(!is_rez_path(&fixture("v3.rez")).unwrap());
     }
 }
 
@@ -2337,31 +1225,6 @@ mod recovery_tests {
         assert!(recs[0].complete);
     }
 
-    /// End to end: a v1 archive through the read boundary and back out of
-    /// `write_archive_bytes` stays complete, rather than becoming a v2-stamped
-    /// archive that reads as "not cleanly finalized".
-    #[test]
-    fn v1_archive_through_write_archive_bytes_stays_complete() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("v1.rez");
-        std::fs::write(&src, v1_archive()).unwrap();
-
-        let (manifest, recs) = read_archive_bytes(&src).unwrap();
-        let out_recs: Vec<RecordingSegments> = manifest
-            .recordings
-            .into_iter()
-            .zip(recs)
-            .map(|(rec, rb)| (rec, rb.tables.into_iter().map(|(_, b)| b).collect()))
-            .collect();
-        let out = dir.path().join("v2.rez");
-        write_archive_bytes(&out, &out_recs).unwrap();
-
-        let (manifest, recs) = read_archive_bytes(&out).unwrap();
-        assert_eq!(manifest.version, REZ_SCHEMA_VERSION);
-        assert!(manifest.recordings[0].complete);
-        assert!(recs[0].complete);
-    }
-
     #[test]
     fn version_gate_rejects_newer() {
         let tar = tar_bytes(&[(REZ_MANIFEST_NAME, br#"{"version":3,"recordings":[]}"#)]);
@@ -2371,7 +1234,7 @@ mod recovery_tests {
 
     // The subtle one, and the only geometry where the read-length check is what
     // decides the outcome: a manifest that *precedes* the data it names (how
-    // `write_archive`/`write_archive_bytes` lay an archive out) can reference a
+    // the whole-archive tar writer laid an archive out) can reference a
     // segment the truncation ate. `tar` yields that entry `Ok` with a silently
     // short buffer, so without the length check M2 would "resolve" against a
     // corrupt stub instead of falling back to M1.
@@ -2512,121 +1375,6 @@ mod recovery_tests {
 }
 
 #[cfg(test)]
-mod finalize_tests {
-    use super::recorder_tests_support::*;
-    use super::*;
-    use crate::window::Window;
-    use metriken_model::{Gauge, Snapshot, SnapshotV2};
-    use std::collections::HashMap;
-    use std::time::SystemTime;
-
-    #[test]
-    fn recorder_finalize_writes_readable_archive() {
-        let mut r = RezRecorder::new(
-            [("source".to_string(), "rezolus".to_string())]
-                .into_iter()
-                .collect(),
-            [("source".to_string(), "rezolus".to_string())]
-                .into_iter()
-                .collect(),
-            "rezolus".to_string(),
-        );
-        // drivehealth: same window over 3 polls → 1 row.
-        let w = Window::new(900, 1_000);
-        for i in 0..3u64 {
-            r.ingest(
-                &snap(1_000 + i, vec![counter("0", "drivehealth", 5, Some(w))]),
-                1_000 + i,
-            );
-        }
-        // cpu_perf: windowless → 3 rows.
-        for i in 0..3u64 {
-            r.ingest(
-                &snap(2_000 + i, vec![counter("1", "cpu_perf", i, None)]),
-                2_000 + i,
-            );
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("rec.rez");
-        r.finalize(&out).unwrap();
-
-        let archive = read_archive(&out).unwrap();
-        let rec = &archive.manifest.recordings[0];
-        assert_eq!(
-            rec.labels.get("source").map(String::as_str),
-            Some("rezolus")
-        );
-        assert_eq!(
-            rec.metadata.get("source").map(String::as_str),
-            Some("rezolus")
-        );
-        let dh = archive.tables[0]
-            .iter()
-            .find(|t| t.sampler == "drivehealth")
-            .unwrap();
-        assert_eq!(dh.timestamps.len(), 1);
-        assert_eq!(dh.columns[0].windows, vec![Some(Window::new(900, 1_000))]);
-        let perf = archive.tables[0]
-            .iter()
-            .find(|t| t.sampler == "cpu_perf")
-            .unwrap();
-        assert_eq!(perf.timestamps.len(), 3);
-        assert_eq!(perf.columns[0].windows, vec![None, None, None]);
-    }
-
-    // Added coverage: a GAUGE metric must round-trip through ingest→finalize→read
-    // (the recorder sets metric_type="gauge", which the parquet reader keys on).
-    #[test]
-    fn recorder_round_trips_a_gauge_column() {
-        let mut r = RezRecorder::new(
-            BTreeMap::new(),
-            [("source".to_string(), "rezolus".to_string())]
-                .into_iter()
-                .collect(),
-            "rezolus".to_string(),
-        );
-        let w = Window::new(1_900, 2_000);
-        let g = Gauge::new(
-            "0".to_string(),
-            -7,
-            [
-                ("metric".to_string(), "mem_free".to_string()),
-                ("sampler".to_string(), "memory_meminfo".to_string()),
-            ]
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-        )
-        .with_window(Some(w));
-        let s = Snapshot::V2(SnapshotV2 {
-            systemtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(2_000),
-            duration: std::time::Duration::ZERO,
-            metadata: HashMap::new(),
-            counters: Vec::new(),
-            gauges: vec![g],
-            histograms: Vec::new(),
-            gauge_histograms: Vec::new(),
-        });
-        r.ingest(&s, 2_000);
-
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("g.rez");
-        r.finalize(&out).unwrap();
-        let archive = read_archive(&out).unwrap();
-        let t = archive.tables[0]
-            .iter()
-            .find(|t| t.sampler == "memory_meminfo")
-            .unwrap();
-        assert_eq!(t.columns.len(), 1);
-        match &t.columns[0].values {
-            RezValues::Gauge(v) => assert_eq!(v, &vec![Some(-7)]),
-            other => panic!("expected gauge column, got {other:?}"),
-        }
-        assert_eq!(t.columns[0].windows, vec![Some(w)]);
-    }
-}
-
-#[cfg(test)]
 mod label_tests {
     use super::*;
 
@@ -2641,31 +1389,6 @@ mod label_tests {
         assert_eq!(host_from_systeminfo(r#"{"cpus":64}"#), None);
         assert_eq!(host_from_systeminfo("not json"), None);
         assert_eq!(host_from_systeminfo(r#"{"hostname":null}"#), None);
-    }
-
-    #[test]
-    fn build_labels_populates_source_and_host() {
-        let labels = build_labels("rezolus", Some(r#"{"hostname":"node7"}"#), &[]);
-        assert_eq!(labels.get("source").map(String::as_str), Some("rezolus"));
-        assert_eq!(labels.get("host").map(String::as_str), Some("node7"));
-    }
-
-    #[test]
-    fn build_labels_no_host_when_systeminfo_absent() {
-        let labels = build_labels("rezolus", None, &[]);
-        assert_eq!(labels.get("source").map(String::as_str), Some("rezolus"));
-        assert!(!labels.contains_key("host"));
-    }
-
-    #[test]
-    fn build_labels_user_labels_merge_and_override() {
-        let user = vec![
-            ("arm".to_string(), "redis".to_string()),
-            ("host".to_string(), "friendly".to_string()), // user overrides auto host
-        ];
-        let labels = build_labels("rezolus", Some(r#"{"hostname":"node7"}"#), &user);
-        assert_eq!(labels.get("arm").map(String::as_str), Some("redis"));
-        assert_eq!(labels.get("host").map(String::as_str), Some("friendly"));
     }
 
     #[test]
@@ -2738,7 +1461,9 @@ mod label_tests {
 /// able to stall a recording.
 #[cfg(test)]
 mod malformed_histogram_tests {
-    use super::{read_table_parquet, write_table_parquet, GroupTableBuilder, RezValues};
+    use super::{read_table_parquet, RezValues};
+    use crate::builder::GroupTableBuilder;
+    use crate::table::write_table_parquet;
     use metriken_model::{GroupSchema, MetricDesc};
     use std::collections::BTreeMap;
 
@@ -2754,8 +1479,8 @@ mod malformed_histogram_tests {
     ///
     /// The blast radius was wider than "sealing" by the time this was fixed:
     /// `materialize_wal_tail` is also how the reader materializes a live WAL
-    /// tail, and how `copy_recordings_into` carries one across for `combine`,
-    /// `filter`, `upgrade` and hindsight's dump. All of them inherited it.
+    /// tail, and how the `.rez` rewrite tools (`combine`, `filter`, `upgrade`,
+    /// hindsight's dump) carried one across. All of them inherited it.
     ///
     /// `push_row` is infallible now, so the wedge is impossible by type rather
     /// than by promise. Three things are asserted, and the middle one is what
@@ -2825,8 +1550,10 @@ mod malformed_histogram_tests {
 /// previous occupant created — see #1205.
 #[cfg(test)]
 mod slot_relabel_tests {
-    use super::{read_table_parquet, write_table_parquet, GroupTableBuilder, RezValues};
+    use super::{read_table_parquet, RezValues};
+    use crate::builder::GroupTableBuilder;
     use crate::schema::{GroupSchema, MetricDesc};
+    use crate::table::write_table_parquet;
 
     /// One gauge in slot 0, named as a group slot is: `{metric_id}x{slot}`,
     /// unchanged by a relabel.
