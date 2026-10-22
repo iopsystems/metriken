@@ -167,6 +167,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `histogram_count` and `histogram_quantile` over two recordings or files
   of one metric with different grouping powers counted the finer one's
   observations more than once; present since metriken-query 0.37.0.
+- **Changed:** a histogram column's rows are converted to snapshots from the
+  list's value offsets into its bucket buffer, instead of through
+  `ListArray::iter`, which built an array per row. The snapshots are
+  unchanged. On a 9.6 h recording, `histogram_quantile`, `histogram_count`
+  and `histogram_heatmap` at a 60 s step take 88 to 90% of the time they
+  did (five interleaved runs each, against a 99 to 101% run-to-run spread),
+  and reading every histogram stream of the archive 87%.
 
 ### metriken-storage 0.4.0
 
