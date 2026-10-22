@@ -152,11 +152,12 @@ impl<'d> PartSink<'d> {
 /// passed on.
 pub(crate) struct UnionStage<'d> {
     inner: Box<PartSink<'d>>,
-    /// Per member series (local to the partition): its unit (local) and
-    /// track; `None` for a member of a unit that is not combined.
+    /// Per member series (local to the partition): its unit (local).
     member_unit: Vec<u32>,
     /// Per member series: its place among its unit's members.
     member_slot: Vec<u32>,
+    /// Per member series: the coverage of its rows; `None` for a member of
+    /// a unit that is not combined.
     tracks: Vec<Option<crate::promql::streaming::per_source::RowTrack>>,
     /// Per unit (local): its members (local) in rank order, and the grid
     /// indices with a member's point, each member's point there.
@@ -167,32 +168,47 @@ pub(crate) struct UnionStage<'d> {
 struct StageUnit {
     combine: bool,
     members: Vec<usize>,
-    /// The grid indices from `base` on, `members.len()` slots each: each
-    /// member's point there, if it has given one.
-    base: usize,
-    pending: VecDeque<Option<Point>>,
+    /// Per member (in rank order), its points not yet answered, in grid
+    /// order: a member's points arrive in increasing time, so each is a
+    /// queue, and a member read ahead of another holds only its own points.
+    pending: Vec<VecDeque<(usize, Point)>>,
 }
 
 impl StageUnit {
-    /// The first index held with a point.
+    /// The first index a member holds a point at.
     fn first(&self) -> Option<usize> {
-        let n = self.members.len();
         self.pending
             .iter()
-            .position(Option::is_some)
-            .map(|i| self.base + i / n)
+            .filter_map(|q| q.front().map(|(i, _)| *i))
+            .min()
     }
 
-    /// Drop the indices through `index`, the first held (those before it
-    /// hold no point).
-    fn drop_through(&mut self, index: usize) {
-        let n = self.members.len();
-        self.pending.drain(..(index + 1 - self.base) * n);
-        self.base = index + 1;
+    /// Member `k`'s point at `index`, the first held, if it has one.
+    fn at(&self, k: usize, index: usize) -> Option<&Point> {
+        self.pending[k]
+            .front()
+            .filter(|(i, _)| *i == index)
+            .map(|(_, p)| p)
+    }
+
+    /// Drop the points at `index`, the first held.
+    fn drop_first(&mut self, index: usize) {
+        for q in &mut self.pending {
+            if q.front().is_some_and(|(i, _)| *i == index) {
+                q.pop_front();
+            }
+        }
     }
 }
 
 impl UnionStage<'_> {
+    /// Member `m`'s series has no more rows: its track decides the rest.
+    fn end_member(&mut self, m: usize) {
+        if let Some(t) = &mut self.tracks[m] {
+            t.finish();
+        }
+    }
+
     /// A row of member `m`'s series.
     fn row(&mut self, m: usize, ts: u64) {
         if let Some(t) = &mut self.tracks[m] {
@@ -217,8 +233,7 @@ impl UnionStage<'_> {
                     break;
                 }
                 let n = unit.members.len();
-                let off = (index - unit.base) * n;
-                let at = |k: usize| unit.pending[off + k].as_ref();
+                let at = |k: usize| unit.at(k, index);
                 let covers = |k: usize| {
                     let m = unit.members[k];
                     let track = self.tracks[m].as_ref().expect("combined");
@@ -232,7 +247,7 @@ impl UnionStage<'_> {
                     .find(|&k| at(k).is_some() && covers(k))
                     .or_else(|| (0..n).find(|&k| at(k).is_some() && holds(k)))
                     .and_then(|k| at(k).copied());
-                self.units[u].drop_through(index);
+                self.units[u].drop_first(index);
                 if let Some(p) = pick {
                     self.inner.sink().emit(u, index, p);
                 }
@@ -270,23 +285,7 @@ impl Sink for UnionStage<'_> {
             return;
         }
         let k = self.member_slot[series] as usize;
-        let unit = &mut self.units[u];
-        let n = unit.members.len();
-        if unit.pending.is_empty() {
-            unit.base = index;
-        } else if index < unit.base {
-            // Members' points arrive in increasing time per member, not
-            // across them.
-            for _ in 0..(unit.base - index) * n {
-                unit.pending.push_front(None);
-            }
-            unit.base = index;
-        }
-        let at = (index - unit.base) * n + k;
-        if unit.pending.len() <= at {
-            unit.pending.resize((index - unit.base + 1) * n, None);
-        }
-        unit.pending[at] = Some(point);
+        self.units[u].pending[k].push_back((index, point));
     }
 }
 
@@ -1296,8 +1295,7 @@ pub(crate) fn grid_rates(
                     .map(|&u| StageUnit {
                         combine: plan.units[u].combine,
                         members: Vec::new(),
-                        base: 0,
-                        pending: VecDeque::new(),
+                        pending: Vec::new(),
                     })
                     .collect();
                 let mut member_unit = Vec::new();
@@ -1321,6 +1319,7 @@ pub(crate) fn grid_rates(
                 for (ul, _, ml) in ranked {
                     member_slot[ml] = units[ul].members.len() as u32;
                     units[ul].members.push(ml);
+                    units[ul].pending.push(VecDeque::new());
                 }
                 PartSink::Union(Box::new(UnionStage {
                     inner: Box::new(inner),
@@ -1350,6 +1349,22 @@ pub(crate) fn grid_rates(
     let resumed = std::sync::atomic::AtomicBool::new(false);
     while let Some(chunk) = scan.next_chunk(threads).ok()? {
         let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
+            // A joined scan's series whose scan has ended get no more rows:
+            // finish them now, emitting what the scan's end would, so a
+            // union's stage need not hold its units' points until then.
+            for range in &chunk.ended {
+                for s in range.clone() {
+                    let s = s as usize;
+                    if spart[s] != part {
+                        continue;
+                    }
+                    let l = slocal[s] as usize;
+                    rates[l].finish(&grid, l, sink.sink());
+                    if let Some(stage) = sink.stage() {
+                        stage.end_member(l);
+                    }
+                }
+            }
             let get = |a: Option<&arrow::array::UInt64Array>, r: usize| {
                 a.and_then(|a| (!arrow::array::Array::is_null(a, r)).then(|| a.value(r)))
             };
@@ -1374,7 +1389,16 @@ pub(crate) fn grid_rates(
                                 return;
                             };
                             if let Some(stage) = sink.stage() {
-                                stage.row(slocal[series] as usize, base);
+                                let l = slocal[series] as usize;
+                                // A row of a series taken as ended (out of
+                                // the range or not) ends the read, as a
+                                // sample does: its coverage was decided
+                                // without it.
+                                if rates[l].ended_early() {
+                                    resumed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return;
+                                }
+                                stage.row(l, base);
                             }
                             if base < data_start(series) || base > end {
                                 return;
@@ -1463,6 +1487,11 @@ pub(crate) fn grid_rates(
                             && lag.is_some_and(|lag| last.saturating_add(lag) < w)
                         {
                             rate.end_early(&grid, s, sink.sink());
+                            // Its rows are taken as ended too; a row after
+                            // this ends the read (`resumed`), as a sample does.
+                            if let Some(stage) = sink.stage() {
+                                stage.end_member(s);
+                            }
                         }
                     }
                     if let Some(t) = earliest_point(rate, w, &grid) {

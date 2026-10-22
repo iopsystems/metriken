@@ -459,7 +459,9 @@ fn scan_rates(
                 ranked.sort_by(|(ia, a), (ib, b)| {
                     ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo))
                 });
-                let first_unit = units.len();
+                // Each group series' unit, by labels.
+                let mut unit_of: std::collections::HashMap<crate::labels::Labels, usize> =
+                    std::collections::HashMap::new();
                 for (rank, (interval_ns, m)) in ranked.into_iter().enumerate() {
                     let from = data_start(m.source.as_ref());
                     let mut scan = m.source.counter_scan(name, filter, from, request.end_ns)?;
@@ -471,19 +473,13 @@ fn scan_rates(
                         tap.context_rows(true, name, filter, (from, request.end_ns), &labels);
                     for s in &mut scan.series {
                         s.interval.get_or_insert(interval);
-                        let u = match units[first_unit..]
-                            .iter()
-                            .position(|x| x.labels == s.labels)
-                        {
-                            Some(i) => first_unit + i,
-                            None => {
-                                units.push(crate::batch_rate::UnionUnit {
-                                    labels: s.labels.clone(),
-                                    combine: true,
-                                });
-                                units.len() - 1
-                            }
-                        };
+                        let u = *unit_of.entry(s.labels.clone()).or_insert_with(|| {
+                            units.push(crate::batch_rate::UnionUnit {
+                                labels: s.labels.clone(),
+                                combine: true,
+                            });
+                            units.len() - 1
+                        });
                         unit.push(u);
                         series.push(crate::batch_rate::UnionMember {
                             data_start: from,

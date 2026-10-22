@@ -1472,8 +1472,14 @@ each member a series of the scan; a stage per partition holds each group
 series' points until every member has passed the point and its rows nine
 past it decide the coverage (`RowTrack`, which gives the runs `runs` gives
 for the same rows and keeps only the rows and runs a later answer needs),
-then passes the chosen point to the aggregation or display sink, so nothing
-is materialized per series. The display query is 86 ms against 56 ms for
+then passes the chosen point to the aggregation or display sink, so an
+aggregate or display query materializes nothing per series (a plain `rate`
+returns each series' points, as for one recording). A member whose recording
+ends inside the range is finished when its scan ends (`ScanChunk::ended`),
+and in a display aggregation a member series silent for ten of its spacings
+is ended as one recording's is, so neither holds its group's points to the
+end; a member series that pauses outside that rule still holds them until
+its rows resume. The display query is 86 ms against 56 ms for
 the double read, 279 MB against 191 MB; the 1 h `rate` 13.8 against 11.9
 ms; `sum(rate(...[1m]))` over 9.6 h 39 against 33 ms. Gauges, raw placement,
 explicit evaluation timestamps, the per-series rate path and members clipped

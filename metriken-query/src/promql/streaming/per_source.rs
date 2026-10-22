@@ -306,7 +306,7 @@ impl RowTrack {
     /// Whether every row up to the first one after `t` is known, with the
     /// gap before it decided: whether `t` can be answered.
     pub(crate) fn ready(&self, t: u64) -> bool {
-        self.finished || (self.count > 0 && self.decided >= self.base && t < self.row(self.decided))
+        self.finished || (self.count > 0 && t < self.row(self.decided))
     }
 
     /// Drop the runs that end more than an interval before `t`, which no
@@ -1249,7 +1249,9 @@ mod tests {
                 n - next(n as u64 / 2 + 1) as usize,
             );
             let before: Vec<u64> = ts[..a].to_vec();
-            let after: Vec<u64> = ts[b.max(a)..].to_vec();
+            // The rows after can begin inside the scanned rows, as the
+            // context rows after a read can repeat its last rows.
+            let after: Vec<u64> = ts[b.max(a).saturating_sub(next(3) as usize)..].to_vec();
             let scanned: Vec<u64> = ts[a.saturating_sub(next(3) as usize)..b.max(a)].to_vec();
             let interval = [S / 4, S, 2 * S][next(3) as usize];
             let want = Coverage {
@@ -1270,6 +1272,8 @@ mod tests {
                         want.covers(t, window),
                         "covers at {t}"
                     );
+                    // As the stage does once it has answered `t`.
+                    track.forget_before(t);
                     asked += 1;
                 }
             }
@@ -1282,6 +1286,7 @@ mod tests {
                     want.covers(t, window),
                     "covers at {t}"
                 );
+                track.forget_before(t);
             }
         }
     }

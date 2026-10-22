@@ -34,23 +34,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   S9 of `docs/journal/2026-10-19-recording-identity-and-views.md`.
 - Cost: `rate` and `irate` on the grid over process groups are computed in
   one batched scan of every recording the query reaches, each group's members
-  combined point by point as the scan reads (a point is answered once every
-  member has passed it and the rows nine past it decide its coverage, so a
-  group holds no more than a few rows' worth of points per series), and
-  aggregated or reduced for display as the scan reads, as one recording is.
+  combined point by point as the scan reads (a point is held until every
+  member has passed it and the rows nine past it decide its coverage; a
+  member whose recording ends inside the range is finished when its scan
+  ends, and in a display aggregation a member series silent for ten of its
+  spacings is ended as one recording's is, so neither holds the group's
+  points to the end), and aggregated or reduced for display as the scan
+  reads, as one recording is.
   A member clipped to a producer epoch, raw placement, explicit evaluation
   timestamps, gauges and the per-series rate path read each member alone.
   On the 9.6 h recording with a copy of itself (one uuid), medians of three
   interleaved rounds, against the same archive read twice by 0.41.0: a
   display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at a 1 s
-  step 86 ms against 56 ms (peak RSS 279 MB against 191 MB; one source 30
-  ms and 128 MB), of `sum(irate(cpu_usage[5s]))` 27 ms against 21 ms (150
-  MB against 119 MB), `rate(cgroup_cpu_usage[1m])` over 1 h at 1 s 13.8 ms
+  step 86 ms against 56 ms (peak RSS 295 MB against 191 MB; one source 30
+  ms and 125 MB), `rate(cgroup_cpu_usage[1m])` over 1 h at 1 s 13.8 ms
   against 11.9 ms, `sum(irate(cgroup_cpu_usage[5s]))` over 1 h 10.0 ms
   against 5.8 ms, and `sum(rate(cgroup_cpu_usage[1m]))` over 9.6 h at 60 s
-  39 ms against 33 ms. Single-source archives take the path they took
-  before (six interleaved rounds: 30.9 against 29.8 ms for the 9.6 h display
-  query, 6.04 against 5.93 ms for the 1 h `rate`, spreads overlapping).
+  39 ms against 33 ms. With the copy holding only the first hour, or hours
+  3 to 4 (a dump's shape), the display query takes 49 to 50 ms and 231 to
+  239 MB. A group of 8000 series in two members: `sum(rate(w[10s]))` 318 to
+  349 ms against 415 to 458 ms read per member. Single-source archives take
+  the path they took before (30.9 against 33.2 ms for the 9.6 h display
+  query, 6.05 against 6.28 ms for the 1 h `rate`, spreads overlapping).
 - Histogram functions over a group read one of its sources alone, until
   they are combined per source: the one covering the most of the query's
   range, ties to the finest. They count a process once and leave the other
@@ -77,6 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Added:** `scan::interleave`, several counter scans read as one in time
   order, their series concatenated (what `RecordingsSource` joins its
   recordings' scans with).
+- **Changed:** `scan::ScanChunk` has a field `ended`: the series of the
+  scans `interleave` joined that have ended since the last chunk (empty for
+  a single scan).
 
 - **Changed:** `ArchiveReader::series_labels` labels each source with its
   read group's labels (`read_groups`), so the sources of one process group
