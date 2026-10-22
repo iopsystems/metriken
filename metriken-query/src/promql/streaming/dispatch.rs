@@ -694,7 +694,8 @@ fn batch_display(
 fn held_somewhere(source: &dyn DataSource, name: &str) -> Result<(), QueryError> {
     let held = source.counter_names().iter().any(|n| n == name)
         || source.gauge_names().iter().any(|n| n == name)
-        || source.histogram_names().iter().any(|n| n == name);
+        || source.histogram_names().iter().any(|n| n == name)
+        || source.gauge_histogram_names().iter().any(|n| n == name);
     if held {
         Ok(())
     } else {

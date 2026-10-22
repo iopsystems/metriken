@@ -319,10 +319,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column whose `metric_type` names another kind (the sparse layout's
   `sparse_histogram` halves, which were read as garbage buckets, or a kind
   from a later release) is no longer read.
-- **Changed:** `convert` writes a snapshot's gauge histograms as
-  `gauge_histogram` columns in the standard layout whatever `histogram_type`
-  asks for, stamps such a file format 2, and writes counting histograms as
-  `counter_histogram`.
+- **Breaking:** metriken writes no standalone parquet. `convert` is
+  `MsgpackToArchive`, which writes a raw msgpack recording into a new
+  `.dendro` archive (one source; `label`, `metadata`, `writer_config`,
+  `convert_file_path`, `convert_reader`) through `ArchiveWriter`, and the
+  `convert` feature now turns on `write`. `MsgpackToParquet`,
+  `ParquetOptions`, `ParquetCompression`, `ParquetHistogramType` (with the
+  sparse layout), `ParquetSchema` and `ParquetWriter` are removed. A parquet
+  file carries no format version its readers check, so a reader from
+  before a column kind would read a new kind with nothing to stop it; an
+  archive's segments do. Parquet files written before are read as they
+  were.
+- **Fixed:** `StreamDecoder::decode` keeps a group row's gauge histogram
+  slots; a group row carrying gauge histograms (seven fields) is decoded
+  as a group row. A long row, or a group written long, that carries gauge
+  histograms is refused with an error naming the group, since a long table
+  cannot hold them.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in
   one coarser bucket had their cumulative counts summed, so 3 observations

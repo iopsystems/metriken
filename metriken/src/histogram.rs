@@ -260,9 +260,10 @@ pub type RwLockHistogram = RwLockCounterHistogram;
 /// class, tasks per queue length), not how many events have been recorded.
 ///
 /// Every write replaces every bucket, so a bucket can go down between two
-/// reads, and there is no `increment`. Exposition marks it as a gauge
-/// histogram (`metric_type = gauge_histogram`), and readers take each
-/// reading as it is instead of differencing consecutive readings. Use
+/// reads, and there is no `increment`. Exposition sends it in a snapshot's
+/// or group's `gauge_histograms` list, storage records it as a column whose
+/// `metric_type` is `gauge_histogram`, and readers take each reading as it
+/// is instead of differencing consecutive readings. Use
 /// [`AtomicCounterHistogram`] or [`RwLockCounterHistogram`] for a distribution of events.
 ///
 /// ```

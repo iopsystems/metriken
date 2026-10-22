@@ -2,7 +2,7 @@
 //! counting histogram columns say `metric_type = histogram`, read as counting
 //! histograms: an archive through `ArchiveReader`, a parquet file through
 //! the parquet reader, and a raw msgpack recording through `convert`, which
-//! now writes `counter_histogram`.
+//! writes an archive whose column says `counter_histogram`.
 //!
 //! `tests/fixtures/legacy/` was written by a scratch program against the
 //! crates.io releases (metriken-storage 0.4.0, metriken-exposition 0.24.0):
@@ -70,21 +70,41 @@ fn a_legacy_parquet_file_reads_its_histogram_as_counting() {
     assert!(source.gauge_histogram_names().is_empty());
 }
 
-/// `convert` of a legacy recording writes the counting histogram as
-/// `counter_histogram`, which reads as counting.
+/// `convert` of a legacy recording writes an archive whose counting
+/// histogram is a `counter_histogram` column and reads as counting.
 #[cfg(feature = "convert")]
 #[test]
 fn convert_of_a_legacy_recording_writes_counter_histogram() {
-    use parquet::file::reader::FileReader;
-    let mut out = Vec::new();
-    metriken_storage::convert::MsgpackToParquet::new()
-        .convert_file_handle(
-            std::fs::File::open(fixture("legacy-v2.msgpack")).unwrap(),
-            &mut out,
-        )
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("converted.dendro");
+    let written = metriken_storage::convert::MsgpackToArchive::new()
+        .convert_file_path(fixture("legacy-v2.msgpack"), &path)
         .unwrap();
-    let file =
-        parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(out.clone())).unwrap();
+    assert_eq!(written, 4);
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let mut recordings =
+        ArchiveReader::from_catalog(Box::new(catalog), None, BufferPool::new(64 << 20), None)
+            .unwrap();
+    let reader = recordings.remove(0).1;
+    assert_eq!(ArchiveReader::histogram_names(&reader), ["lat"]);
+    let got = reader
+        .query_range("histogram_count(lat)", BASE_S + 1.0, BASE_S + 3.0, 1.0)
+        .unwrap();
+    assert_eq!(counts(got), one_a_tick(1, 3));
+
+    use parquet::file::reader::FileReader;
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let source = metriken_storage::Catalog::sources(&catalog)
+        .unwrap()
+        .remove(0);
+    let table = metriken_storage::Catalog::tables(&catalog, source.id)
+        .unwrap()
+        .remove(0);
+    let (seq, _) = metriken_storage::Catalog::segment_meta(&catalog, source.id, &table).unwrap()[0];
+    let bytes = metriken_storage::Catalog::segment_bytes(&catalog, source.id, &table, seq)
+        .unwrap()
+        .unwrap();
+    let file = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
     let schema = parquet::arrow::parquet_to_arrow_schema(
         file.metadata().file_metadata().schema_descr(),
         file.metadata().file_metadata().key_value_metadata(),
@@ -92,12 +112,6 @@ fn convert_of_a_legacy_recording_writes_counter_histogram() {
     .unwrap();
     let lat = schema.field_with_name("2:buckets").unwrap();
     assert_eq!(lat.metadata()["metric_type"], "counter_histogram");
-    let source = metriken_storage::parquet::MultiParquetSource::open_bytes_with_pool(
-        out,
-        BufferPool::new(1 << 20),
-    )
-    .unwrap();
-    assert_eq!(source.histogram_names(), ["lat"]);
 }
 
 /// A list column's `metric_type` decides its kind: absent, `histogram` and

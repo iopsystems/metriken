@@ -70,9 +70,9 @@ write = ["archive", "dendro/write"]
 # breaking release,
 # and `StreamRow`/`Pass` for the `.rez` row wire's `AgentRow`/`AgentRows`.
 stream = ["dep:metriken-exposition"]
-# `MsgpackToParquet`: msgpack snapshots into a parquet file (`convert`).
-# Needs neither dendro nor the archive.
-convert = []
+# `MsgpackToArchive`: a raw msgpack recording into a `.dendro` archive
+# (`convert`), through the archive writer.
+convert = ["write"]
 # Reading segments written with LZ4_RAW, the codec rezolus writes.
 lz4 = ["parquet/lz4"]
 

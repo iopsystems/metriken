@@ -1101,7 +1101,10 @@ impl DataSource for GroupSource {
     /// (`super::gauge_histogram`), so the group counts once and no value
     /// is a difference between rows of two sources. Where two sources both
     /// hold a row in a staleness window, the later row answers rather than
-    /// the finer source's.
+    /// the finer source's. The staleness is the coarsest source's
+    /// (`gauge_histogram_interval`), so a fine source's rows are held longer
+    /// than its own interval would hold them where a coarse source's are
+    /// absent.
     fn gauge_histogram_stream(
         &self,
         name: &str,
@@ -1116,9 +1119,16 @@ impl DataSource for GroupSource {
                 .collect(),
         )
     }
+    /// The longest interval among the sources holding `name`: the merged
+    /// rows are held that long, so where only a coarser source has rows
+    /// (after a finer one ends) its rows still reach every step.
     fn gauge_histogram_interval(&self, name: &str) -> f64 {
-        self.finest_holding(|s| s.gauge_histogram_names().iter().any(|n| n == name))
-            .gauge_histogram_interval(name)
+        self.sources
+            .iter()
+            .filter(|s| s.gauge_histogram_names().iter().any(|n| n == name))
+            .map(|s| s.gauge_histogram_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
     }
     fn gauge_histogram_names(&self) -> Vec<String> {
         self.names(|s| s.gauge_histogram_names())

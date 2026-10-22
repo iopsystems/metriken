@@ -243,6 +243,13 @@ fn write_histogram(
 /// should `rate()`. With [`PrometheusOptions::percentiles`] the quantiles
 /// are a `gauge` family `<name>{quantile=..}` rather than a `summary`, whose
 /// `_count` and `_sum` would be counters.
+///
+/// `_gsum` counts each item at its bucket's upper edge, as this renderer's
+/// counting `_sum` does, so the two kinds' sums mean the same thing in one
+/// scrape. It is the upper end of the query engine's `histogram_sum` band
+/// (`[Σ count·start, Σ count·end]`), whose nominal value is the midpoint
+/// sum: a bucketed value is known only to its bucket, and the text format
+/// has room for one number.
 fn write_gauge_histogram(
     output: &mut String,
     name: &str,

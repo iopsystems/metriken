@@ -2,10 +2,11 @@
 
 **Status:** OPEN. Design 2026-10-21; built on `feat/gauge-histogram`
 2026-10-22 (see "As built"). Owner decisions 2026-10-22: the kind is on the
-wire (open decision 1, option b), the counting histogram types and stored
-string are renamed (`CounterHistogram`, `counter_histogram`), and the
-rebucket fix ships on its own branch first. Not reviewed, not merged, not
-released.
+wire (open decision 1, option b); the counting histogram types and stored
+string are renamed (`CounterHistogram`, `counter_histogram`); the rebucket
+fix ships on its own (#308, merged); metriken writes no standalone parquet
+(`convert` writes an archive). Reviewed once (fixes applied, "As built");
+not merged, not released.
 
 ## Goal
 
@@ -214,9 +215,16 @@ Reading:
   (`insert_gauge_histogram_series`); `ingest_snapshot` stores a snapshot's
   `gauge_histograms` as gauge histograms.
 - `ArchiveReader`'s per-table name catalog gets a gauge histogram list.
-- `convert` (msgpack to parquet) writes a snapshot's gauge histograms as
-  `gauge_histogram` columns in the standard layout and stamps format 2;
-  counting histograms are `counter_histogram`.
+- metriken writes no standalone parquet. A parquet file has no format
+  version its readers check, so a reader from before a column kind reads
+  the new kind with nothing to stop it; an archive's segments carry
+  `metriken.format`. `convert` is `MsgpackToArchive` (a raw msgpack
+  recording into a `.dendro`, one source, through `ArchiveWriter`), and
+  `MsgpackToParquet`, `ParquetOptions`, `ParquetHistogramType` (with its
+  sparse layout), `ParquetSchema` and `ParquetWriter` are removed. Reading
+  parquet stays. metriken-query's `fixtures` feature still writes parquet
+  in the legacy layout (`metric_type = histogram`, no gauge histograms), to
+  test reading it.
 - `.rez` writers (`RezStream`, the v3 writer) take a snapshot's counting
   histograms only, so a gauge histogram is left out of a `.rez`; nothing in
   6.0 writes `.rez`.
@@ -332,8 +340,13 @@ Branches, both local, on upstream main 8172a5a (after #306):
 - `feat/gauge-histogram`, on top of it: the design note; (a) producer and
   exposition; (b) storage; the counting histogram rename; the wire fields
   and `counter_histogram`; (c) the query engine; the legacy-artifact tests.
-  The first three are the tag-based build, which the wire commit reworks;
-  the history keeps both.
+  The first three are the tag-based build, which the wire commit reworks.
+- Review fixes, one commit: the stream decoder kept a group's gauge
+  histogram slots (it dropped them, and with them the whole group, for
+  every `/metrics/stream` recording); a long row carrying gauge histograms
+  is refused rather than dropped; a process group's gauge histogram is held
+  for its coarsest source's interval; an empty gauge histogram read is
+  empty rather than `MetricNotFound`; `convert` writes an archive.
 
 Query (c): `promql/streaming/gauge_histogram.rs` (the state evaluator), the
 handlers in `promql/mod.rs`, `histogram_quantile` in
@@ -358,20 +371,26 @@ apart, a seal every 5 rows).
 | archive without a gauge histogram (counter, gauge, `counter_histogram`; sealed and live tail) | opens; `histogram_count(io_latency)` 1 a tick, `mem_free`, `rate(ops)` 10/s: correct |
 | archive with no histogram at all | opens; `mem_free` and `rate(ops)` correct |
 | V3 msgpack snapshots without a gauge histogram | decoded (12 of 12); the 0.4.0 writer records them and its reader answers correctly |
+| `/metrics/stream` passes from `GroupBuilder::build_stream` (groups `fs/ext4` with a gauge histogram, `fs/lat`, `fs/mem`) through the 0.4.0 `StreamDecoder` | every pass refused: "stream fs/ext4: failed to decode a group WAL row: array had incorrect length, expected 3", so the 0.4.0 recorder writes no row of the pass, the other groups' included |
+| the same passes without `fs/ext4` | decoded (12 of 12); recorded and read back correctly |
+| a standalone parquet file | none written: `convert` writes an archive |
 
 Every row is a refusal or a correct read. What the published releases still
 read: any archive, live tail, snapshot or row from this branch that holds
 no gauge histogram, counting histogram columns included. What they refuse:
 a sealed archive with a gauge histogram anywhere (the whole archive, since
 the open probes every table), a live tail or stream row of a group holding
-one, and any snapshot holding one.
+one (the whole stream pass), and any snapshot holding one. This branch's
+own stream decoder records the pass, gauge histogram included
+(`tests/stream_gauge_histogram.rs`).
 
 This branch against artifacts the published releases wrote
 (`tests/fixtures/legacy/`, `metric_type = histogram`): the archive through
 `ArchiveReader`, the parquet file through the parquet reader and
 `ParquetReader`, msgpack snapshots through `MemoryStore::ingest_snapshot`,
-and `convert` of a raw recording (writing `counter_histogram`) all read
-`lat` as a counting histogram with one observation a tick.
+and `convert` of a raw recording (into an archive whose column says
+`counter_histogram`) all read `lat` as a counting histogram with one
+observation a tick.
 
 The first, tag-based build was measured the same way and misread two paths:
 an archive whose gauge histogram was still in the live WAL tail
@@ -401,3 +420,10 @@ caught unless noted:
   arm of `nothing_read` removed: 1; the `histogram_irate` refusal removed: 1
   (in the first build this survived, because `nothing_read` refuses the
   read too, until the test asserted each refusal's own wording).
+- Review fixes: the stream decoder dropping gauge histogram slots again: the
+  stream round-trip test fails; a group's interval back to its finest
+  source's: the group test fails; `held_somewhere` without gauge
+  histograms: the empty-read test fails; each of the two long-row refusal
+  arms, and the long-written-group refusal, removed: the refusal tests fail
+  (the schema arm survived until the test sent columns naming a gauge
+  histogram with no value).

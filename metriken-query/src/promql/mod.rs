@@ -88,8 +88,9 @@ pub(crate) fn reads_gauge_histogram(
     }
     if source.histogram_names().iter().any(|n| n == name) {
         return Err(QueryError::Unsupported(format!(
-            "{name} is a gauge histogram in some series and a counting histogram in others, \
-             which are read differently; select one kind with a label matcher"
+            "{name} is held as a gauge histogram and as a counting histogram, which are \
+             read differently, so it cannot be queried while it is both; a label matcher \
+             does not separate them"
         )));
     }
     Ok(true)

@@ -1,95 +1,123 @@
-//! Msgpack snapshots into one parquet file (feature `convert`): one row per
-//! snapshot, one column per metric. [`MsgpackToParquet`] converts a file of
-//! concatenated msgpack [`Snapshot`]s; [`ParquetSchema`] and
-//! [`ParquetWriter`] build the file from snapshots in hand.
+//! Msgpack snapshots into a `.dendro` archive (feature `convert`).
 //!
-//! The column layout and file metadata are what `metriken-query`'s
-//! `ParquetReader` reads.
+//! [`MsgpackToArchive`] reads a file of concatenated msgpack
+//! [`Snapshot`]s (a raw recording) and writes them to a new archive as one
+//! source, each snapshot a tick at its own timestamp, through the same
+//! [`ArchiveWriter`] a recorder uses.
+//!
+//! This replaced `MsgpackToParquet`, which wrote one standalone parquet file.
+//! metriken writes no standalone parquet: a parquet file carries no format
+//! version a reader checks, so a reader from before a new column kind (a
+//! gauge histogram) would read the new kind with nothing to stop it. An
+//! archive's segments carry `metriken.format`, which those readers check.
+//! Parquet files written before keep reading (`parquet`, `MultiParquetSource`,
+//! and metriken-query's `ParquetReader`).
 
-mod hashed;
-mod writer;
-
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, Write};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-
-use parquet::errors::ParquetError;
+use std::time::UNIX_EPOCH;
 
 use metriken_model::Snapshot;
-pub use writer::{
-    ParquetCompression, ParquetHistogramType, ParquetOptions, ParquetSchema, ParquetWriter,
-};
 
-/// A struct for converting msgpack'd metriken snapshots into a parquet file.
-#[derive(Clone, Debug, Default)]
-pub struct MsgpackToParquet {
-    parquet_options: ParquetOptions,
-    metadata: HashMap<String, String>,
+use crate::{ArchiveWriter, WriterConfig};
+
+type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Converts a raw msgpack recording into a `.dendro` archive.
+///
+/// ```no_run
+/// use metriken_storage::convert::MsgpackToArchive;
+///
+/// let ticks = MsgpackToArchive::new()
+///     .label("source", "rezolus")
+///     .metadata("host", "web-01")
+///     .convert_file_path("rezolus.raw", "rezolus.dendro")
+///     .unwrap();
+/// println!("{ticks} snapshots");
+/// ```
+#[derive(Default)]
+pub struct MsgpackToArchive {
+    labels: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
+    config: WriterConfig,
 }
 
-impl MsgpackToParquet {
-    /// Returns a new `MsgpackToParquet` converter that uses the default
-    /// conversion options.
+impl MsgpackToArchive {
+    /// A converter writing one source with no labels or metadata, under the
+    /// default [`WriterConfig`].
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a `MsgpackToParquet` converted from the provided parquet options.
-    pub fn with_options(options: ParquetOptions) -> Self {
-        Self {
-            parquet_options: options,
-            metadata: HashMap::new(),
-        }
-    }
-
-    /// Add a key-value pair to the metadata.
-    pub fn metadata(mut self, key: String, value: String) -> Self {
-        self.metadata.insert(key, value);
+    /// A label of the archive's source (`source`, `host`, ...).
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
         self
     }
 
-    /// Converts a file with metrics in msgpack format to a parquet file.
-    /// Input and putput are file paths.
-    /// If successful, returns the number of rows written out to the parquet
-    /// file.
+    /// A metadata entry of the archive's source.
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// The writer's configuration (seal policy, compression, long groups).
+    pub fn writer_config(mut self, config: WriterConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Convert the msgpack recording at `input` into a new archive at
+    /// `output`, which must not exist. Returns the number of snapshots
+    /// written.
     pub fn convert_file_path(
         self,
         input: impl AsRef<Path>,
         output: impl AsRef<Path>,
-    ) -> Result<i64, ParquetError> {
-        self.convert_file_handle(File::open(input)?, File::create(output)?)
+    ) -> Result<u64, Error> {
+        let input = input.as_ref();
+        let file =
+            std::fs::File::open(input).map_err(|e| format!("opening {}: {e}", input.display()))?;
+        self.convert_reader(file, output)
     }
 
-    /// Converts a file with metrics in msgpack format to a parquet file.
-    /// Input and putput are open file handles.
-    /// If successful, returns the number of rows written out to the parquet
-    /// file.
-    pub fn convert_file_handle(
-        self,
-        reader: impl Read + Seek,
-        writer: impl Write + Send,
-    ) -> Result<i64, ParquetError> {
+    /// Convert concatenated msgpack snapshots read from `reader` into a new
+    /// archive at `output`. A snapshot that does not decode ends the
+    /// conversion with an error naming its position; an input with no
+    /// snapshot is an error, and no archive is created.
+    pub fn convert_reader(self, reader: impl Read, output: impl AsRef<Path>) -> Result<u64, Error> {
         let mut reader = BufReader::new(reader);
-        let mut schema = ParquetSchema::new();
-
-        // First pass to build the schema
-        while !reader.fill_buf().unwrap().is_empty() {
-            let s: Snapshot = rmp_serde::from_read(&mut reader)
-                .map_err(|x| ParquetError::External(Box::new(x)))?;
-            schema.push(s);
+        let mut next = |index: u64| -> Result<Option<Snapshot>, Error> {
+            if reader.fill_buf()?.is_empty() {
+                return Ok(None);
+            }
+            rmp_serde::from_read(&mut reader)
+                .map(Some)
+                .map_err(|e| format!("snapshot {index}: {e}").into())
+        };
+        let Some(first) = next(0)? else {
+            return Err("the input holds no snapshot".into());
+        };
+        let ts = |s: &Snapshot| -> Result<u64, Error> {
+            Ok(s.systemtime().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
+        };
+        let mut writer = ArchiveWriter::create(output.as_ref(), self.config)?;
+        let mut source = writer.add_source(self.labels, self.metadata, ts(&first)?)?;
+        let mut written = 0u64;
+        let mut last = 0u64;
+        let mut snapshot = Some(first);
+        while let Some(s) = snapshot {
+            let at = ts(&s)?;
+            last = last.max(at);
+            let staged = source.stage(&s, at, 0)?;
+            writer.commit(vec![staged])?;
+            source.maybe_seal()?;
+            written += 1;
+            snapshot = next(written)?;
         }
-        let mut writer = schema.finalize(writer, self.parquet_options, Some(self.metadata))?;
-
-        // Rewind file pointer and second pass for the actual metrics
-        reader.rewind().unwrap();
-        while !reader.fill_buf().unwrap().is_empty() {
-            let s: Snapshot = rmp_serde::from_read(&mut reader)
-                .map_err(|x| ParquetError::External(Box::new(x)))?;
-            writer.push(s)?;
-        }
-        let metadata = writer.finalize()?;
-
-        Ok(metadata.file_metadata().num_rows())
+        source.finalize((last, 0))?;
+        writer.join()?;
+        Ok(written)
     }
 }

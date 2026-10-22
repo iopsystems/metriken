@@ -236,14 +236,14 @@ fn a_name_of_both_kinds_is_refused() {
         )
         .unwrap();
     let msg = refused(&store, "histogram_count(free)");
-    assert!(msg.contains("counting histogram in others"), "{msg}");
+    assert!(msg.contains("cannot be queried while it is both"), "{msg}");
 }
 
 /// `ingest_snapshot` stores a snapshot's `gauge_histograms` entries as gauge
 /// histograms.
 #[cfg(feature = "ingest")]
 #[test]
-fn an_ingested_tagged_entry_is_a_gauge_histogram() {
+fn an_ingested_gauge_histogram_entry_is_a_gauge_histogram() {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
@@ -278,4 +278,32 @@ fn an_ingested_tagged_entry_is_a_gauge_histogram() {
     );
     let got = matrix(&store, "histogram_count(free)", 1000.0, 1002.0, 1.0);
     assert_eq!(got, [[(1000.0, 10.0), (1001.0, 11.0), (1002.0, 12.0)]]);
+}
+
+/// A read of a gauge histogram that matches nothing is an empty answer, not
+/// `MetricNotFound`: a label matching no series, and an instant past every
+/// series' staleness.
+#[test]
+fn an_empty_read_is_empty_not_missing() {
+    let store = store();
+    for q in [
+        "histogram_quantile(0.5, free{dev=\"none\"})",
+        "histogram_quantiles([0.5], free{dev=\"none\"})",
+        "histogram_count(free{dev=\"none\"})",
+        "histogram_quantile(0.5, free)",
+    ] {
+        let start = if q.ends_with("(0.5, free)") {
+            2000.0
+        } else {
+            1000.0
+        };
+        match store.query_range(q, start, start + 10.0, 1.0) {
+            Ok(QueryResult::Matrix { result }) => assert!(result.is_empty(), "{q}: {result:?}"),
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    match store.query("histogram_quantile(0.5, free)", Some(2000.0)) {
+        Ok(QueryResult::Vector { result }) => assert!(result.is_empty(), "{result:?}"),
+        other => panic!("{other:?}"),
+    }
 }

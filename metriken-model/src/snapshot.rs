@@ -115,12 +115,10 @@ pub struct SnapshotV1 {
     /// Counting histograms.
     pub histograms: Vec<Histogram>,
     /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row or snapshot without one encodes (and hashes) as it did
-    /// before the field existed, and decoders from before it read it. One
-    /// that holds a gauge histogram is an array one longer, which those
-    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
-    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
-    /// state as counts.
+    /// empty, so a snapshot without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (no variant of the untagged [`Snapshot`] matching it) rather than read the state as counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gauge_histograms: Vec<Histogram>,
 }
@@ -139,12 +137,10 @@ pub struct SnapshotV2 {
     /// Counting histograms.
     pub histograms: Vec<Histogram>,
     /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row or snapshot without one encodes (and hashes) as it did
-    /// before the field existed, and decoders from before it read it. One
-    /// that holds a gauge histogram is an array one longer, which those
-    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
-    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
-    /// state as counts.
+    /// empty, so a snapshot without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (no variant of the untagged [`Snapshot`] matching it) rather than read the state as counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gauge_histograms: Vec<Histogram>,
 }
@@ -210,12 +206,10 @@ pub struct GroupSnapshot {
     /// Counting histograms.
     pub histograms: Vec<Option<histogram::Histogram>>,
     /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row or snapshot without one encodes (and hashes) as it did
-    /// before the field existed, and decoders from before it read it. One
-    /// that holds a gauge histogram is an array one longer, which those
-    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
-    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
-    /// state as counts.
+    /// empty, so a group without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (no variant of the untagged [`Snapshot`] matching the snapshot that holds it) rather than read the state as counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gauge_histograms: Vec<Option<histogram::Histogram>>,
 }

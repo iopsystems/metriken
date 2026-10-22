@@ -254,56 +254,48 @@ fn v2_snapshot(t: u64) -> Snapshot {
     })
 }
 
-/// `convert` keeps a gauge histogram's tag (it used to overwrite every
-/// histogram's `metric_type` with `histogram`), writes it in the standard
-/// layout even when the sparse one is asked for, and stamps the file
-/// format 2.
+/// `convert` writes a raw recording to an archive: the gauge histogram is a
+/// `gauge_histogram` column in a format 2 segment, the counting one a
+/// `counter_histogram` column.
 #[cfg(feature = "convert")]
 #[test]
-fn convert_keeps_a_gauge_histogram() {
-    use metriken_storage::convert::{MsgpackToParquet, ParquetHistogramType, ParquetOptions};
-    use parquet::file::reader::FileReader;
+fn convert_writes_a_gauge_histogram_to_an_archive() {
+    use metriken_storage::convert::MsgpackToArchive;
 
     let mut msgpack = Vec::new();
     for t in 0..3 {
         msgpack.extend(rmp_serde::to_vec(&v2_snapshot(t)).unwrap());
     }
-    for layout in [ParquetHistogramType::Standard, ParquetHistogramType::Sparse] {
-        let mut out = Vec::new();
-        MsgpackToParquet::with_options(ParquetOptions::new().histogram_type(layout))
-            .convert_file_handle(std::io::Cursor::new(msgpack.clone()), &mut out)
-            .unwrap();
-        let file =
-            parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(out.clone()))
-                .unwrap();
-        let format = file
-            .metadata()
-            .file_metadata()
-            .key_value_metadata()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|e| e.key == FORMAT_KEY)
-            .and_then(|e| e.value);
-        assert_eq!(format.as_deref(), Some("2"), "{layout:?}");
-
-        let source = metriken_storage::parquet::MultiParquetSource::open_bytes_with_pool(
-            out,
-            BufferPool::new(1 << 20),
-        )
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("converted.dendro");
+    let written = MsgpackToArchive::new()
+        .label("source", "raw")
+        .convert_reader(std::io::Cursor::new(msgpack), &path)
         .unwrap();
-        assert_eq!(
-            source.gauge_histogram_names(),
-            ["free_extents"],
-            "{layout:?}"
-        );
-        let rows = gauge_rows(&source, "free_extents");
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].1.count, cumulative(&state(1)).count);
-        if layout == ParquetHistogramType::Standard {
-            assert_eq!(source.histogram_names(), ["io_latency"]);
-        }
-    }
+    assert_eq!(written, 3);
+    let reader = open(&path);
+    assert_eq!(reader.gauge_histogram_names(), ["free_extents"]);
+    assert_eq!(reader.histogram_names(), ["io_latency"]);
+    let rows = gauge_rows(
+        table_source(&reader, "free_extents").as_ref(),
+        "free_extents",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1].1.count, cumulative(&state(1)).count);
+    assert_eq!(formats(&path, "ext4"), [Some("2".to_string())]);
+    assert_eq!(
+        column_types(&path, "ext4"),
+        [
+            ("7:buckets".to_string(), "gauge_histogram".to_string()),
+            ("8:buckets".to_string(), "counter_histogram".to_string()),
+        ]
+    );
+    // An empty input writes nothing.
+    let empty = dir.path().join("empty.dendro");
+    assert!(MsgpackToArchive::new()
+        .convert_reader(std::io::Cursor::new(Vec::new()), &empty)
+        .is_err());
+    assert!(!empty.exists());
 }
 
 /// A V2 snapshot's `gauge_histograms` entry (what `Snapshotter` writes for
@@ -591,4 +583,76 @@ fn mixed_bucket_configs_sum_at_the_coarsest() {
     // One bucket of the coarser configuration holds all eight.
     assert_eq!(result.bucket_bounds, [7]);
     assert_eq!(result.data, [(0, 0, 8.0)]);
+}
+
+/// Two recorders of one agent (one producer epoch, so one process group): a
+/// fine source with rows every second from 0 to 10 s and a coarse one every
+/// 5 s from 0 to 40 s, each row's state holding `t + 1` items. After the
+/// fine source ends the coarse rows answer at every step: the group's
+/// staleness is the coarse source's 5 s, not the fine source's 1 s, which
+/// left points only at 15, 16, 20, 21, 25, 26 and 30.
+#[test]
+fn a_group_reads_its_coarse_source_after_the_fine_one_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.dendro");
+    let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
+    for ticks in [
+        (0..=10).collect::<Vec<u64>>(),
+        (0..=40).step_by(5).collect(),
+    ] {
+        let mut source = writer
+            .add_source(
+                [("source".to_string(), "agent".to_string())].into(),
+                [("producer_epoch".to_string(), "e1".to_string())].into(),
+                BASE,
+            )
+            .unwrap();
+        let mut last = BASE;
+        for t in ticks {
+            let ts = BASE + t * S;
+            last = ts;
+            let mut h = histogram::Histogram::new(0, 16).unwrap();
+            h.as_mut_slice()[1] = t + 1;
+            let metadata: HashMap<String, String> = [
+                ("metric", "free"),
+                ("sampler", "ext4"),
+                ("grouping_power", "0"),
+                ("max_value_power", "16"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            let snap = Snapshot::V2(SnapshotV2 {
+                systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+                duration: Duration::from_millis(1),
+                metadata: HashMap::new(),
+                counters: Vec::new(),
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+                gauge_histograms: vec![metriken_exposition::Histogram::new(
+                    "7".to_string(),
+                    h,
+                    metadata,
+                )],
+            });
+            let staged = source.stage(&snap, ts, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+        }
+        source.finalize((last, 0)).unwrap();
+    }
+    writer.join().unwrap();
+    let reader = open_flat(&path);
+    assert_eq!(reader.sources().len(), 2);
+    let got = query_matrix(&reader, "histogram_count(free)", 0, 30, 1.0);
+    assert_eq!(got.len(), 1, "one series for the group: {got:?}");
+    let base = BASE as f64 / 1e9;
+    let want: Vec<(f64, f64)> = (0..=30u64)
+        .map(|t| {
+            // The latest row at or before t: every second to 10 s, then
+            // every 5 s.
+            let row = if t <= 10 { t } else { t / 5 * 5 };
+            (base + t as f64, (row + 1) as f64)
+        })
+        .collect();
+    assert_eq!(got[0], want);
 }

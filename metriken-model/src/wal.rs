@@ -26,11 +26,11 @@ pub struct WalCell {
     pub name: String,
     /// The snapshot **entry's** metadata, verbatim — NOT the parquet column's.
     ///
-    /// The difference matters to a reader. `metric_type` is **not** in here,
-    /// except for a gauge histogram, whose producer sets it to
-    /// [`GAUGE_HISTOGRAM`](crate::GAUGE_HISTOGRAM):
-    /// `TableBuilder::push_row` injects it (`metriken-storage`'s `builder.rs`, the `or_insert_with` that
-    /// builds a `Column`, which keeps a value the entry carries). A
+    /// The difference matters to a reader. `metric_type` is **not** in here:
+    /// `TableBuilder::push_row` injects it (`metriken-storage`'s `builder.rs`,
+    /// where a `Column` is built), from the [`WalValue`]: a
+    /// [`WalValue::GaugeHistogram`] cell makes a `gauge_histogram` column, a
+    /// [`WalValue::Histogram`] cell a `counter_histogram` one. A
     /// recovery path that built `Column { metadata: cell.metadata, .. }`
     /// directly would produce a column a natively sealed segment does not
     /// match, and `read_table_parquet` would then read every gauge back as a
@@ -119,12 +119,10 @@ pub struct WalGroupRow {
     /// slot — the same shape `WalValue::Histogram` carries.
     pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
     /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row or snapshot without one encodes (and hashes) as it did
-    /// before the field existed, and decoders from before it read it. One
-    /// that holds a gauge histogram is an array one longer, which those
-    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
-    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
-    /// state as counts.
+    /// empty, so a row without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (rmp-serde's `LengthMismatch`) rather than read the state as counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gauge_histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
 }
@@ -220,12 +218,10 @@ pub struct LongOccupant {
     /// `(grouping_power, max_value_power, buckets)` per counting histogram.
     pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
     /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row or snapshot without one encodes (and hashes) as it did
-    /// before the field existed, and decoders from before it read it. One
-    /// that holds a gauge histogram is an array one longer, which those
-    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
-    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
-    /// state as counts.
+    /// empty, so an occupant without one encodes as it did before the field
+    /// existed, and decoders from before it read it. One that holds a gauge
+    /// histogram is an array one element longer, which those decoders refuse
+    /// (rmp-serde's `LengthMismatch`, which refuses the whole long row) rather than read the state as counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gauge_histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
 }

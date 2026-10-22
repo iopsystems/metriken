@@ -182,17 +182,20 @@ impl StreamDecoder {
                     continue;
                 }
             }
-            let histograms = decoded
-                .histograms
-                .into_iter()
-                .map(|h| {
-                    h.map(|(gp, mvp, buckets)| {
-                        histogram::Histogram::from_buckets(gp, mvp, buckets)
-                            .map_err(|e| format!("stream {stream}: histogram: {e}"))
+            let rebuild = |slots: Vec<Option<(u8, u8, Vec<u64>)>>, kind: &str| {
+                slots
+                    .into_iter()
+                    .map(|h| {
+                        h.map(|(gp, mvp, buckets)| {
+                            histogram::Histogram::from_buckets(gp, mvp, buckets)
+                                .map_err(|e| format!("stream {stream}: {kind}: {e}"))
+                        })
+                        .transpose()
                     })
-                    .transpose()
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+                    .collect::<Result<Vec<_>, String>>()
+            };
+            let histograms = rebuild(decoded.histograms, "histogram")?;
+            let gauge_histograms = rebuild(decoded.gauge_histograms, "gauge histogram")?;
             out.push(StreamedGroup::Wide(GroupSnapshot {
                 name: stream,
                 schema_hash: decoded.schema_hash,
@@ -203,7 +206,7 @@ impl StreamDecoder {
                 counters: decoded.counters,
                 gauges: decoded.gauges,
                 histograms,
-                gauge_histograms: Vec::new(),
+                gauge_histograms,
             }));
         }
         Ok(out)
@@ -213,15 +216,16 @@ impl StreamDecoder {
 /// Which row type an encoded stream payload is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowForm {
-    /// A [`WalGroupRow`](crate::wal::WalGroupRow): six fields.
+    /// A [`WalGroupRow`](crate::wal::WalGroupRow): six fields, seven when it
+    /// carries gauge histograms.
     Group,
     /// A [`WalLongRow`]: four fields.
     Long,
 }
 
 /// The form of an encoded row, from the length of the msgpack array its
-/// struct is encoded as. `None` for a payload that is not an array of 6 or 4
-/// elements.
+/// struct is encoded as. `None` for a payload that is not an array of 6, 7
+/// or 4 elements.
 fn row_form(payload: &[u8]) -> Option<RowForm> {
     let len = match *payload.first()? {
         b @ 0x90..=0x9f => usize::from(b & 0x0f),
@@ -230,13 +234,14 @@ fn row_form(payload: &[u8]) -> Option<RowForm> {
         _ => return None,
     };
     match len {
-        GROUP_ROW_FIELDS => Some(RowForm::Group),
+        GROUP_ROW_FIELDS | GROUP_ROW_FIELDS_WITH_GAUGE_HISTOGRAMS => Some(RowForm::Group),
         LONG_ROW_FIELDS => Some(RowForm::Long),
         _ => None,
     }
 }
 
 const GROUP_ROW_FIELDS: usize = 6;
+const GROUP_ROW_FIELDS_WITH_GAUGE_HISTOGRAMS: usize = 7;
 const LONG_ROW_FIELDS: usize = 4;
 
 impl ArchiveWriter {
@@ -854,6 +859,21 @@ impl SourceRecorder {
         // The columns are taken before the dedup below: the producer sends
         // them once, and a row skipped as a repeat would otherwise lose them
         // for the rest of the connection.
+        // The long layout has no gauge histogram columns, and dropping the
+        // values would lose them without a word. A producer sends a group
+        // holding one wide (`GroupBuilder` never makes it long).
+        if row
+            .schema
+            .as_ref()
+            .is_some_and(|s| !s.gauge_histograms.is_empty())
+            || row.occupants.iter().any(|o| !o.gauge_histograms.is_empty())
+        {
+            return Err(format!(
+                "group {name}: a long row carries gauge histograms, which a long table \
+                 cannot hold; the producer must send the group wide"
+            )
+            .into());
+        }
         if let Some(schema) = &row.schema {
             if state.wire.as_ref().map(|(h, _)| *h) != Some(row.schema_hash) {
                 let shared = shared_keys(schema);
@@ -1171,6 +1191,17 @@ impl SourceRecorder {
         };
         let gauge_histograms = match layout.as_ref() {
             Layout::Wide(s) => s.gauge_histograms.len(),
+            // A group is made long on its first schema, which held no gauge
+            // histogram; one that gains one later cannot be written long,
+            // and is refused rather than written without it.
+            Layout::Long(_) if !g.gauge_histograms.is_empty() => {
+                return Err(format!(
+                    "group {}: gauge histograms arrived in a group written long, which a \
+                     long table cannot hold",
+                    g.name
+                )
+                .into());
+            }
             Layout::Long(_) => 0,
         };
         if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len())

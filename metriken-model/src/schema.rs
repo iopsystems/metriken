@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// The metadata key that names a metric's kind where a recording stores it
-/// (a segment column's field metadata). The storage builders set it from a
-/// value's shape when a producer has not, and keep it when one has.
+/// (a segment column's field metadata). The storage builders set it from
+/// the value: for a histogram from the list it arrived in, replacing any
+/// value the producer's metadata carried; for a counter or gauge only when
+/// the producer's metadata has none.
 pub const METRIC_TYPE: &str = "metric_type";
 
 /// [`METRIC_TYPE`]'s value for a counting histogram, whose buckets count the
@@ -75,12 +77,11 @@ pub struct GroupSchema {
     /// Counting histograms.
     pub histograms: Vec<MetricDesc>,
     /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row or snapshot without one encodes (and hashes) as it did
-    /// before the field existed, and decoders from before it read it. One
-    /// that holds a gauge histogram is an array one longer, which those
-    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
-    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
-    /// state as counts.
+    /// empty, so a schema without one encodes, and [`hash`](Self::hash)es,
+    /// as it did before the field existed, and decoders from before it read
+    /// it. One that holds a gauge histogram is an array one element longer,
+    /// which those decoders refuse (rmp-serde's `LengthMismatch`) rather
+    /// than read the state as counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gauge_histograms: Vec<MetricDesc>,
 }
