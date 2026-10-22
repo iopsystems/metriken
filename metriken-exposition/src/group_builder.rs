@@ -551,6 +551,7 @@ fn build_wide<R: Router, N: MemberNames>(
             metadata.remove(GROUP_METADATA_KEY);
 
             let metric_id_u64 = metric_id as u64;
+            let gauge_histogram = matches!(value, Value::GaugeHistogram(_));
 
             match value {
                 Value::Counter(v) => {
@@ -648,7 +649,7 @@ fn build_wide<R: Router, N: MemberNames>(
                     }
                     group.mark_end();
                 }
-                Value::Histogram(h) => {
+                Value::Histogram(h) | Value::GaugeHistogram(h) => {
                     // `config()` needs no loaded value.
                     let mut metadata = metadata;
                     metadata.insert(
@@ -659,6 +660,12 @@ fn build_wide<R: Router, N: MemberNames>(
                         "max_value_power".to_string(),
                         h.config().max_value_power().to_string(),
                     );
+                    if gauge_histogram {
+                        metadata.insert(
+                            metriken_model::METRIC_TYPE.to_string(),
+                            metriken_model::GAUGE_HISTOGRAM.to_string(),
+                        );
+                    }
                     let hv = h.load();
                     // Registered: the metric is the member, and `None`
                     // means no reading yet. Omitting it would make
@@ -666,9 +673,10 @@ fn build_wide<R: Router, N: MemberNames>(
                     // exactly the event (a histogram not yet loaded)
                     // registered membership exists to ignore.
                     if registered || hv.is_some() {
-                        group.walk_identity.histograms = identity_fold(
+                        group.walk_identity.histograms = histogram_identity_fold(
                             group.walk_identity.histograms,
-                            &metric_id_u64.to_le_bytes(),
+                            gauge_histogram,
+                            metric_id_u64,
                         );
                         group.histogram_descs.push(MetricDesc {
                             name: names.metric(metric_id, metric),
@@ -738,7 +746,7 @@ fn build_wide<R: Router, N: MemberNames>(
                     }
                     group.mark_end();
                 }
-                Value::Histogram(h) => {
+                Value::Histogram(h) | Value::GaugeHistogram(h) => {
                     let hv = h.load();
                     if registered || hv.is_some() {
                         group.histogram_values.push(hv);
@@ -1593,6 +1601,19 @@ fn members<'a>(set: Option<&'a [usize]>, bound: Option<usize>, entries: usize) -
 const IDENTITY_FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const IDENTITY_FNV_PRIME: u128 = 0x0000000001000000000000000000013b;
 
+/// Fold a single histogram metric into a group identity. A gauge histogram
+/// folds a marker first, so a dynamic metric replaced at the same position
+/// by one of the other kind changes the identity and the cached schema (whose
+/// descriptor says which kind it is) is rebuilt.
+fn histogram_identity_fold(identity: u128, gauge: bool, metric_id: u64) -> u128 {
+    let identity = if gauge {
+        identity_fold(identity, b"g")
+    } else {
+        identity
+    };
+    identity_fold(identity, &metric_id.to_le_bytes())
+}
+
 #[inline]
 fn identity_fold(mut acc: u128, bytes: &[u8]) -> u128 {
     for &b in bytes {
@@ -1722,7 +1743,10 @@ fn fold_group_identities<'a, R: Router>(
                 }
             }
             Value::Histogram(h) if registered || h.load().is_some() => {
-                accum.histograms = identity_fold(accum.histograms, &metric_id.to_le_bytes());
+                accum.histograms = histogram_identity_fold(accum.histograms, false, metric_id);
+            }
+            Value::GaugeHistogram(h) if registered || h.load().is_some() => {
+                accum.histograms = histogram_identity_fold(accum.histograms, true, metric_id);
             }
             Value::HistogramGroup(g) => {
                 accum.histograms =

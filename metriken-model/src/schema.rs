@@ -5,6 +5,18 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// The metadata key that names a metric's kind where a recording stores it
+/// (a segment column's field metadata). The storage builders set it from a
+/// value's shape when a producer has not, and keep it when one has.
+pub const METRIC_TYPE: &str = "metric_type";
+
+/// [`METRIC_TYPE`]'s value for a gauge histogram: a histogram entry or slot
+/// whose buckets are the current state of something, not counts since start.
+/// A producer puts it in the entry's metadata (or a group descriptor's); a
+/// reader that finds it must read each row as it is and never take a
+/// difference between two rows.
+pub const GAUGE_HISTOGRAM: &str = "gauge_histogram";
+
 /// One metric's identity within a [`GroupSchema`]: its column key (the
 /// snapshot entry name, e.g. `"5"` / `"5x3"`) plus its annotations
 /// (`metric`, `sampler`, labels, and for histograms `grouping_power` /

@@ -130,6 +130,18 @@ pub enum Value<'a> {
     /// A group of histogram metrics with per-entry metadata.
     HistogramGroup(&'a dyn HistogramGroupMetric),
 
+    /// A histogram whose buckets are the current state of something (how
+    /// many items of each size exist now), not a count of events since the
+    /// histogram was created. Each write replaces every bucket, so a bucket
+    /// can go down, and a reader must not take a difference between two
+    /// readings.
+    ///
+    /// A separate variant rather than a property of [`HistogramMetric`]: a
+    /// consumer that predates it reaches its wildcard arm and skips the
+    /// metric, where a property it does not know would be ignored and the
+    /// state read as cumulative counts.
+    GaugeHistogram(&'a dyn HistogramMetric),
+
     /// The value of the metric could not be represented using the other `Value`
     /// variants.
     ///

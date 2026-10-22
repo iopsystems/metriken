@@ -99,9 +99,20 @@ impl Snapshotter {
                             .with_window(window),
                     );
                 }
-                (Some(Value::Histogram(h)), window) => {
+                (Some(v @ (Value::Histogram(_) | Value::GaugeHistogram(_))), window) => {
+                    let (h, gauge) = match v {
+                        Value::GaugeHistogram(h) => (h, true),
+                        Value::Histogram(h) => (h, false),
+                        _ => unreachable!("matched above"),
+                    };
                     if let Some(histogram) = h.load() {
                         let mut metadata = build_metadata(metric);
+                        if gauge {
+                            metadata.insert(
+                                metriken_model::METRIC_TYPE.to_string(),
+                                metriken_model::GAUGE_HISTOGRAM.to_string(),
+                            );
+                        }
                         metadata.insert(
                             "grouping_power".to_string(),
                             histogram.config().grouping_power().to_string(),

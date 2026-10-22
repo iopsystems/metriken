@@ -123,6 +123,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Changed:** takes metriken-storage 0.5, whose `WriterConfig` it
   re-exports.
 
+### metriken-core 0.3.4
+
+- **Added:** `Value::GaugeHistogram`, a histogram whose buckets are current
+  state rather than counts since start. `Value` is `#[non_exhaustive]`, so a
+  consumer built before the variant reaches its wildcard arm and skips the
+  metric instead of exposing it as a counting histogram
+  (`docs/journal/2026-10-21-gauge-histogram.md`).
+
+### metriken 0.11.4
+
+- **Added:** `GaugeHistogram`: `set` and `set_with_window` replace every
+  bucket, there is no `increment`, and it reports
+  `Value::GaugeHistogram`. For distributions of state (free extents per
+  size, queue lengths across queues), which readers must not difference.
+
+### metriken-model 0.1.4
+
+- **Added:** `METRIC_TYPE` (`"metric_type"`) and `GAUGE_HISTOGRAM`
+  (`"gauge_histogram"`), the metadata key and value that mark a histogram
+  entry or group slot as a gauge histogram.
+
+### metriken-exposition 0.24.1
+
+- **Added:** gauge histograms. `Snapshotter` and `GroupBuilder` write a
+  `GaugeHistogram` as a histogram entry or slot whose metadata carries
+  `metric_type = gauge_histogram`; the wire shapes are unchanged.
+  `prometheus_text` writes one as the series Prometheus stores for an
+  OpenMetrics `gaugehistogram`, each a `gauge` family: `<name>_bucket{le}`,
+  `<name>_gcount` and `<name>_gsum` (with `percentiles`, a `gauge` family
+  `<name>{quantile}` in place of the buckets). The 0.0.4 text format has no
+  gauge histogram type, and a scrape fails on an unknown `# TYPE`.
+
 ### metriken-storage 0.5.0
 
 - **Added:** `scan::LaterRows` (non-exhaustive) and

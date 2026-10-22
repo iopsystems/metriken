@@ -26,7 +26,7 @@ pub mod wal;
 pub mod wire;
 
 pub use metriken_types::{Window, UID_LABEL};
-pub use schema::{GroupSchema, MetricDesc};
+pub use schema::{GroupSchema, MetricDesc, GAUGE_HISTOGRAM, METRIC_TYPE};
 pub use snapshot::{
     Counter, Gauge, GroupSnapshot, GroupValidationError, Histogram, Snapshot, SnapshotV1,
     SnapshotV2, SnapshotV3,
