@@ -1011,6 +1011,7 @@ impl DataSource for FileSource {
     }
 
     fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {
+        let leaves = self.0.first_leaves();
         self.0
             .columns()
             .iter()
@@ -1023,6 +1024,9 @@ impl DataSource for FileSource {
                     begin_col: c.begin_col.map(|i| i as u32),
                     width_col: c.width_col.map(|i| i as u32),
                     occupant: c.occupant,
+                    holds_values: self
+                        .0
+                        .column_holds_values(leaves.get(c.col_idx).copied().flatten()),
                 },
             })
             .collect()
@@ -1279,6 +1283,37 @@ impl ParquetSource {
                 .index_of("timestamp")
                 .unwrap_or(usize::MAX);
             parse_schema(self, ts)
+        })
+    }
+
+    /// Per arrow (root) column, its first parquet leaf; `None` for a root
+    /// with no leaf. One pass over the schema.
+    fn first_leaves(&self) -> Vec<Option<usize>> {
+        let descr = self.meta.metadata().file_metadata().schema_descr();
+        let mut first = vec![None; descr.root_schema().get_fields().len()];
+        for leaf in (0..descr.num_columns()).rev() {
+            if let Some(f) = first.get_mut(descr.get_column_root_idx(leaf)) {
+                *f = Some(leaf);
+            }
+        }
+        first
+    }
+
+    /// Whether parquet leaf `leaf` can hold a non-null cell, from the
+    /// footer's statistics: false only when every row group's chunk of it
+    /// reports as many nulls as the row group has rows. A chunk without a
+    /// null count, or no leaf, answers true.
+    fn column_holds_values(&self, leaf: Option<usize>) -> bool {
+        let meta = self.meta.metadata();
+        let Some(leaf) = leaf else {
+            return true;
+        };
+        (0..meta.num_row_groups()).any(|rg| {
+            let rg = meta.row_group(rg);
+            rg.column(leaf)
+                .statistics()
+                .and_then(|s| s.null_count_opt())
+                .is_none_or(|nulls| (nulls as i64) < rg.num_rows())
         })
     }
 
@@ -3570,5 +3605,79 @@ mod interval_tests {
         };
         assert_eq!(source.histogram_interval("h"), 10.0);
         assert_eq!(source.histogram_interval("absent"), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod holds_values_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+    use super::MultiParquetSource;
+    use crate::buffer_pool::BufferPool;
+
+    /// `holds_values` of counter `c`, written as `cells` (four rows) in row
+    /// groups of `rows_per_group`, with or without statistics.
+    fn holds_values(cells: [Option<u64>; 4], rows_per_group: usize, stats: bool) -> bool {
+        let meta: HashMap<String, String> = [
+            ("metric".to_string(), "c".to_string()),
+            ("metric_type".to_string(), "counter".to_string()),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("c", DataType::UInt64, true).with_metadata(meta),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 2, 3, 4])) as ArrayRef,
+                Arc::new(UInt64Array::from(cells.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group))
+            .set_statistics_enabled(if stats {
+                EnabledStatistics::Chunk
+            } else {
+                EnabledStatistics::None
+            })
+            .build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let src = MultiParquetSource::open_bytes_with_pool(buf, BufferPool::new(1 << 20)).unwrap();
+        let refs = src.counter_column_refs();
+        assert_eq!(refs.len(), 1, "one counter column");
+        refs[0].position.holds_values
+    }
+
+    /// Only a column whose every row group's statistics count all its rows
+    /// as null holds no value: without statistics, or with values in a later
+    /// row group only, it may.
+    #[test]
+    fn holds_values_is_false_only_when_statistics_say_every_cell_is_null() {
+        assert!(!holds_values([None; 4], 4, true), "all null, one row group");
+        assert!(
+            !holds_values([None; 4], 2, true),
+            "all null, two row groups"
+        );
+        assert!(holds_values([None; 4], 4, false), "no statistics");
+        assert!(
+            holds_values([None, None, Some(1), Some(2)], 2, true),
+            "values in the second row group only"
+        );
+        assert!(
+            holds_values([Some(1), None, None, None], 4, true),
+            "one value"
+        );
     }
 }

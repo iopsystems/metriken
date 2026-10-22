@@ -20,8 +20,8 @@ pub struct CounterColumnRef {
 /// [`DataSource::counter_column`] takes, so a reader that indexed a table's
 /// columns at open can read one back without re-parsing the schema. Small on
 /// purpose — a reader keeps one per column per segment, which on a wide
-/// table is hundreds of thousands — so it carries positions and nothing
-/// that names the column.
+/// table is hundreds of thousands — so it carries positions, whether the
+/// column can hold a value, and nothing that names the column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColumnPosition {
     pub col_idx: u32,
@@ -30,6 +30,10 @@ pub struct ColumnPosition {
     /// In a [long](crate::long) segment, the occupant whose rows are this
     /// series; `None` for a column that is one series.
     pub occupant: Option<u64>,
+    /// False when the footer's statistics say every cell of the column is
+    /// null (a wide table keeps a series' column after it stops); true
+    /// when they do not say. Fits the struct's padding.
+    pub holds_values: bool,
 }
 pub trait DataSource: Send + Sync {
     /// A source emits every sample at the timestamp it was recorded with.

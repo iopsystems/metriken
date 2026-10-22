@@ -67,10 +67,32 @@ pub struct ScanChunk {
 #[derive(Debug)]
 pub struct ScanError;
 
+/// What a reader knows of one series' rows in the segments it has not
+/// returned yet ([`ChunkReader::later_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaterRows {
+    /// No unread segment holds a row of the series.
+    None,
+    /// An unread segment may hold a row of the series.
+    Possible,
+    /// The reader does not say.
+    Unknown,
+}
+
 /// Where a scan's chunks come from.
 pub trait ChunkReader {
     /// The next up to `n` segments, or `None` when none remain.
     fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError>;
+
+    /// Whether the segments not returned yet can hold rows of `series` (an
+    /// index into the scan's series). The batch path ends a series that
+    /// falls silent in a grouped display read only when none can follow.
+    /// [`LaterRows::Unknown`] unless the reader says.
+    fn later_rows(&self, series: u32) -> LaterRows {
+        let _ = series;
+        LaterRows::Unknown
+    }
 }
 
 /// A counter's matched series and its decoded segments. A reader returns
@@ -96,6 +118,11 @@ impl<'a> CounterScan<'a> {
     /// Decodes up to `n` of the remaining segments.
     pub fn next_chunk(&mut self, n: usize) -> Result<Option<ScanChunk>, ScanError> {
         self.reader.next_chunk(n)
+    }
+
+    /// See [`ChunkReader::later_rows`].
+    pub fn later_rows(&self, series: u32) -> LaterRows {
+        self.reader.later_rows(series)
     }
 }
 
@@ -196,6 +223,14 @@ impl ChunkReader for Interleaved<'_> {
                 .flatten();
             return Ok(Some(chunk));
         }
+    }
+
+    /// The answer of the scan holding `series`.
+    fn later_rows(&self, series: u32) -> LaterRows {
+        self.children
+            .iter()
+            .find(|c| (c.offset..c.offset + c.len).contains(&series))
+            .map_or(LaterRows::Unknown, |c| c.scan.later_rows(series - c.offset))
     }
 }
 

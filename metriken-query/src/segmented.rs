@@ -3521,6 +3521,207 @@ pub(crate) mod tests {
         }
     }
 
+    /// Series that fall silent and come back, a segment per series and
+    /// 100 s window, rows a second over 1..=3200 s (the queries read to
+    /// 3000 s). Per series: its group, and the windows it has no rows in.
+    /// Series 1 restarts its counter when it comes back.
+    const QUIET: &[(&str, &[(u64, u64)])] = &[
+        // 0: never silent.
+        ("a", &[]),
+        // 1: silent from 500 s to 1200 s.
+        ("a", &[(5, 12)]),
+        // 2: silent twice.
+        ("a", &[(2, 8), (15, 22)]),
+        // 3: back only for the last window of the range.
+        ("b", &[(3, 29)]),
+        // 4: one window at the start, back near the end.
+        ("b", &[(1, 28)]),
+        // 5: alone in `d`; back only after the range's end (from 3001 s).
+        ("d", &[(20, 30)]),
+        // 6: never silent.
+        ("b", &[]),
+        // 7: back in the window after the range's end only, beside a
+        // series that is not silent.
+        ("e", &[(10, 30)]),
+        ("e", &[]),
+    ];
+
+    fn quiet_series(many: u64) -> SegmentedParquetReader {
+        let s = 1_000_000_000u64;
+        let mut segments = Vec::new();
+        // Twenty more series in group `c`, each silent for a stretch of a
+        // few windows somewhere.
+        let extra: Vec<(String, Vec<(u64, u64)>)> = (0..many)
+            .map(|i| {
+                let from = (i * 7) % 26;
+                ("c".to_string(), vec![(from, from + 2 + i % 5)])
+            })
+            .collect();
+        let all: Vec<(String, Vec<(u64, u64)>)> = QUIET
+            .iter()
+            .map(|(g, q)| (g.to_string(), q.to_vec()))
+            .chain(extra)
+            .collect();
+        for win in 0..32u64 {
+            for (id, (g, quiet)) in all.iter().enumerate() {
+                let id = id as u64;
+                if quiet.iter().any(|(a, b)| (*a..*b).contains(&win)) {
+                    continue;
+                }
+                let restarted = id == 1 && win >= 12;
+                let rows: Vec<(u64, u64)> = (win * 100 + 1..=win * 100 + 100)
+                    .map(|t| {
+                        let t0 = if restarted { t - 1200 } else { t };
+                        let v = t0 * (id + 1) * 3 + (t0 * 7919 * (id + 1)) % 5;
+                        (t * s, v)
+                    })
+                    .collect();
+                let id_s = id.to_string();
+                segments.push(segment(
+                    "cpu_cycles",
+                    &[("id", id_s.as_str()), ("g", g.as_str())],
+                    &rows,
+                ));
+            }
+        }
+        SegmentedParquetReader::open_bytes_with_pool(segments, BufferPool::new(64 * 1024 * 1024))
+            .unwrap()
+    }
+
+    /// After each chunk, the scan says a series has later rows exactly when
+    /// a later chunk holds one of its rows, at any chunk size.
+    #[test]
+    fn later_rows_is_whether_a_later_chunk_reads_the_series() {
+        use crate::scan::{LaterRows, RowSeries};
+        let r = quiet_series(20);
+        let scan = || {
+            r.source
+                .counter_scan("cpu_cycles", &Labels::default(), 0, u64::MAX)
+                .expect("cpu_cycles scans")
+        };
+        let n = scan().series.len();
+        for size in [1, 3, 8] {
+            // The series each chunk holds rows of.
+            let mut held: Vec<Vec<bool>> = Vec::new();
+            let mut s = scan();
+            while let Some(chunk) = s.next_chunk(size).expect("no read error") {
+                let mut rows = vec![false; n];
+                for seg in &chunk.segments {
+                    for batch in &seg.series {
+                        for series in batch {
+                            if let RowSeries::One(i) = series {
+                                rows[*i as usize] = true;
+                            }
+                        }
+                    }
+                }
+                held.push(rows);
+            }
+            let mut s = scan();
+            for k in 0..held.len() {
+                s.next_chunk(size).expect("no read error").expect("a chunk");
+                for i in 0..n {
+                    let later = held[k + 1..].iter().any(|rows| rows[i]);
+                    let want = if later {
+                        LaterRows::Possible
+                    } else {
+                        LaterRows::None
+                    };
+                    assert_eq!(
+                        s.later_rows(i as u32),
+                        want,
+                        "chunk size {size}, after chunk {k}, series {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A series that falls silent and comes back keeps a grouped display
+    /// read batched, its points across the silence interpolated to the
+    /// sample it comes back with as the per-series path's are, and the
+    /// answers match the path without the flush. Groups whose silent series
+    /// come back only after the range's end are fed before the end.
+    #[test]
+    fn a_series_that_comes_back_keeps_the_grouped_display_read_batched() {
+        use crate::{DisplayOptions, MetricsSource};
+        let displays = || crate::promql::streaming::dispatch::BATCH_DISPLAYS.with(|n| n.get());
+        let fed = || crate::batch_rate::FED_BEFORE_END.with(|n| n.get());
+        let abandoned = || crate::batch_rate::BATCH_ABANDONED.with(|n| n.replace(0));
+        let qopts = crate::QueryOptions::default();
+        let r = quiet_series(20);
+        // The per-series path gives series 1 points across its silence,
+        // interpolated between its samples at 500 s and 1201 s: a flushed
+        // aggregate there must have included them.
+        let crate::QueryResult::Matrix { result } = r
+            .query_range_opts(
+                "irate(cpu_cycles{id=\"1\"}[1s])",
+                400.0,
+                1300.0,
+                100.0,
+                &qopts,
+            )
+            .unwrap()
+        else {
+            panic!("a matrix");
+        };
+        let silent: Vec<f64> = result[0]
+            .values
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|t| (600.0..=1100.0).contains(t))
+            .collect();
+        assert_eq!(silent, [600.0, 700.0, 800.0, 900.0, 1000.0, 1100.0]);
+        for (start, end) in [(1.0, 3000.0), (150.0, 2950.0), (2850.0, 3000.0)] {
+            for q in [
+                "sum(irate(cpu_cycles[1s]))",
+                "sum by (g) (irate(cpu_cycles[1s]))",
+                "count by (g) (irate(cpu_cycles[5s]))",
+                "sum(rate(cpu_cycles[30s]))",
+                "sum by (g) (rate(cpu_cycles[2m]))",
+                "avg by (g) (rate(cpu_cycles[10s])) * 2",
+                "max by (g) (irate(cpu_cycles[1s]))",
+            ] {
+                for budget in [0, 50] {
+                    let display = DisplayOptions {
+                        budget,
+                        ..Default::default()
+                    };
+                    let before = displays();
+                    abandoned();
+                    crate::batch_rate::FED_BEFORE_END.with(|n| n.set(0));
+                    let streamed = r
+                        .query_range_display_opts(q, start, end, 1.0, &display, &qopts)
+                        .unwrap();
+                    assert_eq!(
+                        abandoned(),
+                        0,
+                        "{q} {start}..{end}: the batched read gave up"
+                    );
+                    assert!(displays() > before, "{q} {start}..{end}: not batched");
+                    // Over the whole range, three blocks of grid points per
+                    // group; the first two are final before the last chunk
+                    // in every group, `d` and `e` too, though their silent
+                    // series have rows after the range's end.
+                    if start == 1.0 {
+                        let crate::DisplayResult::Series { result, .. } = &streamed else {
+                            panic!("{q}: series");
+                        };
+                        assert_eq!(fed(), 2 * result.len(), "{q}: blocks fed before the end");
+                    }
+                    let matrix = r.query_range_opts(q, start, end, 1.0, &qopts).unwrap();
+                    let reduced =
+                        crate::display::display_from_result(matrix, start, end, 1.0, &display);
+                    assert_eq!(
+                        serde_json::to_value(&streamed).unwrap(),
+                        serde_json::to_value(&reduced).unwrap(),
+                        "{q} {start}..{end} budget {budget}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_grouped_display_query_feeds_final_points_before_the_end() {
         use crate::{DisplayOptions, MetricsSource};
@@ -3562,17 +3763,16 @@ pub(crate) mod tests {
                     let streamed = r
                         .query_range_display_opts(q, 1.0, 3000.0, 1.0, &display, &qopts)
                         .unwrap();
-                    assert_eq!(displays() > before, !w.resume, "{q}");
+                    assert!(displays() > before, "{q}: the batched read gave up");
                     // Three blocks of grid points per group. The first two
                     // are final before the last chunk is read, in group `a`
-                    // only once series 2 is ended early, and in group `c`
-                    // once its short series is.
-                    if !w.resume {
-                        let crate::DisplayResult::Series { result, .. } = &streamed else {
-                            panic!("{q}: series");
-                        };
-                        assert_eq!(fed(), 2 * result.len(), "{q}: blocks fed before the end");
-                    }
+                    // only once series 2 is ended early or, when it comes
+                    // back at 2501 s, once that sample is read, and in group
+                    // `c` once its short series is.
+                    let crate::DisplayResult::Series { result, .. } = &streamed else {
+                        panic!("{q}: series");
+                    };
+                    assert_eq!(fed(), 2 * result.len(), "{q}: blocks fed before the end");
                     let matrix = r.query_range_opts(q, 1.0, 3000.0, 1.0, &qopts).unwrap();
                     let reduced =
                         crate::display::display_from_result(matrix, 1.0, 3000.0, 1.0, &display);
