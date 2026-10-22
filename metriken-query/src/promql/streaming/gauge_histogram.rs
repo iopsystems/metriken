@@ -86,6 +86,9 @@ struct PartState {
 fn merged(parts: Vec<Part>) -> Option<Merged> {
     let config = common_config(parts.iter().map(|(s, _)| s.meta.config))?;
     let mut series: Vec<Labels> = Vec::new();
+    // By labels, as `merge_streams` does: a linear search per series made a
+    // read of n series cost n² comparisons.
+    let mut index: std::collections::HashMap<Labels, usize> = std::collections::HashMap::new();
     let mut states = Vec::with_capacity(parts.len());
     for (stream, staleness_ns) in parts {
         let stream = stream.rebucketed(config);
@@ -93,12 +96,11 @@ fn merged(parts: Vec<Part>) -> Option<Merged> {
             .meta
             .series
             .iter()
-            .map(|labels| match series.iter().position(|l| l == labels) {
-                Some(i) => i,
-                None => {
+            .map(|labels| {
+                *index.entry(labels.clone()).or_insert_with(|| {
                     series.push(labels.clone());
                     series.len() - 1
-                }
+                })
             })
             .collect::<Vec<_>>();
         states.push(PartState {
@@ -379,6 +381,25 @@ mod tests {
                 }
             })),
         }
+    }
+
+    /// Series are unified across parts by a label index. 20,000 series in
+    /// each of two parts take n² label comparisons with a linear search
+    /// (several seconds in a debug build) and milliseconds with the index;
+    /// the bound is far above either build's linear time.
+    #[test]
+    fn many_series_unify_in_linear_time() {
+        let n = 20_000;
+        let mk = || stream((0..n).map(|i| (i, 10 * S, snap(&[(1, 1)]))).collect(), n);
+        let t0 = std::time::Instant::now();
+        let m = merged(vec![(mk(), S), (mk(), S)]).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(m.series.len(), n, "the two parts' series are one set");
+        assert_eq!(m.parts[0].global, m.parts[1].global);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "unifying {n} series took {elapsed:?}"
+        );
     }
 
     /// Two equal states in a row read as that state twice, not as an empty
