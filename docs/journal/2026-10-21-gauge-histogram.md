@@ -1,7 +1,8 @@
 # Gauge histograms: a distribution that is current state
 
 **Status:** OPEN. Design 2026-10-21; layers (a) to (c) built on
-`feat/gauge-histogram` (see "As built"), not merged, not released.
+`feat/gauge-histogram` on 2026-10-22 (see "As built"), not reviewed, not
+merged, not released.
 
 ## Goal
 
@@ -210,12 +211,16 @@ already does.
 
 Per-source union (S9 of
 [recording identity and views](2026-10-19-recording-identity-and-views.md)):
-a gauge histogram is a gauge read per source. Each source's series is read
-alone with its own interval, and in a span two sources cover the finer
-source's state at `t` is used where it has a row in the staleness window,
-the other's elsewhere. Because no value is a difference, a junction between
-sources cannot spike; the remaining question is the S1 one (two copies of one
-process counted twice by an aggregate), the same as for a gauge.
+S9 exists because a value computed from rows of two sources (a rate across a
+junction) is wrong; a gauge histogram's value is one row, so no combination
+of sources can produce that error. A process group's gauge histogram is
+therefore the merge of every source's rows (`GroupSource::gauge_histogram_stream`,
+`HistogramStream::merge`, which makes a series held by several sources one
+series), read as the latest row at each step. A source and its copy count
+once. This differs from S9's rule for a gauge in one case: where two sources
+both hold a row in the staleness window, the later row answers rather than
+the finer source's. Both are readings of the same state; the later one is the
+more recent.
 
 ### Grouping power 0
 
@@ -288,4 +293,64 @@ consumer of its own wire.
 
 ## As built
 
-Filled in as each layer lands.
+On `feat/gauge-histogram`, rebased onto upstream main 8172a5a (after #306,
+the per-source union), one commit per layer:
+
+- (a) metriken-core `Value::GaugeHistogram`; metriken `GaugeHistogram`;
+  metriken-model `METRIC_TYPE`, `GAUGE_HISTOGRAM`; metriken-exposition
+  `Snapshotter`, `GroupBuilder` (the descriptor carries the tag, and the
+  group identity folds a marker for a gauge histogram so a dynamic metric
+  replaced by one of the other kind rebuilds the schema) and
+  `prometheus_text`. Tests: `metriken-exposition/tests/gauge_histogram.rs`,
+  `metriken/src/histogram.rs`.
+- (b) metriken-storage: `ColKind::GaugeHistogram` from `metric_type`,
+  `DataSource::gauge_histogram_*` through every source, segment format 2
+  (`format::format_of`, `stamped_for`, `stamped_if_newer`; the table, long
+  table, `convert`, `.rez` parquet ingest and projection writers stamp),
+  `convert` keeps the tag. Tests: `metriken-storage/tests/gauge_histogram.rs`
+  (sealed, live WAL tail, V2 entry, `convert` in both layouts).
+- A fix found by the mixed-configuration test: `HistogramStream::merge`
+  summed cumulative counts of buckets that rebucket into one, so 3 + 1
+  observations read as 7. It affected counting histograms merged across
+  configurations too. Separate commit.
+- (c) metriken-query: `promql/streaming/gauge_histogram.rs` (the state
+  evaluator), the handlers in `promql/mod.rs`, `histogram_quantile` in
+  `promql/streaming/dispatch.rs`, forwarding in
+  `promql/streaming/per_source.rs` (`Tap`, `GroupSource`), the
+  `MetricsSource` listings, `MemoryStore`. Tests:
+  `metriken-query/tests/gauge_histogram.rs` (`MemoryStore`), the evaluator's
+  unit tests, and the archive tests in `metriken-storage/tests/gauge_histogram.rs`
+  (`ArchiveReader`, a source and its copy, mixed configurations). Raw rate
+  mode evaluates at the same grid with the start unsnapped.
+
+What the published releases do, measured 2026-10-22 with metriken-storage
+0.4.0 and metriken-query 0.41.0 from crates.io against archives this branch
+wrote (`free_extents`, grouping power 0, 12 ticks, a seal every 5 rows; the
+state at tick 1 holds 111 items):
+
+| archive | 0.4.0 / 0.41.0 | this branch |
+|---|---|---|
+| sealed, finalized | open refused: "probing table fs/ext4: segment format 2 is newer than this reader, which reads up to 1" (the whole archive, other tables included) | gauge histogram, 12 rows |
+| 3 ticks, all in the live WAL tail | read as a counting histogram: `histogram_count` 2 at each step, `histogram_quantile(0.5)` 7 | gauge histogram, 3 rows |
+| recorded by the 0.4.0 writer from tagged snapshots | read as a counting histogram, as above | gauge histogram, 12 rows (the tag survives) |
+
+The second and third rows are open decision 1. The scratch projects are not
+in the repository.
+
+Mutation checks, each one foreground run with the file restored and its hash
+compared (all caught unless noted):
+
+- the `GroupBuilder` tag removed: the group builder test fails;
+- `parse_schema` ignoring `metric_type`: the four storage round-trip tests
+  fail;
+- `format_of` always 1: the format test, the sealed round trip, the V2 and
+  `convert` tests fail;
+- the rebucket fix reverted: its unit test and the mixed-configuration test
+  fail;
+- `reads_gauge_histogram` always false (gauge histograms read on the
+  counting path): 9 of the query and archive tests fail;
+- staleness never applied: the two staleness tests fail;
+- the gauge histogram arm of `nothing_read` removed: the refusal test fails;
+- the `histogram_irate` refusal removed: survived at first, because
+  `nothing_read` refuses the read as well; the test now asserts each
+  refusal's own wording, and fails.

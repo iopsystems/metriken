@@ -909,6 +909,26 @@ impl DataSource for Tap {
             .histogram_stream(name, filter, start_ns.max(self.lo), end_ns.min(self.hi))
     }
 
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.inner
+            .gauge_histogram_stream(name, filter, start_ns.max(self.lo), end_ns.min(self.hi))
+    }
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.inner.gauge_histogram_interval(name)
+    }
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.inner.gauge_histogram_names()
+    }
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.gauge_histogram_labels(name)
+    }
+
     fn interval(&self) -> f64 {
         self.inner.interval()
     }
@@ -1075,6 +1095,36 @@ impl DataSource for GroupSource {
         }
         best.map_or(self.sources[0].as_ref(), |(s, _)| s)
             .histogram_stream(name, filter, start_ns, end_ns)
+    }
+    /// Every source's rows, merged: a series held by several sources is one
+    /// series, and a gauge histogram is read as the latest row at each time
+    /// (`super::gauge_histogram`), so the group counts once and no value
+    /// is a difference between rows of two sources. Where two sources both
+    /// hold a row in a staleness window, the later row answers rather than
+    /// the finer source's.
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        HistogramStream::merge(
+            self.sources
+                .iter()
+                .filter_map(|s| s.gauge_histogram_stream(name, filter, start_ns, end_ns))
+                .collect(),
+        )
+    }
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.finest_holding(|s| s.gauge_histogram_names().iter().any(|n| n == name))
+            .gauge_histogram_interval(name)
+    }
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.names(|s| s.gauge_histogram_names())
+    }
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.gauge_histogram_labels(name))
     }
     fn interval(&self) -> f64 {
         self.sources

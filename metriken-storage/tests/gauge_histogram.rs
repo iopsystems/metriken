@@ -402,3 +402,193 @@ fn column_types(path: &Path, table: &str) -> Vec<(String, String)> {
     out.sort();
     out
 }
+
+// ─── Queries through the archive ────────────────────────────────────────────
+
+use metriken_query::{MetricsSource, QueryError, QueryResult};
+
+fn query_matrix(
+    reader: &ArchiveReader,
+    q: &str,
+    from: u64,
+    to: u64,
+    step: f64,
+) -> Vec<Vec<(f64, f64)>> {
+    let (start, end) = ((BASE + from * S) as f64 / 1e9, (BASE + to * S) as f64 / 1e9);
+    match reader.query_range(q, start, end, step).unwrap() {
+        QueryResult::Matrix { result } => result.into_iter().map(|m| m.values).collect(),
+        other => panic!("{q}: {other:?}"),
+    }
+}
+
+/// `(t, items)` of `state` from tick `from` to `to`.
+fn state_counts(from: u64, to: u64) -> Vec<(f64, f64)> {
+    (from..=to)
+        .map(|t| {
+            (
+                (BASE + t * S) as f64 / 1e9,
+                state(t).iter().sum::<u64>() as f64,
+            )
+        })
+        .collect()
+}
+
+fn open_flat(path: &Path) -> ArchiveReader {
+    let catalog = DendroCatalog::open(path).unwrap();
+    let recordings =
+        ArchiveReader::from_catalog(Box::new(catalog), None, BufferPool::new(64 << 20), None)
+            .unwrap();
+    ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None)
+}
+
+/// Through `ArchiveReader` as a `MetricsSource`: the histogram functions
+/// read the state at each step; the counting histogram beside it still
+/// reads deltas; the delta functions refuse.
+#[test]
+fn an_archive_answers_with_the_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rec.dendro");
+    record(&path, true);
+    let reader = open(&path);
+    assert_eq!(
+        MetricsSource::gauge_histogram_names(&reader),
+        ["free_extents"]
+    );
+    assert_eq!(MetricsSource::histogram_names(&reader), ["io_latency"]);
+
+    assert_eq!(
+        query_matrix(&reader, "histogram_count(free_extents)", 2, 9, 1.0),
+        [state_counts(2, 9)]
+    );
+    assert_eq!(
+        query_matrix(&reader, "histogram_quantile(1.0, free_extents)", 2, 2, 1.0),
+        [[((BASE + 2 * S) as f64 / 1e9, 7.0)]]
+    );
+    // The counting histogram: one observation a tick.
+    let latency = query_matrix(&reader, "histogram_count(io_latency)", 2, 9, 1.0);
+    assert!(latency[0].iter().all(|(_, v)| *v == 1.0), "{latency:?}");
+
+    let (start, end) = ((BASE + 2 * S) as f64 / 1e9, (BASE + 9 * S) as f64 / 1e9);
+    for q in [
+        "histogram_irate(free_extents)",
+        "histogram_count(free_extents, 5)",
+        "rate(free_extents[5s])",
+    ] {
+        match reader.query_range(q, start, end, 1.0) {
+            Err(QueryError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("free_extents is a gauge histogram"),
+                    "{q}: {msg}"
+                )
+            }
+            other => panic!("{q}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// A source and its copy are one process group (S1): the copy's rows are
+/// the same states, merged into one series, so the count is the source's
+/// alone rather than twice it.
+#[test]
+fn a_source_and_its_copy_count_once() {
+    use dendro::archive::{Archive, ArchiveMut};
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    use metriken_storage::writer::Encoder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.dendro");
+    record(&a, true);
+    let both = dir.path().join("both.dendro");
+    {
+        let mut out = ArchiveMut::create(&both).unwrap();
+        for _ in 0..2 {
+            let src = Archive::open(&a).unwrap();
+            let encoder = Encoder::for_archive(&src).unwrap();
+            out.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &encoder))
+                .unwrap();
+        }
+    }
+    let union = open_flat(&both);
+    assert_eq!(union.sources().len(), 2);
+    for q in [
+        "histogram_count(free_extents)",
+        "histogram_quantiles([0.5, 1.0], free_extents)",
+    ] {
+        assert_eq!(
+            query_matrix(&union, q, 2, 9, 1.0),
+            query_matrix(&open(&a), q, 2, 9, 1.0),
+            "{q}"
+        );
+    }
+    assert_eq!(
+        query_matrix(&union, "histogram_count(free_extents)", 2, 9, 1.0),
+        [state_counts(2, 9)]
+    );
+}
+
+/// Two recordings of one metric under different bucket configurations sum
+/// after rebucketing to the coarsest (the lower grouping power).
+#[test]
+fn mixed_bucket_configs_sum_at_the_coarsest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.dendro");
+    let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
+    for (host, gp) in [("a", 0u8), ("b", 2u8)] {
+        let labels = [
+            ("source".to_string(), "test".to_string()),
+            ("host".to_string(), host.to_string()),
+        ]
+        .into();
+        let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+        for t in 0..3u64 {
+            let ts = BASE + t * S;
+            let mut h = histogram::Histogram::new(gp, 16).unwrap();
+            // 3 items of value 5 and 1 of value 6: at grouping power 2 they
+            // are in two buckets ([5, 5] and [6, 6]); at 0, in [4, 7].
+            for v in [5, 5, 5, 6] {
+                h.increment(v).unwrap();
+            }
+            let metadata: HashMap<String, String> = [
+                ("metric", "free_extents".to_string()),
+                ("sampler", "ext4".to_string()),
+                ("grouping_power", gp.to_string()),
+                ("max_value_power", "16".to_string()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+            let snap = Snapshot::V2(SnapshotV2 {
+                systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+                duration: Duration::from_millis(1),
+                metadata: HashMap::new(),
+                counters: Vec::new(),
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+                gauge_histograms: vec![metriken_exposition::Histogram::new(
+                    "7".to_string(),
+                    h,
+                    metadata,
+                )],
+            });
+            let staged = source.stage(&snap, ts, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+        }
+        source.finalize((BASE + 2 * S, 0)).unwrap();
+    }
+    writer.join().unwrap();
+    let reader = open_flat(&path);
+    let (t, _) = state_counts(1, 1)[0];
+    assert_eq!(
+        query_matrix(&reader, "histogram_count(free_extents)", 1, 1, 1.0),
+        [[(t, 8.0)]]
+    );
+    let QueryResult::HistogramHeatmap { result } = reader
+        .query_range("histogram_heatmap(free_extents)", t, t, 1.0)
+        .unwrap()
+    else {
+        panic!("a heatmap")
+    };
+    // One bucket of the coarser configuration holds all eight.
+    assert_eq!(result.bucket_bounds, [7]);
+    assert_eq!(result.data, [(0, 0, 8.0)]);
+}

@@ -42,6 +42,7 @@ pub(crate) enum MetricKind {
     Counter,
     Gauge,
     Histogram,
+    GaugeHistogram,
 }
 
 impl MetricKind {
@@ -50,8 +51,81 @@ impl MetricKind {
             MetricKind::Counter => "counter",
             MetricKind::Gauge => "gauge",
             MetricKind::Histogram => "histogram",
+            MetricKind::GaugeHistogram => "gauge histogram",
         }
     }
+}
+
+/// What to say of a function that cannot read gauge histogram `name`.
+fn gauge_histogram_reads(name: &str) -> String {
+    format!(
+        "{name} is a gauge histogram: each row is its state at that time, not a count since \
+         start, so it is read as it is, with histogram_quantile(0.5, {name}), \
+         histogram_quantiles([..], {name}), histogram_count({name}), histogram_sum({name}), \
+         histogram_mean({name}) or histogram_heatmap({name})"
+    )
+}
+
+/// The error for a function of a counting histogram's increase given gauge
+/// histogram `name`: `what` names the function.
+pub(crate) fn gauge_histogram_refused(name: &str, what: &str) -> QueryError {
+    QueryError::Unsupported(format!(
+        "{what} takes the difference between rows, which a gauge histogram does not have; {}",
+        gauge_histogram_reads(name)
+    ))
+}
+
+/// Whether histogram functions read `name` as a gauge histogram. A name the
+/// source holds as both a gauge histogram and a counting histogram (two
+/// producers disagreeing) is refused, not read either way. The gauge
+/// listing is asked first, and is empty for a source holding none.
+pub(crate) fn reads_gauge_histogram(
+    source: &dyn DataSource,
+    name: &str,
+) -> Result<bool, QueryError> {
+    if !source.gauge_histogram_names().iter().any(|n| n == name) {
+        return Ok(false);
+    }
+    if source.histogram_names().iter().any(|n| n == name) {
+        return Err(QueryError::Unsupported(format!(
+            "{name} is a gauge histogram in some series and a counting histogram in others, \
+             which are read differently; select one kind with a label matcher"
+        )));
+    }
+    Ok(true)
+}
+
+/// Gauge histogram `name`'s rows for evaluation from `start_ns` (snapped as
+/// the gauge grid is) to `end_ns` at `step_ns`, with the times to evaluate
+/// at and the staleness: the step, or the metric's row interval when that
+/// is longer. `None` when nothing is read.
+pub(crate) fn read_gauge_histogram(
+    source: &dyn DataSource,
+    name: &str,
+    filter: &Labels,
+    (start_ns, end_ns, step_ns): (u64, u64, u64),
+    eval: Option<&[u64]>,
+) -> Option<(crate::histogram_stream::HistogramStream, Vec<u64>, u64)> {
+    let times = streaming::gauge_histogram::times(start_ns, end_ns, step_ns, eval);
+    let (first, last) = (*times.first()?, *times.last()?);
+    let interval_ns = (source.gauge_histogram_interval(name).max(0.0) * 1e9) as u64;
+    let staleness_ns = step_ns.max(interval_ns);
+    let stream =
+        source.gauge_histogram_stream(name, filter, first.saturating_sub(staleness_ns), last)?;
+    Some((stream, times, staleness_ns))
+}
+
+/// A range's `(start_ns, end_ns, step_ns)` as the gauge grid lays it: the
+/// start snapped down to a step boundary in grid mode, unless the range is
+/// one point (an instant), which is evaluated where asked.
+pub(crate) fn state_grid(start: f64, end: f64, step: f64, opts: &QueryOptions) -> (u64, u64, u64) {
+    let step_ns = (step * 1e9) as u64;
+    let raw = range_start_ns(start);
+    let start_ns = match opts.rate_mode {
+        crate::RateMode::Grid if step_ns > 0 && end > start => (raw / step_ns) * step_ns,
+        _ => raw,
+    };
+    (start_ns, range_end_ns(end), step_ns)
 }
 
 /// What a read of `name` as `kind` that found no series means: `Ok` when
@@ -69,6 +143,7 @@ pub(crate) fn nothing_read(
             MetricKind::Counter => source.counter_names(),
             MetricKind::Gauge => source.gauge_names(),
             MetricKind::Histogram => source.histogram_names(),
+            MetricKind::GaugeHistogram => source.gauge_histogram_names(),
         };
         names.iter().any(|n| n == name)
     };
@@ -79,10 +154,16 @@ pub(crate) fn nothing_read(
         MetricKind::Counter,
         MetricKind::Gauge,
         MetricKind::Histogram,
+        MetricKind::GaugeHistogram,
     ]
     .into_iter()
     .find(|k| *k != kind && holds(*k));
     match held {
+        Some(MetricKind::GaugeHistogram) => Err(QueryError::Unsupported(format!(
+            "this function reads a {}; {}",
+            kind.noun(),
+            gauge_histogram_reads(name)
+        ))),
         Some(MetricKind::Counter) if kind == MetricKind::Gauge => {
             Err(QueryError::Unsupported(format!(
                 "{name} is a counter: read it through rate() or irate(), \
@@ -317,8 +398,14 @@ fn instant_histogram_lookback(source: &dyn crate::DataSource, query: &str) -> f6
     if strided {
         return 0.0;
     }
-    let interval = crate::referenced_metrics(query)
-        .unwrap_or_default()
+    // A gauge histogram is read at the instant itself, with a gauge's
+    // staleness, and needs no row before it.
+    let names = crate::referenced_metrics(query).unwrap_or_default();
+    let gauge_histograms = source.gauge_histogram_names();
+    if !names.is_empty() && names.iter().all(|n| gauge_histograms.contains(n)) {
+        return 0.0;
+    }
+    let interval = names
         .iter()
         .map(|name| source.histogram_interval(name))
         .filter(|i| i.is_finite() && *i > 0.0)
@@ -851,6 +938,15 @@ impl QueryEngine {
     pub(crate) fn histogram_names(&self) -> Vec<String> {
         self.source.histogram_names()
     }
+    pub(crate) fn gauge_histogram_names(&self) -> Vec<String> {
+        self.source.gauge_histogram_names()
+    }
+    pub(crate) fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.source.gauge_histogram_labels(name)
+    }
     pub(crate) fn counter_labels(
         &self,
         name: &str,
@@ -994,8 +1090,7 @@ impl QueryEngine {
     fn handle_histogram_quantiles(
         &self,
         query_str: &str,
-        start: f64,
-        end: f64,
+        (start, end, step): (f64, f64, f64),
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         // Accept both `histogram_quantiles(` and `histogram_percentiles(` as
@@ -1054,6 +1149,39 @@ impl QueryEngine {
         let (metric_selector, stride_ns) = parse_optional_stride(remaining)?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
 
+        if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
+            if stride_ns.is_some() {
+                return Err(gauge_histogram_refused(
+                    &metric_name,
+                    "a stride, which pools the observations between rows,",
+                ));
+            }
+            let grid = state_grid(start, end, step, opts);
+            let read = read_gauge_histogram(
+                self.source.as_ref(),
+                &metric_name,
+                &labels,
+                grid,
+                opts.eval_timestamps.as_deref(),
+            );
+            let Some((stream, times, staleness_ns)) = read else {
+                nothing_read(
+                    self.source.as_ref(),
+                    &metric_name,
+                    MetricKind::GaugeHistogram,
+                )?;
+                return Ok(QueryResult::Matrix { result: vec![] });
+            };
+            let result = streaming::gauge_histogram::quantiles(
+                stream,
+                &quantiles,
+                &times,
+                staleness_ns,
+                &metric_name,
+            );
+            return Ok(QueryResult::Matrix { result });
+        }
+
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
         let stride = stride_ns
@@ -1086,13 +1214,43 @@ impl QueryEngine {
     fn handle_histogram_heatmap(
         &self,
         query_str: &str,
-        start: f64,
-        end: f64,
+        (start, end, step): (f64, f64, f64),
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let inner = &query_str["histogram_heatmap(".len()..query_str.len() - 1];
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
+            if stride_ns.is_some() {
+                return Err(gauge_histogram_refused(
+                    &metric_name,
+                    "a stride, which pools the observations between rows,",
+                ));
+            }
+            let grid = state_grid(start, end, step, opts);
+            let read = read_gauge_histogram(
+                self.source.as_ref(),
+                &metric_name,
+                &labels,
+                grid,
+                opts.eval_timestamps.as_deref(),
+            );
+            let Some((stream, times, staleness_ns)) = read else {
+                nothing_read(
+                    self.source.as_ref(),
+                    &metric_name,
+                    MetricKind::GaugeHistogram,
+                )?;
+                return Ok(QueryResult::Matrix { result: vec![] });
+            };
+            return Ok(
+                match streaming::gauge_histogram::heatmap(stream, &times, staleness_ns) {
+                    Some(result) => QueryResult::HistogramHeatmap { result },
+                    None => QueryResult::Matrix { result: vec![] },
+                },
+            );
+        }
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
@@ -1137,6 +1295,9 @@ impl QueryEngine {
             ));
         }
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+        if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
+            return Err(gauge_histogram_refused(&metric_name, "histogram_irate"));
+        }
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
@@ -1162,12 +1323,50 @@ impl QueryEngine {
         func: &str,
         inner: &str,
         group_by: HistogramGroupBy,
-        start: f64,
-        end: f64,
+        (start, end, step): (f64, f64, f64),
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
         let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+
+        if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
+            if stride_ns.is_some() {
+                return Err(gauge_histogram_refused(
+                    &metric_name,
+                    "a stride, which pools the observations between rows,",
+                ));
+            }
+            let grid = state_grid(start, end, step, opts);
+            let read = read_gauge_histogram(
+                self.source.as_ref(),
+                &metric_name,
+                &labels,
+                grid,
+                opts.eval_timestamps.as_deref(),
+            );
+            let Some((stream, times, staleness_ns)) = read else {
+                nothing_read(
+                    self.source.as_ref(),
+                    &metric_name,
+                    MetricKind::GaugeHistogram,
+                )?;
+                return Ok(QueryResult::Matrix { result: vec![] });
+            };
+            let reduce = match func {
+                "histogram_mean" => streaming::gauge_histogram::Reduce::Mean,
+                "histogram_sum" => streaming::gauge_histogram::Reduce::Sum,
+                _ => streaming::gauge_histogram::Reduce::Count,
+            };
+            let result = streaming::gauge_histogram::reduce(
+                stream,
+                reduce,
+                group_by.as_ref(),
+                &times,
+                staleness_ns,
+                &metric_name,
+            );
+            return Ok(QueryResult::Matrix { result });
+        }
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
@@ -1246,8 +1445,7 @@ impl QueryEngine {
     ) -> Result<crate::DisplayResult, QueryError> {
         self.evaluate_range_as(
             query_str,
-            start,
-            end,
+            (start, end, step),
             opts,
             |r| crate::display::display_from_result(r, start, end, step, display),
             |expr| {
@@ -1275,8 +1473,7 @@ impl QueryEngine {
     ) -> Result<QueryResult, QueryError> {
         self.evaluate_range_as(
             query_str,
-            start,
-            end,
+            (start, end, step),
             opts,
             |r| r,
             |expr| self.evaluate_expr(expr, start, end, step, opts),
@@ -1288,8 +1485,7 @@ impl QueryEngine {
     fn evaluate_range_as<T>(
         &self,
         query_str: &str,
-        start: f64,
-        end: f64,
+        (start, end, step): (f64, f64, f64),
         opts: &QueryOptions,
         from_result: impl Fn(QueryResult) -> T,
         expr: impl FnOnce(&Expr) -> Result<T, QueryError>,
@@ -1299,13 +1495,13 @@ impl QueryEngine {
             && query_str.ends_with(")")
         {
             return self
-                .handle_histogram_quantiles(query_str, start, end, opts)
+                .handle_histogram_quantiles(query_str, (start, end, step), opts)
                 .map(from_result);
         }
 
         if query_str.starts_with("histogram_heatmap(") && query_str.ends_with(")") {
             return self
-                .handle_histogram_heatmap(query_str, start, end, opts)
+                .handle_histogram_heatmap(query_str, (start, end, step), opts)
                 .map(from_result);
         }
 
@@ -1315,7 +1511,7 @@ impl QueryEngine {
         for func in ["histogram_mean", "histogram_count", "histogram_sum"] {
             if let Some((inner, group_by)) = parse_histogram_call(func, query_str)? {
                 return self
-                    .handle_histogram_scalar(func, inner, group_by, start, end, opts)
+                    .handle_histogram_scalar(func, inner, group_by, (start, end, step), opts)
                     .map(from_result);
             }
         }

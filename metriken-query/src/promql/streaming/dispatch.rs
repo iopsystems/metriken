@@ -1280,6 +1280,32 @@ where
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
+    if crate::promql::reads_gauge_histogram(ctx.source, metric_name)? {
+        let read = crate::promql::read_gauge_histogram(
+            ctx.source,
+            metric_name,
+            &filter,
+            (ctx.start_ns, ctx.end_ns, ctx.step_ns),
+            ctx.eval_timestamps.as_deref(),
+        );
+        let result = match read {
+            Some((stream, times, staleness_ns)) => super::gauge_histogram::quantiles(
+                stream,
+                &[quantile],
+                &times,
+                staleness_ns,
+                metric_name,
+            ),
+            None => {
+                nothing_read(ctx.source, metric_name, MetricKind::GaugeHistogram)?;
+                Vec::new()
+            }
+        };
+        return Ok(Built::Materialized {
+            result,
+            name: metric_name.to_string(),
+        });
+    }
     let Some(stream) = ctx.source.histogram_stream(
         metric_name,
         &filter,

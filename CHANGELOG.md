@@ -117,6 +117,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which two runs of 0.41.0 also show. A source holding several producer
   epochs is now read per epoch, which changes its answers only across each
   restart.
+- **Added:** gauge histograms (`docs/journal/2026-10-21-gauge-histogram.md`).
+  `histogram_quantile`, `histogram_quantiles`/`histogram_percentiles`,
+  `histogram_count`, `histogram_sum`, `histogram_mean` (with `by`,
+  `without` and `sum by (..)`) and `histogram_heatmap` read a gauge
+  histogram as a gauge is read: a point per step at `start + k·step`, from
+  each series' latest row within the step or its row interval, summed
+  bucket by bucket across series (rebucketed to the coarsest
+  configuration), and never a difference between rows. An empty state
+  counts 0 and has no quantile or mean. `histogram_irate`, the strided
+  forms, and `rate`, `irate` or a bare selector given a gauge histogram
+  return `QueryError::Unsupported` naming the metric as a gauge histogram
+  and the functions that read it; a name held as both kinds is refused.
+  `MetricsSource` gains `gauge_histogram_names` and `gauge_histogram_labels`
+  (defaulted to empty; `label_values` includes them), implemented by every
+  reader here, and `MemoryStore` gains `insert_gauge_histogram_series`,
+  with `ingest_snapshot` storing a snapshot's `gauge_histograms` as gauge
+  histograms. Within a process group, a gauge histogram is the
+  merge of every source's rows read as the latest row at each step, so a
+  source and its copy count once.
 
 ### metriken-recorder 0.5.0
 

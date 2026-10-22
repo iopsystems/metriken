@@ -531,6 +531,8 @@ fn refuse_kinds_across_recordings(
                 Some("gauge")
             } else if t.holds_histogram(name) {
                 Some("histogram")
+            } else if t.holds_gauge_histogram(name) {
+                Some("gauge histogram")
             } else {
                 None
             }
@@ -769,6 +771,12 @@ impl MetricsSource for ArchiveReader {
     }
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         ArchiveReader::histogram_labels(self, name)
+    }
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        ArchiveReader::gauge_histogram_names(self)
+    }
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        ArchiveReader::gauge_histogram_labels(self, name)
     }
     fn time_range(&self) -> Option<(f64, f64)> {
         ArchiveReader::time_range_ns(self).map(|(b, e)| (b as f64 / 1e9, e as f64 / 1e9))

@@ -203,6 +203,17 @@ impl MetricsSource for UnionMetricsSource {
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.engine.histogram_labels(name)
     }
+
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.engine.gauge_histogram_names()
+    }
+
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.engine.gauge_histogram_labels(name)
+    }
 }
 
 #[cfg(test)]
