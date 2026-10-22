@@ -24,18 +24,25 @@ rustfmt.toml settings: `wrap_comments = true`, `imports_granularity = "module"`,
 
 ## Workspace Crates
 
-Five crates with this dependency flow:
+Nine crates. Each depends (normal dependencies, optional ones included) on the crates after its arrow:
 
 ```
-metriken-core  <──  metriken-derive
-      │                    │
-      └───── metriken ─────┘
-                │
-       metriken-exposition
-                │
-         metriken-query
+metriken-types
+metriken-derive
+metriken-core        -> metriken-types
+metriken-model       -> metriken-types
+metriken             -> metriken-core, metriken-derive, metriken-types
+metriken-exposition  -> metriken, metriken-model, metriken-types
+metriken-storage     -> metriken, metriken-exposition, metriken-model, metriken-types
+metriken-query       -> metriken-model, metriken-storage
+metriken-recorder    -> metriken, metriken-exposition, metriken-model, metriken-storage, metriken-types
 ```
 
+`metriken-storage` also has a path-only dev-dependency on `metriken-query`, which `cargo publish` strips. Regenerate the list with `cargo metadata --format-version 1 --no-deps` when a dependency changes (filter `.packages[].dependencies` to workspace members whose `kind` is null).
+
+- **metriken-types** — Types shared by the metriken registry and the readers of what it records.
+- **metriken-model** — The observation model: snapshots, group schemas, the rows a recording stores, and the stream's wire names.
+- **metriken-storage** — Storage for recordings: the segment format, column readers, and the dendro and `.rez` archives.
 - **metriken-core** — `Metric` trait, `Value` enum, `MetricEntry`, global `METRICS` distributed slice (linkme), dynamic metrics registry, type-based request/provide system. Uses `links = "metriken-core"` to enforce single version at compile time.
 - **metriken-derive** — Proc macro for `#[metric]` attribute. Generates `declare_metric_v1!` invocations and PHF static maps for metadata.
 - **metriken** — User-facing crate re-exporting everything. Defines metric types: `Counter` (AtomicU64), `Gauge` (AtomicI64), `AtomicHistogram` (OnceLock-backed), `RwLockHistogram`, `Lazy<T>`.
@@ -61,5 +68,14 @@ metriken-core  <──  metriken-derive
 
 - Feature PRs do not bump crate versions; versions are bumped per crate in release PRs.
 - A user-facing change adds a bullet to `CHANGELOG.md` under `## Unreleased`, inside the affected crate's `### <crate> <next-version>` sub-section (created if absent).
-- Commit subjects are conventional, `type(scope): description`, with the crate area as the scope (`feat(query): …`, `fix(storage): …`).
+- Commit subjects are conventional, `type(scope): description`, with the crate area as the scope (`feat(query): …`, `fix(storage): …`), except release PRs (see Releases).
 - Open PRs as drafts.
+
+## Releases
+
+Cut releases with `/cs:release`. What it cannot read from the repository:
+
+- Each crate is versioned and tagged on its own. Tags are `<crate>-v<version>` (`metriken-query-v0.41.0`).
+- A release PR covers one crate, or a crate and the dependents whose requirement on it changed, titled `release: <crate> v<version>[, <crate> v<version>…]` in the order of the list under Workspace Crates, from a branch named `release-<crate>-<version>[-<crate>-<version>…]`. It bumps each crate's version and the workspace requirements on it, and updates `Cargo.lock`.
+- The root `CHANGELOG.md` keeps released `### <crate> <version>` blocks under `## Unreleased`; a release does not move them. A crate with its own `CHANGELOG.md` has its pending entries put under the new version: metriken-query and metriken-storage rename `## [Unreleased]` to `## [<version>] - <date>`; metriken-core keeps `## Unreleased` and adds `## <version>` beneath it.
+- Nothing is automated: CI (`cargo.yml`) builds and tests only. After the PR merges, tag the merge commit `<crate>-v<version>` for each crate by hand and push the tags to `origin`. Then stop and ask before `cargo publish -p <crate>`, in the order of the list; a crates.io publish cannot be undone, only yanked.
