@@ -29,6 +29,7 @@ use crate::promql::streaming::{
     derive_group_labels, scalar_point, AggOp, BinOp, GroupBy, LabeledPoints, Point, RateEdges,
     SPACING_PROBE,
 };
+use crate::scan::LaterRows;
 
 /// What the dispatcher asks a source for.
 pub(crate) struct GridRateRequest<'a> {
@@ -313,6 +314,14 @@ thread_local! {
     /// summed over the stages: for one batched read, an upper bound on the
     /// points its partitions held together.
     pub(crate) static UNION_HELD_PEAK: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    /// Batched reads on this thread that gave up because a series ended as
+    /// silent was pushed a sample or a row afterwards.
+    pub(crate) static BATCH_ABANDONED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -1279,11 +1288,14 @@ pub(crate) fn grid_rates(
     let mut spart: Vec<usize> = Vec::with_capacity(unit_of.len());
     let mut slocal: Vec<u32> = Vec::with_capacity(unit_of.len());
     let mut rate_unit: Vec<Vec<usize>> = (0..parts).map(|_| Vec::new()).collect();
+    // Per partition, each rate's scanned series.
+    let mut rate_series: Vec<Vec<u32>> = (0..parts).map(|_| Vec::new()).collect();
     for (s, rate) in rates.into_iter().enumerate() {
         let p = partition[unit_of[s]];
         spart.push(p);
         slocal.push(part_rates[p].len() as u32);
         rate_unit[p].push(unit_of[s]);
+        rate_series[p].push(s as u32);
         part_rates[p].push(rate);
     }
     let data_start = |s: usize| union.map_or(start, |u| u.series[s].data_start);
@@ -1372,10 +1384,14 @@ pub(crate) fn grid_rates(
     // A grouped display query feeds each group's points to its reducer once
     // no member can emit before them. After each chunk, a series whose last
     // sample is more than ten times the larger of its spacing and the step
-    // before the earliest span start of the unread chunks is ended early; a
-    // series without a spacing yet uses the median of the others'. If an
-    // ended series is pushed a sample afterwards, the read returns `None` and
-    // the caller evaluates the query per series.
+    // before the earliest span start of the unread chunks (silent) is ended
+    // early, when the scan says no unread segment is planned to read it; a
+    // series without a spacing yet uses the median of the others'. A silent series that can still return is left open: its
+    // points across the silence interpolate to its next sample, as the
+    // per-series path's do, so it holds back its own group's flush (and its
+    // unit's, in a union) until that sample arrives. A scan that does not
+    // say ends the series anyway; if it is then pushed a sample, the read
+    // returns `None` and the caller evaluates the query per series.
     let mut flush = match (&groups, request.display) {
         (Some((op, (glabels, _))), Some(display)) => {
             Some(GroupFlush::new(*op, glabels.len(), display))
@@ -1494,6 +1510,8 @@ pub(crate) fn grid_rates(
         drop(chunk);
         if let (Some(flush), Some((_, (_, group_of)))) = (flush.as_mut(), &groups) {
             if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+                #[cfg(any(test, feature = "fixtures"))]
+                BATCH_ABANDONED.with(|n| n.set(n.get() + 1));
                 return None;
             }
             let Some(w) = rest_start else {
@@ -1521,10 +1539,13 @@ pub(crate) fn grid_rates(
                             .map(|sp| sp.max(grid.step_ns).saturating_mul(10));
                         if rate.pending_ns().is_some()
                             && lag.is_some_and(|lag| last.saturating_add(lag) < w)
+                            && scan.later_rows(rate_series[p][s]) != LaterRows::Possible
                         {
                             rate.end_early(&grid, s, sink.sink());
                             // Its rows are taken as ended too; a row after
-                            // this ends the read (`resumed`), as a sample does.
+                            // this (only from a scan that cannot say whether
+                            // one follows) ends the read (`resumed`), as a
+                            // sample does.
                             if let Some(stage) = sink.stage() {
                                 stage.end_member(s);
                             }
@@ -1561,6 +1582,8 @@ pub(crate) fn grid_rates(
         }
     }
     if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(any(test, feature = "fixtures"))]
+        BATCH_ABANDONED.with(|n| n.set(n.get() + 1));
         return None;
     }
     let finish = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, _p: usize| {

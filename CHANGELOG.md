@@ -49,9 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against 59 ms with each member read alone and combined after (#306), and
   peaks at 157 MB RSS against 473 MB (one source: 13 ms, 80 MB). On this
   recording a cgroup series that falls silent for ten spacings returns, so
-  grouped display queries of `cgroup_cpu_usage` end the batched read after
-  about 9 ms and are evaluated without the flush; the figures below include
-  that. Against the same archive read twice by 0.41.0: a display query of
+  grouped display queries of `cgroup_cpu_usage` ended the batched read after
+  about 9 ms and were evaluated without the flush (until the next entry);
+  the figures below include that. Against the same archive read twice by
+  0.41.0: a display query of
   `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at a 1 s step 86 ms against
   56 ms (peak RSS 295 MB against 191 MB; one source 30 ms and 125 MB),
   `rate(cgroup_cpu_usage[1m])` over 1 h at 1 s 13.8 ms against 11.9 ms,
@@ -68,6 +69,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member that ends at a quarter of the range, or whose series fall silent
   there, the stages hold about 340 points per group series at most, against
   about 3000 when the member is waited on to the end.
+- Cost: a grouped display read (`sum`, `avg`, `min`, `max` or `count` of
+  `rate`/`irate`, reduced for display as the scan reads) no longer gives up
+  when a series it ended as silent comes back, which sent the query to the
+  path without the flush. A series silent for ten times the larger of its
+  spacing and the step is ended only when no unread segment of the scan is
+  planned to read it (`scan::ChunkReader::later_rows`). One that can still
+  come back stays open and holds back only its own group's flush (over a
+  process group, its unit's), because the per-series path interpolates its
+  points across the silence to the sample it comes back with, so its
+  group's aggregates there are not final until that sample is read. Answers
+  are unchanged: on 200 random churn fixtures (243,200 answers, 2046 display
+  reads that the flush gave up on before) all but 74 are byte-identical, and
+  those 74 differ by at most 3.2e-16 relative (summation order). On the
+  9.6 h recording, alone and with a copy, five display queries of
+  `cgroup_cpu_usage` (the three below, `sum by (name) (rate(...[1m]))` and
+  `count by (name) (irate(...[5s]))`) at full resolution, and the three
+  below at a 500-point budget, are identical apart from 105 values that
+  differ by at most 4.5e-16 relative, and the batched read gives up on
+  none of them. On that recording 10 of 106 `cgroup_cpu_usage` series fall
+  silent and come back, 52 times, for 100 s to 8415 s. Display queries over
+  9.6 h at a 1 s step, medians of three interleaved rounds against the same
+  build without this change (two runs of that build differed by up to 7%):
+  `sum by (name) (irate(cgroup_cpu_usage[5s]))` 97 ms against 61 ms, peak
+  RSS 364 MB against 83 MB; `sum by (state) (...)` 43 against 37 ms, 154
+  against 73 MB; `sum(irate(cgroup_cpu_usage[5s]))` 40 against 36 ms, 109
+  against 69 MB. With a copy of the recording (one process group): 153
+  against 115 ms and 584 against 219 MB, 114 against 93 ms and 287 against
+  218 MB, 103 against 86 ms and 245 against 214 MB. A scan that does not
+  say (`LaterRows::Unknown`) keeps the old rule.
 - Histogram functions over a group read one of its sources alone, until
   they are combined per source: the one covering the most of the query's
   range, ties to the finest. They count a process once and leave the other
@@ -91,6 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-storage 0.5.0
 
+- **Added:** `scan::LaterRows` and `scan::ChunkReader::later_rows` (by
+  default `LaterRows::Unknown`): whether a scan's unread segments are
+  planned to read a series. The segmented scan answers from its plan, and
+  `scan::interleave` from the scan holding the series.
 - **Added:** `scan::interleave`, several counter scans read as one in time
   order, their series concatenated (what `RecordingsSource` joins its
   recordings' scans with).

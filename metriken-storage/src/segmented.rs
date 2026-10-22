@@ -1060,6 +1060,14 @@ impl SegmentedSource {
             let span = self.state.catalog[*seg as usize].span.map(|s| s.0);
             rest_from[i] = rest_from[i + 1].zip(span).map(|(a, b)| a.min(b));
         }
+        let mut last_at = vec![0usize; series.len()];
+        for (i, seg) in segments.iter().enumerate() {
+            for plan in plans[seg].values() {
+                for s in plan.wide.iter().chain(plan.long.values()) {
+                    last_at[*s] = i;
+                }
+            }
+        }
         Some(CounterScan::new(
             series,
             Box::new(SegmentedScan {
@@ -1067,6 +1075,7 @@ impl SegmentedSource {
                 plans,
                 segments,
                 rest_from,
+                last_at,
                 next: 0,
                 start,
                 end,
@@ -1751,6 +1760,9 @@ struct SegmentedScan<'a> {
     /// `rest_from[i]`: the earliest catalog start of `segments[i..]`;
     /// `None` when one of them has no span.
     rest_from: Vec<Option<u64>>,
+    /// Per series, the last place in `segments` of a segment planned to
+    /// read it.
+    last_at: Vec<usize>,
     next: usize,
     start: u64,
     end: u64,
@@ -1855,6 +1867,17 @@ impl crate::scan::ChunkReader for SegmentedScan<'_> {
             rest_start,
             ended: Vec::new(),
         }))
+    }
+
+    /// From the plan: whether a segment not read yet is planned to read
+    /// `series`.
+    fn later_rows(&self, series: u32) -> crate::scan::LaterRows {
+        use crate::scan::LaterRows;
+        match self.last_at.get(series as usize) {
+            Some(last) if *last >= self.next => LaterRows::Possible,
+            Some(_) => LaterRows::None,
+            None => LaterRows::Unknown,
+        }
     }
 }
 

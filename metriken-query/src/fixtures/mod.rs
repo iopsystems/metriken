@@ -18,3 +18,11 @@ pub use synthetic::{Fixture, FixtureBuilder};
 pub fn take_union_held_peak() -> usize {
     crate::batch_rate::UNION_HELD_PEAK.with(|p| p.replace(0))
 }
+
+/// Batched rate reads on this thread that gave up and left the query to
+/// the per-series path because a series ended as silent came back (since
+/// the last call), reset to zero.
+#[doc(hidden)]
+pub fn take_batch_abandoned() -> usize {
+    crate::batch_rate::BATCH_ABANDONED.with(|p| p.replace(0))
+}
