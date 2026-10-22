@@ -1434,22 +1434,37 @@ at its range's start, so a narrower read moves points (a 250 ms source with
 a hole over [200, 210) s beside a 2 s source, `rate(c[1s])` at a 0.25 s
 step: 9360 at 210.25, 210.5 and 210.75 s where the 2 s source alone reads
 9380, 9400 and 9420; 134 of 4360 random grid queries differed, and padding
-the ranges never brought that to 0). The wrapper also reads the rows of the
-ten intervals before each read, timestamps only, so a series whose rows run
-on before the read is not taken to start at the read (S3 needs the row
-before to tell a hole). `metriken-storage/tests/union_oracle.rs` checks the
+the ranges never brought that to 0). The wrapper also reads, for each
+series, the nine rows nearest the read on each side (before its start and
+after its end; ten of the metric's own intervals, then 64 when a series
+has fewer than nine rows there, a series with fewer than nine rows in 64
+intervals being taken as having no more), keeping
+their timestamps; the read decodes values too, since the sources have no
+timestamp-only read per series. S3's hole test takes the medians of up to
+eight gaps on each side of a gap, so without these rows a series looks as
+if its rows start at the read's start or end at its end, and the first or
+last points of a range depend on where it starts or ends (a 1 s source with
+a gap to 203 s and then 5 s rows, beside a 2 s source: `g` at 204 s read
+478 to 204 s and 486 to 260 s). `metriken-storage/tests/union_oracle.rs` checks the
 union against each source read alone over the whole range and combined
-point by point. Measured on the 9.6 h recording with a copy of itself,
-against the same archive read twice by metriken-query 0.41.0, medians of
-four interleaved rounds: a display query of
-`sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at 1 s 193 ms against 59 ms,
-`rate(cgroup_cpu_usage[1m])` over 1 h 21 ms against 12 ms,
-`sum(irate(...))` over 1 h 19 ms against 5.9 ms, `sum(rate(...[1m]))` over
-9.6 h at 60 s 55 ms against 35 ms. Peak memory on that display query is
-1.15 GB against 193 MB, because each member's series are materialized before
-they are combined; streaming the combination needs each series' rows ahead
-of its points (a read-ahead of nine rows answers S3's hole test), which the
-batched scan does not give. That is the next PR. Queries
+point by point (S3 and S9 applied in the test; random fixtures with holes,
+cadence changes, cadences from 250 ms to 15 s and a faster second table).
+Measured on the 9.6 h recording with a copy of itself, against the same
+archive read twice by metriken-query 0.41.0, medians of four interleaved
+rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at
+1 s 194 ms against 60 ms, `rate(cgroup_cpu_usage[1m])` over 1 h 22 ms
+against 12 ms, `sum(irate(...))` over 1 h 21 ms against 6.0 ms,
+`sum(rate(...[1m]))` over 9.6 h at 60 s 56 ms against 36 ms. (Reading the
+context rows until each series had nine, however far, took the 1 h queries
+to 190 ms on that recording, whose long cgroup table holds many series that
+ended.) Peak memory on the display query is 1.08 GB against 193 MB,
+because each member's series are materialized before they are combined;
+streaming the combination needs each series' rows ahead of its points,
+which the batched scan does not give. That is the next PR. Two
+pre-existing behaviours were found on the way and are not changed here:
+`offset` in a selector is ignored (on upstream/main too), and a single
+source's last points can move with the range's end (a rate at the range's
+end, held past the source's last row). Queries
 reaching no multi-member group take the code path they took before, and
 cost the same within noise.
 

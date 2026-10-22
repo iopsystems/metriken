@@ -306,6 +306,10 @@ fn combine_series(
     chosen.into_iter().map(|(i, k)| members[i].0[k]).collect()
 }
 
+/// The rows on each side of a read that a member's coverage needs (S3: the
+/// medians of up to eight gaps on either side of a gap).
+const CONTEXT_ROWS: usize = 9;
+
 /// A member's source as a leaf reads it: its rows clipped to `[lo, hi]`, the
 /// timestamps of every row it hands out recorded per series, and no batched
 /// counter scan (whose rows it could not record), so the per-series path
@@ -332,41 +336,114 @@ impl Tap {
         Arc::clone(rows.entry(labels.clone()).or_default())
     }
 
-    /// Record the rows of `name` in the ten intervals before `start_ns`,
-    /// which the read starting there does not return: whether a series' rows
-    /// run on before the read or a hole precedes it decides whether a window
-    /// near the read's start is covered (S3). Only the timestamps are kept.
-    fn context(&self, counter: bool, name: &str, filter: &Labels, start_ns: u64) {
-        let margin = (self.inner.interval() * 1e10) as u64;
-        let (from, to) = (start_ns.saturating_sub(margin), start_ns.saturating_sub(1));
-        if from > to {
+    /// Record, for each of `series` (and any other series the read finds),
+    /// the timestamps of the nine rows nearest `at` on one side of it:
+    /// before it when `before`, else after it. A read starting or ending at
+    /// `at` does not return them, and S3's hole test needs the medians of
+    /// up to eight gaps on each side of a gap, so without them a series
+    /// looks as if its rows start at the read's start or end at its end.
+    /// The window read is ten of the metric's own intervals, and `longest`
+    /// when a series has fewer than nine rows in that (or the member's rows
+    /// end first). The read decodes values as well as timestamps (the
+    /// sources have no timestamp-only read per series); only the timestamps
+    /// are kept.
+    fn context(
+        &self,
+        counter: bool,
+        name: &str,
+        filter: &Labels,
+        (at, before): (u64, bool),
+        series: &[Labels],
+        longest: u64,
+    ) {
+        let Some((first, last)) = self.inner.time_range() else {
             return;
-        }
-        let rows: Vec<(Labels, Vec<u64>)> = if counter {
-            self.inner
-                .counters(name, filter, from, to)
-                .map(|c| {
-                    c.series
-                        .into_iter()
-                        .map(|c| (c.labels, c.timestamps))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            self.inner
-                .gauges(name, filter, from, to)
-                .map(|g| {
-                    g.series
-                        .into_iter()
-                        .map(|g| (g.labels, g.timestamps))
-                        .collect()
-                })
-                .unwrap_or_default()
         };
-        for (labels, mut ts) in rows {
-            ts.retain(|&t| self.keeps(t) && t < start_ns);
-            self.record(&labels, &ts);
+        let (first, last) = (first.max(self.lo), last.min(self.hi));
+        let interval = if counter {
+            self.inner.counter_interval(name)
+        } else {
+            self.inner.gauge_interval(name)
+        };
+        let mut span = ((interval * 1e9) as u64).max(1).saturating_mul(10);
+        loop {
+            let (from, to) = if before {
+                (at.saturating_sub(span).max(first), at.saturating_sub(1))
+            } else {
+                (at.saturating_add(1), at.saturating_add(span).min(last))
+            };
+            if from > to {
+                return;
+            }
+            let mut rows: HashMap<Labels, Vec<u64>> = HashMap::new();
+            let read: Vec<(Labels, Vec<u64>)> = if counter {
+                self.inner
+                    .counters(name, filter, from, to)
+                    .map(|c| {
+                        c.series
+                            .into_iter()
+                            .map(|c| (c.labels, c.timestamps))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                self.inner
+                    .gauges(name, filter, from, to)
+                    .map(|g| {
+                        g.series
+                            .into_iter()
+                            .map(|g| (g.labels, g.timestamps))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for (labels, ts) in read {
+                rows.entry(labels).or_default().extend(
+                    ts.into_iter()
+                        .filter(|&t| self.keeps(t) && t >= from && t <= to),
+                );
+            }
+            let reached = if before { from <= first } else { to >= last } || span >= longest;
+            let enough = |l: &Labels| rows.get(l).is_some_and(|r| r.len() >= CONTEXT_ROWS);
+            if reached || series.iter().all(enough) {
+                for (labels, mut ts) in rows {
+                    ts.sort_unstable();
+                    ts.dedup();
+                    let keep = ts.len().min(CONTEXT_ROWS);
+                    let kept = if before {
+                        &ts[ts.len() - keep..]
+                    } else {
+                        &ts[..keep]
+                    };
+                    self.record(&labels, kept);
+                }
+                return;
+            }
+            span = longest;
         }
+    }
+
+    /// [`context`](Self::context) on both sides of a read of `[start_ns,
+    /// end_ns]`.
+    fn contexts(
+        &self,
+        counter: bool,
+        name: &str,
+        filter: &Labels,
+        (start_ns, end_ns): (u64, u64),
+        series: &[Labels],
+    ) {
+        // A series with fewer than nine rows within 64 of the metric's
+        // intervals of the read (it ended, or a long hole follows) is taken
+        // as having none further.
+        let interval = if counter {
+            self.inner.counter_interval(name)
+        } else {
+            self.inner.gauge_interval(name)
+        };
+        let longest = ((interval * 1e9) as u64).max(1).saturating_mul(64);
+        self.context(counter, name, filter, (start_ns, true), series, longest);
+        self.context(counter, name, filter, (end_ns, false), series, longest);
     }
 
     fn record(&self, labels: &Labels, timestamps: &[u64]) {
@@ -488,7 +565,8 @@ impl DataSource for Tap {
             return None;
         }
         let scan = self.inner.counter_scan(name, filter, start_ns, end_ns)?;
-        self.context(true, name, filter, start_ns);
+        let labels: Vec<Labels> = scan.series.iter().map(|s| s.labels.clone()).collect();
+        self.contexts(true, name, filter, (start_ns, end_ns), &labels);
         let sinks: Vec<_> = scan.series.iter().map(|s| self.sink(&s.labels)).collect();
         let (series, reader) = scan.into_parts();
         Some(crate::scan::CounterScan::new(
@@ -508,7 +586,8 @@ impl DataSource for Tap {
         end_ns: u64,
     ) -> Option<Counters> {
         let mut counters = self.inner.counters(name, filter, start_ns, end_ns)?;
-        self.context(true, name, filter, start_ns);
+        let labels: Vec<Labels> = counters.series.iter().map(|s| s.labels.clone()).collect();
+        self.contexts(true, name, filter, (start_ns, end_ns), &labels);
         for c in &mut counters.series {
             if !c.timestamps.iter().all(|&t| self.keeps(t)) {
                 let keep: Vec<bool> = c.timestamps.iter().map(|&t| self.keeps(t)).collect();
@@ -531,7 +610,8 @@ impl DataSource for Tap {
         end_ns: u64,
     ) -> Option<Vec<CounterStream<'s>>> {
         let streams = self.inner.counter_streams(name, filter, start_ns, end_ns)?;
-        self.context(true, name, filter, start_ns);
+        let labels: Vec<Labels> = streams.iter().map(|s| s.labels.clone()).collect();
+        self.contexts(true, name, filter, (start_ns, end_ns), &labels);
         let (lo, hi) = (self.lo, self.hi);
         Some(
             streams
@@ -555,7 +635,8 @@ impl DataSource for Tap {
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
         let gauges = self.inner.gauges(name, filter, start_ns, end_ns)?;
-        self.context(false, name, filter, start_ns);
+        let labels: Vec<Labels> = gauges.series.iter().map(|s| s.labels.clone()).collect();
+        self.contexts(false, name, filter, (start_ns, end_ns), &labels);
         Some(self.clip_gauges(gauges))
     }
 
@@ -571,7 +652,17 @@ impl DataSource for Tap {
             .inner
             .gauge_parts(name, filter, start_ns, end_ns, step_ns)?;
         let lookback = step_ns.max((self.inner.gauge_interval(name) * 1e9) as u64);
-        self.context(false, name, filter, start_ns.saturating_sub(lookback));
+        let labels: Vec<Labels> = parts
+            .iter()
+            .flat_map(|(g, _)| g.series.iter().map(|s| s.labels.clone()))
+            .collect();
+        self.contexts(
+            false,
+            name,
+            filter,
+            (start_ns.saturating_sub(lookback), end_ns),
+            &labels,
+        );
         Some(
             parts
                 .into_iter()
