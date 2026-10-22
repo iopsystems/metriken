@@ -189,8 +189,12 @@ Old readers classify list columns by Arrow type and ignore `metric_type`, so
 a gauge histogram column alone would be read as counting by
 metriken-storage 0.4.0. A segment holding one is therefore written with
 `metriken.format = 2` (`format.rs`; segments without one stay format 1).
-`format::check` in metriken-storage 0.3.0 and later refuses a newer format,
-with "segment format 2 is newer than this reader, which reads up to 1". A
+`format::check` in metriken-storage 0.4.0 refuses a newer format, with
+"segment format 2 is newer than this reader, which reads up to 1". Earlier
+readers do not get that far: metriken-storage 0.1.0 to 0.3.2 and
+metriken-archive 0.2.x (rezolus 5.25 to 5.28 lock 0.2.7) run on dendro up
+to 0.5.1, which opens only schema 4, and dendro 0.6.0 writes schema 5, so
+they refuse every new archive when opening it. A
 `counter_histogram` column is read correctly by those readers, since they
 never look at the string.
 
@@ -218,11 +222,8 @@ Reading:
 - metriken writes no standalone parquet. A parquet file has no format
   version its readers check, so a reader from before a column kind reads
   the new kind with nothing to stop it; an archive's segments carry
-  `metriken.format`, which metriken-storage 0.3.0 to 0.4.0 check. Readers
-  on metriken-segment 0.1.4 / metriken-archive 0.2.7 (rezolus 5.25 to 5.28)
-  do not check it and read any list column as a counting histogram; they
-  are kept from a new archive by dendro, whose 0.3.3 opens only schema 4,
-  while dendro 0.6 writes schema 5. `convert` is `MsgpackToArchive` (a raw msgpack
+  `metriken.format`, which metriken-storage 0.4.0 checks; earlier readers
+  refuse a new archive at open, on its dendro schema (above). `convert` is `MsgpackToArchive` (a raw msgpack
   recording into a `.dendro`, one source, through `ArchiveWriter`), and
   `MsgpackToParquet`, `ParquetOptions`, `ParquetHistogramType` (with its
   sparse layout), `ParquetSchema` and `ParquetWriter` are removed. Reading
@@ -232,11 +233,14 @@ Reading:
 - `.rez` is legacy (pre-6.0) and frozen: nothing new is written into one,
   so gauge histograms are recorded in `.dendro` only. `record -o out.rez`
   and a hindsight `.rez` buffer still write `.rez`, and every writer path
-  leaves gauge histograms out and keeps the rest: `rez::group_by_sampler`
+  that remains leaves gauge histograms out and keeps the rest (the
+  row-wire writer, `StreamRecorderV3::ingest_rows`/`stage_rows`, which had
+  no caller, is removed rather than taught to strip): `rez::group_by_sampler`
   (V1/V2 snapshots, `RezStream` and the v3 writer's flat path), the v3
   writer's `ingest_v3` (the group's schema without its gauge histograms,
   rehashed; a group holding nothing else is not written), and
-  `parquet_ingest` (a `gauge_histogram` column is skipped). Each calls
+  `parquet_ingest` (a `gauge_histogram` column is skipped, and a
+  `counter_histogram` one is written as `histogram`). Each calls
   `rez::gauge_histograms_left_out`, which warns once per process "gauge
   histograms are recorded in .dendro only; this .rez recording leaves them
   out". `.rez` segments are sealed through `table::write_rez_table_parquet`

@@ -184,6 +184,15 @@ pub fn ingest_parquet_bytes(
                     f.name().strip_suffix(":buckets").unwrap_or(f.name()),
                 );
             }
+            // A counting histogram keeps the pre-6.0 string in a `.rez`.
+            if md.get(metriken_model::METRIC_TYPE).map(String::as_str)
+                == Some(metriken_model::COUNTER_HISTOGRAM)
+            {
+                md.insert(
+                    metriken_model::METRIC_TYPE.to_string(),
+                    metriken_model::LEGACY_HISTOGRAM.to_string(),
+                );
+            }
             fields.push(
                 Field::new(f.name(), f.data_type().clone(), f.is_nullable()).with_metadata(md),
             );
@@ -330,6 +339,46 @@ mod tests {
         let cols = segment_columns(&segs[0].bytes);
         assert!(cols.iter().any(|c| c == "cpu_cycles"), "{cols:?}");
         assert!(!cols.iter().any(|c| c.starts_with("free")), "{cols:?}");
+    }
+
+    /// A column an input parquet marks `counter_histogram` is written into
+    /// the `.rez` as `histogram`, the pre-6.0 string.
+    #[test]
+    fn a_counter_histogram_column_is_written_as_histogram() {
+        let schema = Arc::new(Schema::new(vec![
+            field("timestamp", "timestamp", None),
+            field("lat:buckets", "counter_histogram", Some("io")),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1000u64, 2000])),
+                Arc::new(UInt64Array::from(vec![5u64, 6])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        let mut db = RezDb::create_in_memory().unwrap();
+        db.transaction(|tx| {
+            ingest_parquet_bytes(&bytes, tx, None)?;
+            Ok(())
+        })
+        .unwrap();
+        let rec = db.read_recordings().unwrap().remove(0);
+        let segs = db.read_segments(rec.id, "io").unwrap();
+        let b =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(&segs[0].bytes))
+                .unwrap();
+        let lat = b.schema().field_with_name("lat:buckets").unwrap().clone();
+        assert_eq!(
+            lat.metadata().get("metric_type").map(String::as_str),
+            Some("histogram")
+        );
     }
 
     fn segment_columns(bytes: &[u8]) -> Vec<String> {

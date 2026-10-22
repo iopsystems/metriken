@@ -307,16 +307,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   histograms, or a group written long that gains one, is written without
   their values, with a warning once per group.
 - **Changed:** gauge histograms are recorded in `.dendro` only. `.rez` stays
-  at its pre-6.0 shape: every `.rez` writer (V1/V2 snapshots through
-  `group_by_sampler`, the v3 writer's V3 group path, parquet ingest) leaves
-  gauge histograms out, with the rest of the group or table recorded, and
-  warns once per process ("gauge histograms are recorded in .dendro only;
-  this .rez recording leaves them out"). A `.rez` segment is never format 2,
-  and its counting histogram columns keep `metric_type = histogram`.
-  Reading `.rez` is unchanged.
+  at its pre-6.0 shape: every `.rez` writer path that remains (V1/V2
+  snapshots through `group_by_sampler`, which the tar writer and the v3
+  writer's flat path share; the v3 writer's V3 group path; parquet ingest)
+  leaves gauge histograms out, with the rest of the group or table
+  recorded, and warns once per process ("gauge histograms are recorded in
+  .dendro only; this .rez recording leaves them out"). A `.rez` segment is
+  never format 2, and its counting histogram columns keep
+  `metric_type = histogram` (parquet ingest maps an input's
+  `counter_histogram` to it). Reading `.rez` is unchanged.
+- **Breaking:** `rez::rez_v3_writer::StreamRecorderV3::ingest_rows` and
+  `stage_rows`, the `.rez` writer fed by the row-format wire, are removed.
+  They passed a gauge histogram row into the `.rez` WAL unchanged, and the
+  first seal then refused it and ended the recording. Nothing in metriken
+  or rezolus called them; a recorder of a row-wire producer writes
+  `.dendro`.
 - **Added:** segment format 2. A segment holding a gauge histogram column is
-  written with `metriken.format = 2`, which readers from 0.3.0 to 0.4.0
-  refuse: opening such an archive with metriken-storage 0.4.0 fails with
+  written with `metriken.format = 2`, which metriken-storage 0.4.0 refuses
+  (earlier releases refuse any archive dendro 0.6 writes when opening it,
+  on its schema version): opening such an archive with 0.4.0 fails with
   "probing table fs/ext4: segment format 2 is newer than this reader, which
   reads up to 1". Segments without one are still format 1.
   `format::FORMAT_VERSION` is now 2 and means the newest format this crate
@@ -353,16 +362,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standalone parquet file is opened by readers that do not check
   `metriken.format` (pyarrow, DuckDB, scripts), which nothing stops reading
   a new column kind as one they know. Older metriken readers refuse an
-  archive holding a gauge histogram: metriken-storage 0.3.0 to 0.4.0 by its
-  format 2 segment, and readers on metriken-segment 0.1 / metriken-archive
-  0.2 (rezolus 5.25 to 5.28), which do not check `metriken.format`, because
-  their dendro 0.3 opens only schema 4 and the archive is schema 5.
+  archive: every reader before metriken-storage 0.4.0 (metriken-storage
+  0.1.0 to 0.3.2, and rezolus 5.25 to 5.28 on metriken-archive 0.2.7) runs
+  on a dendro up to 0.5.1, which opens only schema 4, and dendro 0.6
+  writes schema 5, so they refuse it when opening it; metriken-storage
+  0.4.0 opens it and refuses a format 2 segment by its `metriken.format`
+  key.
   `MsgpackToArchive` carries the first non-empty snapshot metadata into the
   source's metadata (the caller's entries first), writes `producer_epochs`
   when the snapshots' `producer_epoch` changes (a raw recording that spans
-  a producer restart), and when the conversion fails removes the files it
-  created (the archive, and sidecars that did not exist before), never a
-  file that was already there. Parquet files written before are read as
+  a producer restart) and then takes the newest process's `version`
+  (unless the caller set `version`, in which case no entry carries one).
+  When the conversion fails it removes the files it created (the archive,
+  and sidecars that did not exist before), never a file that was already
+  there. Parquet files written before are read as
   they were.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in

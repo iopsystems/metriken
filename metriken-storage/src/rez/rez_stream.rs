@@ -913,6 +913,53 @@ mod tests {
         handle.abort();
     }
 
+    /// The tar writer seals a counting histogram column as `histogram`, the
+    /// pre-6.0 string, though the builder names it `counter_histogram`.
+    #[test]
+    fn a_counting_histogram_seals_as_histogram() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.rez");
+        let h = metriken_model::Histogram::new(
+            "5".to_string(),
+            histogram::Histogram::new(0, 8).unwrap(),
+            [
+                ("sampler".to_string(), "io".to_string()),
+                ("metric".to_string(), "lat".to_string()),
+                ("grouping_power".to_string(), "0".to_string()),
+                ("max_value_power".to_string(), "8".to_string()),
+            ]
+            .into(),
+        );
+        let mut b = TableBuilder::new("io".to_string());
+        b.push_entries(1_000, 0, &[Entry::Histogram(&h)]);
+        let table = b.finish();
+        assert_eq!(
+            table.columns[0]
+                .metadata
+                .get("metric_type")
+                .map(String::as_str),
+            Some("counter_histogram")
+        );
+        let mut handle = RezWriterHandle::create(&out, seed()).unwrap();
+        handle
+            .seal(vec![SealJob {
+                sampler: "io".to_string(),
+                table,
+            }])
+            .unwrap();
+        handle.finalize(Vec::new(), (1_000, 0)).unwrap();
+        let (_, recordings) = crate::rez::rez::read_archive_bytes(&out).unwrap();
+        let blob = recordings[0].tables[0].1[0].clone();
+        let sealed = crate::rez::rez::read_table_parquet("io".to_string(), blob).unwrap();
+        assert_eq!(
+            sealed.columns[0]
+                .metadata
+                .get("metric_type")
+                .map(String::as_str),
+            Some("histogram")
+        );
+    }
+
     #[test]
     fn seal_finalize_roundtrip_with_checkpoints() {
         let dir = tempfile::tempdir().unwrap();

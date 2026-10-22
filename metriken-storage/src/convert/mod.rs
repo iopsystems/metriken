@@ -9,13 +9,13 @@
 //! metriken writes no standalone parquet. A standalone file is opened by
 //! readers that do not check its `metriken.format` key (pyarrow, DuckDB, a
 //! script over its columns), so nothing stops one of them reading a new
-//! column kind (a gauge histogram) as the kind it knows. An archive with a
-//! gauge histogram is refused by older metriken readers: metriken-storage
-//! 0.3.0 to 0.4.0 refuse its format 2 segment (`metriken.format`), and
-//! readers built on metriken-segment 0.1 and metriken-archive 0.2 (rezolus
-//! 5.25 to 5.28), which do not check `metriken.format`, refuse the archive
-//! because dendro 0.3 opens only schema 4 and this archive is schema 5 (as
-//! is every archive dendro 0.6 writes).
+//! column kind (a gauge histogram) as the kind it knows. Older metriken
+//! readers refuse an archive: every reader before metriken-storage 0.4.0
+//! (metriken-storage 0.1.0 to 0.3.2, and rezolus 5.25 to 5.28 on
+//! metriken-archive 0.2.7) runs on a dendro up to 0.5.1, which opens only
+//! schema 4, and dendro 0.6 writes schema 5, so they refuse every archive
+//! this writes when opening it. metriken-storage 0.4.0 opens it and refuses
+//! a format 2 segment (a gauge histogram) by its `metriken.format` key.
 //! Parquet files written before keep reading (`parquet`, `MultiParquetSource`,
 //! and metriken-query's `ParquetReader`).
 
@@ -27,6 +27,9 @@ use std::time::UNIX_EPOCH;
 use metriken_model::Snapshot;
 
 use crate::process::{PRODUCER_EPOCH, PRODUCER_EPOCHS};
+
+/// The metadata key naming the producer's version (dendro's `keys::VERSION`).
+const VERSION: &str = "version";
 use crate::{ArchiveWriter, WriterConfig};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -101,9 +104,11 @@ impl MsgpackToArchive {
     /// `producer_epoch` differs from the one before it) gets
     /// `producer_epochs`, one `{"epoch", "from_ts"}` entry per epoch (with
     /// the snapshot's `version` when it carries one), oldest first, the
-    /// first from the first row, and `producer_epoch` names the newest, as
-    /// metriken-recorder writes them. A caller that sets `producer_epoch` or
-    /// `producer_epochs` through [`metadata`](Self::metadata) keeps its own.
+    /// first from the first row; `producer_epoch` names the newest, and
+    /// `version` becomes the newest process's, as metriken-recorder writes
+    /// them. A caller that sets `producer_epoch` or `producer_epochs` through
+    /// [`metadata`](Self::metadata) keeps its own and no list is written; a
+    /// caller that sets `version` keeps it, and no entry carries a version.
     ///
     /// An input with no snapshot is an error, and no archive is created. A
     /// snapshot that does not decode, or a write that fails, ends the
@@ -163,6 +168,7 @@ impl MsgpackToArchive {
         let mut source = writer.add_source(self.labels, self.metadata.clone(), first_ts)?;
         let track_epochs = !self.metadata.contains_key(PRODUCER_EPOCH)
             && !self.metadata.contains_key(PRODUCER_EPOCHS);
+        let version_pinned = self.metadata.contains_key(VERSION);
         // Every epoch seen, oldest first, with its first row and version.
         let mut epochs: Vec<(String, u64, Option<String>)> = Vec::new();
         let mut carried = false;
@@ -189,9 +195,18 @@ impl MsgpackToArchive {
             {
                 if epochs.last().is_none_or(|(last, _, _)| last != epoch) {
                     let from_ts = if epochs.is_empty() { first_ts } else { at };
-                    epochs.push((epoch.clone(), from_ts, found.get("version").cloned()));
+                    // A `version` the caller set is its label, not what the
+                    // process reported, so no entry carries one then.
+                    let version = (!version_pinned)
+                        .then(|| found.get(VERSION).cloned())
+                        .flatten();
+                    epochs.push((epoch.clone(), from_ts, version.clone()));
                     if epochs.len() > 1 {
-                        source.update_metadata(epoch_patch(&epochs))?;
+                        let mut patch = epoch_patch(&epochs);
+                        if let Some(version) = version {
+                            patch.insert(VERSION.to_string(), version);
+                        }
+                        source.update_metadata(patch)?;
                     }
                 }
             }

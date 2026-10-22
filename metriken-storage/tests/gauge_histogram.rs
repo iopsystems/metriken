@@ -422,6 +422,11 @@ fn convert_records_each_producer_epoch() {
             { "epoch": "epoch-b", "from_ts": BASE + 2 * S, "version": "1.1.0" },
         ])
     );
+    assert_eq!(
+        meta.get("version").map(String::as_str),
+        Some("1.1.0"),
+        "the newest process's version"
+    );
     let spans = metriken_storage::process::epoch_spans(&meta, Some((BASE, BASE + 3 * S)));
     assert_eq!(spans.len(), 2);
     assert_eq!(
@@ -446,6 +451,29 @@ fn convert_records_each_producer_epoch() {
         .remove(0)
         .metadata;
     assert!(!meta.contains_key("producer_epochs"), "{meta:?}");
+
+    // A caller's version is kept, and no entry carries one.
+    let versioned = dir.path().join("versioned.dendro");
+    MsgpackToArchive::new()
+        .metadata("version", "label")
+        .convert_reader(std::io::Cursor::new(msgpack.clone()), &versioned)
+        .unwrap();
+    let meta = DendroCatalog::open(&versioned)
+        .unwrap()
+        .sources()
+        .unwrap()
+        .remove(0)
+        .metadata;
+    assert_eq!(meta.get("version").map(String::as_str), Some("label"));
+    let epochs: serde_json::Value =
+        serde_json::from_str(meta.get("producer_epochs").expect("a list")).unwrap();
+    assert_eq!(
+        epochs,
+        serde_json::json!([
+            { "epoch": "epoch-a", "from_ts": BASE },
+            { "epoch": "epoch-b", "from_ts": BASE + 2 * S },
+        ])
+    );
 
     // The caller's epoch wins.
     let pinned = dir.path().join("pinned.dendro");
