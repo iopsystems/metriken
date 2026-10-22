@@ -7,7 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-storage 0.4.1
+### metriken-query 0.42.0
+
+- **Changed:** a query over an archive reads each process group (copies of
+  one source, a recording and a hindsight dump of it, two recorders of one
+  agent; `ArchiveReader::read_groups`) as one recording, so a process counts
+  once, except across a bridge (a continuous recording beside separate
+  recordings of attempts), which is a recording of its own and still counts
+  twice beside them until its pieces join their attempts:
+  `sum(rate(cpu_cycles[1m]))` over a source and its copy equals the
+  source alone, where it was twice that, and the group's series carry one
+  label set, without `__recording__`. Each source of a group, and each
+  producer epoch of a source, is evaluated alone up to the per-series
+  function (`rate`, `irate`, a gauge read, `avg_over_time`, `idelta`,
+  `deriv`), as one recording is, and the results are combined per series:
+  at each point the finest source whose rows cover the function's whole
+  window answers (ties to the lowest uuid, then catalog order); else the
+  finest holding rows there; and where no source holds rows (a gap longer
+  than twice the larger of the median spacings before and after it), there
+  is no point. No
+  value is a difference between rows of two sources, and no increase is
+  taken across an epoch's `from_ts`, so a restart is never read as a spike
+  (`rate` across one read 83 million per second on a fixture whose counter
+  restarted at half its last value; it now reads the true 1000/s).
+  Aggregation and binary operators run on the combined series. Rules S1 to
+  S9 of `docs/journal/2026-10-19-recording-identity-and-views.md`.
+- Cost: a member that is a whole source reads the batched counter scan
+  (one clipped to a producer epoch, the per-series path), over the whole
+  query range, and for each series the timestamps of the nine rows on each
+  side of the read (within 64 of the metric's intervals), which S3's hole
+  test needs. On the 9.6 h recording with a copy of itself (one uuid),
+  against the same archive read twice by 0.41.0, medians of four
+  interleaved rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))`
+  over 9.6 h at a 1 s step 194 ms against 60 ms (peak RSS 1.08 GB against
+  193 MB), of `sum(irate(cpu_usage[5s]))` 55 ms against 21 ms (453 MB
+  against 123 MB), `rate(cgroup_cpu_usage[1m])` over 1 h at 1 s 22 ms
+  against 12 ms, `sum(irate(cgroup_cpu_usage[5s]))` over 1 h 21 ms against
+  6.0 ms, and `sum(rate(cgroup_cpu_usage[1m]))` over 9.6 h at 60 s 56 ms
+  against 36 ms. Memory is higher because each member's series are
+  materialized before they are combined. Single-source archives take the
+  path they took before: in two sets of four interleaved rounds the 9.6 h
+  display query read 31.1 and 32.7 ms against 32.0 and 31.4 ms, the 1 h
+  `rate` 6.01 and 6.16 ms against 6.12 and 6.00 ms, with peak RSS 127 to 129
+  MB against 130 MB.
+- Histogram functions over a group read one of its sources alone, until
+  they are combined per source: the one covering the most of the query's
+  range, ties to the finest. They count a process once and leave the other
+  sources' spans out.
+- A recording that does not hold the metric a function reads (a filtered
+  copy, another host) adds no series to it, beside a group as beside a
+  single source; series come in catalog order.
+- Archives whose sources form no group of more than one member, each of
+  one producer epoch, answer as before (a differential harness,
+  `metriken-storage/tests/answers_dump.rs`): byte for byte on six fixtures
+  and one long-table recording, and on a wide-table recording and a 9.6 h
+  recording identical apart from last-place differences in summed bands,
+  which two runs of 0.41.0 also show. A source holding several producer
+  epochs is now read per epoch, which changes its answers only across each
+  restart.
+
+### metriken-recorder 0.5.0
+
+- **Changed:** takes metriken-storage 0.5, whose `WriterConfig` it
+  re-exports.
+
+### metriken-storage 0.5.0
+
+- **Changed:** `ArchiveReader::series_labels` labels each source with its
+  read group's labels (`read_groups`), so the sources of one process group
+  carry one label set and `__recording__` tells apart only read groups whose
+  label sets are equal (two processes recorded with the same labels), with
+  the catalog index of the group's first source. `counter_labels`,
+  `gauge_labels` and `histogram_labels` list a group's series once.
+- **Added:** `scan::CounterScan::into_parts`, the matched series and the
+  chunk reader, for a caller that wraps the reader.
+- **Added:** `ArchiveReader::read_groups`, `read_group_of` and
+  `source_position`, and `process::{read_groups, ReadGroup}`: what a query
+  reads as one recording, a process group or the part of one whose sources
+  agree on every label. A key some sources carry takes the carried value; a
+  key carried with two values splits the group by value (a source lacking
+  it takes its uuid group's value when that is one value).
 
 - **Added:** process groups. `ArchiveReader::process_groups()` groups an
   archive's sources by producer process, by the rules of
@@ -29,9 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could not be read (a pair is known to share no row when either source is
   known to have none in the intersection). The pure rules are
   `process::form`, over `SourceInfo`.
-  Queries are unchanged: a process group's sources are still read as
-  separate recordings, so a source and its copy still count twice until the
-  per-source union lands.
+  metriken-query 0.42.0 reads each process group once.
 - **Added:** `Catalog::sources_with_uuids`, defaulting to `sources` with no
   uuid; `DendroCatalog` reads the uuid in the same query. A `Catalog`
   wrapper that forwards `sources` and not this method loses the uuids, so

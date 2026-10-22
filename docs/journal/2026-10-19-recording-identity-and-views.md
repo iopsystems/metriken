@@ -2,8 +2,11 @@
 
 **Status:** OPEN. Design 2026-10-19, reframed by the owner on 2026-10-20:
 storage keeps everything and records provenance, and the viewer decides
-presentation. dendro's documents table and rezolus's combined view (#1504)
-are done; nothing else is built. "Step N" means this entry's order of work.
+presentation. dendro's documents table, rezolus's combined view (#1504),
+process groups in metriken-storage (#304) and the S9 per-source union for
+counters and gauges in metriken-query (branch `feat/per-source-union`; "S1
+to S9 in metriken" below) are done; nothing else is built. "Step N" means
+this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
 handshake) ([metriken-viewer](2026-10-12-metriken-viewer.md)), and rezolus's
@@ -1140,7 +1143,12 @@ check`, systemslab through the `dashboard` crate).
   source has no row at `t` when its rows on either side of `t` are further
   apart than twice the larger of the median of its gaps before that pair and
   the median of its gaps after it, each over up to eight gaps; with none on
-  one side, the other side's median is used. In each span the results come
+  one side, the other side's median is used. Beyond a read, a source's rows
+  count only as far as the nearest nine on each side within 64 of its
+  intervals: a series with fewer there is taken as having no more rows on
+  that side (implemented 2026-10-21; reading until nine rows, however far,
+  cost a 1 h query four times as much on a recording with many ended
+  series). In each span the results come
   from the source with the finest spacing there (S9), ties going to the
   lowest uuid, then to catalog order; where it has no result, or its rows
   do not cover the whole window (S9), the next finest's is used. Test: a
@@ -1151,9 +1159,11 @@ check`, systemslab through the `dashboard` crate).
   one 5 s gap; the gap is a hole (5 s against a 2 s threshold).
 - **S4. Conflicts are reported.** Two sources of one group holding a read
   of one series at one timestamp with one acquisition window must hold one
-  value. When they differ, the query returns the finer source's value and
-  the consumer reports a conflict naming both sources, the series and the
-  first timestamp (Q16 for the value used). Two stream recorders of one
+  value. When they differ, the query returns the finer source's value; if
+  both have the same interval, the value of the source with the earlier
+  first timestamp; further ties by S3's rule (Q16, decided 2026-10-21). The
+  consumer reports a conflict naming both sources, the series and the
+  first timestamp. Two stream recorders of one
   rezolus agent share reads: ticks of two subscriptions that fall within
   three quarters of one pass's TTL are answered from that pass
   (`src/agent/exposition/http/mod.rs:194-197` at rezolus upstream/main
@@ -1386,6 +1396,121 @@ not needed while each source keeps one cadence; S12 is done.
   point per stride window that holds observations, and that
   a chart uses the strided form with the stride at its step (step 3.5), with
   a doctest of both histogram forms over rows 1 s and then 100 ms apart.
+
+#### S1 to S9 in metriken (counters and gauges, built)
+
+Built on branch `feat/per-source-union` of metriken (metriken-query 0.42.0,
+metriken-storage 0.5.0, unreleased), slice 2a of three:
+
+- 2a: S1, S2, S3, S5 to S9 for counters and gauges (`rate`, `irate`, a
+  gauge read, `avg_over_time`, `idelta`, `deriv`), with each producer
+  epoch's `from_ts` as the start of a new run of rows. Histograms read one
+  source of a group (the one covering the most of the query's range, ties
+  to the finest), which counts a process once and leaves the other sources'
+  spans out.
+- 2b: histograms per source (the per-row and per-stride deltas combined per
+  series per span).
+- 2c: S4: conflict detection, the warnings channel on query results (an
+  API change; `QueryResult` has none today), and Q16's value at a conflict.
+  Until then the value at a conflict is whichever source S3's order
+  chooses, which is the finer source's and, at equal intervals, the lowest
+  uuid's rather than the earlier-starting source's.
+
+The leaf design: each leaf (`rate(x[r])`, `irate`, a bare gauge selector,
+the windowed gauge functions) over a process group is evaluated by the same
+code that evaluates one recording, once per member, through a wrapper that
+clips the member to its epoch and records the timestamps of every row it
+hands out, and the members' series are combined per label set before the
+rest of the expression runs (metriken-query
+`promql/streaming/per_source.rs`, called from `dispatch.rs`). The
+alternative, a combinator inside each producer (the batched
+`batch_rate.rs`, the streaming `rate.rs`, the gauge producers), needs a
+source identity on every sample and a separate implementation on each of
+three paths; evaluating the leaf per member reuses the one-recording code,
+so "evaluated alone, as one recording is evaluated today" holds by
+construction. A member that is a whole source reads the batched counter
+scan, the wrapper recording each row the scan decodes; a member clipped to
+an epoch takes the per-series path, since a scan cannot be clipped. Every
+member is read over the whole query range. Reading a later member only over
+the grid times the first does not cover was tried and changed answers: a
+grid rate interpolates between the rows on either side of its window's
+edges, which can be any distance away across a hole, and a gauge read starts
+at its range's start, so a narrower read moves points (a 250 ms source with
+a hole over [200, 210) s beside a 2 s source, `rate(c[1s])` at a 0.25 s
+step: 9360 at 210.25, 210.5 and 210.75 s where the 2 s source alone reads
+9380, 9400 and 9420; 134 of 4360 random grid queries differed, and padding
+the ranges never brought that to 0). The wrapper also reads, for each
+series, the nine rows nearest the read on each side (before its start and
+after its end; ten of the metric's own intervals, then 64 when a series
+has fewer than nine rows there, a series with fewer than nine rows in 64
+intervals being taken as having no more), keeping
+their timestamps; the read decodes values too, since the sources have no
+timestamp-only read per series. S3's hole test takes the medians of up to
+eight gaps on each side of a gap, so without these rows a series looks as
+if its rows start at the read's start or end at its end, and the first or
+last points of a range depend on where it starts or ends (a 1 s source with
+a gap to 203 s and then 5 s rows, beside a 2 s source: `g` at 204 s read
+478 to 204 s and 486 to 260 s). `metriken-storage/tests/union_oracle.rs` checks the
+union against each source read alone over the whole range and combined
+point by point (S3 and S9 applied in the test; random fixtures with holes,
+cadence changes, cadences from 250 ms to 15 s and a faster second table).
+Measured on the 9.6 h recording with a copy of itself, against the same
+archive read twice by metriken-query 0.41.0, medians of four interleaved
+rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at
+1 s 194 ms against 60 ms, `rate(cgroup_cpu_usage[1m])` over 1 h 22 ms
+against 12 ms, `sum(irate(...))` over 1 h 21 ms against 6.0 ms,
+`sum(rate(...[1m]))` over 9.6 h at 60 s 56 ms against 36 ms. (Reading the
+context rows until each series had nine, however far, measured as one
+ten-interval read and then a read to the member's end, took the 1 h `rate`
+and `sum(irate)` queries to 92.7 and 91.6 ms on that recording, whose long
+cgroup table holds many series that ended, against 22.3 and 20.5 ms with
+the bound.) Peak memory on the display query is 1.08 GB against 193 MB,
+because each member's series are materialized before they are combined;
+streaming the combination needs each series' rows ahead of its points,
+which the batched scan does not give. That is the next PR. Two
+pre-existing behaviours were found on the way and are not changed here:
+`offset` in a selector is ignored (on upstream/main too), and a single
+source's last points can move with the range's end (a rate at the range's
+end, held past the source's last row). Queries
+reaching no multi-member group take the code path they took before, and
+cost the same within noise.
+
+Readings of the rules where the text left a choice:
+
+- The coverage rule needs "has rows at `t`" as well as "covers the
+  window". A member holds `t` when one of its runs (S3's hole rule) runs from
+  at or before `t` to within one interval after; it covers the window when
+  that run also starts at or before `t − w`. At each point the finest member
+  that covers the window and has a result answers; else the finest that
+  holds `t` and has a result (the start of a recording, where no member
+  covers a whole window); else nothing (S5). In raw placement the member is
+  chosen the same way and only its own points are kept.
+- "At each epoch's `from_ts` a series has a counter reset" is implemented as
+  a member boundary: no increase is taken across `from_ts`, so the counter's
+  first value after a restart never enters a rate. The Prometheus reading
+  (the first value after the reset counted as the increase) would read a
+  counter that a restarted producer does not start at zero as a spike.
+- A group's labels: a key some sources carry takes the carried value; a key
+  carried with two values splits the group into one read group per value
+  (`ArchiveReader::read_groups`), a source lacking the key taking its uuid
+  group's value when that is one value. This is the presented-recording
+  split by any label, since the user layer is not stored apart (Q2).
+- Bridges are read groups of their own until slice 3 joins their pieces, so
+  case 3's continuous-recording-plus-attempts test (`sum` at 09:30 equals
+  the attempt's alone) waits for slice 3.
+- S5 applies to every series of a group, including one that a single source
+  of the group holds (a filtered copy lacks it): a hole in it is a gap, as
+  for a series every source holds, where the source alone interpolates a
+  rate across the hole as before.
+- A recording that does not hold the metric a leaf reads, as the kind it
+  reads, is not read for that leaf (a filtered copy, another host), so it
+  adds neither series nor a "not found".
+- A gauge's staleness window and S9's "within one interval of its last row"
+  use the member's interval for that metric; the rank uses the same
+  interval.
+- A group is one recording to cross-cadence evaluation only when its
+  members are one source; a group of several sources is evaluated on the
+  uniform grid, as several recordings are.
 
 ### What is stored where
 
@@ -1964,10 +2089,14 @@ Presentation and query rules:
   which carries no `endpoint`). Candidates: (a)
   none, as written; (b) a warning when two sources' first segments or row
   groups are byte-equal.
-- **Q16.** The value S4 returns at a conflict. Candidates: (a) the finer
-  source's, as written; (b) none (a gap at that timestamp), so a conflict
-  is visible in the chart; (c) the value of the source with the earlier
-  first timestamp.
+- **Q16.** The value S4 returns at a conflict. Decided 2026-10-21: the
+  finer source's value; if both have the same interval, the value of the
+  source with the earlier first timestamp; further ties by S3's rule (the
+  lowest uuid, then catalog order). The consumer reports a conflict naming
+  both sources, the series and the first timestamp. The candidates were (a)
+  the finer source's, (b) none (a gap at that timestamp), so a conflict is
+  visible in the chart, and (c) the value of the source with the earlier
+  first timestamp; the decision is (a) with (c) as its tie rule.
 - **Q17.** `combine` into a parquet output drops `producer_epoch` and
   `producer_epochs`, so the result cannot be unioned. Candidates: (a)
   carry them under `per_source_metadata`, which is keyed by `source` and so

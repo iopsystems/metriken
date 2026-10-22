@@ -11,6 +11,7 @@ use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
 use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
+use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups};
 use crate::promql::QueryEngine;
 use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 
@@ -63,6 +64,7 @@ pub fn eval_timestamps_for(
 /// What every query entry point works out once: the tables that can answer
 /// it and the labels each recording's series carry.
 struct Plan<'a> {
+    reader: &'a ArchiveReader,
     owners: Vec<&'a SamplerReader>,
     labels: &'a SeriesLabels,
     /// The metric names the query references that some table of the
@@ -132,6 +134,7 @@ impl<'a> Plan<'a> {
             .collect();
         let missing = held.iter().any(|n| !owners.iter().any(|t| t.holds(n)));
         Ok(Self {
+            reader,
             owners,
             labels,
             held,
@@ -293,6 +296,15 @@ fn cross_cadence(
 /// recording's interval and row times; see [`RecordingsSource`] and the
 /// engine's `Join`.
 ///
+/// The sources of one process group (`ArchiveReader::read_groups`: copies,
+/// a recording and a dump of it, two recorders of one agent) are one
+/// recording to a query, and their series carry one label set. A leaf reads
+/// each of them alone, and each producer epoch of a source alone, and
+/// combines the results per series (`streaming::per_source`, S9), so a
+/// process counts once and no value is a difference between rows of two
+/// sources or across a restart. A query reaching no such group, or a source
+/// of one epoch, is evaluated exactly as before.
+///
 /// Refused: a metric name held by two tables of one recording
 /// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
 /// name that is a different kind in two recordings the query reaches.
@@ -314,28 +326,127 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     if recordings.len() > 1 {
         refuse_kinds_across_recordings(plan, &recordings, query)?;
     }
-    let mut sources: Vec<Arc<dyn DataSource>> = Vec::new();
+    // The recordings by read group, in first-recording order.
+    let mut units: Vec<(Option<usize>, Vec<&Vec<&SamplerReader>>)> = Vec::new();
     for tables in &recordings {
-        if let Some(source) = recording_source(tables, query)? {
-            let labels = plan.labels.of(tables[0]).clone();
-            sources.push(Arc::new(LabeledSource::new(source, labels)));
+        let group = plan.reader.read_group_of(tables[0]);
+        match units
+            .iter_mut()
+            .find(|(g, _)| group.is_some() && *g == group)
+        {
+            Some((_, unit)) => unit.push(tables),
+            None => units.push((group, vec![tables])),
         }
     }
-    let source: Arc<dyn DataSource> = match sources.len() {
-        // A table whose segments have gone since the probe is absent, so its
-        // metrics are too: the same error a query naming a metric this
-        // archive never held gets.
-        0 => {
-            return Err(QueryError::ParseError(format!(
-                "query references {query}, whose tables have all been evicted since this \
-                 archive was opened"
-            )))
+    // The recordings in catalog order: a source alone, or a group's members
+    // and its sources ranked.
+    let mut parts: Vec<Result<Arc<dyn DataSource>, Grouped>> = Vec::new();
+    for (group, unit) in units {
+        // A source whose process group has other sources is read by the
+        // group's rules even where it alone holds the metric, so a series
+        // reads the same whichever of the group's sources hold it.
+        let grouped = group
+            .and_then(|g| plan.reader.read_groups().get(g))
+            .is_some_and(|g| g.sources.len() > 1);
+        let mut members: Vec<Member> = Vec::new();
+        let mut whole: Vec<Ranked> = Vec::new();
+        for tables in unit {
+            let Some(source) = recording_source(tables, query)? else {
+                continue;
+            };
+            let labels = plan.labels.of(tables[0]).clone();
+            let source: Arc<dyn DataSource> = Arc::new(LabeledSource::new(source, labels));
+            let position = plan.reader.source_position(tables[0]);
+            let info = position.map(|p| &plan.reader.sources()[p]);
+            let member = |lo: u64, hi: u64| Member {
+                source: Arc::clone(&source),
+                lo,
+                hi,
+                uuid: info.and_then(|i| i.uuid.clone()),
+                catalog_index: info.map_or(0, |i| i.catalog_index),
+                position: position.unwrap_or(0),
+            };
+            // One member per producer epoch: from its first row (the
+            // epoch's `from_ts`) to the next epoch's, so no pair of rows
+            // spans a restart.
+            let epochs = info.map_or(&[][..], |i| i.epochs.as_slice());
+            for k in 0..epochs.len().max(1) {
+                let lo = if k == 0 { 0 } else { epochs[k].first_ns };
+                let hi = match epochs.get(k + 1) {
+                    Some(next) => next.first_ns.saturating_sub(1),
+                    None => u64::MAX,
+                };
+                members.push(member(lo, hi));
+            }
+            let finest = tables
+                .iter()
+                .map(|t| t.interval())
+                .filter(|i| *i > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            whole.push((finest, Arc::clone(&source), member(0, u64::MAX)));
         }
-        1 => sources.pop().expect("one"),
-        _ => Arc::new(RecordingsSource::new(sources)),
+        match members.len() {
+            0 => {}
+            1 if !grouped => parts.push(Ok(members.pop().expect("one").source)),
+            _ => parts.push(Err((members, whole))),
+        }
+    }
+    if parts.iter().all(|p| p.is_ok()) {
+        let mut singles: Vec<Arc<dyn DataSource>> = parts
+            .into_iter()
+            .map(|p| p.ok().expect("all single"))
+            .collect();
+        let source: Arc<dyn DataSource> = match singles.len() {
+            // A table whose segments have gone since the probe is absent, so
+            // its metrics are too: the same error a query naming a metric
+            // this archive never held gets.
+            0 => {
+                return Err(QueryError::ParseError(format!(
+                    "query references {query}, whose tables have all been evicted since this \
+                     archive was opened"
+                )))
+            }
+            1 => singles.pop().expect("one"),
+            _ => Arc::new(RecordingsSource::new(singles)),
+        };
+        return Ok(Some(QueryEngine::new(source)));
+    }
+    let mut children: Vec<Arc<dyn DataSource>> = Vec::with_capacity(parts.len());
+    let mut ordered: Vec<Part> = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            Ok(source) => {
+                children.push(Arc::clone(&source));
+                ordered.push(Part::Single(source));
+            }
+            Err((members, mut whole)) => {
+                // A group as the whole sees it, its sources finest first
+                // (S3's tie rule after the interval).
+                whole
+                    .sort_by(|(ia, _, a), (ib, _, b)| ia.total_cmp(ib).then_with(|| a.cmp_ties(b)));
+                children.push(Arc::new(GroupSource::new(
+                    whole.into_iter().map(|(_, s, _)| s).collect(),
+                )));
+                ordered.push(Part::Group(members));
+            }
+        }
+    }
+    let source: Arc<dyn DataSource> = match children.len() {
+        1 => children.pop().expect("one"),
+        _ => Arc::new(RecordingsSource::new(children)),
     };
-    Ok(Some(QueryEngine::new(source)))
+    Ok(Some(QueryEngine::with_groups(
+        source,
+        SourceGroups { parts: ordered },
+    )))
 }
+
+/// A source of a process group with what ranks it: its finest table
+/// interval and its tie-breaking facts.
+type Ranked = (f64, Arc<dyn DataSource>, Member);
+
+/// A process group's members, and its sources ranked.
+type Grouped = (Vec<Member>, Vec<Ranked>);
 
 /// Refuse a result in which two series share a label set. Two recordings'
 /// series can: one recording carries `host` as a recording label and the

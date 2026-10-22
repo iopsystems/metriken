@@ -28,6 +28,7 @@
 //! * Parenthesised expressions are unwrapped.
 
 use super::histogram::HistogramOps;
+use super::per_source::{self, MemberSeries, SourceGroups, Tap, Window};
 use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
@@ -44,13 +45,14 @@ use crate::{DataSource, QueryOptions, RateMode};
 /// recognise; this is now the only PromQL evaluator in the engine.
 pub fn try_streaming(
     source: &dyn DataSource,
+    groups: Option<&SourceGroups>,
     expr: &Expr,
     start: f64,
     end: f64,
     step: f64,
     opts: &QueryOptions,
 ) -> Result<QueryResult, QueryError> {
-    let ctx = make_ctx(source, expr, start, end, step, opts);
+    let ctx = make_ctx(source, groups, expr, start, end, step, opts);
     let result = match build(&ctx, expr)? {
         Built::Series {
             series,
@@ -79,6 +81,7 @@ pub fn try_streaming(
 /// The evaluation context for `[start, end]` at `step`.
 fn make_ctx<'a>(
     source: &'a dyn DataSource,
+    groups: Option<&'a SourceGroups>,
     expr: &Expr,
     start: f64,
     end: f64,
@@ -100,6 +103,7 @@ fn make_ctx<'a>(
     };
     Ctx {
         source,
+        groups,
         start_ns,
         end_ns: crate::promql::range_end_ns(end),
         step_ns,
@@ -241,8 +245,10 @@ fn clip_raw<'a>(ctx: &Ctx<'_>, series: SeriesSet<'a>) -> SeriesSet<'a> {
 
 /// [`try_streaming`] in display form: each series is reduced per `display`
 /// as it is collected (see `collect_to_display`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_streaming_display(
     source: &dyn DataSource,
+    groups: Option<&SourceGroups>,
     expr: &Expr,
     start: f64,
     end: f64,
@@ -250,7 +256,7 @@ pub(crate) fn try_streaming_display(
     opts: &QueryOptions,
     display: &crate::DisplayOptions,
 ) -> Result<crate::DisplayResult, QueryError> {
-    let ctx = make_ctx(source, expr, start, end, step, opts);
+    let ctx = make_ctx(source, groups, expr, start, end, step, opts);
     if let Some(result) = batch_display(&ctx, expr, start, end, step, display)? {
         return Ok(result);
     }
@@ -297,6 +303,10 @@ pub(crate) fn try_streaming_display(
 
 struct Ctx<'a> {
     source: &'a dyn DataSource,
+    /// The process groups of more than one member among the sources, which
+    /// each leaf reads per member and combines ([`per_source`]); `None` when
+    /// there are none, and in the context a member is read in.
+    groups: Option<&'a SourceGroups>,
     start_ns: u64,
     end_ns: u64,
     step_ns: u64,
@@ -314,6 +324,23 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
+    /// This context over `source` alone, which forms no group.
+    fn over<'s>(&self, source: &'s dyn DataSource) -> Ctx<'s> {
+        Ctx {
+            source,
+            groups: None,
+            start_ns: self.start_ns,
+            end_ns: self.end_ns,
+            step_ns: self.step_ns,
+            rate_mode: self.rate_mode,
+            eval_timestamps: self.eval_timestamps.clone(),
+            per_series_rates: self.per_series_rates,
+            recording_keys: source.recording_label_keys(),
+            raw_hold_ns: self.raw_hold_ns,
+            raw_depth: self.raw_depth,
+        }
+    }
+
     /// Apply the caller's explicit evaluation timestamps to a gauge producer,
     /// leaving its default placement alone when there are none.
     ///
@@ -432,6 +459,11 @@ fn batch_display(
     step: f64,
     display: &crate::DisplayOptions,
 ) -> Result<Option<crate::DisplayResult>, QueryError> {
+    // An aggregate over process groups aggregates the combined series, which
+    // the source cannot compute as it reads.
+    if ctx.groups.is_some() {
+        return Ok(None);
+    }
     let mut ops = Vec::new();
     let mut e = expr;
     let call = loop {
@@ -618,8 +650,9 @@ where
     while let Expr::Paren(p) = inner {
         inner = &p.expr;
     }
+    // Over process groups the aggregation runs on the combined series.
     let batched = match inner {
-        Expr::Call(call) => batch_rates(ctx, call, Some((op, group_by))),
+        Expr::Call(call) if ctx.groups.is_none() => batch_rates(ctx, call, Some((op, group_by))),
         _ => None,
     };
     if let Some((series, name)) = batched {
@@ -799,6 +832,14 @@ where
 {
     if call.func.name == "histogram_quantile" {
         return build_histogram_quantile(ctx, call);
+    }
+    if let Some(groups) = ctx.groups {
+        if matches!(
+            call.func.name,
+            "rate" | "irate" | "avg_over_time" | "idelta" | "deriv"
+        ) {
+            return build_per_source(ctx, groups, Leaf::Call(call));
+        }
     }
 
     let Some(first) = call.args.args.first() else {
@@ -1140,6 +1181,9 @@ fn build_vector_selector<'a, 'expr>(
 where
     'expr: 'a,
 {
+    if let Some(groups) = ctx.groups {
+        return build_per_source(ctx, groups, Leaf::Selector(sel));
+    }
     let metric_name = sel
         .name
         .as_deref()
@@ -1193,6 +1237,210 @@ where
         series,
         metric_name: Some(metric_name),
         metric_name_for_error: Some(metric_name.to_string()),
+    })
+}
+
+/// A leaf a process group's members are read for one by one.
+#[derive(Clone, Copy)]
+enum Leaf<'e> {
+    Call(&'e parser::Call),
+    Selector(&'e parser::VectorSelector),
+}
+
+impl<'e> Leaf<'e> {
+    /// The metric the leaf reads.
+    fn metric(self) -> Option<&'e str> {
+        match self {
+            Leaf::Call(call) => match call.args.args.first().map(|a| &**a) {
+                Some(Expr::MatrixSelector(sel)) => sel.vs.name.as_deref(),
+                _ => None,
+            },
+            Leaf::Selector(sel) => sel.name.as_deref(),
+        }
+    }
+
+    /// What a point of the leaf reads (`per_source::Window`).
+    fn window(self, mode: RateMode) -> Window {
+        let raw = matches!(mode, RateMode::Raw);
+        match self {
+            Leaf::Call(call) => {
+                let range = match call.args.args.first().map(|a| &**a) {
+                    Some(Expr::MatrixSelector(sel)) => sel.range.as_nanos() as u64,
+                    _ => 0,
+                };
+                match (call.func.name, raw) {
+                    ("irate", false) => Window::Step,
+                    ("irate", true) => Window::Point,
+                    _ => Window::Range(range),
+                }
+            }
+            Leaf::Selector(_) if raw => Window::Point,
+            Leaf::Selector(_) => Window::Stale,
+        }
+    }
+
+    /// Whether the leaf reads `name` as a counter in `source`.
+    fn reads_counter(self, source: &dyn DataSource, name: &str) -> bool {
+        match self {
+            Leaf::Call(call) => match call.func.name {
+                "rate" | "irate" => true,
+                "deriv" => source.counter_names().iter().any(|n| n == name),
+                _ => false,
+            },
+            Leaf::Selector(_) => false,
+        }
+    }
+
+    /// Whether `source` holds `name` as the kind the leaf reads, so reading
+    /// it can give series rather than "not found" or "wrong kind".
+    fn held_by(self, source: &dyn DataSource, name: &str) -> bool {
+        let counter = || source.counter_names().iter().any(|n| n == name);
+        let gauge = || source.gauge_names().iter().any(|n| n == name);
+        match self {
+            Leaf::Call(call) => match call.func.name {
+                "rate" | "irate" => counter(),
+                "deriv" => counter() || gauge(),
+                _ => gauge(),
+            },
+            Leaf::Selector(_) => gauge(),
+        }
+    }
+
+    fn build<'a>(self, ctx: &'a Ctx<'a>) -> Result<Built<'a>, QueryError>
+    where
+        'e: 'a,
+    {
+        match self {
+            Leaf::Call(call) => build_call(ctx, call),
+            Leaf::Selector(sel) => build_vector_selector(ctx, sel),
+        }
+    }
+}
+
+/// `leaf`'s series over sources some of which form process groups: the
+/// recordings of one member as one evaluation, and each group's members one
+/// by one, combined per series (S9, [`per_source`]).
+fn build_per_source<'a, 'e>(
+    ctx: &'a Ctx<'a>,
+    groups: &'a SourceGroups,
+    leaf: Leaf<'e>,
+) -> Result<Built<'a>, QueryError>
+where
+    'e: 'a,
+{
+    let Some(name) = leaf.metric() else {
+        // The errors the single-source path gives these shapes.
+        return Err(match leaf {
+            Leaf::Call(call) => match call.args.args.first().map(|a| &**a) {
+                None => QueryError::Unsupported(format!(
+                    "function {} requires arguments",
+                    call.func.name
+                )),
+                Some(Expr::MatrixSelector(_)) => {
+                    QueryError::ParseError("Matrix selector missing name".to_string())
+                }
+                Some(_) => QueryError::Unsupported(format!(
+                    "function {} requires a matrix-selector argument",
+                    call.func.name
+                )),
+            },
+            Leaf::Selector(_) => QueryError::ParseError("Vector selector missing name".to_string()),
+        });
+    };
+    let collect = |built: Built<'_>| -> Vec<(crate::labels::Labels, Vec<super::Point>)> {
+        match built {
+            Built::Series { series, .. } => series
+                .into_iter()
+                .map(|ls| (ls.labels, ls.iter.collect()))
+                .collect(),
+            Built::Scalar(_) | Built::Materialized { .. } => Vec::new(),
+        }
+    };
+    let mut out: Vec<(crate::labels::Labels, Vec<super::Point>)> = Vec::new();
+    // A recording that does not hold the leaf's metric as the kind it reads
+    // adds no series and is not read: read alone, it would answer "not
+    // found" for a name other recordings hold. When none holds it, the
+    // whole source answers, with the error a single source would give.
+    let held = |source: &dyn DataSource| leaf.held_by(source, name);
+    let any = groups.parts.iter().any(|p| match p {
+        per_source::Part::Single(s) => held(s.as_ref()),
+        per_source::Part::Group(members) => members.iter().any(|m| held(m.source.as_ref())),
+    });
+    if !any {
+        out.extend(collect(leaf.build(&ctx.over(ctx.source))?));
+    }
+    let window = leaf.window(ctx.rate_mode);
+    let step_ns = ctx.step_ns;
+    let eval = ctx.eval_timestamps.clone();
+    let window_ns = move |t: u64, interval_ns: u64| -> u64 {
+        match window {
+            Window::Range(r) => r,
+            Window::Step => match &eval {
+                Some(points) => {
+                    let i = points.partition_point(|&p| p < t);
+                    i.checked_sub(1).map_or(step_ns, |j| t - points[j])
+                }
+                None => step_ns,
+            },
+            Window::Stale => step_ns.max(interval_ns),
+            Window::Point => 0,
+        }
+    };
+    for part in groups.parts.iter().filter(|_| any) {
+        let members: Vec<&per_source::Member> = match part {
+            per_source::Part::Single(source) => {
+                if held(source.as_ref()) {
+                    out.extend(collect(leaf.build(&ctx.over(source.as_ref()))?));
+                }
+                continue;
+            }
+            per_source::Part::Group(members) => {
+                members.iter().filter(|m| held(m.source.as_ref())).collect()
+            }
+        };
+        if members.is_empty() {
+            continue;
+        }
+        let interval_ns = |m: &per_source::Member| -> u64 {
+            let s = if leaf.reads_counter(m.source.as_ref(), name) {
+                m.source.counter_interval(name)
+            } else {
+                m.source.gauge_interval(name)
+            };
+            (s * 1e9) as u64
+        };
+        // S3's rank: finest first, then the lowest uuid, then catalog order.
+        let mut ranked: Vec<(u64, &per_source::Member)> =
+            members.iter().map(|m| (interval_ns(m), *m)).collect();
+        ranked.sort_by(|(ia, a), (ib, b)| {
+            ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo))
+        });
+        // Every member is read over the whole range: a grid point
+        // interpolates between rows on either side of its window's edges,
+        // however far apart they are, so a narrower read can change a point.
+        let mut evaluated = Vec::with_capacity(ranked.len());
+        for (interval_ns, m) in ranked {
+            let tap = Tap::new(m.source.clone(), m.lo, m.hi);
+            let series = collect(leaf.build(&ctx.over(&tap))?);
+            evaluated.push(MemberSeries::new(series, tap.take_rows(), interval_ns));
+        }
+        out.extend(per_source::combine(
+            evaluated,
+            &window_ns,
+            matches!(ctx.rate_mode, RateMode::Raw),
+        ));
+    }
+    let metric_name = match leaf {
+        Leaf::Call(call) if call.func.name == "deriv" => Some("deriv"),
+        _ => Some(name),
+    };
+    Ok(Built::Series {
+        series: out
+            .into_iter()
+            .map(|(labels, points)| LabeledSeries::new(labels, points.into_iter()))
+            .collect(),
+        metric_name,
+        metric_name_for_error: Some(name.to_string()),
     })
 }
 
