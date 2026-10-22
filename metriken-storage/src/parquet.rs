@@ -3064,26 +3064,49 @@ impl Iterator for ParquetHistogramCursor {
 /// zeros made the series' next value count as an increase from zero, so a
 /// member's first reading was counted in full or not at all depending on
 /// whether an earlier row of the same segment held a null for it.
+///
+/// Each row is read from the list's value offsets straight out of the child
+/// buffer. `ListArray::iter` allocates a sliced child array per row; not
+/// doing so took 10 to 12% off a histogram query over a 9.6 h recording.
 fn snapshots_of(list: &ListArray) -> Vec<Option<HistogramSnapshot>> {
-    list.iter()
-        .map(|value| {
-            value.and_then(|lv| {
-                lv.as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .map(raw_to_sparse_cumulative)
+    use arrow::array::Array;
+    let Some(values) = list.values().as_any().downcast_ref::<UInt64Array>() else {
+        return vec![None; list.len()];
+    };
+    // `value_offsets()` index into `list.values()`, which slicing the list does
+    // not slice; the child's `values()` and `nulls()` are already shifted by the
+    // child's own offset. So a sliced list and a sliced child both index correctly.
+    let buckets = values.values();
+    let bucket_nulls = values.nulls().filter(|n| n.null_count() > 0);
+    let offsets = list.value_offsets();
+    (0..list.len())
+        .map(|row| {
+            if list.is_null(row) {
+                return None;
+            }
+            let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+            Some(match bucket_nulls {
+                None => raw_to_sparse_cumulative(buckets[start..end].iter().copied()),
+                Some(nulls) => raw_to_sparse_cumulative((start..end).map(|i| {
+                    if nulls.is_valid(i) {
+                        buckets[i]
+                    } else {
+                        0
+                    }
+                })),
             })
         })
         .collect()
 }
 
-/// Convert a raw bucket array (individual counts per bucket) into a
-/// sparse cumulative prefix-sum snapshot. Only non-zero buckets are stored.
-fn raw_to_sparse_cumulative(arr: &UInt64Array) -> HistogramSnapshot {
+/// Convert raw bucket counts (individual counts per bucket) into a sparse
+/// cumulative prefix-sum snapshot. Only non-zero buckets are stored; a null
+/// bucket counts as zero.
+fn raw_to_sparse_cumulative(buckets: impl Iterator<Item = u64>) -> HistogramSnapshot {
     let mut index = Vec::new();
     let mut count = Vec::new();
     let mut running = 0u64;
-    for (i, v) in arr.iter().enumerate() {
-        let v = v.unwrap_or(0);
+    for (i, v) in buckets.enumerate() {
         if v > 0 {
             running = running.saturating_add(v);
             index.push(i as u32);
@@ -3091,6 +3114,151 @@ fn raw_to_sparse_cumulative(arr: &UInt64Array) -> HistogramSnapshot {
         }
     }
     HistogramSnapshot { index, count }
+}
+
+#[cfg(test)]
+mod snapshots_of_tests {
+    use super::*;
+    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
+    use arrow::datatypes::{DataType, Field};
+
+    /// The conversion as it was, through `ListArray::iter`: the oracle.
+    fn reference(list: &ListArray) -> Vec<Option<(Vec<u32>, Vec<u64>)>> {
+        list.iter()
+            .map(|value| {
+                value.and_then(|lv| {
+                    lv.as_any().downcast_ref::<UInt64Array>().map(|arr| {
+                        let (mut index, mut count, mut running) = (Vec::new(), Vec::new(), 0u64);
+                        for (i, v) in arr.iter().enumerate() {
+                            let v = v.unwrap_or(0);
+                            if v > 0 {
+                                running = running.saturating_add(v);
+                                index.push(i as u32);
+                                count.push(running);
+                            }
+                        }
+                        (index, count)
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn converted(list: &ListArray) -> Vec<Option<(Vec<u32>, Vec<u64>)>> {
+        snapshots_of(list)
+            .into_iter()
+            .map(|s| s.map(|s| (s.index, s.count)))
+            .collect()
+    }
+
+    /// xorshift64*, so the cases are reproducible without a dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A random list column: null rows, empty rows, null and zero buckets,
+    /// counts that saturate, a child array sliced from a larger one, and the
+    /// list itself sliced at a non-zero offset.
+    /// Returns the list and whether its child and the list itself were sliced.
+    fn random_list(rng: &mut Rng) -> (ListArray, bool, bool) {
+        let rows = rng.below(12) as usize;
+        let child_nulls = rng.below(3) == 0;
+        let lead = rng.below(4) as usize;
+        let mut vals: Vec<Option<u64>> = (0..lead).map(|_| Some(rng.next())).collect();
+        let mut offsets = vec![0i32];
+        let mut valid = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let is_null = rng.below(4) == 0;
+            valid.push(!is_null);
+            // A null row may still own child values; the reader must skip them.
+            let len = if rng.below(5) == 0 {
+                0
+            } else {
+                rng.below(10) as usize
+            };
+            for _ in 0..len {
+                vals.push(match rng.below(8) {
+                    0..=2 => Some(0),
+                    3 if child_nulls => None,
+                    4 => Some(u64::MAX - rng.below(3)),
+                    _ => Some(rng.below(1000)),
+                });
+            }
+            offsets.push((vals.len() - lead) as i32);
+        }
+        let trail = rng.below(4) as usize;
+        vals.extend((0..trail).map(|_| Some(rng.next())));
+        let child_len = vals.len() - lead - trail;
+        // A null bucket's slot holds a non-zero value, as nothing guarantees
+        // it is zero.
+        let bucket_nulls = vals.iter().map(Option::is_some).collect::<Vec<_>>();
+        let raw = vals.iter().map(|v| v.unwrap_or(7)).collect::<Vec<_>>();
+        let child: ArrayRef = Arc::new(
+            UInt64Array::new(raw.into(), Some(NullBuffer::from(bucket_nulls)))
+                .slice(lead, child_len),
+        );
+        let nulls = (rng.below(2) == 0).then(|| NullBuffer::from(valid));
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt64, true)),
+            OffsetBuffer::new(offsets.into()),
+            child,
+            nulls,
+        );
+        let sliced_child = lead + trail > 0;
+        if rows > 1 && rng.below(2) == 0 {
+            let start = 1 + rng.below(rows as u64 - 1) as usize;
+            let len = rng.below((rows - start) as u64 + 1) as usize;
+            (list.slice(start, len), sliced_child, true)
+        } else {
+            (list, sliced_child, false)
+        }
+    }
+
+    #[test]
+    fn matches_the_iterating_conversion() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // Null rows, empty rows, sliced children, sliced lists.
+        let mut seen = [0usize; 4];
+        for case in 0..20_000 {
+            let (list, sliced_child, sliced_list) = random_list(&mut rng);
+            for r in 0..list.len() {
+                if list.is_null(r) {
+                    seen[0] += 1;
+                } else if list.value_length(r) == 0 {
+                    seen[1] += 1;
+                }
+            }
+            seen[2] += usize::from(sliced_child);
+            seen[3] += usize::from(sliced_list && list.value_offsets()[0] > 0);
+            assert_eq!(converted(&list), reference(&list), "case {case}");
+        }
+        assert!(
+            seen.iter().all(|&n| n > 100),
+            "cases did not cover {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_that_is_not_u64_reads_as_null_rows() {
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(vec![0i32, 2, 2, 3].into()),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            None,
+        );
+        assert_eq!(converted(&list), vec![None, None, None]);
+        assert_eq!(converted(&list), reference(&list));
+    }
 }
 
 #[cfg(test)]
