@@ -902,3 +902,56 @@ fn a_group_holds_each_row_for_its_own_sources_interval() {
     assert_eq!(times("histogram_count(free)"), want);
     assert_eq!(times("g"), want);
 }
+
+/// A composition of files (`MultiParquetSource`, what a labelled parquet
+/// builder makes) gives each file's gauge histogram rows as a part of its
+/// own interval, under its injected labels, not one stream held for the
+/// longest file's interval.
+#[cfg(feature = "ingest")]
+#[test]
+fn a_composition_gives_each_files_own_interval() {
+    use metriken_storage::memory::Memory;
+    use metriken_storage::parquet::MultiParquetSource;
+
+    let child = |interval_ms: u64| -> std::sync::Arc<dyn DataSource> {
+        let mut m = Memory::new(interval_ms);
+        for k in 0..3u64 {
+            m.upsert_gauge_histogram_sample(
+                "free",
+                Labels::default(),
+                histogram::Config::new(0, 16).unwrap(),
+                BASE + k * interval_ms * 1_000_000,
+                cumulative(&state(k)),
+            );
+        }
+        std::sync::Arc::new(m)
+    };
+    let run = |v: &str| {
+        let mut l = Labels::default();
+        l.inner.insert("run".to_string(), v.to_string());
+        l
+    };
+    let composed = MultiParquetSource {
+        files: vec![(child(1000), run("a")), (child(10_000), run("b"))],
+    };
+    let parts = composed
+        .gauge_histogram_parts("free", &Labels::default(), 0, u64::MAX)
+        .expect("parts");
+    let got: Vec<(f64, Option<String>)> = parts
+        .iter()
+        .map(|(stream, interval)| {
+            assert_eq!(stream.meta.series.len(), 1);
+            (*interval, stream.meta.series[0].inner.get("run").cloned())
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [(1.0, Some("a".to_string())), (10.0, Some("b".to_string()))]
+    );
+    // A filter on an injected label leaves the other file out.
+    let only_b = composed
+        .gauge_histogram_parts("free", &run("b"), 0, u64::MAX)
+        .expect("parts");
+    assert_eq!(only_b.len(), 1);
+    assert_eq!(only_b[0].1, 10.0);
+}

@@ -300,7 +300,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gauge_histogram_labels` and `SamplerReader::holds_gauge_histogram`;
   `Memory` gains `push_gauge_histogram_series` and, with `ingest`,
   `upsert_gauge_histogram_sample`. `DataSource::gauge_histogram_parts`
-  gives a read as parts of one row interval each, defaulting to one part.
+  gives a read as parts of one row interval each, defaulting to one part;
+  `MultiParquetSource` gives each file's parts under its injected labels.
   `StreamDecoder::decode` keeps a group row's gauge histogram slots. A long
   table has no gauge histogram columns: a long row carrying gauge
   histograms, or a group written long that gains one, is written without

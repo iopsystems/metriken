@@ -92,6 +92,20 @@ fn resolve_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
     })
 }
 
+/// Add a child's injected labels to each of its stream's series.
+fn inject_labels(stream: &mut HistogramStream, extra: &Labels) {
+    for series_labels in &mut stream.meta.series {
+        for (k, v) in &extra.inner {
+            debug_assert!(
+                !series_labels.inner.contains_key(k),
+                "injected label key '{}' conflicts with native parquet label",
+                k
+            );
+            series_labels.inner.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 impl DataSource for MultiParquetSource {
     // NOTE: Counter series are naively concatenated across files.
     // Same (metric, label) pairs in multiple files produce duplicate series.
@@ -225,6 +239,36 @@ impl DataSource for MultiParquetSource {
         self.merged_histogram_stream(filter, |pf, f| {
             pf.gauge_histogram_stream(name, f, start_ns, end_ns)
         })
+    }
+
+    /// Each child's parts, under its injected labels: a child keeps its own
+    /// row interval, so a reader holds each file's rows for that file's
+    /// interval rather than the longest file's.
+    fn gauge_histogram_parts(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<Vec<(HistogramStream, f64)>> {
+        let mut out = Vec::new();
+        for (pf, extra) in &self.files {
+            let Some(pq_filter) = resolve_filter(extra, filter) else {
+                continue;
+            };
+            let Some(parts) = pf.gauge_histogram_parts(name, &pq_filter, start_ns, end_ns) else {
+                continue;
+            };
+            for (mut stream, interval) in parts {
+                inject_labels(&mut stream, extra);
+                out.push((stream, interval));
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
@@ -668,18 +712,7 @@ impl MultiParquetSource {
             .filter_map(|(pf, extra)| {
                 let pq_filter = resolve_filter(extra, filter)?;
                 let mut stream = read(pf.as_ref(), &pq_filter)?;
-                if !extra.inner.is_empty() {
-                    for series_labels in &mut stream.meta.series {
-                        for (k, v) in &extra.inner {
-                            debug_assert!(
-                                !series_labels.inner.contains_key(k),
-                                "injected label key '{}' conflicts with native parquet label",
-                                k
-                            );
-                            series_labels.inner.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
+                inject_labels(&mut stream, extra);
                 Some(stream)
             })
             .collect();
