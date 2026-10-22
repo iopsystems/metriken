@@ -218,7 +218,11 @@ Reading:
 - metriken writes no standalone parquet. A parquet file has no format
   version its readers check, so a reader from before a column kind reads
   the new kind with nothing to stop it; an archive's segments carry
-  `metriken.format`. `convert` is `MsgpackToArchive` (a raw msgpack
+  `metriken.format`, which metriken-storage 0.3.0 to 0.4.0 check. Readers
+  on metriken-segment 0.1.4 / metriken-archive 0.2.7 (rezolus 5.25 to 5.28)
+  do not check it and read any list column as a counting histogram; they
+  are kept from a new archive by dendro, whose 0.3.3 opens only schema 4,
+  while dendro 0.6 writes schema 5. `convert` is `MsgpackToArchive` (a raw msgpack
   recording into a `.dendro`, one source, through `ArchiveWriter`), and
   `MsgpackToParquet`, `ParquetOptions`, `ParquetHistogramType` (with its
   sparse layout), `ParquetSchema` and `ParquetWriter` are removed. Reading

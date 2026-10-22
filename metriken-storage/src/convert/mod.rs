@@ -9,8 +9,13 @@
 //! metriken writes no standalone parquet. A standalone file is opened by
 //! readers that do not check its `metriken.format` key (pyarrow, DuckDB, a
 //! script over its columns), so nothing stops one of them reading a new
-//! column kind (a gauge histogram) as the kind it knows; an archive is read
-//! through metriken's readers, which refuse a format newer than theirs.
+//! column kind (a gauge histogram) as the kind it knows. An archive with a
+//! gauge histogram is refused by older metriken readers: metriken-storage
+//! 0.3.0 to 0.4.0 refuse its format 2 segment (`metriken.format`), and
+//! readers built on metriken-segment 0.1 and metriken-archive 0.2 (rezolus
+//! 5.25 to 5.28), which do not check `metriken.format`, refuse the archive
+//! because dendro 0.3 opens only schema 4 and this archive is schema 5 (as
+//! is every archive dendro 0.6 writes).
 //! Parquet files written before keep reading (`parquet`, `MultiParquetSource`,
 //! and metriken-query's `ParquetReader`).
 
@@ -21,6 +26,7 @@ use std::time::UNIX_EPOCH;
 
 use metriken_model::Snapshot;
 
+use crate::process::{PRODUCER_EPOCH, PRODUCER_EPOCHS};
 use crate::{ArchiveWriter, WriterConfig};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -91,26 +97,41 @@ impl MsgpackToArchive {
     /// `producer_epoch` and the like), with the entries given to
     /// [`metadata`](Self::metadata) replacing those of the same key.
     ///
+    /// A recording that spans a producer restart (a snapshot whose
+    /// `producer_epoch` differs from the one before it) gets
+    /// `producer_epochs`, one `{"epoch", "from_ts"}` entry per epoch (with
+    /// the snapshot's `version` when it carries one), oldest first, the
+    /// first from the first row, and `producer_epoch` names the newest, as
+    /// metriken-recorder writes them. A caller that sets `producer_epoch` or
+    /// `producer_epochs` through [`metadata`](Self::metadata) keeps its own.
+    ///
     /// An input with no snapshot is an error, and no archive is created. A
     /// snapshot that does not decode, or a write that fails, ends the
     /// conversion with an error naming the snapshot's position, and the
-    /// archive written so far is removed, so `output` holds a finished
-    /// archive or nothing.
+    /// files the conversion created are removed: the archive and any of its
+    /// `-wal`, `-shm` and `-journal` sidecars that did not exist when it was
+    /// created. A file that was there before is left alone.
     pub fn convert_reader(self, reader: impl Read, output: impl AsRef<Path>) -> Result<u64, Error> {
         let output = output.as_ref();
-        let existed = output.exists();
-        let result = self.convert_into(reader, output);
-        if result.is_err() && !existed {
-            for suffix in ["", "-wal", "-shm", "-journal"] {
-                let mut path = output.as_os_str().to_owned();
-                path.push(suffix);
+        let mut created = Vec::new();
+        let result = self.convert_into(reader, output, &mut created);
+        if result.is_err() {
+            for path in created {
                 let _ = std::fs::remove_file(path);
             }
         }
         result
     }
 
-    fn convert_into(self, reader: impl Read, output: &Path) -> Result<u64, Error> {
+    /// `created` receives the files the conversion owns, once
+    /// [`ArchiveWriter::create`] has succeeded: the archive, and the
+    /// sidecar paths that did not exist just before it.
+    fn convert_into(
+        self,
+        reader: impl Read,
+        output: &Path,
+        created: &mut Vec<std::path::PathBuf>,
+    ) -> Result<u64, Error> {
         let mut reader = BufReader::new(reader);
         let mut next = |index: u64| -> Result<Option<Snapshot>, Error> {
             if reader.fill_buf()?.is_empty() {
@@ -126,28 +147,54 @@ impl MsgpackToArchive {
         let ts = |s: &Snapshot| -> Result<u64, Error> {
             Ok(s.systemtime().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
         };
+        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"]
+            .iter()
+            .map(|suffix| {
+                let mut path = output.as_os_str().to_owned();
+                path.push(suffix);
+                std::path::PathBuf::from(path)
+            })
+            .filter(|path| !path.exists())
+            .collect();
         let mut writer = ArchiveWriter::create(output, self.config)?;
-        let mut source = writer.add_source(self.labels, self.metadata.clone(), ts(&first)?)?;
+        created.push(output.to_path_buf());
+        created.extend(sidecars);
+        let first_ts = ts(&first)?;
+        let mut source = writer.add_source(self.labels, self.metadata.clone(), first_ts)?;
+        let track_epochs = !self.metadata.contains_key(PRODUCER_EPOCH)
+            && !self.metadata.contains_key(PRODUCER_EPOCHS);
+        // Every epoch seen, oldest first, with its first row and version.
+        let mut epochs: Vec<(String, u64, Option<String>)> = Vec::new();
         let mut carried = false;
         let mut written = 0u64;
         let mut last = 0u64;
         let mut snapshot = Some(first);
         while let Some(s) = snapshot {
-            if !carried {
-                let found = snapshot_metadata(&s);
-                if !found.is_empty() {
-                    let patch: BTreeMap<String, String> = found
-                        .iter()
-                        .filter(|(k, _)| !self.metadata.contains_key(*k))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    if !patch.is_empty() {
-                        source.update_metadata(patch)?;
-                    }
-                    carried = true;
+            let found = snapshot_metadata(&s);
+            if !carried && !found.is_empty() {
+                let patch: BTreeMap<String, String> = found
+                    .iter()
+                    .filter(|(k, _)| !self.metadata.contains_key(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if !patch.is_empty() {
+                    source.update_metadata(patch)?;
                 }
+                carried = true;
             }
             let at = ts(&s)?;
+            if let Some(epoch) = found
+                .get(PRODUCER_EPOCH)
+                .filter(|e| track_epochs && !e.is_empty())
+            {
+                if epochs.last().is_none_or(|(last, _, _)| last != epoch) {
+                    let from_ts = if epochs.is_empty() { first_ts } else { at };
+                    epochs.push((epoch.clone(), from_ts, found.get("version").cloned()));
+                    if epochs.len() > 1 {
+                        source.update_metadata(epoch_patch(&epochs))?;
+                    }
+                }
+            }
             last = last.max(at);
             let staged = source
                 .stage(&s, at, 0)
@@ -161,6 +208,28 @@ impl MsgpackToArchive {
         writer.join()?;
         Ok(written)
     }
+}
+
+/// `producer_epochs` for `epochs` and `producer_epoch` naming the newest.
+fn epoch_patch(epochs: &[(String, u64, Option<String>)]) -> BTreeMap<String, String> {
+    let list: Vec<serde_json::Value> = epochs
+        .iter()
+        .map(|(epoch, from_ts, version)| {
+            let mut e = serde_json::json!({ "epoch": epoch, "from_ts": from_ts });
+            if let Some(version) = version {
+                e["version"] = serde_json::Value::String(version.clone());
+            }
+            e
+        })
+        .collect();
+    let newest = &epochs.last().expect("a patch names at least one epoch").0;
+    BTreeMap::from([
+        (
+            PRODUCER_EPOCHS.to_string(),
+            serde_json::Value::Array(list).to_string(),
+        ),
+        (PRODUCER_EPOCH.to_string(), newest.clone()),
+    ])
 }
 
 /// A snapshot's metadata, any version.

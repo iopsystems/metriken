@@ -322,6 +322,147 @@ fn convert_writes_a_gauge_histogram_to_an_archive() {
     assert!(!partial.exists());
 }
 
+/// A failed conversion removes only the files it created. Sidecars that
+/// were there before (an empty input fails before the archive is created)
+/// and an existing output (which the writer refuses to create over) are
+/// left alone; a conversion that fails after creating the archive removes
+/// the archive and its sidecars.
+#[cfg(feature = "convert")]
+#[test]
+fn a_failed_convert_removes_only_what_it_created() {
+    use metriken_storage::convert::MsgpackToArchive;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = |base: &Path, suffix: &str| {
+        let mut p = base.as_os_str().to_owned();
+        p.push(suffix);
+        std::path::PathBuf::from(p)
+    };
+    // Sidecars present, no archive, an empty input.
+    let side = dir.path().join("side.dendro");
+    for suffix in ["-wal", "-journal"] {
+        std::fs::write(sidecar(&side, suffix), b"theirs").unwrap();
+    }
+    assert!(MsgpackToArchive::new()
+        .convert_reader(std::io::Cursor::new(Vec::new()), &side)
+        .is_err());
+    for suffix in ["-wal", "-journal"] {
+        assert_eq!(
+            std::fs::read(sidecar(&side, suffix)).unwrap(),
+            b"theirs",
+            "{suffix} kept"
+        );
+    }
+    // An existing output, a valid input: the create fails, the file stays.
+    let msgpack = rmp_serde::to_vec(&v2_snapshot(0)).unwrap();
+    let existing = dir.path().join("existing.dendro");
+    std::fs::write(&existing, b"theirs").unwrap();
+    assert!(MsgpackToArchive::new()
+        .convert_reader(std::io::Cursor::new(msgpack.clone()), &existing)
+        .is_err());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"theirs");
+    // Created, then a snapshot that does not decode: everything it made is
+    // gone.
+    let mut broken = msgpack;
+    broken.extend([0xc1, 0x00]);
+    let made = dir.path().join("made.dendro");
+    assert!(MsgpackToArchive::new()
+        .convert_reader(std::io::Cursor::new(broken), &made)
+        .is_err());
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        assert!(!sidecar(&made, suffix).exists(), "{suffix:?} removed");
+    }
+}
+
+/// A raw recording spanning a producer restart (the snapshots'
+/// `producer_epoch` changes) gets `producer_epochs`, one entry per epoch
+/// from its first row, and `producer_epoch` names the newest. A caller's
+/// `producer_epoch` is kept and no list is written.
+#[cfg(feature = "convert")]
+#[test]
+fn convert_records_each_producer_epoch() {
+    use metriken_storage::convert::MsgpackToArchive;
+
+    let with_epoch = |t: u64, epoch: &str, version: &str| {
+        let Snapshot::V2(mut s) = v2_snapshot(t) else {
+            unreachable!()
+        };
+        s.metadata
+            .insert("producer_epoch".to_string(), epoch.to_string());
+        s.metadata
+            .insert("version".to_string(), version.to_string());
+        rmp_serde::to_vec(&Snapshot::V2(s)).unwrap()
+    };
+    let mut msgpack = Vec::new();
+    for (t, epoch, version) in [
+        (0, "epoch-a", "1.0.0"),
+        (1, "epoch-a", "1.0.0"),
+        (2, "epoch-b", "1.1.0"),
+        (3, "epoch-b", "1.1.0"),
+    ] {
+        msgpack.extend(with_epoch(t, epoch, version));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.dendro");
+    MsgpackToArchive::new()
+        .convert_reader(std::io::Cursor::new(msgpack.clone()), &path)
+        .unwrap();
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let meta = catalog.sources().unwrap().remove(0).metadata;
+    assert_eq!(
+        meta.get("producer_epoch").map(String::as_str),
+        Some("epoch-b")
+    );
+    let epochs: serde_json::Value =
+        serde_json::from_str(meta.get("producer_epochs").expect("a list")).unwrap();
+    assert_eq!(
+        epochs,
+        serde_json::json!([
+            { "epoch": "epoch-a", "from_ts": BASE, "version": "1.0.0" },
+            { "epoch": "epoch-b", "from_ts": BASE + 2 * S, "version": "1.1.0" },
+        ])
+    );
+    let spans = metriken_storage::process::epoch_spans(&meta, Some((BASE, BASE + 3 * S)));
+    assert_eq!(spans.len(), 2);
+    assert_eq!(
+        (spans[0].first_ns, spans[0].last_ns),
+        (BASE, BASE + 2 * S - 1)
+    );
+    assert_eq!(spans[1].first_ns, BASE + 2 * S);
+    drop(catalog);
+
+    // One epoch throughout: no list.
+    let single = dir.path().join("single.dendro");
+    MsgpackToArchive::new()
+        .convert_reader(
+            std::io::Cursor::new(with_epoch(0, "epoch-a", "1.0.0")),
+            &single,
+        )
+        .unwrap();
+    let meta = DendroCatalog::open(&single)
+        .unwrap()
+        .sources()
+        .unwrap()
+        .remove(0)
+        .metadata;
+    assert!(!meta.contains_key("producer_epochs"), "{meta:?}");
+
+    // The caller's epoch wins.
+    let pinned = dir.path().join("pinned.dendro");
+    MsgpackToArchive::new()
+        .metadata("producer_epoch", "mine")
+        .convert_reader(std::io::Cursor::new(msgpack), &pinned)
+        .unwrap();
+    let meta = DendroCatalog::open(&pinned)
+        .unwrap()
+        .sources()
+        .unwrap()
+        .remove(0)
+        .metadata;
+    assert_eq!(meta.get("producer_epoch").map(String::as_str), Some("mine"));
+    assert!(!meta.contains_key("producer_epochs"), "{meta:?}");
+}
+
 /// A V2 snapshot's `gauge_histograms` entry (what `Snapshotter` writes for
 /// a `GaugeHistogram`) is a gauge histogram in its sampler's table. The list
 /// is the kind: a counting entry whose metadata claims `metric_type =

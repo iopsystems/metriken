@@ -351,11 +351,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sparse layout), `ParquetSchema` and `ParquetWriter` are removed. A
   standalone parquet file is opened by readers that do not check
   `metriken.format` (pyarrow, DuckDB, scripts), which nothing stops reading
-  a new column kind as one they know; an archive is read through metriken's
-  readers, which refuse a newer format. `MsgpackToArchive` carries the first
-  non-empty snapshot metadata into the source's metadata (the caller's
-  entries first) and removes a partial archive when the conversion fails.
-  Parquet files written before are read as they were.
+  a new column kind as one they know. Older metriken readers refuse an
+  archive holding a gauge histogram: metriken-storage 0.3.0 to 0.4.0 by its
+  format 2 segment, and readers on metriken-segment 0.1 / metriken-archive
+  0.2 (rezolus 5.25 to 5.28), which do not check `metriken.format`, because
+  their dendro 0.3 opens only schema 4 and the archive is schema 5.
+  `MsgpackToArchive` carries the first non-empty snapshot metadata into the
+  source's metadata (the caller's entries first), writes `producer_epochs`
+  when the snapshots' `producer_epoch` changes (a raw recording that spans
+  a producer restart), and when the conversion fails removes the files it
+  created (the archive, and sidecars that did not exist before), never a
+  file that was already there. Parquet files written before are read as
+  they were.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in
   one coarser bucket had their cumulative counts summed, so 3 observations
