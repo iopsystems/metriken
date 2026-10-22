@@ -290,12 +290,14 @@ pub fn project_segment_columns(
 
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(
-            &mut buf,
-            projected_schema,
-            Some(crate::rez::rez::segment_writer_props()),
-        )
-        .map_err(|e| format!("failed to open a projected segment writer: {e}"))?;
+        // The projection keeps the columns' metadata but not the file's, so
+        // a segment still holding a gauge histogram is stamped again.
+        let props = crate::format::stamped_if_newer(
+            crate::rez::rez::segment_writer_props(),
+            &projected_schema,
+        );
+        let mut writer = ArrowWriter::try_new(&mut buf, projected_schema, Some(props))
+            .map_err(|e| format!("failed to open a projected segment writer: {e}"))?;
         for batch in reader {
             let batch = batch.map_err(|e| format!("failed to read a segment batch: {e}"))?;
             let projected = batch

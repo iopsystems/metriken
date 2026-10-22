@@ -21,7 +21,7 @@ use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
 use crate::buffer_pool::{content_source_id, next_source_id, BufferPool, CacheKey};
-use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::histogram_stream::{HistKind, HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 
 use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
@@ -210,28 +210,21 @@ impl DataSource for MultiParquetSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        let streams: Vec<HistogramStream> = self
-            .files
-            .iter()
-            .filter_map(|(pf, extra)| {
-                let pq_filter = resolve_filter(extra, filter)?;
-                let mut stream = pf.histogram_stream(name, &pq_filter, start_ns, end_ns)?;
-                if !extra.inner.is_empty() {
-                    for series_labels in &mut stream.meta.series {
-                        for (k, v) in &extra.inner {
-                            debug_assert!(
-                                !series_labels.inner.contains_key(k),
-                                "injected label key '{}' conflicts with native parquet label",
-                                k
-                            );
-                            series_labels.inner.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                Some(stream)
-            })
-            .collect();
-        HistogramStream::merge(streams)
+        self.merged_histogram_stream(filter, |pf, f| {
+            pf.histogram_stream(name, f, start_ns, end_ns)
+        })
+    }
+
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        self.merged_histogram_stream(filter, |pf, f| {
+            pf.gauge_histogram_stream(name, f, start_ns, end_ns)
+        })
     }
 
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
@@ -290,6 +283,16 @@ impl DataSource for MultiParquetSource {
             .unwrap_or_else(|| self.interval())
     }
 
+    /// The longest of the intervals of the files holding `name`.
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.files
+            .iter()
+            .filter(|(pf, _)| pf.gauge_histogram_names().iter().any(|n| n == name))
+            .map(|(pf, _)| pf.gauge_histogram_interval(name))
+            .max_by(f64::total_cmp)
+            .unwrap_or_else(|| self.interval())
+    }
+
     fn time_range(&self) -> Option<(u64, u64)> {
         let (mut lo, mut hi): (Option<u64>, Option<u64>) = (None, None);
         for (pf, _) in &self.files {
@@ -325,49 +328,31 @@ impl DataSource for MultiParquetSource {
         names.into_iter().collect()
     }
 
-    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
-        for (pf, extra) in &self.files {
-            for mut labels in pf.counter_labels(name) {
-                for (k, v) in &extra.inner {
-                    labels.insert(k.clone(), v.clone());
-                }
-                sets.push(labels);
-            }
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
+            names.extend(pf.gauge_histogram_names());
         }
-        sets.sort();
-        sets.dedup();
-        sets
+        names.into_iter().collect()
+    }
+
+    fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.injected_labels(|pf| pf.counter_labels(name))
     }
 
     fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
-        for (pf, extra) in &self.files {
-            for mut labels in pf.gauge_labels(name) {
-                for (k, v) in &extra.inner {
-                    labels.insert(k.clone(), v.clone());
-                }
-                sets.push(labels);
-            }
-        }
-        sets.sort();
-        sets.dedup();
-        sets
+        self.injected_labels(|pf| pf.gauge_labels(name))
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
-        for (pf, extra) in &self.files {
-            for mut labels in pf.histogram_labels(name) {
-                for (k, v) in &extra.inner {
-                    labels.insert(k.clone(), v.clone());
-                }
-                sets.push(labels);
-            }
-        }
-        sets.sort();
-        sets.dedup();
-        sets
+        self.injected_labels(|pf| pf.histogram_labels(name))
+    }
+
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.injected_labels(|pf| pf.gauge_histogram_labels(name))
     }
 
     fn column_map(
@@ -406,10 +391,14 @@ impl DataSource for MultiParquetSource {
         type Names = fn(&dyn DataSource) -> Vec<String>;
         type LabelSets =
             fn(&dyn DataSource, &str) -> Vec<std::collections::BTreeMap<String, String>>;
-        let kinds: [(Names, LabelSets); 3] = [
+        let kinds: [(Names, LabelSets); 4] = [
             (|s| s.counter_names(), |s, n| s.counter_labels(n)),
             (|s| s.gauge_names(), |s, n| s.gauge_labels(n)),
             (|s| s.histogram_names(), |s, n| s.histogram_labels(n)),
+            (
+                |s| s.gauge_histogram_names(),
+                |s, n| s.gauge_histogram_labels(n),
+            ),
         ];
 
         let mut total: usize = self.files.iter().map(|(pf, _)| pf.series_count()).sum();
@@ -545,16 +534,20 @@ impl MultiParquetSource {
     /// histogram configs disagree, which would otherwise splice into silently
     /// wrong bucket boundaries.
     pub fn histogram_configs(&self) -> std::collections::BTreeMap<String, (u8, u8)> {
+        self.histogram_configs_of(HistKind::Counting)
+    }
+
+    /// [`histogram_configs`](Self::histogram_configs) for the histograms of
+    /// `kind`.
+    pub(crate) fn histogram_configs_of(
+        &self,
+        kind: HistKind,
+    ) -> std::collections::BTreeMap<String, (u8, u8)> {
         let mut out = std::collections::BTreeMap::new();
         for (pf, _) in &self.files {
             for col in pf.columns_desc() {
-                if let ColKind::Histogram {
-                    grouping_power,
-                    max_value_power,
-                } = col.kind
-                {
-                    out.entry(col.name)
-                        .or_insert((grouping_power, max_value_power));
+                if let Some(config) = col.kind.histogram(kind) {
+                    out.entry(col.name).or_insert(config);
                 }
             }
         }
@@ -573,16 +566,20 @@ impl MultiParquetSource {
     /// open (a cross-*segment* difference is fine — that's handled by
     /// splitting into distinct runs, not rejected).
     pub fn histogram_config_variants(&self) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
+        self.histogram_config_variants_of(HistKind::Counting)
+    }
+
+    /// [`histogram_config_variants`](Self::histogram_config_variants) for
+    /// the histograms of `kind`.
+    pub(crate) fn histogram_config_variants_of(
+        &self,
+        kind: HistKind,
+    ) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
         let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
             std::collections::BTreeMap::new();
         for (pf, _) in &self.files {
             for col in pf.columns_desc() {
-                if let ColKind::Histogram {
-                    grouping_power,
-                    max_value_power,
-                } = col.kind
-                {
-                    let cfg = (grouping_power, max_value_power);
+                if let Some(cfg) = col.kind.histogram(kind) {
                     let list = out.entry(col.name).or_default();
                     if !list.contains(&cfg) {
                         list.push(cfg);
@@ -635,10 +632,16 @@ impl MultiParquetSource {
 
     /// Histogram twin of [`counter_columns`](Self::counter_columns).
     pub fn histogram_columns(&self) -> Vec<(String, Labels)> {
+        self.histogram_columns_of(HistKind::Counting)
+    }
+
+    /// [`histogram_columns`](Self::histogram_columns) for the histograms of
+    /// `kind`.
+    pub(crate) fn histogram_columns_of(&self, kind: HistKind) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
         for (pf, extra) in &self.files {
             for col in pf.columns_desc() {
-                if matches!(col.kind, ColKind::Histogram { .. }) {
+                if col.kind.histogram(kind).is_some() {
                     let mut labels = col.labels;
                     for (k, v) in &extra.inner {
                         labels.inner.insert(k.clone(), v.clone());
@@ -648,6 +651,59 @@ impl MultiParquetSource {
             }
         }
         out
+    }
+
+    /// Each child's histogram stream from `read`, given the query filter
+    /// less the child's injected labels, with those labels added to its
+    /// series, merged into one stream (rebucketed to the coarsest
+    /// configuration among them).
+    fn merged_histogram_stream(
+        &self,
+        filter: &Labels,
+        read: impl Fn(&dyn DataSource, &Labels) -> Option<HistogramStream>,
+    ) -> Option<HistogramStream> {
+        let streams: Vec<HistogramStream> = self
+            .files
+            .iter()
+            .filter_map(|(pf, extra)| {
+                let pq_filter = resolve_filter(extra, filter)?;
+                let mut stream = read(pf.as_ref(), &pq_filter)?;
+                if !extra.inner.is_empty() {
+                    for series_labels in &mut stream.meta.series {
+                        for (k, v) in &extra.inner {
+                            debug_assert!(
+                                !series_labels.inner.contains_key(k),
+                                "injected label key '{}' conflicts with native parquet label",
+                                k
+                            );
+                            series_labels.inner.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Some(stream)
+            })
+            .collect();
+        HistogramStream::merge(streams)
+    }
+
+    /// Each child's label sets from `labels`, with the child's injected
+    /// labels added, sorted and deduplicated.
+    fn injected_labels(
+        &self,
+        labels: impl Fn(&dyn DataSource) -> Vec<std::collections::BTreeMap<String, String>>,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (pf, extra) in &self.files {
+            for mut set in labels(pf.as_ref()) {
+                for (k, v) in &extra.inner {
+                    set.insert(k.clone(), v.clone());
+                }
+                sets.push(set);
+            }
+        }
+        sets.sort();
+        sets.dedup();
+        sets
     }
 
     /// Whether any two of these children could hold the same series. Two
@@ -923,9 +979,24 @@ impl DataSource for FileSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        // Fully qualified: the inherent method shares this name and would
-        // otherwise win method resolution and recurse.
-        ParquetSource::histogram_stream(&self.0, name, filter, start_ns, end_ns)
+        ParquetSource::histogram_stream_of(
+            &self.0,
+            HistKind::Counting,
+            name,
+            filter,
+            start_ns,
+            end_ns,
+        )
+    }
+
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        ParquetSource::histogram_stream_of(&self.0, HistKind::Gauge, name, filter, start_ns, end_ns)
     }
 
     fn interval(&self) -> f64 {
@@ -948,6 +1019,11 @@ impl DataSource for FileSource {
         self.0.names_of(|k| matches!(k, ColKind::Histogram { .. }))
     }
 
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.0
+            .names_of(|k| matches!(k, ColKind::GaugeHistogram { .. }))
+    }
+
     fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         self.0.labels_of(name, |k| matches!(k, ColKind::Counter))
     }
@@ -959,6 +1035,14 @@ impl DataSource for FileSource {
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         self.0
             .labels_of(name, |k| matches!(k, ColKind::Histogram { .. }))
+    }
+
+    fn gauge_histogram_labels(
+        &self,
+        name: &str,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0
+            .labels_of(name, |k| matches!(k, ColKind::GaugeHistogram { .. }))
     }
 
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
@@ -1541,8 +1625,10 @@ impl ParquetSource {
         min_ns.zip(max_ns)
     }
 
-    fn histogram_stream(
+    /// The rows of the histograms of `kind` named `name`.
+    fn histogram_stream_of(
         self: &Arc<Self>,
+        kind: HistKind,
         name: &str,
         filter: &Labels,
         start_ns: u64,
@@ -1555,7 +1641,7 @@ impl ParquetSource {
             .columns()
             .iter()
             .filter(|c| {
-                matches!(c.kind, ColKind::Histogram { .. })
+                c.kind.histogram(kind).is_some()
                     && c.name == name
                     && (filter.inner.is_empty() || c.labels.matches(filter))
             })
@@ -1566,12 +1652,9 @@ impl ParquetSource {
             return None;
         }
 
-        let config = col_descs.iter().find_map(|c| match c.kind {
-            ColKind::Histogram {
-                grouping_power: gp,
-                max_value_power: mvp,
-            } => ::histogram::Config::new(gp, mvp).ok(),
-            _ => None,
+        let config = col_descs.iter().find_map(|c| {
+            let (gp, mvp) = c.kind.histogram(kind)?;
+            ::histogram::Config::new(gp, mvp).ok()
         })?;
 
         let series: Vec<Labels> = col_descs.iter().map(|c| c.labels.clone()).collect();
@@ -1658,6 +1741,35 @@ enum ColKind {
         grouping_power: u8,
         max_value_power: u8,
     },
+    /// A list column whose field metadata has `metric_type =
+    /// gauge_histogram`: buckets laid out as a histogram's, read as state.
+    GaugeHistogram {
+        grouping_power: u8,
+        max_value_power: u8,
+    },
+}
+
+impl ColKind {
+    /// The bucket configuration, when this is a histogram of `kind`.
+    fn histogram(&self, kind: HistKind) -> Option<(u8, u8)> {
+        match (self, kind) {
+            (
+                ColKind::Histogram {
+                    grouping_power,
+                    max_value_power,
+                },
+                HistKind::Counting,
+            )
+            | (
+                ColKind::GaugeHistogram {
+                    grouping_power,
+                    max_value_power,
+                },
+                HistKind::Gauge,
+            ) => Some((*grouping_power, *max_value_power)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1794,9 +1906,22 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                     let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
                         return None;
                     };
-                    ColKind::Histogram {
-                        grouping_power: gp,
-                        max_value_power: mvp,
+                    // `metric_type` is what separates the two histogram
+                    // kinds; the buckets are laid out alike. Segments holding
+                    // a gauge histogram are format 2, which readers that do
+                    // not know this refuse (`format.rs`).
+                    if meta.get(metriken_model::METRIC_TYPE).map(String::as_str)
+                        == Some(metriken_model::GAUGE_HISTOGRAM)
+                    {
+                        ColKind::GaugeHistogram {
+                            grouping_power: gp,
+                            max_value_power: mvp,
+                        }
+                    } else {
+                        ColKind::Histogram {
+                            grouping_power: gp,
+                            max_value_power: mvp,
+                        }
                     }
                 }
                 _ => return None,

@@ -230,6 +230,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-source archive is unchanged (median 11.8 to 12.4 ms before, 12.0 to
   12.1 ms after, three sets of 11 opens each), and grouping 64 sources that
   share one epoch takes 0.25 to 0.6 ms beside an open of 335 ms or more.
+- **Added:** gauge histograms. A histogram column whose field metadata has
+  `metric_type = gauge_histogram` is listed by
+  `DataSource::gauge_histogram_names` and read by `gauge_histogram_stream`
+  (with `gauge_histogram_labels` and `gauge_histogram_interval`), and never
+  by the histogram methods, so a caller that differences histogram rows does
+  not see one. The new methods default to empty and `None`; every source in
+  the crate forwards them, and `CompositionCatalog::gauge_histograms` names
+  a lazy child's. `ArchiveReader` gains `gauge_histogram_names`,
+  `gauge_histogram_labels` and `SamplerReader::holds_gauge_histogram`;
+  `Memory` gains `push_gauge_histogram_series` and, with `ingest`,
+  `upsert_gauge_histogram_sample`.
+- **Added:** segment format 2. A segment holding a gauge histogram column is
+  written with `metriken.format = 2`, which readers from 0.3.0 to 0.4.0
+  refuse: opening such an archive with metriken-storage 0.4.0 fails with
+  "probing table fs/ext4: segment format 2 is newer than this reader, which
+  reads up to 1". Segments without one are still format 1.
+  `format::FORMAT_VERSION` is now 2 and means the newest format this crate
+  reads; a writer stamps `format::stamped_for(props, &schema)` (or
+  `stamped_if_newer`), not `FORMAT_VERSION`. `format::format_of` gives a
+  schema's format. An old reader still reads a gauge histogram as a counting
+  histogram from a live WAL tail written by this release, and from an
+  archive an old writer recorded from a new producer
+  (`docs/journal/2026-10-21-gauge-histogram.md`, open decision 1).
+- **Changed:** `convert` keeps a gauge histogram's `metric_type` (it wrote
+  `histogram` over it), writes it in the standard layout whatever
+  `histogram_type` asks for, and stamps such a file format 2.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in
   one coarser bucket had their cumulative counts summed, so 3 observations

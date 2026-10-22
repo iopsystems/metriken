@@ -26,9 +26,11 @@ pub struct WalCell {
     pub name: String,
     /// The snapshot **entry's** metadata, verbatim — NOT the parquet column's.
     ///
-    /// The difference matters to a reader. `metric_type` is **not** in here:
+    /// The difference matters to a reader. `metric_type` is **not** in here,
+    /// except for a gauge histogram, whose producer sets it to
+    /// [`GAUGE_HISTOGRAM`](crate::GAUGE_HISTOGRAM):
     /// `TableBuilder::push_row` injects it (`metriken-storage`'s `builder.rs`, the `or_insert_with` that
-    /// builds a `Column`) and `metriken-exposition` never carries it. A
+    /// builds a `Column`, which keeps a value the entry carries). A
     /// recovery path that built `Column { metadata: cell.metadata, .. }`
     /// directly would produce a column a natively sealed segment does not
     /// match, and `read_table_parquet` would then read every gauge back as a

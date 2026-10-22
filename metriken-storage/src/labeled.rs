@@ -169,6 +169,36 @@ impl LabeledSource {
     }
 }
 
+impl LabeledSource {
+    /// `stream` with this source's labels added to its series, and the rows
+    /// of series `filter` does not accept dropped.
+    fn relabel_stream(
+        &self,
+        mut stream: HistogramStream,
+        filter: &Labels,
+    ) -> Option<HistogramStream> {
+        for labels in &mut stream.meta.series {
+            self.relabel(labels);
+        }
+        // Rows refer to series by index, so a series cannot be dropped from
+        // the meta; drop its rows instead.
+        let dropped: Vec<bool> = stream
+            .meta
+            .series
+            .iter()
+            .map(|l| !keeps(l, &self.extra, filter))
+            .collect();
+        if dropped.iter().all(|d| *d) {
+            return None;
+        }
+        if dropped.iter().any(|d| *d) {
+            let rows = stream.rows;
+            stream.rows = Box::new(rows.filter(move |r| !dropped[r.series_idx]));
+        }
+        Some(stream)
+    }
+}
+
 impl DataSource for LabeledSource {
     fn counters(
         &self,
@@ -317,28 +347,24 @@ impl DataSource for LabeledSource {
         end_ns: u64,
     ) -> Option<HistogramStream> {
         let inner_filter = translate_filter(&self.extra, filter)?;
-        let mut stream = self
+        let stream = self
             .inner
             .histogram_stream(name, &inner_filter, start_ns, end_ns)?;
-        for labels in &mut stream.meta.series {
-            self.relabel(labels);
-        }
-        // Rows refer to series by index, so a series cannot be dropped from
-        // the meta; drop its rows instead.
-        let dropped: Vec<bool> = stream
-            .meta
-            .series
-            .iter()
-            .map(|l| !keeps(l, &self.extra, filter))
-            .collect();
-        if dropped.iter().all(|d| *d) {
-            return None;
-        }
-        if dropped.iter().any(|d| *d) {
-            let rows = stream.rows;
-            stream.rows = Box::new(rows.filter(move |r| !dropped[r.series_idx]));
-        }
-        Some(stream)
+        self.relabel_stream(stream, filter)
+    }
+
+    fn gauge_histogram_stream(
+        &self,
+        name: &str,
+        filter: &Labels,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<HistogramStream> {
+        let inner_filter = translate_filter(&self.extra, filter)?;
+        let stream = self
+            .inner
+            .gauge_histogram_stream(name, &inner_filter, start_ns, end_ns)?;
+        self.relabel_stream(stream, filter)
     }
 
     fn interval(&self) -> f64 {
@@ -348,6 +374,11 @@ impl DataSource for LabeledSource {
     fn histogram_interval(&self, name: &str) -> f64 {
         self.interval
             .unwrap_or_else(|| self.inner.histogram_interval(name))
+    }
+
+    fn gauge_histogram_interval(&self, name: &str) -> f64 {
+        self.interval
+            .unwrap_or_else(|| self.inner.gauge_histogram_interval(name))
     }
 
     fn counter_interval(&self, name: &str) -> f64 {
@@ -385,6 +416,10 @@ impl DataSource for LabeledSource {
         self.inner.histogram_names()
     }
 
+    fn gauge_histogram_names(&self) -> Vec<String> {
+        self.inner.gauge_histogram_names()
+    }
+
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.relabel_listing(self.inner.counter_labels(name))
     }
@@ -395,6 +430,10 @@ impl DataSource for LabeledSource {
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.relabel_listing(self.inner.histogram_labels(name))
+    }
+
+    fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.relabel_listing(self.inner.gauge_histogram_labels(name))
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {

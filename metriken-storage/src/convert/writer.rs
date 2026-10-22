@@ -259,11 +259,28 @@ impl ParquetSchema {
         // buckets are stored in a single column, while in its sparse
         // representation, the non-zero bucket indices and counts are stored
         // in separate columns.
+        let mut sparse = Vec::with_capacity(self.histograms.len());
         for (histogram, mut metadata) in self.histograms.into_iter() {
-            match options.histogram_type {
+            // A gauge histogram keeps its `metric_type`, and is written in
+            // the standard layout whatever the option says: the sparse
+            // layout's columns are not read back as a histogram, and its
+            // `metric_type` would not say how to read one.
+            let gauge = metadata
+                .get(metriken_model::METRIC_TYPE)
+                .map(String::as_str)
+                == Some(metriken_model::GAUGE_HISTOGRAM);
+            let layout = if gauge {
+                ParquetHistogramType::Standard
+            } else {
+                options.histogram_type
+            };
+            sparse.push(matches!(layout, ParquetHistogramType::Sparse));
+            match layout {
                 ParquetHistogramType::Standard => {
                     // merge metric annotations into the metric metadata
-                    metadata.insert("metric_type".to_string(), "histogram".to_string());
+                    if !gauge {
+                        metadata.insert("metric_type".to_string(), "histogram".to_string());
+                    }
 
                     fields.push(
                         Field::new(
@@ -318,34 +335,38 @@ impl ParquetSchema {
         };
 
         let schema = Arc::new(Schema::new(fields));
-        let props = WriterProperties::builder()
+        let mut props = WriterProperties::builder()
             .set_compression(options.compression.inner)
             .set_key_value_metadata(schema_metadata)
             .set_max_row_group_row_count(Some(options.max_batch_size))
             .build();
+        // A file holding a gauge histogram is stamped with the format that
+        // older readers refuse; any other file stays unmarked, as before.
+        props = crate::format::stamped_if_newer(props, &schema);
         let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
 
         Ok(ParquetWriter {
             writer: arrow_writer,
-            options,
             schema,
             counters,
             gauges,
             histograms,
+            sparse,
         })
     }
 }
 
 pub struct ParquetWriter<W: Write + Send> {
-    /// Writer, options, and schema of the parquet file
+    /// Writer and schema of the parquet file
     writer: ArrowWriter<W>,
-    options: ParquetOptions,
     schema: Arc<Schema>,
 
     /// Schema-ordered list of counters, gauges, and histograms
     counters: Vec<String>,
     gauges: Vec<String>,
     histograms: Vec<String>,
+    /// Per histogram, whether it is written in the sparse layout.
+    sparse: Vec<bool>,
 }
 
 impl<W: Write + Send> ParquetWriter<W> {
@@ -380,10 +401,15 @@ impl<W: Write + Send> ParquetWriter<W> {
                 .map(|v| v.value)])));
         }
 
-        for h in self.histograms.iter_mut() {
+        for (h, &sparse) in self.histograms.iter_mut().zip(&self.sparse) {
+            let layout = if sparse {
+                ParquetHistogramType::Sparse
+            } else {
+                ParquetHistogramType::Standard
+            };
             let histogram = hs.histograms.remove(h).map(|v| v.value);
             if let Some(hist) = histogram {
-                match self.options.histogram_type {
+                match layout {
                     ParquetHistogramType::Standard => {
                         columns.push(Self::listu64_entry_from_slice(hist.as_slice()))
                     }
@@ -396,7 +422,7 @@ impl<W: Write + Send> ParquetWriter<W> {
                     }
                 };
             } else {
-                match self.options.histogram_type {
+                match layout {
                     ParquetHistogramType::Standard => columns.push(Self::listu64_entry_null()),
                     ParquetHistogramType::Sparse => columns.append(&mut vec![
                         Self::listu64_entry_null(),

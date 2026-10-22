@@ -129,6 +129,7 @@ fn probe_one(
         names.counters.extend(probe.counter_names());
         names.gauges.extend(probe.gauge_names());
         names.histograms.extend(probe.histogram_names());
+        names.gauge_histograms.extend(probe.gauge_histogram_names());
         interval.get_or_insert(probe.interval());
     }
     Ok((sampler.clone(), names, interval.unwrap_or(1.0), *span))
@@ -596,6 +597,7 @@ struct TableNames {
     counters: std::collections::HashSet<String>,
     gauges: std::collections::HashSet<String>,
     histograms: std::collections::HashSet<String>,
+    gauge_histograms: std::collections::HashSet<String>,
 }
 
 impl TableNames {
@@ -604,6 +606,7 @@ impl TableNames {
         self.counters.contains(metric)
             || self.gauges.contains(metric)
             || self.histograms.contains(metric)
+            || self.gauge_histograms.contains(metric)
     }
 }
 
@@ -744,6 +747,11 @@ impl SamplerReader {
     /// Whether this table holds histogram `name`.
     pub fn holds_histogram(&self, name: &str) -> bool {
         self.names.histograms.contains(name)
+    }
+
+    /// Whether this table holds gauge histogram `name`.
+    pub fn holds_gauge_histogram(&self, name: &str) -> bool {
+        self.names.gauge_histograms.contains(name)
     }
 
     /// The table's row spacing in seconds. Opened from a catalog: the table's
@@ -1233,6 +1241,7 @@ impl ArchiveReader {
                     .counters(t.names.counters.iter().cloned())
                     .gauges(t.names.gauges.iter().cloned())
                     .histograms(t.names.histograms.iter().cloned())
+                    .gauge_histograms(t.names.gauge_histograms.iter().cloned())
                     .metadata(
                         self.metadata
                             .iter()
@@ -1702,6 +1711,7 @@ impl ArchiveReader {
                     counters: probe.counter_names().into_iter().collect(),
                     gauges: probe.gauge_names().into_iter().collect(),
                     histograms: probe.histogram_names().into_iter().collect(),
+                    gauge_histograms: probe.gauge_histogram_names().into_iter().collect(),
                 };
                 let first_span = probe.time_range();
                 // The interval the segment declares, or else the median gap
@@ -1841,6 +1851,15 @@ impl ArchiveReader {
         )
     }
 
+    /// Gauge histogram names across every table, sorted and deduplicated.
+    pub fn gauge_histogram_names(&self) -> Vec<String> {
+        union_sorted(
+            self.tables
+                .iter()
+                .map(|t| t.names.gauge_histograms.iter().cloned().collect()),
+        )
+    }
+
     /// The label sets of counter `name`, from every table holding it, each
     /// with its recording's labels ([`series_labels`](Self::series_labels)).
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
@@ -1863,6 +1882,15 @@ impl ArchiveReader {
         self.labeled_listing(
             |t| t.names.histograms.contains(name),
             |r| r.source().histogram_labels(name),
+        )
+    }
+
+    /// The label sets of gauge histogram `name`, as
+    /// [`counter_labels`](Self::counter_labels).
+    pub fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing(
+            |t| t.names.gauge_histograms.contains(name),
+            |r| r.source().gauge_histogram_labels(name),
         )
     }
 

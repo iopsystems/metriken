@@ -674,7 +674,7 @@ fn keep_metrics_trims_a_long_table_and_keeps_it_long() {
 /// rather than misread.
 #[test]
 fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
-    use metriken_storage::format::{FORMAT_KEY, FORMAT_VERSION};
+    use metriken_storage::format::FORMAT_KEY;
     use metriken_storage::Catalog;
 
     let dir = tempfile::tempdir().unwrap();
@@ -711,7 +711,9 @@ fn segments_carry_the_format_and_an_unknown_encoder_is_refused() {
                 .into_iter()
                 .find(|e| e.key == FORMAT_KEY)
                 .and_then(|e| e.value);
-            assert_eq!(version, Some(FORMAT_VERSION.to_string()), "{table} #{seq}");
+            // Format 1: this recording holds no gauge histogram, the one
+            // column kind that needs format 2.
+            assert_eq!(version, Some("1".to_string()), "{table} #{seq}");
             segments += 1;
         }
     }

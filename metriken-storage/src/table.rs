@@ -294,7 +294,8 @@ pub fn write_table_parquet(table: &Table) -> Result<Vec<u8>, Error> {
 pub fn write_table_parquet_with(table: &Table, props: WriterProperties) -> Result<Vec<u8>, Error> {
     let (schema, batch) = table_to_batch(table)?;
     let mut buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(crate::format::stamped(props)))?;
+    let props = crate::format::stamped_for(props, &schema);
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(buf)

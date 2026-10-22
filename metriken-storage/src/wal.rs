@@ -55,7 +55,8 @@ impl<T: WalRowSource + ?Sized> WalRowSource for &T {
 /// **This replays the rows through `TableBuilder::push_row`, the same call
 /// `ingest` makes, rather than assembling columns directly.** That is not
 /// stylistic. `WalCell::metadata` is the snapshot *entry's* metadata and does
-/// not carry `metric_type` — `push_row` injects it. A tail built by copying
+/// not carry `metric_type`, except a gauge histogram's, which the producer
+/// sets — `push_row` injects it otherwise. A tail built by copying
 /// that metadata into a `Column` yields a segment a natively sealed one
 /// does not match, and `read_table_parquet` then reads every gauge back as a
 /// counter. Going through the writer's own call makes the two shapes identical

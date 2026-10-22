@@ -282,11 +282,12 @@ impl LongTableBuilder {
                 kv.push(KeyValue::new(column_occupants_key(&col.field_name()), has));
             }
         }
-        let props = crate::format::stamped(
+        let props = crate::format::stamped_for(
             props
                 .into_builder()
                 .set_key_value_metadata(Some(kv))
                 .build(),
+            &schema,
         );
         let mut buf = Vec::new();
         let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))?;

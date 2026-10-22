@@ -3,6 +3,15 @@ use std::collections::BinaryHeap;
 use crate::labels::Labels;
 use crate::types::HistogramSnapshot;
 
+/// Which reading convention a histogram column has: cumulative counts that a
+/// reader differences, or a gauge histogram's state that it must not.
+/// Selects the column set a reader's histogram plumbing works over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistKind {
+    Counting,
+    Gauge,
+}
+
 pub struct HistogramStreamMeta {
     pub config: ::histogram::Config,
     /// Labels for each series, indexed by `HistogramRow::series_idx`.

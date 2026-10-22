@@ -189,7 +189,8 @@ pub fn ingest_parquet_bytes(
             .map_err(|e| format!("failed to build a segment batch: {e}"))?;
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut w = ArrowWriter::try_new(&mut buf, seg_schema, Some(segment_writer_props()))
+            let props = crate::format::stamped_if_newer(segment_writer_props(), &seg_schema);
+            let mut w = ArrowWriter::try_new(&mut buf, seg_schema, Some(props))
                 .map_err(|e| format!("failed to open a segment writer: {e}"))?;
             w.write(&seg_batch)
                 .map_err(|e| format!("failed to write a segment: {e}"))?;
