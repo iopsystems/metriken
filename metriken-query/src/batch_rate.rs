@@ -133,7 +133,10 @@ impl<'d> PartSink<'d> {
     /// The sink a union's stage passes points to, or this one.
     fn into_inner(self) -> Self {
         match self {
-            PartSink::Union(u) => *u.inner,
+            PartSink::Union(mut u) => std::mem::replace(
+                &mut *u.inner,
+                PartSink::Series(PerSeries { points: Vec::new() }),
+            ),
             other => other,
         }
     }
@@ -163,6 +166,9 @@ pub(crate) struct UnionStage<'d> {
     /// indices with a member's point, each member's point there.
     units: Vec<StageUnit>,
     window: UnionWindow,
+    /// Points held now, and the most held at once.
+    #[cfg(any(test, feature = "fixtures"))]
+    held: (usize, usize),
 }
 
 struct StageUnit {
@@ -191,13 +197,16 @@ impl StageUnit {
             .map(|(_, p)| p)
     }
 
-    /// Drop the points at `index`, the first held.
-    fn drop_first(&mut self, index: usize) {
+    /// Drop the points at `index`, the first held; how many there were.
+    fn drop_first(&mut self, index: usize) -> usize {
+        let mut dropped = 0;
         for q in &mut self.pending {
             if q.front().is_some_and(|(i, _)| *i == index) {
                 q.pop_front();
+                dropped += 1;
             }
         }
+        dropped
     }
 }
 
@@ -247,7 +256,11 @@ impl UnionStage<'_> {
                     .find(|&k| at(k).is_some() && covers(k))
                     .or_else(|| (0..n).find(|&k| at(k).is_some() && holds(k)))
                     .and_then(|k| at(k).copied());
-                self.units[u].drop_first(index);
+                let _dropped = self.units[u].drop_first(index);
+                #[cfg(any(test, feature = "fixtures"))]
+                {
+                    self.held.0 -= _dropped;
+                }
                 if let Some(p) = pick {
                     self.inner.sink().emit(u, index, p);
                 }
@@ -286,6 +299,27 @@ impl Sink for UnionStage<'_> {
         }
         let k = self.member_slot[series] as usize;
         self.units[u].pending[k].push_back((index, point));
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            self.held.0 += 1;
+            self.held.1 = self.held.1.max(self.held.0);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    /// The most points each union stage dropped on this thread held at once,
+    /// summed over the stages: for one batched read, an upper bound on the
+    /// points its partitions held together.
+    pub(crate) static UNION_HELD_PEAK: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for UnionStage<'_> {
+    fn drop(&mut self) {
+        UNION_HELD_PEAK.with(|p| p.set(p.get() + self.held.1));
     }
 }
 
@@ -1328,6 +1362,8 @@ pub(crate) fn grid_rates(
                     tracks,
                     units,
                     window: plan.window,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    held: (0, 0),
                 }))
             })
             .collect();

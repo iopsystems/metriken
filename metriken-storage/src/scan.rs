@@ -54,6 +54,11 @@ pub struct ScanChunk {
     /// The series (index ranges into the scan's series) that no later chunk
     /// holds rows of: those of a scan [`interleave`] joined that has ended.
     /// Empty for a single scan, whose series all end with its last chunk.
+    /// An interleave of interleaves reports only its own children that
+    /// ended, not the lists of its children's chunks: the series of an
+    /// inner scan that ended early are reported when that whole inner scan
+    /// ends. A late report costs only memory (the batch path holds points
+    /// until then); no answer depends on it.
     pub ended: Vec<std::ops::Range<u32>>,
 }
 

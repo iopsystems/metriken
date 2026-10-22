@@ -1476,12 +1476,25 @@ then passes the chosen point to the aggregation or display sink, so an
 aggregate or display query materializes nothing per series (a plain `rate`
 returns each series' points, as for one recording). A member whose recording
 ends inside the range is finished when its scan ends (`ScanChunk::ended`),
-and in a display aggregation a member series silent for ten of its spacings
-is ended as one recording's is, so neither holds its group's points to the
+and in a display aggregation a member series silent for ten times the
+larger of its spacing and the step is ended as one recording's is
+(`UnionStage::end_member`), so neither holds its group's points to the
 end; a member series that pauses outside that rule still holds them until
-its rows resume. The display query is 86 ms against 56 ms for
-the double read, 279 MB against 191 MB; the 1 h `rate` 13.8 against 11.9
-ms; `sum(rate(...[1m]))` over 9.6 h 39 against 33 ms. Gauges, raw placement,
+its rows resume. `metriken-storage/tests/union_memory.rs` pins both: with
+a member that ends at a quarter of the range, or whose series fall silent
+there, the stages hold about 340 points per group series at most (a chunk
+or two of rows), against about 3000 when the member is waited on to the
+end. A display query of `sum(irate(cpu_usage[5s]))` over 9.6 h at 1 s,
+read in one batched scan end to end, takes 32 ms against 59 ms with each
+member read alone and combined after (#306), and peaks at 157 MB RSS
+against 473 MB (one source: 13 ms, 80 MB). On this recording a cgroup
+series that falls silent for ten spacings returns, so grouped display
+queries of `cgroup_cpu_usage` end the batched read after about 9 ms and
+are evaluated without the flush (on one source too); the figures that
+follow include that. Against the double read by 0.41.0, the
+`cgroup_cpu_usage` display query is 86 ms against 56 ms, 295 MB against
+191 MB; the 1 h `rate` 13.8 against 11.9 ms; `sum(rate(...[1m]))` over
+9.6 h 39 against 33 ms. Gauges, raw placement,
 explicit evaluation timestamps, the per-series rate path and members clipped
 to an epoch read each member alone as before. Two
 pre-existing behaviours were found on the way and are not changed here:
