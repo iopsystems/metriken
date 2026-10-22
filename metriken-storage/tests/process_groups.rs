@@ -74,6 +74,7 @@ fn snapshot(ts: u64) -> Snapshot {
             .with_window(Some(metriken::Window::new(ts - MS, ts)))],
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     })
 }
 

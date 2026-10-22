@@ -203,6 +203,7 @@ impl StreamDecoder {
                 counters: decoded.counters,
                 gauges: decoded.gauges,
                 histograms,
+                gauge_histograms: Vec::new(),
             }));
         }
         Ok(out)
@@ -657,9 +658,11 @@ impl GroupState {
             return Some(Arc::clone(l));
         }
         let schema = g.schema.as_ref()?;
-        let long = *self
-            .long
-            .get_or_insert_with(|| long_groups && slotted(schema));
+        // A group holding a gauge histogram is written wide: the long layout
+        // has no gauge histogram columns.
+        let long = *self.long.get_or_insert_with(|| {
+            long_groups && slotted(schema) && schema.gauge_histograms.is_empty()
+        });
         let layout = Arc::new(if long {
             Layout::Long(Arc::new(LongLayout::of(schema, &mut self.columns)))
         } else {
@@ -759,7 +762,7 @@ impl SourceRecorder {
             Snapshot::V1(s) => self.stage_flat(
                 &s.counters,
                 &s.gauges,
-                &s.histograms,
+                (&s.histograms, &s.gauge_histograms),
                 ts,
                 wall_offset,
                 &mut rows,
@@ -767,7 +770,7 @@ impl SourceRecorder {
             Snapshot::V2(s) => self.stage_flat(
                 &s.counters,
                 &s.gauges,
-                &s.histograms,
+                (&s.histograms, &s.gauge_histograms),
                 ts,
                 wall_offset,
                 &mut rows,
@@ -961,6 +964,7 @@ impl SourceRecorder {
                 counters: vec![None; widths.0],
                 gauges: vec![None; widths.1],
                 histograms: vec![None; widths.2],
+                gauge_histograms: Vec::new(),
             };
             for (i, v) in o.counters.into_iter().enumerate() {
                 occ.counters[wire.counters[i]] = v;
@@ -988,7 +992,10 @@ impl SourceRecorder {
         &mut self,
         counters: &[metriken_model::Counter],
         gauges: &[metriken_model::Gauge],
-        histograms: &[metriken_model::Histogram],
+        (histograms, gauge_histograms): (
+            &[metriken_model::Histogram],
+            &[metriken_model::Histogram],
+        ),
         ts: u64,
         wall_offset: i64,
         rows: &mut Vec<DWalRow>,
@@ -1041,6 +1048,17 @@ impl SourceRecorder {
                     value: CellValue::Histogram(&h.value),
                 });
         }
+        for h in gauge_histograms {
+            by_sampler
+                .entry(sampler_of(&h.metadata))
+                .or_default()
+                .push(Entry {
+                    name: &h.name,
+                    metadata: &h.metadata,
+                    window: h.window.map(|w| (w.begin_ns, w.end_ns)),
+                    value: CellValue::GaugeHistogram(&h.value),
+                });
+        }
 
         for (sampler, entries) in by_sampler {
             // A `/` would make the table look like a group's to a reader.
@@ -1076,6 +1094,11 @@ impl SourceRecorder {
                             h.config().max_value_power(),
                             h.as_slice().to_vec(),
                         ),
+                        CellValue::GaugeHistogram(h) => WalValue::GaugeHistogram(
+                            h.config().grouping_power(),
+                            h.config().max_value_power(),
+                            h.as_slice().to_vec(),
+                        ),
                     },
                     window: e.window,
                 })
@@ -1093,6 +1116,7 @@ impl SourceRecorder {
                             CellValue::Counter(v) => CellValue::Counter(v),
                             CellValue::Gauge(v) => CellValue::Gauge(v),
                             CellValue::Histogram(h) => CellValue::Histogram(h),
+                            CellValue::GaugeHistogram(h) => CellValue::GaugeHistogram(h),
                         },
                     })
                     .collect::<Vec<_>>(),
@@ -1124,7 +1148,11 @@ impl SourceRecorder {
         let key = g.window.map(|w| w.end_ns).unwrap_or(ts);
         // A group with no members has no values to record, and its schema
         // must not decide whether the group is long.
-        if g.counters.is_empty() && g.gauges.is_empty() && g.histograms.is_empty() {
+        if g.counters.is_empty()
+            && g.gauges.is_empty()
+            && g.histograms.is_empty()
+            && g.gauge_histograms.is_empty()
+        {
             state.last_key = Some(key);
             return Ok(());
         }
@@ -1141,7 +1169,13 @@ impl SourceRecorder {
             );
             return Ok(());
         };
-        if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len()) {
+        let gauge_histograms = match layout.as_ref() {
+            Layout::Wide(s) => s.gauge_histograms.len(),
+            Layout::Long(_) => 0,
+        };
+        if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len())
+            || gauge_histograms != g.gauge_histograms.len()
+        {
             tracing::warn!(
                 "group {} does not match its cached schema; skipped this tick",
                 g.name
@@ -1189,6 +1223,7 @@ impl SourceRecorder {
                         counters: vec![None; widths.0],
                         gauges: vec![None; widths.1],
                         histograms: vec![None; widths.2],
+                        gauge_histograms: Vec::new(),
                     };
                     for &(m, c) in &slot.counters {
                         occ.counters[c] = g.counters[m];
@@ -1439,6 +1474,7 @@ mod row_form_tests {
             counters: Vec::new(),
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
         .unwrap();
         let long = wal::encode_wal_long_row(&WalLongRow {

@@ -1907,21 +1907,29 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                         return None;
                     };
                     // `metric_type` is what separates the two histogram
-                    // kinds; the buckets are laid out alike. Segments holding
-                    // a gauge histogram are format 2, which readers that do
-                    // not know this refuse (`format.rs`).
-                    if meta.get(metriken_model::METRIC_TYPE).map(String::as_str)
-                        == Some(metriken_model::GAUGE_HISTOGRAM)
-                    {
-                        ColKind::GaugeHistogram {
+                    // kinds; the buckets are laid out alike. Absent (files
+                    // written before the key), `histogram` (written before
+                    // 0.5) or `counter_histogram`: counting. `gauge_histogram`:
+                    // a state, in a format 2 segment, which readers that do
+                    // not know it refuse (`format.rs`). Anything else (the
+                    // sparse layout's halves, a kind from a later release) is
+                    // not read rather than read as counts.
+                    match meta.get(metriken_model::METRIC_TYPE).map(String::as_str) {
+                        Some(t) if metriken_model::is_gauge_histogram(t) => {
+                            ColKind::GaugeHistogram {
+                                grouping_power: gp,
+                                max_value_power: mvp,
+                            }
+                        }
+                        None => ColKind::Histogram {
                             grouping_power: gp,
                             max_value_power: mvp,
-                        }
-                    } else {
-                        ColKind::Histogram {
+                        },
+                        Some(t) if metriken_model::is_counter_histogram(t) => ColKind::Histogram {
                             grouping_power: gp,
                             max_value_power: mvp,
-                        }
+                        },
+                        Some(_) => return None,
                     }
                 }
                 _ => return None,

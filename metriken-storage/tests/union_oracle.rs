@@ -107,6 +107,7 @@ fn snap(ts: u64, src: &Src, cpu_row: bool, fast_row: bool) -> Snapshot {
         counters,
         gauges,
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     })
 }
 

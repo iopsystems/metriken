@@ -82,6 +82,7 @@ fn snapshot(ts: u64, host_scale: u64) -> Snapshot {
         counters,
         gauges,
         histograms,
+        gauge_histograms: Vec::new(),
     })
 }
 

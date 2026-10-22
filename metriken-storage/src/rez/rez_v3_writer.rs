@@ -3222,6 +3222,7 @@ mod tests {
                 m.insert("max_value_power".to_string(), "8".to_string());
                 ExpHistogram::new("2".to_string(), h, m).with_window(w)
             }],
+            gauge_histograms: Vec::new(),
         })
     }
 
@@ -3486,6 +3487,7 @@ mod tests {
                 counters: members.iter().map(|n| desc(n)).collect(),
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3494,6 +3496,7 @@ mod tests {
                 counters: Vec::new(),
                 gauges: members.iter().map(|n| desc(n)).collect(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3511,6 +3514,7 @@ mod tests {
                 counters: Vec::new(),
                 gauges,
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3529,6 +3533,7 @@ mod tests {
                 counters,
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             }
         }
 
@@ -3945,6 +3950,7 @@ mod tests {
                     counters: vec![Some(1)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
                 .unwrap(),
             };
@@ -3959,6 +3965,7 @@ mod tests {
                     counters: vec![Some(2)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
                 .unwrap(),
             };
@@ -4001,6 +4008,7 @@ mod tests {
                     counters: vec![Some(1)],
                     gauges: Vec::new(),
                     histograms: Vec::new(),
+                    gauge_histograms: Vec::new(),
                 })
                 .unwrap(),
             };
@@ -4609,6 +4617,7 @@ mod tests {
                             counters,
                             gauges: Vec::new(),
                             histograms: Vec::new(),
+                            gauge_histograms: Vec::new(),
                         },
                         members,
                     ));
@@ -4638,6 +4647,7 @@ mod tests {
                                     .collect(),
                                 gauges: Vec::new(),
                                 histograms: Vec::new(),
+                                gauge_histograms: Vec::new(),
                             })
                             .collect(),
                     )

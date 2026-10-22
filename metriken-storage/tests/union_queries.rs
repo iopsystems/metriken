@@ -126,6 +126,7 @@ fn snapshot(ts: u64, read: &Read) -> Snapshot {
                 metriken_exposition::Histogram::new(n.to_string(), h, m).with_window(window)
             })
             .collect(),
+        gauge_histograms: Vec::new(),
     })
 }
 

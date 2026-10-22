@@ -229,10 +229,10 @@ fn a_gauge_histogram_round_trips_from_the_live_tail() {
 #[cfg(feature = "convert")]
 fn v2_snapshot(t: u64) -> Snapshot {
     let ts = BASE + t * S;
-    let entry = |name: &str, metric: &str, gauge: bool| {
+    let entry = |name: &str, metric: &str| {
         let mut h = histogram::Histogram::new(0, 16).unwrap();
         h.as_mut_slice().copy_from_slice(&state(t));
-        let mut metadata: HashMap<String, String> = [
+        let metadata: HashMap<String, String> = [
             ("metric", metric),
             ("sampler", "ext4"),
             ("grouping_power", "0"),
@@ -241,9 +241,6 @@ fn v2_snapshot(t: u64) -> Snapshot {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        if gauge {
-            metadata.insert("metric_type".to_string(), "gauge_histogram".to_string());
-        }
         metriken_exposition::Histogram::new(name.to_string(), h, metadata)
     };
     Snapshot::V2(SnapshotV2 {
@@ -252,10 +249,8 @@ fn v2_snapshot(t: u64) -> Snapshot {
         metadata: HashMap::new(),
         counters: Vec::new(),
         gauges: Vec::new(),
-        histograms: vec![
-            entry("7", "free_extents", true),
-            entry("8", "io_latency", false),
-        ],
+        histograms: vec![entry("8", "io_latency")],
+        gauge_histograms: vec![entry("7", "free_extents")],
     })
 }
 
@@ -311,40 +306,50 @@ fn convert_keeps_a_gauge_histogram() {
     }
 }
 
-/// A V2 entry tagged `metric_type = gauge_histogram` (what `Snapshotter`
-/// writes) is a gauge histogram in its sampler's table.
+/// A V2 snapshot's `gauge_histograms` entry (what `Snapshotter` writes for
+/// a `GaugeHistogram`) is a gauge histogram in its sampler's table. The list
+/// is the kind: a counting entry whose metadata claims `metric_type =
+/// gauge_histogram` stays a counting histogram. Columns carry the new
+/// strings, `counter_histogram` and `gauge_histogram`.
 #[test]
-fn a_tagged_v2_entry_is_a_gauge_histogram() {
+fn a_v2_gauge_histogram_entry_is_a_gauge_histogram() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v2.dendro");
     let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
     let labels = [("source".to_string(), "test".to_string())].into();
     let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
-    for t in 0..3u64 {
-        let ts = BASE + t * S;
+    let entry = |name: &str, metric: &str, extra: &[(&str, &str)], t: u64| {
         let mut h = histogram::Histogram::new(0, 16).unwrap();
         h.as_mut_slice().copy_from_slice(&state(t));
-        let metadata: HashMap<String, String> = [
-            ("metric", "free_extents"),
+        let mut metadata: HashMap<String, String> = [
+            ("metric", metric),
             ("sampler", "ext4"),
             ("grouping_power", "0"),
             ("max_value_power", "16"),
-            ("metric_type", "gauge_histogram"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+        for (k, v) in extra {
+            metadata.insert(k.to_string(), v.to_string());
+        }
+        metriken_exposition::Histogram::new(name.to_string(), h, metadata)
+    };
+    for t in 0..3u64 {
+        let ts = BASE + t * S;
         let snap = Snapshot::V2(SnapshotV2 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
             duration: Duration::from_millis(1),
             metadata: HashMap::new(),
             counters: Vec::new(),
             gauges: Vec::new(),
-            histograms: vec![metriken_exposition::Histogram::new(
-                "7".to_string(),
-                h,
-                metadata,
+            histograms: vec![entry(
+                "8",
+                "io_latency",
+                &[("metric_type", "gauge_histogram")],
+                t,
             )],
+            gauge_histograms: vec![entry("7", "free_extents", &[], t)],
         });
         let staged = source.stage(&snap, ts, 0).unwrap();
         writer.commit(vec![staged]).unwrap();
@@ -354,7 +359,7 @@ fn a_tagged_v2_entry_is_a_gauge_histogram() {
 
     let reader = open(&path);
     assert_eq!(reader.gauge_histogram_names(), ["free_extents"]);
-    assert!(reader.histogram_names().is_empty());
+    assert_eq!(reader.histogram_names(), ["io_latency"]);
     let rows = gauge_rows(
         table_source(&reader, "free_extents").as_ref(),
         "free_extents",
@@ -362,4 +367,38 @@ fn a_tagged_v2_entry_is_a_gauge_histogram() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].1.count, cumulative(&state(2)).count);
     assert_eq!(formats(&path, "ext4"), [Some("2".to_string())]);
+    assert_eq!(
+        column_types(&path, "ext4"),
+        [
+            ("7:buckets".to_string(), "gauge_histogram".to_string()),
+            ("8:buckets".to_string(), "counter_histogram".to_string()),
+        ]
+    );
+}
+
+/// `table`'s first sealed segment's list columns and their `metric_type`.
+fn column_types(path: &Path, table: &str) -> Vec<(String, String)> {
+    use parquet::file::reader::FileReader;
+    let catalog = DendroCatalog::open(path).unwrap();
+    let source = catalog.sources().unwrap().remove(0);
+    let (seq, _) = catalog.segment_meta(source.id, table).unwrap()[0];
+    let bytes = catalog
+        .segment_bytes(source.id, table, seq)
+        .unwrap()
+        .unwrap();
+    let reader =
+        parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+    let schema = parquet::arrow::parquet_to_arrow_schema(
+        reader.metadata().file_metadata().schema_descr(),
+        reader.metadata().file_metadata().key_value_metadata(),
+    )
+    .unwrap();
+    let mut out: Vec<(String, String)> = schema
+        .fields()
+        .iter()
+        .filter(|f| f.name().ends_with(":buckets"))
+        .map(|f| (f.name().clone(), f.metadata()["metric_type"].clone()))
+        .collect();
+    out.sort();
+    out
 }

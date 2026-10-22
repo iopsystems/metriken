@@ -660,12 +660,6 @@ fn build_wide<R: Router, N: MemberNames>(
                         "max_value_power".to_string(),
                         h.config().max_value_power().to_string(),
                     );
-                    if gauge_histogram {
-                        metadata.insert(
-                            metriken_model::METRIC_TYPE.to_string(),
-                            metriken_model::GAUGE_HISTOGRAM.to_string(),
-                        );
-                    }
                     let hv = h.load();
                     // Registered: the metric is the member, and `None`
                     // means no reading yet. Omitting it would make
@@ -678,11 +672,18 @@ fn build_wide<R: Router, N: MemberNames>(
                             gauge_histogram,
                             metric_id_u64,
                         );
-                        group.histogram_descs.push(MetricDesc {
+                        let desc = MetricDesc {
                             name: names.metric(metric_id, metric),
                             metadata,
-                        });
-                        group.histogram_values.push(hv);
+                        };
+                        // The kind is the list the slot is in.
+                        if gauge_histogram {
+                            group.gauge_histogram_descs.push(desc);
+                            group.gauge_histogram_values.push(hv);
+                        } else {
+                            group.histogram_descs.push(desc);
+                            group.histogram_values.push(hv);
+                        }
                     }
                 }
                 Value::HistogramGroup(g) => {
@@ -746,10 +747,16 @@ fn build_wide<R: Router, N: MemberNames>(
                     }
                     group.mark_end();
                 }
-                Value::Histogram(h) | Value::GaugeHistogram(h) => {
+                Value::Histogram(h) => {
                     let hv = h.load();
                     if registered || hv.is_some() {
                         group.histogram_values.push(hv);
+                    }
+                }
+                Value::GaugeHistogram(h) => {
+                    let hv = h.load();
+                    if registered || hv.is_some() {
+                        group.gauge_histogram_values.push(hv);
                     }
                 }
                 Value::HistogramGroup(g) => {
@@ -802,6 +809,7 @@ fn build_wide<R: Router, N: MemberNames>(
         if group.counter_values.is_empty()
             && group.gauge_values.is_empty()
             && group.histogram_values.is_empty()
+            && group.gauge_histogram_values.is_empty()
         {
             continue;
         }
@@ -822,6 +830,7 @@ fn build_wide<R: Router, N: MemberNames>(
                 counters: group.counter_descs,
                 gauges: group.gauge_descs,
                 histograms: group.histogram_descs,
+                gauge_histograms: group.gauge_histogram_descs,
             };
             let hash = schema.hash();
             let schema = Arc::new(schema);
@@ -842,7 +851,9 @@ fn build_wide<R: Router, N: MemberNames>(
                 Some(cached)
                     if cached.schema.counters.len() == group.counter_values.len()
                         && cached.schema.gauges.len() == group.gauge_values.len()
-                        && cached.schema.histograms.len() == group.histogram_values.len() =>
+                        && cached.schema.histograms.len() == group.histogram_values.len()
+                        && cached.schema.gauge_histograms.len()
+                            == group.gauge_histogram_values.len() =>
                 {
                     (cached.schema.clone(), cached.hash)
                 }
@@ -871,6 +882,7 @@ fn build_wide<R: Router, N: MemberNames>(
             counters: group.counter_values,
             gauges: group.gauge_values,
             histograms: group.histogram_values,
+            gauge_histograms: group.gauge_histogram_values,
         });
     }
 
@@ -1084,6 +1096,7 @@ fn build_long<R: Router, N: MemberNames>(
                         desc
                     })
                     .collect(),
+                gauge_histograms: Vec::new(),
             });
             acc.state.hash = columns.hash();
             acc.state.columns = columns;
@@ -1419,6 +1432,8 @@ struct Group<G> {
     gauge_values: Vec<Option<i64>>,
     histogram_descs: Vec<MetricDesc>,
     histogram_values: Vec<Option<histogram::Histogram>>,
+    gauge_histogram_descs: Vec<MetricDesc>,
+    gauge_histogram_values: Vec<Option<histogram::Histogram>>,
 }
 
 impl<G: ReadGuard> Group<G> {
@@ -1433,6 +1448,8 @@ impl<G: ReadGuard> Group<G> {
             gauge_values: Vec::new(),
             histogram_descs: Vec::new(),
             histogram_values: Vec::new(),
+            gauge_histogram_descs: Vec::new(),
+            gauge_histogram_values: Vec::new(),
         }
     }
 

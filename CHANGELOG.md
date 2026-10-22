@@ -122,6 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Changed:** takes metriken-storage 0.5, whose `WriterConfig` it
   re-exports.
+- **Changed:** takes metriken-model 0.2 and metriken-exposition 0.25, whose
+  snapshot and WAL row types gained `gauge_histograms` fields.
 
 ### metriken-core 0.3.4
 
@@ -144,17 +146,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aliases, so existing code builds with a warning. `metriken_core::Value`
   keeps `Histogram` and `HistogramGroup` for the counting kind.
 
-### metriken-model 0.1.4
+### metriken-model 0.2.0
 
-- **Added:** `METRIC_TYPE` (`"metric_type"`) and `GAUGE_HISTOGRAM`
-  (`"gauge_histogram"`), the metadata key and value that mark a histogram
-  entry or group slot as a gauge histogram.
+- **Breaking:** a gauge histogram's kind is on the wire. `GroupSchema`,
+  `GroupSnapshot`, `WalGroupRow`, `LongOccupant`, `SnapshotV1` and
+  `SnapshotV2` gain a last field, `gauge_histograms`, and `WalValue` a last
+  variant, `GaugeHistogram`. A struct literal of these types needs the new
+  field. Each field is left out of the encoding when empty, so a row,
+  schema or snapshot without a gauge histogram encodes (and a schema
+  hashes) exactly as in 0.1.x and 0.1.x decoders read it; one with a gauge
+  histogram is one element longer, which 0.1.x decoders refuse
+  (rmp-serde's `LengthMismatch`, or no variant of the untagged `Snapshot`
+  matching) instead of reading the state as counts.
+  `Snapshot::histograms` returns the counting histograms only;
+  `Snapshot::gauge_histograms` returns the others.
+- **Added:** `METRIC_TYPE` (`"metric_type"`), `COUNTER_HISTOGRAM`
+  (`"counter_histogram"`), `GAUGE_HISTOGRAM` (`"gauge_histogram"`),
+  `LEGACY_HISTOGRAM` (`"histogram"`, the counting kind's string before
+  this release), and `is_counter_histogram` (either spelling) and
+  `is_gauge_histogram`.
 
-### metriken-exposition 0.24.1
+### metriken-exposition 0.25.0
 
-- **Added:** gauge histograms. `Snapshotter` and `GroupBuilder` write a
-  `GaugeHistogram` as a histogram entry or slot whose metadata carries
-  `metric_type = gauge_histogram`; the wire shapes are unchanged.
+- **Breaking:** takes metriken-model 0.2, whose snapshot types it
+  re-exports (new `gauge_histograms` fields).
+- **Added:** gauge histograms. `Snapshotter` writes a `GaugeHistogram` to
+  the snapshot's `gauge_histograms` list and `GroupBuilder` to the group's
+  `gauge_histograms` slots (the schema's `gauge_histograms` descriptors), so
+  a consumer built on metriken-model 0.1 refuses the snapshot, frame or row
+  rather than reading the state as counts; producers without gauge
+  histograms send what they sent before.
   `prometheus_text` writes one as the series Prometheus stores for an
   OpenMetrics `gaugehistogram`, each a `gauge` family: `<name>_bucket{le}`,
   `<name>_gcount` and `<name>_gsum` (with `percentiles`, a `gauge` family
@@ -255,13 +276,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `format::FORMAT_VERSION` is now 2 and means the newest format this crate
   reads; a writer stamps `format::stamped_for(props, &schema)` (or
   `stamped_if_newer`), not `FORMAT_VERSION`. `format::format_of` gives a
-  schema's format. An old reader still reads a gauge histogram as a counting
-  histogram from a live WAL tail written by this release, and from an
-  archive an old writer recorded from a new producer
-  (`docs/journal/2026-10-21-gauge-histogram.md`, open decision 1).
-- **Changed:** `convert` keeps a gauge histogram's `metric_type` (it wrote
-  `histogram` over it), writes it in the standard layout whatever
-  `histogram_type` asks for, and stamps such a file format 2.
+  schema's format. A live WAL tail holding a gauge histogram is refused by
+  0.4.0 too, through metriken-model 0.2's longer rows; the published
+  releases' answers are in `docs/journal/2026-10-21-gauge-histogram.md`.
+- **Breaking:** a column's histogram kind comes from the list its value
+  arrived in: `CellValue::GaugeHistogram` (V1/V2 snapshots'
+  `gauge_histograms`, `WalValue::GaugeHistogram` cells) and
+  `GroupTableBuilder::push_row_with_gauge_histograms` (a group's
+  `gauge_histograms` slots) write a `gauge_histogram` column; the counting
+  lists write `counter_histogram`, replacing any `metric_type` the
+  producer's metadata carried. A group holding a gauge histogram is written
+  wide.
+- **Changed:** new segments and parquet files name the counting histogram
+  `metric_type = counter_histogram` (was `histogram`). Readers take
+  `histogram`, `counter_histogram` and an absent `metric_type` as counting
+  (`metriken_model::is_counter_histogram`), so every archive and file
+  written before reads as it did; 0.4.0 also reads a new `counter_histogram`
+  column as counting, since it classifies list columns by Arrow type. A list
+  column whose `metric_type` names another kind (the sparse layout's
+  `sparse_histogram` halves, which were read as garbage buckets, or a kind
+  from a later release) is no longer read.
+- **Changed:** `convert` writes a snapshot's gauge histograms as
+  `gauge_histogram` columns in the standard layout whatever `histogram_type`
+  asks for, stamps such a file format 2, and writes counting histograms as
+  `counter_histogram`.
 - **Fixed:** `HistogramStream::merge` and `merge_on_clock` overcounted when
   they rebucketed a stream to a coarser configuration: buckets that land in
   one coarser bucket had their cumulative counts summed, so 3 observations

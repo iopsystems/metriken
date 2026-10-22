@@ -74,6 +74,7 @@ fn write(path: &Path, c_stops: &[u64]) {
                 counters,
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             });
             let staged = source.stage(&snapshot, ts, 0).unwrap();
             writer.commit(vec![staged]).unwrap();

@@ -57,6 +57,7 @@ fn schema(n: usize) -> GroupSchema {
             .collect(),
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     }
 }
 
@@ -91,6 +92,7 @@ fn wide_row(g: &G) -> EncodedGroup {
             counters: (0..g.n).map(|i| Some(g.base + i as u64)).collect(),
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
         .unwrap(),
         schema: Some(Arc::new(schema)),
@@ -116,6 +118,7 @@ fn long_row(g: &G) -> EncodedStreamGroup {
                 counters: vec![Some(g.base + key)],
                 gauges: Vec::new(),
                 histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
             })
             .collect(),
     })

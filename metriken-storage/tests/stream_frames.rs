@@ -28,6 +28,7 @@ fn schema(n: usize) -> GroupSchema {
             .collect(),
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     }
 }
 
@@ -43,6 +44,7 @@ fn row(&(stream, window, n, base): &G) -> AgentRow {
         counters: (0..n).map(|i| Some(base + i as u64)).collect(),
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     })
     .unwrap();
     AgentRow {

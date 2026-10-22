@@ -10,12 +10,38 @@ use serde::{Deserialize, Serialize};
 /// value's shape when a producer has not, and keep it when one has.
 pub const METRIC_TYPE: &str = "metric_type";
 
-/// [`METRIC_TYPE`]'s value for a gauge histogram: a histogram entry or slot
-/// whose buckets are the current state of something, not counts since start.
-/// A producer puts it in the entry's metadata (or a group descriptor's); a
-/// reader that finds it must read each row as it is and never take a
-/// difference between two rows.
+/// [`METRIC_TYPE`]'s value for a counting histogram, whose buckets count the
+/// observations since start, so a reader differences two rows. Written by
+/// every writer from metriken-storage 0.5; earlier ones wrote
+/// [`LEGACY_HISTOGRAM`], which [`is_counter_histogram`] also accepts.
+pub const COUNTER_HISTOGRAM: &str = "counter_histogram";
+
+/// [`METRIC_TYPE`]'s value for a gauge histogram, whose buckets are the
+/// current state of something, not counts since start. A reader that finds it
+/// must read each row as it is and never take a difference between two rows.
+/// On the wire the kind is the list an entry is in
+/// ([`GroupSchema::gauge_histograms`], `SnapshotV2::gauge_histograms`, a
+/// `WalValue::GaugeHistogram` cell); the string is how a segment column says
+/// it.
 pub const GAUGE_HISTOGRAM: &str = "gauge_histogram";
+
+/// The counting histogram's [`METRIC_TYPE`] before [`COUNTER_HISTOGRAM`]:
+/// every archive and parquet file written by metriken-storage 0.4 and
+/// earlier carries it. Read, never written.
+pub const LEGACY_HISTOGRAM: &str = "histogram";
+
+/// Whether a column's [`METRIC_TYPE`] is the counting histogram's, under
+/// either spelling. A list column whose `metric_type` is absent is also a
+/// counting histogram (files written before the key existed); that is the
+/// caller's case to handle, since this takes the value.
+pub fn is_counter_histogram(metric_type: &str) -> bool {
+    metric_type == COUNTER_HISTOGRAM || metric_type == LEGACY_HISTOGRAM
+}
+
+/// Whether a column's [`METRIC_TYPE`] is the gauge histogram's.
+pub fn is_gauge_histogram(metric_type: &str) -> bool {
+    metric_type == GAUGE_HISTOGRAM
+}
 
 /// One metric's identity within a [`GroupSchema`]: its column key (the
 /// snapshot entry name, e.g. `"5"` / `"5x3"`) plus its annotations
@@ -40,12 +66,23 @@ pub struct MetricDesc {
 }
 
 /// The membership of one acquisition group: descriptors for every counter,
-/// gauge and histogram slot, in the order the value arrays use.
+/// gauge, counting histogram and gauge histogram slot, in the order the
+/// value arrays use.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSchema {
     pub counters: Vec<MetricDesc>,
     pub gauges: Vec<MetricDesc>,
+    /// Counting histograms.
     pub histograms: Vec<MetricDesc>,
+    /// Gauge histograms: the last field, and left out of the encoding when
+    /// empty, so a row or snapshot without one encodes (and hashes) as it did
+    /// before the field existed, and decoders from before it read it. One
+    /// that holds a gauge histogram is an array one longer, which those
+    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
+    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
+    /// state as counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gauge_histograms: Vec<MetricDesc>,
 }
 
 impl GroupSchema {

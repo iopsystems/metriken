@@ -28,9 +28,17 @@ impl From<Snapshot> for HashedSnapshot {
             HashMap::from_iter(snapshot.counters().into_iter().map(|v| (v.name.clone(), v)));
         let gauges: HashMap<String, Gauge> =
             HashMap::from_iter(snapshot.gauges().into_iter().map(|v| (v.name.clone(), v)));
-        let histograms: HashMap<String, Histogram> = HashMap::from_iter(
+        // Both kinds by name: names are unique across a snapshot, and the
+        // schema (`ParquetSchema`) says which kind each column is.
+        let mut histograms: HashMap<String, Histogram> = HashMap::from_iter(
             snapshot
                 .histograms()
+                .into_iter()
+                .map(|v| (v.name.clone(), v)),
+        );
+        histograms.extend(
+            snapshot
+                .gauge_histograms()
                 .into_iter()
                 .map(|v| (v.name.clone(), v)),
         );
@@ -65,6 +73,7 @@ mod tests {
             counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let schema_hash = schema.hash();
         SnapshotV3 {
@@ -79,6 +88,7 @@ mod tests {
                 counters: vec![Some(7), None],
                 gauges: vec![],
                 histograms: vec![],
+                gauge_histograms: Vec::new(),
             }],
         }
     }
@@ -91,6 +101,7 @@ mod tests {
             counters: vec![Counter::new("0".to_string(), 7, HashMap::new())],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         }
     }
 

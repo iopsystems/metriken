@@ -639,6 +639,7 @@ mod ingest_tests {
             )],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         })
     }
 
@@ -673,6 +674,7 @@ mod ingest_tests {
                 h,
                 metadata,
             )],
+            gauge_histograms: Vec::new(),
         });
         store.ingest_snapshot(snap);
 
@@ -742,6 +744,7 @@ mod ingest_tests {
                 metadata,
             )],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         })
     }
 

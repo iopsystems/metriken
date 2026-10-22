@@ -362,6 +362,7 @@ fn the_decoder_follows_a_group_that_changes_form() {
         }],
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     };
     let row = |stream: &str, row: Vec<u8>| WalRow {
         stream: stream.to_string(),
@@ -378,6 +379,7 @@ fn the_decoder_follows_a_group_that_changes_form() {
             counters: vec![Some(1)],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         }],
     })
     .unwrap();
@@ -392,6 +394,7 @@ fn the_decoder_follows_a_group_that_changes_form() {
         counters: vec![Some(2)],
         gauges: Vec::new(),
         histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
     })
     .unwrap();
 

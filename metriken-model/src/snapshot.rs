@@ -112,7 +112,17 @@ pub struct SnapshotV1 {
 
     pub counters: Vec<Counter>,
     pub gauges: Vec<Gauge>,
+    /// Counting histograms.
     pub histograms: Vec<Histogram>,
+    /// Gauge histograms: the last field, and left out of the encoding when
+    /// empty, so a row or snapshot without one encodes (and hashes) as it did
+    /// before the field existed, and decoders from before it read it. One
+    /// that holds a gauge histogram is an array one longer, which those
+    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
+    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
+    /// state as counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gauge_histograms: Vec<Histogram>,
 }
 
 /// Contains a snapshot of metric readings.
@@ -126,7 +136,17 @@ pub struct SnapshotV2 {
 
     pub counters: Vec<Counter>,
     pub gauges: Vec<Gauge>,
+    /// Counting histograms.
     pub histograms: Vec<Histogram>,
+    /// Gauge histograms: the last field, and left out of the encoding when
+    /// empty, so a row or snapshot without one encodes (and hashes) as it did
+    /// before the field existed, and decoders from before it read it. One
+    /// that holds a gauge histogram is an array one longer, which those
+    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
+    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
+    /// state as counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gauge_histograms: Vec<Histogram>,
 }
 
 // SnapshotV3, GroupSnapshot and GroupSchema deliberately do NOT follow the
@@ -151,10 +171,11 @@ pub struct SnapshotV2 {
 /// increment does not change the schema, and the schema (hence its hash)
 /// changes only on true membership events.
 ///
-/// Serialization note: every field is serialized unconditionally (an absent
-/// `Option` is msgpack nil). Do not add `skip_serializing_if` to any field —
-/// the untagged [`Snapshot`] enum distinguishes versions by positional
-/// shape, and variable arity would break decoding.
+/// Serialization note: every field but the last is serialized
+/// unconditionally (an absent `Option` is msgpack nil). The untagged
+/// [`Snapshot`] enum tells versions apart by `SnapshotV3`'s own shape, which
+/// a group's arity does not change; `gauge_histograms` alone is left out
+/// when empty, so a group without one encodes as before (see its doc).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GroupSnapshot {
     /// Stable group identity, `"<sampler>/<group>"` (e.g. `"cpu_usage/percpu"`).
@@ -186,7 +207,17 @@ pub struct GroupSnapshot {
     pub window: Option<Window>,
     pub counters: Vec<Option<u64>>,
     pub gauges: Vec<Option<i64>>,
+    /// Counting histograms.
     pub histograms: Vec<Option<histogram::Histogram>>,
+    /// Gauge histograms: the last field, and left out of the encoding when
+    /// empty, so a row or snapshot without one encodes (and hashes) as it did
+    /// before the field existed, and decoders from before it read it. One
+    /// that holds a gauge histogram is an array one longer, which those
+    /// decoders refuse (rmp-serde's `LengthMismatch`, serde's invalid length
+    /// under the untagged [`Snapshot`](crate::Snapshot)) rather than read the
+    /// state as counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gauge_histograms: Vec<Option<histogram::Histogram>>,
 }
 
 /// Errors a receiver can act on; the accessors on [`Snapshot`]
@@ -214,6 +245,7 @@ impl GroupSnapshot {
         if schema.counters.len() != self.counters.len()
             || schema.gauges.len() != self.gauges.len()
             || schema.histograms.len() != self.histograms.len()
+            || schema.gauge_histograms.len() != self.gauge_histograms.len()
         {
             return Err(GroupValidationError::ArityMismatch);
         }
@@ -306,6 +338,68 @@ fn canonicalize_histogram(value: histogram::Histogram) -> Option<histogram::Hist
         value.as_slice().to_vec(),
     )
     .ok()
+}
+
+/// Each histogram of a version-1 or 2 list rebuilt through
+/// [`canonicalize_histogram`], the malformed ones dropped.
+fn canonical(list: Vec<Histogram>) -> Vec<Histogram> {
+    list.into_iter()
+        .filter_map(|mut h| {
+            h.value = canonicalize_histogram(h.value)?;
+            Some(h)
+        })
+        .collect()
+}
+
+/// The histograms of one kind across V3 `groups`: `schema_of` picks the
+/// kind's descriptors, `values_of` its values, which are drained.
+fn expand_histograms(
+    groups: &mut [GroupSnapshot],
+    schema_of: impl Fn(&GroupSchema) -> &Vec<crate::schema::MetricDesc>,
+    values_of: impl Fn(&mut GroupSnapshot) -> &mut Vec<Option<histogram::Histogram>>,
+) -> Vec<Histogram> {
+    let mut out = Vec::new();
+    for g in groups {
+        let Some(schema) = g.schema.clone() else {
+            continue;
+        };
+        let descs = schema_of(&schema);
+        if descs.len() != values_of(g).len() {
+            continue;
+        }
+        let window = g.window;
+        let values = std::mem::take(values_of(g));
+        for (desc, value) in descs.iter().zip(values) {
+            let Some(value) = value else { continue };
+            let Some(value) = canonicalize_histogram(value) else {
+                continue;
+            };
+            // The canonicalized config is now the source of
+            // truth for these two keys, restoring the V2
+            // invariant that the metadata copy cannot disagree
+            // with the embedded config: V2 derived these
+            // strings from the value's own config at the
+            // producer, so they could never diverge; V3's
+            // schema-carried metadata can, so overwrite from
+            // `cfg` here rather than trusting the schema's copy.
+            let cfg = value.config();
+            let mut metadata: HashMap<String, String> = desc
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            metadata.insert(
+                "grouping_power".to_string(),
+                cfg.grouping_power().to_string(),
+            );
+            metadata.insert(
+                "max_value_power".to_string(),
+                cfg.max_value_power().to_string(),
+            );
+            out.push(Histogram::new(desc.name.clone(), value, metadata).with_window(window));
+        }
+    }
+    out
 }
 
 impl Snapshot {
@@ -435,65 +529,32 @@ impl Snapshot {
         }
     }
 
+    /// The counting histograms. Gauge histograms are
+    /// [`gauge_histograms`](Self::gauge_histograms).
     pub fn histograms(&mut self) -> Vec<Histogram> {
         match self {
-            Snapshot::V1(s) => std::mem::take(&mut s.histograms)
-                .into_iter()
-                .filter_map(|mut h| {
-                    h.value = canonicalize_histogram(h.value)?;
-                    Some(h)
-                })
-                .collect(),
-            Snapshot::V2(s) => std::mem::take(&mut s.histograms)
-                .into_iter()
-                .filter_map(|mut h| {
-                    h.value = canonicalize_histogram(h.value)?;
-                    Some(h)
-                })
-                .collect(),
-            Snapshot::V3(s) => {
-                let mut out = Vec::new();
-                for g in &mut s.groups {
-                    let Some(schema) = &g.schema else { continue };
-                    if schema.histograms.len() != g.histograms.len() {
-                        continue;
-                    }
-                    let values = std::mem::take(&mut g.histograms);
-                    for (desc, value) in schema.histograms.iter().zip(values) {
-                        let Some(value) = value else { continue };
-                        let Some(value) = canonicalize_histogram(value) else {
-                            continue;
-                        };
-                        // The canonicalized config is now the source of
-                        // truth for these two keys, restoring the V2
-                        // invariant that the metadata copy cannot disagree
-                        // with the embedded config: V2 derived these
-                        // strings from the value's own config at the
-                        // producer, so they could never diverge; V3's
-                        // schema-carried metadata can, so overwrite from
-                        // `cfg` here rather than trusting the schema's copy.
-                        let cfg = value.config();
-                        let mut metadata: HashMap<String, String> = desc
-                            .metadata
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        metadata.insert(
-                            "grouping_power".to_string(),
-                            cfg.grouping_power().to_string(),
-                        );
-                        metadata.insert(
-                            "max_value_power".to_string(),
-                            cfg.max_value_power().to_string(),
-                        );
-                        out.push(
-                            Histogram::new(desc.name.clone(), value, metadata)
-                                .with_window(g.window),
-                        );
-                    }
-                }
-                out
-            }
+            Snapshot::V1(s) => canonical(std::mem::take(&mut s.histograms)),
+            Snapshot::V2(s) => canonical(std::mem::take(&mut s.histograms)),
+            Snapshot::V3(s) => expand_histograms(
+                &mut s.groups,
+                |schema| &schema.histograms,
+                |g| &mut g.histograms,
+            ),
+        }
+    }
+
+    /// The gauge histograms: entries whose buckets are a state, which a
+    /// reader must not difference. Expanded and canonicalized as
+    /// [`histograms`](Self::histograms) are.
+    pub fn gauge_histograms(&mut self) -> Vec<Histogram> {
+        match self {
+            Snapshot::V1(s) => canonical(std::mem::take(&mut s.gauge_histograms)),
+            Snapshot::V2(s) => canonical(std::mem::take(&mut s.gauge_histograms)),
+            Snapshot::V3(s) => expand_histograms(
+                &mut s.groups,
+                |schema| &schema.gauge_histograms,
+                |g| &mut g.gauge_histograms,
+            ),
         }
     }
 
@@ -600,6 +661,7 @@ mod v3_tests {
             counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let schema_hash = schema.hash();
         SnapshotV3 {
@@ -614,6 +676,7 @@ mod v3_tests {
                 counters: vec![Some(7), None],
                 gauges: vec![],
                 histograms: vec![],
+                gauge_histograms: Vec::new(),
             }],
         }
     }
@@ -626,6 +689,7 @@ mod v3_tests {
             counters: vec![Counter::new("0".to_string(), 7, HashMap::new())],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -636,6 +700,7 @@ mod v3_tests {
             counters: vec![Counter::new("0".to_string(), 7, HashMap::new())],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         }
     }
 
@@ -670,6 +735,7 @@ mod v3_tests {
             counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let group = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
@@ -679,6 +745,7 @@ mod v3_tests {
             counters: vec![Some(7), None],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let s = SnapshotV3 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
@@ -719,6 +786,7 @@ mod v3_tests {
             counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let schema_hash = schema.hash();
         let counters = vec![Some(7), None];
@@ -731,6 +799,7 @@ mod v3_tests {
             counters: counters.clone(),
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
 
         let owned_form = GroupSnapshotOwnedSchema {
@@ -964,6 +1033,7 @@ mod v3_tests {
             counters: vec![desc("0", "cpu_cycles")],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let b = a.clone();
         assert_eq!(a.hash(), b.hash(), "identical schemas hash identically");
@@ -1013,11 +1083,13 @@ mod v3_tests {
                 counters: vec![],
                 gauges: vec![desc("9", "memory_free")],
                 histograms: vec![],
+                gauge_histograms: Vec::new(),
             })),
             window: None,
             counters: vec![],
             gauges: vec![Some(-5)],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         });
         s
     }
@@ -1082,11 +1154,13 @@ mod v3_tests {
                 counters: vec![desc("0", "a"), desc("1", "b")],
                 gauges: vec![],
                 histograms: vec![],
+                gauge_histograms: Vec::new(),
             })),
             window: None,
             counters: vec![Some(1)], // one slot short of the schema's two
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let mut s = v3();
         s.groups.insert(0, malformed);
@@ -1104,6 +1178,7 @@ mod v3_tests {
             counters: vec![desc("0", "cpu_cycles"), desc("1", "cpu_instructions")],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         let good = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
@@ -1113,6 +1188,7 @@ mod v3_tests {
             counters: vec![Some(1), Some(2)],
             gauges: vec![],
             histograms: vec![],
+            gauge_histograms: Vec::new(),
         };
         assert_eq!(good.validate(), Ok(()));
 
@@ -1161,6 +1237,7 @@ mod v3_tests {
             counters: vec![],
             gauges: vec![],
             histograms: vec![desc("0", "bad"), desc("1", "good")],
+            gauge_histograms: Vec::new(),
         };
         let group = GroupSnapshot {
             name: "hist/group".to_string(),
@@ -1170,6 +1247,7 @@ mod v3_tests {
             counters: vec![],
             gauges: vec![],
             histograms: vec![Some(bad), Some(good.clone())],
+            gauge_histograms: Vec::new(),
         };
         let s = SnapshotV3 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
@@ -1205,6 +1283,7 @@ mod v3_tests {
                 ]
                 .into(),
             }],
+            gauge_histograms: Vec::new(),
         };
         let group = GroupSnapshot {
             name: "hist/group".to_string(),
@@ -1214,6 +1293,7 @@ mod v3_tests {
             counters: vec![],
             gauges: vec![],
             histograms: vec![Some(embedded)],
+            gauge_histograms: Vec::new(),
         };
         let s = SnapshotV3 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),

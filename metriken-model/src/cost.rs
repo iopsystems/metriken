@@ -25,7 +25,7 @@ pub fn group_approx_bytes(g: &GroupSnapshot) -> usize {
     let mut bytes = WINDOW_SLOT_BYTES;
     bytes += g.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
     bytes += g.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-    for h in g.histograms.iter().flatten() {
+    for h in g.histograms.iter().chain(&g.gauge_histograms).flatten() {
         bytes += VALUE_SLOT_BYTES + h.as_slice().len() * HISTOGRAM_BUCKET_BYTES;
     }
     bytes
@@ -37,7 +37,7 @@ pub fn wal_group_row_approx_bytes(row: &WalGroupRow) -> usize {
     let mut bytes = WINDOW_SLOT_BYTES;
     bytes += row.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
     bytes += row.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-    for (_, _, buckets) in row.histograms.iter().flatten() {
+    for (_, _, buckets) in row.histograms.iter().chain(&row.gauge_histograms).flatten() {
         bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
     }
     bytes
@@ -51,7 +51,7 @@ pub fn wal_long_row_approx_bytes(row: &WalLongRow) -> usize {
         bytes += VALUE_SLOT_BYTES;
         bytes += o.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
         bytes += o.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
-        for (_, _, buckets) in o.histograms.iter().flatten() {
+        for (_, _, buckets) in o.histograms.iter().chain(&o.gauge_histograms).flatten() {
             bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
         }
     }
@@ -80,6 +80,7 @@ mod tests {
             counters: vec![Some(1), None, Some(3)],
             gauges: vec![None, Some(-4)],
             histograms: vec![Some(h), None],
+            gauge_histograms: Vec::new(),
         };
         let row = wal_group_row(&g, None);
         let decoded = decode_wal_group_row(&encode_wal_group_row(&row).unwrap()).unwrap();

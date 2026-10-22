@@ -181,10 +181,29 @@ impl ParquetSchema {
                 .or_insert(gauge.metadata);
         }
 
+        // Each kind marked here, from the list it arrived in, so `finalize`
+        // writes the column as that kind whatever the producer's metadata
+        // said.
         for histogram in histograms {
+            let mut metadata = histogram.metadata;
+            metadata.insert(
+                metriken_model::METRIC_TYPE.to_string(),
+                metriken_model::COUNTER_HISTOGRAM.to_string(),
+            );
             self.histograms
                 .entry(histogram.name.clone())
-                .or_insert(histogram.metadata);
+                .or_insert(metadata);
+        }
+
+        for histogram in snapshot.gauge_histograms() {
+            let mut metadata = histogram.metadata;
+            metadata.insert(
+                metriken_model::METRIC_TYPE.to_string(),
+                metriken_model::GAUGE_HISTOGRAM.to_string(),
+            );
+            self.histograms
+                .entry(histogram.name.clone())
+                .or_insert(metadata);
         }
 
         let snap_metadata = snapshot.metadata();
@@ -279,7 +298,10 @@ impl ParquetSchema {
                 ParquetHistogramType::Standard => {
                     // merge metric annotations into the metric metadata
                     if !gauge {
-                        metadata.insert("metric_type".to_string(), "histogram".to_string());
+                        metadata.insert(
+                            metriken_model::METRIC_TYPE.to_string(),
+                            metriken_model::COUNTER_HISTOGRAM.to_string(),
+                        );
                     }
 
                     fields.push(
@@ -515,6 +537,7 @@ mod tests {
             counters: counters.remove(1),
             gauges: gauges.remove(1),
             histograms: histograms.remove(1),
+            gauge_histograms: Vec::new(),
         });
 
         let s1 = Snapshot::V1(SnapshotV1 {
@@ -523,6 +546,7 @@ mod tests {
             counters: counters.remove(0),
             gauges: gauges.remove(0),
             histograms: histograms.remove(0),
+            gauge_histograms: Vec::new(),
         });
 
         vec![s1, s2]
@@ -541,6 +565,7 @@ mod tests {
             counters: counters.remove(1),
             gauges: gauges.remove(1),
             histograms: histograms.remove(1),
+            gauge_histograms: Vec::new(),
         });
 
         let s1 = Snapshot::V2(SnapshotV2 {
@@ -550,6 +575,7 @@ mod tests {
             counters: counters.remove(0),
             gauges: gauges.remove(0),
             histograms: histograms.remove(0),
+            gauge_histograms: Vec::new(),
         });
 
         vec![s1, s2]

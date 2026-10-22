@@ -1219,6 +1219,7 @@ pub mod recorder_tests_support {
             counters,
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         })
     }
 
@@ -1359,6 +1360,7 @@ mod recorder_tests {
             }],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         };
         let group = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
@@ -1368,6 +1370,7 @@ mod recorder_tests {
             counters: vec![Some(7)],
             gauges: Vec::new(),
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         };
         let snapshot = Snapshot::V3(SnapshotV3 {
             systemtime: SystemTime::now(),
@@ -2549,6 +2552,7 @@ mod finalize_tests {
             counters: Vec::new(),
             gauges: vec![g],
             histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
         });
         r.ingest(&s, 2_000);
 
@@ -2715,6 +2719,7 @@ mod malformed_histogram_tests {
             counters: vec![desc("good_counter")],
             gauges: Vec::new(),
             histograms: vec![desc("bad_histogram")],
+            gauge_histograms: Vec::new(),
         };
 
         let mut builder = GroupTableBuilder::new("cpu_usage/sweep".to_string());
