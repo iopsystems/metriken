@@ -47,7 +47,8 @@ struct Src {
     /// rows of a fast sampler (z only), may be empty
     fast: Vec<u64>,
     epochs: Vec<(String, u64)>,
-    absent1: Option<(u64, u64)>,
+    /// Where `cpu=1` has no rows, as inclusive spans.
+    absent: Vec<(u64, u64)>,
     window: u64,
 }
 
@@ -69,7 +70,7 @@ fn snap(ts: u64, src: &Src, cpu_row: bool, fast_row: bool) -> Snapshot {
     let mut gauges = Vec::new();
     if cpu_row {
         for cpu in 0..2u64 {
-            if cpu == 1 && src.absent1.is_some_and(|(a, b)| a <= ts && ts <= b) {
+            if cpu == 1 && src.absent.iter().any(|&(a, b)| a <= ts && ts <= b) {
                 continue;
             }
             let meta: HashMap<String, String> = [("metric", "c"), ("sampler", "cpu")]
@@ -303,20 +304,79 @@ fn clip(s: &Src, lo: u64, hi: u64) -> Src {
     c
 }
 
+/// The rows of the engine's read of `q` over `w` for a member of
+/// `interval_ns` (its read starts as far before the range as the function
+/// looks back), as `[first, last]`.
+fn read_span(q: &Q, (s, e, step): (f64, f64, f64), interval_ns: u64) -> (u64, u64) {
+    let step_ns = (step * 1e9) as u64;
+    let start = ((s * 1e9).round() as u64 / step_ns) * step_ns;
+    let end = (e * 1e9).round() as u64 + 1_000;
+    let back = match q.range {
+        // `rate`: its window and two reaches of two intervals.
+        Some(r) if !q.irate && q.text.starts_with("rate(") => r + 4 * interval_ns,
+        // `irate`: its window or a step.
+        Some(r) if q.irate => r.max(step_ns),
+        // `avg_over_time`, `idelta`, `deriv`: their window.
+        Some(r) => r,
+        // A gauge read: a step, or the interval when that is longer.
+        None => step_ns.max(interval_ns),
+    };
+    (start.saturating_sub(back), end)
+}
+
+/// `rows` as the engine sees them for a read of `[lo, hi]`: every row in it,
+/// and on each side the nearest nine rows within 64 intervals (S3's bound
+/// on the rows a coverage decision reads beyond a read).
+fn bounded(rows: &[u64], lo: u64, hi: u64, interval_ns: u64, intervals: u64) -> Vec<u64> {
+    let reach = interval_ns.max(1).saturating_mul(intervals);
+    let before: Vec<u64> = rows
+        .iter()
+        .copied()
+        .filter(|&t| t < lo && t >= lo.saturating_sub(reach))
+        .collect();
+    let after: Vec<u64> = rows
+        .iter()
+        .copied()
+        .filter(|&t| t > hi && t <= hi.saturating_add(reach))
+        .take(9)
+        .collect();
+    let mut out: Vec<u64> = before[before.len().saturating_sub(9)..].to_vec();
+    out.extend(rows.iter().copied().filter(|&t| lo <= t && t <= hi));
+    out.extend(after);
+    out
+}
+
+/// [`reference_within`] with the engine's bound: nine rows within 64
+/// intervals on each side of a read.
+fn reference(
+    dir: &Path,
+    srcs: &[Src],
+    union: &ArchiveReader,
+    q: &Q,
+    w: ((f64, f64, f64), bool),
+    cache: &mut HashMap<String, ArchiveReader>,
+) -> Series {
+    reference_within(dir, srcs, union, q, w, cache, 64)
+}
+
 /// One member as the oracle combines it: its points of one series, the
 /// runs of that series' rows, and its interval.
 type Combined<'a> = (&'a Vec<(u64, f64)>, Vec<(u64, u64)>, u64);
 
 /// The oracle's answer for `q` over `srcs` in `w`, on the per-series path
 /// when `ps`; `union` supplies the sources' uuids, catalog indices and
-/// epochs, `cache` the archives of each source and member alone.
-fn reference(
+/// epochs, `cache` the archives of each source and member alone. A member's
+/// rows beyond its read count as the engine reads them: the nearest nine
+/// within `reach` of the member's intervals on each side.
+#[allow(clippy::too_many_arguments)]
+fn reference_within(
     dir: &Path,
     srcs: &[Src],
     union: &ArchiveReader,
     q: &Q,
     (w, ps): ((f64, f64, f64), bool),
     cache: &mut HashMap<String, ArchiveReader>,
+    reach: u64,
 ) -> Series {
     let infos = union.sources().to_vec();
     let mut members: Vec<MemberRef> = Vec::new();
@@ -362,7 +422,7 @@ fn reference(
                 .rows
                 .iter()
                 .copied()
-                .filter(|&t| !m.absent1.is_some_and(|(a, b)| a <= t && t <= b))
+                .filter(|&t| !m.absent.iter().any(|&(a, b)| a <= t && t <= b))
                 .collect();
             members.push(MemberRef {
                 points,
@@ -393,7 +453,12 @@ fn reference(
         let cpu: usize = l["cpu"].parse().unwrap();
         let ms: Vec<Combined<'_>> = members
             .iter()
-            .filter_map(|m| m.points.get(&l).map(|p| (p, runs(&m.rows[cpu]), m.iv)))
+            .filter_map(|m| {
+                m.points.get(&l).map(|p| {
+                    let (lo, hi) = read_span(q, w, m.iv);
+                    (p, runs(&bounded(&m.rows[cpu], lo, hi, m.iv, reach)), m.iv)
+                })
+            })
             .collect();
         let times: BTreeSet<u64> = ms
             .iter()
@@ -492,32 +557,23 @@ fn differences(got: &Series, want: &Series, within: Option<(u64, u64)>) -> Vec<S
 /// 250 ms to 15 s, a change of cadence partway, holes, a faster second
 /// table, a series absent for a while.
 ///
-/// No epoch chains: the oracle reads a member clipped to one epoch as an
-/// archive of its own, whose measured row spacing is that epoch's, where
-/// the engine reads the clipped source at the whole table's spacing; the two
-/// interpolate differently across a gap, so they are not comparable. Epoch
-/// chains are tested in `union_queries.rs`.
+/// No epoch chains. The oracle reads a member clipped to one epoch as an
+/// archive of its own, at that epoch's measured row spacing (and staleness);
+/// S9 gives each epoch member its whole table's interval, which is what the
+/// engine uses, so it is the oracle that would be off, not the engine. A
+/// reference reading the whole source clipped to the epoch would need the
+/// engine's clipping wrapper, which is not public; epoch chains are tested
+/// in `union_queries.rs` instead.
 fn gen(rng: &mut Rng, f: u64) -> Vec<Src> {
-    let chain = false;
     let disagree = f % 3 == 1;
     let n = 2 + rng.below(2) as usize;
     let mut out = vec![];
     let cad = [250 * MS, 500 * MS, S, S, 2 * S, 5 * S, 10 * S, 15 * S];
-    for k in 0..n {
+    for _ in 0..n {
         let every = rng.pick(&cad);
         let offset = rng.pick(&[0, 137 * MS, 500 * MS, 0, 3 * S]);
-        let from = if chain && k == 0 {
-            BASE + rng.below(60) * S + offset
-        } else if chain {
-            BASE + (100 + rng.below(40)) * S + offset
-        } else {
-            BASE + rng.below(60) * S + offset
-        };
-        let to = if chain && k == 0 {
-            BASE + (220 + rng.below(100)) * S
-        } else {
-            from + (120 + rng.below(240)) * S
-        };
+        let from = BASE + rng.below(60) * S + offset;
+        let to = from + (120 + rng.below(240)) * S;
         let switch = (rng.below(4) == 0).then(|| (from + rng.below(to - from), rng.pick(&cad)));
         let mut rows = vec![];
         let mut t = from;
@@ -550,28 +606,13 @@ fn gen(rng: &mut Rng, f: u64) -> Vec<Src> {
             let a = from + rng.below(to - from);
             (a, a + (5 + rng.below(100)) * S)
         });
-        let epochs = if chain && k == 0 {
-            vec![("e0".to_string(), BASE), ("e1".to_string(), BASE + 100 * S)]
-        } else if chain {
-            vec![("e1".to_string(), BASE + 100 * S)]
-        } else {
-            vec![("e".to_string(), BASE)]
-        };
-        let mut s = Src {
+        out.push(Src {
             rows,
             fast,
-            epochs,
-            absent1,
+            epochs: vec![("e".to_string(), BASE)],
+            absent: absent1.into_iter().collect(),
             window: rng.pick(&[MS, 10 * MS]),
-        };
-        if chain && k > 0 {
-            s.rows.retain(|&t| t >= BASE + 100 * S);
-            s.fast.retain(|&t| t >= BASE + 100 * S);
-            if s.rows.len() < 3 {
-                s.rows = vec![BASE + 150 * S, BASE + 151 * S, BASE + 152 * S];
-            }
-        }
-        out.push(s);
+        });
     }
     out
 }
@@ -599,7 +640,7 @@ fn seg_src(parts: &[(f64, f64, u64)], fast_ms: Option<u64>) -> Src {
         rows,
         fast,
         epochs: vec![("e".into(), BASE)],
-        absent1: None,
+        absent: Vec::new(),
         window: MS,
     }
 }
@@ -691,13 +732,14 @@ fn a_later_source_answers_as_it_does_alone() {
 
 /// Fixed fixtures against the oracle: holes beside a coarser or offset
 /// source, a dump before its record, a series absent for a while, a source
-/// whose cadence changes after a gap near the range's end or start, and a
-/// slow metric beside a fast second table of its source.
+/// whose cadence changes after a gap near the range's end or start, a slow
+/// metric beside a fast second table of its source, and (F5) gaps before
+/// the range that only the ninth row back tells from a hole.
 #[test]
 fn deterministic_cases_match_the_oracle() {
     let dir = tempfile::tempdir().unwrap();
     let mut lacks1 = src(100.0, 300.0, 500, &[]);
-    lacks1.absent1 = Some((BASE + 140 * S, BASE + 280 * S));
+    lacks1.absent = vec![(BASE + 140 * S, BASE + 280 * S)];
     let cases: Vec<(&str, Vec<Src>, Window)> = vec![
         (
             "250 ms hole beside 2 s",
@@ -756,6 +798,21 @@ fn deterministic_cases_match_the_oracle() {
                 seg_src(&[(5.0, 300.0, 10000)], None),
             ],
             (120.0, 200.0, 1.0),
+        ),
+        (
+            "F5 three 3 s gaps then 1 s rows from the range's start",
+            vec![
+                seg_src(
+                    &[
+                        (0.0, 100.0, 1000),
+                        (103.0, 109.0, 3000),
+                        (112.0, 300.0, 1000),
+                    ],
+                    None,
+                ),
+                seg_src(&[(0.5, 300.5, 2000)], None),
+            ],
+            (112.0, 130.0, 1.0),
         ),
     ];
     for (i, (name, srcs, w)) in cases.into_iter().enumerate() {
@@ -942,4 +999,99 @@ fn random_fixtures_match_the_oracle() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A fixture for the bound: its name, sources, query and range, and the
+/// bounds (in intervals) whose answers must differ from the engine's.
+type BoundCase = (&'static str, Vec<Src>, &'static str, Window, Vec<u64>);
+
+/// `cpu=1` present only in `present` (inclusive spans, seconds), absent
+/// elsewhere up to `until`.
+fn only_present(mut s: Src, present: &[(f64, f64)], until: f64) -> Src {
+    let mut edges = vec![(0.0f64, 0.0f64)];
+    edges.extend_from_slice(present);
+    edges.push((until, until));
+    for w in edges.windows(2) {
+        let (a, b) = (w[0].1, w[1].0);
+        if b > a {
+            s.absent
+                .push((BASE + (a * 1e9) as u64 + 1, BASE + (b * 1e9) as u64 - 1));
+        }
+    }
+    s
+}
+
+/// Fixtures whose answers depend on the bound of nine rows within 64
+/// intervals: they match the bounded oracle and not the unbounded one, so a
+/// change to the bound is caught. F1: `cpu=1` present for 4 s every 100 s in
+/// a 1 s and a 2 s source, `rate(c[2m])` over [176, 206] s. F2: `cpu=1` 1 s
+/// rows to 200 s, a hole to 203 s, rows at 203 and 204 s, then one row at
+/// 290 s, beside a 2 s source, `rate(c[5s])` ending at 204 s; F2b, the same
+/// with the row at 250 s, which a bound of 32 intervals would not read.
+#[test]
+fn the_bound_on_rows_beyond_a_read_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let flicker: Vec<(f64, f64)> = (0..12)
+        .map(|k| (k as f64 * 100.0, k as f64 * 100.0 + 4.0))
+        .collect();
+    let f2 = only_present(
+        seg_src(&[(100.0, 300.0, 1000)], None),
+        &[(100.0, 200.0), (203.0, 204.0), (290.0, 290.0)],
+        400.0,
+    );
+    let f2b = only_present(
+        seg_src(&[(100.0, 300.0, 1000)], None),
+        &[(100.0, 200.0), (203.0, 204.0), (250.0, 250.0)],
+        400.0,
+    );
+    // Each case with the bounds (in intervals) whose answers must differ.
+    let cases: Vec<BoundCase> = vec![
+        (
+            "F1 present 4 s every 100 s",
+            vec![
+                only_present(seg_src(&[(0.0, 1200.0, 1000)], None), &flicker, 1300.0),
+                only_present(seg_src(&[(0.5, 1200.5, 2000)], None), &flicker, 1300.0),
+            ],
+            "rate(c[2m])",
+            (176.0, 206.0, 1.0),
+            vec![u64::MAX / 2],
+        ),
+        (
+            "F2 one row 86 s after the range",
+            vec![f2, seg_src(&[(100.5, 300.5, 2000)], None)],
+            "rate(c[5s])",
+            (194.0, 204.0, 1.0),
+            vec![u64::MAX / 2],
+        ),
+        (
+            "F2b one row 46 s after the range",
+            vec![f2b, seg_src(&[(100.5, 300.5, 2000)], None)],
+            "rate(c[5s])",
+            (194.0, 204.0, 1.0),
+            vec![32],
+        ),
+    ];
+    for (i, (name, srcs, q, w, others)) in cases.into_iter().enumerate() {
+        let sub = dir.path().join(format!("b{i}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        let p = sub.join("union.dendro");
+        write(&p, &srcs);
+        let union = open(&p);
+        assert_eq!(union.read_groups().len(), 1, "{name}");
+        let w = abs(w);
+        let mut cache = HashMap::new();
+        let mut sensitive = false;
+        for ps in [false, true] {
+            let got = range(&union, q, w, ps).unwrap();
+            let want = reference(&sub, &srcs, &union, &parse(q), (w, ps), &mut cache);
+            let d = differences(&got, &want, None);
+            assert!(d.is_empty(), "{name} per-series {ps}: {d:?}");
+            for &other in &others {
+                let alt =
+                    reference_within(&sub, &srcs, &union, &parse(q), (w, ps), &mut cache, other);
+                sensitive |= !differences(&got, &alt, None).is_empty();
+            }
+        }
+        assert!(sensitive, "{name}: the bound decides nothing here");
+    }
 }

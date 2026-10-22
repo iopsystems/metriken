@@ -1143,7 +1143,12 @@ check`, systemslab through the `dashboard` crate).
   source has no row at `t` when its rows on either side of `t` are further
   apart than twice the larger of the median of its gaps before that pair and
   the median of its gaps after it, each over up to eight gaps; with none on
-  one side, the other side's median is used. In each span the results come
+  one side, the other side's median is used. Beyond a read, a source's rows
+  count only as far as the nearest nine on each side within 64 of its
+  intervals: a series with fewer there is taken as having no more rows on
+  that side (implemented 2026-10-21; reading until nine rows, however far,
+  cost a 1 h query four times as much on a recording with many ended
+  series). In each span the results come
   from the source with the finest spacing there (S9), ties going to the
   lowest uuid, then to catalog order; where it has no result, or its rows
   do not cover the whole window (S9), the next finest's is used. Test: a
@@ -1455,9 +1460,11 @@ rounds: a display query of `sum(irate(cgroup_cpu_usage[5s]))` over 9.6 h at
 1 s 194 ms against 60 ms, `rate(cgroup_cpu_usage[1m])` over 1 h 22 ms
 against 12 ms, `sum(irate(...))` over 1 h 21 ms against 6.0 ms,
 `sum(rate(...[1m]))` over 9.6 h at 60 s 56 ms against 36 ms. (Reading the
-context rows until each series had nine, however far, took the 1 h queries
-to 190 ms on that recording, whose long cgroup table holds many series that
-ended.) Peak memory on the display query is 1.08 GB against 193 MB,
+context rows until each series had nine, however far, measured as one
+ten-interval read and then a read to the member's end, took the 1 h `rate`
+and `sum(irate)` queries to 92.7 and 91.6 ms on that recording, whose long
+cgroup table holds many series that ended, against 22.3 and 20.5 ms with
+the bound.) Peak memory on the display query is 1.08 GB against 193 MB,
 because each member's series are materialized before they are combined;
 streaming the combination needs each series' rows ahead of its points,
 which the batched scan does not give. That is the next PR. Two
