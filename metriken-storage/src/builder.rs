@@ -533,8 +533,7 @@ impl GroupTableBuilder {
         gauges: &[Option<i64>],
         // `(grouping_power, max_value_power, buckets)` per histogram slot —
         // the same shape `WalValue::Histogram` carries, kept as a bare tuple
-        // here (rather than importing `rez_v3_writer`'s WAL-row type) so this
-        // lower-level format module does not depend on the writer module.
+        // here so this module does not depend on the WAL row type.
         histograms: &[Option<(u8, u8, Vec<u64>)>],
     ) {
         self.push_row_with_gauge_histograms(

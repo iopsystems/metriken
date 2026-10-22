@@ -26,10 +26,9 @@
 //! outright would give.
 //!
 //! The payload is a [`WalGroupRow`](crate::rez::wal::WalGroupRow) with
-//! `schema: None`; `schema_hash` identifies the schema generation. metriken
-//! has no `.rez` consumer of it since `StreamRecorderV3::ingest_rows` was
-//! removed (a row-wire recorder writes `.dendro`). [`AgentRows`] is the wide
-//! pass type `StreamSubscription` carries.
+//! `schema: None`; `schema_hash` identifies the schema generation. A
+//! row-wire consumer writes `.dendro`; nothing writes these rows into a
+//! `.rez`. [`AgentRows`] is the wide pass type `StreamSubscription` carries.
 //!
 //! # What travels in the clear, and why each field does
 //!

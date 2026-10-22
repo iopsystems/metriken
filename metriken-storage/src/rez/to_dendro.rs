@@ -423,7 +423,7 @@ mod tests {
     ///
     /// ```text
     /// REZ_TO_DENDRO=/path/to/archive.rez \
-    ///   cargo test -p rez --features test-support --release \
+    ///   cargo test -p metriken-storage --features rez,write --release --lib \
     ///   converts_a_real_archive -- --ignored --nocapture
     /// ```
     #[test]

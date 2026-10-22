@@ -53,9 +53,7 @@ pub struct Column {
 /// One sampler's table: a timestamp column plus its metric/window columns.
 #[derive(Debug, Clone)]
 pub struct Table {
-    /// Read by the atomic writer only — the streaming writer names segments
-    /// from `SealJob::sampler`. See the note on `RezRecorder`.
-    #[allow(dead_code)]
+    /// The table's key: a sampler, or `<sampler>/<group>` for a V3 group.
     pub sampler: String,
     pub timestamps: Vec<u64>,
     /// Per-row wall-clock observation: the raw `SystemTime` reading minus the
@@ -84,20 +82,6 @@ pub struct Table {
 
 /// What encoding or decoding a table can fail with.
 pub type Error = Box<dyn std::error::Error>;
-
-/// Mean row interval hint; `None` when fewer than 2 rows.
-///
-/// Atomic-writer only: the streaming writer keeps the equivalent running totals
-/// per table because its segments are long gone by manifest time. See the note
-/// on `RezRecorder`.
-#[allow(dead_code)]
-pub fn cadence_hint(timestamps: &[u64]) -> Option<u64> {
-    if timestamps.len() < 2 {
-        return None;
-    }
-    let span = timestamps.last().unwrap().saturating_sub(timestamps[0]);
-    Some(span / (timestamps.len() as u64 - 1))
-}
 
 fn window_offset_columns(
     windows: &[Option<Window>],
@@ -239,7 +223,7 @@ pub fn table_to_batch(table: &Table) -> Result<(Arc<Schema>, RecordBatch), Error
     Ok((schema, batch))
 }
 
-/// Parquet writer settings for a `.rez` segment.
+/// Parquet writer settings for a segment.
 ///
 /// **Passing `None` here would not select parquet-rs's defaults — it selects
 /// `Compression::UNCOMPRESSED`.** That is the trap this function exists to
@@ -299,53 +283,6 @@ pub fn write_table_parquet_with(table: &Table, props: WriterProperties) -> Resul
     writer.write(&batch)?;
     writer.close()?;
     Ok(buf)
-}
-
-/// [`write_table_parquet_with`] for a `.rez` writer. `.rez` is frozen at its
-/// pre-6.0 shape: a counting histogram column says `histogram`, as every
-/// `.rez` written before `counter_histogram` did, and a gauge histogram
-/// column is refused (`.rez` writers leave gauge histograms out before a
-/// table is built).
-#[cfg(feature = "rez")]
-pub(crate) fn write_rez_table_parquet_with(
-    table: &Table,
-    props: WriterProperties,
-) -> Result<Vec<u8>, Error> {
-    let kind = |c: &Column| c.metadata.get(metriken_model::METRIC_TYPE).cloned();
-    if table.columns.iter().any(|c| {
-        kind(c)
-            .as_deref()
-            .is_some_and(metriken_model::is_gauge_histogram)
-    }) {
-        return Err(format!(
-            "{}: a `.rez` holds no gauge histogram (they are recorded in .dendro only)",
-            table.sampler
-        )
-        .into());
-    }
-    if !table
-        .columns
-        .iter()
-        .any(|c| kind(c).as_deref() == Some(metriken_model::COUNTER_HISTOGRAM))
-    {
-        return write_table_parquet_with(table, props);
-    }
-    let mut legacy = table.clone();
-    for c in &mut legacy.columns {
-        if kind(c).as_deref() == Some(metriken_model::COUNTER_HISTOGRAM) {
-            c.metadata.insert(
-                metriken_model::METRIC_TYPE.to_string(),
-                metriken_model::LEGACY_HISTOGRAM.to_string(),
-            );
-        }
-    }
-    write_table_parquet_with(&legacy, props)
-}
-
-/// [`write_rez_table_parquet_with`] with [`segment_writer_props`].
-#[cfg(feature = "rez")]
-pub(crate) fn write_rez_table_parquet(table: &Table) -> Result<Vec<u8>, Error> {
-    write_rez_table_parquet_with(table, segment_writer_props())
 }
 
 fn u64_col(a: &ArrayRef) -> &UInt64Array {

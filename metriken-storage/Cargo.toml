@@ -6,7 +6,7 @@ authors = [
     "Brian Martin <brian@iop.systems>",
 ]
 license = "MIT OR Apache-2.0"
-description = "Storage for metriken recordings: the segment format, column readers, and the dendro and .rez archives"
+description = "Storage for metriken recordings: the segment format, column readers, the dendro archive, and reading .rez archives"
 homepage = "https://github.com/iopsystems/metriken"
 repository = "https://github.com/iopsystems/metriken"
 # The integration tests query through metriken-query, a path-only
@@ -32,7 +32,6 @@ rusqlite = { version = "0.40", features = ["bundled", "blob", "serialize"], opti
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, optional = true }
 tar = { version = "0.4.45", default-features = false, optional = true }
-tempfile = { workspace = true, optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
@@ -53,10 +52,9 @@ default = ["lz4", "archive"]
 # the column filter. Off, nothing here compiles SQLite: the segment format,
 # the column readers and, with `convert`, the parquet conversion.
 archive = ["dep:dendro", "dep:serde_json"]
-# The `.rez` archive format: reading it, and with `write` its writers.
-rez = ["archive", "dep:rusqlite", "dep:serde_json", "dep:tar", "dep:tempfile"]
-# Fixture builders other crates' tests use (the tar `.rez` writer).
-test-support = ["rez", "write"]
+# Reading the `.rez` archive format (v1/v2 tar, v3 SQLite), and with `write`
+# converting a v3 `.rez` to a dendro archive. Nothing writes a `.rez`.
+rez = ["archive", "dep:rusqlite", "dep:serde_json", "dep:tar"]
 # Loading `metriken-model` snapshots into an in-memory source.
 ingest = []
 # Requires `metriken` 0.11.3, whose `Window` is `metriken-types`' type, the
@@ -67,8 +65,8 @@ metriken = ["dep:metriken"]
 # The archive writer, over dendro's. Off, this crate is a reader.
 write = ["archive", "dendro/write"]
 # `metriken_exposition::stream` at `stream`, re-exported until the next
-# breaking release,
-# and `StreamRow`/`Pass` for the `.rez` row wire's `AgentRow`/`AgentRows`.
+# breaking release, and `StreamRow`/`Pass` for the row wire's
+# `AgentRow`/`AgentRows` (`rez::wire`).
 stream = ["dep:metriken-exposition"]
 # `MsgpackToArchive`: a raw msgpack recording into a `.dendro` archive
 # (`convert`), through the archive writer.

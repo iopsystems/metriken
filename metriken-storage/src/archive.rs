@@ -119,9 +119,8 @@ pub fn source_name(labels: &BTreeMap<String, String>) -> String {
 
 /// The sampler a `.rez` table key belongs to. V3 acquisition-group tables are
 /// keyed `"<sampler>/<group>"`; a V2 (or windowless/default) sampler table's
-/// key never contains `/` for every REGISTERED sampler of this build — see
-/// `group_by_sampler`'s `sampler_of` and
-/// `no_registered_sampler_name_contains_a_slash` — so it is its own sampler.
+/// key never contains `/` for any sampler rezolus registers, so it is its
+/// own sampler.
 /// The manifest and filter unit stay the SAMPLER (the part before `/`), even
 /// though the underlying table key is finer-grained.
 ///
@@ -130,13 +129,9 @@ pub fn source_name(labels: &BTreeMap<String, String>) -> String {
 /// sampler, which a query can union, from the same sampler in two
 /// recordings, which it cannot.
 ///
-/// `parquet filter --samplers` uses this on a v3 archive to drop a sampler's
-/// group tables together — naming `cpu_usage` drops every `cpu_usage/<group>`
-/// table, because the sampler is the unit an operator names. Exercised
-/// directly by `table_sampler_tests`, by `rez_v3_writer`'s
-/// `table_sampler_selects_a_samplers_group_tables_out_of_a_mixed_recording`
-/// against a real recording, and end to end by
-/// `filter_rez_v3_keeps_only_named_samplers`.
+/// A filter that names a sampler selects every `<sampler>/<group>` table of
+/// it, because the sampler is the unit an operator names. Exercised by
+/// `table_sampler_tests`.
 ///
 /// `parquet metadata` on a v3-native archive is a known, narrower instance of
 /// the same display gap: it lists one line per GROUP table (`describe_v3_string`

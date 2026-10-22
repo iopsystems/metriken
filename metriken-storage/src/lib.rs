@@ -38,7 +38,7 @@
 //! - `process`: an archive's sources grouped by producer process (copies
 //!   by uuid, bridges set aside, the rest joined by a shared producer
 //!   epoch), which `ArchiveReader::process_groups` returns.
-//! - `rez` (feature `rez`): the `.rez` format.
+//! - `rez` (feature `rez`): reading the `.rez` format; nothing writes one.
 //!
 //! - `convert` (feature `convert`): a raw msgpack recording into a `.dendro`
 //!   archive. metriken writes no standalone parquet; parquet files written

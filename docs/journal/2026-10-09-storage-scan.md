@@ -378,6 +378,11 @@ graph; the rest were choices.
   `RezDb` split into read and write halves was considered and not done: the
   write half would have needed a hidden accessor to the connection, and the
   schema would have had two owners.
+  Update 2026-10-22: metriken-storage 0.5.0 removes the writers (the v3
+  writer, the tar writers, the rewrite tooling, parquet ingest, the seal
+  policy and `test-support`); `rez` reads, and with `write` converts a v3
+  `.rez` to dendro. `RezDb` is now read-only outside this crate's tests,
+  which keep its inserts to build fixtures (`chore/no-rez-writers`).
 
 rezolus main with `metriken-archive` 0.4 and `metriken-segment` 0.2 builds
 against the branch and passes its tests after changing the four
