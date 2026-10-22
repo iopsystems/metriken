@@ -45,9 +45,9 @@ use super::seal_policy::SINGLE_RECORDING_KEY;
 use super::seal_policy::{SealPolicy, SegmentAccount};
 
 use super::rez::{
-    append_tar_entry, dedup_key, entries_approx_bytes, group_by_sampler, write_table_parquet,
-    Entry, PushEntries, RezManifest, RezRecording, RezTable, RezTableIndex, TableBuilder,
-    REZ_MANIFEST_NAME, REZ_SCHEMA_VERSION,
+    append_tar_entry, dedup_key, entries_approx_bytes, group_by_sampler, Entry, PushEntries,
+    RezManifest, RezRecording, RezTable, RezTableIndex, TableBuilder, REZ_MANIFEST_NAME,
+    REZ_SCHEMA_VERSION,
 };
 
 /// The fixed parts of the recording's manifest entry, known at recording start.
@@ -423,7 +423,7 @@ fn seal_segments(
 ) -> Result<Option<(u64, i64)>, String> {
     let mut observation: Option<(u64, i64)> = None;
     for job in batch {
-        let bytes = write_table_parquet(&job.table)
+        let bytes = crate::table::write_rez_table_parquet(&job.table)
             .map_err(|e| format!("failed to encode a {} segment: {e}", job.sampler))?;
         let state = tables.entry(job.sampler.clone()).or_default();
         let name = format!("{}/{:04}.parquet", job.sampler, state.files.len());

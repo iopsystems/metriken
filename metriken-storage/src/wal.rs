@@ -72,6 +72,7 @@ fn materialize_sampler_wal_tail(
     sampler: &str,
     rows: &[impl WalRowSource],
     props: WriterProperties,
+    rez: bool,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Ok(None);
@@ -149,7 +150,7 @@ fn materialize_sampler_wal_tail(
         builder.push_row(row.ts(), row.wall_offset(), &cells);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet_with(&builder.finish(), props)?,
+        bytes: encode_tail(&builder.finish(), props, rez)?,
         rows: row_count,
         first_ts,
     }))
@@ -286,10 +287,40 @@ pub fn materialize_wal_tail_with(
     props: WriterProperties,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if is_group_table_key(table_key) {
-        materialize_group_wal_tail(table_key, rows, props)
+        materialize_group_wal_tail(table_key, rows, props, false)
     } else {
-        materialize_sampler_wal_tail(table_key, rows, props)
+        materialize_sampler_wal_tail(table_key, rows, props, false)
     }
+}
+
+/// [`materialize_wal_tail`] for a `.rez` writer sealing a segment: written
+/// by [`write_rez_table_parquet_with`](crate::table::write_rez_table_parquet_with),
+/// so the segment has the pre-6.0 shape.
+#[cfg(feature = "rez")]
+pub(crate) fn materialize_rez_wal_tail(
+    table_key: &str,
+    rows: &[impl WalRowSource],
+) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
+    if is_group_table_key(table_key) {
+        materialize_group_wal_tail(table_key, rows, segment_writer_props(), true)
+    } else {
+        materialize_sampler_wal_tail(table_key, rows, segment_writer_props(), true)
+    }
+}
+
+/// The segment bytes of a materialized tail.
+fn encode_tail(
+    table: &crate::table::Table,
+    props: WriterProperties,
+    rez: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "rez")]
+    if rez {
+        return crate::table::write_rez_table_parquet_with(table, props);
+    }
+    #[cfg(not(feature = "rez"))]
+    let _ = rez;
+    write_table_parquet_with(table, props)
 }
 
 /// Encode a V3 acquisition-group's live WAL rows as one parquet segment —
@@ -322,6 +353,7 @@ fn materialize_group_wal_tail(
     table_key: &str,
     rows: &[impl WalRowSource],
     props: WriterProperties,
+    rez: bool,
 ) -> Result<Option<MaterializedTail>, Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Ok(None);
@@ -379,7 +411,7 @@ fn materialize_group_wal_tail(
         return Ok(None);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet_with(&builder.finish(), props)?,
+        bytes: encode_tail(&builder.finish(), props, rez)?,
         rows: row_count,
         // `row_count > 0` implies the loop pushed at least one row, which is
         // exactly when `first_ts` gets set — never `None` here.

@@ -225,12 +225,24 @@ Reading:
   parquet stays. metriken-query's `fixtures` feature still writes parquet
   in the legacy layout (`metric_type = histogram`, no gauge histograms), to
   test reading it.
-- `.rez`: `record -o out.rez` and a hindsight `.rez` buffer still write
-  one. The `.rez` v3 writer's V3 path records a group's gauge histograms (a
-  `gauge_histogram` column in a format 2 segment, through the same WAL rows
-  and `materialize_wal_tail`); a `.rez` written from V1/V2 snapshots
-  (`RezStream`, the v3 writer's flat path) leaves them out, warning once
-  per process (`rez::group_by_sampler`).
+- `.rez` is legacy (pre-6.0) and frozen: nothing new is written into one,
+  so gauge histograms are recorded in `.dendro` only. `record -o out.rez`
+  and a hindsight `.rez` buffer still write `.rez`, and every writer path
+  leaves gauge histograms out and keeps the rest: `rez::group_by_sampler`
+  (V1/V2 snapshots, `RezStream` and the v3 writer's flat path), the v3
+  writer's `ingest_v3` (the group's schema without its gauge histograms,
+  rehashed; a group holding nothing else is not written), and
+  `parquet_ingest` (a `gauge_histogram` column is skipped). Each calls
+  `rez::gauge_histograms_left_out`, which warns once per process "gauge
+  histograms are recorded in .dendro only; this .rez recording leaves them
+  out". `.rez` segments are sealed through `table::write_rez_table_parquet`
+  (and `wal::materialize_rez_wal_tail`), which writes counting histogram
+  columns as `histogram`, since a 5.x viewer passes the column's
+  `metric_type` string into its metric catalog, and refuses a
+  `gauge_histogram` column; a `.rez` segment is therefore always format 1.
+  Reading `.rez` is unchanged. Mutations checked: skipping the `ingest_v3`
+  strip, writing `counter_histogram` into a `.rez`, keeping the parquet
+  ingest column, and dropping the V1/V2 warning each fail a test.
 
 ### Query semantics (metriken-query)
 
@@ -304,7 +316,9 @@ be upgraded together: a recorder from before this change ends the whole
 recording when the agent emits a gauge histogram (see "What the published
 releases do"), and rezolus records through metriken-recorder
 (`src/recorder/mod.rs`, `src/hindsight/mod.rs`), so an agent with the
-sampler needs a rezolus `record` and hindsight built on these releases.
+sampler needs a rezolus `record` and hindsight built on these releases. Its
+histograms are recorded only to `.dendro`; `record -o out.rez` and a `.rez`
+hindsight buffer leave them out with the warning above.
 
 ## Open decisions
 

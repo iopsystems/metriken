@@ -162,7 +162,7 @@ pub fn write_archive(path: &Path, recordings: &[RecordingData]) -> Result<(), Re
         let mut index = Vec::with_capacity(rec.tables.len());
         for table in rec.tables {
             let file = format!("{}.parquet", table.sampler);
-            let bytes = write_table_parquet(table)?;
+            let bytes = crate::table::write_rez_table_parquet(table)?;
             index.push(RezTableIndex {
                 sampler: table.sampler.clone(),
                 file: Some(file.clone()),
@@ -762,10 +762,29 @@ mod table_sampler_tests {
     }
 }
 
-#[cfg(feature = "write")]
+/// How many times a `.rez` writer has left gauge histograms out, in this
+/// process.
+pub(crate) static GAUGE_HISTOGRAMS_LEFT_OUT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The `.rez` format is frozen at its pre-6.0 shape: no writer of it records
+/// a gauge histogram (no `gauge_histogram` column, no format 2 segment).
+/// Every `.rez` writer path that meets one leaves it out and calls this,
+/// which says so once per process.
+pub(crate) fn gauge_histograms_left_out() {
+    let before = GAUGE_HISTOGRAMS_LEFT_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if before == 0 {
+        tracing::warn!(
+            "gauge histograms are recorded in .dendro only; this .rez recording leaves them \
+             out (warned once)"
+        );
+    }
+}
+
 /// Partition a snapshot's metrics by their `sampler` label (`"unattributed"`
 /// when the label is absent). Shared by the in-memory `RezRecorder` and the
 /// streaming `StreamRecorder` so the two ingest paths cannot drift apart.
+#[cfg(feature = "write")]
 pub fn group_by_sampler(snapshot: &Snapshot) -> BTreeMap<&str, Vec<Entry<'_>>> {
     let gauge_histograms = match snapshot {
         Snapshot::V1(s) => s.gauge_histograms.len(),
@@ -773,18 +792,7 @@ pub fn group_by_sampler(snapshot: &Snapshot) -> BTreeMap<&str, Vec<Entry<'_>>> {
         Snapshot::V3(_) => 0,
     };
     if gauge_histograms > 0 {
-        // A V1/V2 `.rez` table has no gauge histogram cells (`Entry` has no
-        // such kind), so they are left out, said once per process. The v3
-        // writer's V3 path (`ingest_v3`) records a group's gauge histograms.
-        static WARNED_GAUGE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !WARNED_GAUGE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            warn!(
-                "a V1/V2 snapshot holds {gauge_histograms} gauge histogram(s), which a `.rez` \
-                 table of V1/V2 entries cannot hold; they are not recorded (warned once). \
-                 Record to `.dendro`, or from V3 snapshots, to keep them"
-            );
-        }
+        gauge_histograms_left_out();
     }
     let (counters, gauges, histograms) = match snapshot {
         Snapshot::V1(s) => (&s.counters, &s.gauges, &s.histograms),
@@ -1367,6 +1375,32 @@ mod recorder_tests {
     // the agent was flipped ahead of this recorder build, so group_by_sampler
     // must warn and record nothing for it, not panic and not fabricate a
     // (wrong) split from a shape it can't borrow from.
+    #[test]
+    fn group_by_sampler_leaves_gauge_histograms_out() {
+        use metriken_model::{Histogram, SnapshotV2};
+        let h = |name: &str| {
+            Histogram::new(
+                name.to_string(),
+                histogram::Histogram::new(0, 8).unwrap(),
+                [("sampler".to_string(), "ext4".to_string())].into(),
+            )
+        };
+        let snapshot = Snapshot::V2(SnapshotV2 {
+            systemtime: std::time::SystemTime::UNIX_EPOCH,
+            duration: std::time::Duration::from_millis(1),
+            metadata: HashMap::new(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms: vec![h("lat")],
+            gauge_histograms: vec![h("free")],
+        });
+        let before = GAUGE_HISTOGRAMS_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed);
+        let groups = group_by_sampler(&snapshot);
+        assert!(GAUGE_HISTOGRAMS_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed) > before);
+        let entries = &groups["ext4"];
+        assert_eq!(entries.len(), 1, "the counting histogram alone");
+    }
+
     #[test]
     fn group_by_sampler_skips_v3_without_panicking() {
         use metriken_model::{GroupSchema, GroupSnapshot, MetricDesc, SnapshotV3};

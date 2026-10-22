@@ -88,6 +88,12 @@ pub fn ingest_parquet_bytes(
         if name == "duration" || mt == Some("timestamp") || mt == Some("duration") {
             continue;
         }
+        // `.rez` is frozen at its pre-6.0 shape: a gauge histogram column is
+        // left out, warned once per process.
+        if mt == Some(metriken_model::GAUGE_HISTOGRAM) {
+            crate::rez::rez::gauge_histograms_left_out();
+            continue;
+        }
         if mt == Some("sparse_histogram")
             || name.ends_with(":bucket_indices")
             || name.ends_with(":bucket_counts")
@@ -189,8 +195,7 @@ pub fn ingest_parquet_bytes(
             .map_err(|e| format!("failed to build a segment batch: {e}"))?;
         let mut buf: Vec<u8> = Vec::new();
         {
-            let props = crate::format::stamped_if_newer(segment_writer_props(), &seg_schema);
-            let mut w = ArrowWriter::try_new(&mut buf, seg_schema, Some(props))
+            let mut w = ArrowWriter::try_new(&mut buf, seg_schema, Some(segment_writer_props()))
                 .map_err(|e| format!("failed to open a segment writer: {e}"))?;
             w.write(&seg_batch)
                 .map_err(|e| format!("failed to write a segment: {e}"))?;
@@ -282,6 +287,49 @@ mod tests {
             w.close().unwrap();
         }
         buf
+    }
+
+    /// A parquet column marked `gauge_histogram` is left out of the `.rez`
+    /// (frozen at its pre-6.0 shape), and the rest of its sampler's table
+    /// is ingested.
+    #[test]
+    fn a_gauge_histogram_column_is_left_out() {
+        let schema = Arc::new(Schema::new(vec![
+            field("timestamp", "timestamp", None),
+            field("cpu_cycles", "counter", Some("cpu_usage")),
+            field("free:buckets", "gauge_histogram", Some("cpu_usage")),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1000u64, 2000])),
+                Arc::new(UInt64Array::from(vec![1u64, 2])),
+                Arc::new(UInt64Array::from(vec![5u64, 6])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        let left_out = || {
+            crate::rez::rez::GAUGE_HISTOGRAMS_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = left_out();
+        let mut db = RezDb::create_in_memory().unwrap();
+        db.transaction(|tx| {
+            ingest_parquet_bytes(&bytes, tx, None)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(left_out() > before);
+        let rec = db.read_recordings().unwrap().remove(0);
+        let segs = db.read_segments(rec.id, "cpu_usage").unwrap();
+        let cols = segment_columns(&segs[0].bytes);
+        assert!(cols.iter().any(|c| c == "cpu_cycles"), "{cols:?}");
+        assert!(!cols.iter().any(|c| c.starts_with("free")), "{cols:?}");
     }
 
     fn segment_columns(bytes: &[u8]) -> Vec<String> {

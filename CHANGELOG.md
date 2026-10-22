@@ -304,9 +304,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StreamDecoder::decode` keeps a group row's gauge histogram slots. A long
   table has no gauge histogram columns: a long row carrying gauge
   histograms, or a group written long that gains one, is written without
-  their values, with a warning once per group. A `.rez` written from V1/V2
-  snapshots leaves their gauge histograms out, with a warning once per
-  process; the `.rez` v3 writer's V3 path records them.
+  their values, with a warning once per group.
+- **Changed:** gauge histograms are recorded in `.dendro` only. `.rez` stays
+  at its pre-6.0 shape: every `.rez` writer (V1/V2 snapshots through
+  `group_by_sampler`, the v3 writer's V3 group path, parquet ingest) leaves
+  gauge histograms out, with the rest of the group or table recorded, and
+  warns once per process ("gauge histograms are recorded in .dendro only;
+  this .rez recording leaves them out"). A `.rez` segment is never format 2,
+  and its counting histogram columns keep `metric_type = histogram`.
+  Reading `.rez` is unchanged.
 - **Added:** segment format 2. A segment holding a gauge histogram column is
   written with `metriken.format = 2`, which readers from 0.3.0 to 0.4.0
   refuse: opening such an archive with metriken-storage 0.4.0 fails with
@@ -326,8 +332,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists write `counter_histogram`, replacing any `metric_type` the
   producer's metadata carried. A group holding a gauge histogram is written
   wide.
-- **Changed:** new segments name the counting histogram
-  `metric_type = counter_histogram` (was `histogram`). Readers take
+- **Changed:** new archive segments name the counting histogram
+  `metric_type = counter_histogram` (was `histogram`); `.rez` segments keep
+  `histogram`. Readers take
   `histogram`, `counter_histogram` and an absent `metric_type` as counting
   (`metriken_model::is_counter_histogram`), so every archive and file
   written before reads as it did; 0.4.0 also reads a new `counter_histogram`

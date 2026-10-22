@@ -301,6 +301,53 @@ pub fn write_table_parquet_with(table: &Table, props: WriterProperties) -> Resul
     Ok(buf)
 }
 
+/// [`write_table_parquet_with`] for a `.rez` writer. `.rez` is frozen at its
+/// pre-6.0 shape: a counting histogram column says `histogram`, as every
+/// `.rez` written before `counter_histogram` did, and a gauge histogram
+/// column is refused (`.rez` writers leave gauge histograms out before a
+/// table is built).
+#[cfg(feature = "rez")]
+pub(crate) fn write_rez_table_parquet_with(
+    table: &Table,
+    props: WriterProperties,
+) -> Result<Vec<u8>, Error> {
+    let kind = |c: &Column| c.metadata.get(metriken_model::METRIC_TYPE).cloned();
+    if table.columns.iter().any(|c| {
+        kind(c)
+            .as_deref()
+            .is_some_and(metriken_model::is_gauge_histogram)
+    }) {
+        return Err(format!(
+            "{}: a `.rez` holds no gauge histogram (they are recorded in .dendro only)",
+            table.sampler
+        )
+        .into());
+    }
+    if !table
+        .columns
+        .iter()
+        .any(|c| kind(c).as_deref() == Some(metriken_model::COUNTER_HISTOGRAM))
+    {
+        return write_table_parquet_with(table, props);
+    }
+    let mut legacy = table.clone();
+    for c in &mut legacy.columns {
+        if kind(c).as_deref() == Some(metriken_model::COUNTER_HISTOGRAM) {
+            c.metadata.insert(
+                metriken_model::METRIC_TYPE.to_string(),
+                metriken_model::LEGACY_HISTOGRAM.to_string(),
+            );
+        }
+    }
+    write_table_parquet_with(&legacy, props)
+}
+
+/// [`write_rez_table_parquet_with`] with [`segment_writer_props`].
+#[cfg(feature = "rez")]
+pub(crate) fn write_rez_table_parquet(table: &Table) -> Result<Vec<u8>, Error> {
+    write_rez_table_parquet_with(table, segment_writer_props())
+}
+
 fn u64_col(a: &ArrayRef) -> &UInt64Array {
     a.as_any()
         .downcast_ref::<UInt64Array>()

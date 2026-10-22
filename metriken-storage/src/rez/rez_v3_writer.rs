@@ -29,9 +29,10 @@ use tracing::warn;
 use super::rez::{dedup_key, entries_approx_bytes, group_approx_bytes, group_by_sampler};
 use super::rez_sqlite::{RecordingMeta, RezDb, SegmentMeta, TickBatch, WalRow};
 use super::seal_policy::{SealPolicy, SegmentAccount};
+#[cfg(test)]
+use super::wal::materialize_wal_tail;
 use super::wal::{
-    decode_wal_group_row, encode_wal_group_row, encode_wal_row, materialize_wal_tail,
-    wal_group_row, WalCell,
+    decode_wal_group_row, encode_wal_group_row, encode_wal_row, wal_group_row, WalCell,
 };
 use super::wire::AgentRows;
 
@@ -923,7 +924,7 @@ fn seal_batch(
         // removes a prefix, never punches a hole), so the last row is never
         // itself skipped. `first_ts`/`rows` are NOT this simple — see below.
         let (last_ts, wall_offset) = (last.ts, last.wall_offset);
-        let Some(tail) = materialize_wal_tail(&sampler, &rows)
+        let Some(tail) = crate::wal::materialize_rez_wal_tail(&sampler, &rows)
             .map_err(|e| format!("failed to encode a {sampler} segment: {e}"))?
         else {
             continue;
@@ -1430,6 +1431,33 @@ impl StreamRecorderV3 {
             // cache hit. This is what keeps a group's WAL rows self-sufficient
             // for `materialize_wal_tail`, called by a reader process with no
             // access to this cache at all.
+            // `.rez` is frozen at its pre-6.0 shape, which has no gauge
+            // histogram: a group's gauge histograms are left out (the schema
+            // without them, its own hash, and no values), warned once per
+            // process. A group holding nothing else is not written.
+            let stripped;
+            let original = g;
+            let (g, schema) = if g.gauge_histograms.is_empty() && schema.gauge_histograms.is_empty()
+            {
+                (g, schema)
+            } else {
+                crate::rez::rez::gauge_histograms_left_out();
+                let mut without = schema.as_ref().clone();
+                without.gauge_histograms.clear();
+                stripped = GroupSnapshot {
+                    schema_hash: without.hash(),
+                    schema: Some(std::sync::Arc::new(without.clone())),
+                    gauge_histograms: Vec::new(),
+                    ..g.clone()
+                };
+                if stripped.counters.is_empty()
+                    && stripped.gauges.is_empty()
+                    && stripped.histograms.is_empty()
+                {
+                    continue;
+                }
+                (&stripped, std::sync::Arc::new(without))
+            };
             let need_anchor = self.segment_schema.get(g.name.as_str()) != Some(&g.schema_hash);
             if need_anchor {
                 self.segment_schema.insert(g.name.clone(), g.schema_hash);
@@ -1446,7 +1474,7 @@ impl StreamRecorderV3 {
                 wall_offset: wall_offset_ns,
                 row: encode_wal_group_row(&row)?,
             });
-            accepted.push((g.name.as_str(), key, group_approx_bytes(g)));
+            accepted.push((original.name.as_str(), key, group_approx_bytes(g)));
         }
 
         // Pass 2: infallible, same shape as `ingest`'s.
@@ -3716,16 +3744,25 @@ mod tests {
             );
         }
 
-        /// A V3 group's gauge histogram reaches the `.rez` segment as a
-        /// `gauge_histogram` column in a format 2 segment, through the same
-        /// WAL rows and `materialize_wal_tail` a `.dendro` uses.
+        /// `.rez` records no gauge histogram: a V3 group's gauge histogram is
+        /// left out (no `gauge_histogram` column, the segment format 1, with
+        /// a warning), and the rest of the group is recorded, its counting
+        /// histogram as `histogram`, the string every pre-6.0 `.rez` holds.
         #[test]
-        fn v3_group_gauge_histogram_reaches_the_segment() {
+        fn v3_group_gauge_histogram_is_left_out() {
             use parquet::file::reader::FileReader;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("out.rez");
             let (_archive, mut rec, rid) = recorder(&path, seals_immediately());
             let schema = GroupSchema {
+                gauges: vec![MetricDesc {
+                    name: "6".to_string(),
+                    metadata: [("metric".to_string(), "mem".to_string())].into(),
+                }],
+                histograms: vec![MetricDesc {
+                    name: "8".to_string(),
+                    metadata: [("metric".to_string(), "lat".to_string())].into(),
+                }],
                 gauge_histograms: vec![MetricDesc {
                     name: "7".to_string(),
                     metadata: [("metric".to_string(), "free".to_string())].into(),
@@ -3740,14 +3777,20 @@ mod tests {
                 schema: Some(std::sync::Arc::new(schema)),
                 window: None,
                 counters: Vec::new(),
-                gauges: Vec::new(),
-                histograms: Vec::new(),
+                gauges: vec![Some(42)],
+                histograms: vec![Some(h.clone())],
                 gauge_histograms: vec![Some(h)],
             };
+            let left_out = || {
+                crate::rez::rez::GAUGE_HISTOGRAMS_LEFT_OUT
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let before = left_out();
             let ts = 1_000_000_000u64;
             rec.ingest(&v3_snap(ts, vec![g]), ts, 0).unwrap();
             rec.maybe_seal().unwrap();
             rec.sync().unwrap();
+            assert!(left_out() > before, "the writer said it left them out");
             let db = RezDb::open(&path).unwrap();
             let segs = db.read_segments(rid, "ext4/free").unwrap();
             assert_eq!(segs.len(), 1);
@@ -3761,14 +3804,31 @@ mod tests {
                 .key_value_metadata()
                 .cloned()
                 .unwrap_or_default();
-            assert!(kv
-                .iter()
-                .any(|e| e.key == crate::format::FORMAT_KEY && e.value.as_deref() == Some("2")));
+            assert!(
+                !kv.iter()
+                    .any(|e| e.key == crate::format::FORMAT_KEY && e.value.as_deref() != Some("1")),
+                "no format 2 segment: {kv:?}"
+            );
             let table =
                 crate::rez::rez::read_table_parquet("ext4/free".to_string(), segs[0].bytes.clone())
                     .unwrap();
-            let col = table.columns.iter().find(|c| c.name == "7").unwrap();
-            assert_eq!(col.metadata["metric_type"], "gauge_histogram");
+            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["6", "8"],
+                "the gauge and the counting histogram are recorded, the gauge histogram is not"
+            );
+            let lat = table.columns.iter().find(|c| c.name == "8").unwrap();
+            assert_eq!(
+                lat.metadata.get("metric_type").map(String::as_str),
+                Some("histogram"),
+                "a counting histogram keeps the pre-6.0 `histogram` string in a .rez"
+            );
+            assert!(table.columns.iter().all(|c| c
+                .metadata
+                .get("metric_type")
+                .map(String::as_str)
+                != Some("gauge_histogram")));
         }
 
         #[test]

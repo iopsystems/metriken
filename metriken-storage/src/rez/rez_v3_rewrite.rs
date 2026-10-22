@@ -138,7 +138,7 @@ pub fn copy_recordings_into(
             // tail's span would claim a start the bytes do not contain.
             // `last_ts` stays the raw tail's own last row — a skip is always a
             // leading run, so that one is always right.
-            let materialized = crate::rez::wal::materialize_wal_tail(&table, &tail)
+            let materialized = crate::wal::materialize_rez_wal_tail(&table, &tail)
                 .map_err(|e| format!("failed to seal the {table} tail: {e}"))?;
             if let Some(materialized) = materialized {
                 let meta = SegmentMeta {
@@ -290,14 +290,12 @@ pub fn project_segment_columns(
 
     let mut buf: Vec<u8> = Vec::new();
     {
-        // The projection keeps the columns' metadata but not the file's, so
-        // a segment still holding a gauge histogram is stamped again.
-        let props = crate::format::stamped_if_newer(
-            crate::rez::rez::segment_writer_props(),
-            &projected_schema,
-        );
-        let mut writer = ArrowWriter::try_new(&mut buf, projected_schema, Some(props))
-            .map_err(|e| format!("failed to open a projected segment writer: {e}"))?;
+        let mut writer = ArrowWriter::try_new(
+            &mut buf,
+            projected_schema,
+            Some(crate::rez::rez::segment_writer_props()),
+        )
+        .map_err(|e| format!("failed to open a projected segment writer: {e}"))?;
         for batch in reader {
             let batch = batch.map_err(|e| format!("failed to read a segment batch: {e}"))?;
             let projected = batch
