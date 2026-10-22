@@ -1095,3 +1095,23 @@ fn the_bound_on_rows_beyond_a_read_decides() {
         assert!(sensitive, "{name}: the bound decides nothing here");
     }
 }
+
+/// Write the random fixtures (seeds 7 and 11, `UNION_ORACLE_N` each) to
+/// `UNION_ORACLE_GEN_DIR`, one `.dendro` per fixture, for a differential of
+/// two builds with `answers_dump`. Ignored.
+#[test]
+#[ignore]
+fn write_random_fixtures() {
+    let dir = std::path::PathBuf::from(std::env::var("UNION_ORACLE_GEN_DIR").unwrap());
+    std::fs::create_dir_all(&dir).unwrap();
+    let n: u64 = std::env::var("UNION_ORACLE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    for seed in [7u64, 11] {
+        for f in 0..n {
+            let mut rng = Rng(0x51ED_2701_A5A5_0F0F ^ (seed * 1_000_003 + f));
+            write(&dir.join(format!("s{seed}f{f}.dendro")), &gen(&mut rng, f));
+        }
+    }
+}
