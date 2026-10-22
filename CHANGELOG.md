@@ -363,7 +363,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `metriken.format` (pyarrow, DuckDB, scripts), which nothing stops reading
   a new column kind as one they know. Older metriken readers refuse an
   archive: every reader before metriken-storage 0.4.0 (metriken-storage
-  0.1.0 to 0.3.2, and rezolus 5.25 to 5.28 on metriken-archive 0.2.7) runs
+  0.1.0 to 0.3.2, and rezolus 5.21 to 5.28: dendro 0.2.1 or 0.3.3, 5.23 onward on metriken-archive 0.2.7) runs
   on a dendro up to 0.5.1, which opens only schema 4, and dendro 0.6
   writes schema 5, so they refuse it when opening it; metriken-storage
   0.4.0 opens it and refuses a format 2 segment by its `metriken.format`

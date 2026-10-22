@@ -11,8 +11,8 @@
 //! script over its columns), so nothing stops one of them reading a new
 //! column kind (a gauge histogram) as the kind it knows. Older metriken
 //! readers refuse an archive: every reader before metriken-storage 0.4.0
-//! (metriken-storage 0.1.0 to 0.3.2, and rezolus 5.25 to 5.28 on
-//! metriken-archive 0.2.7) runs on a dendro up to 0.5.1, which opens only
+//! (metriken-storage 0.1.0 to 0.3.2, and rezolus 5.21 to 5.28 on dendro 0.2.1
+//! or 0.3.3) runs on a dendro up to 0.5.1, which opens only
 //! schema 4, and dendro 0.6 writes schema 5, so they refuse every archive
 //! this writes when opening it. metriken-storage 0.4.0 opens it and refuses
 //! a format 2 segment (a gauge histogram) by its `metriken.format` key.

@@ -1465,9 +1465,10 @@ impl StreamRecorderV3 {
             }
 
             // The ingest boundary: the producer's schema becomes the
-            // archive's on the way into the WAL. `wal_group_row` is shared
-            // with the row-format wire so the two cannot drift on what a
-            // row's values are — see its doc.
+            // archive's on the way into the WAL. `wal_group_row` builds the
+            // row from the snapshot; for a group with gauge histograms the
+            // hash becomes the stripped schema's and the gauge-histogram
+            // slots are dropped, since `.rez` has none.
             let mut row = wal_group_row(g, need_anchor.then(|| schema.as_ref().clone()));
             row.schema_hash = schema_hash;
             row.gauge_histograms.clear();

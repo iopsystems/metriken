@@ -192,7 +192,7 @@ metriken-storage 0.4.0. A segment holding one is therefore written with
 `format::check` in metriken-storage 0.4.0 refuses a newer format, with
 "segment format 2 is newer than this reader, which reads up to 1". Earlier
 readers do not get that far: metriken-storage 0.1.0 to 0.3.2 and
-metriken-archive 0.2.x (rezolus 5.25 to 5.28 lock 0.2.7) run on dendro up
+metriken-archive 0.2.x (rezolus 5.21 to 5.28 lock dendro 0.2.1 or 0.3.3, 5.23 onward on metriken-archive 0.2.7) run on dendro up
 to 0.5.1, which opens only schema 4, and dendro 0.6.0 writes schema 5, so
 they refuse every new archive when opening it. A
 `counter_histogram` column is read correctly by those readers, since they
