@@ -3073,8 +3073,9 @@ fn snapshots_of(list: &ListArray) -> Vec<Option<HistogramSnapshot>> {
     let Some(values) = list.values().as_any().downcast_ref::<UInt64Array>() else {
         return vec![None; list.len()];
     };
-    // Both are relative to their array's own offset, so a sliced list or a
-    // sliced child indexes correctly.
+    // `value_offsets()` index into `list.values()`, which slicing the list does
+    // not slice; the child's `values()` and `nulls()` are already shifted by the
+    // child's own offset. So a sliced list and a sliced child both index correctly.
     let buckets = values.values();
     let bucket_nulls = values.nulls().filter(|n| n.null_count() > 0);
     let offsets = list.value_offsets();
