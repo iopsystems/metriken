@@ -85,9 +85,9 @@ pub struct AgentRow {
     /// `(counters, gauges, histograms)` slot counts for `row`, so a consumer
     /// can run the arity check against a resolved schema without decoding.
     pub arity: (u32, u32, u32),
-    /// `rez::group_approx_bytes` for this group — the seal policy's size
-    /// meter, computed by the producer because the consumer would have to
-    /// decode the payload to arrive at it.
+    /// `metriken_model::cost::group_approx_bytes` for this group, which the
+    /// writer's seal policy meters, computed by the producer because the
+    /// consumer would have to decode the payload to arrive at it.
     pub approx_bytes: u32,
     /// The encoded `WalGroupRow`.
     pub row: Vec<u8>,

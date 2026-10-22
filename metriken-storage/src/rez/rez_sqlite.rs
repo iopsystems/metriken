@@ -918,8 +918,8 @@ impl RezDb {
 }
 
 /// Building a v3 `.rez`, for this crate's tests: nothing ships that writes
-/// one. The schema and inserts are the ones metriken-storage 0.4.0's writer
-/// used, so a test can lay out exactly the rows a reader is asked about.
+/// one. The schema and inserts are the ones the writer at 0c39b2d (after
+/// 0.4.0; output kept at 0.4.0's shape) used, so a test can lay out exactly the rows a reader is asked about.
 /// Archives the writer itself produced are under `tests/fixtures/rez`.
 #[cfg(test)]
 impl RezDb {

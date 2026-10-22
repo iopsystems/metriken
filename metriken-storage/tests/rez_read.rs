@@ -4,9 +4,9 @@
 //! path and by bytes, and queried through metriken-query.
 //!
 //! Nothing in this crate writes a `.rez` any more, so `tests/fixtures/rez/`
-//! was written once by the last writers this crate had (metriken-storage
-//! 0.4.0's `RezRecorder`, `rez_stream::StreamRecorder` and
-//! `rez_v3_writer::StreamRecorderV3`, at 0c39b2d). Every recording but
+//! was written once by the last writers this crate had (`RezRecorder`,
+//! `rez_stream::StreamRecorder` and `rez_v3_writer::StreamRecorderV3`) at
+//! 0c39b2d (after 0.4.0; output kept at 0.4.0's shape). Every recording but
 //! `v3-multi.rez` holds 12 ticks, 1 s apart from 1700000000 s, labelled
 //! `source=rezolus,host=web-01`: `ops` (a windowed counter, +10 a tick,
 //! sampler `a`), `mem_free` (a gauge, 1000 − t, sampler `b`) and `lat` (a
@@ -150,6 +150,68 @@ fn a_v2_tar_that_was_never_finalized_reads_to_its_last_checkpoint() {
     assert!(ops.len() >= 4, "{ops:?}");
     let last = ops.last().unwrap().0 - BASE_S;
     assert_holds_the_ticks(&reader, last as u64);
+}
+
+/// Kill geometry on the bytes the streamed tar writer produced: every prefix
+/// of `v2-partial.rez` cut at a coarse sweep and at each entry's header,
+/// data start and mid-data either fails to open (before the first manifest
+/// is whole) or opens incomplete with exactly the segments its newest
+/// surviving manifest names. The hand-built tars in `rez.rs`'s
+/// `recovery_tests` cover the reader's rules; this covers the writer's
+/// output.
+#[test]
+fn truncated_writer_bytes_recover_the_sealed_prefix() {
+    let bytes = std::fs::read(fixture("v2-partial.rez")).unwrap();
+
+    let mut cuts: Vec<usize> = (0..bytes.len()).step_by(64).collect();
+    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes.clone()));
+    for entry in archive.entries().unwrap() {
+        let entry = entry.unwrap();
+        let head = entry.raw_header_position() as usize;
+        cuts.push(head);
+        cuts.push(head + 512);
+        cuts.push(head + 512 + entry.size() as usize / 2);
+    }
+    cuts.push(bytes.len());
+    cuts.retain(|&c| c <= bytes.len());
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut first_ok: Option<usize> = None;
+    let mut recovered_counts: Vec<usize> = Vec::new();
+    for cut in cuts {
+        let read =
+            metriken_storage::rez::rez::read_archive_reader(std::io::Cursor::new(&bytes[..cut]));
+        match read {
+            Ok((manifest, recordings)) => {
+                first_ok.get_or_insert(cut);
+                let rec = &manifest.recordings[0];
+                assert!(
+                    !rec.complete,
+                    "a truncated archive is never complete (cut {cut})"
+                );
+                let named: usize = rec.tables.iter().map(|t| t.files.len()).sum();
+                let recovered: usize = recordings[0].tables.iter().map(|(_, s)| s.len()).sum();
+                assert_eq!(
+                    named, recovered,
+                    "the resolved manifest names exactly the segments recovered (cut {cut})"
+                );
+                assert!(!recordings[0].complete, "cut {cut}");
+                recovered_counts.push(recovered);
+            }
+            Err(e) => assert!(
+                first_ok.is_none(),
+                "cut {cut} failed after the archive first opened at {first_ok:?}: {e}"
+            ),
+        }
+    }
+    // The initial empty manifest makes the archive readable almost at once.
+    assert_eq!(first_ok, Some(896));
+    // One rung per checkpoint: the initial (empty) manifest, then each seal
+    // batch, which seals both samplers' segments together.
+    recovered_counts.sort_unstable();
+    recovered_counts.dedup();
+    assert_eq!(recovered_counts, vec![0, 2, 4, 6]);
 }
 
 #[test]

@@ -1,7 +1,6 @@
 //! The `.rez` per-sampler archive, read only: an uncompressed tar of
 //! `manifest.json` plus one parquet table per sampler (v1/v2), or a SQLite
-//! file (v3, [`super::rez_sqlite`]). See the Stage-3 plan header for the
-//! format decisions.
+//! file (v3, [`super::rez_sqlite`]).
 //!
 //! A table is one or more parquet *segments* (schema v2), so a tar archive
 //! was either written whole (`manifest.json` first, then
@@ -14,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-/// `.rez` manifest schema version written by this build.
+/// The newest `.rez` tar manifest schema version (the last one written).
 pub const REZ_SCHEMA_VERSION: u32 = 2;
 /// Highest manifest schema version this build can read. v1 shipped without a
 /// forward gate (which is what makes a downgraded/compacted v1-shaped manifest
@@ -900,7 +899,8 @@ mod archive_tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    /// A fixture written by metriken-storage 0.4.0's `.rez` writers; see
+    /// A fixture written by the `.rez` writers at 0c39b2d (after 0.4.0;
+    /// output kept at 0.4.0's shape); see
     /// `tests/rez_read.rs` for what each holds.
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

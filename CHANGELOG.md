@@ -314,7 +314,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StreamRecorderV3`, `CHECKPOINT_INTERVAL`), `rez::rez_stream` (the tar
   stream writer), `rez::rez_v3_rewrite` (`copy_recordings_into` and the
   `combine`/`filter`/`upgrade`/report rewrites), `rez::parquet_ingest` and
-  `rez::seal_policy`; from `rez::rez`, `RezRecorder`, `write_archive`,
+  `rez::seal_policy` (use `dendro::seal::SealPolicy::default()` or
+  `metriken_storage::WriterConfig::default().seal`, whose defaults are the
+  same: 8 MiB, 900 rows, 300 s); from `rez::rez`, `RezRecorder`, `write_archive`,
   `write_archive_bytes`, `append_tar_entry`, `RecordingData`,
   `RecordingSegments`, `RezArchive`, `read_archive`, `Entry`,
   `PushEntries`, `entries_approx_bytes`, `group_by_sampler`, `dedup_key`,
@@ -330,7 +332,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `insert_wal_rows_batch` (and `TickBatch`), `prune_wal`, `evict_before`
   (and `Evicted`), `evict_caller_rows_before`, `incremental_vacuum`,
   `vacuum_into`, `mark_complete`, `update_recording_metadata`,
-  `update_recording_labels` and `commits`; `table::cadence_hint`; and the
+  `update_recording_labels` and `commits`; `rez_sqlite::PAGE_SIZE` (now
+  private, test-only); `table::cadence_hint`; and the
   `test-support` feature. `RezDb::open` and `open_bytes` set only the
   reader's page cache (the writer's `synchronous` and
   `wal_autocheckpoint` are gone). `rez::wire` (the row wire,
