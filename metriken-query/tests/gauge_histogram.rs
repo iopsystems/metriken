@@ -307,3 +307,86 @@ fn an_empty_read_is_empty_not_missing() {
         other => panic!("{other:?}"),
     }
 }
+
+/// What the default listings report for `src`: every name, the series count,
+/// every label key, and each key's values for `free`.
+type Listings = (
+    Vec<String>,
+    usize,
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+);
+
+fn listings<S: MetricsSource + ?Sized>(src: &S) -> Listings {
+    (
+        src.all_names(),
+        src.total_series_count(),
+        src.all_label_keys(),
+        src.label_values_by_key("free")
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect(),
+    )
+}
+
+fn set(items: &[&str]) -> std::collections::BTreeSet<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+fn devs() -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    [("dev".to_string(), set(&["sda", "sdb"]))].into()
+}
+
+/// A store holding only a gauge histogram lists it in every default
+/// listing, alone and as the only child of a union.
+#[test]
+fn a_gauge_histogram_alone_is_in_every_listing() {
+    use metriken_query::UnionMetricsSource;
+    use metriken_storage::union::UnionChild;
+
+    let store = store();
+    let want = (vec!["free".to_string()], 2, set(&["dev"]), devs());
+    assert_eq!(listings(&store), want);
+    let union = UnionMetricsSource::new(vec![UnionChild::from(&store)]);
+    assert_eq!(listings(&union), want);
+}
+
+/// Beside a counter and a gauge, a gauge histogram is counted once and its
+/// labels join theirs; a union of the gauge histogram's store and the
+/// other kinds' store lists the same.
+#[test]
+fn a_gauge_histogram_beside_other_kinds_is_in_every_listing() {
+    use metriken_query::UnionMetricsSource;
+    use metriken_storage::union::UnionChild;
+
+    let ts: Vec<u64> = (0..=10).map(|i| T0 + i * S).collect();
+    let mut cpu = Labels::default();
+    cpu.inner.insert("cpu".to_string(), "0".to_string());
+    let add_others = |store: &MemoryStore| {
+        let n = ts.len();
+        store
+            .insert_counter_series("cycles", cpu.clone(), ts.clone(), vec![1; n], None)
+            .unwrap();
+        store
+            .insert_gauge_series("temp", cpu.clone(), ts.clone(), vec![1; n], None)
+            .unwrap();
+    };
+    let mixed = store();
+    add_others(&mixed);
+    let other = MemoryStore::builder().sampling_interval_ms(1000).build();
+    add_others(&other);
+
+    let want = (
+        vec!["cycles".to_string(), "free".to_string(), "temp".to_string()],
+        4,
+        set(&["cpu", "dev"]),
+        devs(),
+    );
+    assert_eq!(listings(&mixed), want);
+    let gauge_histograms = store();
+    let union = UnionMetricsSource::new(vec![
+        UnionChild::from(&gauge_histograms),
+        UnionChild::from(&other),
+    ]);
+    assert_eq!(listings(&union), want);
+}

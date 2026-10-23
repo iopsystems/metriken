@@ -424,7 +424,7 @@ pub trait MetricsSource: Send + Sync {
     }
 
     /// Distinct values of `key` across all series for `metric`. Walks counter,
-    /// gauge, and histogram series and returns the union. Returns empty if the
+    /// gauge, histogram and gauge histogram series and returns the union. Returns empty if the
     /// metric is unknown or no series carry the key.
     fn label_values(&self, metric: &str, key: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
@@ -451,19 +451,22 @@ pub trait MetricsSource: Send + Sync {
         out
     }
 
-    /// Sorted union of all counter, gauge, and histogram metric names.
+    /// Sorted union of all counter, gauge, histogram and gauge histogram
+    /// metric names.
     fn all_names(&self) -> Vec<String> {
         let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         out.extend(self.counter_names());
         out.extend(self.gauge_names());
         out.extend(self.histogram_names());
+        out.extend(self.gauge_histogram_names());
         out.into_iter().collect()
     }
 
     /// Total number of distinct time series across all metric types.
     ///
-    /// Sums the number of label-set combinations for every counter, gauge, and
-    /// histogram metric. Useful for capacity estimates and UI badges.
+    /// Sums the number of label-set combinations for every counter, gauge,
+    /// histogram and gauge histogram metric. Useful for capacity estimates
+    /// and UI badges.
     fn total_series_count(&self) -> usize {
         let mut count = 0;
         for name in self.counter_names() {
@@ -474,6 +477,9 @@ pub trait MetricsSource: Send + Sync {
         }
         for name in self.histogram_names() {
             count += self.histogram_labels(&name).len();
+        }
+        for name in self.gauge_histogram_names() {
+            count += self.gauge_histogram_labels(&name).len();
         }
         count
     }
@@ -513,12 +519,15 @@ pub trait MetricsSource: Send + Sync {
         for name in self.histogram_names() {
             collect(self.histogram_labels(&name));
         }
+        for name in self.gauge_histogram_names() {
+            collect(self.gauge_histogram_labels(&name));
+        }
         out
     }
 
     /// For a specific metric name, return every label key mapped to the set of
     /// distinct values seen across all series of that metric (counter, gauge,
-    /// and histogram types are all included).
+    /// histogram and gauge histogram series are all included).
     fn label_values_by_key(
         &self,
         metric: &str,
@@ -535,6 +544,7 @@ pub trait MetricsSource: Send + Sync {
         collect(self.counter_labels(metric));
         collect(self.gauge_labels(metric));
         collect(self.histogram_labels(metric));
+        collect(self.gauge_histogram_labels(metric));
         out
     }
 

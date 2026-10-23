@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `out`. `convert_v3_to_dendro` and `to_dendro::convert_path`'s v3 arm
   call it; what they write is unchanged.
 
+### metriken-query 0.42.1
+
+- **Fixed:** `MetricsSource`'s default `all_names`, `total_series_count`,
+  `all_label_keys` and `label_values_by_key` include gauge histograms,
+  which were queryable and listed by `gauge_histogram_names` but missing
+  from these. Every reader here uses the defaults except
+  `ParquetReader::total_series_count`, which already counted them.
+
 ### metriken-storage 0.5.1
 
 - **Added:** converters from the legacy recording formats to `.dendro`,

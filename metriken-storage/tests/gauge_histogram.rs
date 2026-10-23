@@ -1094,3 +1094,119 @@ fn a_gauge_histogram_that_stops_reads_to_its_last_row() {
         rate[0]
     );
 }
+
+/// The default listings of a `MetricsSource`, sorted: every name, the
+/// series count, every label key, and each key's values for `name`.
+fn listings<S: metriken_query::MetricsSource + ?Sized>(
+    src: &S,
+    name: &str,
+) -> (
+    Vec<String>,
+    usize,
+    Vec<String>,
+    BTreeMap<String, Vec<String>>,
+) {
+    let by_key = src
+        .label_values_by_key(name)
+        .into_iter()
+        .map(|(k, v)| {
+            let mut v: Vec<_> = v.into_iter().collect();
+            v.sort();
+            (k, v)
+        })
+        .collect();
+    (
+        src.all_names(),
+        src.total_series_count(),
+        src.all_label_keys().into_iter().collect(),
+        by_key,
+    )
+}
+
+/// Every reader over an archive, a table, or a segment holding a gauge
+/// histogram lists it in the default listings: the archive's reader and
+/// its flattened form (the gauge histogram beside a counting one), and a
+/// `ParquetReader`, a `SegmentedParquetReader` and a union over the gauge
+/// histogram's table alone.
+#[test]
+fn every_reader_lists_a_gauge_histogram() {
+    use dendro::archive::Archive;
+    use metriken_query::{ParquetReader, SegmentedParquetReader, UnionMetricsSource};
+    use metriken_storage::union::UnionChild;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rec.dendro");
+    record(&path, true);
+
+    let device = |labels: Vec<BTreeMap<String, String>>| -> Vec<String> {
+        let mut keys: Vec<String> = labels.into_iter().flat_map(|l| l.into_keys()).collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+    let reader = open(&path);
+    let gauge_keys = device(metriken_query::MetricsSource::gauge_histogram_labels(
+        &reader,
+        "free_extents",
+    ));
+    assert!(gauge_keys.contains(&"device".to_string()), "{gauge_keys:?}");
+    let mut keys = gauge_keys.clone();
+    keys.extend(device(metriken_query::MetricsSource::histogram_labels(
+        &reader,
+        "io_latency",
+    )));
+    keys.sort();
+    keys.dedup();
+
+    let (names, count, all_keys, by_key) = listings(&reader, "free_extents");
+    assert_eq!(names, ["free_extents", "io_latency"]);
+    assert_eq!(count, 2);
+    assert_eq!(all_keys, keys);
+    assert_eq!(by_key.get("device"), Some(&vec!["sda1".to_string()]));
+    assert_eq!(by_key.get("source"), Some(&vec!["test".to_string()]));
+    assert_eq!(
+        listings(&open_flat(&path), "free_extents"),
+        (names, count, all_keys, by_key.clone())
+    );
+
+    // The gauge histogram's table alone, through each parquet reader.
+    let archive = Archive::open(&path).unwrap();
+    let source = archive.read_sources().unwrap().remove(0).id;
+    let segments: Vec<Vec<u8>> = archive
+        .read_segments(source, "fs/ext4")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    assert!(segments.len() > 1, "the table was sealed more than once");
+    // A segment carries the column's labels, not the source's.
+    let want = (
+        vec!["free_extents".to_string()],
+        1,
+        vec!["device".to_string()],
+        BTreeMap::from([("device".to_string(), vec!["sda1".to_string()])]),
+    );
+    let pool = || BufferPool::new(64 << 20);
+    let single = ParquetReader::open_bytes_with_pool(segments[0].clone(), pool()).unwrap();
+    assert_eq!(listings(&single, "free_extents"), want);
+    let segmented = SegmentedParquetReader::open_bytes_with_pool(segments, pool()).unwrap();
+    assert_eq!(listings(&segmented, "free_extents"), want);
+    // A union of the gauge histogram's table and the counting histogram's,
+    // as one sampler's group tables are read.
+    let latency: Vec<Vec<u8>> = archive
+        .read_segments(source, "fs/lat")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    let latency = SegmentedParquetReader::open_bytes_with_pool(latency, pool()).unwrap();
+    let union = UnionMetricsSource::try_new(vec![
+        UnionChild::from(&segmented),
+        UnionChild::from(&latency),
+    ])
+    .unwrap();
+    let mut want_union = want;
+    want_union.0.push("io_latency".to_string());
+    want_union.1 += 1;
+    assert_eq!(listings(&union, "free_extents"), want_union);
+}
