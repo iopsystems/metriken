@@ -1,4 +1,7 @@
-//! Convert a v3 `.rez` into a dendro archive.
+//! Convert a `.rez` into a dendro archive: a v3 (SQLite) one with
+//! [`convert_v3_to_dendro`], a v1 or v2 tar with [`convert_tar_to_dendro`].
+//!
+//! # A v3 `.rez`
 //!
 //! The two containers hold the same things under different names: a `.rez`
 //! recording is a dendro source, a sampler table is a stream, and segments,
@@ -29,12 +32,30 @@
 //! the static-site viewer); the `recording` tools do not yet. This is the
 //! migration path #1224 asks about, and the oracle for the dendro reader: a
 //! converted archive must answer every query the `.rez` did.
+//!
+//! # A v1 or v2 tar `.rez`
+//!
+//! A tar holds each recording's tables as parquet segments, read whole into
+//! memory, and `manifest.json` describing them. Each recording becomes a
+//! source with its manifest labels, metadata, clock anchor (its first row
+//! when the manifest has none, as in v1), clock offsets and `complete`
+//! flag (always true for v1, which predates recovery). Each table keeps
+//! its name, and its segments are re-encoded as described in
+//! [`crate::to_dendro`]: the same columns, counting histograms named
+//! `counter_histogram`, split at the seal caps. A tar cut short by an
+//! unclean kill converts what [`rez::read_archive_reader`] reads of it: the
+//! tables of its newest manifest whose files are all present.
 
 use std::path::Path;
 
 use dendro::archive::{ArchiveMut, CallerRow, SegmentMeta, SourceMeta, WalRow};
 
+use crate::rez::rez;
 use crate::rez::rez_sqlite::RezDb;
+use crate::to_dendro::{
+    insert_table, with_new_archive, with_producer_version, TableWriter, Written,
+};
+use crate::WriterConfig;
 
 /// What one conversion wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +150,88 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
         .map_err(|e| e.to_string())?;
     }
     Ok(done)
+}
+
+/// Convert the v1 or v2 tar `.rez` at `src` into a new dendro archive at
+/// `dest`, under the default [`WriterConfig`]; see the module docs.
+///
+/// `dest` must not exist; an existing one is refused and left as it is. On
+/// an error the archive and the sidecars this created are removed.
+pub fn convert_tar_to_dendro(src: &Path, dest: &Path) -> Result<Written, String> {
+    let file = std::fs::File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
+    with_new_archive(dest, |out| {
+        convert_tar_into(std::io::BufReader::new(file), out, &WriterConfig::default())
+    })
+}
+
+/// Convert a v1 or v2 tar `.rez` read from `reader` into `out`, a source
+/// per recording, splitting segments at `config`'s seal caps and encoding
+/// them with its codec.
+pub fn convert_tar_into(
+    reader: impl std::io::Read,
+    out: &mut ArchiveMut,
+    config: &WriterConfig,
+) -> Result<Written, String> {
+    let (manifest, recordings) = rez::read_archive_reader(reader).map_err(|e| e.to_string())?;
+    let mut written = Written::default();
+    // `read_archive_reader` returns the recordings in manifest order.
+    for (recording, entry) in recordings.into_iter().zip(&manifest.recordings) {
+        let mut tables = Vec::with_capacity(recording.tables.len());
+        for (table, segments) in recording.tables {
+            // Encoded before the source is started: without an anchor in
+            // the manifest, the anchor is the earliest row of any table.
+            let mut encoded = Vec::new();
+            let mut sink = |s| {
+                encoded.push(s);
+                Ok(())
+            };
+            let mut writer = TableWriter::new(&table, config, &mut sink);
+            for segment in segments {
+                writer.push_segment(segment)?;
+            }
+            tables.push((table, encoded));
+        }
+        let anchor = match entry.clock_anchor_wall_ns {
+            Some(anchor) => to_i64(anchor, || {
+                format!("recording {}'s clock anchor", recording.dir)
+            })?,
+            None => tables
+                .iter()
+                .flat_map(|(_, segments)| segments.iter().map(|s| s.meta.first_ts))
+                .min()
+                .unwrap_or(0),
+        };
+        let mut metadata = recording.metadata;
+        with_producer_version(&mut metadata);
+        let source = out
+            .insert_source(&SourceMeta {
+                labels: recording.labels,
+                metadata,
+                clock_anchor_wall_ns: anchor,
+            })
+            .map_err(|e| e.to_string())?;
+        written.sources += 1;
+        for (table, segments) in tables {
+            insert_table(out, source, &table, segments, &mut written)?;
+        }
+        let offsets = entry
+            .clock_offsets
+            .iter()
+            .map(|&(ts, offset)| Ok((to_i64(ts, || "a clock offset".to_string())?, offset)))
+            .collect::<Result<Vec<_>, String>>()?;
+        written.clock_offsets += offsets.len();
+        out.transaction(|tx| {
+            for &(ts, offset) in &offsets {
+                tx.insert_clock_offset(source, ts, offset)?;
+            }
+            if recording.complete {
+                tx.mark_complete(source)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(written)
 }
 
 /// Copy one sampler's segments, one at a time, so a large table is never

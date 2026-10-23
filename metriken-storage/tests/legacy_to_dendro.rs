@@ -1,0 +1,1085 @@
+//! Legacy recordings converted to `.dendro` answer as they did: every
+//! committed legacy fixture (the v2 tar `.rez` fixtures, a v1 tar made from
+//! one, truncated tars, the parquet files under `tests/fixtures/legacy` of
+//! this crate and of metriken-query) and synthetic parquet files (combined
+//! metadata, per-metric windows, many row groups) is converted, and the
+//! original, read through the existing readers, and the archive, read
+//! through `ArchiveReader`, are asked the same questions: the metric and
+//! series listings, the metadata, and range and instant queries of `rate`,
+//! `irate`, gauge reads, `avg_over_time`, `count`, `sum`, `sum by`,
+//! `histogram_quantile`, `histogram_count` and `histogram_heatmap`, on the
+//! grid, raw and per-series paths. Answers must be equal; a float may
+//! differ only in its last places ([`REL`]), and none does in these
+//! fixtures.
+//!
+//! `LEGACY_TO_DENDRO=path` with `-- --ignored converts_a_real_recording`
+//! runs the same comparison over any parquet file or tar `.rez`.
+#![cfg(all(feature = "rez", feature = "write"))]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Int64Array, ListBuilder, UInt64Array, UInt64Builder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use metriken_query::{MetricsSource, ParquetReader, QueryOptions, QueryResult, RateMode};
+use metriken_storage::rez::open::{open_recordings, open_recordings_from_bytes};
+use metriken_storage::rez::to_dendro::{convert_tar_into, convert_tar_to_dendro};
+use metriken_storage::to_dendro::{ParquetToArchive, Written, PARQUET_TABLE};
+use metriken_storage::{ArchiveReader, BufferPool, DendroCatalog, WriterConfig};
+use parquet::file::metadata::KeyValue;
+use serde_json::Value;
+
+/// The relative difference two floats of one answer may have.
+const REL: f64 = 1e-12;
+
+const BASE_NS: u64 = 1_700_000_000_000_000_000;
+
+fn storage_fixture(path: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(path)
+}
+
+fn query_fixture(path: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../metriken-query/tests/fixtures")
+        .join(path)
+}
+
+fn pool() -> Arc<BufferPool> {
+    BufferPool::new(64 << 20)
+}
+
+fn open_archive(path: &Path) -> Vec<(BTreeMap<String, String>, ArchiveReader)> {
+    ArchiveReader::from_catalog(
+        Box::new(DendroCatalog::open(path).unwrap()),
+        None,
+        pool(),
+        None,
+    )
+    .unwrap()
+}
+
+// ─── Answers ────────────────────────────────────────────────────────────────
+
+/// One question and its answer, as JSON (an error as its message).
+type Answer = (String, Result<Value, String>);
+
+fn result_json(r: Result<QueryResult, impl std::fmt::Display>) -> Result<Value, String> {
+    let mut v = serde_json::to_value(r.map_err(|e| e.to_string())?).unwrap();
+    // Series in a fixed order: readers list them in their own.
+    if let Some(series) = v.get_mut("result").and_then(Value::as_array_mut) {
+        series.sort_by_key(|s| s.get("metric").map(Value::to_string).unwrap_or_default());
+    }
+    Ok(v)
+}
+
+fn sorted_labels(mut labels: Vec<BTreeMap<String, String>>) -> Value {
+    labels.sort();
+    serde_json::to_value(labels).unwrap()
+}
+
+/// The queries asked of every metric, by kind.
+fn queries<S: MetricsSource + ?Sized>(src: &S) -> Vec<String> {
+    let keys = |labels: Vec<BTreeMap<String, String>>| -> BTreeSet<String> {
+        labels.into_iter().flat_map(|l| l.into_keys()).collect()
+    };
+    let mut out = Vec::new();
+    for m in src.counter_names() {
+        for q in [
+            m.to_string(),
+            format!("rate({m}[5s])"),
+            format!("irate({m}[5s])"),
+            format!("sum(rate({m}[5s]))"),
+            format!("sum(irate({m}[5s]))"),
+            format!("count({m})"),
+        ] {
+            out.push(q);
+        }
+        for k in keys(src.counter_labels(&m)) {
+            out.push(format!("sum by ({k}) (rate({m}[5s]))"));
+        }
+    }
+    for m in src.gauge_names() {
+        for q in [
+            m.to_string(),
+            format!("sum({m})"),
+            format!("max({m})"),
+            format!("count({m})"),
+            format!("avg_over_time({m}[5s])"),
+        ] {
+            out.push(q);
+        }
+        for k in keys(src.gauge_labels(&m)) {
+            out.push(format!("sum by ({k}) ({m})"));
+        }
+    }
+    for m in src.histogram_names() {
+        for q in [
+            format!("histogram_quantile(0.5, {m})"),
+            format!("histogram_quantile(0.99, {m})"),
+            format!("histogram_count({m})"),
+            format!("histogram_heatmap({m})"),
+        ] {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// Everything `src` answers over `(start, end)` seconds.
+fn answers<S: MetricsSource + ?Sized>(src: &S, (start, end): (f64, f64)) -> Vec<Answer> {
+    let mut out: Vec<Answer> = Vec::new();
+    let mut listing = |what: &str, v: Value| out.push((what.to_string(), Ok(v)));
+    listing(
+        "counters",
+        serde_json::to_value(src.counter_names()).unwrap(),
+    );
+    listing("gauges", serde_json::to_value(src.gauge_names()).unwrap());
+    listing(
+        "histograms",
+        serde_json::to_value(src.histogram_names()).unwrap(),
+    );
+    listing(
+        "gauge histograms",
+        serde_json::to_value(src.gauge_histogram_names()).unwrap(),
+    );
+    for m in src.counter_names() {
+        listing(
+            &format!("labels of {m}"),
+            sorted_labels(src.counter_labels(&m)),
+        );
+    }
+    for m in src.gauge_names() {
+        listing(
+            &format!("labels of {m}"),
+            sorted_labels(src.gauge_labels(&m)),
+        );
+    }
+    for m in src.histogram_names() {
+        listing(
+            &format!("labels of {m}"),
+            sorted_labels(src.histogram_labels(&m)),
+        );
+    }
+    listing(
+        "time range",
+        serde_json::to_value(src.time_range()).unwrap(),
+    );
+
+    let raw = QueryOptions::with_rate_mode(RateMode::Raw);
+    let per_series = QueryOptions::default().with_per_series_rates(true);
+    let mid = (start + end) / 2.0;
+    for q in queries(src) {
+        for step in [1.0, 0.5, 3.0] {
+            out.push((
+                format!("{q} @ step {step}"),
+                result_json(src.query_range(&q, start, end, step)),
+            ));
+        }
+        out.push((
+            format!("{q} raw"),
+            result_json(src.query_range_opts(&q, start, end, 1.0, &raw)),
+        ));
+        out.push((
+            format!("{q} per series"),
+            result_json(src.query_range_opts(&q, start, end, 1.0, &per_series)),
+        ));
+        out.push((
+            format!("{q} inner range"),
+            result_json(src.query_range(&q, start + 2.0, mid, 1.0)),
+        ));
+        for at in [Some(start + 2.0), Some(mid), Some(end), None] {
+            out.push((format!("{q} at {at:?}"), result_json(src.query(&q, at))));
+        }
+    }
+    out
+}
+
+/// How two answer sets compared.
+#[derive(Debug, Default)]
+struct Compared {
+    answers: usize,
+    numbers: usize,
+    /// Numbers that differ within [`REL`].
+    noise: usize,
+    max_rel: f64,
+}
+
+fn same_value(a: &Value, b: &Value, at: &str, c: &mut Compared) -> Result<(), String> {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            c.numbers += 1;
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            if x == y {
+                return Ok(());
+            }
+            let rel = (x - y).abs() / x.abs().max(y.abs());
+            if rel <= REL {
+                c.noise += 1;
+                c.max_rel = c.max_rel.max(rel);
+                Ok(())
+            } else {
+                Err(format!("{at}: {x} against {y}"))
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            if x.len() != y.len() {
+                return Err(format!("{at}: {} items against {}", x.len(), y.len()));
+            }
+            for (i, (x, y)) in x.iter().zip(y).enumerate() {
+                same_value(x, y, &format!("{at}[{i}]"), c)?;
+            }
+            Ok(())
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            let xk: Vec<_> = x.keys().collect();
+            let yk: Vec<_> = y.keys().collect();
+            if xk != yk {
+                return Err(format!("{at}: keys {xk:?} against {yk:?}"));
+            }
+            for (k, v) in x {
+                same_value(v, &y[k], &format!("{at}.{k}"), c)?;
+            }
+            Ok(())
+        }
+        _ if a == b => Ok(()),
+        _ => Err(format!("{at}: {a} against {b}")),
+    }
+}
+
+/// Panics naming the first answer that differs.
+fn assert_same_answers(want: &[Answer], got: &[Answer]) -> Compared {
+    let (c, differ) = compare_answers(want, got);
+    if !differ.is_empty() {
+        let mut shown: Vec<String> = differ
+            .iter()
+            .take(8)
+            .map(|d| d.chars().take(700).collect())
+            .collect();
+        shown.push(format!("{} of {} answers differ", differ.len(), c.answers));
+        panic!("{}", shown.join("\n"));
+    }
+    c
+}
+
+/// The comparison, and each answer that differs.
+fn compare_answers(want: &[Answer], got: &[Answer]) -> (Compared, Vec<String>) {
+    let mut c = Compared::default();
+    assert_eq!(
+        want.iter().map(|(q, _)| q).collect::<Vec<_>>(),
+        got.iter().map(|(q, _)| q).collect::<Vec<_>>(),
+        "the same questions"
+    );
+    let mut differ = Vec::new();
+    for ((q, want), (_, got)) in want.iter().zip(got) {
+        c.answers += 1;
+        match (want, got) {
+            (Ok(w), Ok(g)) => {
+                if let Err(e) = same_value(w, g, q, &mut c) {
+                    differ.push(format!("{e}\n  want {w}\n   got {g}"));
+                }
+            }
+            (Err(w), Err(g)) if w == g => {}
+            _ => differ.push(format!("{q}: {want:?} against {got:?}")),
+        }
+    }
+    (c, differ)
+}
+
+/// The converted metadata holds the original's (apart from parquet's own
+/// keys), and adds only `producer_version` beside a `version`.
+fn assert_same_metadata(want: &HashMap<String, String>, got: &HashMap<String, String>) {
+    for (k, v) in want {
+        if k == "ARROW:schema" || k == "metriken.format" {
+            continue;
+        }
+        assert_eq!(got.get(k), Some(v), "metadata `{k}`");
+    }
+    for k in got.keys() {
+        let added = k == "producer_version" && want.contains_key("version");
+        assert!(want.contains_key(k) || added, "metadata `{k}` was added");
+    }
+    if let Some(version) = want.get("version") {
+        assert_eq!(got.get("producer_version"), Some(version));
+    }
+}
+
+/// Every answer `want` gives, `got` gives, each recording alone and the
+/// recordings together.
+fn assert_answers_as<A: MetricsSource + ?Sized, B: MetricsSource + ?Sized>(
+    want: &A,
+    got: &B,
+) -> Compared {
+    assert_same_metadata(&want.file_metadata(), &got.file_metadata());
+    // A recording with no rows (a tar cut right after its first manifest)
+    // has listings and no range to query.
+    let range = want.time_range().unwrap_or((0.0, 0.0));
+    assert_same_answers(&answers(want, range), &answers(got, range))
+}
+
+// ─── Tar `.rez` ─────────────────────────────────────────────────────────────
+
+/// Convert the tar at `input` and compare the archive with it.
+fn check_tar_bytes(bytes: Vec<u8>, config: &WriterConfig) -> (Written, Compared) {
+    let original = open_recordings_from_bytes(bytes.clone(), pool()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let mut out = dendro::archive::ArchiveMut::create(&dest).unwrap();
+    let written = convert_tar_into(bytes.as_slice(), &mut out, config).unwrap();
+    drop(out);
+    let report = dendro::archive::Archive::open(&dest)
+        .unwrap()
+        .verify(dendro::archive::Depth::Full)
+        .unwrap();
+    assert!(report.is_sound(), "{:?}", report.problems);
+
+    let converted = open_recordings(&dest, pool()).unwrap();
+    assert_eq!(original.len(), converted.len(), "one source per recording");
+    let mut total = Compared::default();
+    for ((wl, want), (gl, got)) in original.iter().zip(&converted) {
+        assert_eq!(wl, gl, "recording labels");
+        assert_eq!(want.complete(), got.complete(), "complete");
+        let c = assert_answers_as(want, got);
+        total.answers += c.answers;
+        total.numbers += c.numbers;
+        total.noise += c.noise;
+        total.max_rel = total.max_rel.max(c.max_rel);
+    }
+    // And flattened, as `view` reads a multi-recording archive.
+    let flat = |r: Vec<(BTreeMap<String, String>, ArchiveReader)>| {
+        ArchiveReader::flatten(r.into_iter().map(|(_, r)| r).collect(), None)
+    };
+    let (want, got) = (flat(original), flat(converted));
+    assert_answers_as(&want, &got);
+    (written, total)
+}
+
+fn check_tar(path: &Path) -> (Written, Compared) {
+    check_tar_bytes(std::fs::read(path).unwrap(), &WriterConfig::default())
+}
+
+/// A small seal cap, so a 12-row table splits into several segments.
+fn tiny_segments(rows: usize) -> WriterConfig {
+    let mut config = WriterConfig::default();
+    config.seal.max_rows = rows;
+    config
+}
+
+#[test]
+fn a_v2_tar_converts() {
+    let (written, c) = check_tar(&storage_fixture("rez/v2.rez"));
+    assert_eq!(
+        (
+            written.sources,
+            written.tables,
+            written.segments,
+            written.rows
+        ),
+        (1, 2, 2, 24)
+    );
+    assert_eq!(c.noise, 0, "{c:?}");
+    println!("v2.rez: {c:?}");
+}
+
+#[test]
+fn a_streamed_v2_tar_converts_and_stays_incomplete() {
+    let (written, c) = check_tar(&storage_fixture("rez/v2-partial.rez"));
+    assert_eq!((written.sources, written.tables), (1, 2));
+    assert!(written.segments >= 4, "{written:?}");
+    assert_eq!(c.noise, 0, "{c:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    convert_tar_to_dendro(&storage_fixture("rez/v2-partial.rez"), &dest).unwrap();
+    let (_, reader) = open_archive(&dest).remove(0);
+    assert!(
+        !reader.complete(),
+        "a recovered recording reads as recovered"
+    );
+    println!("v2-partial.rez: {c:?}");
+}
+
+#[test]
+fn split_segments_answer_as_one() {
+    for name in ["rez/v2.rez", "rez/v2-partial.rez"] {
+        for rows in [1, 2, 5] {
+            let bytes = std::fs::read(storage_fixture(name)).unwrap();
+            let (written, c) = check_tar_bytes(bytes, &tiny_segments(rows));
+            assert!(
+                written.segments >= 24 / rows,
+                "{name} at {rows}: {written:?}"
+            );
+            assert_eq!(c.noise, 0, "{name} at {rows}: {c:?}");
+        }
+    }
+}
+
+/// Every prefix of a streamed tar that reads converts to what it reads.
+/// Prefixes that read the same manifest read the same tables, so each
+/// distinct reading is compared in full once.
+#[test]
+fn a_truncated_tar_converts_its_readable_prefix() {
+    let bytes = std::fs::read(storage_fixture("rez/v2-partial.rez")).unwrap();
+    let mut readable = 0;
+    let mut seen = BTreeSet::new();
+    for cut in (512..bytes.len()).step_by(512) {
+        let prefix = bytes[..cut].to_vec();
+        let Ok((manifest, _)) = metriken_storage::rez::rez::read_archive_reader(prefix.as_slice())
+        else {
+            continue;
+        };
+        readable += 1;
+        if !seen.insert(serde_json::to_string(&manifest).unwrap()) {
+            continue;
+        }
+        let (_, c) = check_tar_bytes(prefix, &WriterConfig::default());
+        assert_eq!(c.noise, 0, "cut at {cut}");
+    }
+    assert!(readable >= 3, "{readable} readable prefixes");
+    assert!(seen.len() >= 3, "{} distinct readings", seen.len());
+}
+
+/// The members of a tar, in order.
+fn tar_members(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut archive = tar::Archive::new(bytes);
+    archive
+        .entries()
+        .unwrap()
+        .map(|e| {
+            let mut e = e.unwrap();
+            let name = e.path().unwrap().to_string_lossy().into_owned();
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).unwrap();
+            (name, buf)
+        })
+        .collect()
+}
+
+fn tar_of(members: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, bytes) in members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, bytes.as_slice())
+            .unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// `v2.rez` with a v1 manifest: `file` only, no `files`, no `complete`,
+/// which v1 recordings read as complete.
+#[test]
+fn a_v1_tar_converts_complete() {
+    let members = tar_members(&std::fs::read(storage_fixture("rez/v2.rez")).unwrap());
+    let members: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .map(|(name, bytes)| {
+            if name != "manifest.json" {
+                return (name, bytes);
+            }
+            let mut m: Value = serde_json::from_slice(&bytes).unwrap();
+            m["version"] = 1.into();
+            for rec in m["recordings"].as_array_mut().unwrap() {
+                let rec = rec.as_object_mut().unwrap();
+                rec.remove("complete");
+                for t in rec["tables"].as_array_mut().unwrap() {
+                    t.as_object_mut().unwrap().remove("files");
+                }
+            }
+            (name, serde_json::to_vec(&m).unwrap())
+        })
+        .collect();
+    let bytes = tar_of(&members);
+    let (written, c) = check_tar_bytes(bytes.clone(), &WriterConfig::default());
+    assert_eq!((written.sources, written.rows), (1, 24));
+    assert_eq!(c.noise, 0, "{c:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let mut out = dendro::archive::ArchiveMut::create(&dest).unwrap();
+    convert_tar_into(bytes.as_slice(), &mut out, &WriterConfig::default()).unwrap();
+    drop(out);
+    let (_, reader) = open_archive(&dest).remove(0);
+    assert!(reader.complete());
+}
+
+/// Two recordings in one tar become two sources, each with its labels.
+#[test]
+fn a_tar_of_two_recordings_converts_to_two_sources() {
+    let members = tar_members(&std::fs::read(storage_fixture("rez/v2.rez")).unwrap());
+    let mut out = Vec::new();
+    for (name, bytes) in members {
+        if name == "manifest.json" {
+            let mut m: Value = serde_json::from_slice(&bytes).unwrap();
+            let mut second = m["recordings"][0].clone();
+            second["dir"] = "rezolus-web-02".into();
+            second["labels"]["host"] = "web-02".into();
+            second["metadata"]["version"] = "5.9.0".into();
+            m["recordings"].as_array_mut().unwrap().push(second);
+            out.push((name, serde_json::to_vec(&m).unwrap()));
+        } else {
+            out.push((name.replace("web-01", "web-02"), bytes.clone()));
+            out.push((name, bytes));
+        }
+    }
+    let (written, c) = check_tar_bytes(tar_of(&out), &WriterConfig::default());
+    assert_eq!((written.sources, written.tables), (2, 4));
+    assert_eq!(c.noise, 0, "{c:?}");
+}
+
+#[test]
+fn a_tar_carries_clock_anchor_and_offsets() {
+    let members = tar_members(&std::fs::read(storage_fixture("rez/v2.rez")).unwrap());
+    let members: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .map(|(name, bytes)| {
+            if name != "manifest.json" {
+                return (name, bytes);
+            }
+            let mut m: Value = serde_json::from_slice(&bytes).unwrap();
+            m["recordings"][0]["clock_anchor_wall_ns"] = 1_699_999_999_000_000_000u64.into();
+            m["recordings"][0]["clock_offsets"] = serde_json::json!([
+                [1_700_000_003_000_000_000u64, 12],
+                [1_700_000_007_000_000_000u64, -4]
+            ]);
+            (name, serde_json::to_vec(&m).unwrap())
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.rez");
+    std::fs::write(&src, tar_of(&members)).unwrap();
+    let dest = dir.path().join("out.dendro");
+    let written = convert_tar_to_dendro(&src, &dest).unwrap();
+    assert_eq!(written.clock_offsets, 2);
+    let archive = dendro::archive::Archive::open(&dest).unwrap();
+    let source = &archive.read_sources().unwrap()[0];
+    assert_eq!(source.meta.clock_anchor_wall_ns, 1_699_999_999_000_000_000);
+    assert_eq!(
+        archive.read_clock_offsets(source.id).unwrap(),
+        [
+            (1_700_000_003_000_000_000, 12),
+            (1_700_000_007_000_000_000, -4)
+        ]
+    );
+    assert!(source.complete);
+
+    // Without an anchor in the manifest, the first row.
+    let dest = dir.path().join("plain.dendro");
+    convert_tar_to_dendro(&storage_fixture("rez/v2.rez"), &dest).unwrap();
+    let archive = dendro::archive::Archive::open(&dest).unwrap();
+    assert_eq!(
+        archive.read_sources().unwrap()[0].meta.clock_anchor_wall_ns,
+        BASE_NS as i64
+    );
+}
+
+// ─── Parquet ────────────────────────────────────────────────────────────────
+
+fn check_parquet_with(path: &Path, converter: &ParquetToArchive) -> (Written, Compared) {
+    let original = ParquetReader::open(path).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let written = converter.convert_file_path(path, &dest).unwrap();
+    let report = dendro::archive::Archive::open(&dest)
+        .unwrap()
+        .verify(dendro::archive::Depth::Full)
+        .unwrap();
+    assert!(report.is_sound(), "{:?}", report.problems);
+    let mut recordings = open_archive(&dest);
+    assert_eq!(recordings.len(), 1);
+    let (_, converted) = recordings.remove(0);
+    assert!(converted.complete());
+    let c = assert_answers_as(&original, &converted);
+    (written, c)
+}
+
+fn check_parquet(path: &Path) -> (Written, Compared) {
+    check_parquet_with(path, &ParquetToArchive::new())
+}
+
+#[test]
+fn the_legacy_parquet_fixtures_convert() {
+    for path in [
+        storage_fixture("legacy/legacy-0.4.0.parquet"),
+        query_fixture("legacy/legacy-0.4.0.parquet"),
+    ] {
+        let (written, c) = check_parquet(&path);
+        assert_eq!((written.sources, written.tables, written.rows), (1, 1, 4));
+        assert_eq!(c.noise, 0, "{c:?}");
+        println!("{}: {c:?}", path.display());
+    }
+}
+
+/// A rezolus-shaped parquet file: `ops` (a counter of two series, `id` 0
+/// and 1, +10 and +20 a tick), `mem_free` (a gauge, 1000 − t), `lat` (a
+/// counting histogram, `metric_type = histogram`), each with a per-metric
+/// acquisition window, and a `duration` column; the metadata of a file
+/// rezolus's `combine` wrote.
+fn rezolus_parquet(path: &Path, ticks: u64, windows: bool) {
+    let md = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let config = histogram::Config::new(2, 8).unwrap();
+    let buckets = config.total_buckets();
+    let list = DataType::List(Arc::new(Field::new("item", DataType::UInt64, true)));
+    let mut fields = vec![
+        Field::new("timestamp", DataType::UInt64, false)
+            .with_metadata(md(&[("metric_type", "timestamp"), ("unit", "nanoseconds")])),
+        Field::new("duration", DataType::UInt64, true)
+            .with_metadata(md(&[("metric_type", "duration"), ("unit", "nanoseconds")])),
+        Field::new("0", DataType::UInt64, true).with_metadata(md(&[
+            ("metric", "ops"),
+            ("metric_type", "counter"),
+            ("id", "0"),
+            ("source", "rezolus"),
+        ])),
+        Field::new("1", DataType::UInt64, true).with_metadata(md(&[
+            ("metric", "ops"),
+            ("metric_type", "counter"),
+            ("id", "1"),
+            ("source", "rezolus"),
+        ])),
+        Field::new("2", DataType::Int64, true).with_metadata(md(&[
+            ("metric", "mem_free"),
+            ("metric_type", "gauge"),
+            ("source", "rezolus"),
+        ])),
+        Field::new("3:buckets", list, true).with_metadata(md(&[
+            ("metric", "lat"),
+            ("metric_type", "histogram"),
+            ("grouping_power", "2"),
+            ("max_value_power", "8"),
+            ("source", "llm-perf"),
+        ])),
+    ];
+    let t: Vec<u64> = (0..ticks).collect();
+    let ts: Vec<u64> = t.iter().map(|t| BASE_NS + t * 1_000_000_000).collect();
+    let mut lat = ListBuilder::new(UInt64Builder::new());
+    for t in &t {
+        for b in 0..buckets {
+            lat.values().append_value(if b == 2 { t + 1 } else { 0 });
+        }
+        lat.append(true);
+    }
+    let mut arrays: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(ts.clone())),
+        Arc::new(UInt64Array::from(vec![3_000_000u64; ticks as usize])),
+        Arc::new(UInt64Array::from_iter_values(t.iter().map(|t| 10 * t))),
+        Arc::new(UInt64Array::from_iter_values(t.iter().map(|t| 20 * t + 7))),
+        Arc::new(Int64Array::from_iter_values(
+            t.iter().map(|t| 1000 - *t as i64),
+        )),
+        Arc::new(lat.finish()),
+    ];
+    if windows {
+        // Each read began up to 2 ms before the row's timestamp and took
+        // 1 to 3 ms, varying so the bands are not all alike.
+        for col in ["0", "1", "3"] {
+            fields.push(Field::new(
+                format!("{col}:window_begin"),
+                DataType::Int64,
+                true,
+            ));
+            fields.push(Field::new(
+                format!("{col}:window_width"),
+                DataType::UInt64,
+                true,
+            ));
+            arrays.push(Arc::new(Int64Array::from_iter_values(
+                t.iter().map(|t| -2_000_000 + (*t as i64 % 3) * 500_000),
+            )));
+            arrays.push(Arc::new(UInt64Array::from_iter_values(
+                t.iter().map(|t| 1_000_000 + (t % 5) * 500_000),
+            )));
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
+    let kv = [
+        ("source", r#"["rezolus","llm-perf"]"#),
+        ("sampling_interval_ms", "1000"),
+        ("version", "5.11.0"),
+        ("producer_epoch", "6b0f3c1e-7a8e-4f43-9b6a-2c1d9e0f4a11"),
+        ("systeminfo", r#"{"os":"linux","arch":"x86_64"}"#),
+        (
+            "descriptions",
+            r#"{"ops":"Operations","mem_free":"Free memory"}"#,
+        ),
+        (
+            "per_source_metadata",
+            r#"{"rezolus":{"version":"5.11.0"},"llm-perf":{"version":"0.1.11","role":"loadgen"}}"#,
+        ),
+        ("report", "trimmed"),
+    ]
+    .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+    .to_vec();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_key_value_metadata(Some(kv))
+        .set_max_row_group_row_count(Some(7))
+        .build();
+    let file = std::fs::File::create(path).unwrap();
+    let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+}
+
+#[test]
+fn a_combined_parquet_with_windows_converts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("combined.parquet");
+    rezolus_parquet(&path, 40, true);
+    for converter in [
+        ParquetToArchive::new(),
+        ParquetToArchive::new().writer_config(tiny_segments(6)),
+    ] {
+        let (written, c) = check_parquet_with(&path, &converter);
+        assert_eq!(written.rows, 40);
+        assert_eq!(c.noise, 0, "{c:?}");
+        println!("combined.parquet in {} segments: {c:?}", written.segments);
+    }
+}
+
+/// The bands a parquet file's per-metric windows give are the archive's.
+#[test]
+fn per_metric_windows_keep_their_bands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("windows.parquet");
+    rezolus_parquet(&path, 20, true);
+    let dest = dir.path().join("out.dendro");
+    ParquetToArchive::new()
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    let original = ParquetReader::open(&path).unwrap();
+    let (_, converted) = open_archive(&dest).remove(0);
+    let (lo, hi) = (BASE_NS as f64 / 1e9 + 2.0, BASE_NS as f64 / 1e9 + 18.0);
+    let bands = |r: QueryResult| -> Vec<Vec<Option<(f64, f64)>>> {
+        let QueryResult::Matrix { result } = r else {
+            panic!("{r:?}")
+        };
+        let mut result: Vec<_> = result
+            .into_iter()
+            .map(|s| (format!("{:?}", s.metric.get("id")), s.bands))
+            .collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+            .into_iter()
+            .map(|(_, b)| b.expect("a windowed rate has bands"))
+            .collect()
+    };
+    let want = bands(original.query_range("irate(ops[5s])", lo, hi, 1.0).unwrap());
+    let got = bands(
+        converted
+            .query_range("irate(ops[5s])", lo, hi, 1.0)
+            .unwrap(),
+    );
+    assert_eq!(want, got);
+    // The windows vary, so the bands do: not the duration fallback, and not
+    // degenerate.
+    let widths: BTreeSet<u64> = got[0]
+        .iter()
+        .flatten()
+        .map(|(l, h)| ((h - l) * 1e6) as u64)
+        .collect();
+    assert!(widths.len() > 1, "{widths:?}");
+}
+
+/// The windowless file reads its bands from `duration`, before and after.
+#[test]
+fn a_windowless_parquet_converts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.parquet");
+    rezolus_parquet(&path, 30, false);
+    let (_, c) = check_parquet(&path);
+    assert_eq!(c.noise, 0, "{c:?}");
+}
+
+/// Many row groups and many samples, from metriken-query's fixture builder,
+/// cut into segments of 128 rows.
+#[test]
+fn a_long_parquet_converts_in_segments() {
+    let fixture = metriken_query::fixtures::FixtureBuilder::new()
+        .samples(2000)
+        .row_group_size(300)
+        .monotonic_counter("cpu_cycles", &[("id", "0")], 1000)
+        .monotonic_counter("cpu_cycles", &[("id", "1")], 3000)
+        .resetting_counter("resets", &[], 50, 1200)
+        .gauge("load", &[("cpu", "0")], |t| (t % 17) as i64)
+        .point_histogram("latency", &[], 3, 10, 9, 4)
+        .metadata("source", "rezolus")
+        .build()
+        .unwrap();
+    let path = fixture.path().to_path_buf();
+    let (written, c) = check_parquet_with(
+        &path,
+        &ParquetToArchive::new().writer_config(tiny_segments(128)),
+    );
+    assert_eq!((written.rows, written.segments), (2000, 16));
+    assert_eq!(c.noise, 0, "{c:?}");
+    println!("2000 samples: {c:?}");
+}
+
+#[test]
+fn a_label_tags_every_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.parquet");
+    rezolus_parquet(&path, 10, true);
+    let dest = dir.path().join("out.dendro");
+    ParquetToArchive::new()
+        .label("host", "web-01")
+        .metadata("version", "5.12.0")
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    let (labels, reader) = open_archive(&dest).remove(0);
+    assert_eq!(labels["host"], "web-01");
+    assert!(reader
+        .counter_labels("ops")
+        .iter()
+        .all(|l| l.get("host").map(String::as_str) == Some("web-01")));
+    assert_eq!(reader.metadata()["version"], "5.12.0", "the caller's wins");
+    assert_eq!(reader.metadata()["producer_version"], "5.12.0");
+}
+
+/// A counting histogram written now says `counter_histogram`.
+#[test]
+fn counting_histograms_are_written_as_counter_histogram() {
+    use metriken_storage::Catalog;
+    use parquet::file::reader::FileReader;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    ParquetToArchive::new()
+        .convert_file_path(storage_fixture("legacy/legacy-0.4.0.parquet"), &dest)
+        .unwrap();
+    let catalog = DendroCatalog::open(&dest).unwrap();
+    let source = catalog.sources().unwrap().remove(0);
+    assert_eq!(catalog.tables(source.id).unwrap(), [PARQUET_TABLE]);
+    let bytes = catalog
+        .segment_bytes(source.id, PARQUET_TABLE, 0)
+        .unwrap()
+        .unwrap();
+    let file = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+    let fm = file.metadata().file_metadata();
+    let schema =
+        parquet::arrow::parquet_to_arrow_schema(fm.schema_descr(), fm.key_value_metadata())
+            .unwrap();
+    assert_eq!(
+        schema.field_with_name("2:buckets").unwrap().metadata()["metric_type"],
+        "counter_histogram"
+    );
+    let kv: Vec<_> = fm
+        .key_value_metadata()
+        .unwrap()
+        .iter()
+        .map(|e| e.key.as_str())
+        .collect();
+    assert!(kv.contains(&"metriken.format"), "{kv:?}");
+}
+
+// ─── Errors and cleanup ─────────────────────────────────────────────────────
+
+#[test]
+fn an_existing_output_is_refused_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    std::fs::write(&dest, b"keep me").unwrap();
+    let err = convert_tar_to_dendro(&storage_fixture("rez/v2.rez"), &dest).unwrap_err();
+    assert!(err.contains("already exists"), "{err}");
+    let err = ParquetToArchive::new()
+        .convert_file_path(storage_fixture("legacy/legacy-0.4.0.parquet"), &dest)
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+}
+
+#[test]
+fn a_failed_conversion_removes_what_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    // A tar whose segment is not parquet.
+    let members = tar_members(&std::fs::read(storage_fixture("rez/v2.rez")).unwrap());
+    let broken: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .map(|(n, b)| {
+            if n.ends_with("b.parquet") {
+                (n, b"not parquet".to_vec())
+            } else {
+                (n, b)
+            }
+        })
+        .collect();
+    let src = dir.path().join("broken.rez");
+    std::fs::write(&src, tar_of(&broken)).unwrap();
+    let err = convert_tar_to_dendro(&src, &dest).unwrap_err();
+    assert!(err.contains("table b"), "{err}");
+    let left = || -> BTreeSet<String> {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(left(), BTreeSet::from(["broken.rez".to_string()]));
+
+    // A parquet file with no rows.
+    let empty = dir.path().join("empty.parquet");
+    rezolus_parquet(&empty, 0, false);
+    let err = ParquetToArchive::new()
+        .convert_file_path(&empty, &dest)
+        .unwrap_err();
+    assert!(err.to_string().contains("no rows"), "{err}");
+    assert_eq!(
+        left(),
+        BTreeSet::from(["broken.rez".to_string(), "empty.parquet".to_string()])
+    );
+}
+
+/// Into an archive in memory, as the browser would, and read from its bytes.
+#[test]
+fn converts_into_an_archive_in_memory() {
+    let mut out = dendro::archive::ArchiveMut::create_in_memory().unwrap();
+    let bytes =
+        bytes::Bytes::from(std::fs::read(storage_fixture("legacy/legacy-0.4.0.parquet")).unwrap());
+    ParquetToArchive::new()
+        .convert_into(bytes, &mut out)
+        .unwrap();
+    let tar = std::fs::read(storage_fixture("rez/v2.rez")).unwrap();
+    convert_tar_into(tar.as_slice(), &mut out, &WriterConfig::default()).unwrap();
+    let image = out.serialize().unwrap();
+    let recordings = open_recordings_from_bytes(image, pool()).unwrap();
+    assert_eq!(recordings.len(), 2);
+    assert_eq!(recordings[0].1.histogram_names(), ["lat"]);
+    assert_eq!(recordings[1].0["host"], "web-01");
+}
+
+/// `v` without uncertainty bands and the interpolation flags beside them.
+fn strip_bands(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            for k in ["bands", "intervals", "interval", "interpolated"] {
+                m.remove(k);
+            }
+            m.values_mut().for_each(strip_bands);
+        }
+        Value::Array(a) => a.iter_mut().for_each(strip_bands),
+        _ => {}
+    }
+}
+
+/// Converts any parquet file or tar `.rez` and compares the answers. A tar
+/// is compared as the fixtures are, and fails on a difference. A parquet
+/// file is compared against two readers of the original, and the answers
+/// that differ are counted rather than failed on: `ParquetReader`, and an
+/// `ArchiveReader` holding the file as its one in-memory segment, which
+/// separates what the conversion changed from what the two readers answer
+/// differently for the same bytes.
+///
+/// ```text
+/// LEGACY_TO_DENDRO=/path/to/recording.parquet \
+///   cargo test -p metriken-storage --all-features --release --test \
+///   legacy_to_dendro converts_a_real_recording -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs LEGACY_TO_DENDRO=<path to a parquet file or tar .rez>"]
+fn converts_a_real_recording() {
+    let path = PathBuf::from(std::env::var_os("LEGACY_TO_DENDRO").expect("set LEGACY_TO_DENDRO"));
+    let start = std::time::Instant::now();
+    if metriken_storage::rez::rez::is_rez_path(&path).unwrap_or(false) {
+        let (written, c) = check_tar(&path);
+        println!(
+            "{}: {written:?}, {c:?} in {:.1?}",
+            path.display(),
+            start.elapsed()
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let written = ParquetToArchive::new()
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    let took = start.elapsed();
+    let parquet = ParquetReader::open(&path).unwrap();
+    let metadata: BTreeMap<String, String> = parquet
+        .file_metadata()
+        .into_iter()
+        .filter(|(k, _)| k != "ARROW:schema")
+        .collect();
+    let in_memory = ArchiveReader::from_in_memory(
+        vec![metriken_storage::InMemorySource {
+            name: "original".to_string(),
+            labels: BTreeMap::new(),
+            metadata,
+            complete: true,
+            tables: vec![(
+                PARQUET_TABLE.to_string(),
+                vec![std::fs::read(&path).unwrap()],
+            )],
+        }],
+        None,
+        pool(),
+    )
+    .unwrap();
+    let (_, converted) = open_archive(&dest).remove(0);
+    assert_same_metadata(&parquet.file_metadata(), &converted.file_metadata());
+    let range = parquet.time_range().unwrap();
+    let got = answers(&converted, range);
+    println!(
+        "{}: {written:?} in {took:.1?}, {} -> {} bytes; intervals: parquet {}, in-memory {}, converted {}",
+        path.display(),
+        std::fs::metadata(&path).unwrap().len(),
+        std::fs::metadata(&dest).unwrap().len(),
+        MetricsSource::interval(&parquet),
+        MetricsSource::interval(&in_memory),
+        MetricsSource::interval(&converted),
+    );
+    let unbanded = |a: Vec<Answer>| -> Vec<Answer> {
+        a.into_iter()
+            .map(|(q, r)| {
+                (
+                    q,
+                    r.map(|mut v| {
+                        strip_bands(&mut v);
+                        v
+                    }),
+                )
+            })
+            .collect()
+    };
+    for (name, want, got) in [
+        ("ParquetReader", answers(&parquet, range), got.clone()),
+        (
+            "in-memory ArchiveReader",
+            answers(&in_memory, range),
+            got.clone(),
+        ),
+        (
+            "in-memory ArchiveReader, bands left out",
+            unbanded(answers(&in_memory, range)),
+            unbanded(got),
+        ),
+    ] {
+        let (c, differ) = compare_answers(&want, &got);
+        println!(
+            "  against {name}: {} of {} answers differ; {c:?}",
+            differ.len(),
+            c.answers
+        );
+        for d in differ.iter().take(4) {
+            println!(
+                "    {}",
+                d.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
+        }
+    }
+}

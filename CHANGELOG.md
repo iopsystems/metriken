@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.5.1
+
+- **Added:** converters from the legacy recording formats to `.dendro`,
+  so an edit of an old recording can start from an archive.
+  `to_dendro::ParquetToArchive` (feature `write`; `label`, `metadata`,
+  `writer_config`, `convert_file_path`, and `convert_into` over a
+  `File` or `Bytes` into a caller's `ArchiveMut`, which may be
+  `ArchiveMut::create_in_memory`) converts a standalone parquet
+  recording, combined files included, into one source.
+  `rez::to_dendro::convert_tar_to_dendro` and `convert_tar_into`
+  (features `rez` and `write`) convert a v1 or v2 tar `.rez`, a source
+  per recording with its manifest labels, metadata, clock anchor, clock
+  offsets and `complete` flag; a tar cut short converts the prefix the
+  reader reads. Both return `to_dendro::Written` (sources, tables,
+  segments, rows, clock offsets). Tables are re-encoded column for column
+  (labels, per-metric and table-level windows, `timestamp`, `duration`,
+  `:wall_offset`), split at the seal caps of the `WriterConfig`
+  (`max_rows`, and `max_bytes` measured on decoded rows), with counting
+  histograms written as `counter_histogram`; a parquet file's `duration`
+  is also written as the table-level window pair when it has none, which
+  keeps the bands the parquet reader derived from it, since an archive's
+  reader reads windows only from sidecars. A parquet file's key-value
+  metadata (without `ARROW:schema` and `metriken.format`) and a tar
+  recording's metadata are the source's metadata, and `version` is also
+  written as `producer_version`. The output is finalized (no WAL rows),
+  an existing output is refused, and on an error the archive and the
+  sidecars the conversion created are removed. Nothing spawns a thread,
+  and the crate still checks for wasm32 with `rez` and `write`.
+- The converted archive answers as the input did. `tests/legacy_to_dendro.rs`
+  converts `tests/fixtures/rez/v2.rez` and `v2-partial.rez`, a v1 tar and a
+  two-recording tar made from them, the prefixes of `v2-partial.rez` cut
+  every 512 bytes (each distinct reading of them), both `legacy-0.4.0.parquet` fixtures and synthetic
+  parquet files (a combined file with per-metric windows, a windowless
+  one, 2000 samples in 7 row groups cut into 128-row segments), and
+  compares the series listings, the metadata, and range and instant
+  queries of `rate`, `irate`, gauge reads, `avg_over_time`, `count`,
+  `sum`, `sum by`, `max`, `histogram_quantile`, `histogram_count` and
+  `histogram_heatmap` on the grid, raw and per-series paths: every answer
+  is byte-identical. On fifteen recordings rezolus publishes with its
+  viewer (126 KB to 17.6 MB), the converted archive and an `ArchiveReader`
+  over the original file give identical values (within 1.2e-15 relative)
+  except where the archive's measured interval is not the declared one;
+  see the next bullet. Against `ParquetReader` they also differ where the
+  two readers differ on the same bytes: three columns with one label set
+  read as one series, the error text for a metric name holding `/`, and
+  `rate` at a range's first points (2.4e-8 relative on one recording).
+- An archive's reader measures a table's interval from its rows (span over
+  gaps, rounded to the millisecond) and does not read
+  `sampling_interval_ms`, which a parquet file declares and its reader
+  uses. On a recording with dropped or jittered rows the two differ (0.994
+  s, 1.003 s and 1.013 s against 1 s on the recordings above), and gauge
+  staleness and instant `irate` change where a grid point falls between
+  them (6 of 238 answers on a 5-row recording, 270 to 554 of 9132 to 19479
+  on the others). The converter keeps `sampling_interval_ms` in the
+  metadata; the archive cannot make the reader use it.
+
 ### metriken-query 0.42.0
 
 - **Changed:** a query over an archive reads each process group (copies of

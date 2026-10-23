@@ -43,6 +43,9 @@
 //! - `convert` (feature `convert`): a raw msgpack recording into a `.dendro`
 //!   archive. metriken writes no standalone parquet; parquet files written
 //!   before are read by `parquet`.
+//! - `to_dendro` (feature `write`): a standalone parquet recording into a
+//!   `.dendro` archive, beside `rez::to_dendro`, which converts a `.rez` of
+//!   any version.
 //!
 //! Without the archive:
 //! - `stream` (feature `stream`): `metriken_exposition::stream`, re-exported
@@ -87,6 +90,8 @@ pub mod source;
 #[cfg(feature = "stream")]
 pub mod stream;
 pub mod table;
+#[cfg(feature = "write")]
+pub mod to_dendro;
 pub mod types;
 pub mod union;
 pub mod util;
