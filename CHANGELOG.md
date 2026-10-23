@@ -31,9 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tables are re-encoded column for column (labels, per-metric and
   table-level windows, `timestamp`, `duration`, `:wall_offset`) and split
   at the `WriterConfig` seal caps (`max_rows`, and `max_bytes` metered as
-  the writer meters a row: a cell per value that is not null, and a
-  histogram's buckets), so a converted segment holds what a recorded one
-  would. Rows are decoded about 1 MiB at a time and encoded into the open
+  the input's average encoded bytes per row, so a run of rows denser than
+  the average overshoots it in proportion). The recorder's writer meters
+  resident bytes instead, which bounds a live segment; a copy has nothing
+  resident to bound, and each segment carries its arrow schema (about 1.5
+  MB at 5000 columns), so cutting where the writer would made wide
+  recordings 10 to 48 times larger. The recordings rezolus publishes
+  convert to one segment each (two for the 17.6 MB one). Rows are decoded about 1 MiB at a time and encoded into the open
   segment as they are read, and each segment is inserted when it is
   sealed. Counting histograms are written as `counter_histogram`. A
   parquet file's `duration` is also written as the table-level window

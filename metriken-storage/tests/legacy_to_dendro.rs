@@ -730,6 +730,9 @@ fn rezolus_parquet_at(path: &Path, t: &[u64], windows: bool) {
     let props = parquet::file::properties::WriterProperties::builder()
         .set_key_value_metadata(Some(kv))
         .set_max_row_group_row_count(Some(7))
+        // Compressed, so the encoded bytes the byte cap meters differ from
+        // the uncompressed size.
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
         .build();
     let file = std::fs::File::create(path).unwrap();
     let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -1270,60 +1273,35 @@ fn the_byte_cap_splits_segments() {
     assert_eq!((written.rows, written.segments), (12, 12));
     assert_eq!(c.noise, 0, "{c:?}");
 
-    // The cap meters a row as the writer does: each value costs a cell,
-    // and a histogram's buckets theirs. A cap of three rows' worth seals
-    // after every third row, and the default after the last.
-    use metriken_storage::builder::{CELL_OVERHEAD_BYTES, HISTOGRAM_BUCKET_BYTES};
-    let buckets = histogram::Config::new(2, 8).unwrap().total_buckets();
-    let row = 4 * CELL_OVERHEAD_BYTES + buckets * HISTOGRAM_BUCKET_BYTES;
+    // The cap meters a row as the input's average encoded bytes per row (its
+    // row groups' compressed size over its rows): a cap of three rows' worth
+    // seals after every third row, a byte more after every fourth, and the
+    // default after the last.
+    let per_row = {
+        use parquet::file::reader::FileReader;
+        let file =
+            parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&path).unwrap())
+                .unwrap();
+        let groups = file.metadata().row_groups();
+        let bytes: i64 = groups.iter().map(|g| g.compressed_size()).sum();
+        let rows: i64 = groups.iter().map(|g| g.num_rows()).sum();
+        (bytes / rows) as usize
+    };
     let capped = |bytes: usize| {
         let mut config = WriterConfig::default();
         config.seal.max_rows = 1000;
         config.seal.max_bytes = bytes;
         ParquetToArchive::new().writer_config(config)
     };
-    let (written, _) = check_parquet_with(&path, &capped(3 * row));
+    let (written, _) = check_parquet_with(&path, &capped(3 * per_row));
     assert_eq!(written.segments, 4, "{written:?}");
-    let (written, _) = check_parquet_with(&path, &capped(3 * row + 1));
+    let (written, _) = check_parquet_with(&path, &capped(3 * per_row + 1));
     assert_eq!(
         written.segments, 3,
         "a fourth row reaches the cap: {written:?}"
     );
     let (written, _) = check_parquet(&path);
     assert_eq!(written.segments, 1);
-
-    // A null is not a cell and costs nothing: a column of nulls beside one
-    // counter leaves a row costing one cell.
-    let sparse = dir.path().join("sparse.parquet");
-    let md = |id: &str| -> HashMap<String, String> {
-        [("metric", "ops"), ("metric_type", "counter"), ("id", id)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::UInt64, false),
-        Field::new("0", DataType::UInt64, true).with_metadata(md("0")),
-        Field::new("1", DataType::UInt64, true).with_metadata(md("1")),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(UInt64Array::from_iter_values(
-                (0..12u64).map(|t| BASE_NS + t * 1_000_000_000),
-            )),
-            Arc::new(UInt64Array::from_iter_values((0..12u64).map(|t| 10 * t))),
-            Arc::new(UInt64Array::from(vec![None::<u64>; 12])),
-        ],
-    )
-    .unwrap();
-    let mut w =
-        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&sparse).unwrap(), schema, None)
-            .unwrap();
-    w.write(&batch).unwrap();
-    w.close().unwrap();
-    let (written, _) = check_parquet_with(&sparse, &capped(3 * CELL_OVERHEAD_BYTES));
-    assert_eq!(written.segments, 4, "{written:?}");
 }
 
 /// The source's metadata is the file's, without the parquet format's keys.

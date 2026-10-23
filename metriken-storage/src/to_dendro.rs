@@ -36,8 +36,10 @@
 //!   its name; a parquet file's columns are one table, [`PARQUET_TABLE`].
 //! - **Segments are bounded.** An input file is split into segments at the
 //!   writer's seal caps ([`WriterConfig::seal`]'s `max_rows`, and
-//!   `max_bytes` metered as the writer meters a row: the resident bytes of
-//!   its values and windows), never merged with another
+//!   `max_bytes` metered as the input's average encoded bytes per row,
+//!   where the recorder meters resident bytes; see
+//!   `TableWriter::push_file`), never
+//!   merged with another
 //!   input file. `max_age` bounds what a crash loses while recording and
 //!   does not apply. A long segment is refused, since its occupant list
 //!   indexes its rows; no tar `.rez` holds one.
@@ -598,7 +600,31 @@ impl<'a, 's> TableWriter<'a, 's> {
             });
         let row_width = (decoded.max(0) as usize / input_rows.max(1) as usize).max(1);
         let batch_rows = (BATCH_BYTES / row_width).clamp(1, 1024);
-        let meter = RowMeter::new(&schema);
+        // The byte cap is metered as the input file's encoded bytes per row
+        // (its row groups' compressed size over its rows) times the rows in
+        // the open segment. It is an average, so a segment of rows denser
+        // than the file's average overshoots the cap in proportion. The
+        // `ArrowWriter`'s own estimate of the open segment
+        // (`in_progress_size`) counts the open page before compression and
+        // cut the recordings rezolus publishes into 3 to 50 segments where
+        // this cuts 1 or 2.
+        //
+        // The recorder's writer meters differently, on purpose: it bounds
+        // what a live segment holds resident before it is sealed (a cell per
+        // value, plus a histogram's buckets: `builder::cells_approx_bytes`).
+        // This is a one-shot copy with nothing resident to bound, and each
+        // segment carries its own arrow schema in its footer (about 1.5 MB
+        // at 5000 columns), so cutting where the writer would made a wide
+        // recording 10 to 48 times larger and its queries about 70 times
+        // slower.
+        let (encoded, input_rows) = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .fold((0i64, 0i64), |(b, r), g| {
+                (b + g.compressed_size(), r + g.num_rows())
+            });
+        let per_row = (encoded.max(0) as usize / input_rows.max(1) as usize).max(1);
         let reader = builder.with_batch_size(batch_rows).build()?;
         let mut open: Option<OpenSegment> = None;
         for batch in reader {
@@ -616,24 +642,22 @@ impl<'a, 's> TableWriter<'a, 's> {
                 columns.push(Arc::new(duration.clone()));
             }
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-            let costs = meter.costs(&batch);
-            // Rows go to the open segment one run at a time; a segment is
-            // sealed after the row that reaches either cap, as the writer
-            // seals after the tick that does.
-            let mut start = 0;
-            for (i, cost) in costs.iter().enumerate() {
+            let mut rest = batch;
+            while rest.num_rows() > 0 {
                 let segment = match &mut open {
                     Some(segment) => segment,
                     None => open.insert(OpenSegment::new(&schema, &props)?),
                 };
-                segment.rows += 1;
-                segment.bytes += cost;
-                let full = segment.rows >= self.max_rows || segment.bytes >= self.max_bytes;
-                if full || i + 1 == costs.len() {
-                    segment.write(&batch.slice(start, i + 1 - start), ts_col)?;
-                    start = i + 1;
-                }
-                if full {
+                // As many rows as both caps leave room for, and at least one.
+                let byte_room =
+                    (self.max_bytes.saturating_sub(segment.rows * per_row) / per_row).max(1);
+                let take = (self.max_rows - segment.rows)
+                    .min(byte_room)
+                    .min(rest.num_rows());
+                segment.write(&rest.slice(0, take), ts_col)?;
+                segment.rows += take;
+                rest = rest.slice(take, rest.num_rows() - take);
+                if segment.rows >= self.max_rows || segment.rows * per_row >= self.max_bytes {
                     let segment = open.take().expect("written to above");
                     (self.sink)(segment.finish()?)?;
                 }
@@ -649,63 +673,10 @@ impl<'a, 's> TableWriter<'a, 's> {
 /// How many decoded bytes of an input are read at a time.
 const BATCH_BYTES: usize = 1 << 20;
 
-/// What a row costs against the byte cap: what the writer charges a row of
-/// the same cells ([`crate::builder::cells_approx_bytes`]), the resident
-/// bytes of its values and windows while the segment is open. Each value
-/// that is not null costs [`CELL_OVERHEAD_BYTES`](crate::builder::CELL_OVERHEAD_BYTES),
-/// and a histogram's buckets [`HISTOGRAM_BUCKET_BYTES`](crate::builder::HISTOGRAM_BUCKET_BYTES)
-/// each; the time columns and window sidecars are not cells.
-struct RowMeter {
-    /// The value columns, and whether each is a list (a histogram).
-    columns: Vec<(usize, bool)>,
-}
-
-impl RowMeter {
-    fn new(schema: &Schema) -> Self {
-        let columns = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                let name = f.name();
-                name != "timestamp"
-                    && name != "duration"
-                    && name != crate::table::WALL_OFFSET_COLUMN
-                    && !name.ends_with(":window_begin")
-                    && !name.ends_with(":window_width")
-            })
-            .map(|(i, f)| (i, matches!(f.data_type(), DataType::List(_))))
-            .collect();
-        Self { columns }
-    }
-
-    fn costs(&self, batch: &RecordBatch) -> Vec<usize> {
-        use crate::builder::{CELL_OVERHEAD_BYTES, HISTOGRAM_BUCKET_BYTES};
-        let mut costs = vec![0usize; batch.num_rows()];
-        for &(col, list) in &self.columns {
-            let column = batch.column(col);
-            let lists = list
-                .then(|| column.as_any().downcast_ref::<arrow::array::ListArray>())
-                .flatten();
-            for (row, cost) in costs.iter_mut().enumerate() {
-                if column.is_null(row) {
-                    continue;
-                }
-                *cost += CELL_OVERHEAD_BYTES;
-                if let Some(lists) = lists {
-                    *cost += lists.value_length(row).max(0) as usize * HISTOGRAM_BUCKET_BYTES;
-                }
-            }
-        }
-        costs
-    }
-}
-
 /// A segment being written: rows are encoded into it as they arrive.
 struct OpenSegment {
     writer: ArrowWriter<Vec<u8>>,
     rows: usize,
-    bytes: usize,
     span: Option<(i64, i64)>,
 }
 
@@ -717,7 +688,6 @@ impl OpenSegment {
         Ok(Self {
             writer: ArrowWriter::try_new(Vec::new(), Arc::clone(schema), Some(props.clone()))?,
             rows: 0,
-            bytes: 0,
             span: None,
         })
     }
