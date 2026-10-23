@@ -899,7 +899,7 @@ fn an_existing_output_is_refused_and_kept() {
     let dest = dir.path().join("out.dendro");
     std::fs::write(&dest, b"keep me").unwrap();
     let err = convert_tar_to_dendro(&storage_fixture("rez/v2.rez"), &dest).unwrap_err();
-    assert!(err.contains("already exists"), "{err}");
+    assert!(err.to_string().contains("already exists"), "{err}");
     let err = ParquetToArchive::new()
         .convert_file_path(storage_fixture("legacy/legacy-0.4.0.parquet"), &dest)
         .unwrap_err();
@@ -926,7 +926,7 @@ fn a_failed_conversion_removes_what_it_created() {
     let src = dir.path().join("broken.rez");
     std::fs::write(&src, tar_of(&broken)).unwrap();
     let err = convert_tar_to_dendro(&src, &dest).unwrap_err();
-    assert!(err.contains("table b"), "{err}");
+    assert!(err.to_string().contains("table b"), "{err}");
     let left = || -> BTreeSet<String> {
         std::fs::read_dir(dir.path())
             .unwrap()
@@ -1361,7 +1361,10 @@ fn a_long_segment_in_a_tar_is_refused() {
     std::fs::write(&src, tar_of(&members)).unwrap();
     let dest = dir.path().join("out.dendro");
     let err = convert_tar_to_dendro(&src, &dest).unwrap_err();
-    assert!(err.contains("table b has a long segment"), "{err}");
+    assert!(
+        err.to_string().contains("table b has a long segment"),
+        "{err}"
+    );
     assert!(!dest.exists());
 }
 
@@ -1400,7 +1403,8 @@ fn an_output_with_a_sidecar_beside_it_is_refused() {
         std::fs::write(&sidecar, b"stale").unwrap();
         let err = convert_tar_to_dendro(&storage_fixture("rez/v2.rez"), &dest).unwrap_err();
         assert!(
-            err.contains(&format!("out.dendro{suffix} already exists")),
+            err.to_string()
+                .contains(&format!("out.dendro{suffix} already exists")),
             "{err}"
         );
         let err = ParquetToArchive::new()
@@ -1504,4 +1508,129 @@ fn a_parquet_without_an_interval_reads_at_one_second() {
     );
     let (_, c) = check_parquet(&without);
     assert_eq!(c.noise, 0, "{c:?}");
+}
+
+/// A histogram decodes to its buckets, present or not, so the batch size
+/// comes from the schema: 900 rows of two 262,144-bucket histograms, a file
+/// of tens of kilobytes, decode 2 MiB a row and are read a row at a time.
+#[test]
+fn wide_histograms_are_read_a_row_at_a_time() {
+    use metriken_storage::to_dendro::decode_batch_rows;
+    let (gp, mvp) = (14u32, 29u32);
+    let buckets = ((mvp - gp + 1) as usize) << gp;
+    assert_eq!(buckets, 262_144);
+    let md = |name: &str| -> HashMap<String, String> {
+        [
+            ("metric", name),
+            ("metric_type", "histogram"),
+            ("grouping_power", "14"),
+            ("max_value_power", "29"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    };
+    let list = DataType::List(Arc::new(Field::new("item", DataType::UInt64, true)));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::UInt64, false),
+        Field::new("duration", DataType::UInt64, true),
+        Field::new("h0", list.clone(), true).with_metadata(md("h0")),
+        Field::new("h1", list.clone(), true).with_metadata(md("h1")),
+    ]));
+    assert_eq!(decode_batch_rows(&schema), 1);
+
+    // A smaller file of the same shape, converted a few rows at a time,
+    // reads as it did: 2 columns of 11,264 buckets is 176 KiB a row.
+    let (gp, mvp) = (10u32, 20u32);
+    let buckets = ((mvp - gp + 1) as usize) << gp;
+    let md = |name: &str| -> HashMap<String, String> {
+        [
+            ("metric", name),
+            ("metric_type", "histogram"),
+            ("grouping_power", "10"),
+            ("max_value_power", "20"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::UInt64, false),
+        Field::new("duration", DataType::UInt64, true),
+        Field::new("h0", list.clone(), true).with_metadata(md("h0")),
+        Field::new("h1", list.clone(), true).with_metadata(md("h1")),
+    ]));
+    assert_eq!(decode_batch_rows(&schema), 5);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse.parquet");
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .build();
+    let mut w = parquet::arrow::ArrowWriter::try_new(
+        std::fs::File::create(&path).unwrap(),
+        Arc::clone(&schema),
+        Some(props),
+    )
+    .unwrap();
+    let rows = 12u64;
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from_iter_values(
+            (0..rows).map(|t| BASE_NS + t * 1_000_000_000),
+        )),
+        Arc::new(UInt64Array::from(vec![1000u64; rows as usize])),
+    ];
+    for _ in 0..2 {
+        let mut b = ListBuilder::new(UInt64Builder::new());
+        for t in 0..rows {
+            for i in 0..buckets {
+                b.values().append_value(if i == 100 { t } else { 0 });
+            }
+            b.append(true);
+        }
+        columns.push(Arc::new(b.finish()));
+    }
+    w.write(&RecordBatch::try_new(Arc::clone(&schema), columns).unwrap())
+        .unwrap();
+    w.close().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let written = ParquetToArchive::new()
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    assert_eq!(written.rows, rows);
+    let original = ParquetReader::open(&path).unwrap();
+    let (_, converted) = open_archive(&dest).remove(0);
+    let (lo, hi) = original.time_range().unwrap();
+    for q in ["histogram_count(h0)", "histogram_quantile(0.5, h1)"] {
+        assert_eq!(
+            result_json(original.query_range(q, lo, hi, 1.0)),
+            result_json(converted.query_range(q, lo, hi, 1.0)),
+            "{q}"
+        );
+    }
+
+    // Narrow tables keep 1024-row batches, a list without a configuration
+    // is read a row at a time, and the target is about 1 MiB.
+    let narrow = Schema::new(vec![Field::new("timestamp", DataType::UInt64, false)]);
+    assert_eq!(decode_batch_rows(&narrow), 1024);
+    let unconfigured = Schema::new(vec![Field::new("x", list, true)]);
+    assert_eq!(decode_batch_rows(&unconfigured), 1);
+    let small = Schema::new(
+        (0..4)
+            .map(|i| {
+                Field::new(
+                    format!("h{i}"),
+                    DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+                    true,
+                )
+                .with_metadata(
+                    [("grouping_power", "4"), ("max_value_power", "11")]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect::<HashMap<_, _>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    // 4 columns of (11 - 4 + 1) << 4 = 128 buckets: 4 KiB a row.
+    assert_eq!(decode_batch_rows(&small), 256);
 }

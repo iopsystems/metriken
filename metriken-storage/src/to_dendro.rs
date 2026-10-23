@@ -99,7 +99,8 @@ use parquet::file::reader::ChunkReader;
 
 use crate::WriterConfig;
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
+/// The error the conversions return.
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// The table a parquet file's columns are written to.
 pub const PARQUET_TABLE: &str = "parquet";
@@ -422,16 +423,53 @@ pub(crate) fn remove_archive(output: &Path) {
 /// replace an `output` that appeared since: a file at `output` is never
 /// removed or overwritten. On an error the staged archive and its sidecars
 /// are removed.
-pub(crate) fn staged<T, E: From<String>>(
+pub(crate) fn staged<T, E: From<String> + std::fmt::Display>(
     output: &Path,
     f: impl FnOnce(&Path) -> Result<T, E>,
 ) -> Result<T, E> {
     refuse_existing(output).map_err(E::from)?;
-    let staging = staging_path(output).map_err(E::from)?;
-    let result = f(&staging);
-    let result = result.and_then(|v| publish(&staging, output).map(|()| v).map_err(E::from));
-    remove_archive(&staging);
-    result
+    let staging = Staging(staging_path(output).map_err(E::from)?);
+    // An error that names the staging path names the output instead: the
+    // staging path is gone by the time the caller reads it.
+    let renamed = |e: E| {
+        let text = e.to_string();
+        let staging = staging.0.display().to_string();
+        if text.contains(&staging) {
+            E::from(text.replace(&staging, &output.display().to_string()))
+        } else {
+            e
+        }
+    };
+    let value = f(&staging.0).map_err(renamed)?;
+    unflushed_wal(&staging.0).map_err(E::from)?;
+    publish(&staging.0, output).map_err(E::from)?;
+    Ok(value)
+}
+
+/// A staging path; dropping it removes the archive and sidecars there,
+/// whether the conversion published, failed, returned early or panicked.
+/// After a publish the archive's other name, the output, remains.
+struct Staging(PathBuf);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        remove_archive(&self.0);
+    }
+}
+
+/// Refuse to publish an archive whose `-wal` sidecar holds frames: SQLite
+/// folds the log into the archive when the last connection closes, and a
+/// log left behind holds committed rows the archive file does not.
+fn unflushed_wal(staging: &Path) -> Result<(), String> {
+    let [_, wal, ..] = archive_paths(staging);
+    match std::fs::metadata(&wal) {
+        Ok(m) if m.len() > 0 => Err(format!(
+            "the archive's write-ahead log ({} bytes) was not folded into it when it \
+             was closed",
+            m.len()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// A path beside `output` that no archive or sidecar occupies.
@@ -452,23 +490,44 @@ fn staging_path(output: &Path) -> Result<PathBuf, String> {
 }
 
 /// Give the finished archive at `staging` the name `output`, failing if
-/// `output` exists. A hard link does that atomically; a filesystem without
-/// hard links gets a rename after a check.
+/// `output` exists, so a file there is never replaced. A hard link does
+/// that atomically. A filesystem without hard links gets a copy into a file
+/// created with `create_new`, which fails as atomically if `output`
+/// exists; a copy that fails part way removes that file, which it created.
 fn publish(staging: &Path, output: &Path) -> Result<(), String> {
+    let exists = || format!("{} already exists", output.display());
     match std::fs::hard_link(staging, output) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(format!("{} already exists", output.display()))
-        }
-        Err(_) if !output.exists() => std::fs::rename(staging, output)
-            .map_err(|e| format!("moving the archive to {}: {e}", output.display())),
-        Err(e) => Err(format!("moving the archive to {}: {e}", output.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+        Err(_) => copy_new(staging, output),
     }
+}
+
+/// Copy `staging` into a new file at `output`, failing if `output` exists.
+fn copy_new(staging: &Path, output: &Path) -> Result<(), String> {
+    let mut to = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+    {
+        Ok(to) => to,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("{} already exists", output.display()))
+        }
+        Err(e) => return Err(format!("creating {}: {e}", output.display())),
+    };
+    std::fs::File::open(staging)
+        .and_then(|mut from| std::io::copy(&mut from, &mut to))
+        .and_then(|_| to.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(output);
+            format!("writing {}: {e}", output.display())
+        })
 }
 
 /// Create an archive with [`staged`], run `f` on it, and close it before it
 /// is moved to `output`.
-pub(crate) fn with_new_archive<T, E: From<String>>(
+pub(crate) fn with_new_archive<T, E: From<String> + std::fmt::Display>(
     output: &Path,
     f: impl FnOnce(&mut ArchiveMut) -> Result<T, E>,
 ) -> Result<T, E> {
@@ -588,18 +647,7 @@ impl<'a, 's> TableWriter<'a, 's> {
                 .build(),
             &schema,
         );
-        // Decode about 1 MiB at a time: a batch's rows are held decoded, and
-        // on a table thousands of columns wide (histograms among them) 1024
-        // rows of it run to gigabytes.
-        let (decoded, input_rows) = builder
-            .metadata()
-            .row_groups()
-            .iter()
-            .fold((0i64, 0i64), |(b, r), g| {
-                (b + g.total_byte_size(), r + g.num_rows())
-            });
-        let row_width = (decoded.max(0) as usize / input_rows.max(1) as usize).max(1);
-        let batch_rows = (BATCH_BYTES / row_width).clamp(1, 1024);
+        let batch_rows = decode_batch_rows(&schema);
         // The byte cap is metered as the input file's encoded bytes per row
         // (its row groups' compressed size over its rows) times the rows in
         // the open segment. It is an average, so a segment of rows denser
@@ -613,8 +661,8 @@ impl<'a, 's> TableWriter<'a, 's> {
         // what a live segment holds resident before it is sealed (a cell per
         // value, plus a histogram's buckets: `builder::cells_approx_bytes`).
         // This is a one-shot copy with nothing resident to bound, and each
-        // segment carries its own arrow schema in its footer (about 1.5 MB
-        // at 5000 columns), so cutting where the writer would made a wide
+        // segment carries its own footer (about 3.8 MB at 5000 columns,
+        // about 3 MB of it the arrow schema), so cutting where the writer would made a wide
         // recording 10 to 48 times larger and its queries about 70 times
         // slower.
         let (encoded, input_rows) = builder
@@ -672,6 +720,38 @@ impl<'a, 's> TableWriter<'a, 's> {
 
 /// How many decoded bytes of an input are read at a time.
 const BATCH_BYTES: usize = 1 << 20;
+
+/// How many rows of a table with `schema` decode to about [`BATCH_BYTES`]:
+/// a batch's rows are held decoded, and a histogram's buckets decode to 8
+/// bytes each, present or not, so a file of a few kilobytes can decode to
+/// gigabytes. A row is sized from the schema: 8 bytes a column, and a
+/// histogram column `((max_value_power - grouping_power + 1) <<
+/// grouping_power) * 8`. A list column without that configuration has no
+/// size to read, and the table is read a row at a time. Between 1 and 1024.
+#[doc(hidden)]
+pub fn decode_batch_rows(schema: &Schema) -> usize {
+    let mut width = 0usize;
+    for field in schema.fields() {
+        width += match field.data_type() {
+            DataType::List(_) => {
+                let power = |key: &str| {
+                    field
+                        .metadata()
+                        .get(key)
+                        .and_then(|v| v.parse::<u32>().ok())
+                };
+                match (power("grouping_power"), power("max_value_power")) {
+                    (Some(gp), Some(mvp)) if mvp >= gp && mvp < 64 && gp < 32 => {
+                        (((mvp - gp + 1) as usize) << gp).saturating_mul(8)
+                    }
+                    _ => return 1,
+                }
+            }
+            _ => 8,
+        };
+    }
+    (BATCH_BYTES / width.max(1)).clamp(1, 1024)
+}
 
 /// A segment being written: rows are encoded into it as they arrive.
 struct OpenSegment {
@@ -872,6 +952,82 @@ pub(crate) fn in_memory_interval_ms(segments: &[Vec<u8>]) -> Result<Option<u64>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_copy_fallback_never_replaces_an_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, output) = (dir.path().join("s"), dir.path().join("o"));
+        std::fs::write(&staging, b"new").unwrap();
+        std::fs::write(&output, b"theirs").unwrap();
+        let err = copy_new(&staging, &output).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"theirs");
+        std::fs::remove_file(&output).unwrap();
+        copy_new(&staging, &output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"new");
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_error_names_the_output_not_the_staging_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("o.dendro");
+        let err = staged::<(), String>(&output, |staging| {
+            std::fs::write(staging, b"x").unwrap();
+            Err(format!("{} is broken", staging.display()))
+        })
+        .unwrap_err();
+        assert_eq!(err, format!("{} is broken", output.display()));
+        assert!(files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_panic_leaves_no_staging_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("o.dendro");
+        let result = std::panic::catch_unwind(|| {
+            staged::<(), String>(&output, |staging| {
+                for path in archive_paths(staging) {
+                    std::fs::write(path, b"x").unwrap();
+                }
+                panic!("mid-conversion");
+            })
+        });
+        assert!(result.is_err());
+        assert!(files(dir.path()).is_empty(), "{:?}", files(dir.path()));
+    }
+
+    #[test]
+    fn an_unfolded_wal_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("o.dendro");
+        let err = staged::<(), String>(&output, |staging| {
+            let [archive, wal, ..] = archive_paths(staging);
+            std::fs::write(archive, b"archive").unwrap();
+            std::fs::write(wal, b"frames").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.contains("write-ahead log (6 bytes)"), "{err}");
+        assert!(files(dir.path()).is_empty());
+        // An empty one is what SQLite can leave, and is fine.
+        staged::<(), String>(&output, |staging| {
+            let [archive, wal, ..] = archive_paths(staging);
+            std::fs::write(archive, b"archive").unwrap();
+            std::fs::write(wal, b"").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(files(dir.path()), ["o.dendro"]);
+    }
 
     #[test]
     fn publishing_never_replaces_an_output() {

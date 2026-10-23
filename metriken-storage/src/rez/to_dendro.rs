@@ -28,10 +28,8 @@
 //! recording recovered from a crash still reads as recovered. Each source gets
 //! a fresh dendro UUID: a `.rez` recording has no identity to carry over.
 //!
-//! `RezReader` reads the result through `crate::rez::catalog` (`view`, `mcp`
-//! and the static-site viewer); the `recording` tools do not yet. This is the
-//! migration path #1224 asks about, and the oracle for the dendro reader: a
-//! converted archive must answer every query the `.rez` did.
+//! A converted archive must answer every query the `.rez` did, which makes
+//! the conversion an oracle for the dendro reader.
 //!
 //! # A v1 or v2 tar `.rez`
 //!
@@ -56,7 +54,7 @@ use crate::rez::rez;
 use crate::rez::rez_sqlite::RezDb;
 use crate::to_dendro::{
     in_memory_interval_ms, segment_timestamps, with_new_archive, with_producer_version,
-    EncodedSegment, TableWriter, Written,
+    EncodedSegment, Error, TableWriter, Written,
 };
 use crate::WriterConfig;
 
@@ -161,7 +159,7 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
 /// `dest` must not exist, nor its `-wal`, `-shm` or `-journal` sidecar; an
 /// existing one is refused and left as it is. On an error the archive and
 /// its sidecars are removed.
-pub fn convert_tar_to_dendro(src: &Path, dest: &Path) -> Result<Written, String> {
+pub fn convert_tar_to_dendro(src: &Path, dest: &Path) -> Result<Written, Error> {
     let file = std::fs::File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
     with_new_archive(dest, |out| {
         convert_tar_into(std::io::BufReader::new(file), out, &WriterConfig::default())
@@ -180,7 +178,7 @@ pub fn convert_tar_into(
     reader: impl std::io::Read,
     out: &mut ArchiveMut,
     config: &WriterConfig,
-) -> Result<Written, String> {
+) -> Result<Written, Error> {
     let (manifest, recordings) = rez::read_archive_reader(reader).map_err(|e| e.to_string())?;
     let mut written = Written::default();
     // `read_archive_reader` returns the recordings in manifest order.
