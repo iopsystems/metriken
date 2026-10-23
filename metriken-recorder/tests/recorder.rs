@@ -1874,3 +1874,118 @@ fn a_caller_builds_the_events_a_pump_sends() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A hook whose `enrich` answers on call `answer_on` (from 1), and before
+/// that sleeps for `slow` (past the recorder's timeout) or, when `slow` is
+/// zero, returns `Retry` at once. Counts its calls.
+struct LateProbe {
+    calls: std::sync::atomic::AtomicU32,
+    answer_on: u32,
+    slow: Duration,
+}
+
+impl LateProbe {
+    fn new(answer_on: u32, slow: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Default::default(),
+            answer_on,
+            slow,
+        })
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Probe for LateProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call < self.answer_on {
+            if self.slow.is_zero() {
+                return Enrich::Retry;
+            }
+            tokio::time::sleep(self.slow).await;
+        }
+        Enrich::Metadata {
+            epoch: epoch.map(str::to_string),
+            labels: map(&[("host", "web-01")]),
+            metadata: map(&[
+                ("version", "1.2.3"),
+                ("systeminfo", "{}"),
+                ("owner", "hook"),
+                ("sampling_interval_ms", "1"),
+            ]),
+        }
+    }
+}
+
+/// A hook reply that misses the first ask's timeout is asked for again
+/// after the recording is added, and its metadata is written into the
+/// recording: not over the caller's keys or the recorder's own, and
+/// without its labels, which are fixed at the add.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_hook_reply_writes_its_metadata() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let probe = LateProbe::new(2, Duration::from_secs(1));
+    let mut endpoint = spec(&fake.url);
+    endpoint.metadata.insert("owner".into(), "caller".into());
+    let detected = detect(&client(), &detect_cfg(), vec![endpoint], probe.as_ref()).await;
+    let run = record(
+        detected,
+        probe.clone(),
+        Vec::new(),
+        |cfg| cfg.timeout = Duration::from_millis(200),
+        Duration::from_millis(1500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.unwrap();
+    assert_eq!(probe.calls(), 2, "the first ask and one retry");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["version"], "1.2.3", "{:?}", r.metadata);
+    assert_eq!(r.metadata["systeminfo"], "{}");
+    assert_eq!(r.metadata["owner"], "caller", "the caller's key is kept");
+    assert_eq!(
+        r.metadata["sampling_interval_ms"],
+        INTERVAL.as_millis().to_string(),
+        "the recorder's own key is kept"
+    );
+    assert!(!r.labels.contains_key("host"), "{:?}", r.labels);
+    assert!(r.rows > 0);
+}
+
+/// A hook that never answers is asked `1 + ENRICH_RETRIES` times (5
+/// retries) and then left alone; the recording keeps its handshake's
+/// identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_that_never_answers_is_asked_a_bounded_number_of_times() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let probe = LateProbe::new(u32::MAX, Duration::ZERO);
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe.clone(),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(2500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.unwrap();
+    assert_eq!(probe.calls(), 6, "the first ask and five retries");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert!(!r.metadata.contains_key("version"), "{:?}", r.metadata);
+    assert!(r.rows > 0);
+}

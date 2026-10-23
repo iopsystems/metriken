@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from these. Every reader here uses the defaults except
   `ParquetReader::total_series_count`, which already counted them.
 
+### metriken-recorder 0.5.1
+
+- **Fixed:** a streamed producer whose probe hook reply (`Probe::enrich`)
+  did not arrive within the timeout before its recording was added is asked
+  again on later ticks, one ask at a time, up to 5 more times, retry `k`
+  bounded by the timeout times `2^k` (at most 60 s); no tick waits on one.
+  The metadata of a reply that arrives is written into the recording,
+  never over the caller's keys, `source`, `sampling_interval_ms` or
+  `producer_epoch`. Its labels are not applied, since a recording's labels
+  are fixed when it is added; a warning names them. Before, one ask was
+  made, and a reply slowed by load (two recorders reading one agent) left
+  the recording without the hook's metadata.
+
 ### metriken-storage 0.5.1
 
 - **Added:** converters from the legacy recording formats to `.dendro`,
