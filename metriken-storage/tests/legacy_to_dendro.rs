@@ -1537,6 +1537,23 @@ fn convert_path_chooses_by_content() {
     let v3 = dir.path().join("a");
     let err = convert_path(&v3, dir.path().join("b.dendro")).unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
+    // Before the input is opened: a v3 header over bytes SQLite cannot
+    // read is not reported when the output exists.
+    let broken = dir.path().join("broken");
+    let mut bytes = b"SQLite format 3\0".to_vec();
+    bytes.resize(4096, 0xAB);
+    std::fs::write(&broken, &bytes).unwrap();
+    let err = convert_path(&broken, dir.path().join("b.dendro")).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    // An archive that cannot be created is named by the output, not the
+    // staging path beside it.
+    let missing = dir.path().join("no-such-dir").join("out.dendro");
+    let err = convert_path(&v3, &missing).unwrap_err().to_string();
+    let named = format!("failed to create {}", missing.display());
+    assert!(
+        err.matches(&named).count() == 1 && !err.contains(".partial"),
+        "{err}"
+    );
 }
 
 /// A parquet file with no `sampling_interval_ms` reads at 1000 ms in the

@@ -352,7 +352,12 @@ fn convert_rez(input: &Path, output: &Path, _: &[u8]) -> Result<ConvertedFrom, E
     use crate::rez::rez::{detect_rez_format, RezFormat};
     match detect_rez_format(input).map_err(|e| e.to_string())? {
         RezFormat::V3Sqlite => {
+            // An existing output is refused before the input is opened, as
+            // the other arms refuse it before reading theirs.
+            refuse_existing(output)?;
             let db = crate::rez::rez_sqlite::RezDb::open(input)?;
+            // dendro's error for an archive it cannot create names the
+            // staging path, which `staged` renames to the output.
             Ok(ConvertedFrom::RezV3(with_new_archive(output, |out| {
                 crate::rez::to_dendro::convert_v3_into(&db, out)
             })?))

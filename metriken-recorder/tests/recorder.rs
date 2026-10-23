@@ -1958,6 +1958,15 @@ async fn a_late_hook_reply_writes_its_metadata() {
     );
     assert!(!r.labels.contains_key("host"), "{:?}", r.labels);
     assert!(r.rows > 0);
+    let named: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::LabelsNotApplied { labels, .. } => Some(labels.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(named, [map(&[("host", "web-01")])], "{:?}", run.events);
 }
 
 /// A hook that never answers is asked `1 + ENRICH_RETRIES` times (5
@@ -1988,4 +1997,89 @@ async fn a_hook_that_never_answers_is_asked_a_bounded_number_of_times() {
     let r = &recordings(&run.path, "fake/ops")["svc"];
     assert!(!r.metadata.contains_key("version"), "{:?}", r.metadata);
     assert!(r.rows > 0);
+}
+
+/// A hook that answers about the first process only once the producer has
+/// restarted, and names no epoch in its replies, so `accept` cannot tell
+/// them apart. Its first ask times out.
+struct RestartProbe {
+    restarted: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Probe for RestartProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        use std::sync::atomic::Ordering;
+        if epoch == Some("epoch-2") {
+            self.restarted.store(true, Ordering::SeqCst);
+            return Enrich::Metadata {
+                epoch: None,
+                labels: BTreeMap::new(),
+                metadata: map(&[("fresh", "epoch-2")]),
+            };
+        }
+        while !self.restarted.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Enrich::Metadata {
+            epoch: None,
+            labels: BTreeMap::new(),
+            metadata: map(&[("stale", "epoch-1")]),
+        }
+    }
+}
+
+/// A retry owed to the first process is dropped once the producer
+/// restarted: the restart reads the new process's metadata, and a reply
+/// about the old one, which names no epoch, is not written over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_drops_the_retry_owed_to_the_old_process() {
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let probe = Arc::new(RestartProbe {
+        restarted: Default::default(),
+    });
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.dendro");
+    let mut cfg = RecorderConfig::new(&path, INTERVAL);
+    cfg.timeout = Duration::from_millis(200);
+    let (recorder, _ids, mut events) =
+        Recorder::start(cfg, client(), probe.clone(), detected, Vec::new())
+            .await
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while let Some(e) = events.recv().await {
+            if matches!(e, Event::Restarted { .. }) {
+                return;
+            }
+        }
+        panic!("closed");
+    })
+    .await
+    .expect("the restart is written within 6 s");
+    // Long enough for a retry still asking about the first process to
+    // answer and be written.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
+    recorder
+        .finish(Stop::Grace(INTERVAL), CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, "fake/ops")["svc"];
+    assert_eq!(r.metadata.get("fresh").map(String::as_str), Some("epoch-2"));
+    assert!(!r.metadata.contains_key("stale"), "{:?}", r.metadata);
 }

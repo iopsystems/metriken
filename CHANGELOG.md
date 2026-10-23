@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it converts with no filesystem and no threads, and runs on
   `wasm32-unknown-unknown`. On an error, what was written before it stays
   in `out`. `convert_v3_to_dendro` and `to_dendro::convert_path`'s v3 arm
-  call it; what they write is unchanged.
+  call it; what they write is unchanged. `convert_path` refuses an existing
+  output before it reads a v3 input, as it does the other inputs.
 
 ### metriken-query 0.42.1
 
@@ -35,7 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The metadata of a reply that arrives is written into the recording,
   never over the caller's keys, `source`, `sampling_interval_ms` or
   `producer_epoch`. Its labels are not applied, since a recording's labels
-  are fixed when it is added; a warning names them. Before, one ask was
+  are fixed when it is added; a warning names them and says to give them
+  as the endpoint's labels, and `Event::LabelsNotApplied { source, labels }`
+  carries them. A run that ends with a reply still owed warns that the
+  recording keeps its handshake's labels and metadata, and a retry about a
+  producer that has since restarted is dropped. Before, one ask was
   made, and a reply slowed by load (two recorders reading one agent) left
   the recording without the hook's metadata.
 

@@ -423,9 +423,10 @@ pub trait MetricsSource: Send + Sync {
         Vec::new()
     }
 
-    /// Distinct values of `key` across all series for `metric`. Walks counter,
-    /// gauge, histogram and gauge histogram series and returns the union. Returns empty if the
-    /// metric is unknown or no series carry the key.
+    /// Distinct values of `key` across all series for `metric`. Walks
+    /// counter, gauge, histogram and gauge histogram series and returns the
+    /// union. Returns empty if the metric is unknown or no series carry the
+    /// key.
     fn label_values(&self, metric: &str, key: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         for labels in self.counter_labels(metric) {

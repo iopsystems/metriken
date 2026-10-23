@@ -190,7 +190,8 @@ pub enum Stop {
 /// producer that flaps or restarts in a loop emits without limit, are
 /// counted in `Lagged` instead once 1,024 events are queued (a restart is
 /// still written into the recording's `producer_epochs`). The others
-/// (`Active`, `Pending`, `Refused`, `Failed`) come at most a few per source,
+/// (`Active`, `Pending`, `Refused`, `LabelsNotApplied`, `Failed`) come at
+/// most a few per source,
 /// so the queue stays bounded. Events still
 /// queued when the recorder stops are sent from a task of their own until
 /// the receiver is dropped. A caller that ignores events drops the
@@ -222,6 +223,15 @@ pub enum Event {
     Gap { source: SourceId, seq: u64 },
     /// The source cannot be recorded; `reason` is the line that says why.
     Refused { source: SourceId, reason: String },
+    /// The probe hook's labels for a streamed source arrived after its
+    /// recording was added, whose labels are fixed, and are not applied.
+    /// `labels` are those that would have been added or changed; given as
+    /// the endpoint's labels ([`EndpointSpec::labels`](crate::EndpointSpec))
+    /// on the next run, they are set. At most once per source.
+    LabelsNotApplied {
+        source: SourceId,
+        labels: BTreeMap<String, String>,
+    },
     /// A producer restart is now written into the recording's metadata
     /// (`producer_epochs`), with the new process's `version` when it
     /// reported one.
@@ -2268,18 +2278,40 @@ impl Driver {
             };
             if late.epoch != ep.epoch {
                 debug!("{label}: the producer restarted; its earlier metadata is not asked for");
+                if let Some(task) = late.task.take() {
+                    task.abort();
+                }
                 ep.late_enrich = None;
                 continue;
             }
+            let ended = |late: &mut LateEnrich| {
+                if let Some(task) = late.task.take() {
+                    task.abort();
+                }
+                warn!(
+                    "{label}: its metadata had not arrived when the run ended; the recording \
+                     keeps the labels and metadata of its stream handshake"
+                );
+            };
             let reply = match late.task.take() {
                 Some(task) if task.is_finished() => task
                     .await
                     .unwrap_or_else(|e| Err(format!("its metadata read failed: {e}"))),
-                Some(task) => {
+                Some(task) if !last => {
                     late.task = Some(task);
                     continue;
                 }
-                None if last => continue,
+                Some(task) => {
+                    late.task = Some(task);
+                    ended(late);
+                    ep.late_enrich = None;
+                    continue;
+                }
+                None if last => {
+                    ended(late);
+                    ep.late_enrich = None;
+                    continue;
+                }
                 None if late.retries >= ENRICH_RETRIES => {
                     ep.late_enrich = None;
                     continue;
@@ -2321,17 +2353,23 @@ impl Driver {
                 ..self.identity_of(ep)
             }
             .labels();
-            let lost: Vec<String> = would_be
-                .iter()
-                .filter(|(k, v)| added_with.get(*k) != Some(*v))
-                .map(|(k, v)| format!("{k}={v}"))
+            let lost: BTreeMap<String, String> = would_be
+                .into_iter()
+                .filter(|(k, v)| added_with.get(k) != Some(v))
                 .collect();
             if !lost.is_empty() {
+                let shown: Vec<String> = lost.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 warn!(
                     "{label}: its labels {} arrived after its recording was added, whose labels \
-                     are fixed; they are not applied",
-                    lost.join(", ")
+                     are fixed; they are not applied; give them as the endpoint's labels to set \
+                     them",
+                    shown.join(", ")
                 );
+                let source = self.slots[i].id;
+                self.emitter.must(Event::LabelsNotApplied {
+                    source,
+                    labels: lost,
+                });
             }
             let slot = &self.slots[i];
             let patch: BTreeMap<String, String> = metadata
