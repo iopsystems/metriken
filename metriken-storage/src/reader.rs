@@ -1578,14 +1578,15 @@ impl ArchiveReader {
                             (Some(b), Some(e)) => Some((b, e)),
                             _ => None,
                         };
-                        // The table's cadence, measured: its span over its gaps. A
-                        // segment footer states one too, but only because a producer
-                        // wrote it there, and a `.rez` segment does not — which had
-                        // every archive reporting the 1 s default whatever it held.
-                        // The catalog knows the span and the row count already, so
-                        // this costs no decode. Nothing needs it to be exact any
-                        // more: it is the staleness hint and the step the viewer
-                        // opens at, not something the data is rounded to.
+                        // The table's cadence, measured: its span over its gaps. It
+                        // is used when the first segment's footer declares no
+                        // `sampling_interval_ms` (a declared one wins; see the
+                        // probe below): the writer's segments and a `.rez`'s
+                        // declare none, which had every archive reporting the 1 s
+                        // default whatever it held. The catalog knows the span and
+                        // the row count already, so this costs no decode. It is the
+                        // staleness hint and the step the viewer opens at, not
+                        // something the data is rounded to.
                         let rows = sealed.rows + wal.rows;
                         let measured = span.filter(|_| rows >= 2).map(|(b, e)| {
                             let gap_ns = e.saturating_sub(b) as f64 / (rows - 1) as f64;

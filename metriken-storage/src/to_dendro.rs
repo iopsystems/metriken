@@ -36,8 +36,8 @@
 //!   its name; a parquet file's columns are one table, [`PARQUET_TABLE`].
 //! - **Segments are bounded.** An input file is split into segments at the
 //!   writer's seal caps ([`WriterConfig::seal`]'s `max_rows`, and
-//!   `max_bytes` measured as the input file's encoded bytes per row), never
-//!   merged with another
+//!   `max_bytes` metered as the writer meters a row: the resident bytes of
+//!   its values and windows), never merged with another
 //!   input file. `max_age` bounds what a crash loses while recording and
 //!   does not apply. A long segment is refused, since its occupant list
 //!   indexes its rows; no tar `.rez` holds one.
@@ -46,10 +46,12 @@
 //!   can change at a segment boundary. Only an input whose producer dropped
 //!   a distinguishing label has such columns.
 //! - **The interval the input was read at is declared.** A parquet file's
-//!   `sampling_interval_ms` is kept on every segment, and a tar table's
+//!   `sampling_interval_ms` is kept on every segment (1000 when it has
+//!   none, which is what its reader takes then), and a tar table's
 //!   segments are given the interval the tar's reader reads it at (the
 //!   first segment's declared one, else the median gap of its first rows,
-//!   in whole milliseconds). An archive's reader takes a declared interval
+//!   in whole milliseconds; a table of fewer than two rows declares none,
+//!   and both readers take 1 s for it). An archive's reader takes a declared interval
 //!   over the one it measures from the rows, which differs on a recording
 //!   with dropped or jittered rows and moves gauge staleness and instant
 //!   `irate`.
@@ -79,10 +81,6 @@
 //! filesystem (the browser); none of them spawns a thread. On an error they
 //! leave what they wrote before it in that archive, a partial source
 //! included; the path forms remove the archive then.
-
-//! The functions taking an [`ArchiveMut`] write into an archive the caller
-//! made, which may be [`ArchiveMut::create_in_memory`] where there is no
-//! filesystem (the browser); none of them spawns a thread.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -114,6 +112,10 @@ const VERSION: &str = "version";
 /// The footer key a standalone parquet file declares its interval under,
 /// in milliseconds.
 const SAMPLING_INTERVAL_KEY: &str = "sampling_interval_ms";
+
+/// The interval the parquet reader takes for a file that declares none
+/// (`parquet::parse_sampling_interval`).
+const PARQUET_DEFAULT_INTERVAL_MS: u64 = 1000;
 
 /// What one conversion wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -217,12 +219,17 @@ impl ParquetToArchive {
             .collect();
         metadata.extend(self.metadata.clone());
         with_producer_version(&mut metadata);
-        // The one file key a segment reader interprets (as the table's
-        // interval when it cannot measure one) stays on each segment.
-        let segment_kv: Vec<KeyValue> = kv
-            .into_iter()
-            .filter(|e| e.key == SAMPLING_INTERVAL_KEY)
-            .collect();
+        // The interval the parquet reader reads the file at, declared on
+        // each segment so an archive's reader reads at it too: the file's
+        // `sampling_interval_ms`, or the 1000 ms that reader takes when the
+        // file has none.
+        let segment_kv = vec![KeyValue::new(
+            SAMPLING_INTERVAL_KEY.to_string(),
+            kv.iter()
+                .find(|e| e.key == SAMPLING_INTERVAL_KEY)
+                .and_then(|e| e.value.clone())
+                .unwrap_or_else(|| PARQUET_DEFAULT_INTERVAL_MS.to_string()),
+        )];
 
         // Each segment is inserted as it is sealed, so a large file is not
         // held in memory. The source is started with the first, whose first
@@ -268,15 +275,18 @@ impl ParquetToArchive {
     }
 }
 
-/// What [`convert_path`] found its input to be, and converted.
+/// What [`convert_path`] found its input to be, and what converting it
+/// wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConvertedFrom {
     /// A v3 (SQLite) `.rez`, converted by
     /// `rez::to_dendro::convert_v3_to_dendro`.
-    RezV3,
+    #[cfg(feature = "rez")]
+    RezV3(crate::rez::to_dendro::Converted),
     /// A v1 or v2 tar `.rez`, converted by
     /// `rez::to_dendro::convert_tar_to_dendro`.
+    #[cfg(feature = "rez")]
     RezTar(Written),
     /// A standalone parquet file, converted by [`ParquetToArchive`] with no
     /// labels.
@@ -288,67 +298,72 @@ pub enum ConvertedFrom {
 /// file (`PAR1`), a v3 `.rez` (SQLite) or a v1/v2 `.rez` (a tar holding
 /// `manifest.json`). A dendro archive is refused as one already, and so is
 /// anything else. The `.rez` arms need the `rez` feature; without it a
-/// `.rez` is refused, naming the feature.
+/// `.rez` is refused, naming the feature. Errors name `input`.
 ///
 /// `output` is treated as the converters treat it: one that exists, or has
-/// a sidecar beside it, is refused, and on an error the archive and its
-/// sidecars are removed.
+/// a sidecar beside it, is refused and never touched, and on an error the
+/// archive written beside it is removed.
 pub fn convert_path(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
 ) -> Result<ConvertedFrom, Error> {
     let (input, output) = (input.as_ref(), output.as_ref());
-    if crate::DendroCatalog::is_archive(input)? {
-        return Err(format!("{} is already a dendro archive", input.display()).into());
+    let named = |e: &dyn std::fmt::Display| -> Error { format!("{}: {e}", input.display()).into() };
+    if crate::DendroCatalog::is_archive(input).map_err(|e| named(&e))? {
+        return Err(named(&"already a dendro archive"));
     }
-    let mut magic = [0u8; 4];
-    let parquet = {
+    let head = {
         use std::io::Read as _;
-        let mut file =
-            std::fs::File::open(input).map_err(|e| format!("opening {}: {e}", input.display()))?;
-        file.read_exact(&mut magic).is_ok() && &magic == b"PAR1"
+        let file = std::fs::File::open(input).map_err(|e| named(&e))?;
+        let mut head = Vec::with_capacity(512);
+        file.take(512)
+            .read_to_end(&mut head)
+            .map_err(|e| named(&e))?;
+        head
     };
-    if parquet {
-        return Ok(ConvertedFrom::Parquet(
-            ParquetToArchive::new().convert_file_path(input, output)?,
-        ));
+    if head.starts_with(b"PAR1") {
+        return ParquetToArchive::new()
+            .convert_file_path(input, output)
+            .map(ConvertedFrom::Parquet)
+            .map_err(|e| named(&e));
     }
-    convert_rez(input, output)
+    convert_rez(input, output, &head).map_err(|e| named(&e))
 }
 
+/// Whether `head`, a file's first bytes, could begin a `.rez`, for a build
+/// without the `rez` feature to say which feature a file needs: SQLite's
+/// magic (v3) or a tar header's (v1, v2).
+#[cfg_attr(feature = "rez", allow(dead_code))]
+fn looks_like_rez(head: &[u8]) -> bool {
+    head.starts_with(b"SQLite format 3\0") || head.get(257..262) == Some(b"ustar")
+}
+
+/// The message for a file that is none of the formats [`convert_path`]
+/// converts.
+const NOT_A_RECORDING: &str =
+    "not a recording metriken reads: not parquet, a .rez or a dendro archive";
+
 #[cfg(feature = "rez")]
-fn convert_rez(input: &Path, output: &Path) -> Result<ConvertedFrom, Error> {
+fn convert_rez(input: &Path, output: &Path, _: &[u8]) -> Result<ConvertedFrom, Error> {
     use crate::rez::rez::{detect_rez_format, RezFormat};
     match detect_rez_format(input).map_err(|e| e.to_string())? {
-        RezFormat::V3Sqlite => {
-            // `convert_v3_to_dendro` leaves staging to its caller.
-            refuse_existing(output)?;
-            match crate::rez::to_dendro::convert_v3_to_dendro(input, output) {
-                Ok(_) => Ok(ConvertedFrom::RezV3),
-                Err(e) => {
-                    remove_archive(output);
-                    Err(e.into())
-                }
-            }
-        }
+        RezFormat::V3Sqlite => Ok(ConvertedFrom::RezV3(staged(output, |staging| {
+            crate::rez::to_dendro::convert_v3_to_dendro(input, staging)
+        })?)),
         RezFormat::V2Tar => Ok(ConvertedFrom::RezTar(
             crate::rez::to_dendro::convert_tar_to_dendro(input, output)?,
         )),
-        RezFormat::NotRez => Err(format!(
-            "{} is not a recording this converts: not parquet, a .rez or a dendro archive",
-            input.display()
-        )
-        .into()),
+        RezFormat::NotRez => Err(NOT_A_RECORDING.into()),
     }
 }
 
 #[cfg(not(feature = "rez"))]
-fn convert_rez(input: &Path, _: &Path) -> Result<ConvertedFrom, Error> {
-    Err(format!(
-        "{} is not parquet; converting a .rez needs metriken-storage's `rez` feature",
-        input.display()
-    )
-    .into())
+fn convert_rez(_: &Path, _: &Path, head: &[u8]) -> Result<ConvertedFrom, Error> {
+    if looks_like_rez(head) {
+        Err("converting a .rez needs metriken-storage's `rez` feature".into())
+    } else {
+        Err(NOT_A_RECORDING.into())
+    }
 }
 
 /// Whether a parquet file's key is the recording's metadata rather than
@@ -392,30 +407,75 @@ pub(crate) fn refuse_existing(output: &Path) -> Result<(), String> {
     }
 }
 
-/// Remove the archive at `output` and its sidecars, after a conversion that
-/// created them failed.
+/// Remove the archive at `output` and its sidecars.
 pub(crate) fn remove_archive(output: &Path) {
     for path in archive_paths(output) {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// Create the archive at `output`, run `f` on it, and on an error remove
-/// the archive and its sidecars. An existing `output`, or one with a
-/// sidecar beside it, is refused and left as it is.
+/// Write an archive at a staging path beside `output` with `f`, and move it
+/// to `output` when `f` succeeds. An `output` that exists, or has a sidecar
+/// beside it, is refused before anything is written, and the move does not
+/// replace an `output` that appeared since: a file at `output` is never
+/// removed or overwritten. On an error the staged archive and its sidecars
+/// are removed.
+pub(crate) fn staged<T, E: From<String>>(
+    output: &Path,
+    f: impl FnOnce(&Path) -> Result<T, E>,
+) -> Result<T, E> {
+    refuse_existing(output).map_err(E::from)?;
+    let staging = staging_path(output).map_err(E::from)?;
+    let result = f(&staging);
+    let result = result.and_then(|v| publish(&staging, output).map(|()| v).map_err(E::from));
+    remove_archive(&staging);
+    result
+}
+
+/// A path beside `output` that no archive or sidecar occupies.
+fn staging_path(output: &Path) -> Result<PathBuf, String> {
+    let name = output
+        .file_name()
+        .ok_or_else(|| format!("{} names no file", output.display()))?
+        .to_string_lossy()
+        .into_owned();
+    for n in 0..1000u32 {
+        let candidate =
+            output.with_file_name(format!(".{name}.{}.{n}.partial", std::process::id()));
+        if refuse_existing(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("no free staging path beside {}", output.display()))
+}
+
+/// Give the finished archive at `staging` the name `output`, failing if
+/// `output` exists. A hard link does that atomically; a filesystem without
+/// hard links gets a rename after a check.
+fn publish(staging: &Path, output: &Path) -> Result<(), String> {
+    match std::fs::hard_link(staging, output) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(format!("{} already exists", output.display()))
+        }
+        Err(_) if !output.exists() => std::fs::rename(staging, output)
+            .map_err(|e| format!("moving the archive to {}: {e}", output.display())),
+        Err(e) => Err(format!("moving the archive to {}: {e}", output.display())),
+    }
+}
+
+/// Create an archive with [`staged`], run `f` on it, and close it before it
+/// is moved to `output`.
 pub(crate) fn with_new_archive<T, E: From<String>>(
     output: &Path,
     f: impl FnOnce(&mut ArchiveMut) -> Result<T, E>,
 ) -> Result<T, E> {
-    refuse_existing(output).map_err(E::from)?;
-    let mut out = ArchiveMut::create(output)
-        .map_err(|e| E::from(format!("failed to create {}: {e}", output.display())))?;
-    let result = f(&mut out);
-    drop(out);
-    if result.is_err() {
-        remove_archive(output);
-    }
-    result
+    staged(output, |staging| {
+        let mut out = ArchiveMut::create(staging).map_err(|e| E::from(e.to_string()))?;
+        let result = f(&mut out);
+        drop(out);
+        result
+    })
 }
 
 /// One encoded segment, ready to insert.
@@ -526,21 +586,21 @@ impl<'a, 's> TableWriter<'a, 's> {
                 .build(),
             &schema,
         );
-        // The byte cap is on encoded bytes, as dendro's is, so a row's size
-        // is the input's encoded bytes per row. Decoded Arrow arrays are
-        // several times larger, and on a wide table would cut a segment
-        // every few rows.
-        let (encoded, input_rows) = builder
+        // Decode about 1 MiB at a time: a batch's rows are held decoded, and
+        // on a table thousands of columns wide (histograms among them) 1024
+        // rows of it run to gigabytes.
+        let (decoded, input_rows) = builder
             .metadata()
             .row_groups()
             .iter()
             .fold((0i64, 0i64), |(b, r), g| {
-                (b + g.compressed_size(), r + g.num_rows())
+                (b + g.total_byte_size(), r + g.num_rows())
             });
-        let per_row = (encoded.max(0) as usize / input_rows.max(1) as usize).max(1);
-        let reader = builder.with_batch_size(1024).build()?;
-        let mut pending: Vec<RecordBatch> = Vec::new();
-        let (mut rows, mut bytes) = (0usize, 0usize);
+        let row_width = (decoded.max(0) as usize / input_rows.max(1) as usize).max(1);
+        let batch_rows = (BATCH_BYTES / row_width).clamp(1, 1024);
+        let meter = RowMeter::new(&schema);
+        let reader = builder.with_batch_size(batch_rows).build()?;
+        let mut open: Option<OpenSegment> = None;
         for batch in reader {
             let batch = batch?;
             let mut columns = batch.columns().to_vec();
@@ -556,47 +616,131 @@ impl<'a, 's> TableWriter<'a, 's> {
                 columns.push(Arc::new(duration.clone()));
             }
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-            let mut rest = batch;
-            while rest.num_rows() > 0 {
-                // As many rows as both caps leave room for, and at least one.
-                let byte_room = (self.max_bytes.saturating_sub(bytes) / per_row).max(1);
-                let take = (self.max_rows - rows).min(byte_room).min(rest.num_rows());
-                pending.push(rest.slice(0, take));
-                rest = rest.slice(take, rest.num_rows() - take);
-                rows += take;
-                bytes += take * per_row;
-                if rows >= self.max_rows || bytes >= self.max_bytes {
-                    self.seal(&schema, ts_col, &props, std::mem::take(&mut pending))?;
-                    (rows, bytes) = (0, 0);
+            let costs = meter.costs(&batch);
+            // Rows go to the open segment one run at a time; a segment is
+            // sealed after the row that reaches either cap, as the writer
+            // seals after the tick that does.
+            let mut start = 0;
+            for (i, cost) in costs.iter().enumerate() {
+                let segment = match &mut open {
+                    Some(segment) => segment,
+                    None => open.insert(OpenSegment::new(&schema, &props)?),
+                };
+                segment.rows += 1;
+                segment.bytes += cost;
+                let full = segment.rows >= self.max_rows || segment.bytes >= self.max_bytes;
+                if full || i + 1 == costs.len() {
+                    segment.write(&batch.slice(start, i + 1 - start), ts_col)?;
+                    start = i + 1;
+                }
+                if full {
+                    let segment = open.take().expect("written to above");
+                    (self.sink)(segment.finish()?)?;
                 }
             }
         }
-        if rows > 0 {
-            self.seal(&schema, ts_col, &props, pending)?;
+        if let Some(segment) = open {
+            (self.sink)(segment.finish()?)?;
         }
         Ok(())
     }
+}
 
-    fn seal(
-        &mut self,
+/// How many decoded bytes of an input are read at a time.
+const BATCH_BYTES: usize = 1 << 20;
+
+/// What a row costs against the byte cap: what the writer charges a row of
+/// the same cells ([`crate::builder::cells_approx_bytes`]), the resident
+/// bytes of its values and windows while the segment is open. Each value
+/// that is not null costs [`CELL_OVERHEAD_BYTES`](crate::builder::CELL_OVERHEAD_BYTES),
+/// and a histogram's buckets [`HISTOGRAM_BUCKET_BYTES`](crate::builder::HISTOGRAM_BUCKET_BYTES)
+/// each; the time columns and window sidecars are not cells.
+struct RowMeter {
+    /// The value columns, and whether each is a list (a histogram).
+    columns: Vec<(usize, bool)>,
+}
+
+impl RowMeter {
+    fn new(schema: &Schema) -> Self {
+        let columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let name = f.name();
+                name != "timestamp"
+                    && name != "duration"
+                    && name != crate::table::WALL_OFFSET_COLUMN
+                    && !name.ends_with(":window_begin")
+                    && !name.ends_with(":window_width")
+            })
+            .map(|(i, f)| (i, matches!(f.data_type(), DataType::List(_))))
+            .collect();
+        Self { columns }
+    }
+
+    fn costs(&self, batch: &RecordBatch) -> Vec<usize> {
+        use crate::builder::{CELL_OVERHEAD_BYTES, HISTOGRAM_BUCKET_BYTES};
+        let mut costs = vec![0usize; batch.num_rows()];
+        for &(col, list) in &self.columns {
+            let column = batch.column(col);
+            let lists = list
+                .then(|| column.as_any().downcast_ref::<arrow::array::ListArray>())
+                .flatten();
+            for (row, cost) in costs.iter_mut().enumerate() {
+                if column.is_null(row) {
+                    continue;
+                }
+                *cost += CELL_OVERHEAD_BYTES;
+                if let Some(lists) = lists {
+                    *cost += lists.value_length(row).max(0) as usize * HISTOGRAM_BUCKET_BYTES;
+                }
+            }
+        }
+        costs
+    }
+}
+
+/// A segment being written: rows are encoded into it as they arrive.
+struct OpenSegment {
+    writer: ArrowWriter<Vec<u8>>,
+    rows: usize,
+    bytes: usize,
+    span: Option<(i64, i64)>,
+}
+
+impl OpenSegment {
+    fn new(
         schema: &Arc<Schema>,
-        ts_col: usize,
         props: &parquet::file::properties::WriterProperties,
-        batches: Vec<RecordBatch>,
-    ) -> Result<(), Error> {
-        let batch = arrow::compute::concat_batches(schema, &batches)?;
-        let (first_ts, last_ts) = span(batch.column(ts_col).as_ref())?;
-        let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, Arc::clone(schema), Some(props.clone()))?;
-        writer.write(&batch)?;
-        writer.close()?;
-        (self.sink)(EncodedSegment {
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            writer: ArrowWriter::try_new(Vec::new(), Arc::clone(schema), Some(props.clone()))?,
+            rows: 0,
+            bytes: 0,
+            span: None,
+        })
+    }
+
+    fn write(&mut self, rows: &RecordBatch, ts_col: usize) -> Result<(), Error> {
+        let (lo, hi) = span(rows.column(ts_col).as_ref())?;
+        self.span = Some(match self.span {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
+        self.writer.write(rows)?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<EncodedSegment, Error> {
+        let (first_ts, last_ts) = self.span.ok_or("a segment holds no rows")?;
+        Ok(EncodedSegment {
             meta: SegmentMeta {
-                rows: batch.num_rows() as u64,
+                rows: self.rows as u64,
                 first_ts,
                 last_ts,
             },
-            bytes: buf,
+            bytes: self.writer.into_inner()?,
         })
     }
 }
@@ -753,4 +897,43 @@ pub(crate) fn in_memory_interval_ms(segments: &[Vec<u8>]) -> Result<Option<u64>,
         Some(&gap) if gap > 0 => Some(((gap as f64 / 1e6).round() as u64).max(1)),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publishing_never_replaces_an_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, output) = (dir.path().join("s"), dir.path().join("o"));
+        std::fs::write(&staging, b"new").unwrap();
+        std::fs::write(&output, b"theirs").unwrap();
+        let err = publish(&staging, &output).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"theirs");
+        std::fs::remove_file(&output).unwrap();
+        publish(&staging, &output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"new");
+    }
+
+    /// A failed conversion leaves nothing at the output or the staging path.
+    #[test]
+    fn a_failed_staged_write_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("o.dendro");
+        let err = with_new_archive::<(), String>(&output, |_| Err("boom".to_string()));
+        assert_eq!(err.unwrap_err(), "boom");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_rez_is_told_by_its_magic() {
+        let mut tar = vec![0u8; 512];
+        tar[257..262].copy_from_slice(b"ustar");
+        assert!(looks_like_rez(&tar));
+        assert!(looks_like_rez(b"SQLite format 3\0and the rest"));
+        assert!(!looks_like_rez(b"PAR1"));
+        assert!(!looks_like_rez(b"neither"));
+    }
 }

@@ -24,17 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables, segments, rows, clock offsets).
   `to_dendro::convert_path(input, output)` picks the converter by content
   (parquet, v3 `.rez`, tar `.rez`; a dendro archive is refused as one
-  already) and returns `to_dendro::ConvertedFrom`.
+  already) and returns `to_dendro::ConvertedFrom`, which carries what the
+  converter wrote. Its errors name the input. Every path form writes to a
+  staging path beside the output and links it into place, so a file at
+  the output is never removed or replaced.
 - Tables are re-encoded column for column (labels, per-metric and
   table-level windows, `timestamp`, `duration`, `:wall_offset`) and split
-  at the `WriterConfig` seal caps (`max_rows`, and `max_bytes` measured as
-  the input's encoded bytes per row); a tar segment is inserted as it is
-  encoded. Counting histograms are written as `counter_histogram`. A
+  at the `WriterConfig` seal caps (`max_rows`, and `max_bytes` metered as
+  the writer meters a row: a cell per value that is not null, and a
+  histogram's buckets), so a converted segment holds what a recorded one
+  would. Rows are decoded about 1 MiB at a time and encoded into the open
+  segment as they are read, and each segment is inserted when it is
+  sealed. Counting histograms are written as `counter_histogram`. A
   parquet file's `duration` is also written as the table-level window
   pair when it has none, which keeps the bands the parquet reader derives
-  from it. Every segment declares `sampling_interval_ms`: the parquet
-  file's, or the interval a tar's reader reads that table at (the first
-  segment's declared one, else the median gap of its first rows). A
+  from it. Every parquet segment declares `sampling_interval_ms`: the
+  file's, or 1000 when it has none, which is what `ParquetReader` takes
+  then. A tar table's segments declare the interval the tar's reader
+  reads it at (the first segment's declared one, else the median gap of
+  its first rows); a tar table of fewer than two rows declares none, and
+  both readers take 1 s for it. A
   parquet file's key-value metadata (without `ARROW:schema` and
   `metriken.format`) and a tar recording's metadata are the source's
   metadata, and `version` is also written as `producer_version`. The
@@ -52,10 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metriken read as before. On a recording with dropped or jittered rows
   the measured interval is off the nominal one (0.994 s, 1.003 s, 1.004 s
   and 1.013 s against 1 s on six recordings), which moved gauge staleness
-  and instant `irate` for a converted parquet file: 6 of 238 answers
-  differed from `ParquetReader` on one recording, 270 to 554 of 9132 to
-  19479 on the others, and none differ now beyond the readers' known
-  differences below.
+  and instant `irate` for a converted parquet file. Answers that differed
+  from `ParquetReader`, before and after: 6 and 0 of 238; 648 and 340 of
+  9132 (two recordings); 656 and 340 of 9132; 495 and 229 of 18181; 820
+  and 260 of 19479. What remains is the readers' differences below.
 - Differences between `ParquetReader` and `ArchiveReader` over the same
   file, which a converted parquet file shows too: columns sharing one
   label set (a producer that dropped a distinguishing label) read as one

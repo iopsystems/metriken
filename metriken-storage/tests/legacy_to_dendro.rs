@@ -1006,7 +1006,13 @@ fn converts_a_real_recording() {
     }
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.dendro");
+    // `LEGACY_MAX_BYTES` overrides the byte cap, to compare segment sizes.
+    let mut config = WriterConfig::default();
+    if let Some(bytes) = std::env::var_os("LEGACY_MAX_BYTES") {
+        config.seal.max_bytes = bytes.to_str().unwrap().parse().unwrap();
+    }
     let written = ParquetToArchive::new()
+        .writer_config(config)
         .convert_file_path(&path, &dest)
         .unwrap();
     let took = start.elapsed();
@@ -1034,7 +1040,12 @@ fn converts_a_real_recording() {
     let (_, converted) = open_archive(&dest).remove(0);
     assert_same_metadata(&parquet.file_metadata(), &converted.file_metadata());
     let range = parquet.time_range().unwrap();
+    let start = std::time::Instant::now();
     let got = answers(&converted, range);
+    println!(
+        "  the converted archive's answers took {:.1?}",
+        start.elapsed()
+    );
     println!(
         "{}: {written:?} in {took:.1?}, {} -> {} bytes; intervals: parquet {}, in-memory {}, converted {}",
         path.display(),
@@ -1259,26 +1270,60 @@ fn the_byte_cap_splits_segments() {
     assert_eq!((written.rows, written.segments), (12, 12));
     assert_eq!(c.noise, 0, "{c:?}");
 
-    // The cap is on encoded bytes: a quarter of the file's row groups
-    // makes three to five segments (rounding), and the default makes one.
-    let encoded: i64 = {
-        use parquet::file::reader::FileReader;
-        let file =
-            parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&path).unwrap())
-                .unwrap();
-        file.metadata()
-            .row_groups()
-            .iter()
-            .map(|g| g.compressed_size())
-            .sum()
+    // The cap meters a row as the writer does: each value costs a cell,
+    // and a histogram's buckets theirs. A cap of three rows' worth seals
+    // after every third row, and the default after the last.
+    use metriken_storage::builder::{CELL_OVERHEAD_BYTES, HISTOGRAM_BUCKET_BYTES};
+    let buckets = histogram::Config::new(2, 8).unwrap().total_buckets();
+    let row = 4 * CELL_OVERHEAD_BYTES + buckets * HISTOGRAM_BUCKET_BYTES;
+    let capped = |bytes: usize| {
+        let mut config = WriterConfig::default();
+        config.seal.max_rows = 1000;
+        config.seal.max_bytes = bytes;
+        ParquetToArchive::new().writer_config(config)
     };
-    let mut config = WriterConfig::default();
-    config.seal.max_rows = 1000;
-    config.seal.max_bytes = encoded as usize / 4;
-    let (written, _) = check_parquet_with(&path, &ParquetToArchive::new().writer_config(config));
-    assert!((3..=5).contains(&written.segments), "{written:?}");
+    let (written, _) = check_parquet_with(&path, &capped(3 * row));
+    assert_eq!(written.segments, 4, "{written:?}");
+    let (written, _) = check_parquet_with(&path, &capped(3 * row + 1));
+    assert_eq!(
+        written.segments, 3,
+        "a fourth row reaches the cap: {written:?}"
+    );
     let (written, _) = check_parquet(&path);
     assert_eq!(written.segments, 1);
+
+    // A null is not a cell and costs nothing: a column of nulls beside one
+    // counter leaves a row costing one cell.
+    let sparse = dir.path().join("sparse.parquet");
+    let md = |id: &str| -> HashMap<String, String> {
+        [("metric", "ops"), ("metric_type", "counter"), ("id", id)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::UInt64, false),
+        Field::new("0", DataType::UInt64, true).with_metadata(md("0")),
+        Field::new("1", DataType::UInt64, true).with_metadata(md("1")),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(UInt64Array::from_iter_values(
+                (0..12u64).map(|t| BASE_NS + t * 1_000_000_000),
+            )),
+            Arc::new(UInt64Array::from_iter_values((0..12u64).map(|t| 10 * t))),
+            Arc::new(UInt64Array::from(vec![None::<u64>; 12])),
+        ],
+    )
+    .unwrap();
+    let mut w =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&sparse).unwrap(), schema, None)
+            .unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let (written, _) = check_parquet_with(&sparse, &capped(3 * CELL_OVERHEAD_BYTES));
+    assert_eq!(written.segments, 4, "{written:?}");
 }
 
 /// The source's metadata is the file's, without the parquet format's keys.
@@ -1407,7 +1452,7 @@ fn convert_path_chooses_by_content() {
         let dest = dir.path().join(format!("{name}.dendro"));
         let got = convert_path(&src, &dest).unwrap();
         match (fixture, got) {
-            ("rez/v3.rez", ConvertedFrom::RezV3) => {}
+            ("rez/v3.rez", ConvertedFrom::RezV3(c)) => assert_eq!(c.sources, 1),
             ("rez/v2.rez", ConvertedFrom::RezTar(w)) => assert_eq!(w.rows, 24),
             ("legacy/legacy-0.4.0.parquet", ConvertedFrom::Parquet(w)) => assert_eq!(w.rows, 4),
             other => panic!("{other:?}"),
@@ -1425,7 +1470,8 @@ fn convert_path_chooses_by_content() {
     let out = dir.path().join("junk.dendro");
     let err = convert_path(&junk, &out).unwrap_err();
     assert!(
-        err.to_string().contains("not a recording this converts"),
+        err.to_string()
+            .contains("junk: not a recording metriken reads"),
         "{err}"
     );
     assert!(!out.exists());
@@ -1433,4 +1479,51 @@ fn convert_path_chooses_by_content() {
     let v3 = dir.path().join("a");
     let err = convert_path(&v3, dir.path().join("b.dendro")).unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
+}
+
+/// A parquet file with no `sampling_interval_ms` reads at 1000 ms in the
+/// parquet reader, and its segments declare that.
+#[test]
+fn a_parquet_without_an_interval_reads_at_one_second() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let dir = tempfile::tempdir().unwrap();
+    let with = dir.path().join("with.parquet");
+    let t: Vec<u64> = (0..40)
+        .filter(|t| ![3, 4, 11, 17, 18, 19, 30].contains(t))
+        .collect();
+    rezolus_parquet_at(&with, &t, true);
+    // The same file without the key.
+    let b = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&with).unwrap()).unwrap();
+    let kv: Vec<KeyValue> = b
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.key != "sampling_interval_ms" && e.key != "ARROW:schema")
+        .collect();
+    let schema = b.schema().clone();
+    let batches: Vec<RecordBatch> = b.build().unwrap().map(|x| x.unwrap()).collect();
+    let without = dir.path().join("without.parquet");
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_key_value_metadata(Some(kv))
+        .build();
+    let schema = Arc::new(Schema::new(schema.fields().clone()));
+    let mut w = parquet::arrow::ArrowWriter::try_new(
+        std::fs::File::create(&without).unwrap(),
+        schema,
+        Some(props),
+    )
+    .unwrap();
+    for batch in batches {
+        w.write(&batch).unwrap();
+    }
+    w.close().unwrap();
+    assert_eq!(
+        MetricsSource::interval(&ParquetReader::open(&without).unwrap()),
+        1.0
+    );
+    let (_, c) = check_parquet(&without);
+    assert_eq!(c.noise, 0, "{c:?}");
 }

@@ -28,8 +28,8 @@
 //! recording recovered from a crash still reads as recovered. Each source gets
 //! a fresh dendro UUID: a `.rez` recording has no identity to carry over.
 //!
-//! `RezReader` reads the result through `crate::rez::catalog` (`view`, `mcp` and
-//! the static-site viewer); the `recording` tools do not yet. This is the
+//! `RezReader` reads the result through `crate::rez::catalog` (`view`, `mcp`
+//! and the static-site viewer); the `recording` tools do not yet. This is the
 //! migration path #1224 asks about, and the oracle for the dendro reader: a
 //! converted archive must answer every query the `.rez` did.
 //!
@@ -44,9 +44,9 @@
 //! [`crate::to_dendro`]: the same columns, counting histograms named
 //! `counter_histogram`, split at the seal caps, each declaring the interval
 //! the tar's reader reads its table at. Segments are inserted as they are
-//! encoded; the tar itself is read whole, as its reader reads it. A tar cut short by an
-//! unclean kill converts what [`rez::read_archive_reader`] reads of it: the
-//! tables of the newest manifest all of whose files are present.
+//! encoded; the tar itself is read whole, as its reader reads it. A tar cut
+//! short by an unclean kill converts what [`rez::read_archive_reader`] reads
+//! of it: the tables of the newest manifest all of whose files are present.
 
 use std::path::Path;
 
