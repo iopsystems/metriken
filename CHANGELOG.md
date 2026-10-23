@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.5.1
+
+- **Added:** converters from the legacy recording formats to `.dendro`,
+  so an edit of an old recording can start from an archive.
+  `to_dendro::ParquetToArchive` (feature `write`; `label`, `metadata`,
+  `writer_config`, `convert_file_path`, and `convert_into` over a `File`
+  or `Bytes` into a caller's `ArchiveMut`, which may be
+  `ArchiveMut::create_in_memory`) converts a standalone parquet
+  recording, combined files included, into one source.
+  `rez::to_dendro::convert_tar_to_dendro` and `convert_tar_into`
+  (features `rez` and `write`) convert a v1 or v2 tar `.rez`, a source
+  per recording with its manifest labels, metadata, clock anchor (else its
+  first row), clock offsets and `complete` flag; a tar cut short converts
+  what its reader reads. Both return `to_dendro::Written` (sources,
+  tables, segments, rows, clock offsets), and every function here errs
+  with `to_dendro::Error` (`Box<dyn Error + Send + Sync>`).
+  `to_dendro::convert_path(input, output)` picks the converter by content
+  (parquet, v3 `.rez`, tar `.rez`; a dendro archive is refused as one
+  already) and returns `to_dendro::ConvertedFrom`, which carries what the
+  converter wrote. Its errors name the input. Every path form writes to a
+  staging path beside the output, refuses to publish an archive whose
+  `-wal` still holds frames, and hard-links it into place (or, where
+  hard links are not supported, copies it into a file created with
+  `create_new`), so a file at the output is never removed or replaced;
+  the staging files are removed however the conversion ends, a panic
+  included, and errors name the output, not the staging path.
+- Tables are re-encoded column for column (labels, per-metric and
+  table-level windows, `timestamp`, `duration`, `:wall_offset`) and split
+  at the `WriterConfig` seal caps: `max_rows`, and `max_bytes` metered as
+  the input's average encoded bytes per row, so a run of rows denser than
+  the average overshoots it in proportion. The recorder's writer meters
+  resident bytes instead, which bounds a live segment. A copy has nothing
+  resident to bound, and each segment carries its own footer (about 3.8
+  MB at 5000 columns, about 3 MB of it the arrow schema), so cutting where
+  the writer would made wide recordings 10 to 48 times larger. The
+  recordings rezolus publishes with its viewer convert to one segment
+  each (two for the 17.6 MB one).
+- Rows are decoded in batches sized from the schema to about 1 MiB: 8
+  bytes a column, and a histogram column all its buckets,
+  `((max_value_power - grouping_power + 1) << grouping_power) * 8`
+  bytes, since they decode whether or not they hold counts; a list column
+  without that configuration is read a row at a time. Rows are encoded into the open
+  segment as they are read, and each segment is inserted when it is
+  sealed. Peak RSS: 54 MB for 900 rows of two 262,144-bucket histograms
+  (a 73 KB file, which 1024-row batches took to 10.4 GB), and 1.46 to
+  1.62 GB (two runs) for the 17.6 MB recording of 5028 columns (4.79 GB
+  before).
+- Counting histograms are written as `counter_histogram`. A parquet
+  file's `duration` is also written as the table-level window pair when
+  it has none, which keeps the bands the parquet reader derives from it.
+  Every parquet segment declares `sampling_interval_ms`: the file's, or
+  1000 when it has none, which is what `ParquetReader` takes then. A tar
+  table's segments declare the interval the tar's reader reads it at (the
+  first segment's declared one, else the median gap of its first rows); a
+  tar table of fewer than two rows declares none, and both readers take
+  1 s for it. A parquet file's key-value metadata (without `ARROW:schema`
+  and `metriken.format`) and a tar recording's metadata are the source's
+  metadata, and `version` is also written as `producer_version`.
+- The output has no WAL rows. An output that exists, or beside which a
+  `-wal`, `-shm` or `-journal` file exists, is refused; on an error the
+  archive and its sidecars are removed, and the `ArchiveMut` forms leave
+  what they wrote in the caller's archive. A tar table with no rows is not
+  written, so its names are not listed; a long segment in a tar is
+  refused. Nothing spawns a thread, and the crate still checks for wasm32
+  with `rez` and `write`.
+- **Changed:** `ArchiveReader` over a catalog takes the interval a table's
+  first segment declares as `sampling_interval_ms` over the one it
+  measures from the rows, as it already did for segments held in memory.
+  Segments the writer seals declare none, so archives written by
+  metriken read as before. On a recording with dropped or jittered rows
+  the measured interval is off the nominal one (0.994 s, 1.003 s, 1.004 s
+  and 1.013 s against 1 s on six of the recordings rezolus publishes with
+  its viewer), which moved gauge staleness and instant `irate` for a
+  converted parquet file. Answers that differed from `ParquetReader` on
+  those six, before and after: 6 and 0 of 238; 648 and 340 of 9132 (two
+  recordings); 656 and 340 of 9132; 495 and 229 of 18181; 820 and 260 of
+  19479. What remains is the readers' differences below.
+- Differences between `ParquetReader` and `ArchiveReader` over the same
+  file, which a converted parquet file shows too: columns sharing one
+  label set (a producer that dropped a distinguishing label) read as one
+  series, not one each, and once the table is split into segments, which
+  column that series reads can change at a segment boundary; a metric name
+  holding `/` fails with a different error; `rate` at a range's first
+  points differs by up to 2.4e-8 relative; and other values by up to
+  4.0e-15 relative (summation order).
+
 ### metriken-query 0.42.0
 
 - **Changed:** a query over an archive reads each process group (copies of

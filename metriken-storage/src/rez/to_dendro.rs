@@ -1,4 +1,7 @@
-//! Convert a v3 `.rez` into a dendro archive.
+//! Convert a `.rez` into a dendro archive: a v3 (SQLite) one with
+//! [`convert_v3_to_dendro`], a v1 or v2 tar with [`convert_tar_to_dendro`].
+//!
+//! # A v3 `.rez`
 //!
 //! The two containers hold the same things under different names: a `.rez`
 //! recording is a dendro source, a sampler table is a stream, and segments,
@@ -25,16 +28,35 @@
 //! recording recovered from a crash still reads as recovered. Each source gets
 //! a fresh dendro UUID: a `.rez` recording has no identity to carry over.
 //!
-//! `RezReader` reads the result through `crate::rez::catalog` (`view`, `mcp` and
-//! the static-site viewer); the `recording` tools do not yet. This is the
-//! migration path #1224 asks about, and the oracle for the dendro reader: a
-//! converted archive must answer every query the `.rez` did.
+//! A converted archive must answer every query the `.rez` did, which makes
+//! the conversion an oracle for the dendro reader.
+//!
+//! # A v1 or v2 tar `.rez`
+//!
+//! A tar holds each recording's tables as parquet segments, read whole into
+//! memory, and `manifest.json` describing them. Each recording becomes a
+//! source with its manifest labels, metadata, clock anchor (its first row
+//! when the manifest has none, as in v1), clock offsets and `complete`
+//! flag (always true for v1, which predates recovery). Each table keeps
+//! its name, and its segments are re-encoded as described in
+//! [`crate::to_dendro`]: the same columns, counting histograms named
+//! `counter_histogram`, split at the seal caps, each declaring the interval
+//! the tar's reader reads its table at. Segments are inserted as they are
+//! encoded; the tar itself is read whole, as its reader reads it. A tar cut
+//! short by an unclean kill converts what [`rez::read_archive_reader`] reads
+//! of it: the tables of the newest manifest all of whose files are present.
 
 use std::path::Path;
 
 use dendro::archive::{ArchiveMut, CallerRow, SegmentMeta, SourceMeta, WalRow};
 
+use crate::rez::rez;
 use crate::rez::rez_sqlite::RezDb;
+use crate::to_dendro::{
+    in_memory_interval_ms, segment_timestamps, with_new_archive, with_producer_version,
+    EncodedSegment, Error, TableWriter, Written,
+};
+use crate::WriterConfig;
 
 /// What one conversion wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +151,110 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
         .map_err(|e| e.to_string())?;
     }
     Ok(done)
+}
+
+/// Convert the v1 or v2 tar `.rez` at `src` into a new dendro archive at
+/// `dest`, under the default [`WriterConfig`]; see the module docs.
+///
+/// `dest` must not exist, nor its `-wal`, `-shm` or `-journal` sidecar; an
+/// existing one is refused and left as it is. On an error the archive and
+/// its sidecars are removed.
+pub fn convert_tar_to_dendro(src: &Path, dest: &Path) -> Result<Written, Error> {
+    let file = std::fs::File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
+    with_new_archive(dest, |out| {
+        convert_tar_into(std::io::BufReader::new(file), out, &WriterConfig::default())
+    })
+}
+
+/// Convert a v1 or v2 tar `.rez` read from `reader` into `out`, a source
+/// per recording, splitting segments at `config`'s seal caps and encoding
+/// them with its codec.
+///
+/// On an error, what was written before it stays in `out`: the recordings
+/// already converted, and a partial source for the one that failed.
+/// [`convert_tar_to_dendro`] removes the archive then; a caller writing
+/// into its own archive discards it.
+pub fn convert_tar_into(
+    reader: impl std::io::Read,
+    out: &mut ArchiveMut,
+    config: &WriterConfig,
+) -> Result<Written, Error> {
+    let (manifest, recordings) = rez::read_archive_reader(reader).map_err(|e| e.to_string())?;
+    let mut written = Written::default();
+    // `read_archive_reader` returns the recordings in manifest order.
+    for (recording, entry) in recordings.into_iter().zip(&manifest.recordings) {
+        let anchor = match entry.clock_anchor_wall_ns {
+            Some(anchor) => to_i64(anchor, || {
+                format!("recording {}'s clock anchor", recording.dir)
+            })?,
+            // Without one in the manifest (v1), the recording's first row:
+            // a pass over each segment's timestamp column.
+            None => {
+                let mut first = None::<u64>;
+                for (table, segments) in &recording.tables {
+                    for segment in segments {
+                        let ts = segment_timestamps(segment)
+                            .map_err(|e| format!("table {table}: {e}"))?;
+                        first = first.into_iter().chain(ts.into_iter().min()).min();
+                    }
+                }
+                to_i64(first.unwrap_or(0), || {
+                    format!("recording {}'s first row", recording.dir)
+                })?
+            }
+        };
+        let mut metadata = recording.metadata;
+        with_producer_version(&mut metadata);
+        let source = out
+            .insert_source(&SourceMeta {
+                labels: recording.labels,
+                metadata,
+                clock_anchor_wall_ns: anchor,
+            })
+            .map_err(|e| e.to_string())?;
+        written.sources += 1;
+        for (table, segments) in recording.tables {
+            // The interval the tar's reader reads this table at, declared on
+            // every segment so the archive's reader reads it at the same.
+            let interval_ms =
+                in_memory_interval_ms(&segments).map_err(|e| format!("table {table}: {e}"))?;
+            // Each segment is inserted as it is encoded, and each input
+            // segment is dropped once it is encoded.
+            let mut seq = 0u64;
+            let mut sink =
+                |segment: EncodedSegment| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    out.insert_segment(source, &table, seq, &segment.meta, &segment.bytes)?;
+                    if seq == 0 {
+                        written.tables += 1;
+                    }
+                    seq += 1;
+                    written.segments += 1;
+                    written.rows += segment.meta.rows;
+                    Ok(())
+                };
+            let mut writer = TableWriter::new(&table, config, &mut sink);
+            for segment in segments {
+                writer.push_segment(segment, interval_ms)?;
+            }
+        }
+        let offsets = entry
+            .clock_offsets
+            .iter()
+            .map(|&(ts, offset)| Ok((to_i64(ts, || "a clock offset".to_string())?, offset)))
+            .collect::<Result<Vec<_>, String>>()?;
+        written.clock_offsets += offsets.len();
+        out.transaction(|tx| {
+            for &(ts, offset) in &offsets {
+                tx.insert_clock_offset(source, ts, offset)?;
+            }
+            if recording.complete {
+                tx.mark_complete(source)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(written)
 }
 
 /// Copy one sampler's segments, one at a time, so a large table is never

@@ -13,7 +13,6 @@ pub mod open;
 #[allow(clippy::module_inception)]
 pub mod rez;
 pub mod rez_sqlite;
-/// A v3 `.rez` rewritten as a dendro archive.
 #[cfg(feature = "write")]
 pub mod to_dendro;
 pub mod wal;
