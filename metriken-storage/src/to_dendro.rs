@@ -441,7 +441,7 @@ pub(crate) fn staged<T, E: From<String> + std::fmt::Display>(
         }
     };
     let value = f(&staging.0).map_err(renamed)?;
-    unflushed_wal(&staging.0).map_err(E::from)?;
+    unflushed_wal(&staging.0, output).map_err(E::from)?;
     publish(&staging.0, output).map_err(E::from)?;
     Ok(value)
 }
@@ -460,12 +460,13 @@ impl Drop for Staging {
 /// Refuse to publish an archive whose `-wal` sidecar holds frames: SQLite
 /// folds the log into the archive when the last connection closes, and a
 /// log left behind holds committed rows the archive file does not.
-fn unflushed_wal(staging: &Path) -> Result<(), String> {
+fn unflushed_wal(staging: &Path, output: &Path) -> Result<(), String> {
     let [_, wal, ..] = archive_paths(staging);
     match std::fs::metadata(&wal) {
         Ok(m) if m.len() > 0 => Err(format!(
-            "the archive's write-ahead log ({} bytes) was not folded into it when it \
-             was closed",
+            "{}: the write-ahead log ({} bytes) was not folded into the archive when it \
+             closed (out of space, or another connection held it)",
+            output.display(),
             m.len()
         )),
         _ => Ok(()),
@@ -728,11 +729,10 @@ const BATCH_BYTES: usize = 1 << 20;
 /// histogram column `((max_value_power - grouping_power + 1) <<
 /// grouping_power) * 8`. A list column without that configuration has no
 /// size to read, and the table is read a row at a time. Between 1 and 1024.
-#[doc(hidden)]
-pub fn decode_batch_rows(schema: &Schema) -> usize {
+pub(crate) fn decode_batch_rows(schema: &Schema) -> usize {
     let mut width = 0usize;
     for field in schema.fields() {
-        width += match field.data_type() {
+        let column = match field.data_type() {
             DataType::List(_) => {
                 let power = |key: &str| {
                     field
@@ -741,14 +741,17 @@ pub fn decode_batch_rows(schema: &Schema) -> usize {
                         .and_then(|v| v.parse::<u32>().ok())
                 };
                 match (power("grouping_power"), power("max_value_power")) {
-                    (Some(gp), Some(mvp)) if mvp >= gp && mvp < 64 && gp < 32 => {
-                        (((mvp - gp + 1) as usize) << gp).saturating_mul(8)
-                    }
+                    (Some(gp), Some(mvp)) if mvp >= gp && mvp <= 64 => 1usize
+                        .checked_shl(gp)
+                        .and_then(|b| b.checked_mul((mvp - gp + 1) as usize))
+                        .and_then(|b| b.checked_mul(8))
+                        .unwrap_or(usize::MAX),
                     _ => return 1,
                 }
             }
             _ => 8,
         };
+        width = width.saturating_add(column);
     }
     (BATCH_BYTES / width.max(1)).clamp(1, 1024)
 }
@@ -953,6 +956,44 @@ pub(crate) fn in_memory_interval_ms(segments: &[Vec<u8>]) -> Result<Option<u64>,
 mod tests {
     use super::*;
 
+    /// A histogram column decodes to all its buckets, so it sizes the
+    /// batch: 1 MiB over the row's width, between 1 and 1024.
+    #[test]
+    fn decode_batches_are_sized_from_the_schema() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let list = || DataType::List(Arc::new(Field::new("item", DataType::UInt64, true)));
+        let hist = |name: &str, gp: u32, mvp: u32| {
+            Field::new(name, list(), true).with_metadata(
+                [
+                    ("grouping_power".to_string(), gp.to_string()),
+                    ("max_value_power".to_string(), mvp.to_string()),
+                ]
+                .into_iter()
+                .collect::<HashMap<String, String>>(),
+            )
+        };
+        let ts = || Field::new("timestamp", DataType::UInt64, false);
+        let rows = |fields: Vec<Field>| decode_batch_rows(&Schema::new(fields));
+        // Two of 262,144 buckets: 4 MiB a row.
+        assert_eq!(rows(vec![ts(), hist("a", 14, 29), hist("b", 14, 29)]), 1);
+        // rezolus's: (64 - 3 + 1) << 3 = 496 buckets, 3968 bytes; and
+        // (64 - 7 + 1) << 7 = 7424 buckets, 59,392 bytes.
+        assert_eq!(rows(vec![ts(), hist("a", 3, 64)]), (1 << 20) / (8 + 3968));
+        assert_eq!(rows(vec![ts(), hist("a", 7, 64)]), (1 << 20) / (8 + 59_392));
+        // 4 columns of 128 buckets: 4 KiB a row.
+        assert_eq!(
+            rows((0..4).map(|i| hist(&format!("h{i}"), 4, 11)).collect()),
+            256
+        );
+        assert_eq!(rows(vec![ts()]), 1024);
+        // No configuration, or one past what a histogram can hold: a row
+        // at a time, and no width wraps.
+        assert_eq!(rows(vec![ts(), Field::new("x", list(), true)]), 1);
+        assert_eq!(rows(vec![ts(), hist("a", 3, 65)]), 1);
+        assert_eq!(rows(vec![ts(), hist("a", 63, 64), hist("b", 63, 64)]), 1);
+        assert_eq!(rows(vec![ts(), hist("a", 61, 64)]), 1);
+    }
+
     #[test]
     fn the_copy_fallback_never_replaces_an_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -1016,7 +1057,13 @@ mod tests {
             Ok(())
         })
         .unwrap_err();
-        assert!(err.contains("write-ahead log (6 bytes)"), "{err}");
+        assert!(
+            err.starts_with(&format!(
+                "{}: the write-ahead log (6 bytes) was not folded",
+                output.display()
+            )),
+            "{err}"
+        );
         assert!(files(dir.path()).is_empty());
         // An empty one is what SQLite can leave, and is fine.
         staged::<(), String>(&output, |staging| {

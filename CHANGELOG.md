@@ -45,10 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recordings rezolus publishes with its viewer convert to one segment
   each (two for the 17.6 MB one).
 - Rows are decoded in batches sized from the schema to about 1 MiB: 8
-  bytes a column, and a histogram column all its buckets, `((max_value_power
-  - grouping_power + 1) << grouping_power) * 8` bytes, since they decode
-  whether or not they hold counts; a list column without that
-  configuration is read a row at a time. Rows are encoded into the open
+  bytes a column, and a histogram column all its buckets,
+  `((max_value_power - grouping_power + 1) << grouping_power) * 8`
+  bytes, since they decode whether or not they hold counts; a list column
+  without that configuration is read a row at a time. Rows are encoded into the open
   segment as they are read, and each segment is inserted when it is
   sealed. Peak RSS: 54 MB for 900 rows of two 262,144-bucket histograms
   (a 73 KB file, which 1024-row batches took to 10.4 GB), and 1.46 to

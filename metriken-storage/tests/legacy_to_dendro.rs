@@ -1510,35 +1510,11 @@ fn a_parquet_without_an_interval_reads_at_one_second() {
     assert_eq!(c.noise, 0, "{c:?}");
 }
 
-/// A histogram decodes to its buckets, present or not, so the batch size
-/// comes from the schema: 900 rows of two 262,144-bucket histograms, a file
-/// of tens of kilobytes, decode 2 MiB a row and are read a row at a time.
+/// A file of wide histograms, decoded a few rows at a time (the batch size
+/// is `to_dendro`'s unit test), converts and reads as it did.
 #[test]
-fn wide_histograms_are_read_a_row_at_a_time() {
-    use metriken_storage::to_dendro::decode_batch_rows;
-    let (gp, mvp) = (14u32, 29u32);
-    let buckets = ((mvp - gp + 1) as usize) << gp;
-    assert_eq!(buckets, 262_144);
-    let md = |name: &str| -> HashMap<String, String> {
-        [
-            ("metric", name),
-            ("metric_type", "histogram"),
-            ("grouping_power", "14"),
-            ("max_value_power", "29"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-    };
+fn a_parquet_of_wide_histograms_converts() {
     let list = DataType::List(Arc::new(Field::new("item", DataType::UInt64, true)));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::UInt64, false),
-        Field::new("duration", DataType::UInt64, true),
-        Field::new("h0", list.clone(), true).with_metadata(md("h0")),
-        Field::new("h1", list.clone(), true).with_metadata(md("h1")),
-    ]));
-    assert_eq!(decode_batch_rows(&schema), 1);
-
     // A smaller file of the same shape, converted a few rows at a time,
     // reads as it did: 2 columns of 11,264 buckets is 176 KiB a row.
     let (gp, mvp) = (10u32, 20u32);
@@ -1560,7 +1536,6 @@ fn wide_histograms_are_read_a_row_at_a_time() {
         Field::new("h0", list.clone(), true).with_metadata(md("h0")),
         Field::new("h1", list.clone(), true).with_metadata(md("h1")),
     ]));
-    assert_eq!(decode_batch_rows(&schema), 5);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sparse.parquet");
     let props = parquet::file::properties::WriterProperties::builder()
@@ -1607,30 +1582,4 @@ fn wide_histograms_are_read_a_row_at_a_time() {
             "{q}"
         );
     }
-
-    // Narrow tables keep 1024-row batches, a list without a configuration
-    // is read a row at a time, and the target is about 1 MiB.
-    let narrow = Schema::new(vec![Field::new("timestamp", DataType::UInt64, false)]);
-    assert_eq!(decode_batch_rows(&narrow), 1024);
-    let unconfigured = Schema::new(vec![Field::new("x", list, true)]);
-    assert_eq!(decode_batch_rows(&unconfigured), 1);
-    let small = Schema::new(
-        (0..4)
-            .map(|i| {
-                Field::new(
-                    format!("h{i}"),
-                    DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
-                    true,
-                )
-                .with_metadata(
-                    [("grouping_power", "4"), ("max_value_power", "11")]
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect::<HashMap<_, _>>(),
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-    // 4 columns of (11 - 4 + 1) << 4 = 128 buckets: 4 KiB a row.
-    assert_eq!(decode_batch_rows(&small), 256);
 }
