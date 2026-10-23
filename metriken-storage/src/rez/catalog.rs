@@ -64,9 +64,9 @@ impl Container {
     /// `path`, such as a filtered copy renamed over it, it returns an error.
     pub fn reopen(self, path: &Path) -> crate::Reopen {
         let path = path.to_path_buf();
-        let opened = crate::rez::file_id::FileId::of(&path);
+        let opened = crate::file_id::FileId::of(&path);
         Arc::new(move || {
-            if opened.is_some() && crate::rez::file_id::FileId::of(&path) != opened {
+            if opened.is_some() && crate::file_id::FileId::of(&path) != opened {
                 return Err(format!(
                     "{} was replaced after it was opened",
                     path.display()

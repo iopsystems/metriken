@@ -8,7 +8,9 @@
 pub mod catalog;
 #[cfg(test)]
 mod dendro_replicate_contract;
-pub mod file_id;
+/// Moved to the crate root (feature `archive`), where a dendro archive
+/// opened from a path uses it; kept here for callers of this path.
+pub use crate::file_id;
 pub mod open;
 #[allow(clippy::module_inception)]
 pub mod rez;

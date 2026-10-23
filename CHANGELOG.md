@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.5.3
+
+- **Added:** `ArchiveReader::open_read_groups(path, pool)` and
+  `open_read_groups_from_bytes(bytes, pool)` (feature `archive`): a dendro
+  archive opened as one `ArchiveReader` per read group, the sources a query
+  reads as one recording (a source and its copies, and sources that share a
+  producer epoch and overlap in it by a row of each; a group splits where
+  its sources carry different values of a label), where `from_catalog`
+  gives one per source. Each entry is the group's labels and a reader whose
+  `sources()` are the group's sources (`catalog_index`, `uuid`) for a tool
+  that edits them, whose `metadata()` is the group's, and whose series
+  carry the group's labels. Entries are in order of each group's first
+  source within one open. Only a dendro archive opens: a standalone parquet
+  file, a v3 `.rez` (SQLite without dendro's stamp) and a v1/v2 tar `.rez`
+  are refused by their first bytes, with a message naming `rezolus
+  recording upgrade` and `to_dendro::convert_path`. Builds for
+  `wasm32-unknown-unknown`.
+- **Added:** `ArchiveReader::flatten_read_groups(LabeledRecordings)`
+  (feature `archive`), the grouping the opens apply: readers of one source
+  joined into one per read group, found as `ArchiveReader::read_groups`
+  finds them over the same sources joined. A reader of several sources, or
+  of none, is kept as it is.
+- **Added:** `process::merge_metadata(&[&BTreeMap<String, String>])` and
+  `process::EVENTS` (feature `archive`): a read group's metadata from its
+  sources', the rule rezolus applied in its own reader, except that a lone
+  parseable payload wins over an earlier one that does not parse. `events`
+  is the union of the sources' events, each `id` once (the first source's
+  copy), an event without an id once per distinct event, sorted by
+  `timestamp` then `id`; a payload that is not a JSON object is skipped,
+  and a single payload is kept as written. Every other key is the first
+  source's that holds it.
+- **Changed:** `file_id` (which file is at a path) is a crate-root module
+  under feature `archive`; `rez::file_id` re-exports it.
+
 ### metriken-storage 0.5.2
 
 - **Added:** `rez::to_dendro::convert_v3_into(db: &RezDb, out: &mut

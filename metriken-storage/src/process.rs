@@ -35,6 +35,11 @@
 //! group's series with the group's labels, so the sources of one group are
 //! not told apart by `__recording__`; metriken-query evaluates each source
 //! of a group alone and combines the results per series (S9).
+//!
+//! [`merge_metadata`] is a read group's metadata, from its sources'. A tool
+//! that shows one recording per read group opens them with
+//! `ArchiveReader::open_read_groups` (or `flatten_read_groups` over readers
+//! it already has), whose readers carry it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -830,6 +835,101 @@ pub fn read_groups(sources: &[SourceInfo], groups: &ProcessGroups) -> Vec<ReadGr
     out
 }
 
+/// The metadata key a source's timeline events are stored under: a JSON
+/// object whose `events` member is an array of events, each an object that
+/// may carry a string `id` and an integer `timestamp` (nanoseconds).
+pub const EVENTS: &str = "events";
+
+/// The metadata of a read group, from its sources' metadata in archive
+/// order: the metadata a group reader from
+/// `ArchiveReader::flatten_read_groups` carries.
+///
+/// - [`EVENTS`] is the union of the sources' events. Events are records a
+///   source gains one at a time (an annotation of a copy, a check of the
+///   original), so the group shows each once: an event with a non-empty
+///   string `id` is kept the first time that id is seen, and one without is
+///   kept unless an identical event is already kept. The union is sorted by
+///   `timestamp` (0 when absent), then by `id` (empty when absent), and
+///   stored as `{"events": [...]}`, so members of a payload other than
+///   `events` are not kept. A payload that is not a JSON object is skipped.
+///   When only one source's payload is an object, the group's value is that
+///   payload unchanged; when none is, the value is the first source's that
+///   holds the key, as for any other key. A `check` event re-annotated in
+///   one source alone shows the first source's window.
+/// - Every other key is taken from the first source that holds it. These
+///   are whole values with no merge rule (KPIs, `systeminfo`,
+///   `descriptions`, `version`), and the sources of one group are copies of
+///   one recording or recordings of one process, so they agree on a key
+///   both hold unless one was edited alone. A key only one source holds is
+///   the group's in whichever order the sources were combined. Removing a
+///   key from one source therefore leaves it on the group while another
+///   source holds it; an edit of the group is written to each of its
+///   sources.
+pub fn merge_metadata(sources: &[&BTreeMap<String, String>]) -> BTreeMap<String, String> {
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    for source in sources {
+        for (key, value) in source.iter() {
+            if !merged.contains_key(key) {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    // Each source's events payload that is an object, in order.
+    let mut payloads: Vec<(&String, Vec<serde_json::Value>)> = Vec::new();
+    for source in sources {
+        let Some(raw) = source.get(EVENTS) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(mut payload)) = serde_json::from_str(raw) else {
+            continue;
+        };
+        let list = match payload.remove(EVENTS) {
+            Some(serde_json::Value::Array(list)) => list,
+            _ => Vec::new(),
+        };
+        payloads.push((raw, list));
+    }
+    match payloads.len() {
+        0 => {}
+        1 => {
+            merged.insert(EVENTS.to_string(), payloads[0].0.clone());
+        }
+        _ => {
+            let mut events: Vec<serde_json::Value> = Vec::new();
+            let mut ids: BTreeSet<String> = BTreeSet::new();
+            for (_, list) in payloads {
+                for event in list {
+                    let fresh = match event.get("id").and_then(|v| v.as_str()) {
+                        Some(id) if !id.is_empty() => ids.insert(id.to_string()),
+                        _ => !events.contains(&event),
+                    };
+                    if fresh {
+                        events.push(event);
+                    }
+                }
+            }
+            // Stable, so events of one timestamp and id keep their order.
+            events.sort_by(|a, b| {
+                let key = |e: &serde_json::Value| {
+                    (
+                        e.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0),
+                        e.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                };
+                key(a).cmp(&key(b))
+            });
+            merged.insert(
+                EVENTS.to_string(),
+                serde_json::json!({ EVENTS: events }).to_string(),
+            );
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod equiv_tests;
 
@@ -1270,5 +1370,102 @@ mod tests {
         assert_eq!(g.bridges.len(), 1);
         let r: Vec<Vec<usize>> = read_groups(&s, &g).into_iter().map(|r| r.sources).collect();
         assert_eq!(r, vec![vec![0], vec![1], vec![2], vec![3]]);
+    }
+
+    /// A key both sources hold is the first's, in either order; a key one
+    /// holds is the group's in either order.
+    #[test]
+    fn each_key_is_the_first_source_holding_it() {
+        let a = labels(&[("k", "first")]);
+        let b = labels(&[("k", "second"), ("only", "x")]);
+        assert_eq!(
+            merge_metadata(&[&a, &b]),
+            labels(&[("k", "first"), ("only", "x")])
+        );
+        assert_eq!(
+            merge_metadata(&[&b, &a]),
+            labels(&[("k", "second"), ("only", "x")])
+        );
+        assert_eq!(merge_metadata(&[&a]), a);
+        assert!(merge_metadata(&[]).is_empty());
+    }
+
+    fn events(list: serde_json::Value) -> BTreeMap<String, String> {
+        let payload = serde_json::json!({ EVENTS: list }).to_string();
+        labels(&[(EVENTS, payload.as_str())])
+    }
+
+    fn merged_events(sources: &[&BTreeMap<String, String>]) -> serde_json::Value {
+        let merged = merge_metadata(sources);
+        let payload: serde_json::Value = serde_json::from_str(&merged[EVENTS]).unwrap();
+        payload[EVENTS].clone()
+    }
+
+    /// The events of a group are every source's, each id once (the first
+    /// source's copy), an event without an id once per distinct event, in
+    /// timestamp order and then id order.
+    #[test]
+    fn events_are_unioned_by_id_and_sorted() {
+        use serde_json::json;
+        let a = events(json!([
+            {"id": "e2", "timestamp": 20, "description": "a's"},
+            {"timestamp": 5, "description": "anonymous"},
+            {"id": "", "timestamp": 1, "description": "empty id"},
+        ]));
+        let b = events(json!([
+            {"id": "e2", "timestamp": 20, "description": "b's"},
+            {"id": "e1", "timestamp": 10},
+            {"timestamp": 5, "description": "anonymous"},
+            {"id": "", "timestamp": 1, "description": "empty id"},
+            {"id": "z", "timestamp": 10},
+            {"id": "c", "timestamp": 10},
+            {"description": "no timestamp"},
+        ]));
+        let want = json!([
+            {"description": "no timestamp"},
+            {"id": "", "timestamp": 1, "description": "empty id"},
+            {"timestamp": 5, "description": "anonymous"},
+            {"id": "c", "timestamp": 10},
+            {"id": "e1", "timestamp": 10},
+            {"id": "z", "timestamp": 10},
+            {"id": "e2", "timestamp": 20, "description": "a's"},
+        ]);
+        assert_eq!(merged_events(&[&a, &b]), want);
+        // The other order keeps b's copy of e2, and sorts the same.
+        let mut want = want;
+        want[6]["description"] = json!("b's");
+        assert_eq!(merged_events(&[&b, &a]), want);
+    }
+
+    /// One source's payload is the group's as it is stored, members other
+    /// than `events` and the events' order included.
+    #[test]
+    fn one_payload_is_kept_as_written() {
+        let raw =
+            r#"{"events": [{"id": "b", "timestamp": 2}, {"id": "a", "timestamp": 1}], "v": 1}"#;
+        let a = labels(&[("k", "v")]);
+        let b = labels(&[(EVENTS, raw)]);
+        assert_eq!(merge_metadata(&[&a, &b])[EVENTS], raw);
+    }
+
+    /// A payload that is not a JSON object is skipped: with one other
+    /// payload, that payload is the group's; with none, the first source's
+    /// value is, as for any key.
+    #[test]
+    fn a_payload_that_does_not_parse_is_skipped() {
+        let bad = labels(&[(EVENTS, "not json")]);
+        let list = labels(&[(EVENTS, "[]")]);
+        // Spaced as no serializer writes it, so a payload that was merged
+        // rather than kept shows.
+        let good = labels(&[(EVENTS, r#"{ "events": [ {"id": "a", "timestamp": 1} ] }"#)]);
+        assert_eq!(merge_metadata(&[&bad, &good])[EVENTS], good[EVENTS]);
+        assert_eq!(merge_metadata(&[&list, &good])[EVENTS], good[EVENTS]);
+        assert_eq!(merge_metadata(&[&bad, &list])[EVENTS], "not json");
+        // Two good payloads and a bad one between them still union.
+        let other = events(serde_json::json!([{"id": "b", "timestamp": 0}]));
+        assert_eq!(
+            merged_events(&[&good, &bad, &other]),
+            serde_json::json!([{"id": "b", "timestamp": 0}, {"id": "a", "timestamp": 1}])
+        );
     }
 }
