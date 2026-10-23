@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.5.2
+
+- **Added:** `rez::to_dendro::convert_v3_into(db: &RezDb, out: &mut
+  ArchiveMut) -> Result<Converted, to_dendro::Error>` (features `rez` and
+  `write`), beside `convert_tar_into`: a v3 `.rez` into an archive the
+  caller made. With `RezDb::open_bytes` and `ArchiveMut::create_in_memory`
+  it converts with no filesystem and no threads, and runs on
+  `wasm32-unknown-unknown`. On an error, what was written before it stays
+  in `out`. `convert_v3_to_dendro` and `to_dendro::convert_path`'s v3 arm
+  call it; what they write is unchanged.
+
 ### metriken-storage 0.5.1
 
 - **Added:** converters from the legacy recording formats to `.dendro`,

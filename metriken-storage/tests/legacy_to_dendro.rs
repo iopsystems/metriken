@@ -966,6 +966,82 @@ fn converts_into_an_archive_in_memory() {
     assert_eq!(recordings[1].0["host"], "web-01");
 }
 
+// ─── v3 `.rez` ──────────────────────────────────────────────────────────────
+
+/// Every answer of every recording in `want` and the flattened set, given by
+/// `got` as well.
+fn assert_recordings_answer_as(
+    want: &[(BTreeMap<String, String>, ArchiveReader)],
+    got: &[(BTreeMap<String, String>, ArchiveReader)],
+) -> Compared {
+    assert_eq!(want.len(), got.len(), "one source per recording");
+    let mut total = Compared::default();
+    for ((wl, w), (gl, g)) in want.iter().zip(got) {
+        assert_eq!(wl, gl, "recording labels");
+        assert_eq!(w.complete(), g.complete(), "complete");
+        let c = assert_answers_as(w, g);
+        total.answers += c.answers;
+        total.numbers += c.numbers;
+    }
+    total
+}
+
+/// Each committed v3 fixture, read from bytes and converted into an archive
+/// in memory with `convert_v3_into`, answers as the `.rez` does and as the
+/// path form's archive does. `v3-live.rez` is unfinished with a live WAL
+/// tail, which is carried as WAL rows rather than sealed.
+#[test]
+fn v3_fixtures_convert_from_bytes_into_memory() {
+    use metriken_storage::rez::rez_sqlite::RezDb;
+    use metriken_storage::rez::to_dendro::convert_v3_into;
+    use metriken_storage::to_dendro::{convert_path, ConvertedFrom};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixtures: Vec<PathBuf> = std::fs::read_dir(storage_fixture("rez"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name.starts_with("v3") && name.ends_with(".rez")
+        })
+        .collect();
+    fixtures.sort();
+    assert_eq!(fixtures.len(), 3, "{fixtures:?}");
+
+    for fixture in &fixtures {
+        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(fixture).unwrap();
+
+        let db = RezDb::open_bytes(bytes).unwrap();
+        let mut out = dendro::archive::ArchiveMut::create_in_memory().unwrap();
+        let in_memory = convert_v3_into(&db, &mut out).unwrap();
+        let image = out.serialize().unwrap();
+        drop(out);
+
+        let dest = dir.path().join(format!("{name}.dendro"));
+        let ConvertedFrom::RezV3(by_path) = convert_path(fixture, &dest).unwrap() else {
+            panic!("{name} is a v3 .rez");
+        };
+        assert_eq!(in_memory, by_path, "{name}: what each form wrote");
+        if name == "v3-live.rez" {
+            assert_eq!(in_memory.wal_rows, 4, "{name}: the live tail is copied");
+        }
+
+        let original = open_recordings(fixture, pool()).unwrap();
+        let from_path = open_recordings(&dest, pool()).unwrap();
+        let from_memory = open_recordings_from_bytes(image, pool()).unwrap();
+        let c = assert_recordings_answer_as(&original, &from_memory);
+        assert!(c.numbers > 0, "{name}: compared no numbers");
+        assert_recordings_answer_as(&from_path, &from_memory);
+        if name == "v3-live.rez" {
+            assert!(
+                original.iter().all(|(_, r)| !r.complete()),
+                "{name} is unfinished"
+            );
+        }
+    }
+}
+
 /// `v` without uncertainty bands and the interpolation flags beside them.
 fn strip_bands(v: &mut Value) {
     match v {
