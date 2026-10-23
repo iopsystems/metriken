@@ -31,6 +31,10 @@
 //! A converted archive must answer every query the `.rez` did, which makes
 //! the conversion an oracle for the dendro reader.
 //!
+//! [`convert_v3_into`] writes into an archive the caller made, from a
+//! [`RezDb`] the caller opened, so a `.rez` read from bytes converts into
+//! [`ArchiveMut::create_in_memory`] with no filesystem.
+//!
 //! # A v1 or v2 tar `.rez`
 //!
 //! A tar holds each recording's tables as parquet segments, read whole into
@@ -72,20 +76,31 @@ pub struct Converted {
 ///
 /// `dest` must not exist. The caller stages it and renames it into place, so
 /// a failure part-way leaves no archive rather than a partial one.
+/// [`to_dendro::convert_path`](crate::to_dendro::convert_path) does that.
 pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String> {
     let db = RezDb::open(src)?;
     let mut out = ArchiveMut::create(dest)
         .map_err(|e| format!("failed to create {}: {e}", dest.display()))?;
+    convert_v3_into(&db, &mut out).map_err(|e| e.to_string())
+}
+
+/// Convert the v3 `.rez` `db` into `out`, a source per recording, copying
+/// segments, live WAL rows, caller rows and clock offsets as described in
+/// the module docs.
+///
+/// `db` may be opened from bytes ([`RezDb::open_bytes`]) and `out` may be
+/// [`ArchiveMut::create_in_memory`], which is the form for a build with no
+/// filesystem (the browser); nothing here touches a file or spawns a
+/// thread. On an error, what was written before it stays in `out`: the
+/// recordings already converted, and a partial source for the one that
+/// failed. A caller writing into its own archive discards it.
+pub fn convert_v3_into(db: &RezDb, out: &mut ArchiveMut) -> Result<Converted, Error> {
     let mut done = Converted::default();
 
     for recording in db.read_recordings()? {
         let rec = recording.id;
         let mut metadata = recording.meta.metadata.clone();
-        if let Some(version) = metadata.get("version").cloned() {
-            metadata
-                .entry(dendro::keys::PRODUCER_VERSION.to_string())
-                .or_insert(version);
-        }
+        with_producer_version(&mut metadata);
         let meta = SourceMeta {
             labels: recording.meta.labels.clone(),
             metadata,
@@ -93,11 +108,11 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
                 format!("recording {rec}'s clock anchor")
             })?,
         };
-        let source = out.insert_source(&meta).map_err(|e| e.to_string())?;
+        let source = out.insert_source(&meta)?;
         done.sources += 1;
 
         for sampler in db.all_samplers(rec)? {
-            done.segments += copy_segments(&db, &mut out, rec, source, &sampler)?;
+            done.segments += copy_segments(db, out, rec, source, &sampler)?;
             let live = db.live_wal(rec, &sampler)?;
             let rows = live
                 .into_iter()
@@ -112,8 +127,7 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
                 .collect::<Result<Vec<_>, String>>()?;
             done.wal_rows += rows.len();
             if !rows.is_empty() {
-                out.insert_wal_rows(source, &rows)
-                    .map_err(|e| e.to_string())?;
+                out.insert_wal_rows(source, &rows)?;
             }
         }
 
@@ -129,8 +143,7 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             done.caller_rows += rows.len();
-            out.insert_caller_rows(source, &stream, &rows)
-                .map_err(|e| e.to_string())?;
+            out.insert_caller_rows(source, &stream, &rows)?;
         }
 
         let offsets = db
@@ -147,8 +160,7 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
                 tx.mark_complete(source)?;
             }
             Ok(())
-        })
-        .map_err(|e| e.to_string())?;
+        })?;
     }
     Ok(done)
 }

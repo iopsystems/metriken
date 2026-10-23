@@ -8,7 +8,8 @@
 //!   column per metric, as `MsgpackToParquet` and rezolus's recorder wrote
 //!   them, combined files included).
 //! - `rez::to_dendro::convert_tar_to_dendro` (feature `rez`): a v1 or v2
-//!   tar `.rez`. A v3 `.rez` is `rez::to_dendro::convert_v3_to_dendro`.
+//!   tar `.rez`. A v3 `.rez` is `rez::to_dendro::convert_v3_to_dendro`, or
+//!   `convert_v3_into` from a `RezDb` opened from bytes.
 //! - [`convert_path`]: any of the three, chosen by the input's content.
 //!
 //! The design, which both follow:
@@ -284,7 +285,7 @@ impl ParquetToArchive {
 #[non_exhaustive]
 pub enum ConvertedFrom {
     /// A v3 (SQLite) `.rez`, converted by
-    /// `rez::to_dendro::convert_v3_to_dendro`.
+    /// `rez::to_dendro::convert_v3_into`.
     #[cfg(feature = "rez")]
     RezV3(crate::rez::to_dendro::Converted),
     /// A v1 or v2 tar `.rez`, converted by
@@ -350,9 +351,17 @@ const NOT_A_RECORDING: &str =
 fn convert_rez(input: &Path, output: &Path, _: &[u8]) -> Result<ConvertedFrom, Error> {
     use crate::rez::rez::{detect_rez_format, RezFormat};
     match detect_rez_format(input).map_err(|e| e.to_string())? {
-        RezFormat::V3Sqlite => Ok(ConvertedFrom::RezV3(staged(output, |staging| {
-            crate::rez::to_dendro::convert_v3_to_dendro(input, staging)
-        })?)),
+        RezFormat::V3Sqlite => {
+            // An existing output is refused before the input is opened, as
+            // the other arms refuse it before reading theirs.
+            refuse_existing(output)?;
+            let db = crate::rez::rez_sqlite::RezDb::open(input)?;
+            // dendro's error for an archive it cannot create names the
+            // staging path, which `staged` renames to the output.
+            Ok(ConvertedFrom::RezV3(with_new_archive(output, |out| {
+                crate::rez::to_dendro::convert_v3_into(&db, out)
+            })?))
+        }
         RezFormat::V2Tar => Ok(ConvertedFrom::RezTar(
             crate::rez::to_dendro::convert_tar_to_dendro(input, output)?,
         )),

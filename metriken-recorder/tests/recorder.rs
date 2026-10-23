@@ -1874,3 +1874,212 @@ fn a_caller_builds_the_events_a_pump_sends() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A hook whose `enrich` answers on call `answer_on` (from 1), and before
+/// that sleeps for `slow` (past the recorder's timeout) or, when `slow` is
+/// zero, returns `Retry` at once. Counts its calls.
+struct LateProbe {
+    calls: std::sync::atomic::AtomicU32,
+    answer_on: u32,
+    slow: Duration,
+}
+
+impl LateProbe {
+    fn new(answer_on: u32, slow: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Default::default(),
+            answer_on,
+            slow,
+        })
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Probe for LateProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call < self.answer_on {
+            if self.slow.is_zero() {
+                return Enrich::Retry;
+            }
+            tokio::time::sleep(self.slow).await;
+        }
+        Enrich::Metadata {
+            epoch: epoch.map(str::to_string),
+            labels: map(&[("host", "web-01")]),
+            metadata: map(&[
+                ("version", "1.2.3"),
+                ("systeminfo", "{}"),
+                ("owner", "hook"),
+                ("sampling_interval_ms", "1"),
+            ]),
+        }
+    }
+}
+
+/// A hook reply that misses the first ask's timeout is asked for again
+/// after the recording is added, and its metadata is written into the
+/// recording: not over the caller's keys or the recorder's own, and
+/// without its labels, which are fixed at the add.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_hook_reply_writes_its_metadata() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let probe = LateProbe::new(2, Duration::from_secs(1));
+    let mut endpoint = spec(&fake.url);
+    endpoint.metadata.insert("owner".into(), "caller".into());
+    let detected = detect(&client(), &detect_cfg(), vec![endpoint], probe.as_ref()).await;
+    let run = record(
+        detected,
+        probe.clone(),
+        Vec::new(),
+        |cfg| cfg.timeout = Duration::from_millis(200),
+        Duration::from_millis(1500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.unwrap();
+    assert_eq!(probe.calls(), 2, "the first ask and one retry");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["version"], "1.2.3", "{:?}", r.metadata);
+    assert_eq!(r.metadata["systeminfo"], "{}");
+    assert_eq!(r.metadata["owner"], "caller", "the caller's key is kept");
+    assert_eq!(
+        r.metadata["sampling_interval_ms"],
+        INTERVAL.as_millis().to_string(),
+        "the recorder's own key is kept"
+    );
+    assert!(!r.labels.contains_key("host"), "{:?}", r.labels);
+    assert!(r.rows > 0);
+    let named: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::LabelsNotApplied { labels, .. } => Some(labels.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(named, [map(&[("host", "web-01")])], "{:?}", run.events);
+}
+
+/// A hook that never answers is asked `1 + ENRICH_RETRIES` times (5
+/// retries) and then left alone; the recording keeps its handshake's
+/// identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_that_never_answers_is_asked_a_bounded_number_of_times() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let probe = LateProbe::new(u32::MAX, Duration::ZERO);
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe.clone(),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(2500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.unwrap();
+    assert_eq!(probe.calls(), 6, "the first ask and five retries");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert!(!r.metadata.contains_key("version"), "{:?}", r.metadata);
+    assert!(r.rows > 0);
+}
+
+/// A hook that answers about the first process only once the producer has
+/// restarted, and names no epoch in its replies, so `accept` cannot tell
+/// them apart. Its first ask times out.
+struct RestartProbe {
+    restarted: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Probe for RestartProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        use std::sync::atomic::Ordering;
+        if epoch == Some("epoch-2") {
+            self.restarted.store(true, Ordering::SeqCst);
+            return Enrich::Metadata {
+                epoch: None,
+                labels: BTreeMap::new(),
+                metadata: map(&[("fresh", "epoch-2")]),
+            };
+        }
+        while !self.restarted.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Enrich::Metadata {
+            epoch: None,
+            labels: BTreeMap::new(),
+            metadata: map(&[("stale", "epoch-1")]),
+        }
+    }
+}
+
+/// A retry owed to the first process is dropped once the producer
+/// restarted: the restart reads the new process's metadata, and a reply
+/// about the old one, which names no epoch, is not written over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_drops_the_retry_owed_to_the_old_process() {
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let probe = Arc::new(RestartProbe {
+        restarted: Default::default(),
+    });
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.dendro");
+    let mut cfg = RecorderConfig::new(&path, INTERVAL);
+    cfg.timeout = Duration::from_millis(200);
+    let (recorder, _ids, mut events) =
+        Recorder::start(cfg, client(), probe.clone(), detected, Vec::new())
+            .await
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while let Some(e) = events.recv().await {
+            if matches!(e, Event::Restarted { .. }) {
+                return;
+            }
+        }
+        panic!("closed");
+    })
+    .await
+    .expect("the restart is written within 6 s");
+    // Long enough for a retry still asking about the first process to
+    // answer and be written.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
+    recorder
+        .finish(Stop::Grace(INTERVAL), CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, "fake/ops")["svc"];
+    assert_eq!(r.metadata.get("fresh").map(String::as_str), Some("epoch-2"));
+    assert!(!r.metadata.contains_key("stale"), "{:?}", r.metadata);
+}

@@ -69,5 +69,9 @@ name = "scrape_log"
 required-features = ["http"]
 
 [[test]]
+name = "enrich_log"
+required-features = ["http"]
+
+[[test]]
 name = "registry"
 required-features = ["registry"]

@@ -190,7 +190,8 @@ pub enum Stop {
 /// producer that flaps or restarts in a loop emits without limit, are
 /// counted in `Lagged` instead once 1,024 events are queued (a restart is
 /// still written into the recording's `producer_epochs`). The others
-/// (`Active`, `Pending`, `Refused`, `Failed`) come at most a few per source,
+/// (`Active`, `Pending`, `Refused`, `LabelsNotApplied`, `Failed`) come at
+/// most a few per source,
 /// so the queue stays bounded. Events still
 /// queued when the recorder stops are sent from a task of their own until
 /// the receiver is dropped. A caller that ignores events drops the
@@ -222,6 +223,15 @@ pub enum Event {
     Gap { source: SourceId, seq: u64 },
     /// The source cannot be recorded; `reason` is the line that says why.
     Refused { source: SourceId, reason: String },
+    /// The probe hook's labels for a streamed source arrived after its
+    /// recording was added, whose labels are fixed, and are not applied.
+    /// `labels` are those that would have been added or changed; given as
+    /// the endpoint's labels ([`EndpointSpec::labels`](crate::EndpointSpec))
+    /// on the next run, they are set. At most once per source.
+    LabelsNotApplied {
+        source: SourceId,
+        labels: BTreeMap<String, String>,
+    },
     /// A producer restart is now written into the recording's metadata
     /// (`producer_epochs`), with the new process's `version` when it
     /// reported one.
@@ -429,8 +439,12 @@ impl Recorder {
     /// bounded by `cfg.timeout`, before the archive opens, since a
     /// recording's labels are fixed when it is added. One that does not
     /// answer in time is added with the caller's and the handshake's labels,
-    /// with a warning. A pending endpoint is detected on each tick; a
-    /// refused one is reported in the [`Summary`] and never recorded.
+    /// with a warning, and the hook is asked again on later ticks, up to
+    /// five more times, each ask allowed twice as long as the one before
+    /// (at most 60 s); the metadata of a reply that arrives is written into
+    /// the recording, and its labels are not applied. A pending endpoint is
+    /// detected on each tick; a refused one is reported in the [`Summary`]
+    /// and never recorded.
     ///
     /// Returns the recorder, the id of each detected endpoint and then each
     /// local source, in the order given, and the event channel.
@@ -846,6 +860,10 @@ struct Endpoint {
     opened: Option<Subscription>,
     detecting: Option<JoinHandle<Outcome>>,
     enriching: Option<JoinHandle<Result<probe::Enriched, String>>>,
+    /// The probe hook's reply did not arrive before the recording was
+    /// added: it is asked for again after the add (see
+    /// [`ENRICH_RETRIES`]).
+    late_enrich: Option<LateEnrich>,
     pump: Option<JoinHandle<()>>,
     hook_labels: BTreeMap<String, String>,
     hook_metadata: BTreeMap<String, String>,
@@ -869,6 +887,40 @@ struct Endpoint {
     last_frame: Option<(Option<u64>, u64)>,
 }
 
+/// How many more times a streamed source's probe hook is asked for its
+/// labels and metadata after the first ask timed out or failed: one ask in
+/// flight at a time, the next started on the tick after one fails. Retry
+/// `k` (from 1) is bounded by the timeout times `2^k`, at most
+/// [`ENRICH_RETRY_BOUND`], so a producer that answers slowly under load
+/// (two recorders reading one agent) is given longer each time. No tick
+/// waits on a retry.
+#[cfg(feature = "http")]
+pub(crate) const ENRICH_RETRIES: u32 = 5;
+
+/// The longest one retry of the probe hook may take.
+#[cfg(feature = "http")]
+pub(crate) const ENRICH_RETRY_BOUND: Duration = Duration::from_secs(60);
+
+/// The bound on retry `k` (from 1) of the probe hook's `enrich`.
+#[cfg(feature = "http")]
+fn enrich_retry_bound(timeout: Duration, k: u32) -> Duration {
+    timeout
+        .checked_mul(1 << k.min(16))
+        .unwrap_or(ENRICH_RETRY_BOUND)
+        .min(ENRICH_RETRY_BOUND)
+}
+
+/// A probe hook reply still owed to a recording that was added without it.
+#[cfg(feature = "http")]
+struct LateEnrich {
+    /// Retries started so far.
+    retries: u32,
+    /// The epoch the retries ask about: the one the recording was added
+    /// with.
+    epoch: Option<String>,
+    task: Option<JoinHandle<Result<probe::Enriched, String>>>,
+}
+
 #[cfg(feature = "http")]
 impl Endpoint {
     fn new(spec: EndpointSpec, mode: Mode) -> Self {
@@ -879,6 +931,7 @@ impl Endpoint {
             opened: None,
             detecting: None,
             enriching: None,
+            late_enrich: None,
             pump: None,
             hook_labels: BTreeMap::new(),
             hook_metadata: BTreeMap::new(),
@@ -974,6 +1027,12 @@ impl Endpoint {
             .into_iter()
             .flatten()
             .chain(self.enriching.take().map(|t| t.abort_handle()))
+            .chain(
+                self.late_enrich
+                    .as_mut()
+                    .and_then(|late| late.task.take())
+                    .map(|t| t.abort_handle()),
+            )
             .chain(self.pump.take().map(|t| t.abort_handle()))
         {
             task.abort();
@@ -1269,6 +1328,7 @@ impl Driver {
                 failure.get_or_insert(e);
             }
             self.apply_restarts(false).await;
+            self.retry_enrich(false).await;
             if let Err(e) = self.activate().await {
                 failure.get_or_insert(e);
             }
@@ -1670,6 +1730,7 @@ impl Driver {
                 }
             }
             self.apply_restarts(true).await;
+            self.retry_enrich(true).await;
         }
         self.abort_tasks();
         if let Some(e) = failure {
@@ -2189,6 +2250,155 @@ impl Driver {
         }
     }
 
+    /// Ask the probe hook again for each recording added without its reply,
+    /// and write the metadata of a reply that arrives into the recording.
+    ///
+    /// A recording's labels are fixed when it is added, so the reply's
+    /// labels are not applied; a warning names those that would have
+    /// changed them. Its metadata is written under the same precedence as at
+    /// the add: never over the caller's keys, the recorder's own keys or
+    /// `source`. A reply is dropped once the producer restarted, since the
+    /// restart reads the new process's metadata itself. On the `last` call
+    /// a reply that has already arrived is taken and no ask is started.
+    async fn retry_enrich(&mut self, last: bool) {
+        let Some((_, probe)) = self.client() else {
+            return;
+        };
+        let timeout = self.settings.timeout;
+        for i in 0..self.slots.len() {
+            if !self.slots[i].added || self.slots[i].state != SourceState::Active {
+                continue;
+            }
+            let label = self.slots[i].label();
+            let Kind::Endpoint(ep) = &mut self.slots[i].kind else {
+                continue;
+            };
+            let Some(late) = ep.late_enrich.as_mut() else {
+                continue;
+            };
+            if late.epoch != ep.epoch {
+                debug!("{label}: the producer restarted; its earlier metadata is not asked for");
+                if let Some(task) = late.task.take() {
+                    task.abort();
+                }
+                ep.late_enrich = None;
+                continue;
+            }
+            let ended = |late: &mut LateEnrich| {
+                if let Some(task) = late.task.take() {
+                    task.abort();
+                }
+                warn!(
+                    "{label}: its metadata had not arrived when the run ended; the recording \
+                     keeps the labels and metadata of its stream handshake"
+                );
+            };
+            let reply = match late.task.take() {
+                Some(task) if task.is_finished() => task
+                    .await
+                    .unwrap_or_else(|e| Err(format!("its metadata read failed: {e}"))),
+                Some(task) if !last => {
+                    late.task = Some(task);
+                    continue;
+                }
+                Some(task) => {
+                    late.task = Some(task);
+                    ended(late);
+                    ep.late_enrich = None;
+                    continue;
+                }
+                None if last => {
+                    ended(late);
+                    ep.late_enrich = None;
+                    continue;
+                }
+                None if late.retries >= ENRICH_RETRIES => {
+                    ep.late_enrich = None;
+                    continue;
+                }
+                None => {
+                    late.retries += 1;
+                    let bound = enrich_retry_bound(timeout, late.retries);
+                    let (probe, url, epoch) =
+                        (probe.clone(), ep.spec.url.clone(), late.epoch.clone());
+                    late.task = Some(tokio::spawn(async move {
+                        probe::enrich_within(probe.as_ref(), &url, epoch.as_deref(), bound).await
+                    }));
+                    continue;
+                }
+            };
+            let retries = late.retries;
+            let (labels, metadata) = match reply {
+                Ok(enriched) => enriched,
+                Err(why) if retries < ENRICH_RETRIES && !last => {
+                    debug!("{label}: metadata retry {retries} of {ENRICH_RETRIES}: {why}");
+                    continue;
+                }
+                Err(why) => {
+                    warn!(
+                        "{label}: {why} after {retries} retries; the recording keeps the \
+                         labels and metadata of its stream handshake"
+                    );
+                    ep.late_enrich = None;
+                    continue;
+                }
+            };
+            ep.late_enrich = None;
+            let Kind::Endpoint(ep) = &self.slots[i].kind else {
+                continue;
+            };
+            let added_with = self.identity_of(ep).labels();
+            let would_be = Identity {
+                hook_labels: &labels,
+                ..self.identity_of(ep)
+            }
+            .labels();
+            let lost: BTreeMap<String, String> = would_be
+                .into_iter()
+                .filter(|(k, v)| added_with.get(k) != Some(v))
+                .collect();
+            if !lost.is_empty() {
+                let shown: Vec<String> = lost.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                warn!(
+                    "{label}: its labels {} arrived after its recording was added, whose labels \
+                     are fixed; they are not applied; give them as the endpoint's labels to set \
+                     them",
+                    shown.join(", ")
+                );
+                let source = self.slots[i].id;
+                self.emitter.must(Event::LabelsNotApplied {
+                    source,
+                    labels: lost,
+                });
+            }
+            let slot = &self.slots[i];
+            let patch: BTreeMap<String, String> = metadata
+                .iter()
+                .filter(|(k, v)| {
+                    !slot.pinned.contains(*k)
+                        && !matches!(
+                            k.as_str(),
+                            keys::SOURCE | keys::SAMPLING_INTERVAL_MS | keys::PRODUCER_EPOCH
+                        )
+                        && slot.metadata.get(*k) != Some(*v)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if let Kind::Endpoint(ep) = &mut self.slots[i].kind {
+                ep.hook_metadata = metadata;
+            }
+            if patch.is_empty() {
+                continue;
+            }
+            let written: Vec<&str> = patch.keys().map(String::as_str).collect();
+            let written = written.join(", ");
+            match self.write_metadata(i, patch).await {
+                Ok(()) => info!("{label}: its metadata ({written}) arrived on retry {retries}"),
+                Err(e) => warn!("{label}: its metadata arrived but could not be written: {e}"),
+            }
+        }
+    }
+
     /// Late activation, in steps so that no tick waits on detection or on
     /// the probe hook: a pending endpoint is detected on its own task, one
     /// in flight per endpoint, and the tick that consumes a `Pending` starts
@@ -2408,11 +2618,18 @@ fn adopt_enrich(ep: &mut Endpoint, reply: Result<probe::Enriched, String>) {
             ep.hook_labels = labels;
             ep.hook_metadata = metadata;
         }
-        Err(why) => warn!(
-            "{}: {why}; its recording is added with the labels and metadata of its stream \
-             handshake only",
-            ep.spec.url
-        ),
+        Err(why) => {
+            warn!(
+                "{}: {why}; its recording is added with the labels and metadata of its stream \
+                 handshake, and its metadata is asked for again",
+                ep.spec.url
+            );
+            ep.late_enrich = Some(LateEnrich {
+                retries: 0,
+                epoch: ep.epoch.clone(),
+                task: None,
+            });
+        }
     }
 }
 
@@ -2448,6 +2665,19 @@ async fn scrape_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each retry of the probe hook is allowed twice as long as the one
+    /// before, from twice the timeout, up to the cap.
+    #[cfg(feature = "http")]
+    #[test]
+    fn enrich_retries_double_up_to_the_cap() {
+        let s = Duration::from_secs;
+        let bounds: Vec<_> = (1..=ENRICH_RETRIES)
+            .map(|k| enrich_retry_bound(s(2), k))
+            .collect();
+        assert_eq!(bounds, [s(4), s(8), s(16), s(32), s(60)]);
+        assert_eq!(enrich_retry_bound(s(10), 40), ENRICH_RETRY_BOUND);
+    }
 
     #[test]
     fn the_tick_waits_to_the_next_multiple_of_the_interval() {
