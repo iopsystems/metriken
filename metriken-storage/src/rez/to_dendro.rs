@@ -42,9 +42,11 @@
 //! flag (always true for v1, which predates recovery). Each table keeps
 //! its name, and its segments are re-encoded as described in
 //! [`crate::to_dendro`]: the same columns, counting histograms named
-//! `counter_histogram`, split at the seal caps. A tar cut short by an
+//! `counter_histogram`, split at the seal caps, each declaring the interval
+//! the tar's reader reads its table at. Segments are inserted as they are
+//! encoded; the tar itself is read whole, as its reader reads it. A tar cut short by an
 //! unclean kill converts what [`rez::read_archive_reader`] reads of it: the
-//! tables of its newest manifest whose files are all present.
+//! tables of the newest manifest all of whose files are present.
 
 use std::path::Path;
 
@@ -53,7 +55,8 @@ use dendro::archive::{ArchiveMut, CallerRow, SegmentMeta, SourceMeta, WalRow};
 use crate::rez::rez;
 use crate::rez::rez_sqlite::RezDb;
 use crate::to_dendro::{
-    insert_table, with_new_archive, with_producer_version, TableWriter, Written,
+    in_memory_interval_ms, segment_timestamps, with_new_archive, with_producer_version,
+    EncodedSegment, TableWriter, Written,
 };
 use crate::WriterConfig;
 
@@ -155,8 +158,9 @@ pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String
 /// Convert the v1 or v2 tar `.rez` at `src` into a new dendro archive at
 /// `dest`, under the default [`WriterConfig`]; see the module docs.
 ///
-/// `dest` must not exist; an existing one is refused and left as it is. On
-/// an error the archive and the sidecars this created are removed.
+/// `dest` must not exist, nor its `-wal`, `-shm` or `-journal` sidecar; an
+/// existing one is refused and left as it is. On an error the archive and
+/// its sidecars are removed.
 pub fn convert_tar_to_dendro(src: &Path, dest: &Path) -> Result<Written, String> {
     let file = std::fs::File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
     with_new_archive(dest, |out| {
@@ -167,6 +171,11 @@ pub fn convert_tar_to_dendro(src: &Path, dest: &Path) -> Result<Written, String>
 /// Convert a v1 or v2 tar `.rez` read from `reader` into `out`, a source
 /// per recording, splitting segments at `config`'s seal caps and encoding
 /// them with its codec.
+///
+/// On an error, what was written before it stays in `out`: the recordings
+/// already converted, and a partial source for the one that failed.
+/// [`convert_tar_to_dendro`] removes the archive then; a caller writing
+/// into its own archive discards it.
 pub fn convert_tar_into(
     reader: impl std::io::Read,
     out: &mut ArchiveMut,
@@ -176,30 +185,25 @@ pub fn convert_tar_into(
     let mut written = Written::default();
     // `read_archive_reader` returns the recordings in manifest order.
     for (recording, entry) in recordings.into_iter().zip(&manifest.recordings) {
-        let mut tables = Vec::with_capacity(recording.tables.len());
-        for (table, segments) in recording.tables {
-            // Encoded before the source is started: without an anchor in
-            // the manifest, the anchor is the earliest row of any table.
-            let mut encoded = Vec::new();
-            let mut sink = |s| {
-                encoded.push(s);
-                Ok(())
-            };
-            let mut writer = TableWriter::new(&table, config, &mut sink);
-            for segment in segments {
-                writer.push_segment(segment)?;
-            }
-            tables.push((table, encoded));
-        }
         let anchor = match entry.clock_anchor_wall_ns {
             Some(anchor) => to_i64(anchor, || {
                 format!("recording {}'s clock anchor", recording.dir)
             })?,
-            None => tables
-                .iter()
-                .flat_map(|(_, segments)| segments.iter().map(|s| s.meta.first_ts))
-                .min()
-                .unwrap_or(0),
+            // Without one in the manifest (v1), the recording's first row:
+            // a pass over each segment's timestamp column.
+            None => {
+                let mut first = None::<u64>;
+                for (table, segments) in &recording.tables {
+                    for segment in segments {
+                        let ts = segment_timestamps(segment)
+                            .map_err(|e| format!("table {table}: {e}"))?;
+                        first = first.into_iter().chain(ts.into_iter().min()).min();
+                    }
+                }
+                to_i64(first.unwrap_or(0), || {
+                    format!("recording {}'s first row", recording.dir)
+                })?
+            }
         };
         let mut metadata = recording.metadata;
         with_producer_version(&mut metadata);
@@ -211,8 +215,29 @@ pub fn convert_tar_into(
             })
             .map_err(|e| e.to_string())?;
         written.sources += 1;
-        for (table, segments) in tables {
-            insert_table(out, source, &table, segments, &mut written)?;
+        for (table, segments) in recording.tables {
+            // The interval the tar's reader reads this table at, declared on
+            // every segment so the archive's reader reads it at the same.
+            let interval_ms =
+                in_memory_interval_ms(&segments).map_err(|e| format!("table {table}: {e}"))?;
+            // Each segment is inserted as it is encoded, and each input
+            // segment is dropped once it is encoded.
+            let mut seq = 0u64;
+            let mut sink =
+                |segment: EncodedSegment| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    out.insert_segment(source, &table, seq, &segment.meta, &segment.bytes)?;
+                    if seq == 0 {
+                        written.tables += 1;
+                    }
+                    seq += 1;
+                    written.segments += 1;
+                    written.rows += segment.meta.rows;
+                    Ok(())
+                };
+            let mut writer = TableWriter::new(&table, config, &mut sink);
+            for segment in segments {
+                writer.push_segment(segment, interval_ms)?;
+            }
         }
         let offsets = entry
             .clock_offsets

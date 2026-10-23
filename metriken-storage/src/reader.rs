@@ -115,14 +115,16 @@ fn probe_tables(pending: &[PendingProbe]) -> Vec<Result<ProbedTable, String>> {
     pending.iter().map(|p| probe_one(p, &pool)).collect()
 }
 
-/// One table's footers: the metric names they hold between them, and the
-/// row cadence of the first.
+/// One table's footers: the metric names they hold between them, the row
+/// cadence of the first, and the interval the first declares
+/// ([`declared_interval`]), if it does.
 fn probe_one(
     (sampler, probes, span): &PendingProbe,
     pool: &Arc<BufferPool>,
 ) -> Result<ProbedTable, String> {
     let mut names = TableNames::default();
     let mut interval = None;
+    let mut declared = None;
     for bytes in probes {
         let probe = MultiParquetSource::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
             .map_err(|e| format!("probing table {sampler}: {e}"))?;
@@ -130,9 +132,32 @@ fn probe_one(
         names.gauges.extend(probe.gauge_names());
         names.histograms.extend(probe.histogram_names());
         names.gauge_histograms.extend(probe.gauge_histogram_names());
-        interval.get_or_insert(probe.interval());
+        if interval.is_none() {
+            declared = declared_interval(&probe);
+            interval = Some(probe.interval());
+        }
     }
-    Ok((sampler.clone(), names, interval.unwrap_or(1.0), *span))
+    Ok((
+        sampler.clone(),
+        names,
+        interval.unwrap_or(1.0),
+        declared,
+        *span,
+    ))
+}
+
+/// The interval, in seconds, a segment's footer declares as
+/// `sampling_interval_ms`: what a standalone parquet file carried, and what
+/// `to_dendro` writes on the segments it converts, so that the archive reads
+/// at the interval the original was read at. A segment the writer seals
+/// declares none. A value that is not a positive integer is not a
+/// declaration.
+fn declared_interval(probe: &MultiParquetSource) -> Option<f64> {
+    probe
+        .metadata_get("sampling_interval_ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms as f64 / 1e3)
 }
 
 /// One table awaiting its footer probes: its key, the segments to parse
@@ -186,9 +211,9 @@ fn table_probes(
     Ok(probes)
 }
 
-/// What a probe yields: the table's key, its metric names, its row spacing and
-/// its span.
-type ProbedTable = (String, TableNames, f64, Option<(u64, u64)>);
+/// What a probe yields: the table's key, its metric names, its row spacing,
+/// the interval its first segment declares, and its span.
+type ProbedTable = (String, TableNames, f64, Option<f64>, Option<(u64, u64)>);
 
 /// Where a table's segment payloads come from.
 ///
@@ -1591,13 +1616,20 @@ impl ArchiveReader {
             let recording_labels = Arc::new(rec.labels.clone());
             let mut tables = Vec::new();
             for probe in probed {
-                let (sampler, names, probed_interval, span) = probe?;
-                let interval = measured_intervals
-                    .get(&sampler)
-                    .copied()
-                    .flatten()
-                    .filter(|i| *i > 0.0)
-                    .unwrap_or(probed_interval);
+                let (sampler, names, probed_interval, declared, span) = probe?;
+                // A declared interval wins over the measured one, as it
+                // does when the same segments are read from bytes
+                // (`from_in_memory`): a recording with dropped or jittered
+                // rows measures off its nominal interval, and gauge
+                // staleness and an instant `irate` read at it.
+                let interval = declared.unwrap_or_else(|| {
+                    measured_intervals
+                        .get(&sampler)
+                        .copied()
+                        .flatten()
+                        .filter(|i| *i > 0.0)
+                        .unwrap_or(probed_interval)
+                });
                 tables.push(Arc::new(SamplerReader {
                     recording,
                     recording_labels: Arc::clone(&recording_labels),

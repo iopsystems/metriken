@@ -9,6 +9,7 @@
 //!   them, combined files included).
 //! - `rez::to_dendro::convert_tar_to_dendro` (feature `rez`): a v1 or v2
 //!   tar `.rez`. A v3 `.rez` is `rez::to_dendro::convert_v3_to_dendro`.
+//! - [`convert_path`]: any of the three, chosen by the input's content.
 //!
 //! The design, which both follow:
 //!
@@ -23,8 +24,8 @@
 //!   re-encoded column for column: counters, gauges, histograms, the
 //!   `timestamp`, `duration` and `:wall_offset` columns, per-metric and
 //!   table-level acquisition window sidecars, and every column's field
-//!   metadata (its labels). Two things are added or renamed, neither
-//!   changing an answer: a counting histogram column whose `metric_type` is
+//!   metadata (its labels). Two things are added or renamed: a
+//!   counting histogram column whose `metric_type` is
 //!   `histogram` or absent is written as `counter_histogram`, which is what
 //!   0.5 writes and what every reader takes as the same kind; and a parquet
 //!   file's `duration` column is also written as the table-level window
@@ -35,10 +36,23 @@
 //!   its name; a parquet file's columns are one table, [`PARQUET_TABLE`].
 //! - **Segments are bounded.** An input file is split into segments at the
 //!   writer's seal caps ([`WriterConfig::seal`]'s `max_rows`, and
-//!   `max_bytes` measured on the decoded rows), never merged with another
+//!   `max_bytes` measured as the input file's encoded bytes per row), never
+//!   merged with another
 //!   input file. `max_age` bounds what a crash loses while recording and
-//!   does not apply. A long segment (rezolus wrote none into a tar) is
-//!   copied byte for byte, since its occupant list indexes its rows.
+//!   does not apply. A long segment is refused, since its occupant list
+//!   indexes its rows; no tar `.rez` holds one.
+//!   An archive's reader takes columns of a table that share one label set
+//!   as one series; split into segments, which of them that series reads
+//!   can change at a segment boundary. Only an input whose producer dropped
+//!   a distinguishing label has such columns.
+//! - **The interval the input was read at is declared.** A parquet file's
+//!   `sampling_interval_ms` is kept on every segment, and a tar table's
+//!   segments are given the interval the tar's reader reads it at (the
+//!   first segment's declared one, else the median gap of its first rows,
+//!   in whole milliseconds). An archive's reader takes a declared interval
+//!   over the one it measures from the rows, which differs on a recording
+//!   with dropped or jittered rows and moves gauge staleness and instant
+//!   `irate`.
 //! - **Metadata is carried as-is.** A parquet file's key-value metadata
 //!   (`systeminfo`, `descriptions`, `per_source_metadata`, `version`,
 //!   `producer_epoch`, `sampling_interval_ms`, report and event keys)
@@ -51,21 +65,21 @@
 //!   is in the WAL. A recording that was cleanly finalized is marked
 //!   complete; one recovered from a truncated tar is not, so it still reads
 //!   as recovered.
-//! - **An existing output is refused** and left as it is. On an error the
-//!   files the conversion created are removed: the archive, and its `-wal`,
-//!   `-shm` and `-journal` sidecars that did not exist before it.
+//! - **A table with no rows is not written.** A tar table whose segments
+//!   hold no rows has no segment to write (a dendro stream exists through
+//!   its segments and WAL rows), so its metric names, which the tar's reader
+//!   lists from the empty footer, are not listed by the archive's.
+//! - **An existing output is refused** and left as it is, and so is an
+//!   output beside which a `-wal`, `-shm` or `-journal` file exists, since
+//!   SQLite would read a stale one into the new archive. On an error the
+//!   archive and its sidecars are removed.
 //!
-//! The converted archive answers the queries the input answered:
-//! `tests/legacy_to_dendro.rs` compares the two over every committed legacy
-//! fixture.
-//!
-//! One thing an archive does not carry is a declared interval. A parquet
-//! file's `sampling_interval_ms` is kept in the metadata, but an archive's
-//! reader measures each table's interval from its rows, so on a recording
-//! with dropped or jittered rows gauge staleness and instant `irate` can
-//! differ from the parquet reader's where a grid point falls between the
-//! two intervals.
-//!
+//! The functions taking an [`ArchiveMut`] write into an archive the caller
+//! made, which may be [`ArchiveMut::create_in_memory`] where there is no
+//! filesystem (the browser); none of them spawns a thread. On an error they
+//! leave what they wrote before it in that archive, a partial source
+//! included; the path forms remove the archive then.
+
 //! The functions taking an [`ArchiveMut`] write into an archive the caller
 //! made, which may be [`ArchiveMut::create_in_memory`] where there is no
 //! filesystem (the browser); none of them spawns a thread.
@@ -96,6 +110,10 @@ const ARROW_SCHEMA_KEY: &str = "ARROW:schema";
 
 /// The metadata key naming the producer's version (dendro's `keys::VERSION`).
 const VERSION: &str = "version";
+
+/// The footer key a standalone parquet file declares its interval under,
+/// in milliseconds.
+const SAMPLING_INTERVAL_KEY: &str = "sampling_interval_ms";
 
 /// What one conversion wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -159,8 +177,9 @@ impl ParquetToArchive {
         self
     }
 
-    /// Convert the parquet file at `input` into a new archive at `output`,
-    /// which must not exist. On an error the files this created are
+    /// Convert the parquet file at `input` into a new archive at `output`.
+    /// An `output` that exists, or has a `-wal`, `-shm` or `-journal` file
+    /// beside it, is refused. On an error the archive and its sidecars are
     /// removed.
     pub fn convert_file_path(
         &self,
@@ -175,6 +194,10 @@ impl ParquetToArchive {
 
     /// Convert a parquet file read from `input` (a [`std::fs::File`], or
     /// [`bytes::Bytes`] of a file in memory) into `out`, as one new source.
+    ///
+    /// On an error the source and the segments written before it stay in
+    /// `out`; [`convert_file_path`](Self::convert_file_path) removes the
+    /// archive then, and a caller writing into its own archive discards it.
     pub fn convert_into<R: ChunkReader + 'static>(
         &self,
         input: R,
@@ -198,7 +221,7 @@ impl ParquetToArchive {
         // interval when it cannot measure one) stays on each segment.
         let segment_kv: Vec<KeyValue> = kv
             .into_iter()
-            .filter(|e| e.key == "sampling_interval_ms")
+            .filter(|e| e.key == SAMPLING_INTERVAL_KEY)
             .collect();
 
         // Each segment is inserted as it is sealed, so a large file is not
@@ -245,6 +268,89 @@ impl ParquetToArchive {
     }
 }
 
+/// What [`convert_path`] found its input to be, and converted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConvertedFrom {
+    /// A v3 (SQLite) `.rez`, converted by
+    /// `rez::to_dendro::convert_v3_to_dendro`.
+    RezV3,
+    /// A v1 or v2 tar `.rez`, converted by
+    /// `rez::to_dendro::convert_tar_to_dendro`.
+    RezTar(Written),
+    /// A standalone parquet file, converted by [`ParquetToArchive`] with no
+    /// labels.
+    Parquet(Written),
+}
+
+/// Convert the recording at `input` into a new dendro archive at `output`,
+/// choosing the converter by the input's content, not its name: a parquet
+/// file (`PAR1`), a v3 `.rez` (SQLite) or a v1/v2 `.rez` (a tar holding
+/// `manifest.json`). A dendro archive is refused as one already, and so is
+/// anything else. The `.rez` arms need the `rez` feature; without it a
+/// `.rez` is refused, naming the feature.
+///
+/// `output` is treated as the converters treat it: one that exists, or has
+/// a sidecar beside it, is refused, and on an error the archive and its
+/// sidecars are removed.
+pub fn convert_path(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+) -> Result<ConvertedFrom, Error> {
+    let (input, output) = (input.as_ref(), output.as_ref());
+    if crate::DendroCatalog::is_archive(input)? {
+        return Err(format!("{} is already a dendro archive", input.display()).into());
+    }
+    let mut magic = [0u8; 4];
+    let parquet = {
+        use std::io::Read as _;
+        let mut file =
+            std::fs::File::open(input).map_err(|e| format!("opening {}: {e}", input.display()))?;
+        file.read_exact(&mut magic).is_ok() && &magic == b"PAR1"
+    };
+    if parquet {
+        return Ok(ConvertedFrom::Parquet(
+            ParquetToArchive::new().convert_file_path(input, output)?,
+        ));
+    }
+    convert_rez(input, output)
+}
+
+#[cfg(feature = "rez")]
+fn convert_rez(input: &Path, output: &Path) -> Result<ConvertedFrom, Error> {
+    use crate::rez::rez::{detect_rez_format, RezFormat};
+    match detect_rez_format(input).map_err(|e| e.to_string())? {
+        RezFormat::V3Sqlite => {
+            // `convert_v3_to_dendro` leaves staging to its caller.
+            refuse_existing(output)?;
+            match crate::rez::to_dendro::convert_v3_to_dendro(input, output) {
+                Ok(_) => Ok(ConvertedFrom::RezV3),
+                Err(e) => {
+                    remove_archive(output);
+                    Err(e.into())
+                }
+            }
+        }
+        RezFormat::V2Tar => Ok(ConvertedFrom::RezTar(
+            crate::rez::to_dendro::convert_tar_to_dendro(input, output)?,
+        )),
+        RezFormat::NotRez => Err(format!(
+            "{} is not a recording this converts: not parquet, a .rez or a dendro archive",
+            input.display()
+        )
+        .into()),
+    }
+}
+
+#[cfg(not(feature = "rez"))]
+fn convert_rez(input: &Path, _: &Path) -> Result<ConvertedFrom, Error> {
+    Err(format!(
+        "{} is not parquet; converting a .rez needs metriken-storage's `rez` feature",
+        input.display()
+    )
+    .into())
+}
+
 /// Whether a parquet file's key is the recording's metadata rather than
 /// the file format's.
 fn is_recording_key(key: &str) -> bool {
@@ -260,70 +366,62 @@ pub(crate) fn with_producer_version(metadata: &mut BTreeMap<String, String>) {
     }
 }
 
+/// The paths an archive at `output` occupies: the archive and SQLite's
+/// `-wal`, `-shm` and `-journal` sidecars beside it.
+fn archive_paths(output: &Path) -> [PathBuf; 4] {
+    let with = |suffix: &str| {
+        let mut path = output.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    [
+        output.to_path_buf(),
+        with("-wal"),
+        with("-shm"),
+        with("-journal"),
+    ]
+}
+
+/// Refuse an `output` that exists, or beside which a sidecar exists: SQLite
+/// would replay a stale `-wal` or `-journal` into the new archive, and
+/// deletes a `-shm` it finds.
+pub(crate) fn refuse_existing(output: &Path) -> Result<(), String> {
+    match archive_paths(output).into_iter().find(|p| p.exists()) {
+        Some(p) => Err(format!("{} already exists", p.display())),
+        None => Ok(()),
+    }
+}
+
+/// Remove the archive at `output` and its sidecars, after a conversion that
+/// created them failed.
+pub(crate) fn remove_archive(output: &Path) {
+    for path in archive_paths(output) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Create the archive at `output`, run `f` on it, and on an error remove
-/// what was created: the archive, and the `-wal`, `-shm` and `-journal`
-/// sidecars that did not exist before it. An existing `output` is refused
-/// and never touched.
+/// the archive and its sidecars. An existing `output`, or one with a
+/// sidecar beside it, is refused and left as it is.
 pub(crate) fn with_new_archive<T, E: From<String>>(
     output: &Path,
     f: impl FnOnce(&mut ArchiveMut) -> Result<T, E>,
 ) -> Result<T, E> {
-    if output.exists() {
-        return Err(E::from(format!("{} already exists", output.display())));
-    }
-    let sidecars: Vec<PathBuf> = ["-wal", "-shm", "-journal"]
-        .iter()
-        .map(|suffix| {
-            let mut path = output.as_os_str().to_owned();
-            path.push(suffix);
-            PathBuf::from(path)
-        })
-        .filter(|path| !path.exists())
-        .collect();
+    refuse_existing(output).map_err(E::from)?;
     let mut out = ArchiveMut::create(output)
         .map_err(|e| E::from(format!("failed to create {}: {e}", output.display())))?;
     let result = f(&mut out);
     drop(out);
     if result.is_err() {
-        for path in std::iter::once(output.to_path_buf()).chain(sidecars) {
-            let _ = std::fs::remove_file(path);
-        }
+        remove_archive(output);
     }
     result
 }
 
 /// One encoded segment, ready to insert.
-#[cfg_attr(not(feature = "rez"), allow(dead_code))]
 pub(crate) struct EncodedSegment {
     pub(crate) meta: SegmentMeta,
     pub(crate) bytes: Vec<u8>,
-}
-
-/// Insert a table's segments, numbered from 0, into `source`.
-#[cfg_attr(not(feature = "rez"), allow(dead_code))]
-pub(crate) fn insert_table(
-    out: &mut ArchiveMut,
-    source: i64,
-    table: &str,
-    segments: Vec<EncodedSegment>,
-    written: &mut Written,
-) -> Result<(), String> {
-    if segments.is_empty() {
-        return Ok(());
-    }
-    written.tables += 1;
-    let mut rows = 0;
-    out.transaction(|tx| {
-        for (seq, segment) in segments.iter().enumerate() {
-            tx.insert_segment(source, table, seq as u64, &segment.meta, &segment.bytes)?;
-            rows += segment.meta.rows;
-        }
-        Ok(())
-    })
-    .map_err(|e| format!("writing table {table}: {e}"))?;
-    written.segments += segments.len();
-    written.rows += rows;
-    Ok(())
 }
 
 /// Where a [`TableWriter`] hands each segment it seals, in order.
@@ -349,14 +447,20 @@ impl<'a, 's> TableWriter<'a, 's> {
         }
     }
 
-    /// An input segment from a container: re-encoded keeping its own
-    /// key-value metadata, or copied byte for byte when it is long.
+    /// An input segment from a container, re-encoded keeping its own
+    /// key-value metadata, with `sampling_interval_ms` set to
+    /// `interval_ms` when that is given. A long segment is refused: its
+    /// occupant list indexes its rows, so it cannot be split, and no tar
+    /// `.rez` holds one.
     #[cfg_attr(not(feature = "rez"), allow(dead_code))]
-    pub(crate) fn push_segment(&mut self, bytes: Vec<u8>) -> Result<(), String> {
-        let bytes = bytes::Bytes::from(bytes);
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+    pub(crate) fn push_segment(
+        &mut self,
+        bytes: Vec<u8>,
+        interval_ms: Option<u64>,
+    ) -> Result<(), String> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
             .map_err(|e| format!("table {}: {e}", self.table))?;
-        let kv: Vec<KeyValue> = builder
+        let mut kv: Vec<KeyValue> = builder
             .metadata()
             .file_metadata()
             .key_value_metadata()
@@ -366,20 +470,17 @@ impl<'a, 's> TableWriter<'a, 's> {
             .filter(|e| is_recording_key(&e.key))
             .collect();
         if kv.iter().any(|e| e.key == crate::long::LAYOUT_KEY) {
-            let (first_ts, last_ts, rows) =
-                span_of_file(builder).map_err(|e| format!("table {}: {e}", self.table))?;
-            if rows > 0 {
-                (self.sink)(EncodedSegment {
-                    meta: SegmentMeta {
-                        rows,
-                        first_ts,
-                        last_ts,
-                    },
-                    bytes: bytes.to_vec(),
-                })
-                .map_err(|e| format!("table {}: {e}", self.table))?;
-            }
-            return Ok(());
+            return Err(format!(
+                "table {} has a long segment, which this conversion does not split",
+                self.table
+            ));
+        }
+        if let Some(ms) = interval_ms {
+            kv.retain(|e| e.key != SAMPLING_INTERVAL_KEY);
+            kv.push(KeyValue::new(
+                SAMPLING_INTERVAL_KEY.to_string(),
+                ms.to_string(),
+            ));
         }
         self.push_file(builder, kv, DurationWindows::Leave)
             .map_err(|e| format!("table {}: {e}", self.table))
@@ -425,6 +526,18 @@ impl<'a, 's> TableWriter<'a, 's> {
                 .build(),
             &schema,
         );
+        // The byte cap is on encoded bytes, as dendro's is, so a row's size
+        // is the input's encoded bytes per row. Decoded Arrow arrays are
+        // several times larger, and on a wide table would cut a segment
+        // every few rows.
+        let (encoded, input_rows) = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .fold((0i64, 0i64), |(b, r), g| {
+                (b + g.compressed_size(), r + g.num_rows())
+            });
+        let per_row = (encoded.max(0) as usize / input_rows.max(1) as usize).max(1);
         let reader = builder.with_batch_size(1024).build()?;
         let mut pending: Vec<RecordBatch> = Vec::new();
         let (mut rows, mut bytes) = (0usize, 0usize);
@@ -443,10 +556,11 @@ impl<'a, 's> TableWriter<'a, 's> {
                 columns.push(Arc::new(duration.clone()));
             }
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-            let per_row = batch.get_array_memory_size() / batch.num_rows().max(1);
             let mut rest = batch;
             while rest.num_rows() > 0 {
-                let take = (self.max_rows - rows).min(rest.num_rows());
+                // As many rows as both caps leave room for, and at least one.
+                let byte_room = (self.max_bytes.saturating_sub(bytes) / per_row).max(1);
+                let take = (self.max_rows - rows).min(byte_room).min(rest.num_rows());
                 pending.push(rest.slice(0, take));
                 rest = rest.slice(take, rest.num_rows() - take);
                 rows += take;
@@ -577,29 +691,66 @@ fn span(column: &dyn Array) -> Result<(i64, i64), Error> {
     Ok((fit(min)?, fit(max)?))
 }
 
-/// The span and row count of a whole file, from its `timestamp` column.
+/// A segment's row timestamps in row order, from its `timestamp` column
+/// alone.
 #[cfg_attr(not(feature = "rez"), allow(dead_code))]
-fn span_of_file<R: ChunkReader + 'static>(
-    builder: ParquetRecordBatchReaderBuilder<R>,
-) -> Result<(i64, i64, u64), Error> {
+pub(crate) fn segment_timestamps(bytes: &[u8]) -> Result<Vec<u64>, Error> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))?;
     let column = builder
         .schema()
         .fields()
         .iter()
-        .position(|f| f.name() == "timestamp")
-        .ok_or("the segment has no `timestamp` column")?;
+        .position(|f| f.name() == "timestamp" && f.data_type() == &DataType::UInt64)
+        .ok_or("the segment has no UInt64 `timestamp` column")?;
     let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), [column]);
-    let reader = builder.with_projection(mask).build()?;
-    let (mut lo, mut hi, mut rows) = (i64::MAX, i64::MIN, 0u64);
-    for batch in reader {
+    let mut out = Vec::new();
+    for batch in builder.with_projection(mask).build()? {
         let batch = batch?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let (a, b) = span(batch.column(0).as_ref())?;
-        lo = lo.min(a);
-        hi = hi.max(b);
-        rows += batch.num_rows() as u64;
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("the `timestamp` column is not UInt64")?;
+        out.extend(ts.iter().flatten());
     }
-    Ok((lo, hi, rows))
+    Ok(out)
+}
+
+/// The interval, in whole milliseconds, a reader of a table held in memory
+/// as `segments` reads it at (`ArchiveReader::from_in_memory`, which reads a
+/// tar `.rez`): the first segment's `sampling_interval_ms` when it declares
+/// one, else the median gap between the rows of the first segments that
+/// hold two rows between them, rounded to the millisecond. `None` when
+/// there are fewer than two rows, where that reader takes 1 s, as an
+/// archive's reader does for a table it cannot measure.
+#[cfg_attr(not(feature = "rez"), allow(dead_code))]
+pub(crate) fn in_memory_interval_ms(segments: &[Vec<u8>]) -> Result<Option<u64>, Error> {
+    let Some(first) = segments.first() else {
+        return Ok(None);
+    };
+    let kv = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(first))?
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(v) = kv.iter().find(|e| e.key == SAMPLING_INTERVAL_KEY) {
+        return Ok(v.value.as_deref().and_then(|v| v.parse().ok()));
+    }
+    let mut timestamps = Vec::new();
+    for segment in segments {
+        if timestamps.len() >= 2 {
+            break;
+        }
+        timestamps.extend(segment_timestamps(segment)?);
+    }
+    let mut gaps: Vec<u64> = timestamps
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .collect();
+    gaps.sort_unstable();
+    Ok(match gaps.get(gaps.len() / 2) {
+        Some(&gap) if gap > 0 => Some(((gap as f64 / 1e6).round() as u64).max(1)),
+        _ => None,
+    })
 }

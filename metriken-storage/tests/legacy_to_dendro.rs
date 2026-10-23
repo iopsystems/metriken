@@ -621,6 +621,12 @@ fn the_legacy_parquet_fixtures_convert() {
 /// acquisition window, and a `duration` column; the metadata of a file
 /// rezolus's `combine` wrote.
 fn rezolus_parquet(path: &Path, ticks: u64, windows: bool) {
+    rezolus_parquet_at(path, &(0..ticks).collect::<Vec<_>>(), windows)
+}
+
+/// [`rezolus_parquet`] holding a row at each of `t` seconds only.
+fn rezolus_parquet_at(path: &Path, t: &[u64], windows: bool) {
+    let ticks = t.len() as u64;
     let md = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
         pairs
             .iter()
@@ -660,7 +666,7 @@ fn rezolus_parquet(path: &Path, ticks: u64, windows: bool) {
             ("source", "llm-perf"),
         ])),
     ];
-    let t: Vec<u64> = (0..ticks).collect();
+    let t: Vec<u64> = t.to_vec();
     let ts: Vec<u64> = t.iter().map(|t| BASE_NS + t * 1_000_000_000).collect();
     let mut lat = ListBuilder::new(UInt64Builder::new());
     for t in &t {
@@ -1082,4 +1088,349 @@ fn converts_a_real_recording() {
             );
         }
     }
+}
+
+// ─── Intervals ──────────────────────────────────────────────────────────────
+
+/// A recording with dropped rows measures a longer interval than it
+/// declares. The parquet reader reads at the declared one, and so does the
+/// archive's, from the `sampling_interval_ms` each segment carries.
+#[test]
+fn a_parquet_with_dropped_rows_reads_at_its_declared_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gaps.parquet");
+    // 40 ticks, 1 s apart, with 7 dropped: measured, 39 s over 32 gaps.
+    let t: Vec<u64> = (0..40)
+        .filter(|t| ![3, 4, 11, 17, 18, 19, 30].contains(t))
+        .collect();
+    rezolus_parquet_at(&path, &t, true);
+    let (_, c) = check_parquet(&path);
+    assert_eq!(c.noise, 0, "{c:?}");
+    let dest = dir.path().join("out.dendro");
+    ParquetToArchive::new()
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    let (_, converted) = open_archive(&dest).remove(0);
+    assert_eq!(MetricsSource::interval(&converted), 1.0);
+}
+
+/// Each converted segment declares the input's interval.
+#[test]
+fn converted_segments_declare_the_interval() {
+    use metriken_storage::Catalog;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.parquet");
+    rezolus_parquet(&path, 30, true);
+    let dest = dir.path().join("out.dendro");
+    ParquetToArchive::new()
+        .writer_config(tiny_segments(7))
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    let catalog = DendroCatalog::open(&dest).unwrap();
+    let source = catalog.sources().unwrap().remove(0);
+    let segments = catalog.segment_meta(source.id, PARQUET_TABLE).unwrap();
+    assert_eq!(segments.len(), 5);
+    for (seq, _) in segments {
+        let bytes = catalog
+            .segment_bytes(source.id, PARQUET_TABLE, seq)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            footer(&bytes)
+                .get("sampling_interval_ms")
+                .map(String::as_str),
+            Some("1000"),
+            "segment {seq}"
+        );
+    }
+}
+
+/// A segment's footer key-value metadata.
+fn footer(bytes: &[u8]) -> BTreeMap<String, String> {
+    use parquet::file::reader::FileReader;
+    let file =
+        parquet::file::reader::SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes))
+            .unwrap();
+    file.metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .into_iter()
+        .flatten()
+        .map(|e| (e.key.clone(), e.value.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// `bytes`, a parquet segment, without the rows at `drop`.
+fn drop_rows(bytes: &[u8], drop: &[usize]) -> Vec<u8> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let b = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+    let kv = b.metadata().file_metadata().key_value_metadata().cloned();
+    let schema = b.schema().clone();
+    let batches: Vec<RecordBatch> = b.build().unwrap().map(|x| x.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&schema, &batches).unwrap();
+    let keep: Vec<bool> = (0..batch.num_rows()).map(|i| !drop.contains(&i)).collect();
+    let batch =
+        arrow::compute::filter_record_batch(&batch, &arrow::array::BooleanArray::from(keep))
+            .unwrap();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_key_value_metadata(kv)
+        .build();
+    let mut buf = Vec::new();
+    let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    buf
+}
+
+/// `v2.rez` with the rows at `drop` taken out of table `a` and table `b`
+/// (each 12 rows), and `manifest` applied to its manifest.
+fn v2_with(drop_a: &[usize], drop_b: &[usize], manifest: impl Fn(&mut Value)) -> Vec<u8> {
+    let members = tar_members(&std::fs::read(storage_fixture("rez/v2.rez")).unwrap());
+    let members: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .map(|(name, bytes)| {
+            if name == "manifest.json" {
+                let mut m: Value = serde_json::from_slice(&bytes).unwrap();
+                manifest(&mut m);
+                (name, serde_json::to_vec(&m).unwrap())
+            } else if name.ends_with("/a.parquet") {
+                (name, drop_rows(&bytes, drop_a))
+            } else {
+                (name, drop_rows(&bytes, drop_b))
+            }
+        })
+        .collect();
+    tar_of(&members)
+}
+
+/// A tar with dropped rows reads at the interval its reader measured from
+/// the first rows, which the converted segments declare.
+#[test]
+fn a_tar_with_dropped_rows_reads_at_the_tar_readers_interval() {
+    let bytes = v2_with(&[4, 8], &[4, 8], |_| {});
+    let (_, c) = check_tar_bytes(bytes.clone(), &WriterConfig::default());
+    assert_eq!(c.noise, 0, "{c:?}");
+    for rows in [1, 3] {
+        let (_, c) = check_tar_bytes(bytes.clone(), &tiny_segments(rows));
+        assert_eq!(c.noise, 0, "{c:?}");
+    }
+}
+
+/// Without an anchor in the manifest, the source starts at the recording's
+/// first row, whichever table holds it.
+#[test]
+fn a_v1_anchor_is_the_earliest_row_of_any_table() {
+    let v1 = |m: &mut Value| {
+        m["version"] = 1.into();
+        for rec in m["recordings"].as_array_mut().unwrap() {
+            let rec = rec.as_object_mut().unwrap();
+            rec.remove("complete");
+            rec.remove("clock_anchor_wall_ns");
+        }
+    };
+    // Table `a` starts 3 s in, `b` at the first tick.
+    let bytes = v2_with(&[0, 1, 2], &[], v1);
+    let (_, c) = check_tar_bytes(bytes.clone(), &WriterConfig::default());
+    assert_eq!(c.noise, 0, "{c:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let mut out = dendro::archive::ArchiveMut::create(&dest).unwrap();
+    convert_tar_into(bytes.as_slice(), &mut out, &WriterConfig::default()).unwrap();
+    drop(out);
+    let archive = dendro::archive::Archive::open(&dest).unwrap();
+    assert_eq!(
+        archive.read_sources().unwrap()[0].meta.clock_anchor_wall_ns,
+        BASE_NS as i64
+    );
+}
+
+// ─── Segment caps, metadata, refusals ───────────────────────────────────────
+
+/// A byte cap smaller than a row seals each row alone, whatever the row cap.
+#[test]
+fn the_byte_cap_splits_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.parquet");
+    rezolus_parquet(&path, 12, true);
+    let mut config = WriterConfig::default();
+    config.seal.max_rows = 1000;
+    config.seal.max_bytes = 1;
+    let (written, c) = check_parquet_with(&path, &ParquetToArchive::new().writer_config(config));
+    assert_eq!((written.rows, written.segments), (12, 12));
+    assert_eq!(c.noise, 0, "{c:?}");
+
+    // The cap is on encoded bytes: a quarter of the file's row groups
+    // makes three to five segments (rounding), and the default makes one.
+    let encoded: i64 = {
+        use parquet::file::reader::FileReader;
+        let file =
+            parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&path).unwrap())
+                .unwrap();
+        file.metadata()
+            .row_groups()
+            .iter()
+            .map(|g| g.compressed_size())
+            .sum()
+    };
+    let mut config = WriterConfig::default();
+    config.seal.max_rows = 1000;
+    config.seal.max_bytes = encoded as usize / 4;
+    let (written, _) = check_parquet_with(&path, &ParquetToArchive::new().writer_config(config));
+    assert!((3..=5).contains(&written.segments), "{written:?}");
+    let (written, _) = check_parquet(&path);
+    assert_eq!(written.segments, 1);
+}
+
+/// The source's metadata is the file's, without the parquet format's keys.
+#[test]
+fn the_source_metadata_has_no_format_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.parquet");
+    rezolus_parquet(&path, 5, true);
+    let dest = dir.path().join("out.dendro");
+    ParquetToArchive::new()
+        .convert_file_path(&path, &dest)
+        .unwrap();
+    let archive = dendro::archive::Archive::open(&dest).unwrap();
+    let metadata = &archive.read_sources().unwrap()[0].meta.metadata;
+    assert!(
+        !metadata.contains_key("ARROW:schema"),
+        "{:?}",
+        metadata.keys()
+    );
+    assert!(!metadata.contains_key("metriken.format"));
+    assert_eq!(metadata["sampling_interval_ms"], "1000");
+    assert_eq!(metadata["report"], "trimmed");
+}
+
+/// A long segment in a tar is refused rather than split.
+#[test]
+fn a_long_segment_in_a_tar_is_refused() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let members = tar_members(&std::fs::read(storage_fixture("rez/v2.rez")).unwrap());
+    let members: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .map(|(name, bytes)| {
+            if !name.ends_with("/b.parquet") {
+                return (name, bytes);
+            }
+            let b = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+            let schema = b.schema().clone();
+            let batches: Vec<RecordBatch> = b.build().unwrap().map(|x| x.unwrap()).collect();
+            let props = parquet::file::properties::WriterProperties::builder()
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    "metriken.layout".to_string(),
+                    "long".to_string(),
+                )]))
+                .build();
+            let mut buf = Vec::new();
+            let mut w =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+            for batch in batches {
+                w.write(&batch).unwrap();
+            }
+            w.close().unwrap();
+            (name, buf)
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("long.rez");
+    std::fs::write(&src, tar_of(&members)).unwrap();
+    let dest = dir.path().join("out.dendro");
+    let err = convert_tar_to_dendro(&src, &dest).unwrap_err();
+    assert!(err.contains("table b has a long segment"), "{err}");
+    assert!(!dest.exists());
+}
+
+/// A table whose segments hold no rows is not written, so its names are
+/// not listed.
+#[test]
+fn a_tar_table_with_no_rows_is_not_written() {
+    let bytes = v2_with(&[], &(0..12).collect::<Vec<_>>(), |m| {
+        m["recordings"][0]["tables"][1]["rows"] = 0.into();
+    });
+    let original = open_recordings_from_bytes(bytes.clone(), pool()).unwrap();
+    assert_eq!(
+        original[0].1.gauge_names(),
+        ["mem_free"],
+        "the tar lists it"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out.dendro");
+    let mut out = dendro::archive::ArchiveMut::create(&dest).unwrap();
+    let written = convert_tar_into(bytes.as_slice(), &mut out, &WriterConfig::default()).unwrap();
+    drop(out);
+    assert_eq!(written.tables, 1);
+    let (_, converted) = open_archive(&dest).remove(0);
+    assert!(converted.gauge_names().is_empty());
+    assert_eq!(converted.counter_names(), ["ops"]);
+}
+
+/// An output with a stale sidecar beside it is refused, and nothing is
+/// touched.
+#[test]
+fn an_output_with_a_sidecar_beside_it_is_refused() {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.dendro");
+        let sidecar = dir.path().join(format!("out.dendro{suffix}"));
+        std::fs::write(&sidecar, b"stale").unwrap();
+        let err = convert_tar_to_dendro(&storage_fixture("rez/v2.rez"), &dest).unwrap_err();
+        assert!(
+            err.contains(&format!("out.dendro{suffix} already exists")),
+            "{err}"
+        );
+        let err = ParquetToArchive::new()
+            .convert_file_path(storage_fixture("legacy/legacy-0.4.0.parquet"), &dest)
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"stale");
+    }
+}
+
+// ─── convert_path ───────────────────────────────────────────────────────────
+
+#[test]
+fn convert_path_chooses_by_content() {
+    use metriken_storage::to_dendro::{convert_path, ConvertedFrom};
+    let dir = tempfile::tempdir().unwrap();
+    // Names that say nothing, so only content can decide.
+    let cases = [
+        ("rez/v3.rez", "a"),
+        ("rez/v2.rez", "b"),
+        ("legacy/legacy-0.4.0.parquet", "c"),
+    ];
+    for (fixture, name) in cases {
+        let src = dir.path().join(name);
+        std::fs::copy(storage_fixture(fixture), &src).unwrap();
+        let dest = dir.path().join(format!("{name}.dendro"));
+        let got = convert_path(&src, &dest).unwrap();
+        match (fixture, got) {
+            ("rez/v3.rez", ConvertedFrom::RezV3) => {}
+            ("rez/v2.rez", ConvertedFrom::RezTar(w)) => assert_eq!(w.rows, 24),
+            ("legacy/legacy-0.4.0.parquet", ConvertedFrom::Parquet(w)) => assert_eq!(w.rows, 4),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(open_archive(&dest).len(), 1, "{fixture}");
+        // A dendro archive is refused as one already.
+        let err = convert_path(&dest, dir.path().join(format!("{name}-again.dendro"))).unwrap_err();
+        assert!(
+            err.to_string().contains("already a dendro archive"),
+            "{err}"
+        );
+    }
+    let junk = dir.path().join("junk");
+    std::fs::write(&junk, b"neither parquet nor a tar").unwrap();
+    let out = dir.path().join("junk.dendro");
+    let err = convert_path(&junk, &out).unwrap_err();
+    assert!(
+        err.to_string().contains("not a recording this converts"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    // An existing output is refused for a v3 input too.
+    let v3 = dir.path().join("a");
+    let err = convert_path(&v3, dir.path().join("b.dendro")).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
 }
