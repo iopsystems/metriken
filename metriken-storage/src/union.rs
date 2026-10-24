@@ -258,6 +258,17 @@ impl DataSource for UnionSource {
         }
     }
 
+    /// The children's sample timestamps, ascending, each instant once.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+        for c in &self.children {
+            out.extend(c.sample_timestamps());
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     fn time_range(&self) -> Option<(u64, u64)> {
         self.children
             .iter()

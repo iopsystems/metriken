@@ -1126,6 +1126,18 @@ impl SegmentedSource {
     /// Segment `idx`, opened footer-only — from the cache, or fetched from
     /// the store and cached. `None` when the store no longer has it.
     fn segment(&self, idx: usize) -> Result<Option<Arc<MultiParquetSource>>, Box<dyn Error>> {
+        self.segment_kept(idx, true)
+    }
+
+    /// Segment `idx` as [`segment`](Self::segment) opens it, cached only
+    /// when `keep`. A scan that reads every segment once passes `false`, so
+    /// it holds one segment at a time instead of filling the cache with
+    /// segments no query asked for.
+    fn segment_kept(
+        &self,
+        idx: usize,
+        keep: bool,
+    ) -> Result<Option<Arc<MultiParquetSource>>, Box<dyn Error>> {
         if let Some(seg) = self
             .cache
             .lock()
@@ -1143,6 +1155,9 @@ impl SegmentedSource {
             bytes,
             Arc::clone(&self.pool),
         )?);
+        if !keep {
+            return Ok(Some(seg));
+        }
         let size = seg.resident_estimate();
         self.cache
             .lock()
@@ -1815,10 +1830,17 @@ impl DataSource for SegmentedSource {
 
     fn sample_timestamps(&self) -> Vec<u64> {
         // Per-sample timestamps, concatenated in segment order — same splice
-        // contract as the query path, no sort/dedup. Touches every segment.
+        // contract as the query path, no sort/dedup. Reads every segment
+        // present at open, and caches none it opens: a scan of a table's
+        // whole range would otherwise fill the cache to its budget.
         let mut out = Vec::new();
-        for (_, seg) in self.touched(0, u64::MAX) {
-            out.extend(seg.sample_timestamps());
+        let present = self.state.catalog.iter().enumerate();
+        for idx in present.filter(|(_, c)| c.present).map(|(idx, _)| idx) {
+            match self.segment_kept(idx, false) {
+                Ok(Some(seg)) => out.extend(seg.sample_timestamps()),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(segment = idx, "fetching a segment: {e}"),
+            }
         }
         out
     }

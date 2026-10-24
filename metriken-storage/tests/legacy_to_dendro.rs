@@ -169,6 +169,10 @@ fn answers<S: MetricsSource + ?Sized>(src: &S, (start, end): (f64, f64)) -> Vec<
         "time range",
         serde_json::to_value(src.time_range()).unwrap(),
     );
+    listing(
+        "sample timestamps",
+        serde_json::to_value(src.sample_timestamps()).unwrap(),
+    );
 
     let raw = QueryOptions::with_rate_mode(RateMode::Raw);
     let per_series = QueryOptions::default().with_per_series_rates(true);

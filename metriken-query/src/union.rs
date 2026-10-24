@@ -158,6 +158,12 @@ impl MetricsSource for UnionMetricsSource {
         self.engine.interval()
     }
 
+    /// The union of the children's sample timestamps, ascending, each
+    /// instant once.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        metriken_storage::DataSource::sample_timestamps(&*self.engine.data_source())
+    }
+
     fn source(&self) -> String {
         self.engine.metadata_get("source").unwrap_or_default()
     }
@@ -713,5 +719,19 @@ mod tests {
             serde_json::to_value(union_segmented.query_range(expr, start, end, 1.0).unwrap())
                 .unwrap(),
         );
+    }
+
+    /// A union's sample timestamps are its children's, ascending, each
+    /// instant once: the two tables share seconds 1..=5 and only `b` was
+    /// read at 6..=8.
+    #[test]
+    fn sample_timestamps_are_the_childrens_union() {
+        let a = counter_table("a", 5);
+        let b = counter_table("b", 8);
+        let union = UnionMetricsSource::try_new(vec![(&a).into(), (&b).into()]).unwrap();
+        let want: Vec<u64> = (1..=8).map(|i| i * 1_000_000_000).collect();
+        assert_eq!(union.sample_timestamps(), want);
+        let union = UnionMetricsSource::try_new(vec![(&b).into(), (&a).into()]).unwrap();
+        assert_eq!(union.sample_timestamps(), want, "in either child order");
     }
 }
