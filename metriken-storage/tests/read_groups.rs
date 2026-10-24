@@ -567,7 +567,9 @@ fn legacy_containers_are_refused() {
 }
 
 /// A reader opened by path reads its tables from the path on first query,
-/// and refuses to once another file has been renamed over it.
+/// and refuses to once another file has been renamed over it. The check
+/// compares inodes, so it runs only where files have them.
+#[cfg(unix)]
 #[test]
 fn a_file_replaced_after_the_open_is_not_read() {
     let dir = tempfile::tempdir().unwrap();
