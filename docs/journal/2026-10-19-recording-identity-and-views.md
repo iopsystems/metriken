@@ -1524,6 +1524,18 @@ Readings of the rules where the text left a choice:
   (`ArchiveReader::read_groups`), a source lacking the key taking its uuid
   group's value when that is one value. This is the presented-recording
   split by any label, since the user layer is not stored apart (Q2).
+- A group's metadata, where a tool shows one recording for it (rezolus's
+  `RezReader::open_recordings` before metriken-storage 0.5.3, now
+  `process::merge_metadata` behind `ArchiveReader::open_read_groups`): `events`
+  is the union of the sources' events, each `id` once (the first source's
+  copy), an event with no id once per distinct event, sorted by timestamp
+  then id, except that a lone parseable payload wins over an earlier one
+  that does not parse; every other key is the first source's, in archive
+  order, that holds it. The sources are copies or recordings of one process, so they
+  agree on a key both hold unless one was edited alone, and a key one holds
+  (KPIs annotated onto a snapshot) is the group's whichever order they were
+  combined in. A tool that edits a group writes each of its sources, found
+  by `catalog_index` in the group reader's `sources()`.
 - Bridges are read groups of their own until slice 3 joins their pieces, so
   case 3's continuous-recording-plus-attempts test (`sum` at 09:30 equals
   the attempt's alone) waits for slice 3.

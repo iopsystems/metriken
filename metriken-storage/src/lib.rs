@@ -37,7 +37,10 @@
 //!   recording. `writer` (feature `write`): `ArchiveWriter`.
 //! - `process`: an archive's sources grouped by producer process (copies
 //!   by uuid, bridges set aside, the rest joined by a shared producer
-//!   epoch), which `ArchiveReader::process_groups` returns.
+//!   epoch), which `ArchiveReader::process_groups` returns, and a read
+//!   group's metadata (`process::merge_metadata`).
+//!   `ArchiveReader::open_read_groups` opens a dendro archive as one reader
+//!   per read group (`ArchiveReader::flatten_read_groups`).
 //! - `rez` (feature `rez`): reading the `.rez` format; nothing writes one.
 //!
 //! - `convert` (feature `convert`): a raw msgpack recording into a `.dendro`
@@ -61,6 +64,8 @@ pub mod catalog;
 pub mod convert;
 #[cfg(feature = "archive")]
 pub mod encoder;
+#[cfg(feature = "archive")]
+pub mod file_id;
 #[cfg(feature = "archive")]
 pub mod filter;
 pub mod format;

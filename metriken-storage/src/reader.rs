@@ -1472,6 +1472,171 @@ impl ArchiveReader {
         }
     }
 
+    /// Open the dendro archive at `path` as one reader per read group:
+    /// [`from_catalog`](Self::from_catalog), then
+    /// [`flatten_read_groups`](Self::flatten_read_groups). Tables are read
+    /// from `path` again on their first query, and refused once another file
+    /// is at `path`.
+    ///
+    /// Only a dendro archive opens. A standalone parquet file, a SQLite file
+    /// without dendro's stamp (a v3 `.rez`) and a tar (a v1 or v2
+    /// `.rez`) are refused by their first bytes, with a message saying to
+    /// convert them (`to_dendro::convert_path`, feature `write`); they are
+    /// never converted here.
+    ///
+    /// The identity index of a converted 5.x indexed recording (its caller
+    /// rows) is not read (`index` is `None`), as in `rez::open`: its slot
+    /// columns keep the labels each segment was built with.
+    pub fn open_read_groups(
+        path: &std::path::Path,
+        pool: Arc<BufferPool>,
+    ) -> Result<LabeledRecordings, Box<dyn std::error::Error>> {
+        refuse_legacy(&file_head(path)?, &path.display().to_string())?;
+        // Noted before the catalog opens, so a file swapped in between is
+        // refused on a table's first read.
+        let reopen: Reopen = {
+            let path = path.to_path_buf();
+            let opened = crate::file_id::FileId::of(&path);
+            Arc::new(move || {
+                if opened.is_some() && crate::file_id::FileId::of(&path) != opened {
+                    return Err(format!(
+                        "{} was replaced after it was opened",
+                        path.display()
+                    ));
+                }
+                Ok(Box::new(crate::DendroCatalog::open(&path)?) as Box<dyn Catalog>)
+            })
+        };
+        let catalog = crate::DendroCatalog::open(path)?;
+        Ok(Self::flatten_read_groups(Self::from_catalog(
+            Box::new(catalog),
+            Some(reopen),
+            pool,
+            None,
+        )?))
+    }
+
+    /// [`open_read_groups`](Self::open_read_groups) for an archive held as
+    /// bytes (a browser upload). Every table reads from one in-memory
+    /// catalog.
+    pub fn open_read_groups_from_bytes(
+        bytes: Vec<u8>,
+        pool: Arc<BufferPool>,
+    ) -> Result<LabeledRecordings, Box<dyn std::error::Error>> {
+        refuse_legacy(&bytes, "the recording")?;
+        let catalog = crate::DendroCatalog::open_bytes(bytes)?;
+        Ok(Self::flatten_read_groups(Self::from_catalog(
+            Box::new(catalog),
+            None,
+            pool,
+            None,
+        )?))
+    }
+
+    /// `recordings`, one reader per source, joined into one reader per read
+    /// group: what a caller lists, selects and edits as one recording.
+    ///
+    /// The groups are the ones [`read_groups`](Self::read_groups) finds over
+    /// the same sources joined by [`flatten`](Self::flatten) (a source and
+    /// its copies, and sources of one producer epoch whose spans in it hold
+    /// a row of each, are one; see [`crate::process`]), so a group read here
+    /// answers as it does inside a reader of every source. Each entry is the
+    /// group's labels ([`ReadGroup::labels`]) and a reader of its sources:
+    ///
+    /// - [`sources`](Self::sources) are the group's sources in archive order,
+    ///   each with its `catalog_index` and `uuid`, which is how a writer
+    ///   maps an edit of the group back to the sources it is written to.
+    /// - [`metadata`](Self::metadata) is the group's, by
+    ///   [`crate::process::merge_metadata`] (for a group of one source, that
+    ///   source's metadata). The filename is the first source's.
+    /// - Its series carry the group's labels, as they do in a reader of every
+    ///   source, including a value the group takes from a copy outside it (a
+    ///   source lacking a key takes its uuid's value). Its
+    ///   [`read_groups`](Self::read_groups) is that one group.
+    ///   Joining these readers again with [`flatten`](Self::flatten) groups
+    ///   their sources alone: a value taken from a copy outside them is
+    ///   lost, and groups can merge.
+    ///
+    /// Entries are in order of each group's first source, the order a
+    /// listing of the archive's recordings shows, so a position in the
+    /// returned list is a recording's position in such a listing within one
+    /// open. On a live archive a later overlap can join groups, so positions
+    /// can change between opens.
+    ///
+    /// A reader of one source is grouped. A reader of several sources (one
+    /// made by [`flatten`](Self::flatten)) or of none is returned as it is,
+    /// with its labels, at its own position in `recordings`:
+    /// it cannot be split, so it is taken as one recording already.
+    pub fn flatten_read_groups(recordings: LabeledRecordings) -> LabeledRecordings {
+        // The readers of one source, by position in `recordings`.
+        let single: Vec<usize> = recordings
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, r))| r.sources.len() == 1)
+            .map(|(i, _)| i)
+            .collect();
+        let groups = {
+            let infos: Vec<SourceInfo> = single
+                .iter()
+                .map(|&i| recordings[i].1.sources[0].clone())
+                .collect();
+            // As `read_group_index`: one source has nothing to group, and is
+            // not made to read any rows to find that out.
+            if infos.len() < 2 {
+                crate::process::read_groups(&infos, &ProcessGroups::default())
+            } else {
+                let tables: Vec<Vec<&SamplerReader>> = single
+                    .iter()
+                    .map(|&i| recordings[i].1.tables.iter().map(|t| &**t).collect())
+                    .collect();
+                let formed = crate::process::form(&infos, &mut |source, lo, hi| {
+                    any_row_in(&tables[source], lo, hi)
+                });
+                crate::process::read_groups(&infos, &formed)
+            }
+        };
+        type Entry = (BTreeMap<String, String>, ArchiveReader);
+        let mut slots: Vec<Option<Entry>> = recordings.into_iter().map(Some).collect();
+        // Each entry with the position in `recordings` it is ordered by.
+        let mut out: Vec<(usize, Entry)> = groups
+            .into_iter()
+            .map(|group| {
+                let mut members: Vec<ArchiveReader> = group
+                    .sources
+                    .iter()
+                    .map(|&s| {
+                        slots[single[s]]
+                            .take()
+                            .expect("a source is in one read group")
+                            .1
+                    })
+                    .collect();
+                let first = single[group.sources[0]];
+                if members.len() == 1 {
+                    let mut reader = members.pop().expect("one member");
+                    reader.set_read_group(group.labels.clone());
+                    return (first, (group.labels, reader));
+                }
+                let metadata = crate::process::merge_metadata(
+                    &members.iter().map(|m| &m.metadata).collect::<Vec<_>>(),
+                );
+                let filename = members[0].filename();
+                let mut reader = ArchiveReader::flatten(members, filename);
+                reader.metadata = metadata;
+                reader.set_read_group(group.labels.clone());
+                (first, (group.labels, reader))
+            })
+            .collect();
+        out.extend(
+            slots
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, slot)| slot.map(|entry| (i, entry))),
+        );
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter().map(|(_, entry)| entry).collect()
+    }
+
     /// One reader per source of an archive's catalog, without materializing
     /// it: the catalog answers spans with no segment read, and one segment
     /// per table answers the name catalog. Everything else waits until a
@@ -2002,15 +2167,7 @@ impl ArchiveReader {
                 }
             }
             crate::process::form(&self.sources, &mut |source, lo, hi| {
-                let mut unknown = false;
-                for t in &tables[source] {
-                    match t.has_row_in(lo, hi) {
-                        Some(true) => return Some(true),
-                        Some(false) => {}
-                        None => unknown = true,
-                    }
-                }
-                (!unknown).then_some(false)
+                any_row_in(&tables[source], lo, hi)
             })
         })
     }
@@ -2050,24 +2207,22 @@ impl ArchiveReader {
             } else {
                 crate::process::read_groups(&self.sources, self.process_groups())
             };
-            let mut of = vec![0; self.members.len()];
-            for (g, group) in groups.iter().enumerate() {
-                for &s in &group.sources {
-                    of[s] = g;
-                }
-            }
-            let positions = self
-                .members
-                .iter()
-                .enumerate()
-                .map(|(i, (labels, _))| (Arc::as_ptr(labels) as usize, i))
-                .collect();
-            ReadGroupIndex {
-                groups,
-                of,
-                positions,
-            }
+            ReadGroupIndex::new(groups, &self.members)
         })
+    }
+
+    /// Make this reader one read group labelled `labels`, the labels its
+    /// group has among the archive's sources. Those can hold a value its own
+    /// sources do not carry (a key filled from a copy outside the group, by
+    /// [`crate::process::read_groups`]), which a grouping of its own sources
+    /// alone would not find.
+    fn set_read_group(&mut self, labels: BTreeMap<String, String>) {
+        let groups = vec![ReadGroup {
+            sources: (0..self.members.len()).collect(),
+            labels,
+        }];
+        self.read_groups = std::sync::OnceLock::from(ReadGroupIndex::new(groups, &self.members));
+        self.series_labels = std::sync::OnceLock::new();
     }
 
     /// The labels each recording's series carry: its read group's labels
@@ -2154,7 +2309,9 @@ impl ArchiveReader {
         }
     }
 
-    /// The (first) recording's file-level metadata.
+    /// The (first) recording's file-level metadata; for a reader of a read
+    /// group from [`flatten_read_groups`](Self::flatten_read_groups), the
+    /// group's ([`crate::process::merge_metadata`]).
     pub fn metadata(&self) -> &BTreeMap<String, String> {
         &self.metadata
     }
@@ -2163,6 +2320,59 @@ impl ArchiveReader {
     pub fn filename(&self) -> Option<String> {
         self.filename.clone()
     }
+}
+
+/// The first bytes of the file at `path`, enough to tell the containers
+/// [`refuse_legacy`] refuses: up to the end of a tar header.
+fn file_head(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(TAR_HEADER);
+    std::fs::File::open(path)
+        .and_then(|f| f.take(TAR_HEADER as u64).read_to_end(&mut head))
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    Ok(head)
+}
+
+/// A tar header's length, and where its `ustar` magic sits.
+const TAR_HEADER: usize = 512;
+const TAR_MAGIC_AT: usize = 257;
+
+/// Refuse a recording whose first bytes are one of the legacy containers,
+/// which only a conversion reads: a standalone parquet file (`PAR1`), a
+/// SQLite file without dendro's stamp (a v3 `.rez`), or a tar (`ustar` at
+/// 257, a v1 or v2 `.rez`). Anything else is left to the dendro open.
+fn refuse_legacy(head: &[u8], name: &str) -> Result<(), String> {
+    if crate::DendroCatalog::is_archive_bytes(head) {
+        return Ok(());
+    }
+    let kind = if head.starts_with(b"PAR1") {
+        "a standalone parquet file"
+    } else if head.starts_with(b"SQLite format 3\0") {
+        "a SQLite file without dendro's stamp (a v3 .rez)"
+    } else if head.get(TAR_MAGIC_AT..TAR_MAGIC_AT + 5) == Some(b"ustar".as_slice()) {
+        "a tar archive (a v1 or v2 .rez)"
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "{name} is {kind}, not a dendro archive; convert it to a .dendro with `rezolus \
+         recording upgrade` or metriken_storage::to_dendro::convert_path, and open that"
+    ))
+}
+
+/// Whether a source whose tables are `tables` holds a row in `[lo, hi]`, as
+/// [`crate::process::form`] asks: when any of them does, `Some(false)` when
+/// every one can tell it does not, `None` otherwise.
+fn any_row_in(tables: &[&SamplerReader], lo: u64, hi: u64) -> Option<bool> {
+    let mut unknown = false;
+    for t in tables {
+        match t.has_row_in(lo, hi) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 /// The union of `tables`' probed spans.
@@ -2187,6 +2397,28 @@ struct ReadGroupIndex {
     groups: Vec<ReadGroup>,
     of: Vec<usize>,
     positions: HashMap<usize, usize>,
+}
+
+impl ReadGroupIndex {
+    /// The index of `groups` over a reader's `members`.
+    fn new(groups: Vec<ReadGroup>, members: &[(Arc<BTreeMap<String, String>>, usize)]) -> Self {
+        let mut of = vec![0; members.len()];
+        for (g, group) in groups.iter().enumerate() {
+            for &s in &group.sources {
+                of[s] = g;
+            }
+        }
+        let positions = members
+            .iter()
+            .enumerate()
+            .map(|(i, (labels, _))| (Arc::as_ptr(labels) as usize, i))
+            .collect();
+        Self {
+            groups,
+            of,
+            positions,
+        }
+    }
 }
 
 /// The labels each recording's series carry, from
