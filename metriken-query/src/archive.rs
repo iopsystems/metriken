@@ -805,6 +805,95 @@ impl MetricsSource for ArchiveReader {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+    /// The instants at which the first source with rows, or a copy of it,
+    /// holds a row in any of its tables, ascending, each instant once.
+    /// Sources are tried in order: one that recorded nothing owns no table,
+    /// and one whose rows retention evicted after the reader opened reads
+    /// none. Sources are tried in the order [`ArchiveReader::sources`] lists
+    /// them.
+    ///
+    /// An archive has a table per sampler or acquisition group, and the list
+    /// is the union of their row timestamps, so an instant at which only a
+    /// slower table was read is listed. A copy of the source (a source with
+    /// its uuid, in its read group) can hold fewer or more of the
+    /// recording's rows than the source; the list is their union. Another
+    /// source is not listed, even one in the same read group: a second
+    /// recorder of one agent samples on its own schedule. A reader of
+    /// several read groups lists the group of its first source with rows;
+    /// open each read group as its own reader (`ArchiveReader::open_read_groups`) for its list. A
+    /// second recorder within one read group has no list of its own. Rows of
+    /// a live archive's WAL tail are included, as a query reads them.
+    ///
+    /// Built from each table's [`SamplerReader::row_timestamps`]: the first
+    /// call reads them, and the reader keeps them.
+    fn sample_timestamps(&self) -> Vec<u64> {
+        let names = MetricsSource::all_names(self);
+        let tables: Vec<(usize, &SamplerReader)> = self
+            .owners_of(&names)
+            .into_iter()
+            .filter_map(|t| Some((self.source_position(t)?, t)))
+            .collect();
+        let sources = self.sources();
+        let mut leads: Vec<usize> = tables.iter().map(|(p, _)| *p).collect();
+        leads.sort_unstable();
+        leads.dedup();
+        for lead in leads {
+            let uuid = &sources[lead].uuid;
+            let group = tables
+                .iter()
+                .find(|(p, _)| *p == lead)
+                .and_then(|(_, t)| self.read_group_of(t));
+            let mut out: Vec<u64> = Vec::new();
+            for (p, t) in &tables {
+                let copy =
+                    uuid.is_some() && sources[*p].uuid == *uuid && self.read_group_of(t) == group;
+                if *p != lead && !copy {
+                    continue;
+                }
+                let mut rows = t.row_timestamps().to_vec();
+                rows.sort_unstable();
+                rows.dedup();
+                out = merge_sorted_unique(out, rows);
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// The ascending union of two ascending, duplicate-free lists, each value
+/// once.
+fn merge_sorted_unique(a: Vec<u64>, b: Vec<u64>) -> Vec<u64> {
+    if a.is_empty() {
+        return b;
+    }
+    if b.is_empty() {
+        return a;
+    }
+    let mut out = Vec::with_capacity(a.len().max(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
 }
 
 #[cfg(test)]

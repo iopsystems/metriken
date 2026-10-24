@@ -2265,6 +2265,28 @@ pub(crate) mod tests {
         assert_eq!(r.cached_segments().0, 1);
     }
 
+    /// Listing the sample timestamps reads every segment it does not hold
+    /// and caches none of them; a segment a query already cached is not
+    /// fetched again.
+    #[test]
+    fn sample_timestamps_read_every_segment_and_cache_none() {
+        let store = CountingStore::new(three_segments());
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
+        store.fetched();
+        let want = vec![1_000_000_000, 3_000_000_000, 5_000_000_000];
+        assert_eq!(MetricsSource::sample_timestamps(&r), want);
+        assert_eq!(store.fetched(), vec![0, 1, 2]);
+        assert_eq!(r.cached_segments().0, 0, "a scan keeps no segment");
+
+        let opts = QueryOptions::default().with_per_series_rates(true);
+        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
+        assert_eq!(store.fetched(), vec![1]);
+        assert_eq!(MetricsSource::sample_timestamps(&r), want);
+        assert_eq!(store.fetched(), vec![0, 2], "the cached segment is reused");
+        assert_eq!(r.cached_segments().0, 1);
+    }
+
     /// A segment the store has lost since open — a rolling buffer's
     /// retention — is skipped, and the rest still answer.
     #[test]
@@ -2289,6 +2311,22 @@ pub(crate) mod tests {
             "the lost segment's sample is gone: {points:?}"
         );
         assert_eq!(r.segment_count(), 3, "the catalog still counts it");
+    }
+
+    /// A segment gone at open is not fetched when the sample timestamps are
+    /// listed.
+    #[test]
+    fn sample_timestamps_skip_a_segment_gone_at_open() {
+        let store = CountingStore::new(three_segments());
+        store.gone.lock().unwrap().insert(1);
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
+        store.fetched();
+        assert_eq!(
+            MetricsSource::sample_timestamps(&r),
+            vec![1_000_000_000, 5_000_000_000]
+        );
+        assert_eq!(store.fetched(), vec![0, 2]);
     }
 
     /// The counter scan skips a segment lost after open, and the batched

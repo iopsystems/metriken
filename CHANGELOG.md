@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-query 0.42.2
+
+Requires metriken-storage 0.5.4. With 0.5.3, `UnionMetricsSource` lists
+no sample timestamps and `ArchiveReader`'s list fills every table's
+segment cache.
+
+- **Added:** `MetricsSource::sample_timestamps` for `ArchiveReader`
+  (feature `archive`), which had the trait's empty default. It lists the
+  instants at which the first source with rows, or a copy of it (same
+  uuid, same read group), holds a row in any of its tables, ascending,
+  each instant once, WAL tail included. Tables of different
+  cadence contribute the union of their rows. Other sources are not
+  listed, even one in the same read group: a second recorder of one agent
+  samples on its own schedule. A reader of several read groups lists the
+  group of its first source with rows; open each with
+  `ArchiveReader::open_read_groups` for its list. Built from each table's `row_timestamps`, which the reader keeps:
+  on a 9.6 h, 49-table recording the first call took 6.6 s and a second
+  3.4 ms.
+- **Added:** `MetricsSource::sample_timestamps` for `UnionMetricsSource`,
+  which had the trait's empty default: the union of the children's,
+  ascending, each instant once.
+
+### metriken-storage 0.5.4
+
+- **Added:** `DataSource::sample_timestamps` for `UnionSource`, which had
+  the trait's empty default: the union of the children's, ascending, each
+  instant once.
+- **Changed:** `SegmentedSource`'s `DataSource::sample_timestamps` no
+  longer adds the segments it opens to the segment cache; a segment
+  already cached is read from it. Each table's cache is charged against
+  the whole pool budget, so reading the timestamps of all 49 tables of a
+  9.6 h recording peaked at 2.25 GB resident with a 512 MiB pool when the
+  scan filled the caches, and peaks at 0.37 GB with pools of 16 and
+  512 MiB. The cost: `eval_timestamps_for` reads timestamps through this
+  method and no longer leaves the tables it read cached, so the query
+  that follows fetches their segments.
+
 ### metriken-storage 0.5.3
 
 - **Added:** `ArchiveReader::open_read_groups(path, pool)` and
