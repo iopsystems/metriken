@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.5.5
+
+- **Added:** `layers`, a source's identity in three layers (recorder,
+  producer, user) stored in its dendro metadata under
+  `metriken.layer.recorder`, `metriken.layer.producer` and
+  `metriken.layer.user`. Each layer is a list of entries (`Entry`: `id`,
+  `seq`, `ts`, `by`, `from_ts`, `epoch`, `labels`, `metadata`,
+  `unset_labels`, `unset_metadata`) and a cache of their fold.
+  `layers::append` writes them: it appends an entry, assigns its `seq`, and
+  rewrites the layers' caches, the source's labels (the layers merged
+  recorder, producer, user, the last winning) and the metadata keys the
+  layers set, removing one they no longer set. It edits the two maps and
+  does no I/O, and builds without `write`.
+  - A source without layers is first given the layers
+    `Layers::derive_legacy` reads from it: its labels as one user entry; its
+    metadata, other than `writer_sessions`, `encoder`, `events`, the flat
+    epoch keys and `metriken.` keys, in an at-open recorder entry; the
+    `producer_name` the caller's `LegacyEvidence` names, in an entry of its
+    own; and each epoch as a recorder entry, read as `epoch_spans` reads
+    the flat keys. Derived ids are built from the source's uuid, the layer,
+    the epoch and its `from_ts`.
+  - A label or layered metadata key changed outside `append` since its last
+    write is appended as a user entry by `external`, a removal as the key
+    set to `""`, by the next `append` that appends an entry.
+  - A user entry removes a lower layer's key by setting it to `""`, a
+    metadata key written outside `append` included; a key whose merged
+    value is empty is left out. In the producer and recorder layers an
+    empty value removes the key from that layer only. Unsetting a key
+    removes it from the entry's layer.
+  - A producer entry with the same contents as the one that wins the fold
+    appends nothing. An entry that writes a `metriken.` label or metadata
+    key, a flat epoch key, or `writer_sessions`, `encoder` or `events` is
+    refused. `descriptions` is merged key by key. Fields this build
+    does not know are kept.
+- **Changed:** `process::epoch_spans` reads a source's epochs from its
+  recorder layer's entries that carry an `epoch`; a damaged user or producer
+  layer does not affect it. A source without a recorder layer is read from
+  `producer_epochs` and `producer_epoch` as before. A legacy source gains a
+  recorder layer at its first `append` to any layer, derived from those
+  keys.
+
 ### metriken-query 0.42.2
 
 Requires metriken-storage 0.5.4. With 0.5.3, `UnionMetricsSource` lists

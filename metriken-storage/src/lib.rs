@@ -72,6 +72,8 @@ pub mod format;
 pub mod histogram_stream;
 pub mod labeled;
 pub mod labels;
+#[cfg(feature = "archive")]
+pub mod layers;
 pub mod lazy;
 pub mod long;
 pub mod long_table;
