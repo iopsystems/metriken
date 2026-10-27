@@ -8,8 +8,9 @@
 //! result in agreement. A label or layered metadata key changed by a write
 //! that did not go through [`append`] (dendro's `update_source_labels` or
 //! `update_source_metadata`) is folded in as a user entry by the next
-//! [`append`] that appends an entry. Design: `docs/journal/2026-10-19-recording-identity-and-views.md`,
-//! Q2.
+//! [`append`] that appends an entry.
+//!
+//! Design: `docs/journal/2026-10-19-recording-identity-and-views.md`, Q2.
 //!
 //! [`append`] edits a source's two maps and does no I/O. It builds without the
 //! `write` feature, so the WASM viewer can call it on maps read from an
@@ -1724,5 +1725,60 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A resend of the producer entry appended last that changes the layer's
+    /// fold is appended, though its epoch's fold is unchanged.
+    #[test]
+    fn a_resend_that_changes_the_layers_fold_is_appended() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let stamped = |id: &str, x: &str, epoch: &str, from_ts: u64| Entry {
+            from_ts: Some(from_ts),
+            epoch: Some(epoch.to_string()),
+            ..entry(id, "producer", &[("x", x)])
+        };
+        for e in [
+            stamped("a", "2", "E", 100),
+            stamped("c", "3", "F", 300),
+            stamped("b", "2", "E", 50),
+        ] {
+            assert!(put(&mut labels, &mut metadata, Layer::Producer, e));
+        }
+        assert_eq!(labels["x"], "3");
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("d", "2", "E", 500)
+        ));
+        assert_eq!(labels["x"], "2");
+    }
+
+    /// A JSON object under a key other than `descriptions`, rewritten outside
+    /// `append` with a key removed, is a change, and the rewrite is kept.
+    #[test]
+    fn a_subset_of_another_json_key_written_outside_append_is_a_change() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let mut producer = Entry::new("p", "producer");
+        producer.metadata = map(&[("config", r#"{"a":"A","b":"B"}"#)]);
+        put(&mut labels, &mut metadata, Layer::Producer, producer);
+        metadata.insert("config".to_string(), r#"{"a":"A"}"#.to_string());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("u", "record", &[("k", "v")]),
+        );
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert_eq!(
+            layers
+                .user
+                .entries
+                .iter()
+                .filter(|e| e.by == "external")
+                .count(),
+            1
+        );
+        assert_eq!(metadata["config"], r#"{"a":"A"}"#);
     }
 }
