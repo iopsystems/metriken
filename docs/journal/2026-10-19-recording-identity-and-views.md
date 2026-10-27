@@ -537,14 +537,15 @@ contradicts; the list below is the merged result.
   and presented recording for what is shown.
 - **Kind** (O3). The software a source comes from: `__producer__`, from the
   producer layer, else the recorder layer's `producer_name`, which the probe
-  hook takes from `/about`, `/status` or the banner or D2's read derives (Q3),
-  else the D2 read of a legacy `source`, else, for a source with no producer
-  layer, the producer of the registry entry its `service_kind`, then its
-  `alias`, matches (Q35). A source with none is unidentified (P9). Sources of
-  one process group whose kinds differ (possible through D2's read, a registry
-  match differing between sources of one process group, or two in-process
-  sources of one process under Q9 (a); Q8 keeps one `__producer__` per source)
-  take the kind of the source with the newest first timestamp, with a notice.
+  hook takes from `/about`, `/status` or the `/` banner, or which D2's read
+  derives (Q3), else the D2 read of a legacy `source`, else, for a source with
+  no producer layer, the producer of the registry entry its `service_kind`, then
+  its `alias`, matches (Q35). A source with none is unidentified (P9). Sources
+  of one process group whose kinds differ (possible through D2's read, a
+  registry match differing between sources of one process group, or two
+  in-process sources of one process under Q9 (a); Q8 keeps one `__producer__`
+  per source) take the kind of the source with the newest first timestamp, with
+  a notice.
 - **Labels.** Each source carries labels from the layers below. Grouping is by
   labels: asserted at record time (`--label arm=…`, `--label tier=…`,
   per-endpoint labels after step 3.4), in the viewer (saved into the sources'
@@ -736,16 +737,19 @@ Names:
   identifies a legacy source, the at-open recorder entry D2's read derives (`by:
   upgrade`, or `by: convert` when `recording convert` writes it, Q2) carries
   that `producer_name`, so the identification survives the layers being written
-  and retention, which keeps entries without `epoch`; one identified by evidence
-  2 alone keeps its notice. A registry match on `source` is not written: the
-  derived user-layer `source` is read by the registry rule as before, so the
-  match follows the reader's registry. A name the recorder derived from a URL is
-  not evidence, but a legacy `source` cannot be told from an inferred one
-  (`infer_source_name` gives `vllm` for `http://vllm/metrics`, whose port is the
-  default), so a legacy `source` that matches a registry entry is read as that
-  producer with a notice that the name may have been inferred. Evidence 4 is
-  still accepted, with its caveat above; it is not written either, and the
-  carried `service_queries` stays in the derived metadata, read as before.
+  and retention, which keeps entries without `epoch`; one identified by its
+  metric names without a `version` keeps its notice, which a reader re-derives
+  from the source's metadata (no `version`, no `sampler_status`). A registry
+  match on `source` is not written: the derived user-layer `source` is read by
+  the registry rule as before, so the match follows the reader's registry. A
+  name the recorder derived from a URL is not evidence, but a legacy `source`
+  cannot be told from an inferred one (`infer_source_name` gives `vllm` for
+  `http://vllm/metrics`, whose port is the default), so a legacy `source` that
+  matches a registry entry is read as that producer with a notice that the name
+  may have been inferred. Evidence 4 is still accepted, with its caveat above;
+  it is not written either, and the carried `service_queries` stays in the
+  derived metadata, read as before.
+
 
   Reading `source` alone does not identify the producer: metriken-recorder's
   `Identity::metadata()` writes the resolved `source` over the handshake's,
@@ -2269,12 +2273,14 @@ Identity and naming:
   by `convert` are the same entry. So the derivation read from a pre-layer copy
   and the one written into a layered copy are one entry in the union; when two
   entries share an `id` with different contents, the layered copy's entry is
-  kept and the notice names the source; a pre-layer copy meeting a layered one
-  is read through the same derived layers for the merge. A label the user
-  assigns to specific sources, from the viewer (any key, `tier` and `arm` alike)
-  or with `recording annotate`, is a user entry; a rule meant for other archives
-  (a selector on kind and labels) is a label layer document saved with a view
-  and applied as an open-time overlay (O5). Exports to formats without layers
+  kept (which one is kept when both copies are layered and their derivations
+  differ, for example derived by an older and a newer `upgrade`, is open) and
+  the notice names the source; a pre-layer copy meeting a layered one is read
+  through the same derived layers for the merge. A label the user assigns to
+  specific sources, from the viewer (any key, `tier` and `arm` alike) or with
+  `recording annotate`, is a user entry; a rule meant for other archives (a
+  selector on kind and labels) is a label layer document saved with a view and
+  applied as an open-time overlay (O5). Exports to formats without layers
   (parquet, Prometheus) carry the merged `labels`; whether a parquet keeps the
   epoch history is Q17. The layers are the record; the source's `labels` and its
   merged metadata keys (`service_queries` and the others P5 renders) are their
@@ -2373,14 +2379,14 @@ Identity and naming:
     `/status` and the `/` banner, and records `producer_name` `rezolus` with,
     for a `/status` answer or a banner `Rezolus <version> Agent`,
     `producer_component` `agent` and `version` (on a streamed agent this repeats
-    the producer layer's name); for a banner `Rezolus <version> Exporter`,
-    `producer_component` `exporter` and `exporter_version`. Detection's
-    `not_streamable`, which calls the same `identify` and refuses anything
-    identified as an agent ("a Rezolus agent is never scraped by 6.x",
-    `src/recorder/agent_probe.rs:144-162`), keeps treating an exporter as
-    `Other`, so the exporter is scraped; only `enrich` records it. The hook
-    writes no `source` label (D2). The agent's version is `version` on an agent
-    recording and `agent_version` on an exporter's; rezolus analysis's
+    the handshake's `source` `rezolus`); for a banner `Rezolus <version>
+    Exporter`, `producer_component` `exporter` and `exporter_version`.
+    Detection's `not_streamable`, which calls the same `identify` and refuses
+    anything identified as an agent ("a Rezolus agent is never scraped by 6.x",
+    `src/recorder/agent_probe.rs:144-162`), keeps returning `Verdict::Scrape`
+    for an exporter, as it does for `Other` today; only `enrich` records it. The
+    hook writes no `source` label (D2). The agent's version is `version` on an
+    agent recording and `agent_version` on an exporter's; rezolus analysis's
     `Context.agent_version` (filled from `data.version()`,
     `src/analysis/extract/mod.rs:556`) reads `version` only and must read both
     (step 3.4), and the names are part of Q4's `version`/`producer_version`
