@@ -2242,12 +2242,12 @@ Identity and naming:
   one; the recorder drops the `producer_epoch` copy a producer puts in its
   handshake metadata, so the fold writes no flat `producer_epoch`. A reconnect
   that resends a handshake identical to the producer entry that wins the fold,
-  or to the producer entry appended last when appending it would leave the
-  producer fold unchanged, appends nothing; `from_ts` is not compared
+  or to the producer entry appended last when appending it would change neither
+  the producer fold nor its epoch's, appends nothing; `from_ts` is not compared
   (amended 2026-10-27: the highest-`seq` entry need not win the fold when
-  restart stamps disagree, a resent handshake whose `from_ts` sorts before
-  the winner must still match something, and one whose `from_ts` would make
-  it win is appended). A
+  restart stamps disagree, so a resend whose `from_ts` sorts before the winner
+  is compared with the producer entry appended last, and one that changes the
+  layer's fold or its epoch's fold is appended). A
   recorder entry is an observation: the entry at open carries the endpoint
   (`instance`) and the transport, and each epoch, the opening one included, is a
   recorder entry carrying that `epoch`. Only recorder entries carrying `epoch`
@@ -2293,17 +2293,17 @@ Identity and naming:
   writes the flat keys or `update_metadata` to a layered source has its epochs
   ignored (only the recorder layer is read) and its writes to keys the layers
   set captured as `external` user entries. Amended 2026-10-27, the derivation
-  is: the labels as one user entry; one at-open recorder entry holding the
-  legacy metadata other than the keys dendro maintains (`writer_sessions`,
-  `encoder`, `events`), the flat epoch keys and `metriken.` keys, so a legacy
-  value a producer or user edit overrides and a later edit in that layer
-  unsets falls back to the source's own (a recorder unset removes the
-  source's own value too, since an unset removes the key from its whole
-  layer); the labels leave out `metriken.` labels; `producer_name`, when D2's evidence 1 to 3 names one, in a further
-  at-open recorder entry with `seq` 1 that folds over the at-open entry and
-  whose id includes the name, so readers holding different evidence derive
-  the same entries apart from that one; each epoch as a recorder
-  entry, read as `epoch_spans` reads the flat keys (the `producer_epochs` list
+  is: the labels as one user entry, leaving out `metriken.` labels; one at-open
+  recorder entry holding the legacy metadata other than the keys dendro
+  maintains (`writer_sessions`, `encoder`, `events`), the flat epoch keys and
+  `metriken.` keys, so a legacy value a producer or user edit overrides and a
+  later edit in that layer unsets falls back to the source's own (a recorder
+  unset removes the source's own value too, since an unset removes the key from
+  its whole layer); `producer_name`, when D2's evidence 1 to 3 names one, in a
+  further at-open recorder entry with `seq` 1 that folds over the at-open entry
+  and whose id includes the name, so readers holding different evidence derive
+  the same entries apart from that one; each epoch as a recorder entry, read as
+  `epoch_spans` reads the flat keys (the `producer_epochs` list
   when it parses and is not empty, each listing kept, else `producer_epoch` with
   no `from_ts`). A listed epoch's `version` is not derived: the source's
   `version` is its newest, which the at-open entry holds, and the flat

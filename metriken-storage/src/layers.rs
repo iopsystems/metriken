@@ -605,7 +605,8 @@ fn drift(
     }
     for k in before.metadata.keys() {
         let have = present(metadata, k);
-        if present(&before.metadata, k) != have {
+        let was = present(&before.metadata, k);
+        if was != have && !union_holds(k, was, have) {
             entry
                 .metadata
                 .insert(k.clone(), have.cloned().unwrap_or_default());
@@ -613,6 +614,27 @@ fn drift(
     }
     let changed = !entry.labels.is_empty() || !entry.metadata.is_empty();
     changed.then_some(entry)
+}
+
+/// Whether `have`, the value of union key `k` found in the source, adds
+/// nothing to `was`, the merged value: both JSON objects and every key of
+/// `have` in `was` with the same value. Such a value is not a change, since
+/// the merge would give `was` back.
+fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
+    let (Some(was), Some(have)) = (was, have) else {
+        return false;
+    };
+    if !UNION_KEYS.contains(&k) {
+        return false;
+    }
+    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).ok();
+    match (
+        union_objects(was, have).as_deref().and_then(parse),
+        parse(was),
+    ) {
+        (Some(merged), Some(was)) => merged == was,
+        _ => false,
+    }
 }
 
 /// Append `entry` to `layer` of a source, and rewrite what the layers
@@ -625,10 +647,10 @@ fn drift(
 /// key, or `writer_sessions`, `encoder` or `events` is refused. A producer
 /// entry with the same contents as the producer entry that wins the fold
 /// appends nothing; so does one with the same contents as the producer entry
-/// appended last when appending it would leave the layer's fold unchanged. A
-/// reconnect resending its handshake then adds no entry when its `from_ts`
-/// sorts it before the winner, and is appended when it would change the
-/// fold.
+/// appended last when appending it would change neither the layer's fold nor
+/// the fold of the layer's entries in the entry's epoch. A reconnect
+/// resending its handshake that changes neither is skipped; one that changes
+/// either is appended.
 ///
 /// A source with no layer keys is first given the layers
 /// [`Layers::derive_legacy`] reads from it, with `uuid` and `evidence`, so
@@ -641,9 +663,10 @@ fn drift(
 /// `external-<seq>-<entry's id>`, so it is kept rather than overwritten; a
 /// removal is kept as the key set to `""`. Being a user entry, it wins over
 /// every producer and recorder value of that key, later ones included, until
-/// a user entry unsets it. A key removed from inside a `descriptions` object
-/// is not a change: that key is merged across entries, so it comes back on
-/// the next write. The write that derives a legacy source's layers checks
+/// a user entry unsets it. A `descriptions` value whose keys all hold their
+/// merged values (one with a key removed, or reordered) is not a change:
+/// that key is merged across entries, so a removed key comes back on the
+/// next write. The write that derives a legacy source's layers checks
 /// nothing, since the derivation is the source's own state.
 ///
 /// `labels` becomes the merged labels whole: every label of the source is in
@@ -700,11 +723,18 @@ pub fn append(
         let winner = doc.ordered(layer).last().copied();
         let newest = doc.entries.iter().max_by_key(|e| e.seq);
         let repeats_winner = winner.is_some_and(|w| w.same_contents(&entry));
-        let repeats_newest = newest.is_some_and(|n| n.same_contents(&entry)) && {
-            let mut with = doc.clone();
+        // Whether appending leaves the fold of the entries `keep` selects
+        // unchanged.
+        let unchanged = |keep: &dyn Fn(&Entry) -> bool| {
+            let mut without = doc.clone();
+            without.entries.retain(|e| keep(e));
+            let mut with = without.clone();
             with.entries.push(entry.clone());
-            with.fold(layer) == doc.fold(layer)
+            with.fold(layer) == without.fold(layer)
         };
+        let repeats_newest = newest.is_some_and(|n| n.same_contents(&entry))
+            && unchanged(&|_| true)
+            && unchanged(&|e| e.epoch == entry.epoch);
         if repeats_winner || repeats_newest {
             return Ok(false);
         }
@@ -1612,6 +1642,8 @@ mod tests {
         let id = |uuid, epoch| derived_id(uuid, Layer::Recorder, epoch, None);
         assert_ne!(id(None, None), id(Some(""), None));
         assert_ne!(id(None, None), id(None, Some("")));
+        // Without the presence bytes these two inputs are the same bytes.
+        assert_ne!(id(None, Some("recorder")), id(Some("recorder"), None));
         assert_ne!(id(Some("ab"), Some("c")), id(Some("a"), Some("bc")));
         // Without the lengths these two inputs are the same bytes, the layer
         // name `recorder` sitting between the uuid and the epoch.
@@ -1622,6 +1654,75 @@ mod tests {
         assert_ne!(
             derived_id(None, Layer::Recorder, None, None),
             derived_id(None, Layer::Recorder, None, Some(0))
+        );
+    }
+
+    /// A resend of the producer entry appended last that changes its own
+    /// epoch's fold is appended, though the whole layer's fold is unchanged.
+    #[test]
+    fn a_resend_that_changes_its_epochs_fold_is_appended() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let stamped = |id: &str, x: &str, epoch: &str, from_ts: u64| Entry {
+            from_ts: Some(from_ts),
+            epoch: Some(epoch.to_string()),
+            ..entry(id, "producer", &[("x", x)])
+        };
+        for e in [
+            stamped("a", "1", "E", 100),
+            stamped("c", "3", "F", 300),
+            stamped("b", "2", "E", 50),
+        ] {
+            assert!(put(&mut labels, &mut metadata, Layer::Producer, e));
+        }
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("d", "2", "E", 200)
+        ));
+        assert_eq!(labels["x"], "3");
+    }
+
+    /// A `descriptions` value rewritten outside `append` with a key removed,
+    /// or its keys reordered, is not recorded as a change.
+    #[test]
+    fn a_descriptions_subset_written_outside_append_is_no_change() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let mut producer = Entry::new("p", "producer");
+        producer.metadata = map(&[("descriptions", r#"{"a":"A","b":"B"}"#)]);
+        put(&mut labels, &mut metadata, Layer::Producer, producer);
+        for (i, rewrite) in [r#"{"a":"A"}"#, r#"{"b":"B","a":"A"}"#]
+            .into_iter()
+            .enumerate()
+        {
+            metadata.insert("descriptions".to_string(), rewrite.to_string());
+            let id = format!("u{i}");
+            put(
+                &mut labels,
+                &mut metadata,
+                Layer::User,
+                entry(&id, "record", &[("k", "v")]),
+            );
+        }
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert!(layers.user.entries.iter().all(|e| e.by != "external"));
+        // A changed value is still a change.
+        metadata.insert("descriptions".to_string(), r#"{"a":"Z"}"#.to_string());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("u9", "record", &[("k", "w")]),
+        );
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert_eq!(
+            layers
+                .user
+                .entries
+                .iter()
+                .filter(|e| e.by == "external")
+                .count(),
+            1
         );
     }
 }

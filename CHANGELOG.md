@@ -41,10 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     removes it from the entry's layer.
   - A producer entry with the same contents as the one that wins the fold
     appends nothing, as does one with the same contents as the producer
-    entry appended last when appending it would not change the fold. An
-    entry that writes a `metriken.` label or metadata key, a flat epoch
-    key, or `writer_sessions`, `encoder` or `events` is refused. `descriptions` is merged key by key. Fields this build
-    does not know are kept.
+    entry appended last when appending it would change neither the fold
+    nor the fold of its epoch's entries. An entry that writes a
+    `metriken.` label or metadata key, a flat epoch key, or
+    `writer_sessions`, `encoder` or `events` is refused. `descriptions` is
+    merged key by key, and a `descriptions` value written outside `append`
+    whose keys all hold their merged values is not recorded as a change.
+    Fields this build does not know are kept.
 - **Changed:** `process::epoch_spans` reads a source's epochs from its
   recorder layer's entries that carry an `epoch`; a damaged user or producer
   layer does not affect it. A source without a recorder layer is read from
