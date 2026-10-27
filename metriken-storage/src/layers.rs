@@ -399,17 +399,21 @@ impl Layers {
     }
 
     /// The layers a source recorded before them is read as. Every entry has
-    /// no `ts`, `by` `upgrade`, and an id built from `uuid`, the layer, and
-    /// the epoch and `from_ts` it covers, so every derivation of one source
-    /// gives the same entries:
+    /// no `ts`, has `by` set to `upgrade`, and has an id built from `uuid`,
+    /// the layer, and the epoch and `from_ts` it covers, so every derivation
+    /// of one source gives the same entries:
     ///
-    /// - its labels, as one user entry, `seq` 0;
+    /// - its labels, other than those under [`RESERVED_PREFIX`], as one user
+    ///   entry, `seq` 0;
     /// - an at-open recorder entry (no epoch, no `from_ts`, `seq` 0) holding
     ///   its metadata, other than the keys dendro maintains
     ///   (`writer_sessions`, `encoder`, `events`), the flat epoch keys and
-    ///   reserved keys. It folds below every later entry, so a value a later
-    ///   entry sets and a still later one unsets falls back to the source's
-    ///   own;
+    ///   reserved keys. It folds below every later recorder entry, and the
+    ///   recorder layer below the producer and user layers, so a value a
+    ///   later producer or user entry sets and a still later one in that
+    ///   layer unsets falls back to the source's own. A recorder entry that
+    ///   unsets a key removes the source's own value too, since an unset
+    ///   removes the key from its whole layer;
     /// - the producer `evidence` names, as `producer_name` in a further
     ///   at-open recorder entry with `seq` 1, which folds over the at-open
     ///   entry, and an id built from the name. Readers holding different
@@ -432,9 +436,14 @@ impl Layers {
         evidence: &LegacyEvidence,
     ) -> Layers {
         let mut layers = Layers::default();
+        let labels: BTreeMap<String, String> = labels
+            .iter()
+            .filter(|(k, _)| !k.starts_with(RESERVED_PREFIX))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         if !labels.is_empty() {
             let mut entry = Entry::new(derived_id(uuid, Layer::User, None, None), "upgrade");
-            entry.labels = labels.clone();
+            entry.labels = labels;
             layers.user.entries.push(entry);
         }
 
@@ -614,9 +623,12 @@ fn drift(
 /// producer or recorder entry, `from_ts` and `epoch`. An entry that sets or
 /// unsets a label or metadata key under [`RESERVED_PREFIX`], a flat epoch
 /// key, or `writer_sessions`, `encoder` or `events` is refused. A producer
-/// entry with the same contents as the producer entry that wins the fold, or
-/// as the producer entry appended last, appends nothing: a reconnect resending
-/// its handshake adds no entry, whether or not its `from_ts` sorts it last.
+/// entry with the same contents as the producer entry that wins the fold
+/// appends nothing; so does one with the same contents as the producer entry
+/// appended last when appending it would leave the layer's fold unchanged. A
+/// reconnect resending its handshake then adds no entry when its `from_ts`
+/// sorts it before the winner, and is appended when it would change the
+/// fold.
 ///
 /// A source with no layer keys is first given the layers
 /// [`Layers::derive_legacy`] reads from it, with `uuid` and `evidence`, so
@@ -687,11 +699,13 @@ pub fn append(
     if layer == Layer::Producer {
         let winner = doc.ordered(layer).last().copied();
         let newest = doc.entries.iter().max_by_key(|e| e.seq);
-        if [winner, newest]
-            .into_iter()
-            .flatten()
-            .any(|e| e.same_contents(&entry))
-        {
+        let repeats_winner = winner.is_some_and(|w| w.same_contents(&entry));
+        let repeats_newest = newest.is_some_and(|n| n.same_contents(&entry)) && {
+            let mut with = doc.clone();
+            with.entries.push(entry.clone());
+            with.fold(layer) == doc.fold(layer)
+        };
+        if repeats_winner || repeats_newest {
             return Ok(false);
         }
     }
@@ -1537,5 +1551,77 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.key, PRODUCER_KEY);
         assert_eq!((labels, metadata), before);
+    }
+
+    /// A resend of the newest producer entry that would win the fold, once
+    /// appended, is appended: the source takes its value.
+    #[test]
+    fn a_resend_that_would_win_the_fold_is_appended() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let stamped = |id: &str, x: &str, from_ts: u64| Entry {
+            from_ts: Some(from_ts),
+            ..entry(id, "producer", &[("x", x)])
+        };
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("a", "1", 100)
+        ));
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("b", "2", 50)
+        ));
+        assert_eq!(labels["x"], "1");
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("c", "2", 200)
+        ));
+        assert_eq!(labels["x"], "2");
+    }
+
+    /// A legacy source's labels under the reserved prefix are left out of
+    /// the derived user entry, and the first write drops them.
+    #[test]
+    fn a_legacy_reserved_label_is_not_derived() {
+        let mut labels = map(&[("metriken.x", "y"), ("k", "v")]);
+        let mut metadata = BTreeMap::new();
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("a", "record", &[("j", "w")]),
+        );
+        assert_eq!(labels, map(&[("j", "w"), ("k", "v")]));
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert!(layers
+            .user
+            .entries
+            .iter()
+            .all(|e| !e.labels.contains_key("metriken.x")));
+    }
+
+    /// `derived_id` tells an absent field from an empty one, and does not
+    /// give one id to two field lists whose bytes concatenate alike.
+    #[test]
+    fn derived_ids_separate_fields() {
+        let id = |uuid, epoch| derived_id(uuid, Layer::Recorder, epoch, None);
+        assert_ne!(id(None, None), id(Some(""), None));
+        assert_ne!(id(None, None), id(None, Some("")));
+        assert_ne!(id(Some("ab"), Some("c")), id(Some("a"), Some("bc")));
+        // Without the lengths these two inputs are the same bytes, the layer
+        // name `recorder` sitting between the uuid and the epoch.
+        assert_ne!(
+            id(Some("a\u{1}recorder"), Some("b")),
+            id(Some("a"), Some("recorder\u{1}b"))
+        );
+        assert_ne!(
+            derived_id(None, Layer::Recorder, None, None),
+            derived_id(None, Layer::Recorder, None, Some(0))
+        );
     }
 }
