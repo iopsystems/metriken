@@ -15,16 +15,20 @@
 //!   long table.
 //! - [`convert`]: a group snapshot as a row.
 //! - [`cost`]: a row's cost against a writer's segment byte budget.
+//! - [`identity`]: a producer's name, version, build and hostname, and the
+//!   metadata keys it declares them under.
 //! - [`wire`]: the names `/metrics/stream` is served under and its layouts.
 
 pub mod convert;
 pub mod cost;
+pub mod identity;
 pub mod occupants;
 pub mod schema;
 pub mod snapshot;
 pub mod wal;
 pub mod wire;
 
+pub use identity::ProducerIdentity;
 pub use metriken_types::{Window, UID_LABEL};
 pub use schema::{
     is_counter_histogram, is_gauge_histogram, GroupSchema, MetricDesc, COUNTER_HISTOGRAM,

@@ -5,9 +5,11 @@ storage keeps everything and records provenance, and the viewer decides
 presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
-S9 in metriken" below) are done; nothing else is built. The owner decided Q1,
-Q2, Q7 and Q8 on 2026-10-26, and amended A8 and decided Q3, the layer entries
-and Q40 on 2026-10-27. "Step N" means this entry's order of work.
+S9 in metriken" below) are done; the producer identity keys and
+`producer_identity!` (step 2) are built and unreleased; nothing else is
+built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
+decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
+producer identity keys on 2026-10-27. "Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
 handshake) ([metriken-viewer](2026-10-12-metriken-viewer.md)), and rezolus's
@@ -565,7 +567,7 @@ the lower values readable.
 1. **Producer layer:** what the software declared in its handshake, including a
    producer identity: name, version, build, and the hostname of the machine it
    runs on, which gives `host` (Q1). Rust producers will fill name and version
-   without input through a metriken-exposition macro to be added, expanding in
+   without input through metriken-exposition's `producer_identity!`, expanding in
    the producer's crate (`env!("CARGO_PKG_NAME")`,
    `env!("CARGO_PKG_VERSION")`), and read the hostname at run time; metriken-py
    and others will set it explicitly; a recording made in process (llm-perf's
@@ -2194,6 +2196,21 @@ Identity and naming:
     without `host=`, so llm-perf's server-CPU section (W1) is hidden until
     the server's host is asserted (llm-perf's `server_host`, order of work
     step 6).
+  - The producer identity's keys (amended 2026-10-27): a producer declares
+    it in its handshake's metadata, and a msgpack snapshot's, as four
+    strings, `metriken.producer.name`, `metriken.producer.version`,
+    `metriken.producer.build` and `metriken.producer.host`, the last three
+    optional (metriken-model `identity`). metriken-exposition's
+    `producer_identity!` fills the name and version from the producer's
+    crate and the host from the machine's hostname. They are metadata
+    rather than handshake labels so that a recorder that predates the
+    layers stores them on the source without adding them to its series.
+    The layered recorder will read them into the producer entry (`host` as
+    a label, step 2) and will not store the `metriken.` keys themselves.
+    `Layers::derive_legacy` (#326) keeps them in the source's metadata but
+    reads none of them into the layers, so an upgraded source has no
+    producer entry or `host` from them; the recorder PR adds them to the
+    derivation as a producer entry.
   - The keys that can clash with a producer's own series labels, and so go
     through the clash rule: `instance` (federation, a pushgateway), `source`
     (rezolus's own provenance values), `alias`, `tier`, `host`, `arm`,
@@ -2874,8 +2891,8 @@ written by the new dendro.
      changed and a source created since it opened, sending `SourceUpdate`
      or `Handshake`. `SourceUpdate.ts` is the poll time (Q8).
 2. metriken, released:
-   - The producer identity (metriken-exposition macro and handshake key, with
-     the producer's hostname; metriken-model if the key is a wire key),
+   - The producer identity (metriken-exposition macro and handshake keys, with
+     the producer's hostname; the keys in metriken-model `identity`),
      `SourceIdentity` carrying it for an in-process source (Q7), and the three
      layers in metriken-recorder and metriken-storage, stored as Q2 decides,
      with the one function that writes the layers and the merged labels. The

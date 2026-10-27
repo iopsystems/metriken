@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-model 0.2.1
+
+- **Added:** `identity::ProducerIdentity` (re-exported at the crate root),
+  a producer's name, version, build and hostname, and the metadata keys a
+  producer declares it under in its handshake or snapshot:
+  `metriken.producer.name`, `metriken.producer.version`,
+  `metriken.producer.build` and `metriken.producer.host` (the constants
+  `PRODUCER_NAME`, `PRODUCER_VERSION`, `PRODUCER_BUILD`, `PRODUCER_HOST`).
+  `to_metadata` writes the name, and each other key that is set and not
+  empty; `from_metadata` reads them back, and gives `None` without a name.
+
+### metriken-exposition 0.25.1
+
+Requires metriken-model 0.2.1.
+
+- **Added:** `producer_identity!()`, the calling crate's
+  `ProducerIdentity`: `CARGO_PKG_NAME` and `CARGO_PKG_VERSION` where the
+  macro expands, and the machine's hostname. A producer adds
+  `identity.to_metadata()` to the metadata it passes to
+  `FrameProducer::new` or `for_source`, or to a snapshot's metadata.
+  Nothing adds it by default. `hostname()` reads the hostname as the OS
+  reports it, which may be fully qualified; new dependency `hostname` 0.4
+  on unix and windows targets. `ProducerIdentity` is re-exported at the
+  crate root.
+
 ### metriken-storage 0.5.5
 
 - **Added:** `layers`, a source's identity in three layers (recorder,
