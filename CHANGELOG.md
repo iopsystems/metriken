@@ -25,26 +25,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     metadata, other than `writer_sessions`, `encoder`, `events`, the flat
     epoch keys and `metriken.` keys, in an at-open recorder entry; the
     `producer_name` the caller's `LegacyEvidence` names, in an entry of its
-    own; and each epoch as a recorder entry, read as `epoch_spans` reads
-    the flat keys. Derived ids are built from the source's uuid, the layer,
-    the epoch and its `from_ts`.
+    own, over the at-open entry; and each epoch as a recorder entry, read
+    as `epoch_spans` reads the flat keys, in list order. Derived ids are
+    built from the source's uuid, the layer, the epoch and its `from_ts`.
   - A label or layered metadata key changed outside `append` since its last
     write is appended as a user entry by `external`, a removal as the key
-    set to `""`, by the next `append` that appends an entry.
+    set to `""`, by the next `append` that appends an entry. It wins over
+    later producer and recorder values of the key until a user entry
+    unsets it. A label under `metriken.` written outside `append` is
+    dropped.
   - A user entry removes a lower layer's key by setting it to `""`, a
     metadata key written outside `append` included; a key whose merged
     value is empty is left out. In the producer and recorder layers an
     empty value removes the key from that layer only. Unsetting a key
     removes it from the entry's layer.
-  - A producer entry with the same contents as the one that wins the fold
-    appends nothing. An entry that writes a `metriken.` label or metadata
+  - A producer entry with the same contents as the one that wins the fold,
+    or as the producer entry appended last, appends nothing. An entry that writes a `metriken.` label or metadata
     key, a flat epoch key, or `writer_sessions`, `encoder` or `events` is
     refused. `descriptions` is merged key by key. Fields this build
     does not know are kept.
 - **Changed:** `process::epoch_spans` reads a source's epochs from its
   recorder layer's entries that carry an `epoch`; a damaged user or producer
   layer does not affect it. A source without a recorder layer is read from
-  `producer_epochs` and `producer_epoch` as before. A legacy source gains a
+  `producer_epochs` and `producer_epoch` as before, as is one whose
+  recorder layer does not parse. A legacy source gains a
   recorder layer at its first `append` to any layer, derived from those
   keys.
 

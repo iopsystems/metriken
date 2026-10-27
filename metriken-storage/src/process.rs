@@ -114,17 +114,18 @@ pub const PRODUCER_EPOCHS: &str = "producer_epochs";
 /// The epochs a source's rows belong to, clipped to `span`.
 ///
 /// The epochs are the recorder layer's entries that carry an `epoch`
-/// ([`layers`](crate::layers)); a source without a recorder layer, recorded
-/// before the layers, has them in `producer_epochs` and `producer_epoch`.
-/// Each `producer_epochs` entry runs from its `from_ts` to the next entry's,
-/// exclusive, and the last to the source's last row. Entries are taken in
-/// `from_ts` order rather than list order: restart stamps come from clocks
-/// that need not agree, and an entry stamped before the one listed ahead of
-/// it would otherwise cover nothing. The first entry also covers any rows
-/// before its `from_ts`: the recorder seeds the list with the epoch the
-/// source opened with, so nothing earlier belongs to another epoch. Without
-/// a list that parses (logged), `producer_epoch` covers the whole span. An
-/// entry with no rows in the span is left out.
+/// ([`layers`](crate::layers)), in fold order. A source without a recorder
+/// layer, recorded before the layers, or whose recorder layer does not parse
+/// (logged), has them in `producer_epochs` and `producer_epoch`. Each epoch
+/// runs from its `from_ts` to the next epoch's, exclusive, and the last to
+/// the source's last row. Epochs are taken in `from_ts` order rather than
+/// list order: restart stamps come from clocks that need not agree, and an
+/// epoch stamped before the one listed ahead of it would otherwise cover
+/// nothing; epochs with one `from_ts` keep their order. The first epoch also
+/// covers any rows before its `from_ts`, since it is the epoch the source
+/// opened with. Without a `producer_epochs` list that parses (logged),
+/// `producer_epoch` covers the whole span. An epoch with no rows in the span
+/// is left out.
 pub fn epoch_spans(
     metadata: &BTreeMap<String, String>,
     span: Option<(u64, u64)>,

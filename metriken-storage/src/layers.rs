@@ -95,16 +95,18 @@ impl Layer {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Entry {
-    /// Unique per entry, except derived entries for a legacy listing repeated
-    /// with the same epoch and `from_ts`: a random UUID; `external-<seq>-<id>` for a change
-    /// [`append`] found made outside it; or for an entry
-    /// [derived](Layers::derive_legacy) from a source without layers, an id
-    /// built from the source's uuid, the layer, the epoch and its `from_ts`
-    /// (and the name, for the evidence's `producer_name`), so every
-    /// derivation of one source gives the same ids.
+    /// Set by the caller, normally a random UUID. [`append`] gives an entry it
+    /// records for a change made outside it the id `external-<seq>-<id>`,
+    /// where `<id>` is the appended entry's. An entry
+    /// [derived](Layers::derive_legacy) from a source without layers has an
+    /// id built from the source's uuid, the layer, the epoch and its
+    /// `from_ts` (and the name, for the evidence's `producer_name`), so every
+    /// derivation of one source gives the same ids; a legacy list that repeats
+    /// an epoch at one `from_ts` gives two entries with one id.
     pub id: String,
     /// Append order within the layer, assigned by [`append`]: one more than
-    /// the layer's highest. A derived entry has 0.
+    /// the layer's highest, or 0 in an empty layer. A derived entry's is set
+    /// by [`Layers::derive_legacy`].
     #[serde(default)]
     pub seq: u64,
     /// Wall time of the write, nanoseconds since the Unix epoch. Shown, never
@@ -397,25 +399,28 @@ impl Layers {
     }
 
     /// The layers a source recorded before them is read as. Every entry has
-    /// `seq` 0, no `ts`, `by` `upgrade`, and an id built from `uuid`, the
-    /// layer, and the epoch and `from_ts` it covers, so every derivation of
-    /// one source gives the same entries:
+    /// no `ts`, `by` `upgrade`, and an id built from `uuid`, the layer, and
+    /// the epoch and `from_ts` it covers, so every derivation of one source
+    /// gives the same entries:
     ///
-    /// - its labels, as one user entry;
-    /// - an at-open recorder entry (no epoch, no `from_ts`) holding its
-    ///   metadata, other than the keys dendro maintains (`writer_sessions`,
-    ///   `encoder`, `events`), the flat epoch keys, reserved keys, and
-    ///   `producer_name` when the evidence names one. Below
-    ///   every later entry, so a value a later entry sets and a still later
-    ///   one unsets falls back to the source's own;
+    /// - its labels, as one user entry, `seq` 0;
+    /// - an at-open recorder entry (no epoch, no `from_ts`, `seq` 0) holding
+    ///   its metadata, other than the keys dendro maintains
+    ///   (`writer_sessions`, `encoder`, `events`), the flat epoch keys and
+    ///   reserved keys. It folds below every later entry, so a value a later
+    ///   entry sets and a still later one unsets falls back to the source's
+    ///   own;
     /// - the producer `evidence` names, as `producer_name` in a further
-    ///   at-open recorder entry whose id is built from the name, so readers
-    ///   holding different evidence derive the same entries otherwise;
+    ///   at-open recorder entry with `seq` 1, which folds over the at-open
+    ///   entry, and an id built from the name. Readers holding different
+    ///   evidence derive the same entries apart from this one;
     /// - each epoch, as a recorder entry carrying that `epoch` and its
     ///   `from_ts`, read as [`epoch_spans`](crate::process::epoch_spans)
     ///   reads the flat keys: the `producer_epochs` list when it parses and
     ///   is not empty, an entry repeated in it once per listing, else
-    ///   `producer_epoch` with no `from_ts`.
+    ///   `producer_epoch` with no `from_ts`. Its `seq` is its position in the
+    ///   list, so epochs listed at one `from_ts` fold, and give spans, in list
+    ///   order.
     ///
     /// A listed epoch's `version` is not derived: the source's `version` is
     /// its newest, which the at-open entry holds, and the flat
@@ -437,8 +442,7 @@ impl Layers {
         opened.metadata = metadata
             .iter()
             .filter(|(k, _)| {
-                !(evidence.producer_name.is_some() && *k == "producer_name")
-                    && !UNLAYERED.contains(&k.as_str())
+                !UNLAYERED.contains(&k.as_str())
                     && !k.starts_with(RESERVED_PREFIX)
                     && *k != PRODUCER_EPOCH
                     && *k != PRODUCER_EPOCHS
@@ -454,13 +458,15 @@ impl Layers {
                 derived_id(uuid, Layer::Recorder, Some(&tag), None),
                 "upgrade",
             );
+            named.seq = 1;
             named.metadata = BTreeMap::from([("producer_name".to_string(), name.clone())]);
             layers.recorder.entries.push(named);
         }
 
-        for listed in legacy_epochs(metadata) {
+        for (position, listed) in legacy_epochs(metadata).into_iter().enumerate() {
             let id = derived_id(uuid, Layer::Recorder, Some(&listed.epoch), listed.from_ts);
             let mut entry = Entry::new(id, "upgrade");
+            entry.seq = position as u64;
             entry.from_ts = listed.from_ts;
             entry.epoch = Some(listed.epoch);
             layers.recorder.entries.push(entry);
@@ -500,9 +506,25 @@ fn derived_id(
     epoch: Option<&str>,
     from_ts: Option<u64>,
 ) -> String {
-    // `Debug` for the options, so an absent value and an empty one differ.
-    let input = format!("{uuid:?}\0{}\0{epoch:?}\0{from_ts:?}", layer.name());
-    let hash = twox_hash::XxHash3_128::oneshot(input.as_bytes());
+    // Each field as a presence byte, then its length and bytes, so an absent
+    // value and an empty one differ and no two field lists share an input.
+    fn field(input: &mut Vec<u8>, value: Option<&[u8]>) {
+        match value {
+            None => input.push(0),
+            Some(bytes) => {
+                input.push(1);
+                input.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                input.extend_from_slice(bytes);
+            }
+        }
+    }
+    let mut input = Vec::new();
+    field(&mut input, uuid.map(str::as_bytes));
+    field(&mut input, Some(layer.name().as_bytes()));
+    field(&mut input, epoch.map(str::as_bytes));
+    let from_ts = from_ts.map(u64::to_le_bytes);
+    field(&mut input, from_ts.as_ref().map(|b| &b[..]));
+    let hash = twox_hash::XxHash3_128::oneshot(&input);
     format!("derived-{hash:032x}")
 }
 
@@ -549,7 +571,9 @@ fn refresh_cache(doc: &mut LayerDoc, layer: Layer) {
 /// written: labels added, changed or removed, and layered metadata keys
 /// changed, added back or removed. An empty value and an absent key are the
 /// same. A removed key is set to `""`, which removes it from the merged
-/// result whichever layer sets it. `None` when nothing changed.
+/// result whichever layer sets it. A label under [`RESERVED_PREFIX`] is not
+/// taken, so `append`, which writes the merged labels whole, drops it.
+/// `None` when nothing changed.
 fn drift(
     before: &Folded,
     labels: &BTreeMap<String, String>,
@@ -560,6 +584,9 @@ fn drift(
     }
     let mut entry = Entry::new("", "external");
     for k in before.labels.keys().chain(labels.keys()) {
+        if k.starts_with(RESERVED_PREFIX) {
+            continue;
+        }
         let have = present(labels, k);
         if present(&before.labels, k) != have {
             entry
@@ -586,8 +613,10 @@ fn drift(
 /// `seq` is assigned here; the caller sets `id`, `ts`, `by` and, for a
 /// producer or recorder entry, `from_ts` and `epoch`. An entry that sets or
 /// unsets a label or metadata key under [`RESERVED_PREFIX`], a flat epoch
-/// key, or `writer_sessions`, `encoder` or `events` is refused. A producer entry with the same contents as the producer entry
-/// that wins the fold (a reconnect resending its handshake) appends nothing.
+/// key, or `writer_sessions`, `encoder` or `events` is refused. A producer
+/// entry with the same contents as the producer entry that wins the fold, or
+/// as the producer entry appended last, appends nothing: a reconnect resending
+/// its handshake adds no entry, whether or not its `from_ts` sorts it last.
 ///
 /// A source with no layer keys is first given the layers
 /// [`Layers::derive_legacy`] reads from it, with `uuid` and `evidence`, so
@@ -598,15 +627,25 @@ fn drift(
 /// `update_source_labels` or `update_source_metadata`) has that change
 /// appended first, as a user entry by `external` with the id
 /// `external-<seq>-<entry's id>`, so it is kept rather than overwritten; a
-/// removal is kept as the key set to `""`. The
-/// write that derives a legacy source's layers checks nothing, since the
-/// derivation is the source's own state.
+/// removal is kept as the key set to `""`. Being a user entry, it wins over
+/// every producer and recorder value of that key, later ones included, until
+/// a user entry unsets it. A key removed from inside a `descriptions` object
+/// is not a change: that key is merged across entries, so it comes back on
+/// the next write. The write that derives a legacy source's layers checks
+/// nothing, since the derivation is the source's own state.
 ///
 /// `labels` becomes the merged labels whole: every label of the source is in
 /// a layer. In `metadata`, a key the merged layers set is written, and a key
 /// they set before this write and no longer set is removed; keys the layers
 /// never set (dendro's `writer_sessions`, a legacy `producer_epochs`) are left
 /// alone.
+///
+/// # Errors
+///
+/// A refused entry, and a layer key (`metriken.layer.*`) in `metadata` that
+/// does not parse. The second fails this and every later `append` on the
+/// source until the key is repaired or removed outside `append`; an entry
+/// cannot unset it. Nothing is changed on an error.
 pub fn append(
     labels: &mut BTreeMap<String, String>,
     metadata: &mut BTreeMap<String, String>,
@@ -647,7 +686,12 @@ pub fn append(
     let doc = layers.get_mut(layer);
     if layer == Layer::Producer {
         let winner = doc.ordered(layer).last().copied();
-        if winner.is_some_and(|w| w.same_contents(&entry)) {
+        let newest = doc.entries.iter().max_by_key(|e| e.seq);
+        if [winner, newest]
+            .into_iter()
+            .flatten()
+            .any(|e| e.same_contents(&entry))
+        {
             return Ok(false);
         }
     }
@@ -1372,22 +1416,126 @@ mod tests {
         );
     }
 
-    /// When the evidence names a producer, a legacy `producer_name` stays out
-    /// of the at-open entry, so the evidence's is the only one.
+    /// The evidence's `producer_name` folds over a legacy one, and the
+    /// at-open entry is the same with or without evidence, so readers with
+    /// different evidence differ only in the evidence's entry.
     #[test]
-    fn evidence_replaces_a_legacy_producer_name() {
+    fn evidence_overrides_a_legacy_producer_name() {
         let evidence = LegacyEvidence {
             producer_name: Some("new".to_string()),
         };
         let metadata = map(&[("producer_name", "old"), ("k", "v")]);
-        let layers = Layers::derive_legacy(Some("u"), &BTreeMap::new(), &metadata, &evidence);
-        let holders: Vec<&str> = layers
-            .recorder
-            .entries
-            .iter()
-            .filter_map(|e| e.metadata.get("producer_name").map(String::as_str))
-            .collect();
-        assert_eq!(holders, vec!["new"]);
-        assert_eq!(layers.merged().metadata["producer_name"], "new");
+        // Several uuids, since entries with one `seq` and no `from_ts` fold in
+        // the order of their ids' hashes.
+        for uuid in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            let with = Layers::derive_legacy(Some(uuid), &BTreeMap::new(), &metadata, &evidence);
+            let without = Layers::derive_legacy(Some(uuid), &BTreeMap::new(), &metadata, &NONE);
+            assert_eq!(with.merged().metadata["producer_name"], "new", "{uuid}");
+            assert_eq!(without.merged().metadata["producer_name"], "old");
+            let opened = |l: &Layers| l.recorder.entries[0].clone();
+            assert_eq!(opened(&with), opened(&without));
+            assert_eq!(
+                with.recorder.entries.len(),
+                without.recorder.entries.len() + 1
+            );
+        }
+    }
+
+    /// Epochs a legacy list stamps with one `from_ts` keep their list order
+    /// through the derivation, as `epoch_spans` reads the flat keys.
+    #[test]
+    fn epochs_at_one_stamp_keep_their_list_order() {
+        for (a, b) in [("A", "B"), ("B", "A"), ("x", "y"), ("y", "x")] {
+            let mut labels = BTreeMap::new();
+            let mut metadata = map(&[(
+                PRODUCER_EPOCHS,
+                &format!(r#"[{{"epoch":"{a}","from_ts":5}},{{"epoch":"{b}","from_ts":5}}]"#),
+            )]);
+            let flat = crate::process::epoch_spans(&metadata, Some((0, 10)));
+            put(
+                &mut labels,
+                &mut metadata,
+                Layer::User,
+                entry("e", "record", &[("k", "v")]),
+            );
+            assert!(metadata.contains_key(RECORDER_KEY));
+            assert_eq!(crate::process::epoch_spans(&metadata, Some((0, 10))), flat);
+        }
+    }
+
+    /// A resent handshake stamped before the entry that wins the fold is
+    /// appended once, not at every reconnect.
+    #[test]
+    fn a_resent_handshake_stamped_early_appends_once() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let stamped = |id: &str, x: &str, from_ts: u64| Entry {
+            from_ts: Some(from_ts),
+            ..entry(id, "producer", &[("x", x)])
+        };
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("a", "1", 10)
+        ));
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("b", "2", 5)
+        ));
+        for id in ["c", "d"] {
+            assert!(!put(
+                &mut labels,
+                &mut metadata,
+                Layer::Producer,
+                stamped(id, "2", 5)
+            ));
+        }
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert_eq!(layers.producer.entries.len(), 2);
+        assert_eq!(labels["x"], "1");
+    }
+
+    /// A label under the reserved prefix written outside `append` is not
+    /// taken into the user layer, and the next write drops it.
+    #[test]
+    fn an_external_reserved_label_is_dropped() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("a", "record", &[("k", "v")]),
+        );
+        labels.insert("metriken.x".to_string(), "y".to_string());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("b", "record", &[("j", "w")]),
+        );
+        assert_eq!(labels, map(&[("j", "w"), ("k", "v")]));
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert!(layers.user.entries.iter().all(|e| e.by != "external"));
+    }
+
+    /// A layer key that does not parse fails `append` and changes nothing.
+    #[test]
+    fn a_damaged_layer_fails_append_and_changes_nothing() {
+        let mut labels = map(&[("k", "v")]);
+        let mut metadata = map(&[(PRODUCER_KEY, "garbage")]);
+        let before = (labels.clone(), metadata.clone());
+        let err = append(
+            &mut labels,
+            &mut metadata,
+            Some("u"),
+            &NONE,
+            Layer::User,
+            entry("a", "record", &[("j", "w")]),
+        )
+        .unwrap_err();
+        assert_eq!(err.key, PRODUCER_KEY);
+        assert_eq!((labels, metadata), before);
     }
 }

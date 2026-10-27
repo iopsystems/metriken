@@ -2241,9 +2241,11 @@ Identity and naming:
   (its `uuid`, metriken-recorder `frames.rs:144-146`) when the handshake names
   one; the recorder drops the `producer_epoch` copy a producer puts in its
   handshake metadata, so the fold writes no flat `producer_epoch`. A reconnect
-  that resends a handshake identical to the producer entry that wins the fold
-  appends nothing; `from_ts` is not compared (amended 2026-10-27: the
-  highest-`seq` entry need not win the fold when restart stamps disagree). A
+  that resends a handshake identical to the producer entry that wins the fold,
+  or to the producer entry appended last, appends nothing; `from_ts` is not
+  compared (amended 2026-10-27: the highest-`seq` entry need not win the fold
+  when restart stamps disagree, and a resent handshake whose `from_ts` sorts
+  before the winner must still match something). A
   recorder entry is an observation: the entry at open carries the endpoint
   (`instance`) and the transport, and each epoch, the opening one included, is a
   recorder entry carrying that `epoch`. Only recorder entries carrying `epoch`
@@ -2294,14 +2296,17 @@ Identity and naming:
   `encoder`, `events`), the flat epoch keys and `metriken.` keys, so a legacy
   value an edit overrides and a later edit unsets falls back to the source's
   own; `producer_name`, when D2's evidence 1 to 3 names one, in a further
-  at-open recorder entry whose id includes the name, so readers holding
-  different evidence derive the same entries otherwise; each epoch as a recorder
+  at-open recorder entry with `seq` 1 that folds over the at-open entry and
+  whose id includes the name, so readers holding different evidence derive
+  the same entries apart from that one; each epoch as a recorder
   entry, read as `epoch_spans` reads the flat keys (the `producer_epochs` list
   when it parses and is not empty, each listing kept, else `producer_epoch` with
   no `from_ts`). A listed epoch's `version` is not derived: the source's
   `version` is its newest, which the at-open entry holds, and the flat
   `producer_epochs`, which no write removes, keeps the history. Entries derived
-  by D2's read rule take `seq` 0, the one exception to the `seq` rule, and an
+  by D2's read rule take `seq` 0 (1 for the evidence entry, and an epoch
+  entry its position in the legacy list, so epochs listed at one `from_ts`
+  keep their list order), the one exception to the `seq` rule, and an
   `id` derived from the source uuid, the layer name, the entry's epoch and its
   `from_ts` (none for the at-open entry; `from_ts` because a legacy list can
   repeat an epoch); the derived user layer is one entry holding every derived
