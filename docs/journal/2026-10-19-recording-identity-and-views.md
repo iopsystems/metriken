@@ -183,7 +183,7 @@ Each workflow below came from the scenario reviews of 2026-10-19 and
   overlap either way.
 - **`source` does at least seven jobs:** the user's name for an endpoint
   (`--endpoint url,source=web-01`), the software identity (comparisons with
-  `"rezolus"` in `combine.rs`, `filter.rs:145`, `source_kind.rs:45`, the
+  `"rezolus"` in `combine.rs`, `filter.rs:145`, `source_kind.rs:42`, the
   dashboard builder (`dashboard/mod.rs:775`), the viewer's `metadata.rs`,
   the analysis extractor and the WASM viewer
   (`crates/viewer/src/lib.rs:1663`), among others), the template registry
@@ -570,7 +570,7 @@ the lower values readable.
    and others will set it explicitly; a recording made in process (llm-perf's
    own source through metriken-recorder's `RegistrySource`, llm-perf
    `src/recording.rs:169`) will take it as a field of its `SourceIdentity`, as
-   it takes `epoch`. A Prometheus endpoint declares nothing; a `*_build_info`
+   it takes `epoch`. A Prometheus endpoint has no handshake; a `*_build_info`
    series, where present, may fill it (deferred). The producer layer holds a
    list of handshakes, at least one per epoch of a producer that sends a
    handshake, each stored as sent (its entries, Q2); the merged view folds them
@@ -583,7 +583,10 @@ the lower values readable.
    transport, the host from `/systeminfo` (rezolus's way of reporting the
    producer's host, until the handshake carries it), the served interval, and
    the producer epoch and its history (its entries, in place of the flat
-   `producer_epoch` and `producer_epochs` keys, Q3); and the recorder default
+   `producer_epoch` and `producer_epochs` keys, Q3); for an endpoint with no
+   handshake, the answer the probe hook read from its `/about` or its banner
+   (`name` and `component` as labels, `version` or `exporter_version` and
+   `agent_version` as metadata, Q3); and the recorder default
    template (`template=FILE`). The clock anchor a `.rez` recording stores is
    the agent process's (from `/status`, since v5.21.0, #1270); a streamed
    source takes the handshake's, which is the same process anchor.
@@ -632,7 +635,8 @@ Names:
   `/systeminfo` until then), or a user-layer `host` asserted at record time
   for a producer that declares none, such as a Prometheus endpoint.
 - **`__producer__`** is the producer's declared name, set from the producer
-  layer. Prometheus removes target labels beginning with `__` after target
+  layer, else from the `name` in the recorder layer's `/about` answer (Q3).
+  Prometheus removes target labels beginning with `__` after target
   relabeling; rezolus keeps `__` labels by its own rule (`docs/labels.md`):
   stored, part of series identity, matchable in a selector, hidden from
   listings, legends and MCP output, and dropped by aggregation. Because it
@@ -688,11 +692,15 @@ Names:
   (`src/agent/exposition/http/mod.rs:283-301`): `__producer__` is `rezolus`. 2.
   A `version` the probe hook wrote, or that a msgpack snapshot's metadata
   carries (Q3), together with one of the self-metric names in
-  `REZOLUS_SELF_ANCHORS` (`crates/dashboard/src/source_kind.rs:32`): `rezolus`.
-  For a Prometheus scrape (a `prometheus/scrape` group) the self-metric names
-  alone suffice, since a scrape of `rezolus exporter` made before `/about`
-  carries no `version` (Q3); the viewer shows a notice that the source was
-  identified as rezolus from its metric names. 3. `sampler_status` under `per_source_metadata`, which v5.15.0 to v5.28.0
+  `REZOLUS_SELF_ANCHORS` (`crates/dashboard/src/source_kind.rs:29`): `rezolus`.
+  For a legacy Prometheus scrape (a `prometheus/scrape` group), which carries
+  no `version` (Q3), the self-metric names alone suffice when no series
+  carries an `instance` or `job` label or an `exported_` form of either; the
+  agent's own series carry neither, and a Prometheus server's `/federate`
+  re-emits them for many targets, so a federated scrape stays unidentified.
+  The viewer shows a notice that the source was identified as rezolus from
+  its metric names. 3. `sampler_status` under `per_source_metadata`, which
+  v5.15.0 to v5.28.0
   recorders wrote one level deep in the parquet of an agent that answered
   `/samplers` (`build_per_source_metadata`, v5.28.0
   `src/recorder/mod.rs:1796-1840`) and a combined parquet carries two levels
@@ -706,16 +714,24 @@ Names:
   entry's `service_kind` (Q35); any other value reads as `alias`. The probe
   hook and the agent's stream handshake both set `source=rezolus`
   (`src/recorder/agent_probe.rs:191`; `src/agent/exposition/http/mod.rs:247`,
-  `CARGO_BIN_NAME`), so on a recording that 1 to 3 identify, `source` other
-  than `rezolus` was set by the user. A Prometheus scrape (a
+  `CARGO_BIN_NAME`), so on a recording that 1, 3, or 2 with a `version`
+  identify, `source` other than `rezolus` was set by the user; on a scrape
+  identified by its metric names alone it may be the inferred name. A
+  Prometheus scrape (a
   `prometheus/scrape` group) has no producer layer, so its `source` is read
   by the registry match alone, and an inferred name nobody asserted reads
   as `alias`.
 
   Identity is read only from evidence that names one producer: a
-  declaration (a handshake, an `/about` answer), a name the user gave that
-  matches a registry entry, or a set of metric names that only one producer
-  emits. A name the recorder derived from a URL is not evidence.
+  declaration (a handshake, an `/about` answer or banner, the agent's
+  `sampler_status`), a name the user gave that matches a registry entry, or
+  a set of metric names that only one producer emits. A name the recorder
+  derived from a URL is not evidence. Two exceptions remain for legacy
+  recordings: a legacy `source` cannot be told from an inferred one
+  (`infer_source_name` gives `vllm` for `http://vllm/metrics`, whose port is
+  the default), so a legacy `source` that matches a registry entry is read as
+  that producer with a notice that the name may have been inferred; and
+  evidence 4 is accepted as the weak evidence it is.
 
   Reading `source` alone does not identify the producer: metriken-recorder's
   `Identity::metadata()` writes the resolved `source` over the handshake's,
@@ -1616,10 +1632,10 @@ Readings of the rules where the text left a choice:
   copy), an event with no id once per distinct event, sorted by timestamp
   then id, except that a lone parseable payload wins over an earlier one
   that does not parse; every other key is the first source's, in archive
-  order, that holds it. The sources are copies or recordings of one process, so they
-  agree on a key both hold unless one was edited alone, and a key one holds
-  (KPIs annotated onto a snapshot) is the group's whichever order they were
-  combined in. A tool that edits a group writes each of its sources, found
+  order, that holds it. The sources are copies or recordings of one process,
+  so they agree on a key both hold unless one was edited alone, and a key one
+  holds (KPIs annotated onto a snapshot) is the group's whichever order they
+  were combined in. A tool that edits a group writes each of its sources, found
   by `catalog_index` in the group reader's `sources()`.
 - Bridges are read groups of their own until slice 3 joins their pieces, so
   case 3's continuous-recording-plus-attempts test (`sum` at 09:30 equals
@@ -2184,7 +2200,8 @@ Identity and naming:
   readers take the source's first row for it. `by` names the writer: `producer`
   (a handshake, or an in-process `SourceIdentity`), `recorder` (including what
   rezolus's probe hook reads from `/about`, `/status` and `/systeminfo`:
-  the `/about` answer, `version`, `host`), `record` (labels the user gave at record time), `annotate`,
+  the `/about` answer, `version` or `exporter_version`, `host`), `record`
+  (labels the user gave at record time), `annotate`,
   `viewer`, `upgrade` and `convert` (layers derived by D2's read rule, Q3; a
   msgpack snapshot's `version` goes into its epoch's producer entry), or
   `combine` (its label stamping, step 3.4). `unset` lists keys the entry
@@ -2277,11 +2294,14 @@ Identity and naming:
   cachecannon's does at `src/admin/mod.rs:569-570`), where the candidates are
   (a) the snapshot metadata's `source` as `__producer__`, since the producer
   wrote it, or (b) none, as for a Prometheus scrape; and a Prometheus scrape
-  of `rezolus exporter`, which serves no `/status`
-  (`src/exporter/mod.rs:192-195`) and whose banner, `Rezolus <version>
-  Exporter` (`:204-206`), is rejected by `parse_root_version`, which accepts
-  only a banner ending in ` Agent` (`src/recorder/agent_probe.rs:128-136`),
-  so the probe writes no `version` and evidence 2 does not match.
+  of `rezolus exporter`, which carries no `version`, so evidence 2 does not
+  match: metriken-recorder calls the probe hook's `enrich` only for a
+  streamed endpoint (`first_enrich`, `recorder.rs:1885`; `Verdict::Scrape`
+  carries nothing), and the exporter serves no `/status`
+  (`src/exporter/mod.rs:192-195`) and a banner, `Rezolus <version>
+  Exporter` (`:204-206`), that `parse_root_version` rejects, since it
+  accepts only a banner ending in ` Agent`
+  (`src/recorder/agent_probe.rs:128-136`).
   Candidates: (a) keep the version requirement, so the scrape has no
   producer; (b) the self-metric names alone suffice, as `source_kind.rs`'s
   self-metric check does (`:51-54`), and `__producer__` is `rezolus`.
@@ -2306,17 +2326,28 @@ Identity and naming:
     is read by D2's rule like any legacy `source`; a `version` its snapshot
     metadata carries (a 5.x agent's does) counts as D2's evidence 2.
   - The `rezolus exporter` scrape, amended 2026-10-27: for a new recording
-    the exporter declares itself. The agent and the exporter both serve
-    `GET /about`, a JSON object `{"name": "rezolus", "version": …,
-    "component": "agent" | "exporter"}`; the exporter adds `agent_version`
-    when the agent it reads from answers. The key is `component`, since
-    `role` already has three meanings (Q4). The probe hook fetches `/about`
-    first, falling back to `/status` and the `/` banner for agents that
-    predate it, and writes the answer into the at-open recorder entry: the
-    `name`, and for an exporter `exporter_version` and `agent_version`
-    rather than `version`, since the exporter's version is not the agent's.
-    For a legacy recording, which has no `/about` answer and no URL to ask:
-    (b), with a notice (D2's evidence 2).
+    the exporter declares itself. From step 3.4 the agent and the exporter
+    both serve `GET /about`, a JSON object `{"name": "rezolus", "version": …,
+    "component": "agent" | "exporter"}`; the exporter adds `agent_version`,
+    the `version` in the newest snapshot it decoded from its agent (the one
+    at its configured `mpk_url`), absent when it has decoded none. The key
+    is `component`, since `role` already has three meanings (Q4). Step 2
+    has metriken-recorder call the probe hook for a scraped endpoint, at
+    detection, with its labels and metadata going into the at-open recorder
+    entry. The probe hook fetches `/about` first and records the answer only
+    when it is that object with `name` `rezolus` and `component` `agent` or
+    `exporter`; any other answer is ignored. For an endpoint that predates
+    `/about` it falls back to `/status` and the `/` banner, and a banner
+    `Rezolus <version> Exporter` is recorded as `name` `rezolus`,
+    `component` `exporter` and `exporter_version`. It records an exporter's
+    version as `exporter_version`, since that is not the agent's, and
+    `agent_version` once, at open; a scrape has no epochs, so an agent
+    upgraded during the recording is not reflected. For a legacy recording
+    of an exporter scrape, which has no `/about` answer and no URL to ask:
+    (b), with a notice (D2's evidence 2). Open: whether `component=exporter`
+    selects a different template, since the exporter writes histograms as
+    `{name}_distribution_*` and percentiles as gauges with a `percentile`
+    label (`src/exporter/prometheus.rs:113-143`).
 - **Q4.** The renames the inventory lists (`node`→`host`, `percentile`→
   `quantile` from the exporter, `role`'s three meanings (llm-perf's moves to
   `tier`, Q7), `kind` collisions, `version`/`producer_version`): which change,
@@ -2768,7 +2799,10 @@ written by the new dendro.
      refusal of those keys as caller metadata, there and in metriken-recorder
      (`reserved`, `recorder.rs:671-676`), extends to every `metriken.`-prefixed
      key, and keeps refusing the two flat names. Needs, for subscribers: the
-     dendro frame above.
+     dendro frame above. metriken-recorder also calls the probe hook for a
+     scraped endpoint at detection (today `first_enrich` asks streamed
+     endpoints only, `recorder.rs:1885`), writing its labels and metadata
+     into the at-open recorder entry (Q3).
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`.
    - In metriken-query, each producer epoch's rows evaluated with that
@@ -2810,14 +2844,15 @@ written by the new dendro.
       (`combine`'s, and the agent's external metrics) moved to the one rule;
       the internal comparisons with `"rezolus"` (`filter.rs:145`,
       `dashboard/mod.rs:775`, `crates/viewer/src/lib.rs:1663`,
-      `source_kind.rs:45`, and the others in Today) reading the kind through
+      `source_kind.rs:42`, and the others in Today) reading the kind through
       D2; `dashboard=FILE`; the per-endpoint `source=` written as `alias`
       (Compatibility); `recording upgrade` and `recording convert` writing the
       layers, and `upgrade` accepting a pre-layer `.dendro` and keeping its
       uuids (Q3); `arm=` (#1504) and `host=` (#1538) as user-layer entries;
       `combine`'s label stamping and `annotate`'s metadata writes through the
       metriken-storage layer function (Q2); `/about` on the agent and the
-      exporter, read by the probe hook (Q3). Needs: step 2, Q4, Q5, Q6, Q20,
+      exporter, read by the probe hook (Q3), which needs step 2's probe
+      call for a scraped endpoint. Needs: step 2, Q4, Q5, Q6, Q20,
       Q21, Q22, Q23, Q35, Q38.
    5. The presentation (cases 1 to 6) as one `dashboard` crate function
       called by the viewer, MCP and `recording check`, with notices in MCP's
