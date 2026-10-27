@@ -537,14 +537,14 @@ contradicts; the list below is the merged result.
   and presented recording for what is shown.
 - **Kind** (O3). The software a source comes from: `__producer__`, from the
   producer layer, else the recorder layer's `producer_name`, which the probe
-  hook takes from `/about` or the banner (Q3), else the D2 read of a legacy
-  `source`, else, for a source with no producer layer, the producer of the
-  registry entry its `service_kind`, then its `alias`, matches (Q35). A source
-  with none is unidentified (P9). Sources of one process group whose kinds
-  differ (possible through D2's read, a registry match differing between sources
-  of one process group, or two in-process sources of one process under Q9 (a);
-  Q8 keeps one `__producer__` per source) take the kind of the source with the
-  newest first timestamp, with a notice.
+  hook takes from `/about`, `/status` or the banner (Q3), else the D2 read of a
+  legacy `source`, else, for a source with no producer layer, the producer of
+  the registry entry its `service_kind`, then its `alias`, matches (Q35). A
+  source with none is unidentified (P9). Sources of one process group whose
+  kinds differ (possible through D2's read, a registry match differing between
+  sources of one process group, or two in-process sources of one process under
+  Q9 (a); Q8 keeps one `__producer__` per source) take the kind of the source
+  with the newest first timestamp, with a notice.
 - **Labels.** Each source carries labels from the layers below. Grouping is by
   labels: asserted at record time (`--label arm=…`, `--label tier=…`,
   per-endpoint labels after step 3.4), in the viewer (saved into the sources'
@@ -693,20 +693,20 @@ Names:
   (`src/agent/exposition/http/mod.rs:283-301`): `__producer__` is `rezolus`. 2.
   A `version` the probe hook wrote, or that a msgpack snapshot's metadata
   carries (Q3), together with one of the self-metric names in
-  `REZOLUS_SELF_ANCHORS` (`crates/dashboard/src/source_kind.rs:32`):
-  `rezolus`. For a legacy recording of a Prometheus scrape (a
-  `prometheus/scrape` group, or a parquet or combined-parquet input with no
-  `version` and no `sampler_status`), which carries no `version` (Q3), the
-  self-metric names alone suffice when the `REZOLUS_SELF_ANCHORS` series' own
-  labels, before the recording's labels are added, carry no `job` or
-  `exported_…job` label: the agent's own series carry none, and a
-  Prometheus server's `/federate` re-emits them with each target's `job`, so a
-  federated scrape stays unidentified. `instance` is not tested, since
-  `parquet combine` stamps it on every input whose `source` is not `rezolus`
-  (v5.28.0 `combine.rs:1096-1115`). The viewer shows a notice that the source
-  was identified as rezolus from its metric names. 3. `sampler_status` under
-  `per_source_metadata`, which v5.15.0 to v5.28.0 recorders wrote one level
-  deep in the parquet of an agent that answered `/samplers`
+  `REZOLUS_SELF_ANCHORS` (`crates/dashboard/src/source_kind.rs:32`): `rezolus`.
+  For a legacy recording of a Prometheus scrape (a `prometheus/scrape` group, or
+  a parquet or combined-parquet input with no `version` and no
+  `sampler_status`), which carries no `version` (Q3), the self-metric names
+  alone suffice when the `REZOLUS_SELF_ANCHORS` series' own labels, before the
+  recording's labels are added, carry no `job` label, with or without
+  `exported_` prefixes: the agent's own series carry none, and a Prometheus
+  server's `/federate` re-emits them with each target's `job`, so a federated
+  scrape stays unidentified. `instance` is not tested, since `parquet combine`
+  stamps it on every input whose `source` is not `rezolus` (v5.28.0
+  `combine.rs:1096-1115`). The viewer shows a notice that the source was
+  identified as rezolus from its metric names. 3. `sampler_status` under
+  `per_source_metadata`, which v5.15.0 to v5.28.0 recorders wrote one level deep
+  in the parquet of an agent that answered `/samplers`
   (`build_per_source_metadata`, v5.28.0
   `src/recorder/mod.rs:1796-1840`) and a combined parquet carries two levels
   deep (`source_kind.rs:116-121` reads only the latter): `rezolus` for that
@@ -723,31 +723,32 @@ Names:
   identify, `source` other than `rezolus` was set by the user; on a scrape
   identified by its metric names alone it may be the inferred name. A
   Prometheus scrape (a `prometheus/scrape` group) has no producer layer, so
-  its `source` is read by the registry match alone, and an inferred name
-  nobody asserted reads as `alias`.
+  its `source` is read by the registry match alone, and an inferred name that
+  matches no registry entry reads as `alias`.
 
   Identity is read only from evidence that names one producer: a declaration (a
-  handshake, an `/about` answer or a banner, the agent's `sampler_status`), a
-  name the user gave that matches a registry entry, or, for a recording made
-  before the layers only, a set of metric names that only one producer emits
-  (evidence 2). A new source whose probe hook recorded no `producer_name` is not
-  identified by its metric names. A name the recorder derived from a URL is not
-  evidence. A parquet whose metadata carries `endpoint`, the scraped URL
-  (file-level from v5.21.0, v5.28.0 `src/recorder/mod.rs:878`), shows it: a
-  `source` equal to `infer_source_name(endpoint)` (v5.28.0
-  `src/recorder/endpoint.rs:115`) reads as `alias`. Two exceptions remain for
-  other legacy recordings: a metriken-recorder `prometheus/scrape` group and a
-  parquet without `endpoint` store no URL, so their `source` cannot be told from
-  an inferred one (`infer_source_name` gives `vllm` for `http://vllm/metrics`,
-  whose port is the default), and a `source` there that matches a registry entry
-  is read as that producer with a notice that the name may have been inferred;
-  and evidence 4 is still accepted, with its caveat above.
+  handshake, an answer from `/about`, `/status` or the `/` banner, the agent's
+  `sampler_status`), a name the user gave that matches a registry entry, or, for
+  a recording made before the layers only, a set of metric names that only one
+  producer emits (evidence 2). A new source whose probe hook recorded no
+  `producer_name` is not identified by its metric names. When D2's read
+  identifies a legacy source, the recorder entry it derives (`by: upgrade`,
+  written by `recording upgrade` or `convert` or by the first layer write, Q2)
+  carries that `producer_name`, so the identification survives the layers being
+  written. A name the recorder derived from a URL is not evidence, but a legacy
+  `source` cannot be told from an inferred one (`infer_source_name` gives `vllm`
+  for `http://vllm/metrics`, whose port is the default), so a legacy `source`
+  that matches a registry entry is read as that producer with a notice that the
+  name may have been inferred. Evidence 4 is still accepted, with its caveat
+  above.
 
   Reading `source` alone does not identify the producer: metriken-recorder's
   `Identity::metadata()` writes the resolved `source` over the handshake's,
   so the producer's own value is gone; registry names include role names a
-  user sets (`vllm-prefill`, `sglang-router`); and only a parquet with
-  `endpoint` metadata stores a URL to recognise an inferred name by.
+  user sets (`vllm-prefill`, `sglang-router`); and a `.rez` or `.dendro`
+  stores no URL to recognise an inferred name by. A parquet's file-level
+  `endpoint` (v5.21.0 on) does, but it is not used: a `source` equal to the
+  name inferred from it may still have been typed by the user.
 
 ### D1: the per-query engine scope
 
@@ -2309,8 +2310,8 @@ Identity and naming:
   endpoint (`first_enrich`, `recorder.rs:1885`; `Verdict::Scrape` carries
   nothing), and the exporter serves no `/status` (`src/exporter/mod.rs:192-195`)
   and a banner, `Rezolus <version> Exporter` (`:204-206`), that
-  `parse_root_version` rejects, since it accepts only a banner ending in `
-  Agent` (`src/recorder/agent_probe.rs:128-136`).
+  `parse_root_version` rejects, since it accepts only a banner ending in
+  ` Agent` (`src/recorder/agent_probe.rs:128-136`).
   Candidates: (a) keep the version requirement, so the scrape has no
   producer; (b) the self-metric names alone suffice, as `source_kind.rs`'s
   self-metric check does (`:51-54`), and `__producer__` is `rezolus`.
@@ -2361,35 +2362,39 @@ Identity and naming:
     stands. `Retry` is not used for it: `accept` drops a `Retry` reply whole
     (`probe.rs:113-122`), and after `ENRICH_RETRIES` (5, `recorder.rs:898`)
     failed retries the recording keeps none of the hook's metadata. Filling
-    `agent_version` in later needs a further metriken-recorder change (open).
-    For an endpoint that predates `/about` it falls back to `/status` and the
-    `/` banner, and a banner `Rezolus <version> Exporter` is recorded as
-    `producer_name` `rezolus`, `producer_component` `exporter` and
-    `exporter_version`. The agent's version is `version` on an agent recording
-    and `agent_version` on an exporter's; rezolus analysis's
-    `Context.agent_version` (`src/analysis/extract/context.rs:644`) reads
-    `version` only and must read both (step 3.4), and the names are part of Q4's
-    `version`/`producer_version` question. A scrape has no epochs, so an agent
-    or exporter upgraded during the recording is not reflected. For a legacy
-    recording of an exporter scrape, which has no `/about` answer and no URL to
-    ask: (b), with a notice (D2's evidence 2). Open: whether
-    `producer_component` `exporter` selects a different template, since the
-    exporter writes histograms as `{name}_distribution_*`
+    `agent_version` in later needs a further metriken-recorder change, listed as
+    open in step 2. For an endpoint that predates `/about` it falls back to
+    `/status` and the `/` banner, and records `producer_name` `rezolus` for
+    either: a `/status` answer or a banner `Rezolus <version> Agent` with
+    `producer_component` `agent` and `version`, a banner `Rezolus <version>
+    Exporter` with `producer_component` `exporter` and `exporter_version`. The
+    hook writes no `source` label (D2). The agent's version is `version` on an
+    agent recording and `agent_version` on an exporter's; rezolus analysis's
+    `Context.agent_version` (filled from `data.version()`,
+    `src/analysis/extract/mod.rs:556`) reads `version` only and must read both
+    (step 3.4), and the names are part of Q4's `version`/`producer_version`
+    question. A scrape has no epochs, so an agent or exporter upgraded during
+    the recording is not reflected. For a legacy recording of an exporter
+    scrape, which has no `/about` answer: (b), with a notice (D2's evidence 2).
+    Open: whether `producer_component` `exporter` selects a different template,
+    since the exporter writes histograms as `{name}_distribution_*`
     (`src/exporter/prometheus.rs:113-143`) and percentiles as gauges with a
     `percentile` label (`src/exporter/snapshot.rs:101-105`).
 - **Q4.** The renames the inventory lists (`node`→`host`, `percentile`→
   `quantile` from the exporter, `role`'s three meanings (llm-perf's moves to
-  `tier`, Q7), `kind` collisions, `version`/`producer_version`): which change,
-  in which release, with which read-time aliases. `instance` is the exception:
-  a combined parquet already carries it as a series label (`"0"`, a sequence
-  number, or the input's `instance` metadata, for example `"primary"` in
-  rezolus `docs/parquet_metadata.md`), and the recorder-layer `instance` lands
-  with step 2, when the recorder stops writing an inferred `source` (D2).
-  Candidates for reading a combined parquet's `instance`: (a) keep it as
-  `instance` for parquet only, which leaves two meanings; (b) apply the clash
-  rule, so it reads as `exported_instance`; (c) rename it on read to a user
-  label. A selector `instance="primary"` written for a combined parquet changes
-  meaning under (b) and (c).
+  `tier`, Q7), `kind` collisions, `version`/`producer_version`, and the probe
+  hook's `agent_version`, `exporter_version`, `producer_name` and
+  `producer_component` (Q3)): which change, in which release, with which
+  read-time aliases. `instance` is the exception: a combined parquet already
+  carries it as a series label (`"0"`, a sequence number, or the input's
+  `instance` metadata, for example `"primary"` in rezolus
+  `docs/parquet_metadata.md`), and the recorder-layer `instance` lands with step
+  2, when the recorder stops writing an inferred `source` (D2). Candidates for
+  reading a combined parquet's `instance`: (a) keep it as `instance` for parquet
+  only, which leaves two meanings; (b) apply the clash rule, so it reads as
+  `exported_instance`; (c) rename it on read to a user label. A selector
+  `instance="primary"` written for a combined parquet changes meaning under (b)
+  and (c).
 - **Q5.** What categories become. A category (`members` in
   `inference-library.json` naming `vllm` and `sglang`) lists sources.
   Candidates: (a) `members` names kinds, refined by `service_kind`; (b) a
@@ -2834,7 +2839,9 @@ written by the new dendro.
      streamed endpoints only, `recorder.rs:1885`), writing its metadata into
      the recorder layer (Q3); the warnings and docs that say the hook serves
      a streamed endpoint (`recorder.rs:2292`, `:2339`, `:2623`,
-     `ENRICH_RETRIES`, `late_enrich`) change with it.
+     `ENRICH_RETRIES`, `late_enrich`) change with it. Open: a way to fill
+     in a value the first answer lacked (an exporter's `agent_version`), since
+     `Retry` discards the whole answer (Q3).
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`.
    - In metriken-query, each producer epoch's rows evaluated with that
