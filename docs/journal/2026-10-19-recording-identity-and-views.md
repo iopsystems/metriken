@@ -537,14 +537,14 @@ contradicts; the list below is the merged result.
   and presented recording for what is shown.
 - **Kind** (O3). The software a source comes from: `__producer__`, from the
   producer layer, else the recorder layer's `producer_name`, which the probe
-  hook takes from `/about`, `/status` or the banner (Q3), else the D2 read of a
-  legacy `source`, else, for a source with no producer layer, the producer of
-  the registry entry its `service_kind`, then its `alias`, matches (Q35). A
-  source with none is unidentified (P9). Sources of one process group whose
-  kinds differ (possible through D2's read, a registry match differing between
-  sources of one process group, or two in-process sources of one process under
-  Q9 (a); Q8 keeps one `__producer__` per source) take the kind of the source
-  with the newest first timestamp, with a notice.
+  hook takes from `/about`, `/status` or the banner or D2's read derives (Q3),
+  else the D2 read of a legacy `source`, else, for a source with no producer
+  layer, the producer of the registry entry its `service_kind`, then its
+  `alias`, matches (Q35). A source with none is unidentified (P9). Sources of
+  one process group whose kinds differ (possible through D2's read, a registry
+  match differing between sources of one process group, or two in-process
+  sources of one process under Q9 (a); Q8 keeps one `__producer__` per source)
+  take the kind of the source with the newest first timestamp, with a notice.
 - **Labels.** Each source carries labels from the layers below. Grouping is by
   labels: asserted at record time (`--label arm=…`, `--label tier=…`,
   per-endpoint labels after step 3.4), in the viewer (saved into the sources'
@@ -584,13 +584,14 @@ the lower values readable.
    producer's host, until the handshake carries it), the served interval, and
    the producer epoch and its history (its entries, in place of the flat
    `producer_epoch` and `producer_epochs` keys, Q3); what the probe hook read
-   from the endpoint's `/about` or banner, as metadata (`producer_name`,
-   `producer_component`, `version` or `exporter_version`, `agent_version`; none
-   of them is a series label, since rezolus's cgroup and hw_sensors series carry
-   their own `name`, Q3); and the recorder default template (`template=FILE`).
-   The clock anchor a `.rez` recording stores is the agent process's (from
-   `/status`, since v5.21.0, #1270); a streamed source takes the handshake's,
-   which is the same process anchor.
+   from the endpoint's `/about`, `/status` or `/` banner, or what D2's read
+   derives (Q3), as metadata (`producer_name`, `producer_component`, `version`
+   or `exporter_version`, `agent_version`; none of them is a series label, since
+   rezolus's cgroup and hw_sensors series carry their own `name`, Q3); and the
+   recorder default template (`template=FILE`). The clock anchor a `.rez`
+   recording stores is the agent process's (from `/status`, since v5.21.0,
+   #1270); a streamed source takes the handshake's, which is the same process
+   anchor.
 3. **User layers** (above the producer in P5): labels asserted at record time
    (`service_kind`, `alias`, `tier`, `arm` and any other label, invocation-wide
    with `--label` or per endpoint, the per-endpoint value winning), labels
@@ -731,16 +732,20 @@ Names:
   `sampler_status`), a name the user gave that matches a registry entry, or, for
   a recording made before the layers only, a set of metric names that only one
   producer emits (evidence 2). A new source whose probe hook recorded no
-  `producer_name` is not identified by its metric names. When D2's read
-  identifies a legacy source, the recorder entry it derives (`by: upgrade`,
-  written by `recording upgrade` or `convert` or by the first layer write, Q2)
-  carries that `producer_name`, so the identification survives the layers being
-  written. A name the recorder derived from a URL is not evidence, but a legacy
-  `source` cannot be told from an inferred one (`infer_source_name` gives `vllm`
-  for `http://vllm/metrics`, whose port is the default), so a legacy `source`
-  that matches a registry entry is read as that producer with a notice that the
-  name may have been inferred. Evidence 4 is still accepted, with its caveat
-  above.
+  `producer_name` is not identified by its metric names. When evidence 1, 2 or 3
+  identifies a legacy source, the at-open recorder entry D2's read derives (`by:
+  upgrade`, or `by: convert` when `recording convert` writes it, Q2) carries
+  that `producer_name`, so the identification survives the layers being written
+  and retention, which keeps entries without `epoch`; one identified by evidence
+  2 alone keeps its notice. A registry match on `source` is not written: the
+  derived user-layer `source` is read by the registry rule as before, so the
+  match follows the reader's registry. A name the recorder derived from a URL is
+  not evidence, but a legacy `source` cannot be told from an inferred one
+  (`infer_source_name` gives `vllm` for `http://vllm/metrics`, whose port is the
+  default), so a legacy `source` that matches a registry entry is read as that
+  producer with a notice that the name may have been inferred. Evidence 4 is
+  still accepted, with its caveat above; it is not written either, and the
+  carried `service_queries` stays in the derived metadata, read as before.
 
   Reading `source` alone does not identify the producer: metriken-recorder's
   `Identity::metadata()` writes the resolved `source` over the handshake's,
@@ -2210,14 +2215,14 @@ Identity and naming:
   the source before its pump starts, `recorder.rs:2520-2527`) carries none, and
   readers take the source's first row for it. `by` names the writer: `producer`
   (a handshake, or an in-process `SourceIdentity`), `recorder` (including what
-  rezolus's probe hook reads from `/about`, `/status` and `/systeminfo`:
-  `producer_name`, `producer_component`, `version` or `exporter_version`,
-  `agent_version`, `host`), `record` (labels the user gave at record time),
-  `annotate`, `viewer`, `upgrade` and `convert` (layers derived by D2's read
-  rule, Q3; a msgpack snapshot's `version` goes into its epoch's producer
-  entry), or `combine` (its label stamping, step 3.4). `unset` lists keys the
-  entry removes, so an undo is one more entry. A producer entry carries the
-  handshake's epoch (its `uuid`, metriken-recorder `frames.rs:144-146`) when
+  rezolus's probe hook reads from `/about`, `/status`, the `/` banner and
+  `/systeminfo`: `producer_name`, `producer_component`, `version` or
+  `exporter_version`, `agent_version`, `host`), `record` (labels the user gave
+  at record time), `annotate`, `viewer`, `upgrade` and `convert` (layers derived
+  by D2's read rule, Q3; a msgpack snapshot's `version` goes into its epoch's
+  producer entry), or `combine` (its label stamping, step 3.4). `unset` lists
+  keys the entry removes, so an undo is one more entry. A producer entry carries
+  the handshake's epoch (its `uuid`, metriken-recorder `frames.rs:144-146`) when
   the handshake names one; the recorder drops the `producer_epoch` copy a
   producer puts in its handshake metadata, so the fold writes no flat
   `producer_epoch`. A reconnect that resends a handshake identical to the
@@ -2226,64 +2231,65 @@ Identity and naming:
   transport, and each epoch, the opening one included, is a recorder entry
   carrying that `epoch`. Only recorder entries carrying `epoch` delimit spans;
   the spans are taken as `epoch_spans` takes them from `producer_epochs` today:
-  in `from_ts` order, not list order, since restart stamps come from clocks
-  that need not agree, with the first also covering earlier rows
-  (metriken-storage `src/process.rs:116-125`). A span's handshake is the fold
-  of the producer entries with that `epoch`; a source with no epoch has one
-  span, whose handshake is the fold of all its producer entries. Every layer
-  folds per key, so a key a later entry omits keeps its earlier value; a
-  restarted producer that drops a label such as `zone` keeps it until an entry
-  unsets it. rezolus's `descriptions` is unioned across entries rather than
-  replaced, as a restart unions it today
-  (`src/recorder/agent_probe.rs:222-239`). The producer and recorder layers
-  fold their entries in (`from_ts`, `seq`) order. The user layer folds its
-  entries in (`seq`, `id`) order: within one copy that is append order, so a
-  later edit wins whatever the writer's clock says. When copies of one source
-  (one uuid) meet in a process group, their user entries are merged as a union
-  by `id` and folded the same way; the notice names any key that entries
-  present in only one copy set to different values, since `seq` does not order
-  edits made apart in different copies. The top-level `labels` and `metadata`
-  are a cache of the fold: a reader folds the entries, and when the cache
-  disagrees the fold wins and a notice names the source. Labels are
+  in `from_ts` order, not list order, since restart stamps come from clocks that
+  need not agree, with the first also covering earlier rows (metriken-storage
+  `src/process.rs:116-125`). A span's handshake is the fold of the producer
+  entries with that `epoch`; a source with no epoch has one span, whose
+  handshake is the fold of all its producer entries. Every layer folds per key,
+  so a key a later entry omits keeps its earlier value; a restarted producer
+  that drops a label such as `zone` keeps it until an entry unsets it. rezolus's
+  `descriptions` is unioned across entries rather than replaced, as a restart
+  unions it today (`src/recorder/agent_probe.rs:222-239`). The producer and
+  recorder layers fold their entries in (`from_ts`, `seq`) order. The user layer
+  folds its entries in (`seq`, `id`) order: within one copy that is append
+  order, so a later edit wins whatever the writer's clock says. When copies of
+  one source (one uuid) meet in a process group, their user entries are merged
+  as a union by `id` and folded the same way; the notice names any key that
+  entries present in only one copy set to different values, since `seq` does not
+  order edits made apart in different copies. The top-level `labels` and
+  `metadata` are a cache of the fold: a reader folds the entries, and when the
+  cache disagrees the fold wins and a notice names the source. Labels are
   source-wide: the merged `labels` carry the newest value for every row of the
   source, and only the epoch spans and the per-epoch templates (Q8) apply per
   span. No edit rewrites or removes an entry (M6). Trimming and retention are
   the one removal: dropping every row of an epoch drops the producer and
   recorder entries carrying that `epoch`, as the producer layer specifies
-  (Identity in three layers); entries without `epoch` (the endpoint at open)
-  and user entries are kept. Today nothing prunes `producer_epochs`, and
+  (Identity in three layers); entries without `epoch` (the endpoint at open) and
+  user entries are kept. Today nothing prunes `producer_epochs`, and
   `epoch_spans` skips an entry with no rows in the span. The first layer write
   to a source without `metriken.layer.*` (an `annotate`, a viewer save,
   `combine`'s stamping) first writes the layers D2's read rule derives (`by:
   upgrade`), so the record-time labels of a legacy source enter the fold.
-  Entries derived by D2's read rule take `seq` 0, the one exception to the
-  `seq` rule, and an `id` derived from the source uuid, the layer name and the
-  entry's epoch (none for the at-open entry); the derived user layer is one
-  entry holding every derived user-layer key. So the derivation read from a
-  pre-layer copy and the one written into a layered copy are one entry in the
-  union; when two entries share an `id` with different contents, the layered
-  copy's entry is kept and the notice names the source; a pre-layer copy
-  meeting a layered one is read through the same derived layers for the merge.
-  A label the user assigns to specific sources, from the viewer (any key,
-  `tier` and `arm` alike) or with `recording annotate`, is a user entry; a rule
-  meant for other archives (a selector on kind and labels) is a label layer
-  document saved with a view and applied as an open-time overlay (O5). Exports
-  to formats without layers (parquet, Prometheus) carry the merged `labels`;
-  whether a parquet keeps the epoch history is Q17. The layers are the record;
-  the source's `labels` and its merged metadata keys (`service_queries` and the
-  others P5 renders) are their result, written by one metriken-storage
-  function. Every write of a labelled or layered key goes through it rather
-  than through dendro's `update_source_labels` or `update_source_metadata`:
-  today rezolus `combine`'s label stamping (`src/parquet_tools/combine.rs:442`)
-  and `annotate`'s `service_queries` and `systeminfo` writes
-  (`annotate.rs:454`) bypass it, and move onto it in step 3.4. The recorder
-  drops every `metriken.`-prefixed key from a producer's handshake metadata, as
-  it drops `metriken.frame_interval` today (metriken-recorder
-  `recorder.rs:996-998`), so only the layer function writes the layer keys. The
-  layer function builds without metriken-storage's `write` feature, so the WASM
-  viewer can call it on an in-memory archive (The static-site viewer reads and
-  writes documents). The flat `producer_epoch` and `producer_epochs` keys move
-  into `metriken.layer.recorder` (Q3).
+  Entries derived by D2's read rule take `seq` 0, the one exception to the `seq`
+  rule, and an `id` derived from the source uuid, the layer name and the entry's
+  epoch (none for the at-open entry); the derived user layer is one entry
+  holding every derived user-layer key. Derived entries carry no `ts`, and two
+  derived entries with one `id` are compared on `labels`, `metadata` and `unset`
+  only, so a derivation read at open, one written by `upgrade` and one written
+  by `convert` are the same entry. So the derivation read from a pre-layer copy
+  and the one written into a layered copy are one entry in the union; when two
+  entries share an `id` with different contents, the layered copy's entry is
+  kept and the notice names the source; a pre-layer copy meeting a layered one
+  is read through the same derived layers for the merge. A label the user
+  assigns to specific sources, from the viewer (any key, `tier` and `arm` alike)
+  or with `recording annotate`, is a user entry; a rule meant for other archives
+  (a selector on kind and labels) is a label layer document saved with a view
+  and applied as an open-time overlay (O5). Exports to formats without layers
+  (parquet, Prometheus) carry the merged `labels`; whether a parquet keeps the
+  epoch history is Q17. The layers are the record; the source's `labels` and its
+  merged metadata keys (`service_queries` and the others P5 renders) are their
+  result, written by one metriken-storage function. Every write of a labelled or
+  layered key goes through it rather than through dendro's
+  `update_source_labels` or `update_source_metadata`: today rezolus `combine`'s
+  label stamping (`src/parquet_tools/combine.rs:442`) and `annotate`'s
+  `service_queries` and `systeminfo` writes (`annotate.rs:454`) bypass it, and
+  move onto it in step 3.4. The recorder drops every `metriken.`-prefixed key
+  from a producer's handshake metadata, as it drops `metriken.frame_interval`
+  today (metriken-recorder `recorder.rs:996-998`), so only the layer function
+  writes the layer keys. The layer function builds without metriken-storage's
+  `write` feature, so the WASM viewer can call it on an in-memory archive (The
+  static-site viewer reads and writes documents). The flat `producer_epoch` and
+  `producer_epochs` keys move into `metriken.layer.recorder` (Q3).
 
   Separate columns were the alternative. dendro's columns are what the
   container acts on (`uuid`, `clock_anchor_wall_ns`, `complete`, the
@@ -2364,12 +2370,17 @@ Identity and naming:
     failed retries the recording keeps none of the hook's metadata. Filling
     `agent_version` in later needs a further metriken-recorder change, listed as
     open in step 2. For an endpoint that predates `/about` it falls back to
-    `/status` and the `/` banner, and records `producer_name` `rezolus` for
-    either: a `/status` answer or a banner `Rezolus <version> Agent` with
-    `producer_component` `agent` and `version`, a banner `Rezolus <version>
-    Exporter` with `producer_component` `exporter` and `exporter_version`. The
-    hook writes no `source` label (D2). The agent's version is `version` on an
-    agent recording and `agent_version` on an exporter's; rezolus analysis's
+    `/status` and the `/` banner, and records `producer_name` `rezolus` with,
+    for a `/status` answer or a banner `Rezolus <version> Agent`,
+    `producer_component` `agent` and `version` (on a streamed agent this repeats
+    the producer layer's name); for a banner `Rezolus <version> Exporter`,
+    `producer_component` `exporter` and `exporter_version`. Detection's
+    `not_streamable`, which calls the same `identify` and refuses anything
+    identified as an agent ("a Rezolus agent is never scraped by 6.x",
+    `src/recorder/agent_probe.rs:144-162`), keeps treating an exporter as
+    `Other`, so the exporter is scraped; only `enrich` records it. The hook
+    writes no `source` label (D2). The agent's version is `version` on an agent
+    recording and `agent_version` on an exporter's; rezolus analysis's
     `Context.agent_version` (filled from `data.version()`,
     `src/analysis/extract/mod.rs:556`) reads `version` only and must read both
     (step 3.4), and the names are part of Q4's `version`/`producer_version`
