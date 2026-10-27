@@ -5,8 +5,9 @@ storage keeps everything and records provenance, and the viewer decides
 presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1
-to S9 in metriken" below) are done; nothing else is built. "Step N" means
-this entry's order of work.
+to S9 in metriken" below) are done; nothing else is built. The owner
+decided Q1, Q2, Q7 and Q8 on 2026-10-26 and amended A8 on 2026-10-27.
+"Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
 handshake) ([metriken-viewer](2026-10-12-metriken-viewer.md)), and rezolus's
@@ -23,7 +24,9 @@ the end of the specification).
 Sources: rezolus upstream/main 9acb5a25, metriken upstream/main 451ef1f,
 dendro origin/main 66a2390 (v0.6.0 and a version bump), llm-perf
 upstream/main 5704c35, cachecannon upstream/main dbd17a5; systemslab's
-behaviour as of 2026-10-20. Line numbers are at those commits. Facts about
+behaviour as of 2026-10-20. Line numbers are at those commits, except that
+citations added with the 2026-10-26 decisions are at rezolus upstream/main
+5a53b921 and metriken upstream/main 8f1e17f. Facts about
 other software: prometheus-operator's ServiceMonitor adds a `service` target
 label to scraped Kubernetes data; OpenTelemetry's Prometheus mapping sets
 `job` to `service.namespace/service.name`, or to `service.name` alone when
@@ -63,7 +66,10 @@ design has to let them:
   away.
 - **M6. Add without losing.** Combining files, adding labels, templates or
   views adds a layer. Nothing the producer or the recorder wrote is
-  overwritten, and `combine` never refuses or drops a source.
+  overwritten, except that a user-layer label written after record time (a
+  tier saved from the viewer, P1; `recording annotate --alias`) replaces the
+  record-time value of that key; whether the replaced value is kept is open
+  (Q40). `combine` never refuses or drops a source.
 - **M7. Reuse a view.** A view saved today applies to next week's
   recordings of the same setup without editing.
 - **M8. Carry the view in the file.** A `.dendro` holds what is needed to
@@ -252,9 +258,9 @@ Each workflow below came from the scenario reviews of 2026-10-19 and
   (`pinned_labels`, `:786`), so a selector written for one source keeps its
   own `source` matcher and the scope's is not added.
 - **Per-endpoint options are a fixed list.** `--endpoint` accepts `source`,
-  `role`, `template`, `arm` and `protocol` and refuses anything else
-  ("unknown endpoint option", `src/recorder/config.rs:428-448`); `--label
-  k=v` applies to every recording of the invocation.
+  `role`, `template`, `arm`, `host` (#1538) and `protocol` and refuses
+  anything else ("unknown endpoint option", `src/recorder/config.rs:430-456`);
+  `--label k=v` applies to every recording of the invocation.
 - **Archive-level storage exists but rezolus does not use it.** dendro 0.6.0
   has an archive-level `documents` table (dendro
   `src/archive/sqlite/documents.rs:24-44`; design in dendro's
@@ -301,37 +307,57 @@ contradicts; the list below is the merged result.
   layer it supplies the kind through a registry match (Q35). The tier is a
   user label, `tier`, not unique by design: three server hosts share
   `tier=server`, and grouping by tier aggregates them; it works for host
-  metrics when `__producer__` is unknown. `host` and `instance` name the
-  machine and the endpoint. A legacy `--endpoint url,source=X`, and an old
-  `source` that matches no known producer, map to a plain naming label
-  `alias=X` (P2), not to a kind.
+  metrics when `__producer__` is unknown. `host` names the machine;
+  `instance` is the URL the recorder used (Q1). A legacy `--endpoint
+  url,source=X`, and an old `source` that matches no known producer, map
+  to a plain naming label `alias=X` (P2), not to a kind.
 - **O4. systemslab tiers** (planned). The experiment author gives a job a
   tier in its spec, and the runner passes `--label tier=<value>` to the
   recorder it starts for that job. The tier is a label the author chose, not
   a systemslab id, so systemslab still adds none of its ids to the file. No
   tier is derived from job names, which are unique; a job without a tier
-  gets no `tier` label and falls in the "untiered" group (A8); only when no
-  job has a tier does the file fall back to grouping by host. Inside
-  systemslab its query-time `job` label may also be used as a grouping
-  label.
+  gets no `tier` label, and its recording is drawn as its own line (A8).
+  Inside systemslab its query-time `job` label may also be used as a
+  grouping label.
 - **O5. Open-time label overlay.** metriken-query accepts a label overlay
   when an archive is opened: selectors (a source uuid, or a kind and
   labels) mapped to labels to add or change, applied in memory for the
   caller's session and never written to the file by rezolus. It is a
   generic caller API; a viewer relabel uses the same mechanism and, saved,
-  becomes a label layer document. Its place in the layer order is P5's.
+  becomes either user-layer labels on the sources (a tier, P1) or a label
+  layer document. Its place in the layer order is P5's.
 - **P1. Two grouping levels.** Level 1 is `arm`, else time clusters when
   there are two or more (R2). Level 2 is `tier`, else a single differing
   asserted label (the rules of 4d), else `host`. Charts draw one line per
   level-1 × level-2 pair: two days × {client, server} is four lines, with
   elapsed alignment and a reference per tier. Level 2 is chosen over the
-  whole archive; within each level-1 group the presented recordings that
-  lack the level-2 key form an "untiered" group, and the notice names them
-  (A8). When level 1 is `arm` and one arm's members fall in two or more
-  time clusters, time clusters become level 2 (A9). A saved grouping with
-  more levels draws one line per tuple of its aggregated levels' values; an
-  expanded level draws its members; the reference is chosen per tuple of
-  the values other than level 1 (A10).
+  whole archive. A8 (amended 2026-10-27): within each level-1 group, each
+  presented recording that lacks the level-2 key is drawn as its own line,
+  named by `host`, else `instance` (4e), and the notice names them; no group
+  of untiered recordings is formed. Across level-1 groups such a line is
+  compared with the untiered line of the same `host` in the reference group.
+  A line without `host`, a line whose host has no untiered line in the
+  reference group (it may be a tier member there), and the lines of a host
+  with more than one untiered line in its own group or the reference group
+  are drawn without a reference, and the notice names them. A combined
+  archive whose sources carry no `tier` and no qualifying asserted label is
+  drawn one line per host (4e). The user assigns tiers at record time or by
+  grouping in the viewer; saved from the viewer, the assignment is written
+  as `tier` labels in the user layer of those sources
+  (`metriken.layer.user`, Q2), through the metriken-storage layer function.
+  It replaces a `tier` asserted at record time. The user layer holds one
+  value per key (Q2), so the record-time value is overwritten, an exception
+  to M6 shared with `annotate --alias`. Whether the user layer keeps the
+  replaced value, and under which key, is open (Q40). Tiers stored this way
+  stay with the sources and do not travel with a view to another archive.
+  Whether other labels saved from the viewer (`arm`) also go to the user
+  layer, rather than to a label layer document, is open (Q40). When level 1
+  is `arm` and one arm's members fall in two or more time clusters, time
+  clusters become level 2 (A9). A saved grouping with more levels draws one
+  line per tuple of its aggregated levels' values; an expanded level draws
+  its members; the reference is chosen per tuple of the values other than
+  level 1 (A10). A line keyed by `instance` (a recording without `host`, 4e)
+  has no reference across level-1 groups, as under A8.
 - **P2. `alias` is the naming label.** The legacy `source=X` and an old
   unmatched `source` become `alias=X`. `name` is not used, because rezolus's
   cgroup series carry a `name` label (for example
@@ -363,8 +389,9 @@ contradicts; the list below is the merged result.
   labels group without comparison.
 - **P5. One layer order,** from least to most specific; the last wins:
   1. the viewer's registry fallback;
-  2. the recorder layer: what the recorder writes from observation (`host`,
-     `instance`, the producer epoch, the recorder's hostname), and the
+  2. the recorder layer: what the recorder writes from observation
+     (`instance`, the producer epoch, and `host` from rezolus's
+     `/systeminfo` until the producer's handshake carries it, Q1), and the
      recorder default template, which the recorder binary chooses to embed
      (`record --endpoint url,template=FILE` writes the KPI template,
      `service_queries`; the planned `dashboard=FILE` would write the
@@ -373,8 +400,10 @@ contradicts; the list below is the merged result.
      because it carries version-specific queries;
   4. the user layers: labels asserted at record time (`--label`,
      per-endpoint labels, `service_kind=`, `alias=`; a per-endpoint value
-     beats an invocation-wide one), then the archive's saved user layers
-     (views, template layers, relabels);
+     beats an invocation-wide one) and tiers saved from the viewer, which
+     replace the record-time `tier` (P1); `recording annotate --alias`
+     likewise replaces a record-time `alias` (M6, Q40); then the archive's
+     saved user layers (views, template layers, relabels);
   5. live unsaved edits.
 
   The asymmetry is deliberate (R1): a record-time label sits above the
@@ -513,13 +542,16 @@ contradicts; the list below is the merged result.
   producer layer, else the D2 read of a legacy `source`, else, for a source
   with no producer layer, the producer of the registry entry its
   `service_kind`, then its `alias`, matches (Q35). A source with none is
-  unidentified (P9). Sources of one process group whose kinds differ (Q8)
-  take the kind of the source with the newest first timestamp, with a
-  notice.
+  unidentified (P9). Sources of one process group whose kinds differ
+  (possible through D2's read, a registry match differing between copies,
+  or two in-process sources of one process under Q9 (a); Q8 keeps one
+  `__producer__` per source) take the kind of the source with the newest
+  first timestamp, with a notice.
 - **Labels.** Each source carries labels from the layers below. Grouping is
   by labels: asserted at record time (`--label arm=…`, `--label tier=…`,
-  per-endpoint labels after step 3.4), in the viewer (a label layer, saved
-  as a document), or supplied as an open-time overlay (O5).
+  per-endpoint labels after step 3.4), in the viewer (saved into the
+  sources' user layer, P1, or as a label layer document that a view or
+  report carries), or supplied as an open-time overlay (O5).
 - **Process group and group.** This entry says "process group" for the
   sources S1 unions, and "group" alone for a group of a grouping (an arm, a
   time cluster, a tier).
@@ -531,39 +563,51 @@ a reader sees is the layers merged in P5's order, the last winning, with
 the lower values readable.
 
 1. **Producer layer:** what the software declared in its handshake,
-   including a producer identity: name, version, build. Rust producers will
-   fill it without input through a metriken-exposition macro to be added,
-   expanding in the producer's crate (`env!("CARGO_PKG_NAME")`,
-   `env!("CARGO_PKG_VERSION")`); metriken-py and others will set it
+   including a producer identity: name, version, build, and the hostname of
+   the machine it runs on, which gives `host` (Q1). Rust producers will
+   fill name and version without input through a metriken-exposition
+   macro to be added, expanding in the producer's crate
+   (`env!("CARGO_PKG_NAME")`, `env!("CARGO_PKG_VERSION")`), and read the
+   hostname at run time; metriken-py and others will set it
    explicitly; a recording made in process (llm-perf's own source through
    metriken-recorder's `RegistrySource`, llm-perf `src/recording.rs:169`)
    will take it as a field of its `SourceIdentity`, as it takes `epoch`. A
    Prometheus endpoint declares nothing; a `*_build_info` series, where
-   present, may fill it (deferred). The producer layer is a list of
-   handshakes, one per producer epoch, each stored as sent; the merged view
-   takes the newest, the earlier entries stay readable by epoch, and
-   retention keeps the handshake of every epoch it still holds data for (Q8
-   for a handshake that changes identity).
+   present, may fill it (deferred). The producer layer holds a list of
+   handshakes, one per producer epoch, each stored as sent (`epochs`, Q2);
+   the merged view takes the newest, the earlier entries stay readable by
+   epoch, and retention keeps the handshake of every epoch it still holds
+   data for. A handshake that changes identity is Q8: a new version or
+   build is an event on the source, and a different producer name starts a
+   new source.
 2. **Recorder layer** (below the producer in P5): what the recorder
-   observed: the endpoint (`instance`: the address it recorded from), the
-   transport, the host from `/systeminfo`, the recorder's own hostname (new;
-   needed to resolve a `localhost` endpoint, case 2), the served interval,
-   and the producer epoch and its history; and the recorder default
-   template (`template=FILE`). The clock anchor a `.rez` recording stores is
-   the agent process's (from `/status`, since v5.21.0, #1270); a streamed
-   source takes the handshake's, which is the same process anchor.
+   observed: the endpoint (`instance`: the URL it recorded from, as given;
+   Q1), the transport, the host from `/systeminfo` (rezolus's way of
+   reporting the producer's host, until the handshake carries it), the
+   served interval, and the producer epoch and its history; and the
+   recorder default template (`template=FILE`). The clock anchor a `.rez`
+   recording stores is the agent process's (from `/status`, since v5.21.0,
+   #1270); a streamed source takes the handshake's, which is the same
+   process anchor.
 3. **User layers** (above the producer in P5): labels asserted at record
    time (`service_kind`, `alias`, `tier`, `arm` and any other label,
    invocation-wide with `--label` or per endpoint, the per-endpoint value
-   winning), stored in the source's metadata; then relabels and template
-   layers saved as documents in the archive; then live edits. An open-time
-   overlay sits above the saved documents for its caller (P5).
+   winning), tiers saved from the viewer (P1) and labels written by
+   `recording annotate`, stored in the source's metadata; a user-layer label
+   written after record time replaces the record-time value of that key (M6,
+   Q40); then relabels and template layers saved as documents in the
+   archive; then live edits. An open-time overlay sits above the saved
+   documents for its caller (P5).
 
 A consequence of P5 (R1): an asserted label beats the producer's declared
 label on the same key, while a `template=FILE` given at record time sits
-below the producer's template. llm-perf's in-process source declares
-`source` and `role=loadgen` as labels (llm-perf `src/recording.rs:171-174`);
-which layer `role` belongs to is Q7.
+below the producer's template. A label a tool supplies when it runs the
+recorder is a user-layer label, as `--label` is, including one it puts on
+its own in-process source (Q7). llm-perf's `source` and `role=loadgen` on
+its own source and `role=service` on the server's endpoint (llm-perf
+`src/recording.rs:128`, `:171-174`) are therefore user-layer labels; the
+two `role` values become `tier=client` and `tier=server`, and `source` is
+read by D2.
 
 Names:
 
@@ -582,8 +626,14 @@ Names:
   `llm-perf.json` lists `llm-bench`, `valkey.json` lists `redis`).
 - **`tier`** is the user label for a role in a benchmark (client, server,
   database), shared by every endpoint in that role (O3, O4).
-- **`instance`** names the endpoint, in Prometheus's sense (Q1 for its
-  spelling).
+- **`instance`** is the URL the recorder recorded from, as given. It tells
+  two endpoints of one archive apart and is shown to the user; nothing
+  binds or unions on it across presented recordings, because a port
+  forward or a proxy makes the address the recorder's view rather than the
+  producer's (Q1). 4e and P9 use it as a last-resort series key.
+- **`host`** is the producer's hostname from its handshake (for rezolus,
+  `/systeminfo` until then), or a user-layer `host` asserted at record time
+  for a producer that declares none, such as a Prometheus endpoint.
 - **`__producer__`** is the producer's declared name, set from the producer
   layer. Prometheus removes target labels beginning with `__` after target
   relabeling; rezolus keeps `__` labels by its own rule (`docs/labels.md`):
@@ -591,14 +641,15 @@ Names:
   listings, legends and MCP output, and dropped by aggregation. Because it
   is hidden, a legend shows the kind from the navigation group, not from
   the series.
-- **`role`** keeps its current meanings, listed with the renames (Q4).
+- **`role`** keeps its current meanings, listed with the renames (Q4);
+  llm-perf's label moves to `tier` (Q7).
 - **Series labels** come from the identity keys of every layer, as
   recording labels do today: `__producer__`, `instance`, `host`,
   `service_kind`, `alias`, `tier` and every other user label. The
   transport, the interval, the epoch history and the source `uuid` stay
   source metadata. On one key the last layer in P5's order gives the series
-  label; the lower values are readable as `<layer>.<key>` in the source's
-  metadata and information panel (Q2 for the storage).
+  label; the lower values are readable per layer in the source's metadata
+  and information panel (Q2 for the storage).
 - **One clash rule.** A series that carries a key the recording adds keeps
   its own value under `exported_<key>`, equal values included, with a
   further `exported_` prefix when the series also carries
@@ -723,8 +774,8 @@ evidence disagree.
    whose values differ among the presented recordings, that each of them
    carries, and that has fewer values than there are presented recordings;
    else `host`, a recording without `host` taking `instance` (as P9). Within
-   each level-1 group, presented recordings that lack the level-2 key form
-   an "untiered" group.
+   each level-1 group, each presented recording that lacks the level-2 key
+   is drawn as its own line, named as in 4e (A8).
 5. Alignment, chosen after grouping: elapsed when the groups of the
    innermost comparing level (arm or time cluster) do not overlap, whichever
    rule chose them; absolute otherwise. Under A9 the time clusters are
@@ -793,24 +844,30 @@ evidence default, with a notice naming the label.
     by `service_kind` where it says so), never by source uuid, so the
     template applies to any recording (principle 4).
   - The section declares its binding, for example "kind `rezolus`, on the
-    host of the recording with `role=service`". Today `role=` on a rezolus
-    `--endpoint` is metadata (`src/recorder/config.rs:428-448`) and only
-    llm-perf writes `role` as a label (llm-perf `src/recording.rs:128`), so
-    a binding on a label set at record time needs step 3.4's per-endpoint
-    labels for any key.
-  - Host matching: the declaring recording's host is the host part of its
-    `instance`. A name matches a rezolus source whose `host`, lowercased
-    with the domain stripped, equals it lowercased with the domain
-    stripped. An IP literal is not stripped and matches the host part of the
-    rezolus source's `instance`. `localhost`, `127.0.0.1` and `::1` mean the
-    hostname of the recorder that wrote the declaring source (a new
-    recorder-layer key, Q1).
+    host of the recording with `tier=server`". Today `role=` on a rezolus
+    `--endpoint` is metadata (`src/recorder/mod.rs:1189-1194`) and only
+    llm-perf writes `role` as a label (llm-perf `src/recording.rs:128`).
+    rezolus writes `source`, `arm` (#1504) and `host` (#1538) per endpoint
+    as labels; a binding on another label set per endpoint at record time
+    needs step 3.4's per-endpoint labels for any key.
+  - Host matching: the declaring recording's host is its `host` label
+    (producer-declared, or asserted for a producer that declares none). A
+    name matches a rezolus source whose `host`, lowercased with the domain
+    stripped, equals it lowercased with the domain stripped. An IP
+    literal is compared whole, so it matches only a rezolus source whose
+    `host` was asserted as the same IP; rezolus reports a hostname, and the
+    notice says to assert one. `instance` takes no part (Q1): through a
+    port forward or a proxy, the address is the recorder's view and names
+    no machine.
   - Under a grouping the section binds within its level-1 group, then
     within shared context (A1).
   - No match: the section is hidden, with the notice "section X needs
-    rezolus on <host>: no match among <list>". No recording carries the
-    binding label: the section is hidden, with the notice "section X needs
-    a recording with `role=service`". Two recordings carry it: one copy of
+    rezolus on <host>: no match among <list>". The binding recording
+    carries no `host`: the section is hidden, with the notice "section X
+    needs the host of the recording with `tier=server`; set `host=` on its
+    endpoint". No recording carries the binding label: the section is
+    hidden, with the notice "section X needs a recording with
+    `tier=server`". Two recordings carry it: one copy of
     the section per such recording, each titled by its host, with a notice.
   - Each query in the section carries an engine scope (D1) naming the
     presented recording it binds to.
@@ -823,26 +880,31 @@ evidence default, with a notice naming the label.
   host match, and two declaring recordings are covered above. A
   cross-producer section under time clusters binds per cluster.
 - **Test.** Fixture: llm-perf's own `.dendro`, holding llm-perf's source and
-  a vLLM source from `http://s1.lab.example:8000` with `role=service` and
-  `source=vllm` (llm-perf's `[metrics] server_source = "vllm"`, written as a
-  label, llm-perf `src/recording.rs:128-131`; its kind comes from the
-  registry match of D2), combined with one `rezolus record` of the agents on
-  `c1` and `s1.lab.example`. Expected: navigation groups `rezolus`,
-  `llm-perf`, `vllm`; in the `rezolus` group one series per host on each
-  chart (case 4); in the `llm-perf` group the server-CPU section reading
-  only the `s1` agent's rows; absolute alignment; notice "3 producers:
-  rezolus, llm-perf, vllm". Variants of the same fixture, each with its
+  a vLLM source from `http://s1.lab.example:8000` with `tier=server`,
+  `host=s1.lab.example` asserted at record time, and `source=vllm`
+  (llm-perf's `[metrics] server_source = "vllm"`, written as a label,
+  llm-perf `src/recording.rs:128-131`; its kind comes from the registry
+  match of D2), and llm-perf's own source with `tier=client` (Q7),
+  combined with one `rezolus record` of the agents on `c1` and
+  `s1.lab.example`. Expected: navigation groups `rezolus`, `llm-perf`,
+  `vllm`; in the `rezolus` group one line per host on each chart, since
+  the agents carry no `tier` (A8); in the `llm-perf` group the server-CPU
+  section reading only the `s1` agent's rows; absolute alignment; notices
+  "3 producers: rezolus, llm-perf, vllm" and "grouped by `tier`; c1 and
+  s1.lab.example carry no `tier`". Variants of the same fixture, each with its
   expected result:
-  - The vLLM `instance` is `http://10.0.0.5:8000` and the `s1` agent was
-    recorded as `http://10.0.0.5:4241`: the section binds to `s1`.
-  - The vLLM `instance` is `http://localhost:8000`, and llm-perf ran on
-    `c1`: the section binds to `c1`'s agent.
+  - The vLLM `instance` is `http://localhost:8000` through a port forward,
+    with `host=s1.lab.example` asserted: the section binds to `s1`.
+  - The vLLM source carries no `host`: the section is hidden with "section
+    server CPU needs the host of the recording with `tier=server`; set
+    `host=` on its endpoint", even when its `instance` names `s1`.
   - No agent on the server host: the section is hidden with "section
     server CPU needs rezolus on s1: no match among c1".
-  - Two vLLM sources with `role=service`, on `s1` and `s2`, and agents on
-    both: two copies of the section, titled `s1` and `s2`, and a notice; in
-    the `vllm` group two lines, by `instance`, since the vLLM sources carry
-    no `host` (not an "untiered" group).
+  - Two vLLM sources with `tier=server`, asserted as `host=s1` and
+    `host=s2`, and agents on both: two copies of the section, titled `s1`
+    and `s2`, and a notice; in the `vllm` group one line, `server`, whose
+    split toggle draws two, by `host`; in the `rezolus` group still one
+    series per host, since the agents carry no `tier` (A8).
   - The whole fixture recorded on two days and combined: two level-1
     groups (time clusters), each holding all three kinds; each day's
     server-CPU section reads only that day's `s1` agent.
@@ -954,8 +1016,8 @@ evidence default, with a notice naming the label.
     level-1 group: time clusters, when level 1 is `arm` and one arm's
     members fall in two or more clusters (A9); else `tier` when some sources
     carry it, one series per tier on each chart, members aggregated (P3), no
-    comparison, and the presented recordings without `tier` forming an
-    "untiered" group (A8); else exactly one asserted label, other than
+    comparison, and each presented recording without `tier` drawn as its
+    own line, named as in 4e (A8); else exactly one asserted label, other than
     `alias`, `instance`, `host`, `service_kind` and the level-1 label, whose
     values differ among the presented recordings, that each of them carries,
     and that has fewer values than there are presented recordings: group by
@@ -980,9 +1042,10 @@ evidence default, with a notice naming the label.
   host, or by presented recording, split a group into its members, and
   "treat as one recording" for presented recordings of one epoch. The
   choice is one action away.
-- **Saved.** The grouping rule and alignment as a view document; any
-  relabel the user made to express it (for example adding `arm` in the
-  viewer) as a label layer document.
+- **Saved.** The grouping rule and alignment as a view document; a tier
+  the user assigned to express it as user-layer labels on the sources
+  (P1); any other relabel (for example adding `arm` in the viewer) as a
+  label layer document, until P1's open point is decided.
 - **Edge cases.**
   - More than two level-1 groups: every group is drawn against the
     reference (Q24 for which). The views that compare two (heatmap diff,
@@ -1028,8 +1091,12 @@ evidence default, with a notice naming the label.
     (member, `id`), nothing summed across members. `topk(1, …)` on the
     `server` line picks from the aggregated series (A5).
   - Three agents with `tier=server` and one with no `tier`: two lines,
-    `server` and "untiered", and a notice naming the untiered recording
-    (A8).
+    `server` and the fourth agent's host, and a notice naming that
+    recording (A8). Variant: two of the four agents without `tier`: three
+    lines, `server` and each one's host. The same archive after the fourth
+    agent is given `tier=server` in the viewer and saved: one line, and
+    the fourth source's `metriken.layer.user` holds `tier: server` in its
+    `labels`.
   - A bridge: agent A recording 09:00–18:00, agent B 09:00–10:00 and agent
     C 17:00–18:00, on one kind, no labels. Expected: two clusters,
     {B, A 09:00–10:00} and {C, A 17:00–18:00}, compared with elapsed
@@ -1523,7 +1590,9 @@ Readings of the rules where the text left a choice:
   carried with two values splits the group into one read group per value
   (`ArchiveReader::read_groups`), a source lacking the key taking its uuid
   group's value when that is one value. This is the presented-recording
-  split by any label, since the user layer is not stored apart (Q2).
+  split by any label, since the user layer is not yet stored apart (Q2
+  decides `metriken.layer.user`; until it is written, any label can split a
+  group).
 - A group's metadata, where a tool shows one recording for it (rezolus's
   `RezReader::open_recordings` before metriken-storage 0.5.3, now
   `process::merge_metadata` behind `ArchiveReader::open_read_groups`): `events`
@@ -1558,7 +1627,7 @@ Readings of the rules where the text left a choice:
 | Item | Where | Written by |
 | --- | --- | --- |
 | Rows, source labels, source metadata (producer handshakes, recorder layer) | the source row and its segments and WAL | the recorder |
-| Labels asserted at record time (`--label`, per-endpoint labels, `service_kind=`, `alias=`; the user layer) | source metadata, apart from the recorder layer (Q2) | the recorder, on the user's behalf |
+| Labels asserted at record time (`--label`, per-endpoint labels, `service_kind=`, `alias=`) and tiers saved from the viewer (P1); the user layer | source metadata, apart from the recorder layer (Q2) | the recorder, on the user's behalf; `recording annotate` and the viewer, through the metriken-storage layer function |
 | Source uuid | `sources.uuid`, random at creation, kept by dendro copies | dendro |
 | Producer epoch and history | source metadata (`producer_epoch`, `producer_epochs`) | the recorder |
 | View (default and named), template layer, label layer (relabel), report, archive-level events | v5 `.dendro` `documents` table, one kind each (Q24) | the viewer, MCP, `recording annotate`, `recording upgrade`, `recording views import` |
@@ -1589,16 +1658,18 @@ refusal at `:212`, called at `:362`). Each opens with the default (case 6).
   new uuid per recording as today, and may write a view document (case 6).
 - **`record`**: `--label k=v` on every recording of the invocation (today);
   per-endpoint labels, `--endpoint url,tier=client`, for any key (new:
-  today the option list is fixed); `--endpoint url,service_kind=X`;
-  `source=X` written as `alias=X` (Compatibility). No run, session or join
+  today the option list is fixed, and `source`, `arm` and `host` are its
+  only labels); `--endpoint url,service_kind=X`; `source=X` written as
+  `alias=X` (Compatibility). No run, session or join
   options.
 - **The viewer** applies the presentation steps, shows the notice and the
-  alternatives, and saves the user's choice as a document in a v5
-  `.dendro`. An interactive relabel writes a rule when a selector on kind
-  and labels separates the recordings the user picked, else a uuid list,
-  and says which it wrote. Save-as-Report saves the current presentation,
-  saved or not, as the report's default view, with the archive's own
-  layers only (P8).
+  alternatives, and saves the user's choice as a document in a v5 `.dendro`,
+  except a tier assigned by grouping, which it writes to the sources' user
+  layer (P1). Any other interactive relabel writes a rule when a selector on
+  kind and labels separates the recordings the user picked, else a uuid
+  list, and says which it wrote. Save-as-Report saves the current
+  presentation, saved or not, as the report's default view, with the
+  archive's own layers only (P8).
 - **MCP and `recording check`** call the same `dashboard` crate function as
   the viewer, with the archive's saved default view, else the evidence
   default. Notices go in the MCP tool result and on stderr for the CLI (P7).
@@ -1682,7 +1753,7 @@ Motivation to specification:
   (O5). Interim gap: `combine` keeps its shared-uuid refusal until S1
   lands, and combine-to-parquet drops epochs (Q17). Test: `recording
   annotate --alias web` on a rezolus recording leaves the producer's
-  `source=rezolus` readable as `producer.source`.
+  `source=rezolus` readable in the labels of `metriken.layer.producer`.
 - M7 → References to sources (rules transfer); Views (export and apply);
   combine with a saved view (A13). Test: a view "group by `tier`" exported
   from one archive and applied to another with three `tier=server` and one
@@ -1719,9 +1790,11 @@ Tests for the layer order (P5, R1), under M6:
   file's template is readable as the recorder default.
 - A producer whose handshake declares `source=rezolus`, recorded with
   `--endpoint url,alias=web`: the series carry `alias=web`, and the
-  handshake's value is readable as `producer.source`.
+  handshake's value is readable in the labels of
+  `metriken.layer.producer`.
 - A producer whose handshake declares `tier=a`, recorded with `--label
-  tier=b`: the series carry `tier=b`, and `producer.tier=a` is readable.
+  tier=b`: the series carry `tier=b`, and `tier=a` is readable in the
+  labels of `metriken.layer.producer`.
 
 Specification to motivation:
 
@@ -1890,8 +1963,8 @@ A view stores rules where it can, so it reapplies to future recordings
   `arm` or by time cluster is a comparison (a reference group and the diff
   views, P4); a grouping by `tier` or another label is not. The default has
   two levels (P1). Recordings without the level-1 label are shared context,
-  shown once; within a level-1 group, recordings without the level-2 key
-  form an "untiered" group (A8). A grouping renders whatever groups it
+  shown once; within a level-1 group, each recording without the level-2
+  key is drawn as its own line (A8). A grouping renders whatever groups it
   yields, one group included, with a notice.
 - **A group can be an explicit set** (a hand-picked set, above). This keeps
   today's `?compare=1` without arms expressible: `arm_slots` then takes the
@@ -1983,9 +2056,10 @@ gets an alias, a deprecation warning, or a refusal:
   `src/recorder/mod.rs:107`, `:133`, `:652`): read as `alias=X` with the
   same warning.
 - `recording annotate --source X [--overwrite]`: an alias for `--alias X`,
-  with a warning. `--alias` adds a user-layer value and the producer's
-  stays, so `--overwrite` has nothing to protect; it is accepted and
-  ignored with a warning.
+  with a warning. `--alias` writes the user layer's `alias`, replacing a
+  record-time `alias` (M6); the producer's `source` stays. Whether
+  `--overwrite` is then required to replace a record-time `alias`, rather
+  than accepted and ignored with a warning, is open (Q40).
 - `recording metadata --field source`: prints the value the D2 read rule
   gives, with a warning naming `--field alias`.
 - `recording combine --ab baseline=… experiment=…`: into a `.rez` or
@@ -2036,20 +2110,74 @@ gets an alias, a deprecation warning, or a refusal:
 
 Identity and naming:
 
-- **Q1.** The exact set and spelling of recorder-layer keys. `instance` as a
-  URL (with its path) or `host:port`: `host:port` cannot tell apart several
-  exporters behind one address distinguished by path, an ordinary Prometheus
-  deployment that metriken-recorder `identity.rs` documents as the reason
-  `infer_source_name` keeps the path, so the URL form or one that keeps the
-  path is the candidate. `host` versus `node`. The spelling of the
-  recorder's own hostname (needed to resolve a `localhost` endpoint in a
-  cross-producer binding, case 2), for example `recorder_host`. The keys
-  that can clash with a producer's own series labels: `instance`
-  (federation, a pushgateway), `source` (rezolus's own provenance values),
-  `alias`, `tier`, `host`, `arm`, `role`.
-- **Q2.** How each layer is stored in dendro: per-source metadata
-  namespaces (`producer.*`, `recorder.*`, `user.*`) or separate columns, and
-  how the merged view is computed and exposed by metriken-storage.
+- **Q1.** The exact set and spelling of recorder-layer keys. Decided
+  2026-10-26:
+  - `instance` is the URL the recorder recorded from, as given, path
+    included. It tells two endpoints of one archive apart and is displayed;
+    nothing binds or unions on it across presented recordings. 4e and P9 use
+    it as a last-resort series key within a host or among sources without
+    one, where a port forward can merge or split those series. Through a
+    port forward or a proxy the address is the recorder's view:
+    `localhost:9000` can name a remote process, one service reached through
+    two forwards gets two values, and one address on two days can be two
+    programs. Case 5's duplicate warning still compares it, and a port
+    forward can make that warning wrong in either direction; it is a warning
+    only. An earlier revision resolved a `localhost` endpoint by the
+    recorder's hostname, which a port forward makes wrong; that key is
+    dropped.
+  - `host` (not `node`) is the producer's hostname, declared in its
+    handshake as part of the producer identity (the producer layer). rezolus
+    reports it through `/systeminfo` until its handshake carries it. A
+    producer that declares none (a Prometheus endpoint) has no `host`
+    unless one is asserted at record time (`--endpoint url,host=NAME`,
+    rezolus #1538); a cross-producer binding (case 2) then needs that
+    assertion. This gives up a case the earlier rule
+    covered: an endpoint recorded by its DNS name or IP no longer binds
+    without `host=`, so llm-perf's server-CPU section (W1) is hidden until
+    the server's host is asserted (llm-perf's `server_host`, order of work
+    step 6).
+  - The keys that can clash with a producer's own series labels, and so go
+    through the clash rule: `instance` (federation, a pushgateway), `source`
+    (rezolus's own provenance values), `alias`, `tier`, `host`, `arm`,
+    `role`.
+
+  The candidates were `instance` as a URL or as `host:port`, `host` or
+  `node`, and a recorder-hostname key such as `recorder_host`.
+- **Q2.** How each layer is stored in dendro. Decided 2026-10-26: in source
+  metadata, one key per layer holding JSON, under the `metriken.` prefix
+  metriken uses for its handshake keys (`metriken.frame_interval`) and
+  segment keys (`metriken.layout`): for example
+  `metriken.layer.recorder = {"labels": {…}, "metadata": {…}}`, and
+  likewise `metriken.layer.user`. The producer layer adds the per-epoch
+  handshakes: `metriken.layer.producer = {"labels": {…}, "metadata": {…},
+  "epochs": [{"epoch": …, "labels": {…}, "metadata": {…}}, …]}`, whose
+  top-level `labels` and `metadata` are the newest epoch's. The layers
+  are the record; the source's `labels` and its merged metadata keys
+  (`service_queries` and the others P5 renders) are their result, written
+  by one metriken-storage function. Every write of a labelled or layered
+  key goes through it rather than through dendro's `update_source_labels`
+  or `update_source_metadata`: today rezolus `combine`'s label stamping
+  (`src/parquet_tools/combine.rs:442`) and `annotate`'s `service_queries`
+  and `systeminfo` writes (`annotate.rs:454`) bypass it, and move onto it
+  in step 3.4. The recorder drops every `metriken.`-prefixed key from a
+  producer's handshake metadata, as it drops `metriken.frame_interval`
+  today (metriken-recorder `recorder.rs:996-998`), so only the layer
+  function writes the layer keys. The layer function builds without
+  metriken-storage's `write` feature, so the WASM viewer can call it on an
+  in-memory archive (The static-site viewer reads and writes documents).
+  Whether the flat `producer_epoch` and `producer_epochs` keys move into
+  `metriken.layer.recorder` is left to Q3.
+
+  Separate columns were the alternative. dendro's columns are what the
+  container acts on (`uuid`, `clock_anchor_wall_ns`, `complete`, the
+  heartbeat); it never interprets identity layers, which exist for
+  metriken's merge order (P5) and clash rule. Every dendro path that copies
+  a source carries its free-form identity only as `labels` and `metadata`
+  (the replication `Handshake` frame, `copy_sources_into`), and
+  metriken-storage's `to_dendro` writes the same two, so columns would
+  need a dendro schema bump, a wire change and a change to each path,
+  where metadata keys travel through all of them unchanged. A reader that
+  does not know the keys shows them as ordinary metadata.
 - **Q3.** Migration: reading recordings made before the layers (`source`
   label and metadata) without rewriting them; whether `recording upgrade`
   rewrites them; until when the recorder writes `source` (D2); and how to
@@ -2069,13 +2197,13 @@ Identity and naming:
   producer; (b) the self-metric names alone suffice, as `source_kind.rs`'s
   self-metric check does (`:51-54`), and `__producer__` is `rezolus`.
 - **Q4.** The renames the inventory lists (`node`→`host`, `percentile`→
-  `quantile` from the exporter, `role`'s three meanings, `kind`
-  collisions, `version`/`producer_version`): which change, in which
-  release, with which read-time aliases. `instance` is the exception: a
-  combined parquet already carries it as a series label (`"0"`, a sequence
-  number, or the input's `instance` metadata, for example `"primary"` in
-  rezolus `docs/parquet_metadata.md`), and the recorder-layer `instance`
-  lands with step 3.4. Candidates for reading a combined parquet's
+  `quantile` from the exporter, `role`'s three meanings (llm-perf's moves to
+  `tier`, Q7), `kind` collisions, `version`/`producer_version`): which
+  change, in which release, with which read-time aliases. `instance` is the
+  exception: a combined parquet already carries it as a series label (`"0"`,
+  a sequence number, or the input's `instance` metadata, for example
+  `"primary"` in rezolus `docs/parquet_metadata.md`), and the recorder-layer
+  `instance` lands with step 3.4. Candidates for reading a combined parquet's
   `instance`: (a) keep it as `instance` for parquet only, which leaves two
   meanings; (b) apply the clash rule, so it reads as `exported_instance`;
   (c) rename it on read to a user label. A selector `instance="primary"`
@@ -2095,17 +2223,57 @@ Identity and naming:
   `RegistrySource` has no endpoint, no `instance` and no `/systeminfo`. Its
   `role=loadgen` label, and the `role=service` it puts on the server's
   endpoint (`src/recording.rs:128`), are asserted by llm-perf as the
-  caller: whether they belong to the user layer or to a fourth,
-  caller-asserted one.
+  caller. Decided 2026-10-26: a tool that runs the recorder writes what a
+  user would, so every label it supplies is in the user layer, including
+  one on its own in-process source; there is no fourth layer. The producer
+  layer of an in-process source holds what any producer declares (name,
+  version, hostname), passed in `SourceIdentity`. llm-perf writes
+  `tier=client` on its own source and `tier=server` on the server's
+  endpoint in place of `role` (`role` has three meanings, Q4; `tier` is
+  O3's label for a role in a benchmark), and the user's configuration can
+  override both. llm-perf's KPI template on its own source
+  (`service_queries` in its `RegistrySource` metadata) is producer-layer
+  metadata, as in a handshake. The alternative of recording the load
+  generator and the server under test into separate files and combining
+  them later was rejected: llm-perf's one archive is written live on one
+  clock, and two files need a second step and can cover different spans.
 - **Q8.** Handshakes that change identity across epochs. A producer restart
   can bring a different producer on the same port, and an upgrade can
-  rename a metric. Candidates: (a) `__producer__` and the template layer
-  are the newest epoch's for the whole recording, with a notice when an
-  earlier epoch's differ; (b) both are per epoch, so `__producer__` changes
-  value at the restart and each epoch's rows are evaluated with its own
-  handshake's template; (c) a reconnect whose handshake names a different
-  producer starts a new source, and (a) applies within one producer's
-  epochs.
+  rename a metric. Decided 2026-10-26:
+  - A new version or build of the same producer is an event on one source:
+    the `producer_epochs` entry for the new epoch records it, and the
+    viewer marks it. `__producer__` keeps one value per source. Each
+    epoch's rows are evaluated with that epoch's handshake template, which
+    covers a metric that keeps its name and changes meaning. The newest
+    epoch's template gives the sections; how a chart is matched to an
+    older epoch's query is settled with the template evaluation rule.
+    Counters need nothing more, since no increase is taken across an epoch
+    boundary (metriken-query `archive.rs:369-379`, one member per epoch); a
+    renamed metric's old series ends and the new one starts.
+  - A reconnect whose handshake names a different producer starts a new
+    source, since none of its series continue the old one's.
+  - The change reaches a subscriber as a dendro replication frame,
+    `SourceUpdate { source, ts, labels, metadata }`, sent by dendro's
+    `ArchivePublisher`. Today the publisher reads the sources once, when it
+    opens (dendro `src/replicate/publisher.rs:214`), and sends each
+    source's metadata only in its `Handshake`: a subscriber tailing an
+    archive keeps the identity it read at connect after the recorder
+    patches it (metriken-recorder `restart.rs`, `metadata_patch`), and
+    receives no `Handshake` for a source created after it connected. The
+    archive records no time for a metadata change
+    (`update_source_metadata` and `update_source_labels` are plain
+    updates, `src/archive/sqlite.rs:2890`, `:2918`), so `ts` needs a stored
+    change time or a defined substitute such as the poll time. `Frame` is
+    `#[non_exhaustive]` and a subscriber on dendro 0.3.0 or later skips a
+    kind it does not know (WIRE.md §7). Nothing ships today that follows a
+    recorder over replication; this is for the subscriber that will.
+
+  Splitting at every version change was rejected: it makes a run one
+  line in two pieces for every consumer, for a case per-epoch template
+  evaluation already handles. The candidates were (a) the newest epoch's
+  `__producer__` and template for the whole recording, (b) both per epoch,
+  and (c) a new source when the producer's name changes, with (a)
+  within one producer's epochs.
 
 Presentation and query rules:
 
@@ -2406,6 +2574,15 @@ Views:
     its epochs stated: three agents, three epochs, so no two union; and the
     variant where the two 10:00 recordings share an epoch, which unions
     them under R3 and leaves two presented recordings.
+- **Q40.** User-layer writes after record time (raised 2026-10-27). The
+  user layer holds one value per key (Q2), so a tier saved from the viewer
+  or an `alias` written by `recording annotate` replaces the record-time
+  value (M6, P1). Open: whether the user layer keeps the replaced value,
+  and under which key; whether `recording annotate` then requires
+  `--overwrite` to replace a record-time `alias`, rather than accepting and
+  ignoring it with a warning; and whether labels other than `tier` saved
+  from the viewer (`arm`) go to the user layer or to a label layer
+  document.
 
 
 Closed by the owner on 2026-10-20: Q11 (one epoch over disjoint spans gives
@@ -2431,12 +2608,28 @@ written by the new dendro.
      Needs: Q24.
    - Nothing for the union: dendro already keeps a copy's uuid and allows
      two sources with one uuid.
+   - The `SourceUpdate` replication frame (Q8), and `ArchivePublisher`
+     changed to detect, on each `next`, a source whose labels or metadata
+     changed and a source created since it opened, sending `SourceUpdate`
+     or `Handshake`. The archive records no time for a metadata change, so
+     `ts` needs a stored change time or a defined substitute (the poll
+     time).
 2. metriken, released:
-   - The producer identity (metriken-exposition macro and handshake key;
-     metriken-model if the key is a wire key) and the three layers in
-     metriken-recorder and metriken-storage. Needs: Q1, Q2, Q3, Q7, Q8.
+   - The producer identity (metriken-exposition macro and handshake key,
+     with the producer's hostname; metriken-model if the key is a wire
+     key), `SourceIdentity` carrying it for an in-process source (Q7), and
+     the three layers in metriken-recorder and metriken-storage, stored as
+     Q2 decides, with the one function that writes the layers and the
+     merged labels. The recorder starts a new source when a reconnect's
+     handshake names a different producer, and writes a patched identity
+     through the layer function; dendro's publisher carries it to
+     subscribers (step 1). Needs: Q3; for subscribers, the dendro frame
+     above.
    - `__producer__`, and the one clash rule on every path, including
-     `MultiParquetSource`. Needs: Q1.
+     `MultiParquetSource`.
+   - In metriken-query, each producer epoch's rows evaluated with that
+     epoch's handshake template (Q8), as part of the template evaluation rule
+     (the D1 item below).
    - ~~In metriken-query, the per-sample `avg_over_time` and per-row
      unstrided histogram behaviour documented (S12).~~ Done in the
      metriken-query crate docs.
@@ -2474,8 +2667,12 @@ written by the new dendro.
       agent's external metrics) moved to the one rule; the internal
       comparisons with `"rezolus"` (`filter.rs:145`, `dashboard/mod.rs:775`,
       `crates/viewer/src/lib.rs:1663`, `source_kind.rs:45`, and the others
-      in Today) reading the kind through D2; `dashboard=FILE`. Needs: Q1,
-      Q3, Q4, Q5, Q6, Q20, Q21, Q22, Q23, Q35, Q38.
+      in Today) reading the kind through D2; `dashboard=FILE`; the
+      per-endpoint `source=`, `arm=` (#1504) and `host=` (#1538) written to
+      the user layer; `combine`'s label stamping and `annotate`'s metadata
+      writes through the metriken-storage layer
+      function (Q2). Needs: step 2, Q3, Q4, Q5, Q6, Q20, Q21, Q22, Q23, Q35,
+      Q38.
    5. The presentation (cases 1 to 6) as one `dashboard` crate function
       called by the viewer, MCP and `recording check`, with notices in MCP's
       tool results and on the CLI's stderr, and the per-recording MCP tools
@@ -2483,8 +2680,9 @@ written by the new dendro.
       aggregation by plot type and the split toggle (P3), time clusters
       compared like `arm` (P4, P6), and the unidentified group (P9);
       cross-producer sections with their binding and host matching; views,
-      template layers and label layers as documents, and interactive
-      relabels writing rules or uuid lists; alignment; reports, pins and
+      template layers and label layers as documents, interactive
+      relabels writing rules or uuid lists, and tiers saved from the
+      viewer into the user layer (P1); alignment; reports, pins and
       group events as documents; `combine` as a plain union reporting
       document forks and placing new recordings beside a saved view, with
       the shared-uuid refusal removed; `recording upgrade` writing a view
@@ -2493,11 +2691,15 @@ written by the new dendro.
       and the archive's own layers only (P8), and the read-build ingest path
       for the static site; histogram charts passing a stride at the step
       (S12); the `arm_slots` and report-anchor compatibility items. Needs:
-      step 2's process groups, Q10, Q13, Q15 to Q18, Q24 to Q28, Q30, Q31,
-      Q36, Q39.
+      step 2's process groups and layer function, Q10, Q13, Q15 to Q18,
+      Q24 to Q28, Q30, Q31, Q36, Q39.
 4. The renames (Q4, except `instance`), each with read-time aliases.
 5. systemslab, as a consumer (planned): render each archive through the
    `dashboard` crate with the archive's own layers; keep its own views at
    its own levels in its own storage; pass `--label
    tier=<value>` for a job whose spec gives a tier (O4); optionally pass an
    open-time overlay. Needs: step 3.5, Q34, Q37.
+6. llm-perf (Q7): `tier=client` and `tier=server` in place of `role`, the
+   producer hostname in `SourceIdentity`, a `[metrics] server_host`
+   asserted as `host` on the server endpoint (Q1), and a `[metrics]` key
+   that overrides each `tier`. Needs: step 2.
