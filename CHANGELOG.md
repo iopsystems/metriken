@@ -243,8 +243,9 @@ Requires metriken-model 0.2.1.
   from these indexes, so opening an archive whose segments all carry one
   fetches no sealed segment. A segment with a names fingerprint (`MNS1`,
   written by 0.5.4 and earlier) is read as before. A later segment with no
-  index is fetched when another segment of its table has an index (dendro's
-  compaction drops a merged segment's index), so a compacted table costs a
+  index is fetched when another segment of its table has a names index or
+  fingerprint (dendro's compaction drops a merged segment's index), so a
+  compacted table costs a
   fetch per merged segment at open. A table with no index on any segment
   (copied with a projection, or compacted so that every segment was
   merged) still lists only its first segment's names and its live tail's.

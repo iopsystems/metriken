@@ -234,8 +234,8 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 ///   one is fetched when its names index does not decode or gives a format,
 ///   layout or interval this reader refuses (its probe then fails the open),
 ///   or when its names fingerprint is new. A later segment with no index is
-///   fetched when another segment of the table has an index (dendro's
-///   compaction drops the index of a merged segment). A table with no index
+///   fetched when another segment of the table has a names index or
+///   fingerprint (dendro's compaction drops the index of a merged segment). A table with no index
 ///   on any segment (converted by metriken-storage 0.5.4 or earlier, sealed
 ///   before fingerprints, copied with a projection, or compacted so that
 ///   every segment was merged) lists only its first segment's names and its
@@ -259,9 +259,9 @@ fn table_probes(
             .into_iter()
             .filter_map(|(seq, index)| Some((seq, index?)))
             .collect();
-        // A table whose writer stored indexes: a segment without one was
-        // merged by compaction, or its footer could not be indexed, and may
-        // hold names no index gives.
+        // A table whose writer stored names indexes or fingerprints: a
+        // segment without one was merged by compaction, or its footer could
+        // not be indexed, and may hold names no index gives.
         let indexed_table = stored
             .values()
             .any(|raw| crate::names::read(Some(raw)).is_some());
