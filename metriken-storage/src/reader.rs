@@ -115,16 +115,23 @@ fn probe_tables(pending: &[PendingProbe]) -> Vec<Result<ProbedTable, String>> {
     pending.iter().map(|p| probe_one(p, &pool)).collect()
 }
 
-/// One table's footers: the metric names they hold between them, the row
-/// cadence of the first, and the interval the first declares
-/// ([`declared_interval`]), if it does.
+/// One table's footers and names indexes: the metric names they hold
+/// between them, the row cadence of the first, and the interval the first
+/// declares ([`declared_interval`]), if it does.
 fn probe_one(
-    (sampler, probes, span): &PendingProbe,
+    PendingProbe {
+        sampler,
+        known,
+        probes,
+        span,
+    }: &PendingProbe,
     pool: &Arc<BufferPool>,
 ) -> Result<ProbedTable, String> {
-    let mut names = TableNames::default();
-    let mut interval = None;
-    let mut declared = None;
+    let mut names = known.names.clone();
+    let (mut interval, mut declared) = match known.first {
+        Some((interval, declared)) => (Some(interval), declared),
+        None => (None, None),
+    };
     for bytes in probes {
         let probe = MultiParquetSource::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
             .map_err(|e| format!("probing table {sampler}: {e}"))?;
@@ -160,17 +167,66 @@ fn declared_interval(probe: &MultiParquetSource) -> Option<f64> {
         .map(|ms| ms as f64 / 1e3)
 }
 
-/// One table awaiting its footer probes: its key, the segments to parse
-/// (see `table_probes`), and the span the catalog already answered.
-type PendingProbe = (String, Vec<Vec<u8>>, Option<(u64, u64)>);
+/// One table awaiting its footer probes: its key, what its names indexes
+/// give (see `table_probes`), the segments to parse, and the span the
+/// catalog already answered.
+struct PendingProbe {
+    sampler: String,
+    known: KnownNames,
+    probes: Vec<Vec<u8>>,
+    span: Option<(u64, u64)>,
+}
 
-/// The segments whose footers name every metric a table holds:
+/// What a table's names indexes (`crate::names`) give before any footer is
+/// parsed.
+#[derive(Default)]
+struct KnownNames {
+    names: TableNames,
+    /// The first sealed segment's row cadence and declared interval, when
+    /// its index gives them.
+    first: Option<(f64, Option<f64>)>,
+}
+
+/// The row cadence and declared interval a probe of the segment `names`
+/// indexes would read (`MultiParquetSource::interval`, [`declared_interval`]),
+/// or `None` when the probe would fail (a format this reader does not read,
+/// an interval that is not a number), so the segment is probed and the
+/// open fails as it would without the index.
+fn indexed_intervals(names: &crate::names::SegmentNames) -> Option<(f64, Option<f64>)> {
+    if let Some(format) = &names.format {
+        let kv = vec![parquet::file::metadata::KeyValue::new(
+            crate::format::FORMAT_KEY.to_string(),
+            format.clone(),
+        )];
+        crate::format::check(Some(&kv)).ok()?;
+    }
+    let ms = match &names.sampling_interval_ms {
+        Some(v) => v.parse::<u64>().ok()?,
+        None => 1000,
+    };
+    let declared = names
+        .sampling_interval_ms
+        .is_some()
+        .then_some(ms)
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms as f64 / 1e3);
+    Some((ms as f64 / 1e3, declared))
+}
+
+/// What [`table_probes`] gives: the names the indexes give, and the
+/// segments to parse.
+type TableProbes = (KnownNames, Vec<Vec<u8>>);
+
+/// What a table's catalog says of its metric names, and the segments whose
+/// footers name the rest:
 ///
-/// - its first sealed segment, and each later one whose names fingerprint
-///   (`crate::names`) no earlier probe has. A segment without a fingerprint
-///   (a `.rez`, or one sealed before fingerprints) is assumed to hold the
-///   first segment's names, which is what the reader assumed of every segment
-///   before;
+/// - a sealed segment with a names index gives its names, and the first
+///   sealed segment's gives the table's cadence, with no segment fetched;
+/// - the first sealed segment without one is fetched, and each later one
+///   whose names fingerprint no earlier fetch has. A later segment with
+///   neither (a `.rez`, or one sealed before fingerprints) is assumed to
+///   hold the first segment's names, which is what the reader assumed of
+///   every segment before;
 /// - the rows of its live tail that name its columns
 ///   (`crate::wal::schema_rows`), materialized alone.
 fn table_probes(
@@ -179,23 +235,37 @@ fn table_probes(
     table: &str,
     sealed: &[(u64, crate::catalog::SegmentMeta)],
     long: bool,
-) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+) -> Result<TableProbes, Box<dyn std::error::Error>> {
+    use crate::names::Stored;
+
+    let mut known = KnownNames::default();
     let mut probes = Vec::new();
-    if let Some((first, _)) = sealed.first() {
-        let fingerprints: HashMap<u64, u64> = db
+    if !sealed.is_empty() {
+        let stored: HashMap<u64, Stored> = db
             .segment_indexes(recording_id, table)?
             .into_iter()
-            .filter_map(|(seq, index)| Some((seq, crate::names::fingerprint(index.as_deref())?)))
+            .filter_map(|(seq, index)| Some((seq, crate::names::read(index.as_deref())?)))
             .collect();
-        let mut seen: HashSet<u64> = fingerprints.get(first).copied().into_iter().collect();
-        // By number: this runs inside the open's snapshot, where a listed
-        // number still names the listed segment.
-        probes.extend(db.segment_bytes(recording_id, table, *first)?);
-        for (seq, _) in &sealed[1..] {
-            if let Some(fp) = fingerprints.get(seq) {
-                if seen.insert(*fp) {
-                    probes.extend(db.segment_bytes(recording_id, table, *seq)?);
-                }
+        let mut seen: HashSet<u64> = HashSet::new();
+        for (i, (seq, _)) in sealed.iter().enumerate() {
+            let fetch = match stored.get(seq) {
+                Some(Stored::Names(names)) => match indexed_intervals(names) {
+                    Some(intervals) => {
+                        known.names.add(names);
+                        if i == 0 {
+                            known.first = Some(intervals);
+                        }
+                        false
+                    }
+                    None => true,
+                },
+                Some(Stored::Fingerprint(fp)) => seen.insert(*fp) || i == 0,
+                None => i == 0,
+            };
+            if fetch {
+                // By number: this runs inside the open's snapshot, where a
+                // listed number still names the listed segment.
+                probes.extend(db.segment_bytes(recording_id, table, *seq)?);
             }
         }
     }
@@ -208,7 +278,7 @@ fn table_probes(
         crate::wal::materialize_wal_tail_with(table, &naming, props)?
     };
     probes.extend(tail.map(|t| t.bytes));
-    Ok(probes)
+    Ok((known, probes))
 }
 
 /// What a probe yields: the table's key, its metric names, its row spacing,
@@ -617,7 +687,7 @@ impl SegmentSource {
 /// `histogram_names` are distinct questions on `MetricsSource` — a merged set
 /// would answer all three with the same list, which is wrong and would not
 /// have failed loudly.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TableNames {
     counters: std::collections::HashSet<String>,
     gauges: std::collections::HashSet<String>,
@@ -626,6 +696,15 @@ struct TableNames {
 }
 
 impl TableNames {
+    /// Add the names a segment's names index gives.
+    fn add(&mut self, names: &crate::names::SegmentNames) {
+        self.counters.extend(names.counters.iter().cloned());
+        self.gauges.extend(names.gauges.iter().cloned());
+        self.histograms.extend(names.histograms.iter().cloned());
+        self.gauge_histograms
+            .extend(names.gauge_histograms.iter().cloned());
+    }
+
     /// Whether this table holds `metric` under any kind — the routing question.
     fn holds(&self, metric: &str) -> bool {
         self.counters.contains(metric)
@@ -1710,13 +1789,13 @@ impl ArchiveReader {
                     for sampler in samplers {
                         let metas = db.segment_meta(rec.id, &sampler)?;
 
-                        // The footers that name every metric the table holds: sealed
-                        // segments by names fingerprint, and the live tail's rows that
-                        // carry a schema. A quiet sampler in a live hindsight buffer
+                        // The metric names the table holds: from sealed segments'
+                        // names indexes, else their footers by names fingerprint, and
+                        // the live tail's rows that carry a schema. A quiet sampler in a live hindsight buffer
                         // has only the latter: rows in the WAL, no seal yet. Skipping
                         // it would make it invisible to the reader, which the eager
                         // path never did because `table_segments` splices the tail in.
-                        let probes = table_probes(
+                        let (known, probes) = table_probes(
                             &**db,
                             rec.id,
                             &sampler,
@@ -1725,7 +1804,7 @@ impl ArchiveReader {
                         )?;
                         // Nothing sealed and nothing live: the table has no rows at
                         // all, so there is nothing to open. Same skip as the eager path.
-                        if probes.is_empty() {
+                        if probes.is_empty() && known.first.is_none() {
                             continue;
                         }
 
@@ -1764,7 +1843,12 @@ impl ArchiveReader {
                         measured_intervals.insert(sampler.clone(), measured);
                         row_indexes.insert(sampler.clone(), RowIndex::new(metas, wal));
 
-                        pending.push((sampler, probes, span));
+                        pending.push(PendingProbe {
+                            sampler,
+                            known,
+                            probes,
+                            span,
+                        });
                     }
                     Ok::<_, Box<dyn std::error::Error>>((
                         pending,
@@ -2460,6 +2544,29 @@ impl SeriesLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A names index gives the interval a probe of its footer would read,
+    /// and nothing when the probe would fail, so the segment is probed.
+    #[test]
+    fn an_indexed_interval_is_what_the_footer_probe_reads() {
+        let names = |interval: Option<&str>, format: Option<&str>| crate::names::SegmentNames {
+            sampling_interval_ms: interval.map(str::to_string),
+            format: format.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(indexed_intervals(&names(None, None)), Some((1.0, None)));
+        assert_eq!(
+            indexed_intervals(&names(Some("100"), Some("1"))),
+            Some((0.1, Some(0.1)))
+        );
+        assert_eq!(
+            indexed_intervals(&names(Some("0"), None)),
+            Some((0.0, None))
+        );
+        assert_eq!(indexed_intervals(&names(Some("x"), None)), None);
+        let newer = (crate::format::FORMAT_VERSION + 1).to_string();
+        assert_eq!(indexed_intervals(&names(None, Some(&newer))), None);
+    }
 
     /// A later row for an occupant, even with other labels, is dropped; the
     /// first rows keep their order.

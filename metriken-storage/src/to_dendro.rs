@@ -255,12 +255,13 @@ impl ParquetToArchive {
                     *source.insert(id)
                 }
             };
-            out.insert_segment(
+            out.insert_segment_with_index(
                 id,
                 PARQUET_TABLE,
                 written.segments as u64,
                 &segment.meta,
                 &segment.bytes,
+                crate::names::index_of(&segment.bytes).as_deref(),
             )?;
             written.segments += 1;
             written.rows += segment.meta.rows;

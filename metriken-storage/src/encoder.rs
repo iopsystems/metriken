@@ -196,8 +196,8 @@ impl SegmentEncoder for Encoder {
         // cut into it, or a deferred seal whose retry before an eviction
         // failed with an error that is not retryable, after which dendro
         // evicts the stream's live rows.
-        // The names fingerprint, so a reader probes one footer per distinct
-        // set of metric names rather than only the table's first.
+        // The names index, so a reader opening the archive learns the
+        // segment's metric names from the catalog, with no footer fetched.
         Ok(tail.map(|t| Segment {
             index: crate::names::index_of(&t.bytes),
             bytes: t.bytes,

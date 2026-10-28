@@ -235,7 +235,14 @@ pub fn convert_tar_into(
             let mut seq = 0u64;
             let mut sink =
                 |segment: EncodedSegment| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                    out.insert_segment(source, &table, seq, &segment.meta, &segment.bytes)?;
+                    out.insert_segment_with_index(
+                        source,
+                        &table,
+                        seq,
+                        &segment.meta,
+                        &segment.bytes,
+                        crate::names::index_of(&segment.bytes).as_deref(),
+                    )?;
                     if seq == 0 {
                         written.tables += 1;
                     }
@@ -292,8 +299,15 @@ fn copy_segments(
                 format!("segment {sampler}#{seq}'s last_ts")
             })?,
         };
-        out.insert_segment(source, sampler, *seq, &meta, &bytes)
-            .map_err(|e| e.to_string())?;
+        out.insert_segment_with_index(
+            source,
+            sampler,
+            *seq,
+            &meta,
+            &bytes,
+            crate::names::index_of(&bytes).as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(metas.len())
 }

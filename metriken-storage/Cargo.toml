@@ -33,6 +33,7 @@ serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, optional = true }
 tar = { version = "0.4.45", default-features = false, optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+zstd = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
 # The archive's integration tests query through the engine; an integration
@@ -51,7 +52,7 @@ default = ["lz4", "archive"]
 # The dendro archive: its catalog, `ArchiveReader`, the segment encoder and
 # the column filter. Off, nothing here compiles SQLite: the segment format,
 # the column readers and, with `convert`, the parquet conversion.
-archive = ["dep:dendro", "dep:serde_json"]
+archive = ["dep:dendro", "dep:serde_json", "dep:zstd"]
 # Reading the `.rez` archive format (v1/v2 tar, v3 SQLite), and with `write`
 # converting a v3 `.rez` to a dendro archive. Nothing writes a `.rez`.
 rez = ["archive", "dep:rusqlite", "dep:serde_json", "dep:tar"]

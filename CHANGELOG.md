@@ -231,6 +231,18 @@ Requires metriken-model 0.2.1.
   `VERSION`, `BUILD` and `HOST`: a producer identity as producer-layer
   keys. `derive_legacy` derives a producer entry from a legacy source's
   `metriken.producer.*` metadata.
+- **Changed:** a sealed segment's caller index (dendro's
+  `segment_indexes`) is a names index (`MNI1`): the metric names its footer
+  holds by kind, and its `sampling_interval_ms` and `metriken.format`,
+  msgpack compressed with zstd. The writer stores it at each seal, and the
+  parquet and `.rez` conversions with each segment they insert.
+  `ArchiveReader` takes a table's names, and its first segment's interval,
+  from these indexes, so opening an archive whose segments all carry one
+  fetches no sealed segment. A segment with a names fingerprint (`MNS1`,
+  written before) or no index is read as before. A reader before this one
+  does not read `MNI1` and takes each table's names from its first segment
+  and live tail only, so it does not list a metric that first appears in a
+  later segment of an archive written by this one.
 
 ### metriken-query 0.42.3
 
