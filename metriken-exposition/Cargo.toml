@@ -29,6 +29,9 @@ serde_json = { workspace = true, optional = true }
 tokio = { version = "1", default-features = false, features = ["time"], optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
+[target.'cfg(any(unix, windows))'.dependencies]
+hostname = "0.4.2"
+
 [dev-dependencies]
 # The frame tests apply frames through dendro's subscriber into an archive.
 dendro = { version = "0.6.0" }
