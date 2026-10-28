@@ -1,4 +1,4 @@
-//! What the recorder logs when a reconnect names another producer. Its own
+//! What the recorder logs when a recording's producer or label set changes. Its own
 //! test binary because it installs the process's global subscriber: the
 //! recorder runs on runtime worker threads, which a thread-local
 //! `set_default` would not reach.
@@ -150,4 +150,64 @@ async fn a_split_with_the_same_labels_does_not_warn_about_them() {
         "the second warning names the endpoint still recording: {}",
         warnings[1]
     );
+
+    // Two endpoints given one label set, the hook naming the producer at
+    // once for one and late for the other: they differ at the add, and the
+    // late reply gives the second the first's labels, which warns.
+    let before = captured.0.lock().unwrap().len();
+    let named = serve(stream_only(&[("source", "a")], &[])).await;
+    let late = serve(stream_only(&[("source", "a")], &[])).await;
+    let probe = Arc::new(NamesLate {
+        late: late.url.clone(),
+        asked: Default::default(),
+    });
+    let detected = detect(
+        &client(),
+        &DetectConfig::new(interval, Duration::from_secs(2)),
+        vec![shared(&named.url), shared(&late.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let mut cfg = RecorderConfig::new(dir.path().join("late.dendro"), interval);
+    cfg.timeout = Duration::from_millis(200);
+    let (recorder, _ids, rx) = Recorder::start(cfg, client(), probe, detected, Vec::new())
+        .await
+        .unwrap();
+    drop(rx);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let log = String::from_utf8(captured.0.lock().unwrap()[before..].to_vec()).unwrap();
+    let warnings = log
+        .lines()
+        .filter(|l| l.contains("carry identical labels"))
+        .count();
+    assert_eq!(warnings, 1, "{log}");
+}
+
+/// A hook that names the producer `x`, answering `Retry` to its first ask
+/// about `late`.
+struct NamesLate {
+    late: url::Url,
+    asked: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Probe for NamesLate {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, url: &url::Url, epoch: Option<&str>) -> Enrich {
+        if *url == self.late && !self.asked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Enrich::Retry;
+        }
+        Enrich::Metadata {
+            epoch: epoch.map(str::to_string),
+            labels: Default::default(),
+            metadata: map(&[("producer_name", "x")]),
+        }
+    }
 }

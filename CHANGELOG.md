@@ -40,7 +40,8 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   replace the recorder's; a local source's own `sampling_interval_ms`, which
   was kept before, gives way to the recorder's tick. A restart's producer
   entry can change the recording's labels mid-recording (a new handshake's
-  `source`, say); the identical-labels warning is checked at the add only.
+  `source`, say), and the identical-labels warning is checked then as at
+  the add.
 - **Changed:** the recorder writes no `source` of its own: no name
   inferred from the URL, no `local` default, and not the probe hook's
   `source`. A `source` label the caller or the producer gives is kept in
@@ -68,7 +69,8 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   the caller's labels, metadata and patches written again, and the probe
   hook is asked about the new producer on the following ticks; the new
   recording carries no label from the hook, and a label it gives arrives
-  as `LabelsNotApplied`.
+  as `LabelsNotApplied` (a `producer_name` in the reply still gives it
+  `__producer__`).
   `Event::ProducerChanged { source, from, to, name }` reports it. A
   handshake that names no producer does not split, and leaves the producer
   on record; a reconnect while no handshake has named a producer does not
@@ -98,7 +100,8 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
 - **Changed:** the identical-labels warning keeps the set of endpoints
   recording under each label set, so a producer change on one of two
   endpoints sharing labels keeps the warning for the other, and a restart
-  that changes an endpoint's labels moves it. `finish` returns the cause
+  that changes an endpoint's labels moves it, and warns when its new labels
+  equal another recording's. `finish` returns the cause
   `Event::Failed` reports.
 - **Changed:** a recording whose merged layers name a producer (its
   identity, the probe hook's `producer_name`, or a caller's) carries the
