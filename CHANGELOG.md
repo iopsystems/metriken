@@ -40,8 +40,9 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   replace the recorder's; a local source's own `sampling_interval_ms`, which
   was kept before, gives way to the recorder's tick. A restart's producer
   entry can change the recording's labels mid-recording (a new handshake's
-  `source`, say), as can a late hook reply's `producer_name`, and the
-  identical-labels warning is checked then as at the add.
+  `source`, say), as can a late hook reply's `producer_name` or a
+  caller's patch, and the identical-labels warning is checked then as at
+  the add.
 - **Changed:** the recorder writes no `source` of its own: no name
   inferred from the URL, no `local` default, and not the probe hook's
   `source`. A `source` label the caller or the producer gives is kept in
@@ -71,7 +72,8 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   recording carries no label from the hook, and a label it gives arrives
   as `LabelsNotApplied` (a `producer_name` in the reply still adds
   `__producer__` when neither the producer's handshake nor the caller
-  names the producer).
+  sets `producer_name` or `__producer__`; a handshake that names its
+  producer only by its `source` label sets neither).
   `Event::ProducerChanged { source, from, to, name }` reports it. A
   handshake that names no producer does not split, and leaves the producer
   on record; a reconnect while no handshake has named a producer does not
@@ -100,12 +102,12 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   added with.
 - **Changed:** the identical-labels warning keeps the set of endpoints
   recording under each label set, so a producer change on one of two
-  endpoints sharing labels keeps the warning for the other, and a restart
-  or a late hook reply that changes an endpoint's labels moves it, and
-  warns when its new labels equal another recording's. Two recordings
-  warned about at the add that both move to one new label set are warned
-  about again when the second moves. `finish` returns the cause
-  `Event::Failed` reports.
+  endpoints sharing labels keeps the warning for the other, and a
+  restart, a late hook reply or a caller's patch that changes an
+  endpoint's labels moves it, and warns when its new labels equal another
+  recording's. Two recordings warned about at the add that both move to
+  one new label set are warned about again when the second moves. `finish`
+  returns the cause `Event::Failed` reports.
 - **Changed:** a recording whose merged layers name a producer (its
   identity, the probe hook's `producer_name`, or a caller's) carries the
   `__producer__` label (metriken-storage's layer merge). A hook reply or
