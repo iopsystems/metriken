@@ -169,8 +169,9 @@ pub enum ActiveTransport {
 pub enum SourceState {
     /// Not detected yet; detected again on each tick.
     Pending,
-    /// Streamed, and waiting for the probe hook's `enrich`, which runs off
-    /// the tick; added to the archive on the first tick after it returns.
+    /// Detected (streamed or scraped), and waiting for the probe hook's
+    /// `enrich`, which runs off the tick; added to the archive on the first
+    /// tick after it returns.
     Activating,
     /// In the archive and recording.
     Active,
@@ -244,18 +245,19 @@ pub enum Event {
         epoch: Option<String>,
         restarted: bool,
     },
-    /// A streamed source reconnected to a different producer: the
-    /// reconnect's handshake names `to` where the recording's names `from`
-    /// (a producer identity's name, else the handshake's `source` label).
-    /// None of the new producer's series continue the old one's, so the
-    /// recording so far is finalized and a new one is added for the
-    /// endpoint, with the caller's labels, metadata and patches written to
-    /// it again. `source` keeps naming the endpoint; `name` is the new
-    /// recording's shown name, as [`Event::Active`]'s is. A handshake that
-    /// names no producer does not split, and a reconnect while no handshake
-    /// has named a producer does not either. The new recording carries no
-    /// label from the probe hook: the hook is asked again, and a label it
-    /// gives arrives as [`Event::LabelsNotApplied`].
+    /// A streamed source reconnected to a different producer: the reconnect's
+    /// handshake names `to` where the recording's names `from` (a producer
+    /// identity's name, else the handshake's `source` label). None of the new
+    /// producer's series continue the old one's, so the recording so far is
+    /// finalized and a new one is added for the endpoint, with the caller's
+    /// labels, metadata and patches written to it again. `source` keeps naming
+    /// the endpoint; `name` is the new recording's shown name, as
+    /// [`Event::Active`]'s is. A handshake that names no producer does not
+    /// split, and a reconnect while no handshake has named a producer does not
+    /// either, nor one while the recorder stops (its rows go into the old
+    /// recording). The new recording carries no label from the probe hook: the
+    /// hook is asked again, and a label it gives arrives as
+    /// [`Event::LabelsNotApplied`].
     ProducerChanged {
         source: SourceId,
         from: String,
@@ -266,7 +268,7 @@ pub enum Event {
     Gap { source: SourceId, seq: u64 },
     /// The source cannot be recorded; `reason` is the line that says why.
     Refused { source: SourceId, reason: String },
-    /// The probe hook's labels for a streamed source arrived after its
+    /// The probe hook's labels for an endpoint arrived after its
     /// recording was added, whose labels are fixed, and are not applied.
     /// `labels` are those that would have been added or changed; given as
     /// the endpoint's labels ([`EndpointSpec::labels`](crate::EndpointSpec))
@@ -300,9 +302,9 @@ pub enum Event {
     },
     /// A commit included passes of this source. Cumulative, so a dropped
     /// one loses nothing: `passes_total` passes since the start, the first
-    /// at `first_ts`, the newest at `ts` (wall clock `wall_ns`). Both count
-    /// the endpoint across the recordings a [`Event::ProducerChanged`]
-    /// starts.
+    /// at `first_ts`, the newest at `ts` (wall clock `wall_ns`).
+    /// `passes_total` and `first_ts` count the endpoint across the
+    /// recordings a [`Event::ProducerChanged`] starts.
     Committed {
         source: SourceId,
         passes_total: u64,
@@ -488,10 +490,11 @@ impl Recorder {
     /// Start recording `detected` endpoints and `local` sources into the
     /// archive at `cfg.path`.
     ///
-    /// Every streamed endpoint's first [`Probe::enrich`] runs at once, each
+    /// Every streamed or scraped endpoint's first [`Probe::enrich`] runs at
+    /// once, each
     /// bounded by `cfg.timeout`, before the archive opens, since a
     /// recording's labels are fixed when it is added. One that does not
-    /// answer in time is added with the caller's and the handshake's labels,
+    /// answer in time is added without the hook's labels and metadata,
     /// with a warning, and the hook is asked again on later ticks, up to
     /// five more times, each ask allowed twice as long as the one before
     /// (at most 60 s); the metadata of a reply that arrives is written into
@@ -622,8 +625,8 @@ impl Recorder {
             seen_by: BTreeMap::new(),
         };
 
-        // The probe hook's first `enrich` of every streamed endpoint, at
-        // once, each bounded by the timeout.
+        // The probe hook's first `enrich` of every streamed or scraped
+        // endpoint, at once, each bounded by the timeout.
         #[cfg(feature = "http")]
         driver.first_enrich().await;
 
@@ -967,7 +970,7 @@ struct Endpoint {
     last_frame: Option<(Option<u64>, u64)>,
 }
 
-/// How many more times a streamed source's probe hook is asked for its
+/// How many more times an endpoint's probe hook is asked for its
 /// labels and metadata after the first ask timed out or failed: one ask in
 /// flight at a time, the next started on the tick after one fails. Retry
 /// `k` (from 1) is bounded by the timeout times `2^k`, at most
@@ -1263,9 +1266,10 @@ struct Driver {
     stopping: bool,
     /// Each added recording's label set, for the identical-labels warning.
     seen_labels: BTreeMap<BTreeMap<String, String>, String>,
-    /// The slot that added each label set in `seen_labels`, so a slot's own
-    /// set is taken out when its recording ends at a producer change.
-    seen_by: BTreeMap<BTreeMap<String, String>, usize>,
+    /// The slots recording under each label set in `seen_labels`, so a
+    /// slot's set is taken out when its recording ends at a producer change,
+    /// and moved when a restart changes its labels.
+    seen_by: BTreeMap<BTreeMap<String, String>, BTreeSet<usize>>,
     commit_streams_on_arrival: bool,
 }
 
@@ -1746,8 +1750,7 @@ impl Driver {
         if let Some(warning) = label_collision(&self.seen_labels, &maps.labels, &label) {
             warn!("{warning}");
         }
-        self.seen_labels.insert(maps.labels.clone(), label);
-        self.seen_by.insert(maps.labels.clone(), i);
+        self.note_labels(i, &maps.labels, label);
 
         let (labels, seed) = (maps.labels.clone(), maps.metadata.clone());
         let rec = self
@@ -1871,10 +1874,7 @@ impl Driver {
         .await
         .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
         let old = std::mem::take(&mut self.slots[i].maps);
-        if self.seen_by.get(&old.labels) == Some(&i) {
-            self.seen_labels.remove(&old.labels);
-            self.seen_by.remove(&old.labels);
-        }
+        self.forget_labels(i, &old.labels);
         let slot = &mut self.slots[i];
         slot.added = false;
         slot.last_stamp = None;
@@ -1925,8 +1925,40 @@ impl Driver {
         })
         .await
         .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
+        if maps.labels != self.slots[i].maps.labels {
+            let old = self.slots[i].maps.labels.clone();
+            self.forget_labels(i, &old);
+            let label = self.slots[i].label();
+            self.note_labels(i, &maps.labels, label);
+        }
         self.slots[i].maps = maps;
         Ok(())
+    }
+
+    /// Note that slot `i` records under `labels`, shown as `label` in the
+    /// identical-labels warning.
+    fn note_labels(&mut self, i: usize, labels: &BTreeMap<String, String>, label: String) {
+        self.seen_labels.entry(labels.clone()).or_insert(label);
+        self.seen_by.entry(labels.clone()).or_default().insert(i);
+    }
+
+    /// Note that slot `i` no longer records under `labels`; the set leaves
+    /// the warning's list when no slot records under it.
+    fn forget_labels(&mut self, i: usize, labels: &BTreeMap<String, String>) {
+        let Some(slots) = self.seen_by.get_mut(labels) else {
+            return;
+        };
+        slots.remove(&i);
+        match slots.iter().next().copied() {
+            None => {
+                self.seen_by.remove(labels);
+                self.seen_labels.remove(labels);
+            }
+            Some(other) => {
+                let label = self.slots[other].label();
+                self.seen_labels.insert(labels.clone(), label);
+            }
+        }
     }
 
     async fn finish(&mut self, stop: Stop, cancel: CancellationToken) -> Result<Summary, Error> {
@@ -1989,7 +2021,7 @@ impl Driver {
         self.abort_tasks();
         if let Some(e) = failure {
             self.fail(e.clone()).await;
-            return Err(Error::Archive(e));
+            return Err(Error::Archive(self.failed.clone().unwrap_or(e)));
         }
         self.commit(false).await;
         if let Some(e) = &self.failed {
@@ -2134,6 +2166,10 @@ impl Driver {
             .filter_map(|(i, s)| match &s.kind {
                 Kind::Endpoint(ep) if ep.opened.is_some() => {
                     Some((i, ep.spec.url.clone(), ep.epoch.clone()))
+                }
+                // A scrape has no epoch to name.
+                Kind::Endpoint(ep) if matches!(ep.mode, Mode::Scraped { .. }) => {
+                    Some((i, ep.spec.url.clone(), None))
                 }
                 _ => None,
             })
@@ -2589,7 +2625,7 @@ impl Driver {
                 }
                 warn!(
                     "{label}: its metadata had not arrived when the run ended; the recording \
-                     keeps the labels and metadata of its stream handshake"
+                     keeps the labels and metadata it was added with"
                 );
             };
             let reply = match late.task.take() {
@@ -2636,7 +2672,7 @@ impl Driver {
                 Err(why) => {
                     warn!(
                         "{label}: {why} after {retries} retries; the recording keeps the \
-                         labels and metadata of its stream handshake"
+                         labels and metadata it was added with"
                     );
                     ep.late_enrich = None;
                     continue;
@@ -2694,8 +2730,9 @@ impl Driver {
     /// Late activation, in steps so that no tick waits on detection or on
     /// the probe hook: a pending endpoint is detected on its own task, one
     /// in flight per endpoint, and the tick that consumes a `Pending` starts
-    /// the next. A streamed endpoint's `enrich` runs on its own task, and it
-    /// is added on the first tick after that returns or times out.
+    /// the next. A streamed or scraped endpoint's `enrich` runs on its own
+    /// task, and it is added on the first tick after that returns or times
+    /// out.
     async fn activate(&mut self) -> Result<(), String> {
         let Some((client, probe)) = self.client() else {
             return Ok(());
@@ -2807,7 +2844,12 @@ impl Driver {
                                 url: scrape,
                                 converter: PrometheusConverter::new(),
                             };
-                            added.push(i);
+                            let probe = probe.clone();
+                            let url = url.clone();
+                            ep.enriching = Some(tokio::spawn(async move {
+                                probe::enrich_within(probe.as_ref(), &url, None, timeout).await
+                            }));
+                            self.slots[i].state = SourceState::Activating;
                         }
                     }
                 }
@@ -2918,8 +2960,8 @@ fn adopt_enrich(ep: &mut Endpoint, reply: Result<probe::Enriched, String>) {
         }
         Err(why) => {
             warn!(
-                "{}: {why}; its recording is added with the labels and metadata of its stream \
-                 handshake, and its metadata is asked for again",
+                "{}: {why}; its recording is added without the probe hook's labels and \
+                 metadata, and its metadata is asked for again",
                 layered::instance(&ep.spec.url)
             );
             ep.late_enrich = Some(LateEnrich {

@@ -87,4 +87,65 @@ async fn a_split_with_the_same_labels_does_not_warn_about_them() {
         "{log}"
     );
     assert!(!log.contains("carry identical labels"), "{log}");
+
+    // Two endpoints given one label set (the caller sets `instance` on
+    // both): the second warns at its add, and when the first changes
+    // producer its new recording warns again, against the second.
+    let before = captured.0.lock().unwrap().len();
+    let changing = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        restarted_metadata: map(&[("metriken.producer.name", "b")]),
+        ..stream_only(&[], &[("metriken.producer.name", "a")])
+    })
+    .await;
+    let steady = serve(stream_only(&[], &[("metriken.producer.name", "a")])).await;
+    let shared = |url: &url::Url| {
+        EndpointSpec::new(url.clone())
+            .with_label("instance", "shared")
+            .with_label("zone", "z")
+    };
+    let detected = detect(
+        &client(),
+        &DetectConfig::new(interval, Duration::from_secs(2)),
+        vec![shared(&changing.url), shared(&steady.url)],
+        &NoProbe,
+    )
+    .await;
+    let (recorder, _ids, mut rx) = Recorder::start(
+        RecorderConfig::new(dir.path().join("shared.dendro"), interval),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            match rx.recv().await {
+                Some(Event::ProducerChanged { .. }) => break,
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        }
+    })
+    .await
+    .expect("the producer change is seen within 6 s");
+    drop(rx);
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let log = String::from_utf8(captured.0.lock().unwrap()[before..].to_vec()).unwrap();
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("carry identical labels"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{log}");
+    let steady_port = steady.url.port().unwrap().to_string();
+    assert!(
+        warnings[1].contains(&steady_port),
+        "the second warning names the endpoint still recording: {}",
+        warnings[1]
+    );
 }
