@@ -5,10 +5,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use metriken_model::identity::ProducerIdentity;
 use metriken_model::wire::{Layout, WireNames, WIRE_NAMES};
 #[cfg(feature = "http")]
 use metriken_model::wire::{HANDSHAKE_FRAME_INTERVAL, HANDSHAKE_UPDATE_FLOOR};
 use metriken_model::Snapshot;
+use metriken_storage::layers::{self, Entry, Layer};
 use metriken_storage::writer::Staged;
 use metriken_storage::{ArchiveWriter, SourceRecorder, WriterConfig};
 use tokio::sync::{mpsc, oneshot};
@@ -17,11 +19,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::keys;
+use crate::layered::{self, Maps};
 
 #[cfg(feature = "http")]
 use crate::identity::Identity;
 #[cfg(feature = "http")]
-use crate::restart::{self, Restart, FETCH_ATTEMPTS};
+use crate::restart::{Restart, FETCH_ATTEMPTS};
 #[cfg(feature = "http")]
 use metriken_storage::StreamDecoder;
 #[cfg(feature = "http")]
@@ -67,15 +70,26 @@ impl Stamp {
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct SourceIdentity {
-    /// The recording's labels; `source` names it.
+    /// The recording's labels, written to its user layer, as the labels a
+    /// caller gives an endpoint are. A `source` label names it in events and
+    /// the summary.
     pub labels: BTreeMap<String, String>,
-    /// The recording's metadata. These keys are the caller's.
+    /// The recording's metadata, written to its producer layer: what the
+    /// process declares about itself, as a stream handshake's metadata is,
+    /// except that a `metriken.` key is refused (give a producer identity as
+    /// [`producer`](Self::producer)) and `events` is stored as given outside
+    /// the layers. `transport` and `sampling_interval_ms` are the recorder's
+    /// and are left out.
     pub metadata: BTreeMap<String, String>,
     /// The wall clock the source's timeline is anchored to: its stamps'
     /// `ts` are `clock_anchor_wall_ns + monotonic elapsed`.
     pub clock_anchor_wall_ns: u64,
-    /// The process's producer epoch, written as `producer_epoch`.
+    /// The process's producer epoch, the epoch of the source's recorder and
+    /// producer entries.
     pub epoch: Option<String>,
+    /// The process's producer identity, written to its producer layer as
+    /// `producer_name`, `version`, `build` and the `host` label.
+    pub producer: Option<ProducerIdentity>,
 }
 
 impl SourceIdentity {
@@ -92,12 +106,20 @@ impl SourceIdentity {
             metadata,
             clock_anchor_wall_ns,
             epoch: None,
+            producer: None,
         }
     }
 
     /// With the process's producer epoch.
     pub fn with_epoch(mut self, epoch: impl Into<String>) -> Self {
         self.epoch = Some(epoch.into());
+        self
+    }
+
+    /// With the process's producer identity
+    /// (`metriken_exposition::producer_identity!()`).
+    pub fn with_producer(mut self, producer: ProducerIdentity) -> Self {
+        self.producer = Some(producer);
         self
     }
 }
@@ -189,7 +211,7 @@ pub enum Stop {
 /// them late, in order. `Dropped`, `Reconnected` and `Restarted`, which a
 /// producer that flaps or restarts in a loop emits without limit, are
 /// counted in `Lagged` instead once 1,024 events are queued (a restart is
-/// still written into the recording's `producer_epochs`). The others
+/// still written into the recording's recorder and producer layers). The others
 /// (`Active`, `Pending`, `Refused`, `LabelsNotApplied`, `Failed`) come at
 /// most a few per source,
 /// so the queue stays bounded. Events still
@@ -199,8 +221,11 @@ pub enum Stop {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
-    /// The source is in the archive. `name` is its `source`, and `inferred`
-    /// says that nobody named it and `name` was made from its URL.
+    /// The source is in the archive. `name` is the `source` label the
+    /// caller, the producer or the probe hook gave it, and `inferred` says
+    /// that nobody named it and `name` was made from its URL. The recorder
+    /// writes no `source` of its own either way. An unnamed local source is
+    /// shown as `source <id>`, also with `inferred`.
     Active {
         source: SourceId,
         transport: ActiveTransport,
@@ -232,9 +257,12 @@ pub enum Event {
         source: SourceId,
         labels: BTreeMap<String, String>,
     },
-    /// A producer restart is now written into the recording's metadata
-    /// (`producer_epochs`), with the new process's `version` when it
-    /// reported one.
+    /// A producer restart is now written into the recording's identity
+    /// layers: a recorder entry for the new epoch and a producer entry for
+    /// its handshake. `version` is what the new process reported, from the
+    /// probe hook or else its handshake. It can differ from the recording's
+    /// `version`, where the handshake's (the producer layer) wins over the
+    /// hook's (the recorder layer).
     Restarted {
         source: SourceId,
         epoch: String,
@@ -274,8 +302,8 @@ pub struct SourceSummary {
     pub id: SourceId,
     /// The endpoint's URL; `None` for a local source.
     pub endpoint: Option<String>,
-    /// The recording's `source`, once it was added; before, the caller's
-    /// `source` label if it gave one.
+    /// The name the recording is shown under ([`Event::Active`]'s), once
+    /// it was added; before, the caller's `source` label if it gave one.
     pub name: Option<String>,
     pub state: SourceState,
     pub transport: Option<ActiveTransport>,
@@ -363,7 +391,7 @@ pub enum Error {
     Archive(String),
     /// No such source, or one that was refused before it was recorded.
     Source(String),
-    /// A metadata key the recorder writes itself.
+    /// A label or metadata key the recorder or dendro writes itself.
     Reserved(String),
     /// The recorder is gone.
     Closed,
@@ -388,7 +416,8 @@ pub enum StartError {
     Create(String),
     /// A source could not be added to the new archive.
     AddSource(String),
-    /// The caller set a key the recorder writes itself.
+    /// The caller set a label or metadata key the recorder or dendro writes
+    /// itself.
     Reserved(String),
 }
 
@@ -488,7 +517,7 @@ impl Recorder {
 
         #[cfg(feature = "http")]
         for d in detected {
-            reserved(&d.spec().metadata)?;
+            reserved(&d.spec().labels, &d.spec().metadata)?;
             let id = SourceId(slots.len() as u32);
             let (spec, mode, state, opened) = match d {
                 Detected::Streamed { spec, subscription } => (
@@ -528,7 +557,7 @@ impl Recorder {
         let mut ids: Vec<SourceId> = slots.iter().map(|s| s.id).collect();
         for source in local {
             let identity = source.identity();
-            reserved(&identity.metadata)?;
+            reserved(&identity.labels, &identity.metadata)?;
             let id = SourceId(slots.len() as u32);
             let mut slot = Slot::new(
                 id,
@@ -668,26 +697,45 @@ impl Recorder {
     }
 }
 
-/// Refuse the keys the recorder writes from a producer's handshake and
-/// rewrites on every restart: a caller's value would seed the restart
-/// history with an epoch no process had.
-fn reserved(metadata: &BTreeMap<String, String>) -> Result<(), StartError> {
-    reserved_key(metadata).map_err(StartError::Reserved)
+/// Refuse a caller's label or metadata key that the identity layers or
+/// dendro own: a `metriken.` key, the flat epoch keys, whose epochs are the
+/// recorder layer's entries, and dendro's `encoder` and `writer_sessions`.
+/// dendro's `events` is the caller's to write, outside the layers.
+fn reserved(
+    labels: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, String>,
+) -> Result<(), StartError> {
+    reserved_key(labels, metadata).map_err(StartError::Reserved)
 }
 
-fn reserved_key(metadata: &BTreeMap<String, String>) -> Result<(), String> {
-    for key in [keys::PRODUCER_EPOCH, keys::PRODUCER_EPOCHS] {
-        if metadata.contains_key(key) {
-            return Err(format!(
-                "{key} is written by the recorder from the producer's handshake and rewritten \
-                 when the producer restarts, so it cannot be set"
-            ));
-        }
+fn reserved_key(
+    labels: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let key = labels
+        .keys()
+        .find(|k| layered::refused_label(k))
+        .or_else(|| {
+            metadata
+                .keys()
+                .find(|k| layers::forbidden_metadata(k) && *k != layered::EVENTS)
+        });
+    match key.map(String::as_str) {
+        None => Ok(()),
+        Some(key) if key.starts_with(layers::RESERVED_PREFIX) => Err(format!(
+            "{key} is under metriken., whose keys the recorder writes, so it cannot be set"
+        )),
+        Some(key @ (keys::PRODUCER_EPOCH | keys::PRODUCER_EPOCHS)) => Err(format!(
+            "{key} is written by the recorder from the producer's handshake as the recording's \
+             epochs, so it cannot be set"
+        )),
+        Some(key) => Err(format!(
+            "{key} is a key dendro maintains for the source, so it cannot be set"
+        )),
     }
-    Ok(())
 }
 
-fn wall_now_ns() -> u64 {
+pub(crate) fn wall_now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -749,7 +797,7 @@ impl Emitter {
     fn must(&mut self, event: Event) {
         // Each can be emitted without limit by a producer that flaps or
         // restarts in a loop. A restart's history is kept in the
-        // recording's `producer_epochs` metadata either way.
+        // recording's recorder layer either way.
         let unbounded = matches!(
             event,
             Event::Dropped { .. } | Event::Reconnected { .. } | Event::Restarted { .. }
@@ -867,8 +915,8 @@ struct Endpoint {
     pump: Option<JoinHandle<()>>,
     hook_labels: BTreeMap<String, String>,
     hook_metadata: BTreeMap<String, String>,
-    /// The first connection's: a recording's labels are fixed when it is
-    /// added.
+    /// The latest connection's, written as the producer entry when the
+    /// recording is added and at a restart.
     handshake_labels: BTreeMap<String, String>,
     /// The latest connection's: a restarted producer's replaces it. The
     /// stream's own keys (the served interval and the update floor) are
@@ -975,15 +1023,14 @@ impl Endpoint {
                  their whole member list on each change"
             );
         }
-        let handshake = sub.handshake();
-        self.handshake_labels = handshake.labels.clone();
         self.mode = Mode::Streamed;
-        self.adopt(handshake, false);
+        self.adopt(sub.handshake());
     }
 
-    /// Take a handshake's anchor, metadata and epoch. Returns the new epoch
-    /// when it differs from the one on record: a restarted producer.
-    fn adopt(&mut self, handshake: &Handshake, rows_staged: bool) -> Option<String> {
+    /// Take a handshake's anchor, labels, metadata and epoch. Returns the new
+    /// epoch when it differs from the one on record: a restarted producer.
+    fn adopt(&mut self, handshake: &Handshake) -> Option<String> {
+        self.handshake_labels = handshake.labels.clone();
         // Zero is what no producer anchors at (1970), so it is not an anchor.
         if handshake.clock_anchor_wall_ns != 0 {
             self.anchor = Some(handshake.clock_anchor_wall_ns);
@@ -1014,7 +1061,8 @@ impl Endpoint {
                 self.restarts.push(Restart {
                     epoch: seen.to_string(),
                     from_ts: None,
-                    rows_before: rows_staged,
+                    labels: self.handshake_labels.clone(),
+                    metadata: self.handshake_metadata.clone(),
                 });
                 self.restart_fetches = 0;
                 Some(seen.to_string())
@@ -1048,12 +1096,12 @@ struct Slot {
     name: Option<String>,
     /// Whether the archive has a recorder for this source.
     added: bool,
-    /// The recording's metadata as last written.
-    metadata: BTreeMap<String, String>,
-    /// The caller's keys.
+    /// The recording's labels and metadata as last written.
+    maps: Maps,
+    /// The caller's metadata keys.
     pinned: BTreeSet<String>,
-    /// Patches for a source not added yet.
-    pending_patch: BTreeMap<String, String>,
+    /// Patches for a source not added yet, each a user entry at the add.
+    pending: Vec<BTreeMap<String, String>>,
     passes_total: u64,
     first_ts: Option<u64>,
     last_stamp: Option<(u64, i64)>,
@@ -1076,9 +1124,9 @@ impl Slot {
             transport: None,
             name: None,
             added: false,
-            metadata: BTreeMap::new(),
+            maps: Maps::default(),
             pinned,
-            pending_patch: BTreeMap::new(),
+            pending: Vec::new(),
             passes_total: 0,
             first_ts: None,
             last_stamp: None,
@@ -1524,57 +1572,86 @@ impl Driver {
         Ok(())
     }
 
-    /// Add slot `i`'s recording to the archive.
+    /// Add slot `i`'s recording to the archive, its labels and metadata
+    /// written as its identity layers: the recorder's entry for the open and
+    /// for the opening epoch, the producer's entry, and the caller's.
     async fn add_source(&mut self, i: usize) -> Result<(), String> {
         let interval_ms = self.settings.interval.as_millis().to_string();
-        let (labels, mut metadata, anchor, transport, name) = match &self.slots[i].kind {
+        let mut entries: Vec<(Layer, Entry)> = Vec::new();
+        let (anchor, transport, name) = match &self.slots[i].kind {
             Kind::Local { identity, .. } => {
-                let mut metadata = identity.metadata.clone();
+                let none = BTreeMap::new();
+                entries.push((
+                    Layer::Recorder,
+                    layered::opened(None, "local", interval_ms, &none, &none),
+                ));
                 if let Some(epoch) = &identity.epoch {
-                    metadata
-                        .entry(keys::PRODUCER_EPOCH.to_string())
-                        .or_insert_with(|| epoch.clone());
+                    entries.push((Layer::Recorder, layered::epoch(epoch, None, &none)));
                 }
-                metadata
-                    .entry(keys::SAMPLING_INTERVAL_MS.to_string())
-                    .or_insert(interval_ms);
+                entries.push((
+                    Layer::Producer,
+                    layered::producer(
+                        &none,
+                        &identity.metadata,
+                        identity.producer.as_ref(),
+                        identity.epoch.as_deref(),
+                        None,
+                    ),
+                ));
+                entries.push((Layer::User, layered::user(&identity.labels, &none)));
                 let name = identity
                     .labels
                     .get(keys::SOURCE)
                     .cloned()
-                    .unwrap_or_else(|| "local".to_string());
-                let mut labels = identity.labels.clone();
-                labels.insert(keys::SOURCE.to_string(), name.clone());
-                metadata
-                    .entry(keys::SOURCE.to_string())
-                    .or_insert_with(|| name.clone());
-                (
-                    labels,
-                    metadata,
-                    identity.clock_anchor_wall_ns,
-                    ActiveTransport::Local,
-                    name,
-                )
+                    .unwrap_or_else(|| self.slots[i].id.to_string());
+                (identity.clock_anchor_wall_ns, ActiveTransport::Local, name)
             }
             #[cfg(feature = "http")]
             Kind::Endpoint(ep) => {
-                let mut recorder = BTreeMap::new();
                 // A streamed source's interval is the one its producer serves.
                 let interval_ms = ep
                     .served_interval
                     .map_or(interval_ms, |served| served.as_millis().to_string());
-                recorder.insert(keys::SAMPLING_INTERVAL_MS.to_string(), interval_ms);
-                if let Some(epoch) = &ep.epoch {
-                    recorder.insert(keys::PRODUCER_EPOCH.to_string(), epoch.clone());
-                }
-                let identity = Identity {
-                    recorder_metadata: recorder,
-                    ..self.identity_of(ep)
-                };
                 let transport = match ep.mode {
                     Mode::Streamed => ActiveTransport::Stream,
                     _ => ActiveTransport::Prometheus,
                 };
+                let wire = match transport {
+                    ActiveTransport::Stream => "stream",
+                    _ => "prometheus",
+                };
+                entries.push((
+                    Layer::Recorder,
+                    layered::opened(
+                        Some(ep.spec.url.as_str()),
+                        wire,
+                        interval_ms,
+                        &ep.hook_labels,
+                        &ep.hook_metadata,
+                    ),
+                ));
+                if let Some(epoch) = &ep.epoch {
+                    entries.push((
+                        Layer::Recorder,
+                        layered::epoch(epoch, None, &BTreeMap::new()),
+                    ));
+                }
+                if transport == ActiveTransport::Stream {
+                    entries.push((
+                        Layer::Producer,
+                        layered::producer(
+                            &ep.handshake_labels,
+                            &ep.handshake_metadata,
+                            None,
+                            ep.epoch.as_deref(),
+                            None,
+                        ),
+                    ));
+                }
+                entries.push((
+                    Layer::User,
+                    layered::user(&ep.spec.labels, &layered::split_events(&ep.spec.metadata).0),
+                ));
                 // A streamed recording's rows carry the producer's stamps,
                 // so it is anchored on the producer's clock; a scraped one
                 // keeps the recorder's, whose stamps its rows carry.
@@ -1582,23 +1659,37 @@ impl Driver {
                     ActiveTransport::Stream => ep.anchor.unwrap_or(self.anchor_wall_ns),
                     _ => self.anchor_wall_ns,
                 };
-                (
-                    identity.labels(),
-                    identity.metadata(),
-                    anchor,
-                    transport,
-                    identity.source().0,
-                )
+                (anchor, transport, self.identity_of(ep).source().0)
             }
         };
-        metadata.extend(std::mem::take(&mut self.slots[i].pending_patch));
+        // `events` is the caller's, stored as given outside the layers: the
+        // endpoint's or local source's, then each queued patch's.
+        let mut events = match &self.slots[i].kind {
+            Kind::Local { identity, .. } => identity.metadata.get(layered::EVENTS).cloned(),
+            #[cfg(feature = "http")]
+            Kind::Endpoint(ep) => ep.spec.metadata.get(layered::EVENTS).cloned(),
+        };
+        for patch in std::mem::take(&mut self.slots[i].pending) {
+            let (rest, patched) = layered::split_events(&patch);
+            if !rest.is_empty() {
+                entries.push((Layer::User, layered::user(&BTreeMap::new(), &rest)));
+            }
+            events = patched.or(events);
+        }
+        let mut maps = Maps::default();
+        for (layer, entry) in entries {
+            maps.append(layer, entry).map_err(|e| e.to_string())?;
+        }
+        if let Some(events) = events {
+            maps.metadata.insert(layered::EVENTS.to_string(), events);
+        }
         let label = self.slots[i].label();
-        if let Some(warning) = label_collision(&self.seen_labels, &labels, &label) {
+        if let Some(warning) = label_collision(&self.seen_labels, &maps.labels, &label) {
             warn!("{warning}");
         }
-        self.seen_labels.insert(labels.clone(), label);
+        self.seen_labels.insert(maps.labels.clone(), label);
 
-        let seed = metadata.clone();
+        let (labels, seed) = (maps.labels.clone(), maps.metadata.clone());
         let rec = self
             .blocking(move |a| {
                 a.writer
@@ -1611,7 +1702,7 @@ impl Driver {
             archive.recs.insert(i, rec);
         }
         let slot = &mut self.slots[i];
-        slot.metadata = metadata;
+        slot.maps = maps;
         slot.added = true;
         slot.state = SourceState::Active;
         slot.transport = Some(transport);
@@ -1627,7 +1718,7 @@ impl Driver {
         if let Some(e) = &self.failed {
             return Err(Error::Archive(e.clone()));
         }
-        reserved_key(&patch).map_err(Error::Reserved)?;
+        reserved_key(&BTreeMap::new(), &patch).map_err(Error::Reserved)?;
         let i = source.0 as usize;
         let slot = self
             .slots
@@ -1641,17 +1732,26 @@ impl Driver {
         }
         slot.pinned.extend(patch.keys().cloned());
         if !slot.added {
-            slot.pending_patch.extend(patch);
+            slot.pending.push(patch);
             return Ok(());
         }
-        slot.metadata.extend(patch.clone());
+        let (rest, events) = layered::split_events(&patch);
+        let mut maps = self.slots[i].maps.clone();
+        if !rest.is_empty() {
+            let entry = layered::user(&BTreeMap::new(), &rest);
+            maps.append(Layer::User, entry)
+                .map_err(|e| Error::Archive(e.to_string()))?;
+        }
+        if let Some(events) = events {
+            maps.metadata.insert(layered::EVENTS.to_string(), events);
+        }
+        self.write_maps(i, maps).await.map_err(Error::Archive)?;
         let result = self
             .blocking(move |a| -> Result<(), String> {
                 let rec = a
                     .recs
                     .get_mut(&i)
                     .ok_or_else(|| format!("no recording is open for {source}"))?;
-                rec.update_metadata(patch).map_err(|e| e.to_string())?;
                 rec.sync().map_err(|e| e.to_string())
             })
             .await
@@ -1659,21 +1759,30 @@ impl Driver {
         result.map_err(Error::Archive)
     }
 
-    /// Replace keys of slot `i`'s metadata without pinning them, for the
-    /// recorder's own writes.
-    #[cfg(feature = "http")]
-    async fn write_metadata(
-        &mut self,
-        i: usize,
-        patch: BTreeMap<String, String>,
-    ) -> Result<(), String> {
-        self.slots[i].metadata.extend(patch.clone());
+    /// Append `entry` to `layer` of slot `i`'s recording and write the
+    /// labels and metadata the layers give. Whether anything was appended.
+    async fn write_entry(&mut self, i: usize, layer: Layer, entry: Entry) -> Result<bool, String> {
+        let mut maps = self.slots[i].maps.clone();
+        if !maps.append(layer, entry).map_err(|e| e.to_string())? {
+            return Ok(false);
+        }
+        self.write_maps(i, maps).await?;
+        Ok(true)
+    }
+
+    /// Write `maps` as slot `i`'s labels and metadata, and keep them.
+    async fn write_maps(&mut self, i: usize, maps: Maps) -> Result<(), String> {
+        let (labels, metadata) = (maps.labels.clone(), maps.metadata.clone());
         self.blocking(move |a| match a.recs.get_mut(&i) {
-            Some(rec) => rec.update_metadata(patch).map_err(|e| e.to_string()),
+            Some(rec) => rec
+                .set_identity(labels, metadata)
+                .map_err(|e| e.to_string()),
             None => Err("no recording is open".to_string()),
         })
         .await
-        .unwrap_or_else(|| Err("the archive is closed".to_string()))
+        .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
+        self.slots[i].maps = maps;
+        Ok(())
     }
 
     async fn finish(&mut self, stop: Stop, cancel: CancellationToken) -> Result<Summary, Error> {
@@ -1862,12 +1971,8 @@ impl Driver {
     fn identity_of<'a>(&self, ep: &'a Endpoint) -> Identity<'a> {
         Identity {
             user_labels: &ep.spec.labels,
-            user_metadata: &ep.spec.metadata,
-            recorder_metadata: BTreeMap::new(),
             hook_labels: &ep.hook_labels,
-            hook_metadata: &ep.hook_metadata,
             handshake_labels: &ep.handshake_labels,
-            handshake_metadata: &ep.handshake_metadata,
             inferred: &ep.inferred,
         }
     }
@@ -2018,9 +2123,10 @@ impl Driver {
             // The scrape's HELP text, when it named a metric not yet stored.
             // A failed hand-off is retried after the next scrape.
             if let Some(json) = descriptions {
-                let patch = BTreeMap::from([(keys::DESCRIPTIONS.to_string(), json)]);
-                match self.write_metadata(i, patch).await {
-                    Ok(()) => {
+                let mut entry = layered::entry("recorder");
+                entry.metadata = BTreeMap::from([(keys::DESCRIPTIONS.to_string(), json)]);
+                match self.write_entry(i, Layer::Recorder, entry).await {
+                    Ok(_) => {
                         if let Kind::Endpoint(ep) = &mut self.slots[i].kind {
                             if let Mode::Scraped { converter, .. } = &mut ep.mode {
                                 converter.descriptions_stored();
@@ -2122,9 +2228,8 @@ impl Driver {
             }
             StreamEvent::Connected(handshake) => {
                 info!("{label}: stream reconnected");
-                let rows = self.slots[i].first_ts.is_some();
                 let restarted = match &mut self.slots[i].kind {
-                    Kind::Endpoint(ep) => ep.adopt(&handshake, rows).is_some(),
+                    Kind::Endpoint(ep) => ep.adopt(&handshake).is_some(),
                     _ => false,
                 };
                 self.emitter.must(Event::Reconnected {
@@ -2172,10 +2277,11 @@ impl Driver {
         self.emitter.must(Event::Refused { source, reason });
     }
 
-    /// Write each restart into its recording's metadata once a row from the
-    /// new process has been staged. The probe hook's reply is asked for on
-    /// up to [`FETCH_ATTEMPTS`] ticks; on the `last` call there is no next
-    /// tick, so the restart is written at once.
+    /// Write each restart into its recording's identity layers once a row from
+    /// the new process has been staged: per restart, a recorder entry and a
+    /// producer entry (its handshake), each from its first row. The probe
+    /// hook's reply is asked for on up to [`FETCH_ATTEMPTS`] ticks; on the
+    /// `last` call there is no next tick, so the restart is written at once.
     async fn apply_restarts(&mut self, last: bool) {
         let Some((_, probe)) = self.client() else {
             return;
@@ -2218,33 +2324,44 @@ impl Driver {
                 continue;
             };
             ep.restart_fetches = 0;
-            let mut reported = ep.handshake_metadata.clone();
-            reported.extend(hook);
             let restarts = std::mem::take(&mut ep.restarts);
-            let merge = |key: &str, old: &str, new: &str| probe.merge(key, old, new);
-            let patch = restart::metadata_patch(
-                &slot.metadata,
-                slot.first_ts,
-                &restarts,
-                &reported,
-                &slot.pinned,
-                &merge,
-            );
-            let version = patch.get(keys::VERSION).cloned().or_else(|| {
-                (!slot.pinned.contains(keys::VERSION))
-                    .then(|| reported.get(keys::VERSION).cloned())
-                    .flatten()
-            });
+            // Per restart, a recorder entry for its epoch and a producer
+            // entry for its handshake; only the newest process can be asked
+            // about itself, so only its recorder entry has the hook's reply.
+            let none = BTreeMap::new();
+            let mut entries: Vec<(Layer, Entry)> = Vec::new();
+            let mut version = None;
+            for (n, r) in restarts.iter().enumerate() {
+                let newest_one = n + 1 == restarts.len();
+                let reply = if newest_one { &hook } else { &none };
+                entries.push((Layer::Recorder, layered::epoch(&r.epoch, r.from_ts, reply)));
+                let producer =
+                    layered::producer(&r.labels, &r.metadata, None, Some(&r.epoch), r.from_ts);
+                if newest_one {
+                    version = hook
+                        .get(keys::VERSION)
+                        .or_else(|| producer.metadata.get(keys::VERSION))
+                        .cloned();
+                }
+                entries.push((Layer::Producer, producer));
+            }
             let source = slot.id;
-            match self.write_metadata(i, patch).await {
-                Ok(()) => self.emitter.must(Event::Restarted {
+            let mut failed = None;
+            for (layer, entry) in entries {
+                if let Err(e) = self.write_entry(i, layer, entry).await {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            match failed {
+                None => self.emitter.must(Event::Restarted {
                     source,
                     epoch: newest,
                     version,
                 }),
-                Err(e) => warn!(
+                Some(e) => warn!(
                     "{label}: the producer restart could not be written into the recording's \
-                     metadata: {e}"
+                     identity: {e}"
                 ),
             }
         }
@@ -2253,13 +2370,13 @@ impl Driver {
     /// Ask the probe hook again for each recording added without its reply,
     /// and write the metadata of a reply that arrives into the recording.
     ///
-    /// A recording's labels are fixed when it is added, so the reply's
-    /// labels are not applied; a warning names those that would have
-    /// changed them. Its metadata is written under the same precedence as at
-    /// the add: never over the caller's keys, the recorder's own keys or
-    /// `source`. A reply is dropped once the producer restarted, since the
-    /// restart reads the new process's metadata itself. On the `last` call
-    /// a reply that has already arrived is taken and no ask is started.
+    /// The reply's labels are not applied; a warning names those that would
+    /// have changed the recording's. Its metadata is written as a recorder
+    /// entry, under the producer's and the caller's keys, without the
+    /// recorder's own keys or `source`. A reply is dropped once the producer
+    /// restarted, since the restart reads the new process's metadata itself. On
+    /// the `last` call a reply that has already arrived is taken and no ask is
+    /// started.
     async fn retry_enrich(&mut self, last: bool) {
         let Some((_, probe)) = self.client() else {
             return;
@@ -2344,18 +2461,22 @@ impl Driver {
                 }
             };
             ep.late_enrich = None;
-            let Kind::Endpoint(ep) = &self.slots[i].kind else {
+            // A hook label the producer or the caller does not set, and
+            // that the recording does not carry already.
+            let slot = &self.slots[i];
+            let Kind::Endpoint(ep) = &slot.kind else {
                 continue;
             };
-            let added_with = self.identity_of(ep).labels();
-            let would_be = Identity {
-                hook_labels: &labels,
-                ..self.identity_of(ep)
-            }
-            .labels();
-            let lost: BTreeMap<String, String> = would_be
-                .into_iter()
-                .filter(|(k, v)| added_with.get(k) != Some(v))
+            let lost: BTreeMap<String, String> = labels
+                .iter()
+                .filter(|(k, v)| {
+                    k.as_str() != keys::SOURCE
+                        && !layered::refused_label(k)
+                        && !ep.spec.labels.contains_key(*k)
+                        && !ep.handshake_labels.contains_key(*k)
+                        && slot.maps.labels.get(*k) != Some(*v)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             if !lost.is_empty() {
                 let shown: Vec<String> = lost.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -2365,35 +2486,24 @@ impl Driver {
                      them",
                     shown.join(", ")
                 );
-                let source = self.slots[i].id;
+                let source = slot.id;
                 self.emitter.must(Event::LabelsNotApplied {
                     source,
                     labels: lost,
                 });
             }
-            let slot = &self.slots[i];
-            let patch: BTreeMap<String, String> = metadata
-                .iter()
-                .filter(|(k, v)| {
-                    !slot.pinned.contains(*k)
-                        && !matches!(
-                            k.as_str(),
-                            keys::SOURCE | keys::SAMPLING_INTERVAL_MS | keys::PRODUCER_EPOCH
-                        )
-                        && slot.metadata.get(*k) != Some(*v)
-                })
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
             if let Kind::Endpoint(ep) = &mut self.slots[i].kind {
-                ep.hook_metadata = metadata;
+                ep.hook_metadata = metadata.clone();
             }
-            if patch.is_empty() {
+            let entry = layered::late_hook(&metadata);
+            if entry.metadata.is_empty() {
                 continue;
             }
-            let written: Vec<&str> = patch.keys().map(String::as_str).collect();
+            let written: Vec<&str> = entry.metadata.keys().map(String::as_str).collect();
             let written = written.join(", ");
-            match self.write_metadata(i, patch).await {
-                Ok(()) => info!("{label}: its metadata ({written}) arrived on retry {retries}"),
+            match self.write_entry(i, Layer::Recorder, entry).await {
+                Ok(true) => info!("{label}: its metadata ({written}) arrived on retry {retries}"),
+                Ok(false) => {}
                 Err(e) => warn!("{label}: its metadata arrived but could not be written: {e}"),
             }
         }

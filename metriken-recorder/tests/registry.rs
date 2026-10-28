@@ -18,7 +18,10 @@ async fn the_registry_is_recorded_on_the_process_timeline() {
         GroupBuilder::new(DefaultRouter::new("selftest")),
         [("source".to_string(), "selftest".to_string())].into(),
         Default::default(),
-    );
+    )
+    .with_producer(metriken_recorder::ProducerIdentity::new(
+        "selftest-producer",
+    ));
     let (recorder, _ids, rx) = Recorder::start_local(
         RecorderConfig::new(&path, Duration::from_millis(100)),
         vec![Box::new(source)],
@@ -40,10 +43,20 @@ async fn the_registry_is_recorded_on_the_process_timeline() {
     assert_eq!(sources.len(), 1);
     let s = &sources[0];
     assert_eq!(s.labels.get("source").map(String::as_str), Some("selftest"));
-    assert_eq!(
-        s.metadata.get("producer_epoch").map(String::as_str),
-        Some(metriken::epoch::producer_epoch())
-    );
+    let metadata: std::collections::BTreeMap<String, String> =
+        s.metadata.clone().into_iter().collect();
+    assert_eq!(metadata["producer_name"], "selftest-producer");
+    let layers = metriken_storage::layers::Layers::read(&metadata)
+        .unwrap()
+        .expect("the source has layers");
+    let epochs: Vec<Option<&str>> = layers
+        .recorder
+        .entries
+        .iter()
+        .filter(|e| e.epoch.is_some())
+        .map(|e| e.epoch.as_deref())
+        .collect();
+    assert_eq!(epochs, vec![Some(metriken::epoch::producer_epoch())]);
     let tables = catalog.tables(s.id).unwrap();
     assert!(
         tables.iter().any(|t| t.starts_with("selftest/")),

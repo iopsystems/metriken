@@ -976,8 +976,6 @@ mod equiv_tests;
 mod tests {
     use super::*;
 
-    /// The recorder layer's epoch entries give the spans, and the flat keys
-    /// beside them are not read.
     /// The recorder layer's epochs are read in fold order: an epoch with no
     /// `from_ts`, appended after one at 0, folds before it, so the epoch at 0
     /// covers every row.
@@ -1008,6 +1006,8 @@ mod tests {
         assert_eq!(epochs, vec!["e2"]);
     }
 
+    /// The recorder layer's epoch entries give the spans, and the flat keys
+    /// beside them are not read.
     #[test]
     fn epoch_spans_read_the_recorder_layer() {
         let mut labels = BTreeMap::new();

@@ -1422,6 +1422,21 @@ impl SourceRecorder {
         self.writer.update_metadata(patch).map_err(boxed)
     }
 
+    /// Replace this source's labels and metadata with these while it
+    /// records, ordered with the ticks around it like
+    /// [`update_metadata`](Self::update_metadata) and, like it,
+    /// fire-and-forget. A key absent from either map is removed, except
+    /// dendro's `encoder` and `writer_sessions`, which keep their stored
+    /// values; `events` is written as given. For writing the identity layers
+    /// ([`layers::append`](crate::layers::append)), which rewrite both maps.
+    pub fn set_identity(
+        &mut self,
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        self.writer.set_identity(labels, metadata).map_err(boxed)
+    }
+
     /// Wait until everything this source sent has landed, so a reader sees
     /// its last tick.
     pub fn sync(&mut self) -> Result<(), Error> {

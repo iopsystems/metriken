@@ -43,10 +43,15 @@ pub enum Transport {
 pub struct EndpointSpec {
     pub url: Url,
     pub transport: Transport,
-    /// The highest-ranked labels; a `source` here names the recording.
+    /// The recording's user-layer labels, which win over the producer's and
+    /// the recorder's; a `source` here names the recording in events and
+    /// the summary. A `metriken.` key is refused.
     pub labels: BTreeMap<String, String>,
-    /// The highest-ranked metadata. These keys are the caller's: a producer
-    /// restart, or a scrape's HELP text, never replaces them.
+    /// The recording's user-layer metadata, which a producer restart or a
+    /// scrape's HELP text does not replace (`descriptions` given here stops
+    /// the HELP text from being written). A `metriken.` key, the flat
+    /// epoch keys, `encoder` and `writer_sessions` are refused; `events` is
+    /// stored as given, outside the layers.
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -67,7 +72,8 @@ impl EndpointSpec {
         self
     }
 
-    /// With the label `key=value`; `source` names the recording.
+    /// With the label `key=value`; `source` names the recording in events
+    /// and the summary.
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.labels.insert(key.into(), value.into());
         self

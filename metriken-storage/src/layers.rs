@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use metriken_model::identity::ProducerIdentity;
 use serde::{Deserialize, Serialize};
 
 /// The prefix of every metadata key metriken reserves, the layer keys among
@@ -43,6 +44,34 @@ pub const USER_KEY: &str = "metriken.layer.user";
 /// metrics still describes the ones it reported before.
 pub const UNION_KEYS: &[&str] = &["descriptions"];
 
+/// The producer layer's metadata key for a producer identity's name.
+pub const PRODUCER_NAME: &str = "producer_name";
+/// The producer layer's metadata key for a producer identity's version.
+pub const VERSION: &str = "version";
+/// The producer layer's metadata key for a producer identity's build.
+pub const BUILD: &str = "build";
+/// The producer layer's label for a producer identity's host.
+pub const HOST: &str = "host";
+
+/// Add `identity` to a producer entry's maps: [`PRODUCER_NAME`],
+/// [`VERSION`] and [`BUILD`] to `metadata` and [`HOST`] to `labels`, each
+/// that is set, replacing what the maps held under those keys.
+pub fn identity_keys(
+    identity: &ProducerIdentity,
+    labels: &mut BTreeMap<String, String>,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    metadata.insert(PRODUCER_NAME.to_string(), identity.name.clone());
+    for (key, value) in [(VERSION, &identity.version), (BUILD, &identity.build)] {
+        if let Some(value) = value {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(host) = &identity.host {
+        labels.insert(HOST.to_string(), host.clone());
+    }
+}
+
 /// The flat epoch keys of a source recorded before the layers, which the
 /// recorder layer's entries replace. An entry may not set them.
 const PRODUCER_EPOCH: &str = "producer_epoch";
@@ -52,6 +81,20 @@ const PRODUCER_EPOCHS: &str = "producer_epochs";
 /// derivation leaves them where they are, and an entry may not set or unset
 /// them.
 const UNLAYERED: &[&str] = &["writer_sessions", "encoder", "events"];
+
+/// Whether an entry may not set or unset metadata key `key`: one under
+/// [`RESERVED_PREFIX`], a flat epoch key (`producer_epoch`,
+/// `producer_epochs`), or a key dendro maintains (`writer_sessions`,
+/// `encoder`, `events`). A label is forbidden only under
+/// [`RESERVED_PREFIX`]. A writer filters what it did not choose (a
+/// producer's handshake) with this before building an entry, since
+/// [`append`] refuses the whole entry.
+pub fn forbidden_metadata(key: &str) -> bool {
+    key.starts_with(RESERVED_PREFIX)
+        || key == PRODUCER_EPOCH
+        || key == PRODUCER_EPOCHS
+        || UNLAYERED.contains(&key)
+}
 
 /// One of a source's three identity layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -176,14 +219,7 @@ impl Entry {
         labels
             .map(String::as_str)
             .find(|k| k.starts_with(RESERVED_PREFIX))
-            .or_else(|| {
-                metadata.map(String::as_str).find(|k| {
-                    k.starts_with(RESERVED_PREFIX)
-                        || *k == PRODUCER_EPOCH
-                        || *k == PRODUCER_EPOCHS
-                        || UNLAYERED.contains(k)
-                })
-            })
+            .or_else(|| metadata.map(String::as_str).find(|k| forbidden_metadata(k)))
     }
 }
 
@@ -423,6 +459,11 @@ impl Layers {
     ///   at-open recorder entry with `seq` 1, which folds over the at-open
     ///   entry, and an id built from the name. Readers holding different
     ///   evidence derive the same entries apart from this one;
+    /// - a producer identity its metadata declares under
+    ///   `metriken.producer.*` (a producer that declared one, recorded before
+    ///   the recorder read it), as one producer entry, `seq` 0, written as
+    ///   [`identity_keys`] writes it. Above the at-open recorder entry, so its
+    ///   `version` replaces a flat `version` the source carried;
     /// - each epoch, as a recorder entry carrying that `epoch` and its
     ///   `from_ts`, read as [`epoch_spans`](crate::process::epoch_spans)
     ///   reads the flat keys: the `producer_epochs` list when it parses and
@@ -465,6 +506,11 @@ impl Layers {
             .collect();
         if !opened.metadata.is_empty() {
             layers.recorder.entries.push(opened);
+        }
+        if let Some(identity) = ProducerIdentity::from_metadata(metadata) {
+            let mut declared = Entry::new(derived_id(uuid, Layer::Producer, None, None), "upgrade");
+            identity_keys(&identity, &mut declared.labels, &mut declared.metadata);
+            layers.producer.entries.push(declared);
         }
         if let Some(name) = &evidence.producer_name {
             let tag = format!("producer_name:{name}");
@@ -653,9 +699,11 @@ fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
 /// entry with the same contents as the producer entry that wins the fold
 /// appends nothing; so does one with the same contents as the producer entry
 /// appended last when appending it would change neither the layer's fold nor
-/// the fold of the layer's entries in the entry's epoch. A reconnect
-/// resending its handshake that changes neither is skipped; one that changes
-/// either is appended.
+/// the fold of the layer's entries in the entry's epoch. A skipped entry is
+/// not in the layer, so a later entry whose `from_ts` falls between the
+/// copy on record and the skipped one folds after both, where the full
+/// sequence of handshakes would have put the skipped one after it. Only the
+/// producer layer is deduplicated this way.
 ///
 /// A source with no layer keys is first given the layers
 /// [`Layers::derive_legacy`] reads from it, with `uuid` and `evidence`, so
@@ -685,8 +733,9 @@ fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
 /// A refused entry, and a layer key (`metriken.layer.*`) in `metadata` that
 /// does not parse. The second fails this and every later `append` on the
 /// source until the key is repaired or removed outside `append`; an entry
-/// cannot unset it. A layer whose highest `seq` is `u64::MAX` refuses a
-/// further entry. Nothing is changed on an error.
+/// cannot unset it. An `append` that must add an entry to a layer whose
+/// highest `seq` is `u64::MAX`, the `external` entry included, fails.
+/// Nothing is changed on an error.
 pub fn append(
     labels: &mut BTreeMap<String, String>,
     metadata: &mut BTreeMap<String, String>,
@@ -1850,5 +1899,119 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.key, USER_KEY);
+    }
+
+    /// A producer entry with the fold winner's labels and metadata in
+    /// another epoch, or with different unset lists, is appended: neither
+    /// repeats it.
+    #[test]
+    fn the_dedupe_compares_epoch_and_unset_lists() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let with_epoch = |id: &str, epoch: &str| Entry {
+            epoch: Some(epoch.to_string()),
+            ..entry(id, "producer", &[("x", "1")])
+        };
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            with_epoch("a", "E")
+        ));
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            with_epoch("b", "F")
+        ));
+        let mut unsets = with_epoch("c", "F");
+        unsets.unset_metadata = vec!["k".to_string()];
+        assert!(put(&mut labels, &mut metadata, Layer::Producer, unsets));
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert_eq!(layers.producer.entries.len(), 3);
+    }
+
+    /// A user or recorder entry repeating its layer's fold winner is
+    /// appended: only the producer layer is deduplicated.
+    #[test]
+    fn only_the_producer_layer_is_deduplicated() {
+        for layer in [Layer::User, Layer::Recorder] {
+            let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+            for id in ["a", "b"] {
+                assert!(put(
+                    &mut labels,
+                    &mut metadata,
+                    layer,
+                    entry(id, "record", &[("k", "v")])
+                ));
+            }
+            let layers = Layers::read(&metadata).unwrap().unwrap();
+            assert_eq!(layers.get(layer).entries.len(), 2, "{layer:?}");
+        }
+    }
+
+    /// The appended entry takes a `seq` after the `external` entry recorded
+    /// before it, so it folds after it whatever the ids.
+    #[test]
+    fn an_entry_folds_after_the_external_change_before_it() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("z", "record", &[("k", "v")]),
+        );
+        labels.insert("k".to_string(), "outside".to_string());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("a", "record", &[("k", "mine")]),
+        );
+        assert_eq!(labels["k"], "mine");
+    }
+
+    /// A legacy source whose metadata declares a producer identity under
+    /// `metriken.producer.*` derives a producer entry from it; the declared
+    /// keys stay in its metadata.
+    #[test]
+    fn a_declared_producer_identity_is_derived() {
+        let mut labels = map(&[("source", "svc")]);
+        let mut metadata = map(&[
+            ("metriken.producer.name", "cachecannon"),
+            ("metriken.producer.version", "0.4.0"),
+            ("metriken.producer.host", "lg-1"),
+            ("metriken.producer.build", "c0ffee"),
+            ("version", "0.3.0"),
+        ]);
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("a", "record", &[("k", "v")]),
+        );
+        assert_eq!(labels["host"], "lg-1");
+        assert_eq!(metadata[PRODUCER_NAME], "cachecannon");
+        assert_eq!(metadata[VERSION], "0.4.0");
+        assert_eq!(metadata[BUILD], "c0ffee");
+        assert_eq!(metadata["metriken.producer.name"], "cachecannon");
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert_eq!(layers.producer.entries.len(), 1);
+        assert_eq!(layers.producer.entries[0].by, "upgrade");
+    }
+
+    /// `identity_keys` replaces what the maps held under its keys.
+    #[test]
+    fn identity_keys_replace_the_maps_values() {
+        let identity = ProducerIdentity::new("new")
+            .with_version("2")
+            .with_host("h");
+        let mut labels = map(&[("host", "old")]);
+        let mut metadata = map(&[(PRODUCER_NAME, "old"), (VERSION, "1"), ("k", "v")]);
+        identity_keys(&identity, &mut labels, &mut metadata);
+        assert_eq!(labels, map(&[("host", "h")]));
+        assert_eq!(
+            metadata,
+            map(&[(PRODUCER_NAME, "new"), (VERSION, "2"), ("k", "v")])
+        );
     }
 }

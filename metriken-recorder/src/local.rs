@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use metriken_exposition::group_builder::{GroupBuilder, MemberNames, Router, Stamp as PassStamp};
+use metriken_model::identity::ProducerIdentity;
 use metriken_model::Snapshot;
 
 use crate::{LocalSource, SourceIdentity, Stamp};
@@ -16,10 +17,13 @@ pub struct RegistrySource<R: Router, N: MemberNames> {
     builder: GroupBuilder<R, N>,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
+    producer: Option<ProducerIdentity>,
 }
 
 impl<R: Router, N: MemberNames> RegistrySource<R, N> {
-    /// A source recorded with `labels` (a `source` names it) and `metadata`.
+    /// A source recorded with `labels` (a `source` names it), the user
+    /// layer's, and `metadata`, the producer layer's
+    /// ([`SourceIdentity`]).
     pub fn new(
         builder: GroupBuilder<R, N>,
         labels: BTreeMap<String, String>,
@@ -29,7 +33,15 @@ impl<R: Router, N: MemberNames> RegistrySource<R, N> {
             builder,
             labels,
             metadata,
+            producer: None,
         }
+    }
+
+    /// With the process's producer identity
+    /// (`metriken_exposition::producer_identity!()`).
+    pub fn with_producer(mut self, producer: ProducerIdentity) -> Self {
+        self.producer = Some(producer);
+        self
     }
 }
 
@@ -45,6 +57,7 @@ where
             metadata: self.metadata.clone(),
             clock_anchor_wall_ns: u64::try_from(anchor).unwrap_or_default(),
             epoch: Some(metriken::epoch::producer_epoch().to_string()),
+            producer: self.producer.clone(),
         }
     }
 

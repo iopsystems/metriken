@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-recorder 0.6.0
+
+Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
+
+- **Changed:** a recording's labels and metadata are written as its
+  identity layers (metriken-storage `layers`), each write through
+  `layers::append` and dendro's `SourceWriter::set_identity`:
+  - the recorder layer: at the add, `instance` (an endpoint's URL, as
+    parsed) as a label, `transport` (`stream`, `prometheus`, `local`),
+    `sampling_interval_ms`, and the probe hook's labels and metadata; one
+    entry per producer epoch, the opening one with no `from_ts` and each
+    restart's from its first row, the newest restart's with the hook's
+    reply about its process; a scrape's HELP text as `descriptions`; a
+    late hook reply's metadata. The hook's labels and metadata now sit
+    below the handshake's, where they were above;
+  - the producer layer: a stream handshake's labels and metadata, or a
+    local source's `SourceIdentity` metadata, at the add and for each
+    restart's own handshake, without dendro's keys (`events`, `encoder`,
+    `writer_sessions`). A producer identity (`metriken.producer.*`
+    handshake keys, or `SourceIdentity::producer`) is written as
+    `producer_name`, `version`, `build` and the `host` label; the
+    stream's own `metriken.` keys are not stored;
+  - the user layer: an endpoint's labels and metadata, a local source's
+    labels, and each `Recorder::patch_metadata`. A value set to `""`
+    removes the key from the recording, where it was stored as `""`.
+
+  A caller's `events` is stored as given, outside the layers, as before. A
+  handshake's or a local source's `instance` label and `transport` and
+  `sampling_interval_ms` metadata are left out of its entry, so they do not
+  replace the recorder's; a local source's own `sampling_interval_ms`, which
+  was kept before, gives way to the recorder's tick.
+- **Changed:** the recorder writes no `source` of its own: no name
+  inferred from the URL, no `local` default, and not the probe hook's
+  `source`. A `source` label the caller or the producer gives is kept in
+  its layer. The recorder writes no `source` metadata key, which it wrote
+  beside the label before; a recording has one only when the caller's or
+  the producer's metadata sets it, so metriken-query's
+  `MetricsSource::source()` returns `""` otherwise. `Event::Active`'s
+  `name` is the `source` label the caller, the producer or the hook gave,
+  else the name inferred from an endpoint's URL, else, for a local source,
+  `source <id>`, where it was `local`.
+- **Changed:** new recordings carry no flat `producer_epoch` or
+  `producer_epochs`; their epochs are the recorder layer's entries, which
+  metriken-storage's `epoch_spans` reads. `Event::Restarted`'s `version`
+  is the new process's, from the probe hook or else its handshake.
+- **Changed:** a caller's label or metadata key under `metriken.`, and
+  dendro's `encoder` and `writer_sessions`, are refused, at start
+  (`StartError::Reserved`) and by `patch_metadata` (`Error::Reserved`), as
+  `producer_epoch` and `producer_epochs` are.
+- **Added:** `SourceIdentity::producer` and `with_producer`,
+  `RegistrySource::with_producer`, and `ProducerIdentity` re-exported.
+- **Removed:** `restart::metadata_patch`, `restart::Restart` and
+  `restart::FETCH_ATTEMPTS` (the `restart` module is private).
+  `Probe::merge` is no longer called: in each layer the fold takes a key's
+  newest value, the higher layer winning, and merges `descriptions` key by
+  key.
+
 ### metriken-model 0.2.1
 
 - **Added:** `identity::ProducerIdentity` (re-exported at the crate root),
@@ -80,6 +137,15 @@ Requires metriken-model 0.2.1.
   recorder layer does not parse. A legacy source gains a
   recorder layer at its first `append` to any layer, derived from those
   keys.
+- **Added:** `SourceRecorder::set_identity(labels, metadata)` (feature
+  `write`), dendro 0.6.1's `SourceWriter::set_identity` for a recording
+  source. Requires dendro 0.6.1.
+- **Added:** `layers::forbidden_metadata`, whether an entry may not carry
+  a metadata key, for a writer filtering input it did not choose.
+- **Added:** `layers::identity_keys` and the constants `PRODUCER_NAME`,
+  `VERSION`, `BUILD` and `HOST`: a producer identity as producer-layer
+  keys. `derive_legacy` derives a producer entry from a legacy source's
+  `metriken.producer.*` metadata.
 
 ### metriken-query 0.42.2
 

@@ -44,9 +44,9 @@ struct MetricKey {
 }
 
 impl PrometheusConverter {
-    /// A converter for one endpoint's scrapes. The endpoint's `source` and
-    /// URL describe the recording, not a metric, so neither is written into
-    /// the metrics' metadata.
+    /// A converter for one endpoint's scrapes. The endpoint's name and URL
+    /// describe the recording, not a metric, so neither is written into the
+    /// metrics' metadata.
     pub fn new() -> Self {
         Self {
             metric_ids: HashMap::new(),

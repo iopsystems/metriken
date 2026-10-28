@@ -68,8 +68,10 @@ pub trait Probe: Send + Sync {
     /// the epoch or the clock anchor.
     async fn enrich(&self, url: &Url, epoch: Option<&str>) -> Enrich;
 
-    /// Combine a metadata value the hook owns when a restarted producer
-    /// reports a new one. The default takes the new value.
+    /// Not called by the recorder. A restarted producer's metadata is written
+    /// as new entries in the recording's identity layers, whose fold takes a
+    /// key's newest value in each layer, the higher layer winning, and merges
+    /// `descriptions` key by key.
     fn merge(&self, key: &str, old: &str, new: &str) -> String {
         let _ = (key, old);
         new.to_string()

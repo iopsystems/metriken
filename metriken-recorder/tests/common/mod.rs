@@ -44,6 +44,11 @@ pub enum Streams {
     /// The first subscription gets this many frames and is closed; every
     /// later one streams under epoch `epoch-2` with `restarted_metadata`.
     Restarts(u64),
+    /// The first subscription gets this many frames and is closed; the
+    /// second sends its handshake under `epoch-2` with `restarted_metadata`
+    /// and no frame; every later one streams under `epoch-3` with
+    /// `second_restarted_metadata`. Two restarts, the first with no row.
+    RestartsTwice(u64),
 }
 
 /// What a fake producer serves. Changed while it runs through
@@ -57,6 +62,11 @@ pub struct Behaviour {
     pub metadata: BTreeMap<String, String>,
     /// The handshake's metadata after a restart.
     pub restarted_metadata: BTreeMap<String, String>,
+    /// The handshake's metadata after a second restart
+    /// ([`Streams::RestartsTwice`]).
+    pub second_restarted_metadata: BTreeMap<String, String>,
+    /// The handshake's labels after a restart; `None` keeps `labels`.
+    pub restarted_labels: Option<BTreeMap<String, String>>,
     /// The body of `/`, e.g. `Rezolus 5.20.0 Agent`.
     pub banner: Option<String>,
     /// The body of `/metrics`.
@@ -82,6 +92,8 @@ impl Default for Behaviour {
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
             restarted_metadata: BTreeMap::new(),
+            restarted_labels: None,
+            second_restarted_metadata: BTreeMap::new(),
             banner: None,
             prometheus: None,
             down: false,
@@ -200,21 +212,59 @@ fn answer(b: Behaviour, uri: Uri, subscriptions: &AtomicU64) -> Response {
     match uri.path() {
         "/metrics/stream" => {
             let n = subscriptions.fetch_add(1, Ordering::SeqCst);
-            let (frames, epoch, metadata) = match &b.streams {
+            let (frames, epoch, labels, metadata) = match &b.streams {
                 Streams::Never => return StatusCode::NOT_FOUND.into_response(),
-                Streams::Always => (None, "epoch-1", b.metadata.clone()),
-                Streams::OnceThen(frames, _) if n == 0 => {
-                    (Some(*frames), "epoch-1", b.metadata.clone())
-                }
+                Streams::Always => (None, "epoch-1", b.labels.clone(), b.metadata.clone()),
+                Streams::OnceThen(frames, _) if n == 0 => (
+                    Some(*frames),
+                    "epoch-1",
+                    b.labels.clone(),
+                    b.metadata.clone(),
+                ),
                 Streams::OnceThen(_, status) => {
                     return StatusCode::from_u16(*status).unwrap().into_response()
                 }
-                Streams::Restarts(frames) if n == 0 => {
-                    (Some(*frames), "epoch-1", b.metadata.clone())
-                }
-                Streams::Restarts(_) => (None, "epoch-2", b.restarted_metadata.clone()),
+                Streams::Restarts(frames) if n == 0 => (
+                    Some(*frames),
+                    "epoch-1",
+                    b.labels.clone(),
+                    b.metadata.clone(),
+                ),
+                Streams::Restarts(_) => (
+                    None,
+                    "epoch-2",
+                    b.restarted_labels
+                        .clone()
+                        .unwrap_or_else(|| b.labels.clone()),
+                    b.restarted_metadata.clone(),
+                ),
+                Streams::RestartsTwice(frames) if n == 0 => (
+                    Some(*frames),
+                    "epoch-1",
+                    b.labels.clone(),
+                    b.metadata.clone(),
+                ),
+                Streams::RestartsTwice(_) if n == 1 => (
+                    Some(0),
+                    "epoch-2",
+                    b.labels.clone(),
+                    b.restarted_metadata.clone(),
+                ),
+                Streams::RestartsTwice(_) => (
+                    None,
+                    "epoch-3",
+                    b.labels.clone(),
+                    b.second_restarted_metadata.clone(),
+                ),
             };
-            stream(&b, uri.query().unwrap_or(""), frames, epoch, metadata)
+            stream(
+                &b,
+                uri.query().unwrap_or(""),
+                frames,
+                epoch,
+                labels,
+                metadata,
+            )
         }
         "/metrics" => match b.prometheus {
             Some(text) => {
@@ -244,6 +294,7 @@ fn stream(
     query: &str,
     frames: Option<u64>,
     epoch: &str,
+    labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
 ) -> Response {
     let request = match StreamRequest::parse(query) {
@@ -261,7 +312,7 @@ fn stream(
         b.update_floor,
         epoch.to_string(),
         wall_ns() as i64,
-        b.labels.clone(),
+        labels,
         metadata,
     );
     let subscription = if b.negotiate {
@@ -479,6 +530,36 @@ fn row_walls(catalog: &metriken_storage::DendroCatalog, source_id: i64, table: &
     rows.sort_by_key(|&(ts, _)| ts);
     rows.into_iter()
         .map(|(ts, offset)| (ts as i64 + offset) as u64)
+        .collect()
+}
+
+/// The recorder layer's epochs in fold order, each with its `from_ts`.
+pub fn recorder_epochs(metadata: &BTreeMap<String, String>) -> Vec<(String, Option<u64>)> {
+    use metriken_storage::layers::{Layer, Layers};
+    let layers = Layers::read(metadata)
+        .unwrap()
+        .expect("the source has layers");
+    layers
+        .recorder
+        .ordered(Layer::Recorder)
+        .into_iter()
+        .filter_map(|e| Some((e.epoch.clone()?, e.from_ts)))
+        .collect()
+}
+
+/// The producer layer's entries as (epoch, `version`), in fold order.
+pub fn producer_versions(
+    metadata: &BTreeMap<String, String>,
+) -> Vec<(Option<String>, Option<String>)> {
+    use metriken_storage::layers::{Layer, Layers};
+    let layers = Layers::read(metadata)
+        .unwrap()
+        .expect("the source has layers");
+    layers
+        .producer
+        .ordered(Layer::Producer)
+        .into_iter()
+        .map(|e| (e.epoch.clone(), e.metadata.get("version").cloned()))
         .collect()
 }
 
