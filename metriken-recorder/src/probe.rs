@@ -73,8 +73,9 @@ pub trait Probe: Send + Sync {
     /// again on later ticks, up to five more times; the metadata of a reply
     /// that arrives then is a further recorder entry, and its labels are not
     /// applied ([`Event::LabelsNotApplied`](crate::Event::LabelsNotApplied)),
-    /// though a `producer_name` in it adds or changes the recording's
-    /// `__producer__` label.
+    /// though a `producer_name` in it adds the recording's `__producer__`
+    /// label when neither the producer's handshake nor the caller names the
+    /// producer.
     async fn enrich(&self, url: &Url, epoch: Option<&str>) -> Enrich;
 
     /// Not called by the recorder. A restarted producer's metadata is written

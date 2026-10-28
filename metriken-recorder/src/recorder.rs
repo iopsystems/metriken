@@ -257,9 +257,10 @@ pub enum Event {
     /// either, nor one while the recorder stops (its rows go into the old
     /// recording). The new recording carries no label from the probe hook: the
     /// hook is asked again, and a label it gives arrives as
-    /// [`Event::LabelsNotApplied`]. A `producer_name` in its reply gives the
-    /// recording `__producer__`
-    /// ([`PRODUCER_LABEL`](metriken_storage::layers::PRODUCER_LABEL)).
+    /// [`Event::LabelsNotApplied`]. A `producer_name` in its reply adds
+    /// `__producer__` ([`PRODUCER_LABEL`](metriken_storage::layers::PRODUCER_LABEL))
+    /// when neither the producer's handshake nor the caller names the
+    /// producer.
     ProducerChanged {
         source: SourceId,
         from: String,
@@ -272,8 +273,8 @@ pub enum Event {
     Refused { source: SourceId, reason: String },
     /// The probe hook's labels for an endpoint arrived after its
     /// recording was added, and are not applied. A `producer_name` in the
-    /// same reply still changes the recording's labels through
-    /// `__producer__`.
+    /// same reply still adds `__producer__` when neither the producer's
+    /// handshake nor the caller names the producer.
     /// `labels` are those that would have been added or changed; given as
     /// the endpoint's labels ([`EndpointSpec::labels`](crate::EndpointSpec))
     /// on the next run, they are set. At most once per source.
@@ -503,7 +504,8 @@ impl Recorder {
     /// five more times, each ask allowed twice as long as the one before
     /// (at most 60 s); the metadata of a reply that arrives is written into
     /// the recording, and its labels are not applied; a `producer_name` in
-    /// it adds or changes `__producer__`. A pending endpoint is
+    /// it adds `__producer__` when neither the producer's handshake nor the
+    /// caller names the producer. A pending endpoint is
     /// detected on each tick; a refused one is reported in the [`Summary`]
     /// and never recorded.
     ///
