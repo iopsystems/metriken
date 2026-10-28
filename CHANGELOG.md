@@ -242,7 +242,7 @@ Requires metriken-model 0.2.1.
   `ArchiveReader` takes a table's names, and its first segment's interval,
   from these indexes, so opening an archive whose segments all carry one
   fetches no sealed segment. A segment with a names fingerprint (`MNS1`,
-  written by 0.4.0 to 0.5.4) is read as before. A later segment with no
+  written by 0.5.4 and earlier) is read as before. A later segment with no
   index is fetched when another segment of its table has an index (dendro's
   compaction drops a merged segment's index), so a compacted table costs a
   fetch per merged segment at open. A table with no index on any segment

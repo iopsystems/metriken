@@ -260,8 +260,11 @@ fn table_probes(
             .filter_map(|(seq, index)| Some((seq, index?)))
             .collect();
         // A table whose writer stored indexes: a segment without one was
-        // merged by compaction, and may hold names no index gives.
-        let indexed_table = !stored.is_empty();
+        // merged by compaction, or its footer could not be indexed, and may
+        // hold names no index gives.
+        let indexed_table = stored
+            .values()
+            .any(|raw| crate::names::read(Some(raw)).is_some());
         let mut seen: HashSet<u64> = HashSet::new();
         // Names indexes already added: segments that hold the same names
         // store the same bytes, which are decoded once.

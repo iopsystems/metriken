@@ -891,6 +891,11 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         let mut names = counted.gauge_names();
         names.sort();
         assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::FingerprintFirstOnly);
+        assert_eq!(fetched.get().0, sealed.iter().sum::<usize>());
+        let mut names = counted.gauge_names();
+        names.sort();
+        assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
 
         let reader = open(&path);
         let points = |q: &str| -> usize {
@@ -946,6 +951,9 @@ enum Indexes {
     /// The stored indexes with every segment's but the first removed, as
     /// dendro's compaction leaves merged segments.
     FirstOnly,
+    /// A names fingerprint on the first segment and no index on the rest,
+    /// as compaction leaves a table sealed before names indexes.
+    FingerprintFirstOnly,
 }
 
 /// Sealed segments read: of data tables, and of occupant streams.
@@ -1022,6 +1030,10 @@ impl Catalog for Counting {
             Indexes::LaterVersion => stored
                 .into_iter()
                 .map(|(seq, _)| (seq, Some(b"MNI2a later index".to_vec())))
+                .collect(),
+            Indexes::FingerprintFirstOnly => stored
+                .into_iter()
+                .map(|(seq, _)| (seq, (seq == 0).then(|| b"MNS1\0\0\0\0\0\0\0\0".to_vec())))
                 .collect(),
             Indexes::FirstOnly => stored
                 .into_iter()
