@@ -1447,6 +1447,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]

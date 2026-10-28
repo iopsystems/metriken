@@ -6,11 +6,13 @@ presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
 S9 in metriken" below) are done; the producer identity keys and
-`producer_identity!`, the identity layers in metriken-storage (#326), and
-metriken-recorder writing them (step 2) are built and unreleased; nothing
-else is built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
+`producer_identity!`, the identity layers in metriken-storage (#326),
+metriken-recorder writing them (step 2), and the names index of the catalog
+index (step 2) are built and unreleased; nothing else is built. The owner
+decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
-producer identity keys on 2026-10-27. "Step N" means this entry's order of work.
+producer identity keys on 2026-10-27. Q9 and Q37 were decided on
+2026-10-28. "Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
 handshake) ([metriken-viewer](2026-10-12-metriken-viewer.md)), and rezolus's
@@ -2566,7 +2568,10 @@ Presentation and query rules:
   correct when they are one process's metrics split in two and conflicts
   under S4 when both carry one series; (b) the key is the epoch and the
   producer name, so a process exposing two producers' sources keeps them
-  apart.
+  apart. Decided 2026-10-28: (b). `process::read_groups` splits a group
+  whose sources carry different `__producer__` values (#331), which
+  implements (b); a source without the label beside one with it is not
+  split.
 - **Q10.** A recorder- or producer-layer key whose values differ among the
   sources of one process group (two recorders' `instance`, a `host` that
   changed between copies). Candidates: (a) no series label for the key, each
@@ -2715,10 +2720,10 @@ Views:
   (`comparison_order`), shows groups of several recordings each.
 - **Q29.** Cost with many sources. Measured on 30-minute slices of the
   9.6-hour bench archive copied N times (labels `host=h1..hN`):
-  - `ArchiveReader::from_catalog` probes every source at open. For each
-    table it fetches the first sealed segment, one more segment for each
-    names fingerprint not seen before, and a materialized WAL tail
-    (`table_probes`, metriken-storage `reader.rs:149-185`). An earlier
+  - Before the names index, `ArchiveReader::from_catalog` probed every
+    source at open. For each table it fetched the first sealed segment,
+    one more segment for each names fingerprint not seen before, and a
+    materialized WAL tail (metriken-storage `table_probes` at 1d0c67a). An earlier
     per-source cost figure is dropped here because its run is not recorded.
   - dendro's `docs/journal/2026-10-19-segment-index-table.md` measured a
     metriken prototype (`proto/segment-index`) that stores a three-tier
@@ -2813,7 +2818,10 @@ Views:
 - **Q37.** The open-time overlay's interface (O5): an argument to
   metriken-query's archive open, a file format shared with exported label
   layers, or both; and how a caller (systemslab, a script) passes it to
-  the `dashboard` crate.
+  the `dashboard` crate. Decided 2026-10-28: an argument to
+  metriken-query's archive open, which the `dashboard` crate takes from
+  its caller and passes on. A file format shared with exported label
+  layers can follow when label layers become documents (step 3.5).
 - **Q38.** A record-time flag that writes a user layer (for example to beat
   a broken producer template without opening the viewer), since
   `template=FILE` is now the recorder default below the producer (P5).
@@ -2984,19 +2992,26 @@ written by the new dendro.
      unstrided histogram behaviour documented (S12).~~ Done in the
      metriken-query crate docs.
    - In metriken-storage and metriken-query, process groups (S1, S2) and
-     conflicts (S4). Needs: Q9 and Q16 for the grouping key and the
-     conflict value; prerequisite for case 3.
+     conflicts (S4). Q9 (the grouping key) and Q16 (the conflict value)
+     are decided; prerequisite for case 3.
    - In metriken-query, the S9 per-source union, with S3's span selection
      (which source's results are used in each span, which needs S9's
      coverage rule) and S5 to S8: each source evaluated alone and the
      results combined per series per span, never a delta across sources.
      Needs: the process groups above; prerequisite for case 3.
    - In metriken-query the open-time label overlay (O5), a generic caller
-     API. Needs: Q37.
+     API, as an argument to the archive open (Q37).
    - In metriken-query the scope input (D1), resolving to process groups,
      then the template evaluation rule, for the producer and registry
      layers.
-   - The catalog index and scope-aware listings. Needs: Q29.
+   - The catalog index and scope-aware listings (Q29's direction). The
+     names index is built: each sealed segment's caller index holds its
+     metric names by kind and its footer's `sampling_interval_ms`,
+     `metriken.format` and `metriken.layout` (metriken-storage `names.rs`,
+     `MNI1`), and
+     `ArchiveReader` opens an archive whose segments carry one without
+     fetching a segment. Label keys and values per metric, and the
+     scope-aware listings that would use them, are not built.
 3. rezolus, in this order:
    1. ~~Open and merge the combined view.~~ Done: #1504.
    2. The restriction as the engine scope (D1) in both viewers' query APIs

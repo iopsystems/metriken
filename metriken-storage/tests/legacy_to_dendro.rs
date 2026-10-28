@@ -1208,7 +1208,8 @@ fn a_parquet_with_dropped_rows_reads_at_its_declared_interval() {
     assert_eq!(MetricsSource::interval(&converted), 1.0);
 }
 
-/// Each converted segment declares the input's interval.
+/// Each converted segment declares the input's interval and carries a
+/// names index.
 #[test]
 fn converted_segments_declare_the_interval() {
     use metriken_storage::Catalog;
@@ -1235,6 +1236,12 @@ fn converted_segments_declare_the_interval() {
                 .map(String::as_str),
             Some("1000"),
             "segment {seq}"
+        );
+    }
+    for (seq, index) in catalog.segment_indexes(source.id, PARQUET_TABLE).unwrap() {
+        assert!(
+            index.as_deref().is_some_and(|i| i.starts_with(b"MNI1")),
+            "segment {seq}: {index:?}"
         );
     }
 }

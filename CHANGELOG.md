@@ -231,6 +231,31 @@ Requires metriken-model 0.2.1.
   `VERSION`, `BUILD` and `HOST`: a producer identity as producer-layer
   keys. `derive_legacy` derives a producer entry from a legacy source's
   `metriken.producer.*` metadata.
+- **Changed:** a sealed segment's caller index (dendro's
+  `segment_indexes`) is a names index (`MNI1`): the metric names its footer
+  holds by kind, and its `sampling_interval_ms`, `metriken.format` and
+  `metriken.layout`, msgpack with named fields compressed with zstd. The
+  writer stores it at each seal, and the parquet and `.rez` conversions with
+  each segment they insert; a segment whose `sampling_interval_ms` is not a
+  non-negative integer, or whose footer repeats one of those three keys,
+  gets none.
+  `ArchiveReader` takes a table's names, and its first segment's interval,
+  from these indexes, so opening an archive whose segments all carry one
+  fetches no sealed segment. A segment with a names fingerprint (`MNS1`,
+  written by 0.5.4 and earlier) is read as before. A later segment with no
+  index is fetched when another segment of its table has a names index or
+  fingerprint (dendro's compaction drops a merged segment's index), so a
+  compacted table costs a
+  fetch per merged segment at open. A table with no index on any segment
+  (copied with a projection, or compacted so that every segment was
+  merged) still lists only its first segment's names and its live tail's.
+  An index that does not decode, of an `MNI` version this reader does not
+  know, or that decompresses past 4 MiB is fetched. A segment whose bytes
+  are damaged now fails the first query that reads it rather than the
+  open, when its index lets the open skip it. A reader before this one does not
+  read `MNI1` and takes each table's names from its first segment and live
+  tail only, so it does not list a metric that first appears in a later
+  segment of an archive written by this one.
 
 ### metriken-query 0.42.3
 

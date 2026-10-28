@@ -808,7 +808,8 @@ fn growing(t: u64) -> Snapshot {
 
 /// A metric that first appears in a later segment of a table, or only in its
 /// live tail, is found: the reader routes a query by every segment's names,
-/// not the first segment's.
+/// not the first segment's. The names come from the segments' names
+/// indexes, so the open fetches no sealed segment.
 #[test]
 fn a_metric_that_first_appears_in_a_later_segment_is_found() {
     for finalize in [true, false] {
@@ -839,6 +840,63 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         }
         writer.join().unwrap();
 
+        let pool = BufferPool::new(1 << 20);
+        let (counted, fetched) = open_counting(&path, &pool);
+        assert_eq!(
+            fetched.get(),
+            (0, 0),
+            "finalize={finalize}: fetched at open"
+        );
+        let mut names = counted.gauge_names();
+        names.sort();
+        assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+
+        // Segments sealed before names indexes: with a fingerprint each,
+        // every segment whose fingerprint is new is fetched, and the names
+        // are complete; with none, only each table's first.
+        let catalog = DendroCatalog::open(&path).unwrap();
+        let id = catalog.sources().unwrap()[0].id;
+        let sealed: Vec<usize> = catalog
+            .tables(id)
+            .unwrap()
+            .iter()
+            .filter(|t| !t.ends_with("/occupants"))
+            .map(|t| catalog.segment_meta(id, t).unwrap().len())
+            .filter(|n| *n > 0)
+            .collect();
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::Fingerprints);
+        assert_eq!(fetched.get().0, sealed.iter().sum::<usize>());
+        let mut names = counted.gauge_names();
+        names.sort();
+        assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+        let (_, fetched) = open_counting_with(&path, &pool, Indexes::None);
+        assert_eq!(fetched.get().0, sealed.len());
+
+        // An index that does not decode, or that names a segment format
+        // this reader refuses, is not taken: its segment is fetched and
+        // probed (here the footers are of a format it reads, so the names
+        // stay complete).
+        for indexes in [Indexes::Unreadable, Indexes::Newer, Indexes::LaterVersion] {
+            let (counted, fetched) = open_counting_with(&path, &pool, indexes);
+            assert_eq!(fetched.get().0, sealed.iter().sum::<usize>());
+            let mut names = counted.gauge_names();
+            names.sort();
+            assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+        }
+
+        // A later segment without an index, in a table whose first segment
+        // has one, is fetched; the first segment holds only `mem_free`.
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::FirstOnly);
+        assert_eq!(fetched.get().0, sealed.iter().map(|n| n - 1).sum::<usize>());
+        let mut names = counted.gauge_names();
+        names.sort();
+        assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::FingerprintFirstOnly);
+        assert_eq!(fetched.get().0, sealed.iter().sum::<usize>());
+        let mut names = counted.gauge_names();
+        names.sort();
+        assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+
         let reader = open(&path);
         let points = |q: &str| -> usize {
             let (a, _) = answer(&reader, q, 0).unwrap();
@@ -868,6 +926,34 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
 struct Counting {
     inner: DendroCatalog,
     fetched: Arc<Fetched>,
+    indexes: Indexes,
+}
+
+/// The segment indexes a [`Counting`] catalog gives.
+#[derive(Clone, Copy)]
+enum Indexes {
+    /// As stored: the writer's names indexes.
+    Stored,
+    /// A names fingerprint (`MNS1`) per segment, each distinct, as an
+    /// archive sealed before names indexes would give for segments whose
+    /// names all differ.
+    Fingerprints,
+    /// None, as a `.rez` or an archive sealed before fingerprints.
+    None,
+    /// A names index (`MNI1`) per segment that does not decode, as one a
+    /// later version wrote with a field of another type would.
+    Unreadable,
+    /// A names index per segment naming a segment format newer than this
+    /// reader reads (the footers are not changed).
+    Newer,
+    /// A names index of a version this reader does not know (`MNI2`).
+    LaterVersion,
+    /// The stored indexes with every segment's but the first removed, as
+    /// dendro's compaction leaves merged segments.
+    FirstOnly,
+    /// A names fingerprint on the first segment and no index on the rest,
+    /// as compaction leaves a table sealed before names indexes.
+    FingerprintFirstOnly,
 }
 
 /// Sealed segments read: of data tables, and of occupant streams.
@@ -929,7 +1015,51 @@ impl Catalog for Counting {
         source_id: i64,
         table: &str,
     ) -> Result<Vec<metriken_storage::SegmentIndex>, String> {
-        self.inner.segment_indexes(source_id, table)
+        let stored = self.inner.segment_indexes(source_id, table)?;
+        Ok(match self.indexes {
+            Indexes::Stored => stored,
+            Indexes::Fingerprints => stored
+                .into_iter()
+                .map(|(seq, _)| {
+                    let mut index = b"MNS1".to_vec();
+                    index.extend_from_slice(&seq.to_le_bytes());
+                    (seq, Some(index))
+                })
+                .collect(),
+            Indexes::None => Vec::new(),
+            Indexes::LaterVersion => stored
+                .into_iter()
+                .map(|(seq, _)| (seq, Some(b"MNI2a later index".to_vec())))
+                .collect(),
+            Indexes::FingerprintFirstOnly => stored
+                .into_iter()
+                .map(|(seq, _)| (seq, (seq == 0).then(|| b"MNS1\0\0\0\0\0\0\0\0".to_vec())))
+                .collect(),
+            Indexes::FirstOnly => stored
+                .into_iter()
+                .map(|(seq, index)| (seq, index.filter(|_| seq == 0)))
+                .collect(),
+            Indexes::Unreadable => stored
+                .into_iter()
+                .map(|(seq, _)| (seq, Some(b"MNI1not an index".to_vec())))
+                .collect(),
+            Indexes::Newer => stored
+                .into_iter()
+                .map(|(seq, _)| {
+                    #[derive(serde::Serialize)]
+                    struct Names {
+                        format: String,
+                    }
+                    let packed = rmp_serde::to_vec_named(&Names {
+                        format: "99".into(),
+                    })
+                    .unwrap();
+                    let mut index = b"MNI1".to_vec();
+                    index.extend(zstd::stream::encode_all(packed.as_slice(), 3).unwrap());
+                    (seq, Some(index))
+                })
+                .collect(),
+        })
     }
     fn segment_span(
         &self,
@@ -972,10 +1102,20 @@ impl Catalog for Counting {
 /// Opens `path` on `pool` through a [`Counting`] catalog; returns the reader
 /// and its fetch counts.
 fn open_counting(path: &Path, pool: &Arc<BufferPool>) -> (ArchiveReader, Arc<Fetched>) {
+    open_counting_with(path, pool, Indexes::Stored)
+}
+
+/// [`open_counting`] with the catalog giving `indexes`.
+fn open_counting_with(
+    path: &Path,
+    pool: &Arc<BufferPool>,
+    indexes: Indexes,
+) -> (ArchiveReader, Arc<Fetched>) {
     let fetched = Arc::new(Fetched::default());
     let catalog = Counting {
         inner: DendroCatalog::open(path).unwrap(),
         fetched: Arc::clone(&fetched),
+        indexes,
     };
     let mut recordings =
         ArchiveReader::from_catalog(Box::new(catalog), None, Arc::clone(pool), None).unwrap();
