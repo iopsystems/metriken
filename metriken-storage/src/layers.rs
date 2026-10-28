@@ -47,8 +47,10 @@ pub const UNION_KEYS: &[&str] = &["descriptions"];
 /// The producer layer's metadata key for a producer identity's name.
 pub const PRODUCER_NAME: &str = "producer_name";
 /// The label the merged layers give a source from its merged
-/// [`PRODUCER_NAME`]: the producer's declared name, else the recorder
-/// layer's (what the probe hook or a legacy derivation read). Internal by the
+/// [`PRODUCER_NAME`], whichever layer sets it: a user entry over the
+/// producer's declared name over the recorder layer's (what the probe hook or
+/// a legacy derivation read). A later entry that changes the merged name, a
+/// late hook reply among them, changes the label with it. Internal by the
 /// `__` rule, so listings and legends hide it.
 pub const PRODUCER_LABEL: &str = "__producer__";
 /// The producer layer's metadata key for a producer identity's version.
@@ -643,15 +645,15 @@ fn refresh_cache(doc: &mut LayerDoc, layer: Layer) {
     doc.metadata = folded.metadata;
 }
 
-/// A user entry for what changed in `labels` and `metadata` since the
-/// layers' merged result `before` (with the user layer's removals) was
-/// written: labels added, changed or removed, and layered metadata keys
-/// changed, added back or removed. An empty value and an absent key are the
-/// same. A `__producer__` label the source lacks is not a removal (the layers
-/// derive it; a user entry setting it to `""` removes it). A removed key is set to `""`, which removes it from the merged
-/// result whichever layer sets it. A label under [`RESERVED_PREFIX`] is not
-/// taken, so `append`, which writes the merged labels whole, drops it.
-/// `None` when nothing changed.
+/// A user entry for what changed in `labels` and `metadata` since the layers'
+/// merged result `before` (with the user layer's removals) was written: labels
+/// added, changed or removed, and layered metadata keys changed, added back or
+/// removed. An empty value and an absent key are the same. A `__producer__`
+/// label the source lacks is not a removal (the layers derive it; a user entry
+/// setting it to `""` removes it). A removed key is set to `""`, which removes
+/// it from the merged result whichever layer sets it. A label under
+/// [`RESERVED_PREFIX`] is not taken, so `append`, which writes the merged
+/// labels whole, drops it. `None` when nothing changed.
 fn drift(
     before: &Folded,
     labels: &BTreeMap<String, String>,

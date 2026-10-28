@@ -30,11 +30,11 @@ pub const EXPORTED_PREFIX: &str = "exported_";
 
 /// The label added, with a catalog index, to the series of read groups
 /// (`ArchiveReader::read_groups`: the sources of one process) whose labels
-/// other than internal ones are equal, so the series of two processes
-/// recorded with equal labels stay apart, as do an endpoint's recordings
-/// before and after a producer change, which differ in `__producer__`. The sources of one process group share their group's
-/// labels and do not carry it. Internal under the `__` rule
-/// ([`crate::is_internal_label`]).
+/// other than internal ones are equal, so the series of two processes recorded
+/// with equal labels stay apart, as do an endpoint's recordings before and
+/// after a producer change, which differ in `__producer__`. The sources of one
+/// process group share their group's labels and do not carry it. Internal under
+/// the `__` rule ([`crate::is_internal_label`]).
 pub const RECORDING_LABEL: &str = "__recording__";
 
 /// `labels` with `extra` added: a key the series already carries keeps its

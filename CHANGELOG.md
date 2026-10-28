@@ -77,9 +77,9 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   epoch differs. `Committed`'s `passes_total` and
   `first_ts`, and the `SourceSummary`, count the endpoint across its
   recordings. A recording is not evicted by `retain` after it is finalized. Two
-  recordings of one endpoint carry identical labels when no producer name
-  is on record (a producer named only by its `source` label, which the
-  caller's `source` outranks); readers tell them apart by
+  recordings of one endpoint carry identical labels when no producer name,
+  or the same one, is on record (a producer named only by its `source`
+  label, which the caller's `source` outranks); readers tell them apart by
   `__recording__`.
 - **Changed:** an endpoint URL's user name and password are left out of
   the recorder's own log lines and of `SourceSummary::endpoint`, as #328
@@ -100,8 +100,12 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   endpoints sharing labels keeps the warning for the other, and a restart
   that changes an endpoint's labels moves it. `finish` returns the cause
   `Event::Failed` reports.
-- **Changed:** a recording whose producer identity names it carries the
-  `__producer__` label (metriken-storage's layer merge).
+- **Changed:** a recording whose merged layers name a producer (its
+  identity, the probe hook's `producer_name`, or a caller's) carries the
+  `__producer__` label (metriken-storage's layer merge). A hook reply or
+  epoch entry that names it after the recording was added adds the label
+  then, so the label set changes mid-recording, as a restart's producer
+  entry can change it.
 - **Added:** `SourceIdentity::producer` and `with_producer`,
   `RegistrySource::with_producer`, and `ProducerIdentity` re-exported.
 - **Removed:** `restart::metadata_patch`, `restart::Restart` and
@@ -225,7 +229,7 @@ Requires metriken-model 0.2.1.
 Requires metriken-storage 0.5.5.
 
 - **Changed:** `ParquetBuilder::file_labeled` and the other labelled
-  builders: a series that already carries an injected key keeps its own
+  builders: a series whose own labels carry an injected key keeps its own
   value under `exported_<key>`, where the injected value overwrote it. A
   selector on an injected key now resolves in `columns()`, where it found
   no column.

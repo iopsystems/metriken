@@ -2961,14 +2961,14 @@ written by the new dendro.
      the start and on late activation, with no epoch. #331 adds `__producer__`
      (from the merged `producer_name`, in metriken-storage's layer merge, so
      every source written through `layers::append` whose layers name a
-     producer carries it; recordings whose labels differ only in it are twins
-     and get `__recording__`) and the one clash rule on `MultiParquetSource`
-     (the archive already followed it). Left for a later PR: a way to fill in
-     a value the hook's first answer lacked (an exporter's `agent_version`).
-     The plan above is as written before #328, and its `recorder.rs` line
-     references are to the code before it. #328 also leaves a URL's user name
-     and password out of `instance` and writes only newly described names of a
-     scrape's HELP text.
+     producer carries it, unless a user entry removes it; recordings whose
+     labels differ only in it are twins and get `__recording__`) and the one
+     clash rule on `MultiParquetSource` (the archive already followed it).
+     Left for a later PR: a way to fill in a value the hook's first answer
+     lacked (an exporter's `agent_version`). The plan above is as written
+     before #328, and its `recorder.rs` line references are to the code before
+     it. #328 also leaves a URL's user name and password out of `instance` and
+     writes only newly described names of a scrape's HELP text.
    - ~~`__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`.~~ Done in metriken (#331) for the archive and
      `MultiParquetSource`; rezolus's `combine` and the agent's external

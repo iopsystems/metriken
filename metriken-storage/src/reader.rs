@@ -673,16 +673,14 @@ impl TableReader {
 /// table, and any V3 sampler with only one group) don't need it to be.
 ///
 /// `recording` is the index of the recording this table belongs to, in its
-/// catalog (or in `from_in_memory`'s input). It is what `__recording__`
-/// carries for twin recordings (equal labels other than internal ones). Which
-/// recording a table
-/// belongs to, for grouping a query's tables, is decided by
+/// catalog (or in `from_in_memory`'s input). It is what `__recording__` carries
+/// for twin recordings (equal labels other than internal ones). Which recording
+/// a table belongs to, for grouping a query's tables, is decided by
 /// `recording_labels` instead: the index repeats across readers joined by
 /// [`ArchiveReader::flatten`]. An index rather than the recording's `dir`
-/// string: `dir` is a display name derived from labels
-/// (`recording_dir_slug`), not a guaranteed-unique identity — two
-/// recordings with the same labels are entirely legal and would collide on
-/// `dir`.
+/// string: `dir` is a display name derived from labels (`recording_dir_slug`),
+/// not a guaranteed-unique identity — two recordings with the same labels are
+/// entirely legal and would collide on `dir`.
 pub struct SamplerReader {
     recording: usize,
     /// The labels of the recording this table belongs to, one allocation per
