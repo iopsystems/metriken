@@ -2720,8 +2720,7 @@ Views:
   - Before the names index, `ArchiveReader::from_catalog` probed every
     source at open. For each table it fetched the first sealed segment,
     one more segment for each names fingerprint not seen before, and a
-    materialized WAL tail (`table_probes`, metriken-storage
-    `reader.rs:149-185`). An earlier
+    materialized WAL tail (metriken-storage `table_probes` at 1d0c67a). An earlier
     per-source cost figure is dropped here because its run is not recorded.
   - dendro's `docs/journal/2026-10-19-segment-index-table.md` measured a
     metriken prototype (`proto/segment-index`) that stores a three-tier

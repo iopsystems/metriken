@@ -237,7 +237,8 @@ Requires metriken-model 0.2.1.
   `metriken.layout`, msgpack with named fields compressed with zstd. The
   writer stores it at each seal, and the parquet and `.rez` conversions with
   each segment they insert; a segment whose `sampling_interval_ms` is not a
-  non-negative integer gets none.
+  non-negative integer, or whose footer repeats one of those three keys,
+  gets none.
   `ArchiveReader` takes a table's names, and its first segment's interval,
   from these indexes, so opening an archive whose segments all carry one
   fetches no sealed segment. A segment with a names fingerprint (`MNS1`,

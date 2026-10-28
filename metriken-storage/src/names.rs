@@ -5,11 +5,11 @@
 //! from the catalog without fetching a segment.
 //!
 //! The writer stores a [`SegmentNames`]: the metric names the segment's
-//! footer holds by kind, and the footer keys opening the segment as a probe
-//! reads (`sampling_interval_ms`, `metriken.format`, `metriken.layout`). Segments sealed
-//! before it carry a names fingerprint instead (or nothing), which a reader
-//! still uses: two segments with the same fingerprint hold the same metric
-//! names, so the reader parses the footer of one of them.
+//! footer holds by kind, and the footer keys a probe reads when it opens the
+//! segment (`sampling_interval_ms`, `metriken.format`, `metriken.layout`).
+//! Segments sealed before it carry a names fingerprint instead (or nothing),
+//! which a reader still uses: two segments with the same fingerprint hold
+//! the same metric names, so the reader parses the footer of one of them.
 
 use std::collections::BTreeSet;
 
@@ -23,7 +23,10 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 
 /// Prefix naming the index as a [`SegmentNames`], version 1: msgpack with
 /// named fields, compressed with zstd. A field added later is left out by a
-/// reader that does not know it, and a field missing is its default.
+/// reader that does not know it, and a field missing is its default. A
+/// change to what a field means, including how a probe classifies a column
+/// into the four name sets, needs a new prefix, since a reader takes an
+/// index over the footer it was built from.
 const NAMES: &[u8; 4] = b"MNI1";
 
 /// What a segment's footer gives a reader at open: the metric names it
@@ -50,6 +53,9 @@ pub(crate) enum Stored {
     /// A names fingerprint: the segment holds the same names as any other
     /// with this value.
     Fingerprint(u64),
+    /// A names index that does not decode (written by a later version that
+    /// changed a field's type, say): the segment's names are not known.
+    Unreadable,
 }
 
 /// The index to store with a sealed segment, or `None` when its footer
@@ -59,25 +65,40 @@ pub(crate) fn index_of(segment: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The names a probe of `segment` reads, as the reader's open does, or
-/// `None` when its footer cannot be read or its `sampling_interval_ms` is
-/// not a non-negative integer, which the probe does not accept.
+/// `None` when its footer cannot be read, names one of the keys stored
+/// more than once (the probe and this index could read different entries),
+/// or has a `sampling_interval_ms` that is not a non-negative integer,
+/// which the probe does not accept.
 pub(crate) fn names_of(segment: &[u8]) -> Option<SegmentNames> {
+    let bytes = bytes::Bytes::copy_from_slice(segment);
     let meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
-        &bytes::Bytes::copy_from_slice(segment),
+        &bytes,
         parquet::arrow::arrow_reader::ArrowReaderOptions::default(),
     )
     .ok()?;
-    let interval = meta
-        .metadata()
-        .file_metadata()
-        .key_value_metadata()
-        .and_then(|kv| kv.iter().find(|e| e.key == "sampling_interval_ms"));
-    if let Some(e) = interval {
-        e.value.as_deref().unwrap_or("").parse::<u64>().ok()?;
+    let kv = meta.metadata().file_metadata().key_value_metadata();
+    let entries = |key: &str| -> Vec<&str> {
+        kv.into_iter()
+            .flatten()
+            .filter(|e| e.key == key)
+            .map(|e| e.value.as_deref().unwrap_or(""))
+            .collect()
+    };
+    for key in [crate::format::FORMAT_KEY, crate::long::LAYOUT_KEY] {
+        if entries(key).len() > 1 {
+            return None;
+        }
+    }
+    match entries("sampling_interval_ms")[..] {
+        [] => {}
+        [interval] => {
+            interval.parse::<u64>().ok()?;
+        }
+        _ => return None,
     }
     // A footer-only read: no page is decoded, so the pool stays empty.
     let probe = crate::parquet::MultiParquetSource::open_bytes_with_pool(
-        segment.to_vec(),
+        bytes,
         BufferPool::new(1024 * 1024),
     )
     .ok()?;
@@ -100,12 +121,14 @@ fn encode(names: &SegmentNames) -> Option<Vec<u8>> {
 }
 
 /// What a stored index holds, or `None` for an index that is neither (none
-/// at all, another producer's, or one that does not decode).
+/// at all, or another producer's).
 pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
     let index = index?;
     if let Some(rest) = index.strip_prefix(NAMES.as_slice()) {
-        let packed = zstd::stream::decode_all(rest).ok()?;
-        return rmp_serde::from_slice(&packed).ok().map(Stored::Names);
+        let names = zstd::stream::decode_all(rest)
+            .ok()
+            .and_then(|packed| rmp_serde::from_slice(&packed).ok());
+        return Some(names.map_or(Stored::Unreadable, Stored::Names));
     }
     let rest = index.strip_prefix(FINGERPRINT.as_slice())?;
     Some(Stored::Fingerprint(u64::from_le_bytes(
@@ -160,6 +183,12 @@ mod tests {
     /// A parquet segment with one timestamp column and `interval` as its
     /// footer's `sampling_interval_ms`.
     fn segment(interval: &str) -> Vec<u8> {
+        segment_with(&[("sampling_interval_ms", interval)])
+    }
+
+    /// A parquet segment with one timestamp column and `kv` as its footer's
+    /// key-value metadata.
+    fn segment_with(kv: &[(&str, &str)]) -> Vec<u8> {
         use arrow::array::UInt64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -177,10 +206,11 @@ mod tests {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_key_value_metadata(Some(vec![KeyValue::new(
-                "sampling_interval_ms".to_string(),
-                interval.to_string(),
-            )]))
+            .set_key_value_metadata(Some(
+                kv.iter()
+                    .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                    .collect(),
+            ))
             .build();
         let mut out = Vec::new();
         let mut writer =
@@ -200,6 +230,28 @@ mod tests {
         assert_eq!(names_of(&segment("")), None);
     }
 
+    /// A footer naming a key the index stores more than once gets no names
+    /// index: the probe and the index could read different entries.
+    #[test]
+    fn a_segment_with_a_repeated_key_gets_no_names_index() {
+        let interval = "sampling_interval_ms";
+        assert_eq!(
+            names_of(&segment_with(&[(interval, "100"), (interval, "200")])),
+            None
+        );
+        let format = crate::format::FORMAT_KEY;
+        assert_eq!(
+            names_of(&segment_with(&[(format, "1"), (format, "1")])),
+            None
+        );
+        let layout = crate::long::LAYOUT_KEY;
+        assert_eq!(
+            names_of(&segment_with(&[(layout, "long"), (layout, "long")])),
+            None
+        );
+        assert!(names_of(&segment_with(&[(format, "1"), (layout, "long")])).is_some());
+    }
+
     #[test]
     fn a_fingerprint_reads_back_and_anything_else_is_none() {
         let mut fp = FINGERPRINT.to_vec();
@@ -207,6 +259,6 @@ mod tests {
         assert_eq!(read(Some(&fp)), Some(Stored::Fingerprint(7)));
         assert_eq!(read(None), None);
         assert_eq!(read(Some(b"other")), None);
-        assert_eq!(read(Some(b"MNI1not zstd")), None);
+        assert_eq!(read(Some(b"MNI1not zstd")), Some(Stored::Unreadable));
     }
 }

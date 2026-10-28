@@ -227,14 +227,17 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 /// What a table's catalog says of its metric names, and the segments whose
 /// footers name the rest:
 ///
-/// - a sealed segment with a names index gives its names, and the first
-///   sealed segment's gives the table's cadence, with no segment fetched;
-/// - the first sealed segment without one is fetched, and each later one
-///   whose names fingerprint no earlier fetch has. A later segment with
-///   neither (a `.rez`, one sealed before fingerprints, or one dendro
-///   merged or copied with a projection, which drops the index) is assumed
-///   to hold the first segment's names, which is what the reader assumed of
-///   every segment before;
+/// - a sealed segment with a names index this reader accepts gives its
+///   names, and the first sealed segment's gives the table's cadence, with
+///   no segment fetched;
+/// - the first sealed segment is fetched when it has no such index. A later
+///   one is fetched when its names index does not decode or gives a format,
+///   layout or interval this reader refuses (its probe then fails the open),
+///   or when its names fingerprint is new. A later segment with no
+///   index (a `.rez`, one sealed before fingerprints, or one dendro merged
+///   or copied with a projection, which drops the index) is assumed to hold
+///   the first segment's names, which is what the reader assumed of every
+///   segment before;
 /// - the rows of its live tail that name its columns
 ///   (`crate::wal::schema_rows`), materialized alone.
 fn table_probes(
@@ -255,8 +258,8 @@ fn table_probes(
             .filter_map(|(seq, index)| Some((seq, index?)))
             .collect();
         let mut seen: HashSet<u64> = HashSet::new();
-        // Names indexes already added: consecutive segments that hold the
-        // same names store the same bytes, which are decoded once.
+        // Names indexes already added: segments that hold the same names
+        // store the same bytes, which are decoded once.
         let mut added: HashSet<&[u8]> = HashSet::new();
         for (i, (seq, _)) in sealed.iter().enumerate() {
             let raw = stored.get(seq).map(Vec::as_slice);
@@ -276,6 +279,7 @@ fn table_probes(
                     None => true,
                 },
                 Some(Stored::Fingerprint(fp)) => seen.insert(fp) || i == 0,
+                Some(Stored::Unreadable) => true,
                 None => i == 0,
             };
             if fetch {

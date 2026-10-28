@@ -872,6 +872,18 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         let (_, fetched) = open_counting_with(&path, &pool, Indexes::None);
         assert_eq!(fetched.get().0, sealed.len());
 
+        // An index that does not decode, or that names a segment format
+        // this reader refuses, is not taken: its segment is fetched and
+        // probed (here the footers are of a format it reads, so the names
+        // stay complete).
+        for indexes in [Indexes::Unreadable, Indexes::Newer] {
+            let (counted, fetched) = open_counting_with(&path, &pool, indexes);
+            assert_eq!(fetched.get().0, sealed.iter().sum::<usize>());
+            let mut names = counted.gauge_names();
+            names.sort();
+            assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
+        }
+
         let reader = open(&path);
         let points = |q: &str| -> usize {
             let (a, _) = answer(&reader, q, 0).unwrap();
@@ -915,6 +927,12 @@ enum Indexes {
     Fingerprints,
     /// None, as a `.rez` or an archive sealed before fingerprints.
     None,
+    /// A names index (`MNI1`) per segment that does not decode, as one a
+    /// later version wrote with a field of another type would.
+    Unreadable,
+    /// A names index per segment naming a segment format newer than this
+    /// reader reads (the footers are not changed).
+    Newer,
 }
 
 /// Sealed segments read: of data tables, and of occupant streams.
@@ -988,6 +1006,26 @@ impl Catalog for Counting {
                 })
                 .collect(),
             Indexes::None => Vec::new(),
+            Indexes::Unreadable => stored
+                .into_iter()
+                .map(|(seq, _)| (seq, Some(b"MNI1not an index".to_vec())))
+                .collect(),
+            Indexes::Newer => stored
+                .into_iter()
+                .map(|(seq, _)| {
+                    #[derive(serde::Serialize)]
+                    struct Names {
+                        format: String,
+                    }
+                    let packed = rmp_serde::to_vec_named(&Names {
+                        format: "99".into(),
+                    })
+                    .unwrap();
+                    let mut index = b"MNI1".to_vec();
+                    index.extend(zstd::stream::encode_all(packed.as_slice(), 3).unwrap());
+                    (seq, Some(index))
+                })
+                .collect(),
         })
     }
     fn segment_span(
