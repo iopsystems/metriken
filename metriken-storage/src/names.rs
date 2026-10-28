@@ -5,8 +5,8 @@
 //! from the catalog without fetching a segment.
 //!
 //! The writer stores a [`SegmentNames`]: the metric names the segment's
-//! footer holds by kind, its `sampling_interval_ms` and its `metriken.format`,
-//! which is what opening the segment as a probe reads. Segments sealed
+//! footer holds by kind, and the footer keys opening the segment as a probe
+//! reads (`sampling_interval_ms`, `metriken.format`, `metriken.layout`). Segments sealed
 //! before it carry a names fingerprint instead (or nothing), which a reader
 //! still uses: two segments with the same fingerprint hold the same metric
 //! names, so the reader parses the footer of one of them.
@@ -21,13 +21,15 @@ use crate::{BufferPool, DataSource};
 /// `caller_index` written by another producer is not mistaken for one.
 const FINGERPRINT: &[u8; 4] = b"MNS1";
 
-/// Prefix naming the index as a [`SegmentNames`], version 1: msgpack,
-/// compressed with zstd.
+/// Prefix naming the index as a [`SegmentNames`], version 1: msgpack with
+/// named fields, compressed with zstd. A field added later is left out by a
+/// reader that does not know it, and a field missing is its default.
 const NAMES: &[u8; 4] = b"MNI1";
 
 /// What a segment's footer gives a reader at open: the metric names it
-/// holds by kind, and the two footer keys the open reads.
+/// holds by kind, and the footer keys the open reads.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct SegmentNames {
     pub counters: BTreeSet<String>,
     pub gauges: BTreeSet<String>,
@@ -37,6 +39,8 @@ pub(crate) struct SegmentNames {
     pub sampling_interval_ms: Option<String>,
     /// The footer's `metriken.format`, as written.
     pub format: Option<String>,
+    /// The footer's `metriken.layout`, as written.
+    pub layout: Option<String>,
 }
 
 /// A stored index, as a reader uses it.
@@ -54,8 +58,23 @@ pub(crate) fn index_of(segment: &[u8]) -> Option<Vec<u8>> {
     encode(&names_of(segment)?)
 }
 
-/// The names a probe of `segment` reads, as the reader's open does.
+/// The names a probe of `segment` reads, as the reader's open does, or
+/// `None` when its footer cannot be read or its `sampling_interval_ms` is
+/// not a non-negative integer, which the probe does not accept.
 pub(crate) fn names_of(segment: &[u8]) -> Option<SegmentNames> {
+    let meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+        &bytes::Bytes::copy_from_slice(segment),
+        parquet::arrow::arrow_reader::ArrowReaderOptions::default(),
+    )
+    .ok()?;
+    let interval = meta
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|e| e.key == "sampling_interval_ms"));
+    if let Some(e) = interval {
+        e.value.as_deref().unwrap_or("").parse::<u64>().ok()?;
+    }
     // A footer-only read: no page is decoded, so the pool stays empty.
     let probe = crate::parquet::MultiParquetSource::open_bytes_with_pool(
         segment.to_vec(),
@@ -69,11 +88,12 @@ pub(crate) fn names_of(segment: &[u8]) -> Option<SegmentNames> {
         gauge_histograms: probe.gauge_histogram_names().into_iter().collect(),
         sampling_interval_ms: probe.metadata_get("sampling_interval_ms"),
         format: probe.metadata_get(crate::format::FORMAT_KEY),
+        layout: probe.metadata_get(crate::long::LAYOUT_KEY),
     })
 }
 
 fn encode(names: &SegmentNames) -> Option<Vec<u8>> {
-    let packed = rmp_serde::to_vec(names).ok()?;
+    let packed = rmp_serde::to_vec_named(names).ok()?;
     let mut index = NAMES.to_vec();
     index.extend(zstd::stream::encode_all(packed.as_slice(), 3).ok()?);
     Some(index)
@@ -95,6 +115,8 @@ pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -108,6 +130,74 @@ mod tests {
         let index = encode(&names).unwrap();
         assert!(index.starts_with(NAMES));
         assert_eq!(read(Some(&index)), Some(Stored::Names(names)));
+    }
+
+    /// A field this reader does not know is left out, and one it knows but
+    /// the index lacks is its default.
+    #[test]
+    fn a_names_index_with_other_fields_reads() {
+        #[derive(Serialize)]
+        struct Later {
+            gauges: BTreeSet<String>,
+            labels: Vec<String>,
+        }
+        let later = Later {
+            gauges: ["g".to_string()].into(),
+            labels: vec!["k".into()],
+        };
+        let mut index = NAMES.to_vec();
+        index.extend(
+            zstd::stream::encode_all(rmp_serde::to_vec_named(&later).unwrap().as_slice(), 3)
+                .unwrap(),
+        );
+        let expected = SegmentNames {
+            gauges: later.gauges,
+            ..Default::default()
+        };
+        assert_eq!(read(Some(&index)), Some(Stored::Names(expected)));
+    }
+
+    /// A parquet segment with one timestamp column and `interval` as its
+    /// footer's `sampling_interval_ms`.
+    fn segment(interval: &str) -> Vec<u8> {
+        use arrow::array::UInt64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                "sampling_interval_ms".to_string(),
+                interval.to_string(),
+            )]))
+            .build();
+        let mut out = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut out, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        out
+    }
+
+    /// A segment whose `sampling_interval_ms` the probe would not accept
+    /// gets no names index, rather than a panic in the probe.
+    #[test]
+    fn a_segment_with_a_bad_interval_gets_no_names_index() {
+        let names = names_of(&segment("100")).unwrap();
+        assert_eq!(names.sampling_interval_ms.as_deref(), Some("100"));
+        assert_eq!(names_of(&segment("1.5")), None);
+        assert_eq!(names_of(&segment("")), None);
     }
 
     #[test]

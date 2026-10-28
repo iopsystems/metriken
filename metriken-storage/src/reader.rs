@@ -189,17 +189,24 @@ struct KnownNames {
 
 /// The row cadence and declared interval a probe of the segment `names`
 /// indexes would read (`MultiParquetSource::interval`, [`declared_interval`]),
-/// or `None` when the probe would fail (a format this reader does not read,
-/// an interval that is not a number), so the segment is probed and the
-/// open fails as it would without the index.
+/// or `None` when the probe would fail (a format or layout this reader does
+/// not read, an interval that is not a non-negative integer), so the segment
+/// is probed and the open fails as it would without the index.
 fn indexed_intervals(names: &crate::names::SegmentNames) -> Option<(f64, Option<f64>)> {
-    if let Some(format) = &names.format {
-        let kv = vec![parquet::file::metadata::KeyValue::new(
-            crate::format::FORMAT_KEY.to_string(),
-            format.clone(),
-        )];
-        crate::format::check(Some(&kv)).ok()?;
-    }
+    let kv: Vec<parquet::file::metadata::KeyValue> = [
+        (crate::format::FORMAT_KEY, &names.format),
+        (crate::long::LAYOUT_KEY, &names.layout),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| {
+        let value = value.clone()?;
+        Some(parquet::file::metadata::KeyValue::new(
+            key.to_string(),
+            value,
+        ))
+    })
+    .collect();
+    crate::format::check(Some(&kv)).ok()?;
     let ms = match &names.sampling_interval_ms {
         Some(v) => v.parse::<u64>().ok()?,
         None => 1000,
@@ -224,8 +231,9 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 ///   sealed segment's gives the table's cadence, with no segment fetched;
 /// - the first sealed segment without one is fetched, and each later one
 ///   whose names fingerprint no earlier fetch has. A later segment with
-///   neither (a `.rez`, or one sealed before fingerprints) is assumed to
-///   hold the first segment's names, which is what the reader assumed of
+///   neither (a `.rez`, one sealed before fingerprints, or one dendro
+///   merged or copied with a projection, which drops the index) is assumed
+///   to hold the first segment's names, which is what the reader assumed of
 ///   every segment before;
 /// - the rows of its live tail that name its columns
 ///   (`crate::wal::schema_rows`), materialized alone.
@@ -241,17 +249,25 @@ fn table_probes(
     let mut known = KnownNames::default();
     let mut probes = Vec::new();
     if !sealed.is_empty() {
-        let stored: HashMap<u64, Stored> = db
+        let stored: HashMap<u64, Vec<u8>> = db
             .segment_indexes(recording_id, table)?
             .into_iter()
-            .filter_map(|(seq, index)| Some((seq, crate::names::read(index.as_deref())?)))
+            .filter_map(|(seq, index)| Some((seq, index?)))
             .collect();
         let mut seen: HashSet<u64> = HashSet::new();
+        // Names indexes already added: consecutive segments that hold the
+        // same names store the same bytes, which are decoded once.
+        let mut added: HashSet<&[u8]> = HashSet::new();
         for (i, (seq, _)) in sealed.iter().enumerate() {
-            let fetch = match stored.get(seq) {
-                Some(Stored::Names(names)) => match indexed_intervals(names) {
+            let raw = stored.get(seq).map(Vec::as_slice);
+            if raw.is_some_and(|raw| added.contains(raw)) {
+                continue;
+            }
+            let fetch = match crate::names::read(raw) {
+                Some(Stored::Names(names)) => match indexed_intervals(&names) {
                     Some(intervals) => {
-                        known.names.add(names);
+                        known.names.add(&names);
+                        added.extend(raw);
                         if i == 0 {
                             known.first = Some(intervals);
                         }
@@ -259,7 +275,7 @@ fn table_probes(
                     }
                     None => true,
                 },
-                Some(Stored::Fingerprint(fp)) => seen.insert(*fp) || i == 0,
+                Some(Stored::Fingerprint(fp)) => seen.insert(fp) || i == 0,
                 None => i == 0,
             };
             if fetch {
@@ -1790,11 +1806,12 @@ impl ArchiveReader {
                         let metas = db.segment_meta(rec.id, &sampler)?;
 
                         // The metric names the table holds: from sealed segments'
-                        // names indexes, else their footers by names fingerprint, and
-                        // the live tail's rows that carry a schema. A quiet sampler in a live hindsight buffer
-                        // has only the latter: rows in the WAL, no seal yet. Skipping
-                        // it would make it invisible to the reader, which the eager
-                        // path never did because `table_segments` splices the tail in.
+                        // names indexes, else their footers by names fingerprint,
+                        // and the live tail's rows that carry a schema. A quiet
+                        // sampler in a live hindsight buffer has only the latter:
+                        // rows in the WAL, no seal yet. Skipping it would make it
+                        // invisible to the reader, which the eager path never did
+                        // because `table_segments` splices the tail in.
                         let (known, probes) = table_probes(
                             &**db,
                             rec.id,
@@ -2566,6 +2583,16 @@ mod tests {
         assert_eq!(indexed_intervals(&names(Some("x"), None)), None);
         let newer = (crate::format::FORMAT_VERSION + 1).to_string();
         assert_eq!(indexed_intervals(&names(None, Some(&newer))), None);
+        let other_layout = crate::names::SegmentNames {
+            layout: Some("columnar".into()),
+            ..Default::default()
+        };
+        assert_eq!(indexed_intervals(&other_layout), None);
+        let long = crate::names::SegmentNames {
+            layout: Some(crate::long::LAYOUT_LONG.into()),
+            ..Default::default()
+        };
+        assert_eq!(indexed_intervals(&long), Some((1.0, None)));
     }
 
     /// A later row for an occupant, even with other labels, is dropped; the

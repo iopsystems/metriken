@@ -6,9 +6,9 @@ presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
 S9 in metriken" below) are done; the producer identity keys and
-`producer_identity!`, the identity layers in metriken-storage (#326), and
-metriken-recorder writing them (step 2) are built and unreleased; nothing
-else is built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
+`producer_identity!`, the identity layers in metriken-storage (#326),
+metriken-recorder writing them (step 2), and the names index of the catalog
+index (step 2) are built and unreleased; nothing else is built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
 producer identity keys on 2026-10-27. Q9 and Q37 were decided on 2026-10-28. "Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
@@ -2567,7 +2567,8 @@ Presentation and query rules:
   under S4 when both carry one series; (b) the key is the epoch and the
   producer name, so a process exposing two producers' sources keeps them
   apart. Decided 2026-10-28: (b). `process::read_groups` splits a group
-  whose sources differ in `__producer__` (#331), which gives it.
+  whose sources carry different `__producer__` values (#331), which gives
+  it; a source without the label beside one with it is not split.
 - **Q10.** A recorder- or producer-layer key whose values differ among the
   sources of one process group (two recorders' `instance`, a `host` that
   changed between copies). Candidates: (a) no series label for the key, each
@@ -2716,10 +2717,11 @@ Views:
   (`comparison_order`), shows groups of several recordings each.
 - **Q29.** Cost with many sources. Measured on 30-minute slices of the
   9.6-hour bench archive copied N times (labels `host=h1..hN`):
-  - `ArchiveReader::from_catalog` probes every source at open. For each
-    table it fetches the first sealed segment, one more segment for each
-    names fingerprint not seen before, and a materialized WAL tail
-    (`table_probes`, metriken-storage `reader.rs:149-185`). An earlier
+  - Before the names index, `ArchiveReader::from_catalog` probed every
+    source at open. For each table it fetched the first sealed segment,
+    one more segment for each names fingerprint not seen before, and a
+    materialized WAL tail (`table_probes`, metriken-storage
+    `reader.rs:149-185`). An earlier
     per-source cost figure is dropped here because its run is not recorded.
   - dendro's `docs/journal/2026-10-19-segment-index-table.md` measured a
     metriken prototype (`proto/segment-index`) that stores a three-tier
@@ -3002,8 +3004,9 @@ written by the new dendro.
      layers.
    - The catalog index and scope-aware listings (Q29's direction). The
      names index is built: each sealed segment's caller index holds its
-     metric names by kind and its footer's `sampling_interval_ms` and
-     `metriken.format` (metriken-storage `names.rs`, `MNI1`), and
+     metric names by kind and its footer's `sampling_interval_ms`,
+     `metriken.format` and `metriken.layout` (metriken-storage `names.rs`,
+     `MNI1`), and
      `ArchiveReader` opens an archive whose segments carry one without
      fetching a segment. Label keys and values per metric, and the
      scope-aware listings that would use them, are not built.

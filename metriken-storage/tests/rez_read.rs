@@ -278,14 +278,28 @@ fn a_two_recording_v3_reads_each_recording_under_its_labels() {
 }
 
 /// `.rez` to dendro keeps every row: the converted live archive reads the
-/// same as the `.rez` did, its WAL tail included.
+/// same as the `.rez` did, its WAL tail included. Each sealed segment it
+/// copies carries a names index.
 #[cfg(feature = "write")]
 #[test]
 fn a_live_v3_converts_to_dendro() {
+    use metriken_storage::Catalog;
     let (dir, path) = copy("v3-live.rez");
     let dest = dir.path().join("out.dendro");
     metriken_storage::rez::to_dendro::convert_v3_to_dendro(&path, &dest).unwrap();
     let catalog = metriken_storage::DendroCatalog::open(&dest).unwrap();
+    let source = catalog.sources().unwrap().remove(0).id;
+    let mut sealed = 0;
+    for table in catalog.tables(source).unwrap() {
+        for (seq, index) in catalog.segment_indexes(source, &table).unwrap() {
+            assert!(
+                index.as_deref().is_some_and(|i| i.starts_with(b"MNI1")),
+                "{table}#{seq}: {index:?}"
+            );
+            sealed += 1;
+        }
+    }
+    assert!(sealed > 0, "the fixture has sealed segments");
     let mut recordings =
         ArchiveReader::from_catalog(Box::new(catalog), None, pool(), None).unwrap();
     assert_eq!(recordings.len(), 1);
