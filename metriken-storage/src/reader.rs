@@ -234,10 +234,12 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 ///   one is fetched when its names index does not decode or gives a format,
 ///   layout or interval this reader refuses (its probe then fails the open),
 ///   or when its names fingerprint is new. A later segment with no index is
-///   fetched when another segment of the table has a names index (it is one
-///   dendro merged or copied with a projection, which drops the index), and
-///   otherwise assumed to hold the first segment's names (a `.rez`, or a
-///   table sealed before fingerprints, has no index on any segment);
+///   fetched when another segment of the table has an index (dendro's
+///   compaction drops the index of a merged segment). A table with no index
+///   on any segment (converted by metriken-storage 0.5.4 or earlier, sealed
+///   before fingerprints, copied with a projection, or compacted so that
+///   every segment was merged) lists only its first segment's names and its
+///   live tail's;
 /// - the rows of its live tail that name its columns
 ///   (`crate::wal::schema_rows`), materialized alone.
 fn table_probes(
@@ -257,7 +259,9 @@ fn table_probes(
             .into_iter()
             .filter_map(|(seq, index)| Some((seq, index?)))
             .collect();
-        let names_indexed = stored.values().any(|raw| raw.starts_with(b"MNI"));
+        // A table whose writer stored indexes: a segment without one was
+        // merged by compaction, and may hold names no index gives.
+        let indexed_table = !stored.is_empty();
         let mut seen: HashSet<u64> = HashSet::new();
         // Names indexes already added: segments that hold the same names
         // store the same bytes, which are decoded once.
@@ -281,7 +285,7 @@ fn table_probes(
                 },
                 Some(Stored::Fingerprint(fp)) => seen.insert(fp) || i == 0,
                 Some(Stored::Unreadable) => true,
-                None => i == 0 || names_indexed,
+                None => i == 0 || indexed_table,
             };
             if fetch {
                 // By number: this runs inside the open's snapshot, where a

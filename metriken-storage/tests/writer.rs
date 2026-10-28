@@ -884,18 +884,10 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
             assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
         }
 
-        // A later segment without an index, in a table whose other segments
-        // have names indexes, is fetched.
-        let odd: usize = catalog
-            .tables(id)
-            .unwrap()
-            .iter()
-            .filter(|t| !t.ends_with("/occupants"))
-            .flat_map(|t| catalog.segment_meta(id, t).unwrap())
-            .filter(|(seq, _)| seq % 2 == 1)
-            .count();
-        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::OddDropped);
-        assert_eq!(fetched.get().0, odd);
+        // A later segment without an index, in a table whose first segment
+        // has one, is fetched; the first segment holds only `mem_free`.
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::FirstOnly);
+        assert_eq!(fetched.get().0, sealed.iter().map(|n| n - 1).sum::<usize>());
         let mut names = counted.gauge_names();
         names.sort();
         assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
@@ -951,9 +943,9 @@ enum Indexes {
     Newer,
     /// A names index of a version this reader does not know (`MNI2`).
     LaterVersion,
-    /// The stored indexes with the odd-numbered segments' removed, as
-    /// dendro's compaction leaves a merged segment.
-    OddDropped,
+    /// The stored indexes with every segment's but the first removed, as
+    /// dendro's compaction leaves merged segments.
+    FirstOnly,
 }
 
 /// Sealed segments read: of data tables, and of occupant streams.
@@ -1031,9 +1023,9 @@ impl Catalog for Counting {
                 .into_iter()
                 .map(|(seq, _)| (seq, Some(b"MNI2a later index".to_vec())))
                 .collect(),
-            Indexes::OddDropped => stored
+            Indexes::FirstOnly => stored
                 .into_iter()
-                .map(|(seq, index)| (seq, index.filter(|_| seq % 2 == 0)))
+                .map(|(seq, index)| (seq, index.filter(|_| seq == 0)))
                 .collect(),
             Indexes::Unreadable => stored
                 .into_iter()

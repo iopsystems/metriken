@@ -11,7 +11,8 @@ metriken-recorder writing them (step 2), and the names index of the catalog
 index (step 2) are built and unreleased; nothing else is built. The owner
 decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
-producer identity keys on 2026-10-27. Q9 and Q37 were decided on 2026-10-28. "Step N" means this entry's order of work.
+producer identity keys on 2026-10-27. Q9 and Q37 were decided on
+2026-10-28. "Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
 handshake) ([metriken-viewer](2026-10-12-metriken-viewer.md)), and rezolus's

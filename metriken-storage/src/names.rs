@@ -35,8 +35,8 @@ const NAMES: &[u8; 4] = b"MNI1";
 const NAMES_FAMILY: &[u8; 3] = b"MNI";
 
 /// The most a names index decompresses to before it is read as unreadable,
-/// so a crafted index cannot exhaust memory at open. An index of 2500 names
-/// is about 2 KB compressed.
+/// so a crafted index cannot exhaust memory at open. A [`SegmentNames`] of
+/// 2500 names of 20 bytes each packs to about 53 KB (21 bytes a name).
 const MAX_DECODED: u64 = 4 * 1024 * 1024;
 
 /// What a segment's footer gives a reader at open: the metric names it
@@ -276,15 +276,15 @@ mod tests {
         assert!(names_of(&segment_with(&[(format, "1"), (layout, "long")])).is_some());
     }
 
-    /// An index that decompresses past the cap is read as unreadable rather
-    /// than decompressed.
+    /// An index decompresses up to the cap and no further.
     #[test]
-    fn an_index_past_the_cap_is_unreadable() {
-        let big = vec![0u8; MAX_DECODED as usize + 1];
-        let mut index = NAMES.to_vec();
-        index.extend(zstd::stream::encode_all(big.as_slice(), 3).unwrap());
-        assert!(index.len() < 4096, "{}", index.len());
-        assert_eq!(read(Some(&index)), Some(Stored::Unreadable));
+    fn an_index_decodes_up_to_the_cap() {
+        let z = |n: usize| zstd::stream::encode_all(vec![0u8; n].as_slice(), 3).unwrap();
+        assert_eq!(
+            decode(&z(MAX_DECODED as usize)).map(|v| v.len()),
+            Some(MAX_DECODED as usize)
+        );
+        assert_eq!(decode(&z(MAX_DECODED as usize + 1)), None);
     }
 
     #[test]

@@ -242,13 +242,16 @@ Requires metriken-model 0.2.1.
   `ArchiveReader` takes a table's names, and its first segment's interval,
   from these indexes, so opening an archive whose segments all carry one
   fetches no sealed segment. A segment with a names fingerprint (`MNS1`,
-  written by 0.5.4 and earlier) is read as before; a later segment with no
-  index is fetched when another segment of its table has a names index
-  (dendro's compaction and projected copies drop the index), and an index
-  that does not decode, of an `MNI` version this reader does not know, or
-  that decompresses past 4 MiB is fetched. A segment whose bytes are
-  damaged now fails the first query that reads it rather than the open,
-  when its index lets the open skip it. A reader before this one does not
+  written by 0.4.0 to 0.5.4) is read as before. A later segment with no
+  index is fetched when another segment of its table has an index (dendro's
+  compaction drops a merged segment's index), so a compacted table costs a
+  fetch per merged segment at open. A table with no index on any segment
+  (copied with a projection, or compacted so that every segment was
+  merged) still lists only its first segment's names and its live tail's.
+  An index that does not decode, of an `MNI` version this reader does not
+  know, or that decompresses past 4 MiB is fetched. A segment whose bytes
+  are damaged now fails the first query that reads it rather than the
+  open, when its index lets the open skip it. A reader before this one does not
   read `MNI1` and takes each table's names from its first segment and live
   tail only, so it does not list a metric that first appears in a later
   segment of an archive written by this one.
