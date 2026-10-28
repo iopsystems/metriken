@@ -12,6 +12,19 @@
 //! - **Local**: a [`LocalSource`] the caller takes passes of in process
 //!   ([`RegistrySource`] with feature `registry`).
 //!
+//! A source's labels and metadata are its identity layers
+//! (metriken-storage's `layers`): the recorder's entries (`instance`,
+//! `transport`, `sampling_interval_ms`, the probe hook's reply, and one
+//! entry per producer epoch), the producer's (its handshake, or a local
+//! source's [`SourceIdentity`], with a producer identity written as
+//! `producer_name`, `version`, `build` and the `host` label), and the
+//! caller's (an endpoint's labels and metadata, a local source's labels,
+//! [`Recorder::patch_metadata`]), merged in that order, the last winning.
+//! The recorder writes no `source` of its own. It refuses a caller's
+//! `metriken.` keys, the flat epoch keys, and dendro's `encoder` and
+//! `writer_sessions`; a caller's `events` is stored as given, outside the
+//! layers.
+//!
 //! [`detect`] decides how each endpoint is recorded before the archive
 //! opens: by its stream first, then by the caller's [`Probe`] hook, then as
 //! Prometheus. The library never exits the process and installs no signal
@@ -59,13 +72,15 @@ mod detect;
 mod exposition;
 mod frames;
 mod identity;
+mod layered;
 #[cfg(feature = "registry")]
 mod local;
 #[cfg(feature = "http")]
 mod probe;
 mod prometheus;
 mod recorder;
-pub mod restart;
+#[cfg(feature = "http")]
+mod restart;
 #[cfg(feature = "http")]
 mod subscription;
 
@@ -81,6 +96,7 @@ pub use frames::{Applied, FrameDecoder, Handshake, StreamPass, StreamSubscriber}
 pub use identity::infer_source_name;
 #[cfg(feature = "registry")]
 pub use local::RegistrySource;
+pub use metriken_model::identity::ProducerIdentity;
 pub use metriken_model::wire::{Layout, WireNames, WIRE_NAMES};
 pub use metriken_storage::WriterConfig;
 #[cfg(feature = "http")]
@@ -94,18 +110,24 @@ pub use recorder::{
 pub use subscription::{pump, PumpConfig, Refusal, StreamEvent, Subscription};
 pub use tokio_util::sync::CancellationToken;
 
-/// The metadata keys the recorder reads or writes.
+/// The label and metadata keys the recorder reads or writes.
 pub mod keys {
-    /// The recording's name, also its `source` label.
+    /// The label a caller, a producer or the probe hook names a recording
+    /// with. The recorder writes none of its own.
     pub const SOURCE: &str = "source";
-    /// The recorder's tick, in milliseconds.
+    /// The recorder's tick, in milliseconds: a recorder-layer key.
     pub const SAMPLING_INTERVAL_MS: &str = "sampling_interval_ms";
-    /// The producer's current epoch (dendro's `keys::PRODUCER_EPOCH`).
+    /// The flat key for a source's current epoch (dendro's
+    /// `keys::PRODUCER_EPOCH`), which recordings made before the identity
+    /// layers carry. The recorder writes the recorder layer's epoch entries
+    /// instead, and refuses this key from a caller.
     pub const PRODUCER_EPOCH: &str = "producer_epoch";
-    /// Every epoch the source observed (dendro's `keys::PRODUCER_EPOCHS`).
+    /// The flat key for every epoch a source observed (dendro's
+    /// `keys::PRODUCER_EPOCHS`), which recordings made before the identity
+    /// layers carry. Refused from a caller, as `PRODUCER_EPOCH` is.
     pub const PRODUCER_EPOCHS: &str = "producer_epochs";
-    /// The producer's version, as it reports it; carried into each
-    /// `producer_epochs` entry.
+    /// The producer's version, as its handshake (the producer layer) or the
+    /// probe hook (the recorder layer) reports it.
     pub const VERSION: &str = "version";
     /// A JSON object of metric name to help text; a scraped source's `#
     /// HELP` lines.

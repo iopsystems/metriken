@@ -6,8 +6,9 @@ presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
 S9 in metriken" below) are done; the producer identity keys and
-`producer_identity!` (step 2) are built and unreleased; nothing else is
-built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
+`producer_identity!`, the identity layers in metriken-storage (#326), and
+metriken-recorder writing them (step 2) are built and unreleased; nothing
+else is built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
 producer identity keys on 2026-10-27. "Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
@@ -2207,10 +2208,9 @@ Identity and naming:
     layers stores them on the source without adding them to its series.
     The layered recorder will read them into the producer entry (`host` as
     a label, step 2) and will not store the `metriken.` keys themselves.
-    `Layers::derive_legacy` (#326) keeps them in the source's metadata but
-    reads none of them into the layers, so an upgraded source has no
-    producer entry or `host` from them; the recorder PR adds them to the
-    derivation as a producer entry.
+    `Layers::derive_legacy` reads them into a producer entry (#328), so an
+    upgraded source recorded with them before the layered recorder has its
+    producer identity and `host`.
   - The keys that can clash with a producer's own series labels, and so go
     through the clash rule: `instance` (federation, a pushgateway), `source`
     (rezolus's own provenance values), `alias`, `tier`, `host`, `arm`,
@@ -2271,7 +2271,7 @@ Identity and naming:
   delimit spans; the spans are taken as `epoch_spans` takes them from
   `producer_epochs` today: in `from_ts` order, not list order, since restart
   stamps come from clocks that need not agree, with the first also covering
-  earlier rows (metriken-storage `src/process.rs:121-126`). A span's handshake
+  earlier rows (metriken-storage `src/process.rs:121-127`). A span's handshake
   is the fold of the producer entries with that `epoch`; a source with no epoch
   has one span, whose handshake is the fold of all its producer entries. Every
   layer folds per key, so a key a later entry omits keeps its earlier value; a
@@ -2279,8 +2279,8 @@ Identity and naming:
   unsets it. rezolus's `descriptions` is unioned across entries and layers
   rather than replaced, as a restart unions it today
   (`src/recorder/agent_probe.rs:222-239`); for a layered source the layer
-  function's fold does this, and the probe hook's `merge` serves the recorder's
-  unlayered writes only. The producer and recorder layers fold their entries in
+  function's fold does this, and the recorder no longer calls the probe hook's
+  `merge` (#328). The producer and recorder layers fold their entries in
   (`from_ts`, `seq`, `id`) order, `id` ordering derived entries that share the
   other two. The user layer folds its entries in (`seq`, `id`) order: within one
   copy that is append order, so a later edit wins whatever the writer's clock
@@ -2929,6 +2929,34 @@ written by the new dendro.
      `ENRICH_RETRIES`, `late_enrich`) change with it. Open: a way to fill
      in a value the first answer lacked (an exporter's `agent_version`), since
      `Retry` discards the whole answer (Q3).
+
+     Built in parts (2026-10-27): the producer identity keys and macro (#327),
+     the layers and `layers::append` (#326), then metriken-recorder writing
+     every label and metadata write as a layer entry (#328). #328's calls,
+     open to reversal: `transport` (`stream`, `prometheus`, `local`) names the
+     transport in the at-open recorder entry, beside `instance` as a label and
+     `sampling_interval_ms`; the probe hook's labels and metadata go in the
+     recorder layer at open, its `source` label dropped, and a late reply's
+     metadata in a recorder entry with no epoch, so it delimits no span; a
+     caller's `events` is stored as given outside the layers, since `rezolus
+     record` writes its run markers there; a local source's `SourceIdentity`
+     labels are user-layer labels and its metadata producer-layer metadata,
+     with `SourceIdentity::producer` for its producer identity; a scrape's
+     HELP text is a recorder entry, still skipped when the caller set
+     `descriptions`; a restart writes, per new epoch, a recorder entry and a
+     producer entry (that process's handshake) from its first row, so an epoch
+     replaced before it was written keeps its handshake; the hook's labels and
+     metadata sit below the handshake's, where the flat write put them above;
+     dendro's keys are left out of a handshake's entry and its `encoder` and
+     `writer_sessions` refused from a caller; `Probe::merge` is not called,
+     since the fold takes the newest value and unions `descriptions`; the
+     hook's late labels are still not applied. Left for later PRs: a new
+     source when a reconnect's handshake names a different producer, the probe
+     hook for scraped endpoints and late activation, and `__producer__` with
+     the clash rule. The plan above is as written before #328, and its
+     `recorder.rs` line references are to the code before it. #328 also leaves
+     a URL's user name and password out of `instance` and writes only newly
+     described names of a scrape's HELP text.
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`.
    - In metriken-query, each producer epoch's rows evaluated with that

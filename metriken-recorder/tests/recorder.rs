@@ -447,8 +447,10 @@ async fn a_stream_is_recorded_at_the_interval_its_producer_serves() {
     assert_eq!(r.metadata["sampling_interval_ms"], "300");
     assert_eq!(r.metadata["version"], "1.0");
     assert!(
-        !r.metadata.keys().any(|k| k.starts_with("metriken.")),
-        "{:?}",
+        !r.metadata
+            .keys()
+            .any(|k| k.starts_with("metriken.") && !k.starts_with("metriken.layer.")),
+        "the stream's own keys are not stored: {:?}",
         r.metadata
     );
 }
@@ -496,6 +498,15 @@ async fn a_stream_and_a_scrape_are_recorded_into_one_archive() {
         serde_json::from_str(&scraped["svc"].metadata["descriptions"]).unwrap();
     assert_eq!(descriptions["http_requests_total"], "Requests served.");
     assert_eq!(scraped["svc"].metadata["sampling_interval_ms"], "100");
+    assert_eq!(scraped["svc"].metadata["transport"], "prometheus");
+    let layers = metriken_storage::layers::Layers::read(&scraped["svc"].metadata)
+        .unwrap()
+        .unwrap();
+    assert!(
+        layers.recorder.metadata.contains_key("descriptions"),
+        "the HELP text is a recorder entry"
+    );
+    assert_eq!(scraped["svc"].labels["instance"], prom.url.as_str());
 
     for id in [SourceId(0), SourceId(1)] {
         assert!(
@@ -538,18 +549,97 @@ async fn a_producers_handshake_names_its_recording() {
     let recordings = recordings(&run.path, "fake/ops");
     let r = &recordings["cachecannon"];
     assert_eq!(r.labels["source"], "cachecannon");
-    assert_eq!(r.metadata["source"], "cachecannon");
+    assert_eq!(r.labels["instance"], fake.url.as_str());
+    assert!(
+        !r.metadata.contains_key("source"),
+        "the recorder writes no source of its own"
+    );
     assert_eq!(r.metadata["version"], "0.3.0");
     assert_eq!(r.metadata["build"], "abc");
-    assert_eq!(r.metadata["producer_epoch"], "epoch-1");
+    assert_eq!(r.metadata["transport"], "stream");
+    assert_eq!(
+        recorder_epochs(&r.metadata),
+        vec![("epoch-1".to_string(), None)]
+    );
+    assert!(!r.metadata.contains_key("producer_epoch"));
     assert!(run.events.iter().any(|e| matches!(
         e,
         Event::Active { name, inferred: false, .. } if name == "cachecannon"
     )));
 }
 
-/// The caller's labels and metadata outrank the handshake's; the probe
-/// hook's labels sit between.
+/// A producer identity declared in the handshake's `metriken.producer.*`
+/// keys is written as `producer_name`, `version` and the `host` label; the
+/// `metriken.` keys themselves are not stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handshakes_producer_identity_is_written_as_producer_keys() {
+    let fake = serve(stream_only(
+        &[("source", "svc")],
+        &[
+            ("metriken.producer.name", "cachecannon"),
+            ("metriken.producer.version", "0.4.0"),
+            ("metriken.producer.host", "lg-1"),
+        ],
+    ))
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(600),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["producer_name"], "cachecannon");
+    assert_eq!(r.metadata["version"], "0.4.0");
+    assert_eq!(r.labels["host"], "lg-1");
+    assert!(
+        !r.metadata
+            .keys()
+            .any(|k| k.starts_with("metriken.producer.")),
+        "{:?}",
+        r.metadata
+    );
+}
+
+/// An endpoint nobody names is recorded with no `source`: its labels are
+/// the recorder's `instance`. It is shown under the name inferred from its
+/// URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unnamed_scrape_is_recorded_without_a_source() {
+    let exporter = serve(exporter("http_requests_total")).await;
+    let mut prom = spec(&exporter.url);
+    prom.url.set_path("/metrics");
+    let detected = detect(&client(), &detect_cfg(), vec![prom.clone()], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(600),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let scraped = recordings(&run.path, PROMETHEUS_GROUP);
+    let r = &scraped[""];
+    assert_eq!(
+        r.labels,
+        BTreeMap::from([("instance".to_string(), prom.url.to_string())])
+    );
+    assert!(!r.metadata.contains_key("source"));
+    assert!(run
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::Active { inferred: true, .. })));
+}
+
+/// The caller's labels and metadata, the user layer, outrank the
+/// handshake's and the probe hook's.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_callers_identity_outranks_the_hooks_and_the_handshakes() {
     let fake = serve(Behaviour {
@@ -577,6 +667,54 @@ async fn the_callers_identity_outranks_the_hooks_and_the_handshakes() {
     assert_eq!(r.labels["arm"], "baseline");
     assert_eq!(r.labels["zone"], "a", "the handshake's");
     assert_eq!(r.metadata["version"], "pinned");
+}
+
+/// The handshake's metadata, the producer layer, outranks the probe hook's,
+/// the recorder layer; the hook's `source` label is not written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_handshakes_identity_outranks_the_hooks() {
+    let fake = serve(Behaviour {
+        banner: Some("Rezolus 6.0.0 Agent\n".into()),
+        ..stream_only(&[("zone", "a")], &[("version", "handshake")])
+    })
+    .await;
+    let probe = Arc::new(AgentProbe(client()));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe,
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let recordings = recordings(&run.path, "fake/ops");
+    let r = &recordings[""];
+    assert_eq!(r.metadata["version"], "handshake");
+    assert!(!r.labels.contains_key("source"), "{:?}", r.labels);
+    assert!(
+        run.events.iter().any(|e| matches!(
+            e,
+            Event::Active { name, inferred: false, .. } if name == "rezolus"
+        )),
+        "shown under the hook's source: {:?}",
+        run.events
+    );
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        layers.recorder.metadata["version"], "6.0.0",
+        "the hook's, below"
+    );
 }
 
 /// GO check 3, mid-run: an agent too old to stream that comes up after the
@@ -703,6 +841,7 @@ async fn a_producer_restart_is_written_into_the_recording() {
             ("note", "after"),
             ("pinned", "producer"),
         ]),
+        restarted_labels: Some(map(&[("source", "svc"), ("zone", "b")])),
         ..stream_only(
             &[("source", "svc")],
             &[("version", "1.0.0"), ("note", "before")],
@@ -747,14 +886,37 @@ async fn a_producer_restart_is_written_into_the_recording() {
         .unwrap();
 
     let r = &recordings(&path, "fake/ops")["svc"];
-    assert_eq!(r.metadata["producer_epoch"], "epoch-2");
-    let epochs: serde_json::Value = serde_json::from_str(&r.metadata["producer_epochs"]).unwrap();
-    let epochs = epochs.as_array().unwrap();
+    let epochs = recorder_epochs(&r.metadata);
     assert_eq!(epochs.len(), 2, "{epochs:?}");
-    assert_eq!(epochs[0]["epoch"], "epoch-1");
-    assert_eq!(epochs[0]["version"], "1.0.0");
-    assert_eq!(epochs[1]["epoch"], "epoch-2");
-    assert_eq!(epochs[1]["version"], "1.1.0");
+    assert_eq!(epochs[0], ("epoch-1".to_string(), None));
+    assert_eq!(epochs[1].0, "epoch-2");
+    assert!(
+        epochs[1].1.is_some(),
+        "the restart's epoch starts at its first row"
+    );
+    assert_eq!(
+        producer_versions(&r.metadata),
+        vec![
+            (Some("epoch-1".to_string()), Some("1.0.0".to_string())),
+            (Some("epoch-2".to_string()), Some("1.1.0".to_string())),
+        ]
+    );
+    assert!(!r.metadata.contains_key("producer_epoch"));
+    assert!(!r.metadata.contains_key("producer_epochs"));
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    let restarted = layers
+        .producer
+        .entries
+        .iter()
+        .find(|e| e.epoch.as_deref() == Some("epoch-2"))
+        .unwrap();
+    assert_eq!(
+        restarted.from_ts, epochs[1].1,
+        "from the restart's first row"
+    );
+    assert_eq!(r.labels["zone"], "b", "the restarted handshake's labels");
     assert_eq!(r.metadata["version"], "1.1.0");
     assert_eq!(r.metadata["note"], "after");
     assert_eq!(
@@ -1000,9 +1162,19 @@ async fn a_descriptions_the_caller_set_survives_the_help_text() {
 /// caller's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caller_cannot_set_the_producer_epoch() {
-    for key in ["producer_epoch", "producer_epochs"] {
+    for (key, as_label) in [
+        ("producer_epoch", false),
+        ("producer_epochs", false),
+        ("metriken.layer.user", false),
+        ("metriken.x", true),
+        ("encoder", false),
+    ] {
         let mut endpoint = spec(&unused_url());
-        endpoint.metadata.insert(key.into(), "mine".into());
+        if as_label {
+            endpoint.labels.insert(key.into(), "mine".into());
+        } else {
+            endpoint.metadata.insert(key.into(), "mine".into());
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.dendro");
         let started = Recorder::start(
@@ -1052,6 +1224,11 @@ impl LocalSource for Counting {
             self.anchor,
         )
         .with_epoch("local-epoch")
+        .with_producer(
+            ProducerIdentity::new("counting")
+                .with_build("b1")
+                .with_host("h1"),
+        )
     }
 
     fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
@@ -1147,7 +1324,25 @@ async fn a_local_source_is_recorded_with_its_identity() {
     assert!(r.rows >= 5, "{r:?}");
     assert!(r.complete);
     assert_eq!(r.metadata["version"], "9.9.9");
-    assert_eq!(r.metadata["producer_epoch"], "local-epoch");
+    assert_eq!(r.metadata["producer_name"], "counting");
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        layers.user.labels["source"], "self",
+        "the labels are the user's"
+    );
+    assert_eq!(r.metadata["build"], "b1");
+    assert_eq!(r.labels["host"], "h1");
+    assert_eq!(r.metadata["transport"], "local");
+    assert_eq!(
+        recorder_epochs(&r.metadata),
+        vec![("local-epoch".to_string(), None)]
+    );
+    assert_eq!(
+        producer_versions(&r.metadata),
+        vec![(Some("local-epoch".to_string()), Some("9.9.9".to_string()))]
+    );
 }
 
 /// With `retain`, rows older than the newest minus the retention are
@@ -1473,7 +1668,12 @@ async fn patch_metadata_refuses_the_recorders_keys() {
     )
     .await
     .unwrap();
-    for key in ["producer_epoch", "producer_epochs"] {
+    for key in [
+        "producer_epoch",
+        "producer_epochs",
+        "metriken.layer.user",
+        "encoder",
+    ] {
         match recorder.patch_metadata(ids[0], map(&[(key, "mine")])).await {
             Err(Error::Reserved(e)) => assert!(e.contains(key), "{e}"),
             other => panic!("{key}: {other:?}"),
@@ -1914,7 +2114,12 @@ impl Probe for LateProbe {
         }
         Enrich::Metadata {
             epoch: epoch.map(str::to_string),
-            labels: map(&[("host", "web-01")]),
+            labels: map(&[
+                ("host", "web-01"),
+                ("zone", "hook"),
+                ("arm", "hook"),
+                ("source", "hook"),
+            ]),
             metadata: map(&[
                 ("version", "1.2.3"),
                 ("systeminfo", "{}"),
@@ -1927,14 +2132,17 @@ impl Probe for LateProbe {
 
 /// A hook reply that misses the first ask's timeout is asked for again
 /// after the recording is added, and its metadata is written into the
-/// recording: not over the caller's keys or the recorder's own, and
-/// without its labels, which are fixed at the add.
+/// recording: not over the caller's keys or the recorder's own. Its late
+/// labels are not applied.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_late_hook_reply_writes_its_metadata() {
-    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let fake = serve(stream_only(&[("source", "svc"), ("zone", "a")], &[])).await;
     let probe = LateProbe::new(2, Duration::from_secs(1));
     let mut endpoint = spec(&fake.url);
     endpoint.metadata.insert("owner".into(), "caller".into());
+    // The caller's and the handshake's labels win, so the hook's `arm` and
+    // `zone` are not named as lost.
+    endpoint.labels.insert("arm".into(), "caller".into());
     let detected = detect(&client(), &detect_cfg(), vec![endpoint], probe.as_ref()).await;
     let run = record(
         detected,
@@ -1950,6 +2158,13 @@ async fn a_late_hook_reply_writes_its_metadata() {
     let r = &recordings(&run.path, "fake/ops")["svc"];
     assert_eq!(r.metadata["version"], "1.2.3", "{:?}", r.metadata);
     assert_eq!(r.metadata["systeminfo"], "{}");
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        layers.recorder.metadata["version"], "1.2.3",
+        "a recorder entry"
+    );
     assert_eq!(r.metadata["owner"], "caller", "the caller's key is kept");
     assert_eq!(
         r.metadata["sampling_interval_ms"],
@@ -2082,4 +2297,316 @@ async fn a_restart_drops_the_retry_owed_to_the_old_process() {
     let r = &recordings(&path, "fake/ops")["svc"];
     assert_eq!(r.metadata.get("fresh").map(String::as_str), Some("epoch-2"));
     assert!(!r.metadata.contains_key("stale"), "{:?}", r.metadata);
+}
+
+/// A patch to an endpoint not recorded yet is written as a user entry when
+/// the endpoint is added.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_patch_before_the_add_is_written_at_the_add() {
+    let fake = serve(Behaviour {
+        down: true,
+        ..exporter("up_total")
+    })
+    .await;
+    let mut url = fake.url.clone();
+    url.set_path("/metrics");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pending.dendro");
+    let mut pending = EndpointSpec::new(url).with_label("source", "svc");
+    pending
+        .metadata
+        .insert("events".into(), r#"{"events":["spec"]}"#.into());
+    let detected = vec![Detected::Pending {
+        spec: pending,
+        reason: "down".into(),
+    }];
+    let (recorder, ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, Duration::from_millis(50)),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    recorder
+        .patch_metadata(
+            ids[0],
+            map(&[
+                ("owner", "caller"),
+                ("events", r#"{"events":[]}"#),
+                ("descriptions", r#"{"mine":"Mine."}"#),
+            ]),
+        )
+        .await
+        .unwrap();
+    fake.set(exporter("up_total"));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
+    assert_eq!(r.metadata["owner"], "caller", "{:?}", r.metadata);
+    assert_eq!(
+        r.metadata["events"], r#"{"events":[]}"#,
+        "the queued patch's over the endpoint's"
+    );
+    assert_eq!(
+        r.metadata["descriptions"], r#"{"mine":"Mine."}"#,
+        "a patched descriptions stops the HELP text"
+    );
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(layers.user.metadata["owner"], "caller");
+}
+
+/// A handshake carrying keys dendro maintains (`events`, `encoder`) is
+/// recorded; those keys are left out of the producer entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handshakes_dendro_keys_are_left_out() {
+    let fake = serve(stream_only(
+        &[("source", "svc")],
+        &[("events", "{}"), ("encoder", "theirs"), ("note", "kept")],
+    ))
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["note"], "kept");
+    assert!(!r.metadata.contains_key("events"), "{:?}", r.metadata);
+    assert_ne!(
+        r.metadata.get("encoder").map(String::as_str),
+        Some("theirs")
+    );
+}
+
+/// Two restarts written together each get a producer entry with their own
+/// handshake; only the newest recorder entry carries the hook's reply, and
+/// `Restarted`'s version is the hook's.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_restarts_written_together_keep_their_handshakes() {
+    let fake = serve(Behaviour {
+        streams: Streams::RestartsTwice(3),
+        banner: Some("Rezolus 7.0.0 Agent\n".into()),
+        restarted_metadata: map(&[("note", "second process")]),
+        second_restarted_metadata: map(&[("note", "third process"), ("version", "handshake")]),
+        ..stream_only(&[("source", "svc")], &[("note", "first process")])
+    })
+    .await;
+    let probe = Arc::new(AgentProbe(client()));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe,
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(4000),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    let note = |epoch: &str| {
+        layers
+            .producer
+            .entries
+            .iter()
+            .find(|e| e.epoch.as_deref() == Some(epoch))
+            .map(|e| e.metadata["note"].clone())
+    };
+    assert_eq!(note("epoch-2").as_deref(), Some("second process"));
+    assert_eq!(note("epoch-3").as_deref(), Some("third process"));
+    let hook_version = |epoch: &str| {
+        layers
+            .recorder
+            .entries
+            .iter()
+            .find(|e| e.epoch.as_deref() == Some(epoch))
+            .map(|e| e.metadata.get("version").cloned())
+    };
+    assert_eq!(
+        hook_version("epoch-2"),
+        Some(None),
+        "only the newest is asked"
+    );
+    assert_eq!(hook_version("epoch-3"), Some(Some("7.0.0".to_string())));
+    let versions: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Restarted { epoch, version, .. } => Some((epoch.clone(), version.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        versions,
+        [("epoch-3".to_string(), Some("7.0.0".to_string()))],
+        "the hook's version over the handshake's"
+    );
+}
+
+/// `events` is the caller's, stored as given outside the layers, at start and
+/// on a patch; a patch setting a key to `""` removes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_events_are_stored_as_given() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let mut endpoint = spec(&fake.url);
+    endpoint
+        .metadata
+        .insert("events".into(), r#"{"events":[]}"#.into());
+    endpoint.metadata.insert("owner".into(), "caller".into());
+    let detected = detect(&client(), &detect_cfg(), vec![endpoint], &NoProbe).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.dendro");
+    let (recorder, ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    // A patch of other keys leaves the endpoint's `events` as it was added.
+    recorder
+        .patch_metadata(ids[0], map(&[("owner", "")]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = &recordings(&path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["events"], r#"{"events":[]}"#);
+    assert!(!r.metadata.contains_key("owner"), "{:?}", r.metadata);
+
+    let marked = r#"{"events":[{"timestamp":1,"description":"run_start"}]}"#;
+    recorder
+        .patch_metadata(ids[0], map(&[("events", marked)]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recorder
+        .finish(Stop::Grace(INTERVAL), CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, "fake/ops")["svc"];
+    assert_eq!(r.metadata["events"], marked);
+}
+
+/// A local source's `events` in its identity's metadata is stored as given.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_sources_events_are_stored_as_given() {
+    struct WithEvents(Tiny);
+    impl LocalSource for WithEvents {
+        fn identity(&self) -> SourceIdentity {
+            SourceIdentity::new(
+                map(&[("source", "a")]),
+                map(&[("events", r#"{"events":[]}"#), ("version", "1")]),
+                wall(),
+            )
+        }
+        fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
+            self.0.pass()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local-events.dendro");
+    let (recorder, _ids, _events) = Recorder::start_local(
+        RecorderConfig::new(&path, INTERVAL),
+        vec![Box::new(WithEvents(Tiny { name: "a" }))],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, "a/g")["a"];
+    assert_eq!(r.metadata["events"], r#"{"events":[]}"#);
+    assert_eq!(r.metadata["version"], "1");
+}
+
+/// A local source's `metriken.` label is refused at start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_sources_reserved_label_is_refused() {
+    struct Reserved;
+    impl LocalSource for Reserved {
+        fn identity(&self) -> SourceIdentity {
+            SourceIdentity::new(map(&[("metriken.x", "y")]), BTreeMap::new(), 1)
+        }
+        fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
+            None
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reserved-local.dendro");
+    match Recorder::start_local(
+        RecorderConfig::new(&path, INTERVAL),
+        vec![Box::new(Reserved)],
+    )
+    .await
+    {
+        Err(StartError::Reserved(e)) => assert!(e.contains("metriken.x"), "{e}"),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("accepted"),
+    }
+}
+
+/// An unnamed local source is shown as `source <id>`, inferred, and is
+/// recorded without a `source` label.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unnamed_local_source_is_shown_by_its_id() {
+    struct Unnamed(Tiny);
+    impl LocalSource for Unnamed {
+        fn identity(&self) -> SourceIdentity {
+            SourceIdentity::new(BTreeMap::new(), BTreeMap::new(), wall())
+        }
+        fn pass(&mut self) -> Option<(metriken_model::Snapshot, Stamp)> {
+            self.0.pass()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unnamed.dendro");
+    let (recorder, _ids, mut rx) = Recorder::start_local(
+        RecorderConfig::new(&path, INTERVAL),
+        vec![Box::new(Unnamed(Tiny { name: "a" }))],
+    )
+    .await
+    .unwrap();
+    let active = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Event::Active { name, inferred, .. }) = rx.recv().await {
+                break (name, inferred);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(rx);
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(active, ("source 0".to_string(), true));
+    let r = &recordings(&path, "a/g")[""];
+    assert!(!r.labels.contains_key("source"), "{:?}", r.labels);
 }
