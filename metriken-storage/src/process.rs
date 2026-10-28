@@ -978,6 +978,36 @@ mod tests {
 
     /// The recorder layer's epoch entries give the spans, and the flat keys
     /// beside them are not read.
+    /// The recorder layer's epochs are read in fold order: an epoch with no
+    /// `from_ts`, appended after one at 0, folds before it, so the epoch at 0
+    /// covers every row.
+    #[test]
+    fn recorder_epochs_are_read_in_fold_order() {
+        use crate::layers::{append, Entry, Layer, LegacyEvidence};
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let evidence = LegacyEvidence::default();
+        let mut at_zero = Entry::new("a", "recorder");
+        at_zero.epoch = Some("e2".to_string());
+        at_zero.from_ts = Some(0);
+        let mut at_open = Entry::new("b", "recorder");
+        at_open.epoch = Some("e1".to_string());
+        for e in [at_zero, at_open] {
+            append(
+                &mut labels,
+                &mut metadata,
+                None,
+                &evidence,
+                Layer::Recorder,
+                e,
+            )
+            .unwrap();
+        }
+        // Rows from 5: in fold order `e1` covers rows before `e2`'s 0, none.
+        let spans = epoch_spans(&metadata, Some((5, 10)));
+        let epochs: Vec<&str> = spans.iter().map(|s| s.epoch.as_str()).collect();
+        assert_eq!(epochs, vec!["e2"]);
+    }
+
     #[test]
     fn epoch_spans_read_the_recorder_layer() {
         let mut labels = BTreeMap::new();

@@ -2254,7 +2254,7 @@ Identity and naming:
   delimit spans; the spans are taken as `epoch_spans` takes them from
   `producer_epochs` today: in `from_ts` order, not list order, since restart
   stamps come from clocks that need not agree, with the first also covering
-  earlier rows (metriken-storage `src/process.rs:124-126`). A span's handshake
+  earlier rows (metriken-storage `src/process.rs:121-126`). A span's handshake
   is the fold of the producer entries with that `epoch`; a source with no epoch
   has one span, whose handshake is the fold of all its producer entries. Every
   layer folds per key, so a key a later entry omits keeps its earlier value; a

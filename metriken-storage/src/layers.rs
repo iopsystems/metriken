@@ -283,12 +283,16 @@ impl LayerDoc {
         folded
     }
 
-    fn next_seq(&self) -> u64 {
-        self.entries
-            .iter()
-            .map(|e| e.seq)
-            .max()
-            .map_or(0, |s| s + 1)
+    /// One more than the highest `seq`, 0 for no entries; an error when the
+    /// highest is `u64::MAX`.
+    fn next_seq(&self, layer: Layer) -> Result<u64, LayerError> {
+        match self.entries.iter().map(|e| e.seq).max() {
+            None => Ok(0),
+            Some(s) => s.checked_add(1).ok_or_else(|| LayerError {
+                key: layer.key().to_string(),
+                message: format!("an entry's seq is {s}, so no later entry can be appended"),
+            }),
+        }
     }
 }
 
@@ -681,7 +685,8 @@ fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
 /// A refused entry, and a layer key (`metriken.layer.*`) in `metadata` that
 /// does not parse. The second fails this and every later `append` on the
 /// source until the key is repaired or removed outside `append`; an entry
-/// cannot unset it. Nothing is changed on an error.
+/// cannot unset it. A layer whose highest `seq` is `u64::MAX` refuses a
+/// further entry. Nothing is changed on an error.
 pub fn append(
     labels: &mut BTreeMap<String, String>,
     metadata: &mut BTreeMap<String, String>,
@@ -712,7 +717,7 @@ pub fn append(
     if !derived {
         if let Some(mut external) = drift(&layers.merged_with_removals(), labels, metadata) {
             let user = layers.get_mut(Layer::User);
-            external.seq = user.next_seq();
+            external.seq = user.next_seq(Layer::User)?;
             external.id = format!("external-{}-{}", external.seq, entry.id);
             external.ts = entry.ts;
             user.entries.push(external);
@@ -720,6 +725,8 @@ pub fn append(
     }
 
     let doc = layers.get_mut(layer);
+    // Before the dedupe, whose fold check places the entry by its `seq`.
+    entry.seq = doc.next_seq(layer)?;
     if layer == Layer::Producer {
         let winner = doc.ordered(layer).last().copied();
         let newest = doc.entries.iter().max_by_key(|e| e.seq);
@@ -740,7 +747,6 @@ pub fn append(
             return Ok(false);
         }
     }
-    entry.seq = doc.next_seq();
     doc.entries.push(entry);
 
     for layer in Layer::ORDER {
@@ -1329,10 +1335,13 @@ mod tests {
         let mut dendro_key = Entry::new("b", "annotate");
         dendro_key.metadata = map(&[("events", "{}")]);
         let label = entry("c", "annotate", &[("metriken.x", "1")]);
+        let mut unset_label = Entry::new("d", "annotate");
+        unset_label.unset_labels = vec!["metriken.y".to_string()];
         for (e, key) in [
             (unset, "producer_epochs"),
             (dendro_key, "events"),
             (label, "metriken.x"),
+            (unset_label, "metriken.y"),
         ] {
             let err = append(
                 &mut BTreeMap::new(),
@@ -1780,5 +1789,66 @@ mod tests {
             1
         );
         assert_eq!(metadata["config"], r#"{"a":"A"}"#);
+    }
+
+    /// The dedupe's fold check places the entry by the `seq` it is given, so
+    /// a resend tied on `from_ts` with the fold winner, which folds after it,
+    /// is appended.
+    #[test]
+    fn a_resend_tied_with_the_winner_is_placed_by_its_seq() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let stamped = |id: &str, x: &str, from_ts: u64| Entry {
+            from_ts: Some(from_ts),
+            ..entry(id, "producer", &[("x", x)])
+        };
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("w", "1", 200)
+        ));
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("n", "2", 100)
+        ));
+        assert_eq!(labels["x"], "1");
+        assert!(put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            stamped("r", "2", 200)
+        ));
+        assert_eq!(labels["x"], "2");
+    }
+
+    /// A layer whose highest `seq` is `u64::MAX` refuses a further entry
+    /// rather than wrapping.
+    #[test]
+    fn a_layer_at_the_last_seq_refuses_an_entry() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("a", "record", &[("k", "v")]),
+        );
+        let mut layers = Layers::read(&metadata).unwrap().unwrap();
+        layers.user.entries[0].seq = u64::MAX;
+        metadata.insert(
+            USER_KEY.to_string(),
+            serde_json::to_string(&layers.user).unwrap(),
+        );
+        let err = append(
+            &mut labels,
+            &mut metadata,
+            Some("u"),
+            &NONE,
+            Layer::User,
+            entry("b", "record", &[("j", "w")]),
+        )
+        .unwrap_err();
+        assert_eq!(err.key, USER_KEY);
     }
 }
