@@ -83,8 +83,8 @@ pub struct SourceInfo {
 }
 
 impl SourceInfo {
-    /// A source's facts, its epochs read from `metadata`'s
-    /// `producer_epochs` (else `producer_epoch`) and clipped to `span_ns`.
+    /// A source's facts, its epochs read from `metadata` as
+    /// [`epoch_spans`] reads them and clipped to `span_ns`.
     pub fn new(
         labels: BTreeMap<String, String>,
         catalog_index: usize,
@@ -113,15 +113,19 @@ pub const PRODUCER_EPOCHS: &str = "producer_epochs";
 
 /// The epochs a source's rows belong to, clipped to `span`.
 ///
-/// Each `producer_epochs` entry runs from its `from_ts` to the next entry's,
-/// exclusive, and the last to the source's last row. Entries are taken in
-/// `from_ts` order rather than list order: restart stamps come from clocks
-/// that need not agree, and an entry stamped before the one listed ahead of
-/// it would otherwise cover nothing. The first entry also covers any rows
-/// before its `from_ts`: the recorder seeds the list with the epoch the
-/// source opened with, so nothing earlier belongs to another epoch. Without
-/// a list that parses (logged), `producer_epoch` covers the whole span. An
-/// entry with no rows in the span is left out.
+/// The epochs are the recorder layer's entries that carry an `epoch`
+/// ([`layers`](crate::layers)), in fold order. A source without a recorder
+/// layer, recorded before the layers, or whose recorder layer does not parse
+/// (logged), has them in `producer_epochs` and `producer_epoch`. Each epoch
+/// runs from its `from_ts` to the next epoch's, exclusive, and the last to
+/// the source's last row. Epochs are taken in `from_ts` order rather than
+/// list order: restart stamps come from clocks that need not agree, and an
+/// epoch stamped before the one listed ahead of it would otherwise cover
+/// nothing; epochs with one `from_ts` keep their order. The first epoch also
+/// covers any rows before its `from_ts`, since it is the epoch the source
+/// opened with. Without a `producer_epochs` list that parses (logged),
+/// `producer_epoch` covers the whole span. An epoch with no rows in the span
+/// is left out.
 pub fn epoch_spans(
     metadata: &BTreeMap<String, String>,
     span: Option<(u64, u64)>,
@@ -129,6 +133,9 @@ pub fn epoch_spans(
     let Some((first, last)) = span else {
         return Vec::new();
     };
+    if let Some(listed) = recorder_epochs(metadata) {
+        return spans_from(listed, first, last);
+    }
     let listed = metadata.get(PRODUCER_EPOCHS).and_then(|s| {
         let parsed = listed_epochs(s);
         if parsed.is_none() {
@@ -139,7 +146,7 @@ pub fn epoch_spans(
         }
         parsed
     });
-    let Some(mut listed) = listed.filter(|l| !l.is_empty()) else {
+    let Some(listed) = listed.filter(|l| !l.is_empty()) else {
         return match metadata.get(PRODUCER_EPOCH) {
             Some(epoch) if !epoch.is_empty() => vec![EpochSpan {
                 epoch: epoch.clone(),
@@ -149,6 +156,38 @@ pub fn epoch_spans(
             _ => Vec::new(),
         };
     };
+    spans_from(listed, first, last)
+}
+
+/// The recorder layer's epoch entries as `(epoch, from_ts)` pairs, an entry
+/// with no `from_ts` (written at open) taking 0, so it covers from the first
+/// row; `None` for a source without a recorder layer, or one whose recorder
+/// layer does not parse (logged), which then reads the flat keys. A damaged
+/// user or producer layer does not affect it.
+fn recorder_epochs(metadata: &BTreeMap<String, String>) -> Option<Vec<(String, u64)>> {
+    if !metadata.contains_key(crate::layers::RECORDER_KEY) {
+        return None;
+    }
+    let recorder = match crate::layers::read_recorder(metadata) {
+        Ok(recorder) => recorder?,
+        Err(e) => {
+            tracing::warn!("{e}; reading the flat {PRODUCER_EPOCHS} instead");
+            return None;
+        }
+    };
+    // In fold order, an absent `from_ts` first, so `spans_from`'s stable
+    // sort on the stamp keeps it ahead of a `Some(0)`.
+    Some(
+        recorder
+            .ordered(crate::layers::Layer::Recorder)
+            .into_iter()
+            .filter_map(|e| Some((e.epoch.clone()?, e.from_ts.unwrap_or(0))))
+            .collect(),
+    )
+}
+
+/// Spans for `listed` `(epoch, from_ts)` pairs within `first..=last`.
+fn spans_from(mut listed: Vec<(String, u64)>, first: u64, last: u64) -> Vec<EpochSpan> {
     // Stable, so entries with one stamp keep their listed order.
     listed.sort_by_key(|(_, from)| *from);
     let mut out = Vec::new();
@@ -171,7 +210,7 @@ pub fn epoch_spans(
 
 /// The `(epoch, from_ts)` pairs of a `producer_epochs` value; `None` when it
 /// does not parse. Other fields of an entry (`version`) are ignored.
-fn listed_epochs(s: &str) -> Option<Vec<(String, u64)>> {
+pub(crate) fn listed_epochs(s: &str) -> Option<Vec<(String, u64)>> {
     #[derive(serde::Deserialize)]
     struct Entry {
         epoch: String,
@@ -936,6 +975,121 @@ mod equiv_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recorder layer's epoch entries give the spans, and the flat keys
+    /// beside them are not read.
+    /// The recorder layer's epochs are read in fold order: an epoch with no
+    /// `from_ts`, appended after one at 0, folds before it, so the epoch at 0
+    /// covers every row.
+    #[test]
+    fn recorder_epochs_are_read_in_fold_order() {
+        use crate::layers::{append, Entry, Layer, LegacyEvidence};
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let evidence = LegacyEvidence::default();
+        let mut at_zero = Entry::new("a", "recorder");
+        at_zero.epoch = Some("e2".to_string());
+        at_zero.from_ts = Some(0);
+        let mut at_open = Entry::new("b", "recorder");
+        at_open.epoch = Some("e1".to_string());
+        for e in [at_zero, at_open] {
+            append(
+                &mut labels,
+                &mut metadata,
+                None,
+                &evidence,
+                Layer::Recorder,
+                e,
+            )
+            .unwrap();
+        }
+        // Rows from 5: in fold order `e1` covers rows before `e2`'s 0, none.
+        let spans = epoch_spans(&metadata, Some((5, 10)));
+        let epochs: Vec<&str> = spans.iter().map(|s| s.epoch.as_str()).collect();
+        assert_eq!(epochs, vec!["e2"]);
+    }
+
+    #[test]
+    fn epoch_spans_read_the_recorder_layer() {
+        let mut labels = BTreeMap::new();
+        let mut metadata: BTreeMap<String, String> = [
+            (PRODUCER_EPOCH.to_string(), "flat".to_string()),
+            (
+                PRODUCER_EPOCHS.to_string(),
+                r#"[{"epoch":"flat","from_ts":0}]"#.to_string(),
+            ),
+        ]
+        .into();
+        // Written with the layers, so the flat list is not derived into them.
+        metadata.insert(crate::layers::RECORDER_KEY.to_string(), "{}".to_string());
+        for (id, epoch, from_ts) in [("a", "e1", None), ("b", "e2", Some(5 * M))] {
+            let mut entry = crate::layers::Entry::new(id, "recorder");
+            entry.epoch = Some(epoch.to_string());
+            entry.from_ts = from_ts;
+            crate::layers::append(
+                &mut labels,
+                &mut metadata,
+                None,
+                &crate::layers::LegacyEvidence::default(),
+                crate::layers::Layer::Recorder,
+                entry,
+            )
+            .unwrap();
+        }
+        let spans = epoch_spans(&metadata, Some((M, 9 * M)));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.epoch.as_str(), s.first_ns, s.last_ns))
+                .collect::<Vec<_>>(),
+            vec![("e1", M, 5 * M - 1), ("e2", 5 * M, 9 * M)]
+        );
+
+        // A recorder layer with no epoch entry: no spans, not the flat ones.
+        let bare: BTreeMap<String, String> = [
+            (PRODUCER_EPOCH.to_string(), "flat".to_string()),
+            (crate::layers::RECORDER_KEY.to_string(), "{}".to_string()),
+        ]
+        .into();
+        assert!(epoch_spans(&bare, Some((M, 9 * M))).is_empty());
+    }
+
+    /// A damaged recorder layer is read past: the flat keys give the epochs.
+    #[test]
+    fn a_damaged_recorder_layer_falls_back_to_the_flat_keys() {
+        let metadata: BTreeMap<String, String> = [
+            (PRODUCER_EPOCH.to_string(), "flat".to_string()),
+            (
+                crate::layers::RECORDER_KEY.to_string(),
+                "garbage".to_string(),
+            ),
+        ]
+        .into();
+        let spans = epoch_spans(&metadata, Some((M, 2 * M)));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].epoch, "flat");
+    }
+
+    /// A damaged user layer does not hide the recorder layer's epochs.
+    #[test]
+    fn a_damaged_user_layer_does_not_hide_the_epochs() {
+        let mut entry = crate::layers::Entry::new("a", "recorder");
+        entry.epoch = Some("e1".to_string());
+        let mut labels = BTreeMap::new();
+        let mut metadata = BTreeMap::new();
+        crate::layers::append(
+            &mut labels,
+            &mut metadata,
+            None,
+            &crate::layers::LegacyEvidence::default(),
+            crate::layers::Layer::Recorder,
+            entry,
+        )
+        .unwrap();
+        metadata.insert(crate::layers::USER_KEY.to_string(), "garbage".to_string());
+        let spans = epoch_spans(&metadata, Some((M, 2 * M)));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].epoch, "e1");
+    }
 
     const M: u64 = 60_000_000_000;
 

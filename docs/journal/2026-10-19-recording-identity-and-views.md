@@ -734,21 +734,21 @@ Names:
   a recording made before the layers only, a set of metric names that only one
   producer emits (evidence 2). A new source whose probe hook recorded no
   `producer_name` is not identified by its metric names. When evidence 1, 2 or 3
-  identifies a legacy source, the at-open recorder entry D2's read derives (`by:
-  upgrade`, or `by: convert` when `recording convert` writes it, Q2) carries
-  that `producer_name`, so the identification survives the layers being written
-  and retention, which keeps entries without `epoch`; one identified by its
-  metric names without a `version` keeps its notice, which a reader re-derives
-  from the source's metadata (no `version`, no `sampler_status`). A registry
-  match on `source` is not written: the derived user-layer `source` is read by
-  the registry rule as before, so the match follows the reader's registry. A
-  name the recorder derived from a URL is not evidence, but a legacy `source`
-  cannot be told from an inferred one (`infer_source_name` gives `vllm` for
-  `http://vllm/metrics`, whose port is the default), so a legacy `source` that
-  matches a registry entry is read as that producer with a notice that the name
-  may have been inferred. Evidence 4 is still accepted, with its caveat above;
-  it is not written either, and the carried `service_queries` stays in the
-  derived metadata, read as before.
+  identifies a legacy source, a further at-open recorder entry D2's read derives
+  (`by: upgrade`, or `by: convert` when `recording convert` writes it, Q2)
+  carries that `producer_name`, so the identification survives the layers being
+  written and retention, which keeps entries without `epoch`; one identified by
+  its metric names without a `version` keeps its notice, which a reader
+  re-derives from the source's metadata (no `version`, no `sampler_status`). A
+  registry match on `source` is not written: the derived user-layer `source` is
+  read by the registry rule as before, so the match follows the reader's
+  registry. A name the recorder derived from a URL is not evidence, but a legacy
+  `source` cannot be told from an inferred one (`infer_source_name` gives `vllm`
+  for `http://vllm/metrics`, whose port is the default), so a legacy `source`
+  that matches a registry entry is read as that producer with a notice that the
+  name may have been inferred. Evidence 4 is still accepted, with its caveat
+  above; it is not written either, and the carried `service_queries` stays in
+  the derived metadata, read as before.
 
 
   Reading `source` alone does not identify the producer: metriken-recorder's
@@ -2204,71 +2204,118 @@ Identity and naming:
 - **Q2.** How each layer is stored in dendro. Decided 2026-10-26: in source
   metadata, one key per layer holding JSON, under the `metriken.` prefix
   metriken uses for its handshake keys (`metriken.frame_interval`) and segment
-  keys (`metriken.layout`). Decided 2026-10-27: each layer is a list of
-  entries: `metriken.layer.user = {"labels": {…}, "metadata": {…}, "entries":
-  [{"id": …, "seq": …, "ts": …, "by": …, "labels": {…}, "metadata": {…},
-  "unset": […]}, …]}`, and likewise `metriken.layer.producer` and
+  keys (`metriken.layout`). Decided 2026-10-27: each layer is a list of entries:
+  `metriken.layer.user = {"labels": {…}, "metadata": {…}, "entries": [{"id": …,
+  "seq": …, "ts": …, "by": …, "labels": {…}, "metadata": {…}, "unset_labels":
+  […], "unset_metadata": […]}, …]}`, and likewise `metriken.layer.producer` and
   `metriken.layer.recorder`, whose entries also carry `from_ts`. `id` is random
-  per entry. `seq` is one more than the highest `seq` in the layer when the
-  entry is written (the first entry in an empty layer takes 0), so it gives
-  append order without a clock. `ts` is the wall time of the write in
-  nanoseconds since the Unix epoch, shown to the user and not used for
-  ordering. `from_ts` is the timestamp of the first row the entry covers, as
-  dendro defines it for `producer_epochs` (`src/lib.rs:223-227`); an entry
-  written before the source's first row (at open, since metriken-recorder adds
-  the source before its pump starts, `recorder.rs:2520-2527`) carries none, and
-  readers take the source's first row for it. `by` names the writer: `producer`
-  (a handshake, or an in-process `SourceIdentity`), `recorder` (including what
+  per entry, except a derived entry's (below) and an `external` entry's,
+  `external-<seq>-<id of the entry being appended>`. `seq` is one more than the
+  highest `seq` in the layer when the entry is written (the first entry in an
+  empty layer takes 0), so it gives append order without a clock. `ts` is the
+  wall time of the write in nanoseconds since the Unix epoch, shown to the user
+  and not used for ordering. `from_ts` is the timestamp of the first row the
+  entry covers, as dendro defines it for `producer_epochs`
+  (`src/lib.rs:223-227`); an entry written before the source's first row (at
+  open, since metriken-recorder adds the source before its pump starts,
+  `recorder.rs:2520-2527`) carries none, folds before every entry that has one,
+  and covers from the source's first row. `by` names the writer: `producer` (a
+  handshake, or an in-process `SourceIdentity`), `recorder` (including what
   rezolus's probe hook reads from `/about`, `/status`, the `/` banner and
   `/systeminfo`: `producer_name`, `producer_component`, `version` or
   `exporter_version`, `agent_version`, `host`), `record` (labels the user gave
   at record time), `annotate`, `viewer`, `upgrade` and `convert` (layers derived
   by D2's read rule, Q3; a msgpack snapshot's `version` goes into its epoch's
-  producer entry), or `combine` (its label stamping, step 3.4). `unset` lists
-  keys the entry removes, so an undo is one more entry. A producer entry carries
-  the handshake's epoch (its `uuid`, metriken-recorder `frames.rs:144-146`) when
-  the handshake names one; the recorder drops the `producer_epoch` copy a
-  producer puts in its handshake metadata, so the fold writes no flat
-  `producer_epoch`. A reconnect that resends a handshake identical to the
-  producer entry with the highest `seq` appends nothing. A recorder entry is an
-  observation: the entry at open carries the endpoint (`instance`) and the
-  transport, and each epoch, the opening one included, is a recorder entry
-  carrying that `epoch`. Only recorder entries carrying `epoch` delimit spans;
-  the spans are taken as `epoch_spans` takes them from `producer_epochs` today:
-  in `from_ts` order, not list order, since restart stamps come from clocks that
-  need not agree, with the first also covering earlier rows (metriken-storage
-  `src/process.rs:116-125`). A span's handshake is the fold of the producer
-  entries with that `epoch`; a source with no epoch has one span, whose
-  handshake is the fold of all its producer entries. Every layer folds per key,
-  so a key a later entry omits keeps its earlier value; a restarted producer
-  that drops a label such as `zone` keeps it until an entry unsets it. rezolus's
-  `descriptions` is unioned across entries rather than replaced, as a restart
-  unions it today (`src/recorder/agent_probe.rs:222-239`). The producer and
-  recorder layers fold their entries in (`from_ts`, `seq`) order. The user layer
-  folds its entries in (`seq`, `id`) order: within one copy that is append
-  order, so a later edit wins whatever the writer's clock says. When copies of
-  one source (one uuid) meet in a process group, their user entries are merged
-  as a union by `id` and folded the same way; the notice names any key that
-  entries present in only one copy set to different values, since `seq` does not
-  order edits made apart in different copies. The top-level `labels` and
-  `metadata` are a cache of the fold: a reader folds the entries, and when the
-  cache disagrees the fold wins and a notice names the source. Labels are
-  source-wide: the merged `labels` carry the newest value for every row of the
-  source, and only the epoch spans and the per-epoch templates (Q8) apply per
-  span. No edit rewrites or removes an entry (M6). Trimming and retention are
-  the one removal: dropping every row of an epoch drops the producer and
-  recorder entries carrying that `epoch`, as the producer layer specifies
-  (Identity in three layers); entries without `epoch` (the endpoint at open) and
-  user entries are kept. Today nothing prunes `producer_epochs`, and
-  `epoch_spans` skips an entry with no rows in the span. The first layer write
-  to a source without `metriken.layer.*` (an `annotate`, a viewer save,
-  `combine`'s stamping) first writes the layers D2's read rule derives (`by:
-  upgrade`), so the record-time labels of a legacy source enter the fold.
-  Entries derived by D2's read rule take `seq` 0, the one exception to the `seq`
-  rule, and an `id` derived from the source uuid, the layer name and the entry's
-  epoch (none for the at-open entry); the derived user layer is one entry
-  holding every derived user-layer key. Derived entries carry no `ts`, and two
-  derived entries with one `id` are compared on `labels`, `metadata` and `unset`
+  producer entry), `combine` (its label stamping, step 3.4), or `external` (a
+  change the layer function found made outside it). `unset_labels` and
+  `unset_metadata` list the labels and metadata keys the entry removes, so an
+  undo is one more entry: unsetting removes the key from the entry's layer, so
+  the merged result takes the lower layers' value, and undoing one edit of
+  several writes the key's earlier value. They are separate because the recorder
+  writes `source` as both a label and a metadata key. A key set to the empty
+  string is left out of the merged result, as Prometheus treats an empty label
+  value as no label, so a user entry removes a label the producer declared by
+  setting it to `""`; in the producer and recorder layers an empty value removes
+  the key from that layer, as an unset does, and does not remove a lower layer's
+  value (amended 2026-10-27). A producer entry carries the handshake's epoch
+  (its `uuid`, metriken-recorder `frames.rs:144-146`) when the handshake names
+  one; the recorder drops the `producer_epoch` copy a producer puts in its
+  handshake metadata, so the fold writes no flat `producer_epoch`. A reconnect
+  that resends a handshake identical to the producer entry that wins the fold,
+  or to the producer entry appended last when appending it would change neither
+  the producer fold nor its epoch's, appends nothing; `from_ts` is not compared
+  (amended 2026-10-27: the highest-`seq` entry need not win the fold when
+  restart stamps disagree, so a resend whose `from_ts` sorts before the winner
+  is compared with the producer entry appended last, and one that changes the
+  layer's fold or its epoch's fold is appended). A
+  recorder entry is an observation: the entry at open carries the endpoint
+  (`instance`) and the transport, and each epoch, the opening one included, is a
+  recorder entry carrying that `epoch`. Only recorder entries carrying `epoch`
+  delimit spans; the spans are taken as `epoch_spans` takes them from
+  `producer_epochs` today: in `from_ts` order, not list order, since restart
+  stamps come from clocks that need not agree, with the first also covering
+  earlier rows (metriken-storage `src/process.rs:121-126`). A span's handshake
+  is the fold of the producer entries with that `epoch`; a source with no epoch
+  has one span, whose handshake is the fold of all its producer entries. Every
+  layer folds per key, so a key a later entry omits keeps its earlier value; a
+  restarted producer that drops a label such as `zone` keeps it until an entry
+  unsets it. rezolus's `descriptions` is unioned across entries and layers
+  rather than replaced, as a restart unions it today
+  (`src/recorder/agent_probe.rs:222-239`); for a layered source the layer
+  function's fold does this, and the probe hook's `merge` serves the recorder's
+  unlayered writes only. The producer and recorder layers fold their entries in
+  (`from_ts`, `seq`, `id`) order, `id` ordering derived entries that share the
+  other two. The user layer folds its entries in (`seq`, `id`) order: within one
+  copy that is append order, so a later edit wins whatever the writer's clock
+  says. When copies of one source (one uuid) meet in a process group, their user
+  entries are merged as a union by `id` and folded the same way; the notice
+  names any key that entries present in only one copy set to different values,
+  since `seq` does not order edits made apart in different copies. The top-level
+  `labels` and `metadata` are a cache of the fold: a reader folds the entries,
+  and when the cache disagrees the fold wins and a notice names the source. The
+  layer function itself does not discard such a change: a label or layered
+  metadata key changed outside it since its last write is appended first, as a
+  user entry by `external`, a removal as the key set to `""`; the write that
+  derives a legacy source's layers checks nothing, since the derivation is the
+  source's own state (amended 2026-10-27). Labels are source-wide: the merged
+  `labels` carry the newest value for every row of the source, and only the
+  epoch spans and the per-epoch templates (Q8) apply per span. No edit rewrites
+  or removes an entry (M6). Trimming and retention are the one removal: dropping
+  every row of an epoch drops the producer and recorder entries carrying that
+  `epoch`, as the producer layer specifies (Identity in three layers); entries
+  without `epoch` (the endpoint at open) and user entries are kept. Today
+  nothing prunes `producer_epochs`, and `epoch_spans` skips an entry with no
+  rows in the span. The first layer write to a source without `metriken.layer.*`
+  (an `annotate`, a viewer save, `combine`'s stamping) first writes the layers
+  D2's read rule derives (`by: upgrade`), so the record-time labels and metadata
+  of a legacy source enter the fold. The recorder writes through the layer
+  function before any other tool does (step 2 before step 3.4): a recorder that
+  writes the flat keys or `update_metadata` to a layered source has its epochs
+  ignored (only the recorder layer is read) and its writes to keys the layers
+  set captured as `external` user entries. Amended 2026-10-27, the derivation
+  is: the labels as one user entry, leaving out `metriken.` labels; one at-open
+  recorder entry holding the legacy metadata other than the keys dendro
+  maintains (`writer_sessions`, `encoder`, `events`), the flat epoch keys and
+  `metriken.` keys, so a legacy value a producer or user edit overrides and a
+  later edit in that layer unsets falls back to the source's own (a recorder
+  unset removes the source's own value too, since an unset removes the key from
+  its whole layer); `producer_name`, when D2's evidence 1 to 3 names one, in a
+  further at-open recorder entry with `seq` 1 that folds over the at-open entry
+  and whose id includes the name, so readers holding different evidence derive
+  the same entries apart from that one; each epoch as a recorder entry, read as
+  `epoch_spans` reads the flat keys (the `producer_epochs` list
+  when it parses and is not empty, each listing kept, else `producer_epoch` with
+  no `from_ts`). A listed epoch's `version` is not derived: the source's
+  `version` is its newest, which the at-open entry holds, and the flat
+  `producer_epochs`, which no write removes, keeps the history. Entries derived
+  by D2's read rule take `seq` 0 (1 for the evidence entry, and an epoch
+  entry its position in the legacy list, so epochs listed at one `from_ts`
+  keep their list order), the one exception to the `seq` rule, and an
+  `id` derived from the source uuid, the layer name, the entry's epoch and its
+  `from_ts` (none for the at-open entry; `from_ts` because a legacy list can
+  repeat an epoch); the derived user layer is one entry holding every derived
+  user-layer key. Derived entries carry no `ts`, and two derived entries with
+  one `id` are compared on `labels`, `metadata`, the unset lists and `epoch`
   only, so a derivation read at open, one written by `upgrade` and one written
   by `convert` are the same entry. So the derivation read from a pre-layer copy
   and the one written into a layered copy are one entry in the union; when two
@@ -2292,10 +2339,16 @@ Identity and naming:
   move onto it in step 3.4. The recorder drops every `metriken.`-prefixed key
   from a producer's handshake metadata, as it drops `metriken.frame_interval`
   today (metriken-recorder `recorder.rs:996-998`), so only the layer function
-  writes the layer keys. The layer function builds without metriken-storage's
-  `write` feature, so the WASM viewer can call it on an in-memory archive (The
-  static-site viewer reads and writes documents). The flat `producer_epoch` and
-  `producer_epochs` keys move into `metriken.layer.recorder` (Q3).
+  writes the layer keys. The layer function (metriken-storage `layers::append`)
+  edits a source's two maps and does no I/O. It builds without
+  metriken-storage's `write` feature, so the WASM viewer can call it on an
+  in-memory archive (The static-site viewer reads and writes documents), and the
+  recorder applies its result to a live source with dendro's
+  `SourceWriter::set_identity` (dendro 0.6.1), since `update_metadata` can
+  neither set labels nor remove a key. An entry that sets or unsets a
+  `metriken.` label or metadata key, a flat epoch key, or a key dendro maintains
+  (`writer_sessions`, `encoder`, `events`) is refused. The flat `producer_epoch`
+  and `producer_epochs` keys move into `metriken.layer.recorder` (Q3).
 
   Separate columns were the alternative. dendro's columns are what the
   container acts on (`uuid`, `clock_anchor_wall_ns`, `complete`, the
