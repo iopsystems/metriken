@@ -2528,7 +2528,9 @@ Identity and naming:
     boundary (metriken-query `archive.rs:369-379`, one member per epoch); a
     renamed metric's old series ends and the new one starts.
   - A reconnect whose handshake names a different producer starts a new
-    source, since none of its series continue the old one's.
+    source, since none of its series continue the old one's (built, #329:
+    the producer is the handshake's producer identity name, else its
+    `source` label; a handshake that names none does not split).
   - The change reaches a subscriber as a dendro replication frame,
     `SourceUpdate { source, ts, labels, metadata }`, sent by dendro's
     `ArchivePublisher`. Today the publisher reads the sources once, when it
@@ -2936,27 +2938,28 @@ written by the new dendro.
      open to reversal: `transport` (`stream`, `prometheus`, `local`) names the
      transport in the at-open recorder entry, beside `instance` as a label and
      `sampling_interval_ms`; the probe hook's labels and metadata go in the
-     recorder layer at open, its `source` label dropped, and a late reply's
-     metadata in a recorder entry with no epoch, so it delimits no span; a
-     caller's `events` is stored as given outside the layers, since `rezolus
-     record` writes its run markers there; a local source's `SourceIdentity`
-     labels are user-layer labels and its metadata producer-layer metadata,
-     with `SourceIdentity::producer` for its producer identity; a scrape's
-     HELP text is a recorder entry, still skipped when the caller set
-     `descriptions`; a restart writes, per new epoch, a recorder entry and a
-     producer entry (that process's handshake) from its first row, so an epoch
-     replaced before it was written keeps its handshake; the hook's labels and
-     metadata sit below the handshake's, where the flat write put them above;
-     dendro's keys are left out of a handshake's entry and its `encoder` and
-     `writer_sessions` refused from a caller; `Probe::merge` is not called,
-     since the fold takes the newest value and unions `descriptions`; the
-     hook's late labels are still not applied. Left for later PRs: a new
-     source when a reconnect's handshake names a different producer, the probe
-     hook for scraped endpoints and late activation, and `__producer__` with
-     the clash rule. The plan above is as written before #328, and its
-     `recorder.rs` line references are to the code before it. #328 also leaves
-     a URL's user name and password out of `instance` and writes only newly
-     described names of a scrape's HELP text.
+     recorder layer at open, its `source` label and metadata key dropped, and
+     a late reply's metadata in a recorder entry with no epoch, so it delimits
+     no span; a caller's `events` is stored as given outside the layers, since
+     `rezolus record` writes its run markers there; a local source's
+     `SourceIdentity` labels are user-layer labels and its metadata
+     producer-layer metadata, with `SourceIdentity::producer` for its producer
+     identity; a scrape's HELP text is a recorder entry, still skipped when
+     the caller set `descriptions`; a restart writes, per new epoch, a
+     recorder entry and a producer entry (that process's handshake) from its
+     first row, so an epoch replaced before it was written keeps its
+     handshake; the hook's labels and metadata sit below the handshake's,
+     where the flat write put them above; dendro's keys are left out of a
+     handshake's entry and its `encoder` and `writer_sessions` refused from a
+     caller; `Probe::merge` is not called, since the fold takes the newest
+     value and unions `descriptions`; the hook's late labels are still not
+     applied. #329 starts a new source when a reconnect's handshake names a
+     different producer. Left for later PRs: the probe hook for scraped
+     endpoints and late activation, and `__producer__` with the clash rule.
+     The plan above is as written before #328, and its `recorder.rs` line
+     references are to the code before it. #328 also leaves a URL's user name
+     and password out of `instance` and writes only newly described names of a
+     scrape's HELP text.
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`.
    - In metriken-query, each producer epoch's rows evaluated with that

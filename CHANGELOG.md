@@ -59,6 +59,30 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   dendro's `encoder` and `writer_sessions`, are refused, at start
   (`StartError::Reserved`) and by `patch_metadata` (`Error::Reserved`), as
   `producer_epoch` and `producer_epochs` are.
+- **Added:** a streamed source that reconnects to a different producer (a
+  handshake naming another producer identity, else another `source` label)
+  gets a new recording. The old producer's restarts that have a row are
+  written without the probe hook's reply (the new producer is on the
+  port), and its recording is finalized at its last row. A new source is
+  added for the endpoint, anchored and timed by the new handshake, with
+  the caller's labels, metadata and patches written again, and the probe
+  hook is asked about the new producer on the following ticks; the new
+  recording carries no label from the hook, and a label it gives arrives
+  as `LabelsNotApplied`.
+  `Event::ProducerChanged { source, from, to, name }` reports it. A
+  handshake that names no producer does not split, and leaves the producer
+  on record; a reconnect while no handshake has named a producer does not
+  split either. While the recorder stops, a producer change does not
+  split: the last rows go into the old recording, as a restart when the
+  epoch differs. `Committed`'s `passes_total` and
+  `first_ts`, and the `SourceSummary`, count the endpoint across its
+  recordings. A finalized recording is not evicted by `retain` again. Two
+  recordings of one endpoint can carry identical labels until
+  `__producer__` is added; their rows stay apart as separate sources.
+- **Changed:** an endpoint URL's user name and password are left out of
+  the recorder's own log lines and of `SourceSummary::endpoint`, as #328
+  leaves them out of the `instance` label. Messages from detection and
+  subscription still name the URL as given.
 - **Added:** `SourceIdentity::producer` and `with_producer`,
   `RegistrySource::with_producer`, and `ProducerIdentity` re-exported.
 - **Removed:** `restart::metadata_patch`, `restart::Restart` and
@@ -143,6 +167,10 @@ Requires metriken-model 0.2.1.
 - **Added:** `SourceRecorder::set_identity(labels, metadata)` (feature
   `write`), dendro 0.6.1's `SourceWriter::set_identity` for a recording
   source. Requires dendro 0.6.1.
+- **Changed:** a `descriptions` change made outside `append` is recorded
+  in its `external` entry as the names it adds or gives another value,
+  where it was the whole value; a later producer or recorder value of
+  another name is no longer hidden under it.
 - **Added:** `layers::forbidden_metadata`, whether an entry may not carry
   a metadata key, for a writer filtering input it did not choose.
 - **Added:** `layers::identity_keys` and the constants `PRODUCER_NAME`,

@@ -222,6 +222,19 @@ pub(crate) fn producer(
     e
 }
 
+/// The producer a handshake names: its producer identity's name
+/// (`metriken.producer.name`), else its `source` label, which a producer
+/// written before the identity keys declares itself by. `None` when it
+/// names none.
+pub(crate) fn producer_name(
+    labels: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, String>,
+) -> Option<String> {
+    ProducerIdentity::from_metadata(metadata)
+        .map(|identity| identity.name)
+        .or_else(|| labels.get(keys::SOURCE).filter(|s| !s.is_empty()).cloned())
+}
+
 /// A user entry by `record`: labels and metadata the caller gave.
 pub(crate) fn user(
     labels: &BTreeMap<String, String>,
@@ -391,6 +404,25 @@ mod tests {
             r#"{"b":"B","c":"C2"}"#
         );
         assert_eq!(new_descriptions(r#"{"a":"A"}"#, None), r#"{"a":"A"}"#);
+    }
+
+    #[test]
+    fn a_handshake_names_its_producer_by_identity_then_source() {
+        let labels = map(&[("source", "svc")]);
+        let identity = map(&[("metriken.producer.name", "cachecannon")]);
+        assert_eq!(
+            producer_name(&labels, &identity).as_deref(),
+            Some("cachecannon")
+        );
+        assert_eq!(
+            producer_name(&labels, &BTreeMap::new()).as_deref(),
+            Some("svc")
+        );
+        assert_eq!(producer_name(&BTreeMap::new(), &BTreeMap::new()), None);
+        assert_eq!(
+            producer_name(&map(&[("source", "")]), &BTreeMap::new()),
+            None
+        );
     }
 
     #[test]

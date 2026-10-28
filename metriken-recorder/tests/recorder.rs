@@ -1673,6 +1673,7 @@ async fn patch_metadata_refuses_the_recorders_keys() {
         "producer_epochs",
         "metriken.layer.user",
         "encoder",
+        "writer_sessions",
     ] {
         match recorder.patch_metadata(ids[0], map(&[(key, "mine")])).await {
             Err(Error::Reserved(e)) => assert!(e.contains(key), "{e}"),
@@ -2609,4 +2610,344 @@ async fn an_unnamed_local_source_is_shown_by_its_id() {
     assert_eq!(active, ("source 0".to_string(), true));
     let r = &recordings(&path, "a/g")[""];
     assert!(!r.labels.contains_key("source"), "{:?}", r.labels);
+}
+
+/// A reconnect whose handshake names a different producer ends the
+/// recording and starts a new one for the endpoint, with the caller's
+/// patches written to it again. A reconnect to the same producer does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_different_producer_after_a_reconnect_starts_a_new_source() {
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        restarted_labels: Some(map(&[("source", "other")])),
+        banner: Some("Rezolus 7.0.0 Agent\n".into()),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let probe = Arc::new(AgentProbe(client()));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("changed.dendro");
+    let (recorder, ids, mut rx) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        probe,
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    recorder
+        .patch_metadata(ids[0], map(&[("owner", "caller")]))
+        .await
+        .unwrap();
+    let mut firsts = Vec::new();
+    let changed = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            match rx.recv().await {
+                Some(Event::ProducerChanged { from, to, name, .. }) => break (from, to, name),
+                Some(Event::Committed {
+                    first_ts,
+                    passes_total,
+                    ..
+                }) => firsts.push((first_ts, passes_total)),
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        }
+    })
+    .await
+    .expect("the producer change is seen within 6 s");
+    assert_eq!(
+        changed,
+        ("svc".to_string(), "other".to_string(), "other".to_string())
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Committed {
+            first_ts,
+            passes_total,
+            ..
+        } = event
+        {
+            firsts.push((first_ts, passes_total));
+        }
+    }
+    drop(rx);
+    recorder
+        .finish(Stop::Grace(INTERVAL), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut starts: Vec<u64> = firsts.iter().map(|(first, _)| *first).collect();
+    starts.dedup();
+    assert_eq!(starts.len(), 1, "first_ts counts the endpoint: {firsts:?}");
+    assert!(
+        firsts.windows(2).all(|w| w[0].1 <= w[1].1),
+        "passes_total counts the endpoint: {firsts:?}"
+    );
+
+    let recordings = recordings(&path, "fake/ops");
+    assert_eq!(recordings.len(), 2, "{recordings:?}");
+    for (name, epoch) in [("svc", "epoch-1"), ("other", "epoch-2")] {
+        let r = &recordings[name];
+        assert!(r.rows > 0, "{name}: {r:?}");
+        assert!(r.complete, "{name} is finalized");
+        assert_eq!(r.metadata["owner"], "caller", "{name}");
+        assert_eq!(
+            recorder_epochs(&r.metadata),
+            vec![(epoch.to_string(), None)],
+            "{name}"
+        );
+    }
+    assert!(
+        recordings["svc"].last_ts < recordings["other"].first_ts,
+        "the new recording starts after the old one ends"
+    );
+    let layers = metriken_storage::layers::Layers::read(&recordings["other"].metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        layers.recorder.metadata.get("version").map(String::as_str),
+        Some("7.0.0"),
+        "the hook is asked about the new producer"
+    );
+}
+
+/// A reconnect whose handshake names no producer does not split, and the
+/// producer on record stays the one named before, so a later different
+/// producer still splits from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handshake_naming_no_producer_does_not_split() {
+    let fake = serve(Behaviour {
+        streams: Streams::RestartsTwice(3),
+        restarted_metadata: BTreeMap::new(),
+        second_restarted_metadata: map(&[("metriken.producer.name", "b")]),
+        ..stream_only(&[], &[("metriken.producer.name", "a")])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(4000),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let changes: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ProducerChanged { from, to, .. } => Some((from.clone(), to.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(changes, [("a".to_string(), "b".to_string())]);
+    // Producer a's restart to epoch-2 (a handshake naming none, which sends
+    // no frame) has no row, so a's recording keeps its opening epoch alone.
+    {
+        use metriken_storage::Catalog;
+        let catalog = metriken_storage::DendroCatalog::open(&run.path).unwrap();
+        let sources = catalog.sources().unwrap();
+        let a = sources
+            .iter()
+            .find(|s| s.metadata.get("producer_name").map(String::as_str) == Some("a"))
+            .expect("a's recording");
+        let metadata: BTreeMap<String, String> = a.metadata.clone().into_iter().collect();
+        let epochs: Vec<String> = recorder_epochs(&metadata)
+            .into_iter()
+            .map(|(epoch, _)| epoch)
+            .collect();
+        assert_eq!(epochs, ["epoch-1"]);
+    }
+
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        restarted_labels: Some(BTreeMap::new()),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(3000),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    assert!(
+        !run.events
+            .iter()
+            .any(|e| matches!(e, Event::ProducerChanged { .. })),
+        "{:?}",
+        run.events
+    );
+    use metriken_storage::Catalog;
+    let catalog = metriken_storage::DendroCatalog::open(&run.path).unwrap();
+    assert_eq!(catalog.sources().unwrap().len(), 1);
+
+    // A recording whose handshake named no producer does not split when a
+    // named one arrives.
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        restarted_labels: Some(map(&[("source", "b")])),
+        ..stream_only(&[], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(3000),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    assert!(
+        !run.events
+            .iter()
+            .any(|e| matches!(e, Event::ProducerChanged { .. })),
+        "{:?}",
+        run.events
+    );
+}
+
+/// A scrape URL's user name and password reach neither the `instance` label
+/// nor the summary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scrape_urls_credentials_are_left_out() {
+    let exporter = serve(exporter("up_total")).await;
+    let mut url = exporter.url.clone();
+    url.set_path("/metrics");
+    let plain = url.to_string();
+    url.set_username("user").unwrap();
+    url.set_password(Some("secret")).unwrap();
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![EndpointSpec::new(url).with_label("source", "svc")],
+        &NoProbe,
+    )
+    .await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    let summary = run.summary.expect("finished");
+    assert_eq!(summary.sources[0].endpoint.as_deref(), Some(plain.as_str()));
+    let r = &recordings(&run.path, PROMETHEUS_GROUP)["svc"];
+    assert_eq!(r.labels["instance"], plain);
+    assert!(!format!("{:?}", r.metadata).contains("secret"));
+}
+
+/// A scrape that adds a metric name writes a recorder entry with that name's
+/// HELP text alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_metric_name_writes_only_its_help_text() {
+    let fake = serve(exporter("a_total")).await;
+    let mut url = fake.url.clone();
+    url.set_path("/metrics");
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![EndpointSpec::new(url).with_label("source", "svc")],
+        &NoProbe,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("help.dendro");
+    let (recorder, _ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    fake.set(Behaviour {
+        prometheus: Some(
+            "# HELP a_total Requests served.\n# TYPE a_total counter\na_total 42\n\
+             # HELP b_total Bytes served.\n# TYPE b_total counter\nb_total 7\n"
+                .to_string(),
+        ),
+        ..Behaviour::default()
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    recorder
+        .finish(Stop::Grace(INTERVAL), CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    let written: Vec<BTreeMap<String, String>> = layers
+        .recorder
+        .entries
+        .iter()
+        .filter_map(|e| e.metadata.get("descriptions"))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    assert_eq!(
+        written,
+        vec![
+            map(&[("a_total", "Requests served.")]),
+            map(&[("b_total", "Bytes served.")]),
+        ]
+    );
+    let merged: BTreeMap<String, String> =
+        serde_json::from_str(&r.metadata["descriptions"]).unwrap();
+    assert_eq!(merged.len(), 2);
+}
+
+/// With no hook, `Restarted`'s version is the newest restart's handshake's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarts_version_is_the_newest_handshakes() {
+    let fake = serve(Behaviour {
+        streams: Streams::RestartsTwice(3),
+        restarted_metadata: map(&[("version", "2")]),
+        second_restarted_metadata: map(&[("version", "3")]),
+        ..stream_only(&[("source", "svc")], &[("version", "1")])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let run = record(
+        detected,
+        Arc::new(NoProbe),
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(4000),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let versions: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Restarted { version, .. } => Some(version.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(versions, [Some("3".to_string())]);
 }
