@@ -46,6 +46,13 @@ pub const UNION_KEYS: &[&str] = &["descriptions"];
 
 /// The producer layer's metadata key for a producer identity's name.
 pub const PRODUCER_NAME: &str = "producer_name";
+/// The label the merged layers give a source from its merged
+/// [`PRODUCER_NAME`], whichever layer sets it: a user entry over the
+/// producer's declared name over the recorder layer's (what the probe hook or
+/// a legacy derivation read). A later entry that changes the merged name, a
+/// late hook reply among them, changes the label with it. Internal by the
+/// `__` rule, so listings and legends hide it.
+pub const PRODUCER_LABEL: &str = "__producer__";
 /// The producer layer's metadata key for a producer identity's version.
 pub const VERSION: &str = "version";
 /// The producer layer's metadata key for a producer identity's build.
@@ -417,6 +424,9 @@ impl Layers {
     /// does not remove a lower layer's value. Unsetting a key removes it from the
     /// entry's layer, so the merged result takes the lower layers' value; to
     /// undo one edit, an entry writes the key's earlier value.
+    ///
+    /// The labels gain [`PRODUCER_LABEL`] from the merged [`PRODUCER_NAME`]
+    /// when no layer sets that label itself.
     pub fn merged(&self) -> Folded {
         let mut merged = self.merged_with_removals();
         merged.labels.retain(|_, v| !v.is_empty());
@@ -435,6 +445,15 @@ impl Layers {
                 folded.metadata.retain(|_, v| !v.is_empty());
             }
             merged.apply(&folded.labels, &folded.metadata);
+        }
+        // A layer that sets the label itself (a user entry, or `""` to
+        // remove it) decides it.
+        if !merged.labels.contains_key(PRODUCER_LABEL) {
+            if let Some(name) = merged.metadata.get(PRODUCER_NAME).filter(|n| !n.is_empty()) {
+                merged
+                    .labels
+                    .insert(PRODUCER_LABEL.to_string(), name.clone());
+            }
         }
         merged
     }
@@ -626,14 +645,15 @@ fn refresh_cache(doc: &mut LayerDoc, layer: Layer) {
     doc.metadata = folded.metadata;
 }
 
-/// A user entry for what changed in `labels` and `metadata` since the
-/// layers' merged result `before` (with the user layer's removals) was
-/// written: labels added, changed or removed, and layered metadata keys
-/// changed, added back or removed. An empty value and an absent key are the
-/// same. A removed key is set to `""`, which removes it from the merged
-/// result whichever layer sets it. A label under [`RESERVED_PREFIX`] is not
-/// taken, so `append`, which writes the merged labels whole, drops it.
-/// `None` when nothing changed.
+/// A user entry for what changed in `labels` and `metadata` since the layers'
+/// merged result `before` (with the user layer's removals) was written: labels
+/// added, changed or removed, and layered metadata keys changed, added back or
+/// removed. An empty value and an absent key are the same. A `__producer__`
+/// label the source lacks is not a removal (the layers derive it; a user entry
+/// setting it to `""` removes it). A removed key is set to `""`, which removes
+/// it from the merged result whichever layer sets it. A label under
+/// [`RESERVED_PREFIX`] is not taken, so `append`, which writes the merged
+/// labels whole, drops it. `None` when nothing changed.
 fn drift(
     before: &Folded,
     labels: &BTreeMap<String, String>,
@@ -645,6 +665,12 @@ fn drift(
     let mut entry = Entry::new("", "external");
     for k in before.labels.keys().chain(labels.keys()) {
         if k.starts_with(RESERVED_PREFIX) {
+            continue;
+        }
+        // The layers derive `__producer__`; a source written before they did,
+        // or by a writer that sets the visible labels whole, lacks it, and
+        // that is not a removal.
+        if k == PRODUCER_LABEL && !labels.contains_key(k) {
             continue;
         }
         let have = present(labels, k);
@@ -737,7 +763,8 @@ fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
 /// `update_source_labels` or `update_source_metadata`) has that change appended
 /// first, as a user entry by `external` with the id `external-<seq>-<entry's
 /// id>`, so it is kept rather than overwritten; a removal is kept as the key
-/// set to `""`. Being a user entry, it wins over every producer and recorder
+/// set to `""`, except that a source lacking `__producer__` is not read as
+/// having removed it. Being a user entry, it wins over every producer and recorder
 /// value of that key, later ones included, until a user entry unsets it. A
 /// `descriptions` value whose keys all hold their merged values (one with a key
 /// removed, or reordered) is not a change: that key is merged across entries,
@@ -2082,5 +2109,89 @@ mod tests {
         let merged: BTreeMap<String, String> =
             serde_json::from_str(&metadata["descriptions"]).unwrap();
         assert_eq!(merged, map(&[("a", "NEW"), ("b", "B2"), ("z", "Z")]));
+    }
+
+    /// `__producer__` comes from the merged `producer_name`: the producer's
+    /// over the recorder's; a user entry setting the label decides it, and
+    /// `""` removes it. A write keeps it without recording an outside change.
+    #[test]
+    fn the_producer_label_follows_the_merged_producer_name() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let mut hook = Entry::new("r", "recorder");
+        hook.metadata = map(&[(PRODUCER_NAME, "rezolus")]);
+        put(&mut labels, &mut metadata, Layer::Recorder, hook);
+        assert_eq!(labels[PRODUCER_LABEL], "rezolus");
+        let mut declared = Entry::new("p", "producer");
+        declared.metadata = map(&[(PRODUCER_NAME, "cachecannon")]);
+        put(&mut labels, &mut metadata, Layer::Producer, declared);
+        assert_eq!(labels[PRODUCER_LABEL], "cachecannon");
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("u", "record", &[("k", "v")]),
+        );
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert!(layers.user.entries.iter().all(|e| e.by != "external"));
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("x", "record", &[(PRODUCER_LABEL, "mine")]),
+        );
+        assert_eq!(labels[PRODUCER_LABEL], "mine");
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("y", "record", &[(PRODUCER_LABEL, "")]),
+        );
+        assert!(!labels.contains_key(PRODUCER_LABEL));
+    }
+
+    /// A source whose labels lack `__producer__` (written before the layers
+    /// derived it) gains it at its next write, and no outside removal is
+    /// recorded.
+    #[test]
+    fn a_missing_producer_label_is_not_a_removal() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let mut declared = Entry::new("p", "producer");
+        declared.metadata = map(&[(PRODUCER_NAME, "cachecannon")]);
+        put(&mut labels, &mut metadata, Layer::Producer, declared);
+        labels.remove(PRODUCER_LABEL);
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("u", "record", &[("k", "v")]),
+        );
+        assert_eq!(labels[PRODUCER_LABEL], "cachecannon");
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert!(layers.user.entries.iter().all(|e| e.by != "external"));
+    }
+
+    /// An outside write of another `__producer__` value is a change, kept as
+    /// an `external` user entry, so it wins.
+    #[test]
+    fn an_outside_producer_label_is_recorded() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let mut declared = Entry::new("p", "producer");
+        declared.metadata = map(&[(PRODUCER_NAME, "cachecannon")]);
+        put(&mut labels, &mut metadata, Layer::Producer, declared);
+        labels.insert(PRODUCER_LABEL.to_string(), "z".to_string());
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("u", "record", &[("k", "v")]),
+        );
+        assert_eq!(labels[PRODUCER_LABEL], "z");
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        assert!(layers
+            .user
+            .entries
+            .iter()
+            .any(|e| e.by == "external"
+                && e.labels.get(PRODUCER_LABEL).map(String::as_str) == Some("z")));
     }
 }

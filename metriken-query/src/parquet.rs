@@ -473,10 +473,8 @@ impl ParquetBuilder {
 
     /// Add a file whose series will carry `labels` as additional metadata.
     /// The labels are injected into every series from this file at query time.
-    ///
-    /// # Precondition
-    /// Injected label keys must not conflict with column labels already present
-    /// in the parquet file's schema; if they do, the native value is overwritten.
+    /// A series that already carries one of the keys keeps its own value under
+    /// `exported_<key>`, as an archive recording's series do.
     pub fn file_labeled(mut self, path: impl AsRef<Path>, labels: impl Into<Labels>) -> Self {
         self.entries.push(BuilderEntry::Path(
             path.as_ref().to_path_buf(),

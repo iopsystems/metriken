@@ -673,15 +673,14 @@ impl TableReader {
 /// table, and any V3 sampler with only one group) don't need it to be.
 ///
 /// `recording` is the index of the recording this table belongs to, in its
-/// catalog (or in `from_in_memory`'s input). It is what `__recording__`
-/// carries for recordings with identical label sets. Which recording a table
-/// belongs to, for grouping a query's tables, is decided by
+/// catalog (or in `from_in_memory`'s input). It is what `__recording__` carries
+/// for twin recordings (equal labels other than internal ones). Which recording
+/// a table belongs to, for grouping a query's tables, is decided by
 /// `recording_labels` instead: the index repeats across readers joined by
 /// [`ArchiveReader::flatten`]. An index rather than the recording's `dir`
-/// string: `dir` is a display name derived from labels
-/// (`recording_dir_slug`), not a guaranteed-unique identity — two
-/// recordings with the same labels are entirely legal and would collide on
-/// `dir`.
+/// string: `dir` is a display name derived from labels (`recording_dir_slug`),
+/// not a guaranteed-unique identity — two recordings with the same labels are
+/// entirely legal and would collide on `dir`.
 pub struct SamplerReader {
     recording: usize,
     /// The labels of the recording this table belongs to, one allocation per
@@ -1191,8 +1190,8 @@ impl ArchiveReader {
     /// The injected label is what keeps two recordings' identically-named
     /// series apart, and this method cannot see it. `open_recordings` does not
     /// solve that on the caller's behalf: **two recordings may legally carry
-    /// identical label sets** — two endpoints that infer the same `source` and
-    /// `host` do exactly that, and the recorder only warns. A caller that
+    /// identical label sets** — two endpoints given the same labels do
+    /// exactly that, and the recorder only warns. A caller that
     /// derives its injected label from a recording's own labels can therefore
     /// give both arms the same one and reproduce the merge this method refuses,
     /// one level up. Derive the label from something the caller knows is
@@ -2228,8 +2227,11 @@ impl ArchiveReader {
     /// The labels each recording's series carry: its read group's labels
     /// ([`read_groups`](Self::read_groups)), so the sources of one process
     /// group carry one label set and their series union; and for read groups
-    /// whose label sets are identical (two processes recorded with equal
-    /// labels), [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
+    /// whose labels other than internal ones are equal
+    /// ([`is_matched_label`](crate::labels::is_matched_label): two processes
+    /// recorded with equal labels, or an endpoint's recordings before and
+    /// after a producer change, which differ in `__producer__`),
+    /// [`RECORDING_LABEL`](crate::labeled::RECORDING_LABEL) with the
     /// catalog index of the group's first source, so their series stay
     /// apart. Twins are found among every read group, tables or not, and the
     /// index does not change when a live archive is reopened. Recordings of
@@ -2239,10 +2241,25 @@ impl ArchiveReader {
     pub fn series_labels(&self) -> &SeriesLabels {
         self.series_labels.get_or_init(|| {
             let ReadGroupIndex { groups, of, .. } = self.read_group_index();
-            // Read groups by label set, so twins are found in one pass.
+            // Read groups by the labels a query matches on (internal labels
+            // other than `__recording__` left out: `__producer__` differs
+            // between an endpoint's recordings before and after a producer
+            // change, and `without` and binary matching ignore it), so twins
+            // are found in one pass.
+            let matched: Vec<BTreeMap<String, String>> = groups
+                .iter()
+                .map(|group| {
+                    group
+                        .labels
+                        .iter()
+                        .filter(|(k, _)| crate::labels::is_matched_label(k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .collect();
             let mut twins: HashMap<&BTreeMap<String, String>, Vec<usize>> = HashMap::new();
-            for (g, group) in groups.iter().enumerate() {
-                twins.entry(&group.labels).or_default().push(g);
+            for (g, key) in matched.iter().enumerate() {
+                twins.entry(key).or_default().push(g);
             }
             let first = |g: usize| groups[g].sources[0];
             let labelled: Vec<Labels> = groups
@@ -2252,7 +2269,7 @@ impl ArchiveReader {
                     let mut extra = Labels {
                         inner: group.labels.clone(),
                     };
-                    let set = &twins[&group.labels];
+                    let set = &twins[&matched[g]];
                     if set.len() > 1 {
                         // Catalog indices, unless two twins share one (readers
                         // of different archives joined by `flatten`): then the

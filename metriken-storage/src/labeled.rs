@@ -29,11 +29,12 @@ use crate::{parquet, scan};
 pub const EXPORTED_PREFIX: &str = "exported_";
 
 /// The label added, with a catalog index, to the series of read groups
-/// (`ArchiveReader::read_groups`: the sources of one process) whose label
-/// sets are identical, so the series of two processes recorded with equal
-/// labels stay apart. The sources of one process group share their group's
-/// labels and do not carry it. Internal under the `__` rule
-/// ([`crate::is_internal_label`]).
+/// (`ArchiveReader::read_groups`: the sources of one process) whose labels
+/// other than internal ones are equal, so the series of two processes recorded
+/// with equal labels stay apart, as do an endpoint's recordings before and
+/// after a producer change, which differ in `__producer__`. The sources of one
+/// process group share their group's labels and do not carry it. Internal under
+/// the `__` rule ([`crate::is_internal_label`]).
 pub const RECORDING_LABEL: &str = "__recording__";
 
 /// `labels` with `extra` added: a key the series already carries keeps its
@@ -172,31 +173,38 @@ impl LabeledSource {
 impl LabeledSource {
     /// `stream` with this source's labels added to its series, and the rows
     /// of series `filter` does not accept dropped.
-    fn relabel_stream(
-        &self,
-        mut stream: HistogramStream,
-        filter: &Labels,
-    ) -> Option<HistogramStream> {
-        for labels in &mut stream.meta.series {
-            self.relabel(labels);
-        }
-        // Rows refer to series by index, so a series cannot be dropped from
-        // the meta; drop its rows instead.
-        let dropped: Vec<bool> = stream
-            .meta
-            .series
-            .iter()
-            .map(|l| !keeps(l, &self.extra, filter))
-            .collect();
-        if dropped.iter().all(|d| *d) {
-            return None;
-        }
-        if dropped.iter().any(|d| *d) {
-            let rows = stream.rows;
-            stream.rows = Box::new(rows.filter(move |r| !dropped[r.series_idx]));
-        }
-        Some(stream)
+    fn relabel_stream(&self, stream: HistogramStream, filter: &Labels) -> Option<HistogramStream> {
+        relabel_stream(stream, &self.extra, filter)
     }
+}
+
+/// `stream` with `extra` added to its series ([`add_labels`]), and the rows
+/// of series that fail `filter`'s `exported_` matchers ([`keeps`]) dropped;
+/// `None` when every series fails them.
+pub fn relabel_stream(
+    mut stream: HistogramStream,
+    extra: &Labels,
+    filter: &Labels,
+) -> Option<HistogramStream> {
+    for labels in &mut stream.meta.series {
+        add_labels(labels, extra);
+    }
+    // Rows refer to series by index, so a series cannot be dropped from
+    // the meta; drop its rows instead.
+    let dropped: Vec<bool> = stream
+        .meta
+        .series
+        .iter()
+        .map(|l| !keeps(l, extra, filter))
+        .collect();
+    if dropped.iter().all(|d| *d) {
+        return None;
+    }
+    if dropped.iter().any(|d| *d) {
+        let rows = stream.rows;
+        stream.rows = Box::new(rows.filter(move |r| !dropped[r.series_idx]));
+    }
+    Some(stream)
 }
 
 impl DataSource for LabeledSource {

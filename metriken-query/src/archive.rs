@@ -2318,6 +2318,29 @@ mod tests {
         );
     }
 
+    /// Recordings whose labels differ only in `__producer__` (an endpoint's
+    /// recordings before and after a producer change) are twins: they carry
+    /// `__recording__`, so `without` and binary matching keep them apart.
+    #[test]
+    fn recordings_differing_only_in_producer_stay_apart() {
+        let rec = |producer: &'static str, v| {
+            recording(
+                &[("source", "s"), ("__producer__", producer)],
+                vec![("t", counter_table("c", &[(&[("cpu", "0")], v)], 10))],
+            )
+        };
+        let reader = archive(vec![rec("pa", 1), rec("pb", 2)]);
+        for q in [
+            "sum without (cpu) (rate(c[3s]))",
+            "rate(c[3s]) / rate(c[3s])",
+        ] {
+            match reader.query_range_opts(q, 1.0, 10.0, 1.0, &QueryOptions::default()) {
+                Ok(QueryResult::Matrix { result }) => assert_eq!(result.len(), 2, "{q}"),
+                other => panic!("{q}: {other:?}"),
+            }
+        }
+    }
+
     /// `without` keeps `__recording__`, so twins stay apart under it.
     #[test]
     fn without_keeps_twins_apart() {

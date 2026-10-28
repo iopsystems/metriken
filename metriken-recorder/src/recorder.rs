@@ -257,7 +257,12 @@ pub enum Event {
     /// either, nor one while the recorder stops (its rows go into the old
     /// recording). The new recording carries no label from the probe hook: the
     /// hook is asked again, and a label it gives arrives as
-    /// [`Event::LabelsNotApplied`].
+    /// [`Event::LabelsNotApplied`]. A `producer_name` in its reply adds
+    /// `__producer__`
+    /// ([`PRODUCER_LABEL`](metriken_storage::layers::PRODUCER_LABEL)) when
+    /// neither the producer's handshake nor the caller sets `producer_name` or
+    /// `__producer__`; a handshake that names its producer only by its `source`
+    /// label sets neither.
     ProducerChanged {
         source: SourceId,
         from: String,
@@ -268,11 +273,14 @@ pub enum Event {
     Gap { source: SourceId, seq: u64 },
     /// The source cannot be recorded; `reason` is the line that says why.
     Refused { source: SourceId, reason: String },
-    /// The probe hook's labels for an endpoint arrived after its
-    /// recording was added, whose labels are fixed, and are not applied.
-    /// `labels` are those that would have been added or changed; given as
-    /// the endpoint's labels ([`EndpointSpec::labels`](crate::EndpointSpec))
-    /// on the next run, they are set. At most once per source.
+    /// The probe hook's labels for an endpoint arrived after its recording was
+    /// added, and are not applied. A `producer_name` in the same reply still
+    /// adds `__producer__` when neither the producer's handshake nor the caller
+    /// sets `producer_name` or `__producer__`; a handshake that names its
+    /// producer only by its `source` label sets neither. `labels` are those
+    /// that would have been added or changed; given as the endpoint's labels
+    /// ([`EndpointSpec::labels`](crate::EndpointSpec)) on the next run, they
+    /// are set. At most once per source.
     LabelsNotApplied {
         source: SourceId,
         labels: BTreeMap<String, String>,
@@ -491,16 +499,18 @@ impl Recorder {
     /// archive at `cfg.path`.
     ///
     /// Every streamed or scraped endpoint's first [`Probe::enrich`] runs at
-    /// once, each
-    /// bounded by `cfg.timeout`, before the archive opens, since a
-    /// recording's labels are fixed when it is added. One that does not
-    /// answer in time is added without the hook's labels and metadata,
-    /// with a warning, and the hook is asked again on later ticks, up to
-    /// five more times, each ask allowed twice as long as the one before
-    /// (at most 60 s); the metadata of a reply that arrives is written into
-    /// the recording, and its labels are not applied. A pending endpoint is
-    /// detected on each tick; a refused one is reported in the [`Summary`]
-    /// and never recorded.
+    /// once, each bounded by `cfg.timeout`, before the archive opens, since the
+    /// hook's labels are applied only when a recording is added. One that does
+    /// not answer in time is added without the hook's labels and metadata, with
+    /// a warning, and the hook is asked again on later ticks, up to five more
+    /// times, each ask allowed twice as long as the one before (at most 60 s);
+    /// the metadata of a reply that arrives is written into the recording, and
+    /// its labels are not applied; a `producer_name` in it adds `__producer__`
+    /// when neither the producer's handshake nor the caller sets
+    /// `producer_name` or `__producer__`; a handshake that names its producer
+    /// only by its `source` label sets neither. A pending endpoint is detected
+    /// on each tick; a refused one is reported in the [`Summary`] and never
+    /// recorded.
     ///
     /// Returns the recorder, the id of each detected endpoint and then each
     /// local source, in the order given, and the event channel.
@@ -1929,6 +1939,9 @@ impl Driver {
             let old = self.slots[i].maps.labels.clone();
             self.forget_labels(i, &old);
             let label = self.slots[i].label();
+            if let Some(warning) = label_collision(&self.seen_labels, &maps.labels, &label) {
+                warn!("{warning}");
+            }
             self.note_labels(i, &maps.labels, label);
         }
         self.slots[i].maps = maps;
@@ -2699,9 +2712,8 @@ impl Driver {
             if !lost.is_empty() {
                 let shown: Vec<String> = lost.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 warn!(
-                    "{label}: its labels {} arrived after its recording was added, whose labels \
-                     are fixed; they are not applied; give them as the endpoint's labels to set \
-                     them",
+                    "{label}: its labels {} arrived after its recording was added, so they are \
+                     not applied; give them as the endpoint's labels to set them",
                     shown.join(", ")
                 );
                 let source = slot.id;

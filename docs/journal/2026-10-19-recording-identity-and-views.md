@@ -2481,7 +2481,10 @@ Identity and naming:
   only, which leaves two meanings; (b) apply the clash rule, so it reads as
   `exported_instance`; (c) rename it on read to a user label. A selector
   `instance="primary"` written for a combined parquet changes meaning under (b)
-  and (c).
+  and (c). Since #331, a reader that injects `instance` into a combined
+  parquet through `MultiParquetSource` (`ParquetBuilder::file_labeled`) gets
+  (b) on that path; nothing in metriken or rezolus injects it today, so the
+  choice for rezolus's combined parquets stays open.
 - **Q5.** What categories become. A category (`members` in
   `inference-library.json` naming `vllm` and `sglang`) lists sources.
   Candidates: (a) `members` names kinds, refined by `service_kind`; (b) a
@@ -2955,15 +2958,25 @@ written by the new dendro.
      value and unions `descriptions`; the hook's late labels are still not
      applied. #329 starts a new source when a reconnect's handshake names a
      different producer. #330 calls the probe hook for scraped endpoints, at
-     the start and on late activation, with no epoch. Left for later PRs:
-     `__producer__` with the clash rule, and a way to fill in a value the
-     hook's first answer lacked (an exporter's `agent_version`). The plan
-     above is as written before #328, and its `recorder.rs` line references
-     are to the code before it. #328 also leaves a URL's user name and
-     password out of `instance` and writes only newly described names of a
-     scrape's HELP text.
-   - `__producer__`, and the one clash rule on every path, including
-     `MultiParquetSource`.
+     the start and on late activation, with no epoch. #331 adds `__producer__`
+     (from the merged `producer_name`, in metriken-storage's layer merge, so
+     every source written through `layers::append` whose layers name a
+     producer carries it, unless a user entry removes it; recordings whose
+     labels differ only in it are twins and get `__recording__`) and the one
+     clash rule on `MultiParquetSource` (the archive already followed it).
+     Left for a later PR: a way to fill in a value the hook's first answer
+     lacked (an exporter's `agent_version`). The plan above is as written
+     before #328, and its `recorder.rs` line references are to the code before
+     it. #328 also leaves a URL's user name and password out of `instance` and
+     writes only newly described names of a scrape's HELP text.
+   - ~~`__producer__`, and the one clash rule on every path, including
+     `MultiParquetSource`.~~ Done in metriken (#331) for the archive and
+     `MultiParquetSource`; rezolus's `combine` and the agent's external
+     metrics follow in step 3.4. The occupant relabel (adding a long table's
+     occupant labels to a column's) keeps the column's value: an
+     occupant's labels are the series' own identity, split by the writer,
+     and the writer can fold a key into the occupant that a later schema
+     puts on the columns; whether the clash rule applies there is open.
    - In metriken-query, each producer epoch's rows evaluated with that
      epoch's handshake template (Q8), as part of the template evaluation rule
      (the D1 item below).

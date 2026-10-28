@@ -65,14 +65,18 @@ pub trait Probe: Send + Sync {
 
     /// Labels and metadata for the producer at endpoint `url`, streamed or
     /// scraped. `epoch` is the epoch a stream's handshake named; it is `None`
-    /// for a scrape and for a stream whose handshake names none, so it does
-    /// not tell the two apart. Runs after detection (for a stream, after the
-    /// handshake), so it never sets the epoch or the clock anchor. The
-    /// recorder writes the reply's metadata into the recording's recorder
-    /// layer. After an [`Enrich::Retry`] or a timeout the recorder asks
-    /// again on later ticks, up to five more times; the metadata of a reply
-    /// that arrives then is a further recorder entry, and its labels are not
-    /// applied ([`Event::LabelsNotApplied`](crate::Event::LabelsNotApplied)).
+    /// for a scrape and for a stream whose handshake names none, so it does not
+    /// tell the two apart. Runs after detection (for a stream, after the
+    /// handshake), so it never sets the epoch or the clock anchor. The recorder
+    /// writes the reply's metadata into the recording's recorder layer. After
+    /// an [`Enrich::Retry`] or a timeout the recorder asks again on later
+    /// ticks, up to five more times; the metadata of a reply that arrives then
+    /// is a further recorder entry, and its labels are not applied
+    /// ([`Event::LabelsNotApplied`](crate::Event::LabelsNotApplied)), though a
+    /// `producer_name` in it adds the recording's `__producer__` label when
+    /// neither the producer's handshake nor the caller sets `producer_name` or
+    /// `__producer__`; a handshake that names its producer only by its `source`
+    /// label sets neither.
     async fn enrich(&self, url: &Url, epoch: Option<&str>) -> Enrich;
 
     /// Not called by the recorder. A restarted producer's metadata is written

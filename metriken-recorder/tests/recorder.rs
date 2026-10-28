@@ -597,6 +597,7 @@ async fn a_handshakes_producer_identity_is_written_as_producer_keys() {
     assert_eq!(r.metadata["producer_name"], "cachecannon");
     assert_eq!(r.metadata["version"], "0.4.0");
     assert_eq!(r.labels["host"], "lg-1");
+    assert_eq!(r.labels["__producer__"], "cachecannon");
     assert!(
         !r.metadata
             .keys()
@@ -3071,6 +3072,55 @@ impl Probe for ScrapeProbe {
             epoch: None,
             labels: BTreeMap::new(),
             metadata: map(&[("producer_component", "exporter")]),
+        }
+    }
+}
+
+/// A hook reply that names the producer after the recording was added
+/// gives the recording `__producer__` then: the label set changes
+/// mid-recording, as a restart's producer entry can change it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_hook_reply_naming_the_producer_adds_its_label() {
+    let fake = serve(stream_only(&[("source", "svc")], &[])).await;
+    let probe = Arc::new(LateNamingProbe(Default::default()));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![spec(&fake.url)],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe.clone(),
+        Vec::new(),
+        |cfg| cfg.timeout = Duration::from_millis(200),
+        Duration::from_millis(1500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.unwrap();
+    let r = &recordings(&run.path, "fake/ops")["svc"];
+    assert_eq!(r.labels["__producer__"], "hookname", "{:?}", r.labels);
+}
+
+/// A hook that answers `Retry` first, then names the producer.
+struct LateNamingProbe(std::sync::atomic::AtomicU32);
+
+#[async_trait::async_trait]
+impl Probe for LateNamingProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Pending
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Enrich::Retry;
+        }
+        Enrich::Metadata {
+            epoch: epoch.map(str::to_string),
+            labels: BTreeMap::new(),
+            metadata: map(&[("producer_name", "hookname")]),
         }
     }
 }
