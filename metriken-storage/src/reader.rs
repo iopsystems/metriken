@@ -233,11 +233,11 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 /// - the first sealed segment is fetched when it has no such index. A later
 ///   one is fetched when its names index does not decode or gives a format,
 ///   layout or interval this reader refuses (its probe then fails the open),
-///   or when its names fingerprint is new. A later segment with no
-///   index (a `.rez`, one sealed before fingerprints, or one dendro merged
-///   or copied with a projection, which drops the index) is assumed to hold
-///   the first segment's names, which is what the reader assumed of every
-///   segment before;
+///   or when its names fingerprint is new. A later segment with no index is
+///   fetched when another segment of the table has a names index (it is one
+///   dendro merged or copied with a projection, which drops the index), and
+///   otherwise assumed to hold the first segment's names (a `.rez`, or a
+///   table sealed before fingerprints, has no index on any segment);
 /// - the rows of its live tail that name its columns
 ///   (`crate::wal::schema_rows`), materialized alone.
 fn table_probes(
@@ -257,6 +257,7 @@ fn table_probes(
             .into_iter()
             .filter_map(|(seq, index)| Some((seq, index?)))
             .collect();
+        let names_indexed = stored.values().any(|raw| raw.starts_with(b"MNI"));
         let mut seen: HashSet<u64> = HashSet::new();
         // Names indexes already added: segments that hold the same names
         // store the same bytes, which are decoded once.
@@ -280,7 +281,7 @@ fn table_probes(
                 },
                 Some(Stored::Fingerprint(fp)) => seen.insert(fp) || i == 0,
                 Some(Stored::Unreadable) => true,
-                None => i == 0,
+                None => i == 0 || names_indexed,
             };
             if fetch {
                 // By number: this runs inside the open's snapshot, where a
@@ -1810,8 +1811,8 @@ impl ArchiveReader {
                         let metas = db.segment_meta(rec.id, &sampler)?;
 
                         // The metric names the table holds: from sealed segments'
-                        // names indexes, else their footers by names fingerprint,
-                        // and the live tail's rows that carry a schema. A quiet
+                        // names indexes and footers (see `table_probes`), and the
+                        // live tail's rows that carry a schema. A quiet
                         // sampler in a live hindsight buffer has only the latter:
                         // rows in the WAL, no seal yet. Skipping it would make it
                         // invisible to the reader, which the eager path never did

@@ -7,9 +7,10 @@
 //! The writer stores a [`SegmentNames`]: the metric names the segment's
 //! footer holds by kind, and the footer keys a probe reads when it opens the
 //! segment (`sampling_interval_ms`, `metriken.format`, `metriken.layout`).
-//! Segments sealed before it carry a names fingerprint instead (or nothing),
-//! which a reader still uses: two segments with the same fingerprint hold
-//! the same metric names, so the reader parses the footer of one of them.
+//! Segments sealed by metriken-storage 0.5.4 and earlier carry a names
+//! fingerprint instead (or nothing), which a reader still uses: two segments
+//! with the same fingerprint hold the same metric names, so the reader
+//! parses the footer of one of them.
 
 use std::collections::BTreeSet;
 
@@ -25,9 +26,18 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 /// named fields, compressed with zstd. A field added later is left out by a
 /// reader that does not know it, and a field missing is its default. A
 /// change to what a field means, including how a probe classifies a column
-/// into the four name sets, needs a new prefix, since a reader takes an
-/// index over the footer it was built from.
+/// into the four name sets, needs a new prefix (`MNI2`), since a reader
+/// takes an index over the footer it was built from. A reader fetches the
+/// segment of an `MNI` index whose version it does not know.
 const NAMES: &[u8; 4] = b"MNI1";
+
+/// The prefix every names index version starts with.
+const NAMES_FAMILY: &[u8; 3] = b"MNI";
+
+/// The most a names index decompresses to before it is read as unreadable,
+/// so a crafted index cannot exhaust memory at open. An index of 2500 names
+/// is about 2 KB compressed.
+const MAX_DECODED: u64 = 4 * 1024 * 1024;
 
 /// What a segment's footer gives a reader at open: the metric names it
 /// holds by kind, and the footer keys the open reads.
@@ -125,15 +135,29 @@ fn encode(names: &SegmentNames) -> Option<Vec<u8>> {
 pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
     let index = index?;
     if let Some(rest) = index.strip_prefix(NAMES.as_slice()) {
-        let names = zstd::stream::decode_all(rest)
-            .ok()
-            .and_then(|packed| rmp_serde::from_slice(&packed).ok());
+        let names = decode(rest).and_then(|packed| rmp_serde::from_slice(&packed).ok());
         return Some(names.map_or(Stored::Unreadable, Stored::Names));
+    }
+    if index.starts_with(NAMES_FAMILY) {
+        return Some(Stored::Unreadable);
     }
     let rest = index.strip_prefix(FINGERPRINT.as_slice())?;
     Some(Stored::Fingerprint(u64::from_le_bytes(
         rest.try_into().ok()?,
     )))
+}
+
+/// `compressed` decompressed, or `None` when it does not decode or exceeds
+/// [`MAX_DECODED`].
+fn decode(compressed: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    zstd::stream::Decoder::new(compressed)
+        .ok()?
+        .take(MAX_DECODED + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() as u64 <= MAX_DECODED).then_some(out)
 }
 
 #[cfg(test)]
@@ -252,6 +276,17 @@ mod tests {
         assert!(names_of(&segment_with(&[(format, "1"), (layout, "long")])).is_some());
     }
 
+    /// An index that decompresses past the cap is read as unreadable rather
+    /// than decompressed.
+    #[test]
+    fn an_index_past_the_cap_is_unreadable() {
+        let big = vec![0u8; MAX_DECODED as usize + 1];
+        let mut index = NAMES.to_vec();
+        index.extend(zstd::stream::encode_all(big.as_slice(), 3).unwrap());
+        assert!(index.len() < 4096, "{}", index.len());
+        assert_eq!(read(Some(&index)), Some(Stored::Unreadable));
+    }
+
     #[test]
     fn a_fingerprint_reads_back_and_anything_else_is_none() {
         let mut fp = FINGERPRINT.to_vec();
@@ -260,5 +295,6 @@ mod tests {
         assert_eq!(read(None), None);
         assert_eq!(read(Some(b"other")), None);
         assert_eq!(read(Some(b"MNI1not zstd")), Some(Stored::Unreadable));
+        assert_eq!(read(Some(b"MNI2a later index")), Some(Stored::Unreadable));
     }
 }

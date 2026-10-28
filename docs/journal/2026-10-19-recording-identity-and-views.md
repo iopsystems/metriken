@@ -8,7 +8,8 @@ counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
 S9 in metriken" below) are done; the producer identity keys and
 `producer_identity!`, the identity layers in metriken-storage (#326),
 metriken-recorder writing them (step 2), and the names index of the catalog
-index (step 2) are built and unreleased; nothing else is built. The owner decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
+index (step 2) are built and unreleased; nothing else is built. The owner
+decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
 producer identity keys on 2026-10-27. Q9 and Q37 were decided on 2026-10-28. "Step N" means this entry's order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
@@ -2567,8 +2568,9 @@ Presentation and query rules:
   under S4 when both carry one series; (b) the key is the epoch and the
   producer name, so a process exposing two producers' sources keeps them
   apart. Decided 2026-10-28: (b). `process::read_groups` splits a group
-  whose sources carry different `__producer__` values (#331), which gives
-  it; a source without the label beside one with it is not split.
+  whose sources carry different `__producer__` values (#331), which
+  implements (b); a source without the label beside one with it is not
+  split.
 - **Q10.** A recorder- or producer-layer key whose values differ among the
   sources of one process group (two recorders' `instance`, a `host` that
   changed between copies). Candidates: (a) no series label for the key, each

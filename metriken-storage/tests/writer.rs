@@ -876,13 +876,29 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         // this reader refuses, is not taken: its segment is fetched and
         // probed (here the footers are of a format it reads, so the names
         // stay complete).
-        for indexes in [Indexes::Unreadable, Indexes::Newer] {
+        for indexes in [Indexes::Unreadable, Indexes::Newer, Indexes::LaterVersion] {
             let (counted, fetched) = open_counting_with(&path, &pool, indexes);
             assert_eq!(fetched.get().0, sealed.iter().sum::<usize>());
             let mut names = counted.gauge_names();
             names.sort();
             assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
         }
+
+        // A later segment without an index, in a table whose other segments
+        // have names indexes, is fetched.
+        let odd: usize = catalog
+            .tables(id)
+            .unwrap()
+            .iter()
+            .filter(|t| !t.ends_with("/occupants"))
+            .flat_map(|t| catalog.segment_meta(id, t).unwrap())
+            .filter(|(seq, _)| seq % 2 == 1)
+            .count();
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::OddDropped);
+        assert_eq!(fetched.get().0, odd);
+        let mut names = counted.gauge_names();
+        names.sort();
+        assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
 
         let reader = open(&path);
         let points = |q: &str| -> usize {
@@ -933,6 +949,11 @@ enum Indexes {
     /// A names index per segment naming a segment format newer than this
     /// reader reads (the footers are not changed).
     Newer,
+    /// A names index of a version this reader does not know (`MNI2`).
+    LaterVersion,
+    /// The stored indexes with the odd-numbered segments' removed, as
+    /// dendro's compaction leaves a merged segment.
+    OddDropped,
 }
 
 /// Sealed segments read: of data tables, and of occupant streams.
@@ -1006,6 +1027,14 @@ impl Catalog for Counting {
                 })
                 .collect(),
             Indexes::None => Vec::new(),
+            Indexes::LaterVersion => stored
+                .into_iter()
+                .map(|(seq, _)| (seq, Some(b"MNI2a later index".to_vec())))
+                .collect(),
+            Indexes::OddDropped => stored
+                .into_iter()
+                .map(|(seq, index)| (seq, index.filter(|_| seq % 2 == 0)))
+                .collect(),
             Indexes::Unreadable => stored
                 .into_iter()
                 .map(|(seq, _)| (seq, Some(b"MNI1not an index".to_vec())))
