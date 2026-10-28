@@ -597,6 +597,7 @@ async fn a_handshakes_producer_identity_is_written_as_producer_keys() {
     assert_eq!(r.metadata["producer_name"], "cachecannon");
     assert_eq!(r.metadata["version"], "0.4.0");
     assert_eq!(r.labels["host"], "lg-1");
+    assert_eq!(r.labels["__producer__"], "cachecannon");
     assert!(
         !r.metadata
             .keys()

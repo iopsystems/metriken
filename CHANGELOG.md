@@ -77,8 +77,10 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   epoch differs. `Committed`'s `passes_total` and
   `first_ts`, and the `SourceSummary`, count the endpoint across its
   recordings. A recording is not evicted by `retain` after it is finalized. Two
-  recordings of one endpoint can carry identical labels until
-  `__producer__` is added; their rows stay apart as separate sources.
+  recordings of one endpoint carry identical labels when no producer name
+  is on record (a producer named only by its `source` label, which the
+  caller's `source` outranks); readers tell them apart by
+  `__recording__`.
 - **Changed:** an endpoint URL's user name and password are left out of
   the recorder's own log lines and of `SourceSummary::endpoint`, as #328
   leaves them out of the `instance` label. Messages from detection and
@@ -98,6 +100,8 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   endpoints sharing labels keeps the warning for the other, and a restart
   that changes an endpoint's labels moves it. `finish` returns the cause
   `Event::Failed` reports.
+- **Changed:** a recording whose producer identity names it carries the
+  `__producer__` label (metriken-storage's layer merge).
 - **Added:** `SourceIdentity::producer` and `with_producer`,
   `RegistrySource::with_producer`, and `ProducerIdentity` re-exported.
 - **Removed:** `restart::metadata_patch`, `restart::Restart` and
@@ -179,6 +183,29 @@ Requires metriken-model 0.2.1.
   recorder layer does not parse. A legacy source gains a
   recorder layer at its first `append` to any layer, derived from those
   keys.
+- **Added:** `layers::PRODUCER_LABEL`, `__producer__`: the merged layers
+  give a source this label from its merged `producer_name` (the producer's
+  declared name, else the recorder layer's), unless a layer sets the label
+  itself; a user entry setting it to `""` removes it. A source whose
+  stored labels lack it (written before this) gains it at its next
+  `append`. Internal by the `__` rule: listings and legends hide it, and
+  default binary matching and `without` drop it.
+- **Changed:** `ArchiveReader` finds twin recordings (which get
+  `__recording__`) on the labels a query matches on, leaving out internal
+  labels other than `__recording__`. Two recordings that differ only in
+  `__producer__`, as an endpoint's recordings before and after a producer
+  change do, are twins, so `without` and binary operators keep them apart.
+  Recordings that differ only in another internal label (a caller's
+  `__x`) are twins too, where `without` merged them.
+- **Changed:** `MultiParquetSource` (the parquet multi-source path) applies
+  the archive's clash rule on every read and listing path, `column_map`
+  included: a series that carries a key its file's injected labels add
+  keeps its own value under `exported_<key>`, and a matcher on
+  `exported_<key>` is decided on the relabelled series. Before, the
+  injected value overwrote the series' own, a debug build panicked, and
+  `column_map` carried no injected labels.
+- **Added:** `labeled::relabel_stream`, a histogram stream relabelled
+  under the clash rule, for a source that injects labels.
 - **Added:** `SourceRecorder::set_identity(labels, metadata)` (feature
   `write`), dendro 0.6.1's `SourceWriter::set_identity` for a recording
   source. Requires dendro 0.6.1.
@@ -192,6 +219,16 @@ Requires metriken-model 0.2.1.
   `VERSION`, `BUILD` and `HOST`: a producer identity as producer-layer
   keys. `derive_legacy` derives a producer entry from a legacy source's
   `metriken.producer.*` metadata.
+
+### metriken-query 0.42.3
+
+Requires metriken-storage 0.5.5.
+
+- **Changed:** `ParquetBuilder::file_labeled` and the other labelled
+  builders: a series that already carries an injected key keeps its own
+  value under `exported_<key>`, where the injected value overwrote it. A
+  selector on an injected key now resolves in `columns()`, where it found
+  no column.
 
 ### metriken-query 0.42.2
 

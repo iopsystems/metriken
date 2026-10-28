@@ -22,6 +22,7 @@ use parquet::file::statistics::Statistics;
 
 use crate::buffer_pool::{content_source_id, next_source_id, BufferPool, CacheKey};
 use crate::histogram_stream::{HistKind, HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::labeled;
 use crate::labels::Labels;
 
 use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
@@ -50,60 +51,15 @@ impl CompositionSource {
 // ─── Multi-file source ────────────────────────────────────────────────────────
 
 /// Several sources presented as one, each contributing its series under its
-/// own injected labels.
+/// own injected labels. A series that carries a key its child's labels add
+/// keeps its own value under `exported_<key>`, as an archive recording's
+/// series do ([`labeled`]).
 ///
 /// Children are `Arc<dyn DataSource>`, not `Arc<ParquetSource>`: a `.rez`
 /// table is a segmented source whenever its writer sealed more than once, and
 /// composing those alongside plain files is what a job-spanning query needs.
 pub struct MultiParquetSource {
     pub files: Vec<(Arc<dyn DataSource>, Labels)>,
-}
-
-/// Given a file's injected `extra` labels and the query `filter`:
-/// - Returns `None` if `extra` contains a key from `filter` whose value
-///   doesn't satisfy the filter constraint (skip this file entirely).
-/// - Returns the filter with `extra`'s keys removed (since parquet columns
-///   don't carry injected labels; the filter for those keys is already satisfied).
-fn resolve_filter(extra: &Labels, filter: &Labels) -> Option<Labels> {
-    if extra.inner.is_empty() {
-        return Some(filter.clone());
-    }
-    // Build a sub-filter containing only keys present in extra.
-    let extra_constrained = Labels {
-        inner: filter
-            .inner
-            .iter()
-            .filter(|(k, _)| extra.inner.contains_key(k.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    };
-    // Check whether extra's values satisfy those constraints.
-    if !extra.matches(&extra_constrained) {
-        return None;
-    }
-    // Return filter with extra's keys stripped (parquet doesn't have them).
-    Some(Labels {
-        inner: filter
-            .inner
-            .iter()
-            .filter(|(k, _)| !extra.inner.contains_key(k.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    })
-}
-
-/// Add a child's injected labels to each of its stream's series.
-fn inject_labels(stream: &mut HistogramStream, extra: &Labels) {
-    for series_labels in &mut stream.meta.series {
-        for (k, v) in &extra.inner {
-            debug_assert!(
-                !series_labels.inner.contains_key(k),
-                "injected label key '{}' conflicts with native parquet label",
-                k
-            );
-            series_labels.inner.insert(k.clone(), v.clone());
-        }
-    }
 }
 
 impl DataSource for MultiParquetSource {
@@ -121,21 +77,14 @@ impl DataSource for MultiParquetSource {
             .files
             .iter()
             .filter_map(|(pf, extra)| {
-                let pq_filter = resolve_filter(extra, filter)?;
+                let pq_filter = labeled::translate_filter(extra, filter)?;
                 let counters = pf.counters(name, &pq_filter, start_ns, end_ns)?;
                 Some((counters.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
-                series.into_iter().map(move |mut c| {
-                    for (k, v) in &extra.inner {
-                        debug_assert!(
-                            !c.labels.inner.contains_key(k),
-                            "injected label key '{}' conflicts with native parquet label",
-                            k
-                        );
-                        c.labels.inner.insert(k.clone(), v.clone());
-                    }
-                    c
+                series.into_iter().filter_map(move |mut c| {
+                    labeled::add_labels(&mut c.labels, &extra);
+                    labeled::keeps(&c.labels, &extra, filter).then_some(c)
                 })
             })
             .collect();
@@ -160,7 +109,7 @@ impl DataSource for MultiParquetSource {
     ) -> Option<Vec<crate::CounterStream<'s>>> {
         let mut out: Vec<crate::CounterStream<'s>> = Vec::new();
         for (pf, extra) in &self.files {
-            let Some(pq_filter) = resolve_filter(extra, filter) else {
+            let Some(pq_filter) = labeled::translate_filter(extra, filter) else {
                 continue;
             };
             let Some(streams) = pf.counter_streams(name, &pq_filter, start_ns, end_ns) else {
@@ -169,15 +118,10 @@ impl DataSource for MultiParquetSource {
             let interval = pf.counter_interval(name);
             for mut stream in streams {
                 stream.interval.get_or_insert(interval);
-                for (k, v) in &extra.inner {
-                    debug_assert!(
-                        !stream.labels.inner.contains_key(k),
-                        "injected label key '{}' conflicts with native parquet label",
-                        k
-                    );
-                    stream.labels.inner.insert(k.clone(), v.clone());
+                labeled::add_labels(&mut stream.labels, extra);
+                if labeled::keeps(&stream.labels, extra, filter) {
+                    out.push(stream);
                 }
-                out.push(stream);
             }
         }
         if out.is_empty() {
@@ -192,21 +136,14 @@ impl DataSource for MultiParquetSource {
             .files
             .iter()
             .filter_map(|(pf, extra)| {
-                let pq_filter = resolve_filter(extra, filter)?;
+                let pq_filter = labeled::translate_filter(extra, filter)?;
                 let gauges = pf.gauges(name, &pq_filter, start_ns, end_ns)?;
                 Some((gauges.series, extra.clone()))
             })
             .flat_map(|(series, extra)| {
-                series.into_iter().map(move |mut g| {
-                    for (k, v) in &extra.inner {
-                        debug_assert!(
-                            !g.labels.inner.contains_key(k),
-                            "injected label key '{}' conflicts with native parquet label",
-                            k
-                        );
-                        g.labels.inner.insert(k.clone(), v.clone());
-                    }
-                    g
+                series.into_iter().filter_map(move |mut g| {
+                    labeled::add_labels(&mut g.labels, &extra);
+                    labeled::keeps(&g.labels, &extra, filter).then_some(g)
                 })
             })
             .collect();
@@ -253,15 +190,16 @@ impl DataSource for MultiParquetSource {
     ) -> Option<Vec<(HistogramStream, f64)>> {
         let mut out = Vec::new();
         for (pf, extra) in &self.files {
-            let Some(pq_filter) = resolve_filter(extra, filter) else {
+            let Some(pq_filter) = labeled::translate_filter(extra, filter) else {
                 continue;
             };
             let Some(parts) = pf.gauge_histogram_parts(name, &pq_filter, start_ns, end_ns) else {
                 continue;
             };
-            for (mut stream, interval) in parts {
-                inject_labels(&mut stream, extra);
-                out.push((stream, interval));
+            for (stream, interval) in parts {
+                if let Some(stream) = labeled::relabel_stream(stream, extra, filter) {
+                    out.push((stream, interval));
+                }
             }
         }
         if out.is_empty() {
@@ -403,8 +341,12 @@ impl DataSource for MultiParquetSource {
         &self,
     ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
         let mut out = std::collections::HashMap::new();
-        for (pf, _) in &self.files {
+        for (pf, extra) in &self.files {
             for (metric, cols) in pf.column_map() {
+                let cols = cols.into_iter().map(|(mut labels, col)| {
+                    labeled::add_labels(&mut labels, extra);
+                    (labels, col)
+                });
                 out.entry(metric)
                     .or_insert_with(std::collections::HashMap::new)
                     .extend(cols);
@@ -464,9 +406,7 @@ impl DataSource for MultiParquetSource {
                     let (pf, extra) = &self.files[i];
                     for mut labels in label_sets(pf.as_ref(), &name) {
                         per_child += 1;
-                        for (k, v) in &extra.inner {
-                            labels.insert(k.clone(), v.clone());
-                        }
+                        labeled::add_labels_map(&mut labels, extra);
                         merged.insert(labels);
                     }
                 }
@@ -647,9 +587,7 @@ impl MultiParquetSource {
             for col in pf.columns_desc() {
                 if matches!(col.kind, ColKind::Counter) {
                     let mut labels = col.labels;
-                    for (k, v) in &extra.inner {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
+                    labeled::add_labels(&mut labels, extra);
                     out.push((col.name, labels));
                 }
             }
@@ -664,9 +602,7 @@ impl MultiParquetSource {
             for col in pf.columns_desc() {
                 if matches!(col.kind, ColKind::Gauge) {
                     let mut labels = col.labels;
-                    for (k, v) in &extra.inner {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
+                    labeled::add_labels(&mut labels, extra);
                     out.push((col.name, labels));
                 }
             }
@@ -687,9 +623,7 @@ impl MultiParquetSource {
             for col in pf.columns_desc() {
                 if col.kind.histogram(kind).is_some() {
                     let mut labels = col.labels;
-                    for (k, v) in &extra.inner {
-                        labels.inner.insert(k.clone(), v.clone());
-                    }
+                    labeled::add_labels(&mut labels, extra);
                     out.push((col.name, labels));
                 }
             }
@@ -710,10 +644,9 @@ impl MultiParquetSource {
             .files
             .iter()
             .filter_map(|(pf, extra)| {
-                let pq_filter = resolve_filter(extra, filter)?;
-                let mut stream = read(pf.as_ref(), &pq_filter)?;
-                inject_labels(&mut stream, extra);
-                Some(stream)
+                let pq_filter = labeled::translate_filter(extra, filter)?;
+                let stream = read(pf.as_ref(), &pq_filter)?;
+                labeled::relabel_stream(stream, extra, filter)
             })
             .collect();
         HistogramStream::merge(streams)
@@ -728,9 +661,7 @@ impl MultiParquetSource {
         let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
         for (pf, extra) in &self.files {
             for mut set in labels(pf.as_ref()) {
-                for (k, v) in &extra.inner {
-                    set.insert(k.clone(), v.clone());
-                }
+                labeled::add_labels_map(&mut set, extra);
                 sets.push(set);
             }
         }
@@ -3772,6 +3703,113 @@ mod interval_tests {
         assert_eq!(source.histogram_interval("h"), 10.0);
         assert_eq!(source.histogram_interval("absent"), 1.0);
     }
+    /// A series that carries a key its file's injected labels add keeps its
+    /// own value under `exported_<key>`, on the series, stream and listing
+    /// paths, and a matcher on `exported_<key>` is decided on the result.
+    #[test]
+    fn a_clashing_series_label_moves_to_exported() {
+        let pairs = |p: &[(&str, &str)]| Labels {
+            inner: p
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let mut m = Memory::new(1000);
+        m.add_counter(
+            "c",
+            Counter {
+                labels: pairs(&[("job", "a")]),
+                timestamps: vec![0, 1_000_000_000],
+                values: vec![0, 1],
+                windows: None,
+            },
+        );
+        let source = MultiParquetSource {
+            files: vec![(Arc::new(m) as Arc<dyn DataSource>, pairs(&[("job", "b")]))],
+        };
+        let moved = pairs(&[("job", "b"), ("exported_job", "a")]);
+        let all = Labels::default();
+        assert_eq!(
+            source.counters("c", &all, 0, u64::MAX).unwrap().series[0].labels,
+            moved
+        );
+        assert_eq!(
+            source.counter_streams("c", &all, 0, u64::MAX).unwrap()[0].labels,
+            moved
+        );
+        assert_eq!(source.counter_labels("c"), vec![moved.inner.clone()]);
+        let own = pairs(&[("exported_job", "a")]);
+        assert_eq!(
+            source
+                .counters("c", &own, 0, u64::MAX)
+                .unwrap()
+                .series
+                .len(),
+            1
+        );
+        let other = pairs(&[("exported_job", "z")]);
+        assert!(source.counters("c", &other, 0, u64::MAX).is_none());
+        assert!(source.counter_streams("c", &other, 0, u64::MAX).is_none());
+
+        let mut m = Memory::new(1000);
+        m.add_gauge(
+            "g",
+            crate::types::Gauge {
+                labels: pairs(&[("job", "a")]),
+                timestamps: vec![0],
+                values: vec![1],
+                windows: None,
+            },
+        );
+        m.add_histogram(
+            "h",
+            crate::types::Histogram {
+                labels: pairs(&[("job", "a")]),
+                config: ::histogram::Config::new(4, 10).unwrap(),
+                timestamps: vec![0],
+                snapshots: vec![crate::types::HistogramSnapshot {
+                    index: vec![1],
+                    count: vec![1],
+                }],
+            },
+        );
+        let source = MultiParquetSource {
+            files: vec![(Arc::new(m) as Arc<dyn DataSource>, pairs(&[("job", "b")]))],
+        };
+        assert_eq!(
+            source.gauges("g", &all, 0, u64::MAX).unwrap().series[0].labels,
+            moved
+        );
+        assert!(source.gauges("g", &other, 0, u64::MAX).is_none());
+        assert_eq!(source.gauge_labels("g"), vec![moved.inner.clone()]);
+        let stream = source.histogram_stream("h", &all, 0, u64::MAX).unwrap();
+        assert_eq!(stream.meta.series, vec![moved.clone()]);
+        assert!(source.histogram_stream("h", &other, 0, u64::MAX).is_none());
+        assert!(source.column_map()["g"].contains_key(&moved));
+
+        // Two files whose series differ only in the key both inject: the
+        // moved values keep them two series.
+        let counter = |job: &str| -> Arc<dyn DataSource> {
+            let mut m = Memory::new(1000);
+            m.add_counter(
+                "c",
+                Counter {
+                    labels: pairs(&[("job", job)]),
+                    timestamps: vec![0],
+                    values: vec![0],
+                    windows: None,
+                },
+            );
+            Arc::new(m)
+        };
+        let source = MultiParquetSource {
+            files: vec![
+                (counter("a"), pairs(&[("job", "b")])),
+                (counter("b"), pairs(&[("job", "b")])),
+            ],
+        };
+        assert_eq!(source.series_count(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -3824,6 +3862,43 @@ mod holds_values_tests {
         let refs = src.counter_column_refs();
         assert_eq!(refs.len(), 1, "one counter column");
         refs[0].position.holds_values
+    }
+
+    /// A parquet column's labels follow the clash rule in the column listing
+    /// under a file's injected labels.
+    #[test]
+    fn counter_columns_move_a_clashing_label_to_exported() {
+        let meta: HashMap<String, String> = [
+            ("metric".to_string(), "c".to_string()),
+            ("metric_type".to_string(), "counter".to_string()),
+            ("job".to_string(), "a".to_string()),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("c", DataType::UInt64, true).with_metadata(meta),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let opened =
+            MultiParquetSource::open_bytes_with_pool(buf, BufferPool::new(1 << 20)).unwrap();
+        let child = opened.files[0].0.clone();
+        let injected = crate::labels::Labels::from([("job", "b")]);
+        let source = MultiParquetSource {
+            files: vec![(child, injected)],
+        };
+        let moved = crate::labels::Labels::from([("job", "b"), ("exported_job", "a")]);
+        assert_eq!(source.counter_columns()[0].1, moved);
     }
 
     /// Only a column whose every row group's statistics count all its rows

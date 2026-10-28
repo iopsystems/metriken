@@ -25,9 +25,11 @@ impl Write for Captured {
     }
 }
 
-/// A producer change that leaves the label set as it was (the producers are
-/// named by identity) logs the change and no identical-labels warning: the
-/// endpoint's ended recording does not count against its new one.
+/// A producer change that leaves the label set as it was logs the change and
+/// no identical-labels warning: the endpoint's ended recording does not
+/// count against its new one. The producers are named by their handshakes'
+/// `source` labels, which the caller's `source` outranks, so the recording's
+/// labels stay the same (a producer identity would set `__producer__`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_split_with_the_same_labels_does_not_warn_about_them() {
     let captured = Captured::default();
@@ -42,15 +44,15 @@ async fn a_split_with_the_same_labels_does_not_warn_about_them() {
 
     let fake = serve(Behaviour {
         streams: Streams::Restarts(3),
-        restarted_metadata: map(&[("metriken.producer.name", "b")]),
-        ..stream_only(&[], &[("metriken.producer.name", "a")])
+        restarted_labels: Some(map(&[("source", "b")])),
+        ..stream_only(&[("source", "a")], &[])
     })
     .await;
     let interval = Duration::from_millis(100);
     let detected = detect(
         &client(),
         &DetectConfig::new(interval, Duration::from_secs(2)),
-        vec![EndpointSpec::new(fake.url.clone())],
+        vec![EndpointSpec::new(fake.url.clone()).with_label("source", "mine")],
         &NoProbe,
     )
     .await;
@@ -88,21 +90,21 @@ async fn a_split_with_the_same_labels_does_not_warn_about_them() {
     );
     assert!(!log.contains("carry identical labels"), "{log}");
 
-    // Two endpoints given one label set (the caller sets `instance` on
-    // both): the second warns at its add, and when the first changes
+    // Two endpoints given one label set (the caller sets `instance` and
+    // `source` on both): the second warns at its add, and when the first changes
     // producer its new recording warns again, against the second.
     let before = captured.0.lock().unwrap().len();
     let changing = serve(Behaviour {
         streams: Streams::Restarts(3),
-        restarted_metadata: map(&[("metriken.producer.name", "b")]),
-        ..stream_only(&[], &[("metriken.producer.name", "a")])
+        restarted_labels: Some(map(&[("source", "b")])),
+        ..stream_only(&[("source", "a")], &[])
     })
     .await;
-    let steady = serve(stream_only(&[], &[("metriken.producer.name", "a")])).await;
+    let steady = serve(stream_only(&[("source", "a")], &[])).await;
     let shared = |url: &url::Url| {
         EndpointSpec::new(url.clone())
             .with_label("instance", "shared")
-            .with_label("zone", "z")
+            .with_label("source", "mine")
     };
     let detected = detect(
         &client(),
