@@ -77,10 +77,10 @@ pub struct SourceIdentity {
     /// The recording's metadata, written to its producer layer: what the
     /// process declares about itself, as a stream handshake's metadata is,
     /// except that the keys [`StartError::Reserved`] names are refused (a
-    /// `metriken.` key, the flat epoch keys, `encoder`, `writer_sessions`;
-    /// give a producer identity as [`producer`](Self::producer)) and
-    /// `events` is stored as given outside the layers. `transport` and `sampling_interval_ms` are the recorder's
-    /// and are left out.
+    /// `metriken.` key, the flat epoch keys, `encoder`, `writer_sessions`; give
+    /// a producer identity as [`producer`](Self::producer)) and `events` is
+    /// stored as given outside the layers. `transport` and
+    /// `sampling_interval_ms` are the recorder's and are left out.
     pub metadata: BTreeMap<String, String>,
     /// The wall clock the source's timeline is anchored to: its stamps'
     /// `ts` are `clock_anchor_wall_ns + monotonic elapsed`.
@@ -209,13 +209,12 @@ pub enum Stop {
 /// `Lagged`, which the caller reads where the drops happened: after the
 /// events emitted before them. Every other event is queued inside the
 /// recorder and sent as the channel has room; a caller that reads late gets
-/// them late, in order. `Dropped`, `Reconnected` and `Restarted`, which a
-/// producer that flaps or restarts in a loop emits without limit, are
-/// counted in `Lagged` instead once 1,024 events are queued (a restart is
-/// still written into the recording's recorder and producer layers). The others
-/// (`Active`, `Pending`, `Refused`, `LabelsNotApplied`, `Failed`) come at
-/// most a few per source,
-/// so the queue stays bounded. Events still
+/// them late, in order. `Dropped`, `Reconnected`, `Restarted` and
+/// `ProducerChanged`, which a producer that flaps or restarts in a loop
+/// emits without limit, are counted in `Lagged` instead once 1,024 events
+/// are queued (a restart or a producer change is still written into the
+/// archive). The others (`Active`, `Pending`, `Refused`, `LabelsNotApplied`,
+/// `Failed`) come at most a few per source, so the queue stays bounded. Events still
 /// queued when the recorder stops are sent from a task of their own until
 /// the receiver is dropped. A caller that ignores events drops the
 /// receiver.
@@ -244,6 +243,24 @@ pub enum Event {
         source: SourceId,
         epoch: Option<String>,
         restarted: bool,
+    },
+    /// A streamed source reconnected to a different producer: the
+    /// reconnect's handshake names `to` where the recording's names `from`
+    /// (a producer identity's name, else the handshake's `source` label).
+    /// None of the new producer's series continue the old one's, so the
+    /// recording so far is finalized and a new one is added for the
+    /// endpoint, with the caller's labels, metadata and patches written to
+    /// it again. `source` keeps naming the endpoint; `name` is the new
+    /// recording's shown name, as [`Event::Active`]'s is. A handshake that
+    /// names no producer does not split, and a reconnect while no handshake
+    /// has named a producer does not either. The new recording carries no
+    /// label from the probe hook: the hook is asked again, and a label it
+    /// gives arrives as [`Event::LabelsNotApplied`].
+    ProducerChanged {
+        source: SourceId,
+        from: String,
+        to: String,
+        name: String,
     },
     /// The producer's `seq` jumped to `seq`: intervals produced no frame.
     Gap { source: SourceId, seq: u64 },
@@ -283,7 +300,9 @@ pub enum Event {
     },
     /// A commit included passes of this source. Cumulative, so a dropped
     /// one loses nothing: `passes_total` passes since the start, the first
-    /// at `first_ts`, the newest at `ts` (wall clock `wall_ns`).
+    /// at `first_ts`, the newest at `ts` (wall clock `wall_ns`). Both count
+    /// the endpoint across the recordings a [`Event::ProducerChanged`]
+    /// starts.
     Committed {
         source: SourceId,
         passes_total: u64,
@@ -292,7 +311,8 @@ pub enum Event {
         wall_ns: u64,
     },
     /// `dropped` events were dropped because the channel was full (or, for
-    /// `Dropped` and `Reconnected`, the queue was).
+    /// `Dropped`, `Reconnected`, `Restarted` and `ProducerChanged`, the queue
+    /// was).
     Lagged { dropped: u64 },
 }
 
@@ -301,7 +321,8 @@ pub enum Event {
 #[non_exhaustive]
 pub struct SourceSummary {
     pub id: SourceId,
-    /// The endpoint's URL; `None` for a local source.
+    /// The endpoint's URL without a user name or password; `None` for a
+    /// local source.
     pub endpoint: Option<String>,
     /// The name the recording is shown under ([`Event::Active`]'s), once
     /// it was added; before, the caller's `source` label if it gave one.
@@ -345,7 +366,9 @@ pub struct RecorderConfig {
     /// Keep only this much of each source, measured back from its newest
     /// row; `None` keeps everything. Retention drops whole segments, and a
     /// segment whose first row falls behind the window is sealed then, so
-    /// up to about twice this much is kept.
+    /// up to about twice this much is kept. A recording finalized at a
+    /// producer change ([`Event::ProducerChanged`]) is not evicted after it
+    /// is finalized.
     pub retain: Option<Duration>,
     /// The event channel's capacity.
     pub events: usize,
@@ -593,7 +616,10 @@ impl Recorder {
             anchor_mono,
             last_pass: None,
             failed: None,
+            failure_reported: false,
+            stopping: false,
             seen_labels: BTreeMap::new(),
+            seen_by: BTreeMap::new(),
         };
 
         // The probe hook's first `enrich` of every streamed endpoint, at
@@ -771,8 +797,8 @@ struct Archive {
     writer: ArchiveWriter,
 }
 
-/// Past this many queued events, `Dropped`, `Reconnected` and `Restarted`
-/// are counted in `Lagged` instead of queued.
+/// Past this many queued events, `Dropped`, `Reconnected`, `Restarted` and
+/// `ProducerChanged` are counted in `Lagged` instead of queued.
 const QUEUE_CAP: usize = 1024;
 
 /// Sends events without waiting for the caller: `try_send` for every
@@ -797,11 +823,14 @@ impl Emitter {
     /// An event that is never dropped (but see [`QUEUE_CAP`]).
     fn must(&mut self, event: Event) {
         // Each can be emitted without limit by a producer that flaps or
-        // restarts in a loop. A restart's history is kept in the
-        // recording's recorder layer either way.
+        // restarts in a loop. A restart is kept in the recording's recorder
+        // layer, and a producer change as a new source, either way.
         let unbounded = matches!(
             event,
-            Event::Dropped { .. } | Event::Reconnected { .. } | Event::Restarted { .. }
+            Event::Dropped { .. }
+                | Event::Reconnected { .. }
+                | Event::Restarted { .. }
+                | Event::ProducerChanged { .. }
         );
         if unbounded && self.queue.len() >= QUEUE_CAP {
             self.note_drop();
@@ -925,6 +954,8 @@ struct Endpoint {
     handshake_metadata: BTreeMap<String, String>,
     /// The interval the producer serves the stream at, when it said.
     served_interval: Option<Duration>,
+    /// The producer the latest handshake names (`layered::producer_name`).
+    producer: Option<String>,
     epoch: Option<String>,
     anchor: Option<u64>,
     restarts: Vec<Restart>,
@@ -987,6 +1018,7 @@ impl Endpoint {
             handshake_labels: BTreeMap::new(),
             handshake_metadata: BTreeMap::new(),
             served_interval: None,
+            producer: None,
             epoch: None,
             anchor: None,
             restarts: Vec::new(),
@@ -1000,7 +1032,7 @@ impl Endpoint {
     /// Take the handshake's word on the timeline, epoch, labels and
     /// metadata of a subscription detection opened.
     fn begin_stream(&mut self, sub: &Subscription, interval: Duration) {
-        let url = &self.spec.url;
+        let url = layered::instance(&self.spec.url);
         self.served_interval = sub.served_interval();
         if let Some(served) = self.served_interval.filter(|served| *served > interval) {
             info!(
@@ -1032,6 +1064,11 @@ impl Endpoint {
     /// epoch when it differs from the one on record: a restarted producer.
     fn adopt(&mut self, handshake: &Handshake) -> Option<String> {
         self.handshake_labels = handshake.labels.clone();
+        // A handshake that names no producer leaves the one on record, so a
+        // later different producer is still told apart from it.
+        if let Some(producer) = layered::producer_name(&handshake.labels, &handshake.metadata) {
+            self.producer = Some(producer);
+        }
         // Zero is what no producer anchors at (1970), so it is not an anchor.
         if handshake.clock_anchor_wall_ns != 0 {
             self.anchor = Some(handshake.clock_anchor_wall_ns);
@@ -1056,7 +1093,7 @@ impl Endpoint {
                 warn!(
                     "{}: the producer restarted mid-recording (producer epoch {known} -> \
                      {seen}); every cumulative counter reset at this point",
-                    self.spec.url
+                    layered::instance(&self.spec.url)
                 );
                 self.epoch = Some(seen.to_string());
                 self.restarts.push(Restart {
@@ -1103,6 +1140,9 @@ struct Slot {
     pinned: BTreeSet<String>,
     /// Patches for a source not added yet, each a user entry at the add.
     pending: Vec<BTreeMap<String, String>>,
+    /// Every patch the caller made, in order, written again to a new source
+    /// for the endpoint ([`Event::ProducerChanged`]).
+    patches: Vec<BTreeMap<String, String>>,
     passes_total: u64,
     first_ts: Option<u64>,
     last_stamp: Option<(u64, i64)>,
@@ -1128,6 +1168,7 @@ impl Slot {
             maps: Maps::default(),
             pinned,
             pending: Vec::new(),
+            patches: Vec::new(),
             passes_total: 0,
             first_ts: None,
             last_stamp: None,
@@ -1137,14 +1178,15 @@ impl Slot {
         }
     }
 
-    /// The endpoint's URL, or the source's id for a local source.
+    /// The endpoint's URL without credentials, or the source's id for a local
+    /// source.
     fn label(&self) -> String {
         match &self.kind {
             Kind::Local { .. } => self.id.to_string(),
             #[cfg(feature = "http")]
             Kind::Endpoint(ep) => match &self.name {
-                Some(name) => format!("{name} ({})", ep.spec.url),
-                None => ep.spec.url.to_string(),
+                Some(name) => format!("{name} ({})", layered::instance(&ep.spec.url)),
+                None => layered::instance(&ep.spec.url),
             },
         }
     }
@@ -1177,7 +1219,7 @@ impl Slot {
             ),
             #[cfg(feature = "http")]
             Kind::Endpoint(ep) => (
-                Some(ep.spec.url.to_string()),
+                Some(layered::instance(&ep.spec.url)),
                 self.name
                     .clone()
                     .or_else(|| ep.spec.labels.get(keys::SOURCE).cloned()),
@@ -1214,8 +1256,16 @@ struct Driver {
     /// started, on this host.
     last_pass: Option<u64>,
     failed: Option<String>,
+    /// `fail` has reported the failure: a second call reports nothing.
+    failure_reported: bool,
+    /// `finish` has begun: a producer change no longer starts a new
+    /// recording.
+    stopping: bool,
     /// Each added recording's label set, for the identical-labels warning.
     seen_labels: BTreeMap<BTreeMap<String, String>, String>,
+    /// The slot that added each label set in `seen_labels`, so a slot's own
+    /// set is taken out when its recording ends at a producer change.
+    seen_by: BTreeMap<BTreeMap<String, String>, usize>,
     commit_streams_on_arrival: bool,
 }
 
@@ -1392,6 +1442,14 @@ impl Driver {
     /// The archive failed: report it, stop ticking, and leave what is on
     /// disk as it is.
     async fn fail(&mut self, error: String) {
+        if self.failure_reported {
+            self.failed.get_or_insert(error);
+            return;
+        }
+        self.failure_reported = true;
+        // A writer-task panic recorded by `blocking` is the cause; a caller
+        // that saw only the closed archive passes a vaguer error.
+        let error = self.failed.take().unwrap_or(error);
         warn!("the recording failed: {error}");
         self.failed = Some(error.clone());
         self.abort_tasks();
@@ -1689,6 +1747,7 @@ impl Driver {
             warn!("{warning}");
         }
         self.seen_labels.insert(maps.labels.clone(), label);
+        self.seen_by.insert(maps.labels.clone(), i);
 
         let (labels, seed) = (maps.labels.clone(), maps.metadata.clone());
         let rec = self
@@ -1732,6 +1791,7 @@ impl Driver {
             )));
         }
         slot.pinned.extend(patch.keys().cloned());
+        slot.patches.push(patch.clone());
         if !slot.added {
             slot.pending.push(patch);
             return Ok(());
@@ -1758,6 +1818,89 @@ impl Driver {
             .await
             .ok_or(Error::Closed)?;
         result.map_err(Error::Archive)
+    }
+
+    /// The producers a reconnect's `handshake` moves slot `i` between, when
+    /// its recording is added and both the recording's handshake and this
+    /// one name a producer, and the two differ.
+    #[cfg(feature = "http")]
+    fn producer_change(&self, i: usize, handshake: &Handshake) -> Option<(String, String)> {
+        let slot = &self.slots[i];
+        let Kind::Endpoint(ep) = &slot.kind else {
+            return None;
+        };
+        let from = ep.producer.clone()?;
+        let to = layered::producer_name(&handshake.labels, &handshake.metadata)?;
+        if self.stopping && from != to {
+            warn!(
+                "{}: the producer changed ({from} -> {to}) while the recording stops; its last \
+                 rows go into the recording of {from}, as a restart when its epoch differs",
+                slot.label()
+            );
+            return None;
+        }
+        (slot.added && from != to).then_some((from, to))
+    }
+
+    /// End slot `i`'s recording and add a new one for the producer `handshake`
+    /// names: write the old producer's restarts that have a row, without the
+    /// probe hook's reply, commit what is staged, finalize the recording at its
+    /// last stamp, forget what the old producer and the probe hook said (its
+    /// epoch, anchor, served interval, restarts and replies), take the
+    /// handshake, add a source with the caller's labels, metadata and patches,
+    /// and ask the probe hook about the new producer on the following ticks.
+    /// `Ok(false)` when the commit failed, which `commit` has reported.
+    #[cfg(feature = "http")]
+    async fn new_source(&mut self, i: usize, handshake: &Handshake) -> Result<bool, String> {
+        // The new producer is on the port, so the hook is not asked about
+        // the old one's restarts; a restart without a row is dropped.
+        if let Kind::Endpoint(ep) = &mut self.slots[i].kind {
+            ep.restarts.retain(|r| r.from_ts.is_some());
+        }
+        self.apply_restart(i, true, false).await;
+        self.commit(false).await;
+        if self.failed.is_some() {
+            return Ok(false);
+        }
+        let (_, ts, wall_offset) = self.stamp_now();
+        let last = self.slots[i].last_stamp.unwrap_or((ts, wall_offset));
+        self.blocking(move |a| match a.recs.remove(&i) {
+            Some(rec) => rec.finalize(last).map_err(|e| e.to_string()),
+            None => Ok(()),
+        })
+        .await
+        .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
+        let old = std::mem::take(&mut self.slots[i].maps);
+        if self.seen_by.get(&old.labels) == Some(&i) {
+            self.seen_labels.remove(&old.labels);
+            self.seen_by.remove(&old.labels);
+        }
+        let slot = &mut self.slots[i];
+        slot.added = false;
+        slot.last_stamp = None;
+        slot.pending = slot.patches.clone();
+        if let Kind::Endpoint(ep) = &mut slot.kind {
+            ep.epoch = None;
+            ep.anchor = None;
+            ep.served_interval = None;
+            ep.restarts.clear();
+            ep.restart_fetches = 0;
+            if let Some(task) = ep.late_enrich.take().and_then(|late| late.task) {
+                task.abort();
+            }
+            ep.hook_labels.clear();
+            ep.hook_metadata.clear();
+            ep.adopt(handshake);
+        }
+        self.add_source(i).await?;
+        if let Kind::Endpoint(ep) = &mut self.slots[i].kind {
+            ep.late_enrich = Some(LateEnrich {
+                retries: 0,
+                epoch: ep.epoch.clone(),
+                task: None,
+            });
+        }
+        Ok(true)
     }
 
     /// Append `entry` to `layer` of slot `i`'s recording and write the
@@ -1787,6 +1930,7 @@ impl Driver {
     }
 
     async fn finish(&mut self, stop: Stop, cancel: CancellationToken) -> Result<Summary, Error> {
+        self.stopping = true;
         if let Some(e) = &self.failed {
             return Err(Error::Archive(e.clone()));
         }
@@ -2129,9 +2273,14 @@ impl Driver {
                 // and the converter hands over its whole map each time.
                 let held = self.slots[i].maps.metadata.get(keys::DESCRIPTIONS);
                 let added = layered::new_descriptions(&json, held.map(String::as_str));
-                let mut entry = layered::entry("recorder");
-                entry.metadata = BTreeMap::from([(keys::DESCRIPTIONS.to_string(), added)]);
-                match self.write_entry(i, Layer::Recorder, entry).await {
+                let written = if added == "{}" {
+                    Ok(false)
+                } else {
+                    let mut entry = layered::entry("recorder");
+                    entry.metadata = BTreeMap::from([(keys::DESCRIPTIONS.to_string(), added)]);
+                    self.write_entry(i, Layer::Recorder, entry).await
+                };
+                match written {
                     Ok(_) => {
                         if let Kind::Endpoint(ep) = &mut self.slots[i].kind {
                             if let Mode::Scraped { converter, .. } = &mut ep.mode {
@@ -2234,6 +2383,22 @@ impl Driver {
             }
             StreamEvent::Connected(handshake) => {
                 info!("{label}: stream reconnected");
+                if let Some((from, to)) = self.producer_change(i, &handshake) {
+                    warn!(
+                        "{label}: the producer at this endpoint changed ({from} -> {to}); its \
+                         recording ends here and a new one starts"
+                    );
+                    if !self.new_source(i, &handshake).await? {
+                        return Ok(());
+                    }
+                    self.emitter.must(Event::ProducerChanged {
+                        source: id,
+                        from,
+                        to,
+                        name: self.slots[i].name.clone().unwrap_or_default(),
+                    });
+                    return Ok(());
+                }
                 let restarted = match &mut self.slots[i].kind {
                     Kind::Endpoint(ep) => ep.adopt(&handshake).is_some(),
                     _ => false,
@@ -2289,87 +2454,98 @@ impl Driver {
     /// hook's reply is asked for on up to [`FETCH_ATTEMPTS`] ticks; on the
     /// `last` call there is no next tick, so the restart is written at once.
     async fn apply_restarts(&mut self, last: bool) {
+        for i in 0..self.slots.len() {
+            self.apply_restart(i, last, true).await;
+        }
+    }
+
+    /// [`apply_restarts`](Self::apply_restarts) for slot `i`. Without `ask`
+    /// the probe hook is not asked, and the restarts are written without its
+    /// reply.
+    async fn apply_restart(&mut self, i: usize, last: bool, ask: bool) {
         let Some((_, probe)) = self.client() else {
             return;
         };
         let timeout = self.settings.timeout;
-        for i in 0..self.slots.len() {
-            if !self.slots[i].added {
-                continue;
-            }
-            let (url, newest) = match &self.slots[i].kind {
-                Kind::Endpoint(ep) => match ep.restarts.last() {
-                    Some(newest) if ep.restarts.iter().all(|r| r.from_ts.is_some()) => {
-                        (ep.spec.url.clone(), newest.epoch.clone())
-                    }
-                    _ => continue,
-                },
-                _ => continue,
-            };
-            let label = self.slots[i].label();
-            let hook =
-                match probe::enrich_within(probe.as_ref(), &url, Some(&newest), timeout).await {
-                    Ok((_, metadata)) => metadata,
-                    Err(why) => {
-                        let Kind::Endpoint(ep) = &mut self.slots[i].kind else {
-                            continue;
-                        };
-                        if !last && ep.restart_fetches + 1 < FETCH_ATTEMPTS {
-                            ep.restart_fetches += 1;
-                            continue;
-                        }
-                        warn!(
-                        "{label}: could not read the restarted producer's metadata ({why}); the \
-                         recording's metadata records the restart without it"
-                    );
-                        BTreeMap::new()
-                    }
+        if !self.slots[i].added {
+            return;
+        }
+        let (url, newest) = match &self.slots[i].kind {
+            Kind::Endpoint(ep) => match ep.restarts.last() {
+                Some(newest) if ep.restarts.iter().all(|r| r.from_ts.is_some()) => {
+                    (ep.spec.url.clone(), newest.epoch.clone())
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let label = self.slots[i].label();
+        let asked = if ask {
+            probe::enrich_within(probe.as_ref(), &url, Some(&newest), timeout).await
+        } else {
+            Ok((BTreeMap::new(), BTreeMap::new()))
+        };
+        let hook = match asked {
+            Ok((_, metadata)) => metadata,
+            Err(why) => {
+                let Kind::Endpoint(ep) = &mut self.slots[i].kind else {
+                    return;
                 };
-            let slot = &mut self.slots[i];
-            let Kind::Endpoint(ep) = &mut slot.kind else {
-                continue;
-            };
-            ep.restart_fetches = 0;
-            let restarts = std::mem::take(&mut ep.restarts);
-            // Per restart, a recorder entry for its epoch and a producer
-            // entry for its handshake; only the newest process can be asked
-            // about itself, so only its recorder entry has the hook's reply.
-            let none = BTreeMap::new();
-            let mut entries: Vec<(Layer, Entry)> = Vec::new();
-            let mut version = None;
-            for (n, r) in restarts.iter().enumerate() {
-                let newest_one = n + 1 == restarts.len();
-                let reply = if newest_one { &hook } else { &none };
-                entries.push((Layer::Recorder, layered::epoch(&r.epoch, r.from_ts, reply)));
-                let producer =
-                    layered::producer(&r.labels, &r.metadata, None, Some(&r.epoch), r.from_ts);
-                if newest_one {
-                    version = hook
-                        .get(keys::VERSION)
-                        .or_else(|| producer.metadata.get(keys::VERSION))
-                        .cloned();
+                if !last && ep.restart_fetches + 1 < FETCH_ATTEMPTS {
+                    ep.restart_fetches += 1;
+                    return;
                 }
-                entries.push((Layer::Producer, producer));
+                warn!(
+                    "{label}: could not read the restarted producer's metadata ({why}); the \
+                     recording's metadata records the restart without it"
+                );
+                BTreeMap::new()
             }
-            let source = slot.id;
-            let mut failed = None;
-            for (layer, entry) in entries {
-                if let Err(e) = self.write_entry(i, layer, entry).await {
-                    failed = Some(e);
-                    break;
-                }
+        };
+        let slot = &mut self.slots[i];
+        let Kind::Endpoint(ep) = &mut slot.kind else {
+            return;
+        };
+        ep.restart_fetches = 0;
+        let restarts = std::mem::take(&mut ep.restarts);
+        // Per restart, a recorder entry for its epoch and a producer
+        // entry for its handshake; only the newest process can be asked
+        // about itself, so only its recorder entry has the hook's reply.
+        let none = BTreeMap::new();
+        let mut entries: Vec<(Layer, Entry)> = Vec::new();
+        let mut version = None;
+        for (n, r) in restarts.iter().enumerate() {
+            let newest_one = n + 1 == restarts.len();
+            let reply = if newest_one { &hook } else { &none };
+            entries.push((Layer::Recorder, layered::epoch(&r.epoch, r.from_ts, reply)));
+            let producer =
+                layered::producer(&r.labels, &r.metadata, None, Some(&r.epoch), r.from_ts);
+            if newest_one {
+                version = hook
+                    .get(keys::VERSION)
+                    .or_else(|| producer.metadata.get(keys::VERSION))
+                    .cloned();
             }
-            match failed {
-                None => self.emitter.must(Event::Restarted {
-                    source,
-                    epoch: newest,
-                    version,
-                }),
-                Some(e) => warn!(
-                    "{label}: the producer restart could not be written into the recording's \
-                     identity: {e}"
-                ),
+            entries.push((Layer::Producer, producer));
+        }
+        let source = slot.id;
+        let mut failed = None;
+        for (layer, entry) in entries {
+            if let Err(e) = self.write_entry(i, layer, entry).await {
+                failed = Some(e);
+                break;
             }
+        }
+        match failed {
+            None => self.emitter.must(Event::Restarted {
+                source,
+                epoch: newest,
+                version,
+            }),
+            Some(e) => warn!(
+                "{label}: the producer restart could not be written into the recording's \
+                 identity: {e}"
+            ),
         }
     }
 
@@ -2586,7 +2762,10 @@ impl Driver {
                         Some(task) => task,
                     };
                     let outcome = task.await.unwrap_or_else(|e| {
-                        Outcome::Pending(format!("endpoint {url}: detection failed: {e}"))
+                        Outcome::Pending(format!(
+                            "endpoint {}: detection failed: {e}",
+                            layered::instance(&url)
+                        ))
                     });
                     match outcome {
                         Outcome::Pending(why) => {
@@ -2598,8 +2777,9 @@ impl Driver {
                         }
                         Outcome::Streamed(sub) => {
                             info!(
-                                "endpoint {url} now reachable, subscribed to its replication \
-                                 stream; reading its metadata"
+                                "endpoint {} now reachable, subscribed to its replication stream; \
+                                 reading its metadata",
+                                layered::instance(&url)
                             );
                             ep.begin_stream(&sub, self.settings.interval);
                             let epoch = ep.epoch.clone();
@@ -2619,7 +2799,9 @@ impl Driver {
                         }
                         Outcome::Scraped(scrape) => {
                             info!(
-                                "endpoint {url} now reachable, scraped as Prometheus at {scrape}"
+                                "endpoint {} now reachable, scraped as Prometheus at {}",
+                                layered::instance(&url),
+                                layered::instance(&scrape)
                             );
                             ep.mode = Mode::Scraped {
                                 url: scrape,
@@ -2738,7 +2920,7 @@ fn adopt_enrich(ep: &mut Endpoint, reply: Result<probe::Enriched, String>) {
             warn!(
                 "{}: {why}; its recording is added with the labels and metadata of its stream \
                  handshake, and its metadata is asked for again",
-                ep.spec.url
+                layered::instance(&ep.spec.url)
             );
             ep.late_enrich = Some(LateEnrich {
                 retries: 0,

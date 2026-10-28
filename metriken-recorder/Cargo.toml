@@ -73,5 +73,9 @@ name = "enrich_log"
 required-features = ["http"]
 
 [[test]]
+name = "producer_change_log"
+required-features = ["http"]
+
+[[test]]
 name = "registry"
 required-features = ["registry"]

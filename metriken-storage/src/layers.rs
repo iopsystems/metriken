@@ -658,13 +658,35 @@ fn drift(
         let have = present(metadata, k);
         let was = present(&before.metadata, k);
         if was != have && !union_holds(k, was, have) {
-            entry
-                .metadata
-                .insert(k.clone(), have.cloned().unwrap_or_default());
+            let value =
+                union_added(k, was, have).unwrap_or_else(|| have.cloned().unwrap_or_default());
+            entry.metadata.insert(k.clone(), value);
         }
     }
     let changed = !entry.labels.is_empty() || !entry.metadata.is_empty();
     changed.then_some(entry)
+}
+
+/// For union key `k`, the entries of `have` (the value found in the source)
+/// that `was` (the merged value) lacks or holds with another value, as a
+/// JSON object; `None` for another key or when either is not an object. An
+/// `external` entry then carries only what changed, so a later producer or
+/// recorder value of another name in the object is not hidden under it.
+fn union_added(k: &str, was: Option<&String>, have: Option<&String>) -> Option<String> {
+    use serde_json::Value;
+    if !UNION_KEYS.contains(&k) {
+        return None;
+    }
+    let parse = |s: &str| match serde_json::from_str::<Value>(s) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    };
+    let (was, have) = (parse(was?)?, parse(have?)?);
+    let added: serde_json::Map<String, Value> = have
+        .into_iter()
+        .filter(|(name, value)| was.get(name) != Some(value))
+        .collect();
+    Some(Value::Object(added).to_string())
 }
 
 /// Whether `have`, the value of union key `k` found in the source, adds
@@ -712,16 +734,17 @@ fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
 ///
 /// A source whose labels, or whose metadata keys the layers set, were changed
 /// since the last write through this function (by dendro's
-/// `update_source_labels` or `update_source_metadata`) has that change
-/// appended first, as a user entry by `external` with the id
-/// `external-<seq>-<entry's id>`, so it is kept rather than overwritten; a
-/// removal is kept as the key set to `""`. Being a user entry, it wins over
-/// every producer and recorder value of that key, later ones included, until
-/// a user entry unsets it. A `descriptions` value whose keys all hold their
-/// merged values (one with a key removed, or reordered) is not a change:
-/// that key is merged across entries, so a removed key comes back on the
-/// next write. The write that derives a legacy source's layers checks
-/// nothing, since the derivation is the source's own state.
+/// `update_source_labels` or `update_source_metadata`) has that change appended
+/// first, as a user entry by `external` with the id `external-<seq>-<entry's
+/// id>`, so it is kept rather than overwritten; a removal is kept as the key
+/// set to `""`. Being a user entry, it wins over every producer and recorder
+/// value of that key, later ones included, until a user entry unsets it. A
+/// `descriptions` value whose keys all hold their merged values (one with a key
+/// removed, or reordered) is not a change: that key is merged across entries,
+/// so a removed key comes back on the next write. Any other change to it is
+/// recorded as the names it adds or gives another value, so the entry pins only
+/// those. The write that derives a legacy source's layers checks nothing, since
+/// the derivation is the source's own state.
 ///
 /// `labels` becomes the merged labels whole: every label of the source is in
 /// a layer. In `metadata`, a key the merged layers set is written, and a key
@@ -2014,5 +2037,50 @@ mod tests {
             metadata,
             map(&[(PRODUCER_NAME, "new"), (VERSION, "2"), ("k", "v")])
         );
+    }
+
+    /// An outside change to `descriptions` is recorded as the names it adds
+    /// or changes, so a later producer value of another name still shows.
+    #[test]
+    fn an_external_descriptions_change_keeps_only_what_changed() {
+        let (mut labels, mut metadata) = (BTreeMap::new(), BTreeMap::new());
+        let described = |id: &str, json: &str| {
+            let mut e = Entry::new(id, "producer");
+            e.metadata = map(&[("descriptions", json)]);
+            e
+        };
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            described("a", r#"{"a":"A","b":"B"}"#),
+        );
+        metadata.insert(
+            "descriptions".to_string(),
+            r#"{"a":"A","b":"B2","z":"Z"}"#.to_string(),
+        );
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::User,
+            entry("u", "record", &[("k", "v")]),
+        );
+        let layers = Layers::read(&metadata).unwrap().unwrap();
+        let external = layers
+            .user
+            .entries
+            .iter()
+            .find(|e| e.by == "external")
+            .unwrap();
+        assert_eq!(external.metadata["descriptions"], r#"{"b":"B2","z":"Z"}"#);
+        put(
+            &mut labels,
+            &mut metadata,
+            Layer::Producer,
+            described("b", r#"{"a":"NEW"}"#),
+        );
+        let merged: BTreeMap<String, String> =
+            serde_json::from_str(&metadata["descriptions"]).unwrap();
+        assert_eq!(merged, map(&[("a", "NEW"), ("b", "B2"), ("z", "Z")]));
     }
 }
