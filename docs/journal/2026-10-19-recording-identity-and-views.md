@@ -2924,12 +2924,12 @@ written by the new dendro.
      key, and keeps refusing the two flat names. Needs, for subscribers: the
      dendro frame above. metriken-recorder also calls the probe hook's
      `enrich` for every endpoint detection classifies as scraped, with the
-     late retry on `Retry` and on late activation (today `first_enrich` asks
-     streamed endpoints only, `recorder.rs:1885`), writing its metadata into
-     the recorder layer (Q3); the warnings and docs that say the hook serves
-     a streamed endpoint (`recorder.rs:2292`, `:2339`, `:2623`,
-     `ENRICH_RETRIES`, `late_enrich`) change with it. Open: a way to fill
-     in a value the first answer lacked (an exporter's `agent_version`), since
+     late retry on `Retry` and on late activation (before #330 `first_enrich`
+     asked streamed endpoints only, `recorder.rs:1885`), writing its metadata
+     into the recorder layer (Q3); the warnings and docs that say the hook
+     serves a streamed endpoint (`recorder.rs:2292`, `:2339`, `:2623`,
+     `ENRICH_RETRIES`, `late_enrich`) change with it. Open: a way to fill in a
+     value the first answer lacked (an exporter's `agent_version`), since
      `Retry` discards the whole answer (Q3).
 
      Built in parts (2026-10-27): the producer identity keys and macro (#327),
@@ -2954,11 +2954,13 @@ written by the new dendro.
      caller; `Probe::merge` is not called, since the fold takes the newest
      value and unions `descriptions`; the hook's late labels are still not
      applied. #329 starts a new source when a reconnect's handshake names a
-     different producer. Left for later PRs: the probe hook for scraped
-     endpoints and late activation, and `__producer__` with the clash rule.
-     The plan above is as written before #328, and its `recorder.rs` line
-     references are to the code before it. #328 also leaves a URL's user name
-     and password out of `instance` and writes only newly described names of a
+     different producer. #330 calls the probe hook for scraped endpoints, at
+     the start and on late activation, with no epoch. Left for later PRs:
+     `__producer__` with the clash rule, and a way to fill in a value the
+     hook's first answer lacked (an exporter's `agent_version`). The plan
+     above is as written before #328, and its `recorder.rs` line references
+     are to the code before it. #328 also leaves a URL's user name and
+     password out of `instance` and writes only newly described names of a
      scrape's HELP text.
    - `__producer__`, and the one clash rule on every path, including
      `MultiParquetSource`.

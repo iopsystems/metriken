@@ -2951,3 +2951,126 @@ async fn a_restarts_version_is_the_newest_handshakes() {
         .collect();
     assert_eq!(versions, [Some("3".to_string())]);
 }
+
+/// The probe hook is asked about a scraped endpoint, with no epoch, and its
+/// reply is written into the recorder layer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scraped_endpoints_hook_reply_is_recorded() {
+    let fake = serve(exporter("up_total")).await;
+    let mut url = fake.url.clone();
+    url.set_path("/metrics");
+    let probe = Arc::new(ScrapeProbe);
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![EndpointSpec::new(url).with_label("source", "svc")],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe,
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let r = &recordings(&run.path, PROMETHEUS_GROUP)["svc"];
+    assert_eq!(r.metadata["producer_component"], "exporter");
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(layers.recorder.metadata["producer_component"], "exporter");
+}
+
+/// A scraped endpoint that comes up after the start is asked about before it
+/// is added.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_scraped_endpoint_is_asked_before_it_is_added() {
+    let fake = serve(Behaviour {
+        down: true,
+        ..exporter("up_total")
+    })
+    .await;
+    let mut url = fake.url.clone();
+    url.set_path("/metrics");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("late-scrape.dendro");
+    let detected = vec![Detected::Pending {
+        spec: EndpointSpec::new(url).with_label("source", "svc"),
+        reason: "down".into(),
+    }];
+    let (recorder, _ids, _events) = Recorder::start(
+        RecorderConfig::new(&path, Duration::from_millis(50)),
+        client(),
+        Arc::new(ScrapeProbe),
+        detected,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    fake.set(exporter("up_total"));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let r = &recordings(&path, PROMETHEUS_GROUP)["svc"];
+    assert_eq!(
+        r.metadata["producer_component"], "exporter",
+        "{:?}",
+        r.metadata
+    );
+}
+
+/// A scraped endpoint's hook reply that misses the first ask's timeout is
+/// asked for again, and a reply that arrives later is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scraped_endpoints_late_hook_reply_is_written() {
+    let fake = serve(exporter("up_total")).await;
+    let mut url = fake.url.clone();
+    url.set_path("/metrics");
+    let probe = LateProbe::new(2, Duration::from_secs(1));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![EndpointSpec::new(url).with_label("source", "svc")],
+        probe.as_ref(),
+    )
+    .await;
+    let run = record(
+        detected,
+        probe.clone(),
+        Vec::new(),
+        |cfg| cfg.timeout = Duration::from_millis(200),
+        Duration::from_millis(1500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.unwrap();
+    assert_eq!(probe.calls(), 2, "the first ask and one retry");
+    let r = &recordings(&run.path, PROMETHEUS_GROUP)["svc"];
+    assert_eq!(r.metadata["version"], "1.2.3", "{:?}", r.metadata);
+}
+
+/// A hook that names an exporter for any endpoint, as rezolus's will from
+/// `/about` (journal Q3).
+struct ScrapeProbe;
+
+#[async_trait::async_trait]
+impl Probe for ScrapeProbe {
+    async fn not_streamable(&self, _url: &url::Url, _at: At, _answer: &StreamAnswer) -> Verdict {
+        Verdict::Scrape
+    }
+
+    async fn enrich(&self, _url: &url::Url, epoch: Option<&str>) -> Enrich {
+        assert_eq!(epoch, None, "a scrape has no epoch");
+        Enrich::Metadata {
+            epoch: None,
+            labels: BTreeMap::new(),
+            metadata: map(&[("producer_component", "exporter")]),
+        }
+    }
+}

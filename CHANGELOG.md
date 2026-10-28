@@ -76,13 +76,28 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   split: the last rows go into the old recording, as a restart when the
   epoch differs. `Committed`'s `passes_total` and
   `first_ts`, and the `SourceSummary`, count the endpoint across its
-  recordings. A finalized recording is not evicted by `retain` again. Two
+  recordings. A recording is not evicted by `retain` after it is finalized. Two
   recordings of one endpoint can carry identical labels until
   `__producer__` is added; their rows stay apart as separate sources.
 - **Changed:** an endpoint URL's user name and password are left out of
   the recorder's own log lines and of `SourceSummary::endpoint`, as #328
   leaves them out of the `instance` label. Messages from detection and
   subscription still name the URL as given.
+- **Added:** the probe hook's `enrich` is called for a scraped endpoint
+  too, with no epoch: at the start beside the streamed endpoints, and on
+  late activation before the endpoint is added (it enters `Activating`, as
+  a streamed one does, and is added on the tick after its `enrich`
+  returns, one interval later than before, even with `NoProbe`). Its reply is written into the recorder layer; a
+  `Retry` or a timeout is asked again on later ticks, and a reply that
+  arrives then is a further recorder entry. `Probe::enrich`'s doc covers
+  scraped endpoints. A run that ends with a reply still owed, and one whose
+  retries ran out, say the recording keeps the labels and metadata it was
+  added with.
+- **Changed:** the identical-labels warning keeps the set of endpoints
+  recording under each label set, so a producer change on one of two
+  endpoints sharing labels keeps the warning for the other, and a restart
+  that changes an endpoint's labels moves it. `finish` returns the cause
+  `Event::Failed` reports.
 - **Added:** `SourceIdentity::producer` and `with_producer`,
   `RegistrySource::with_producer`, and `ProducerIdentity` re-exported.
 - **Removed:** `restart::metadata_patch`, `restart::Restart` and

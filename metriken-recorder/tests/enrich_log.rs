@@ -83,7 +83,7 @@ async fn a_run_that_ends_with_a_reply_owed_says_so() {
         .filter(|l| {
             l.contains(
                 "its metadata had not arrived when the run ended; the recording keeps the \
-                        labels and metadata of its stream handshake",
+                        labels and metadata it was added with",
             )
         })
         .collect();
