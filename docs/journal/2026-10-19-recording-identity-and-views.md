@@ -2953,80 +2953,93 @@ written by the new dendro.
      hook's late labels are still not applied. Left for later PRs: a new
      source when a reconnect's handshake names a different producer, the probe
      hook for scraped endpoints and late activation, and `__producer__` with
-     the clash rule. - `__producer__`, and the one clash rule on every path,
-     including `MultiParquetSource`. - In metriken-query, each producer
-     epoch's rows evaluated with that epoch's handshake template (Q8), as part
-     of the template evaluation rule (the D1 item below). - ~~In
-     metriken-query, the per-sample `avg_over_time` and per-row unstrided
-     histogram behaviour documented (S12).~~ Done in the metriken-query crate
-     docs. - In metriken-storage and metriken-query, process groups (S1, S2)
-     and conflicts (S4). Needs: Q9 and Q16 for the grouping key and the
-     conflict value; prerequisite for case 3. - In metriken-query, the S9
-     per-source union, with S3's span selection (which source's results are
-     used in each span, which needs S9's coverage rule) and S5 to S8: each
-     source evaluated alone and the results combined per series per span,
-     never a delta across sources. Needs: the process groups above;
-     prerequisite for case 3. - In metriken-query the open-time label overlay
-     (O5), a generic caller API. Needs: Q37. - In metriken-query the scope
-     input (D1), resolving to process groups, then the template evaluation
-     rule, for the producer and registry layers. - The catalog index and
-     scope-aware listings. Needs: Q29. 3. rezolus, in this order: 1. ~~Open
-     and merge the combined view.~~ Done: #1504. 2. The restriction as the
-     engine scope (D1) in both viewers' query APIs and the frontend (replacing
-     `applyScope`'s use of `injectLabel` and `metadata.scope`), stored queries
-     carrying their scope, combined parquets and A/B tarballs (or retire
-     `--ab` tarballs), with `restrict_query`'s pin rule removed; released.
-     Needs: step 2's scope, Q30, Q32. 3. Templates without `source=`
-     (cachecannon and llm-perf in the same step), behind the template schema
-     of Q19. Needs: Q19. 4. `alias`, `tier`, `service_kind` and per-endpoint
-     labels in `record`, and the layers; the template-to-recording binding in
-     `recording check` by kind; template lookup by kind for the registry
-     layer; template and label layers in P5's order, including `template=`
-     becoming the recorder default below the producer's layer; the
-     compatibility list; `instance` in combined parquets; the two clash rules
-     that are rezolus code (`combine`'s, and the agent's external metrics)
-     moved to the one rule; the internal comparisons with `"rezolus"`
-     (`filter.rs:145`, `dashboard/mod.rs:775`,
-     `crates/viewer/src/lib.rs:1663`, `source_kind.rs:45`, and the others in
-     Today) reading the kind through D2; `dashboard=FILE`; the per-endpoint
-     `source=` written as `alias` (Compatibility); `recording upgrade` and
-     `recording convert` writing the layers, and `upgrade` accepting a
-     pre-layer `.dendro` and keeping its uuids (Q3); `arm=` (#1504) and
-     `host=` (#1538) as user-layer entries; `combine`'s label stamping and
-     `annotate`'s metadata writes through the metriken-storage layer function
-     (Q2); `/about` on the agent and the exporter, read by the probe hook
-     (Q3), which needs step 2's probe call for a scraped endpoint, and rezolus
-     analysis reading `agent_version`. Needs: step 2, Q4, Q5, Q6, Q20, Q21,
-     Q22, Q23, Q35, Q38. 5. The presentation (cases 1 to 6) as one `dashboard`
-     crate function called by the viewer, MCP and `recording check`, with
-     notices in MCP's tool results and on the CLI's stderr, and the
-     per-recording MCP tools iterating presented recordings (P7); two-level
-     grouping (P1), aggregation by plot type and the split toggle (P3), time
-     clusters compared like `arm` (P4, P6), and the unidentified group (P9);
-     cross-producer sections with their binding and host matching; views,
-     template layers and label layers as documents, interactive relabels saved
-     as rules, and labels saved from the viewer into the user layer (P1, Q40);
-     alignment; reports, pins and group events as documents; `combine` as a
-     plain union reporting document forks and placing new recordings beside a
-     saved view, with the shared-uuid refusal removed; `recording upgrade`
-     writing a view document; `recording views import` and view export;
-     Save-as-Report writing `.dendro` with the current presentation as its
-     default view and the archive's own layers only (P8), and the read-build
-     ingest path for the static site; histogram charts passing a stride at the
-     step (S12); the `arm_slots` and report-anchor compatibility items. Needs:
-     step 2's process groups and layer function, Q10, Q13, Q15 to Q18, Q24 to
-     Q28, Q30, Q31, Q36, Q39. 4. The renames (Q4, except `instance`), each
-     with read-time aliases. 5. systemslab, as a consumer (planned): render
-     each archive through the `dashboard` crate with the archive's own layers;
-     keep its own views at its own levels in its own storage; pass `--label
-     tier=<value>` for a job whose spec gives a tier (O4); optionally pass an
-     open-time overlay. Needs: step 3.5, Q34, Q37. 6. llm-perf (Q7):
-     `tier=client` and `tier=server` in place of `role`, the producer name and
-     hostname in `SourceIdentity`, a `[metrics] server_host` asserted as
-     `host` on the server endpoint (Q1), a `[metrics]` key that overrides each
-     `tier`, and a new key naming the server's `alias`, with `server_source`
-     accepted as an alias for it with a warning and written as `alias` rather
-     than as a `source` label (`src/recording.rs:128-131`, Compatibility), and
-     no `source` label on its own source (`:172`), whose producer name
-     `SourceIdentity` carries. Needs: step 2, and step 3.4 for registry lookup
-     by `alias`.
+     the clash rule. The plan above is as written before #328, and its
+     `recorder.rs` line references are to the code before it. #328 also leaves
+     a URL's user name and password out of `instance` and writes only newly
+     described names of a scrape's HELP text.
+   - `__producer__`, and the one clash rule on every path, including
+     `MultiParquetSource`.
+   - In metriken-query, each producer epoch's rows evaluated with that
+     epoch's handshake template (Q8), as part of the template evaluation rule
+     (the D1 item below).
+   - ~~In metriken-query, the per-sample `avg_over_time` and per-row
+     unstrided histogram behaviour documented (S12).~~ Done in the
+     metriken-query crate docs.
+   - In metriken-storage and metriken-query, process groups (S1, S2) and
+     conflicts (S4). Needs: Q9 and Q16 for the grouping key and the
+     conflict value; prerequisite for case 3.
+   - In metriken-query, the S9 per-source union, with S3's span selection
+     (which source's results are used in each span, which needs S9's
+     coverage rule) and S5 to S8: each source evaluated alone and the
+     results combined per series per span, never a delta across sources.
+     Needs: the process groups above; prerequisite for case 3.
+   - In metriken-query the open-time label overlay (O5), a generic caller
+     API. Needs: Q37.
+   - In metriken-query the scope input (D1), resolving to process groups,
+     then the template evaluation rule, for the producer and registry
+     layers.
+   - The catalog index and scope-aware listings. Needs: Q29.
+3. rezolus, in this order:
+   1. ~~Open and merge the combined view.~~ Done: #1504.
+   2. The restriction as the engine scope (D1) in both viewers' query APIs
+      and the frontend (replacing `applyScope`'s use of `injectLabel` and
+      `metadata.scope`), stored queries carrying their scope, combined
+      parquets and A/B tarballs (or retire `--ab` tarballs), with
+      `restrict_query`'s pin rule removed; released. Needs: step 2's scope,
+      Q30, Q32.
+   3. Templates without `source=` (cachecannon and llm-perf in the same
+      step), behind the template schema of Q19. Needs: Q19.
+   4. `alias`, `tier`, `service_kind` and per-endpoint labels in `record`, and
+      the layers; the template-to-recording binding in `recording check` by
+      kind; template lookup by kind for the registry layer; template and label
+      layers in P5's order, including `template=` becoming the recorder default
+      below the producer's layer; the compatibility list; `instance` in
+      combined parquets; the two clash rules that are rezolus code
+      (`combine`'s, and the agent's external metrics) moved to the one rule;
+      the internal comparisons with `"rezolus"` (`filter.rs:145`,
+      `dashboard/mod.rs:775`, `crates/viewer/src/lib.rs:1663`,
+      `source_kind.rs:45`, and the others in Today) reading the kind through
+      D2; `dashboard=FILE`; the per-endpoint `source=` written as `alias`
+      (Compatibility); `recording upgrade` and `recording convert` writing the
+      layers, and `upgrade` accepting a pre-layer `.dendro` and keeping its
+      uuids (Q3); `arm=` (#1504) and `host=` (#1538) as user-layer entries;
+      `combine`'s label stamping and `annotate`'s metadata writes through the
+      metriken-storage layer function (Q2); `/about` on the agent and the
+      exporter, read by the probe hook (Q3), which needs step 2's probe call
+      for a scraped endpoint, and rezolus analysis reading `agent_version`.
+      Needs: step 2, Q4, Q5, Q6, Q20, Q21, Q22, Q23, Q35, Q38.
+   5. The presentation (cases 1 to 6) as one `dashboard` crate function
+      called by the viewer, MCP and `recording check`, with notices in MCP's
+      tool results and on the CLI's stderr, and the per-recording MCP tools
+      iterating presented recordings (P7); two-level grouping (P1),
+      aggregation by plot type and the split toggle (P3), time clusters
+      compared like `arm` (P4, P6), and the unidentified group (P9);
+      cross-producer sections with their binding and host matching; views,
+      template layers and label layers as documents, interactive
+      relabels saved as rules, and labels saved from the viewer into the
+      user layer (P1, Q40); alignment; reports, pins and
+      group events as documents; `combine` as a plain union reporting
+      document forks and placing new recordings beside a saved view, with
+      the shared-uuid refusal removed; `recording upgrade` writing a view
+      document; `recording views import` and view export; Save-as-Report
+      writing `.dendro` with the current presentation as its default view
+      and the archive's own layers only (P8), and the read-build ingest path
+      for the static site; histogram charts passing a stride at the step
+      (S12); the `arm_slots` and report-anchor compatibility items. Needs:
+      step 2's process groups and layer function, Q10, Q13, Q15 to Q18,
+      Q24 to Q28, Q30, Q31, Q36, Q39.
+4. The renames (Q4, except `instance`), each with read-time aliases.
+5. systemslab, as a consumer (planned): render each archive through the
+   `dashboard` crate with the archive's own layers; keep its own views at
+   its own levels in its own storage; pass `--label
+   tier=<value>` for a job whose spec gives a tier (O4); optionally pass an
+   open-time overlay. Needs: step 3.5, Q34, Q37.
+6. llm-perf (Q7): `tier=client` and `tier=server` in place of `role`, the
+   producer name and hostname in `SourceIdentity`, a `[metrics] server_host`
+   asserted as `host` on the server endpoint (Q1), a `[metrics]` key that
+   overrides each `tier`, and a new key naming the server's `alias`, with
+   `server_source` accepted as an alias for it with a warning and written as
+   `alias` rather than as a `source` label (`src/recording.rs:128-131`,
+   Compatibility), and no `source` label on its own source (`:172`), whose
+   producer name `SourceIdentity` carries. Needs: step 2, and step 3.4 for
+   registry lookup by `alias`.

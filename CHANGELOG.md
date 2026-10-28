@@ -15,12 +15,13 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   identity layers (metriken-storage `layers`), each write through
   `layers::append` and dendro's `SourceWriter::set_identity`:
   - the recorder layer: at the add, `instance` (an endpoint's URL, as
-    parsed) as a label, `transport` (`stream`, `prometheus`, `local`),
+    parsed, without a user name or password) as a label, `transport` (`stream`, `prometheus`, `local`),
     `sampling_interval_ms`, and the probe hook's labels and metadata; one
     entry per producer epoch, the opening one with no `from_ts` and each
     restart's from its first row, the newest restart's with the hook's
-    reply about its process; a scrape's HELP text as `descriptions`; a
-    late hook reply's metadata. The hook's labels and metadata now sit
+    reply about its process; a scrape's HELP text as `descriptions`, each
+    entry holding the names not described yet; a late hook reply's
+    metadata. The hook's labels and metadata now sit
     below the handshake's, where they were above;
   - the producer layer: a stream handshake's labels and metadata, or a
     local source's `SourceIdentity` metadata, at the add and for each
@@ -37,7 +38,9 @@ Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
   handshake's or a local source's `instance` label and `transport` and
   `sampling_interval_ms` metadata are left out of its entry, so they do not
   replace the recorder's; a local source's own `sampling_interval_ms`, which
-  was kept before, gives way to the recorder's tick.
+  was kept before, gives way to the recorder's tick. A restart's producer
+  entry can change the recording's labels mid-recording (a new handshake's
+  `source`, say); the identical-labels warning is checked at the add only.
 - **Changed:** the recorder writes no `source` of its own: no name
   inferred from the URL, no `local` default, and not the probe hook's
   `source`. A `source` label the caller or the producer gives is kept in

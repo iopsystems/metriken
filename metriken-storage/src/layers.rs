@@ -701,9 +701,10 @@ fn union_holds(k: &str, was: Option<&String>, have: Option<&String>) -> bool {
 /// appended last when appending it would change neither the layer's fold nor
 /// the fold of the layer's entries in the entry's epoch. A skipped entry is
 /// not in the layer, so a later entry whose `from_ts` falls between the
-/// copy on record and the skipped one folds after both, where the full
-/// sequence of handshakes would have put the skipped one after it. Only the
-/// producer layer is deduplicated this way.
+/// copy on record and the skipped one folds after the copy and its values
+/// win, where the full sequence of handshakes would have put the skipped
+/// one after it and the skipped one's values would win. Only the producer
+/// layer is deduplicated this way.
 ///
 /// A source with no layer keys is first given the layers
 /// [`Layers::derive_legacy`] reads from it, with `uuid` and `evidence`, so

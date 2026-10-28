@@ -700,6 +700,14 @@ async fn the_handshakes_identity_outranks_the_hooks() {
     let r = &recordings[""];
     assert_eq!(r.metadata["version"], "handshake");
     assert!(!r.labels.contains_key("source"), "{:?}", r.labels);
+    assert!(
+        run.events.iter().any(|e| matches!(
+            e,
+            Event::Active { name, inferred: false, .. } if name == "rezolus"
+        )),
+        "shown under the hook's source: {:?}",
+        run.events
+    );
     let layers = metriken_storage::layers::Layers::read(&r.metadata)
         .unwrap()
         .unwrap();
@@ -2106,7 +2114,12 @@ impl Probe for LateProbe {
         }
         Enrich::Metadata {
             epoch: epoch.map(str::to_string),
-            labels: map(&[("host", "web-01"), ("zone", "hook"), ("arm", "hook")]),
+            labels: map(&[
+                ("host", "web-01"),
+                ("zone", "hook"),
+                ("arm", "hook"),
+                ("source", "hook"),
+            ]),
             metadata: map(&[
                 ("version", "1.2.3"),
                 ("systeminfo", "{}"),
@@ -2119,8 +2132,8 @@ impl Probe for LateProbe {
 
 /// A hook reply that misses the first ask's timeout is asked for again
 /// after the recording is added, and its metadata is written into the
-/// recording: not over the caller's keys or the recorder's own, and
-/// without its labels, which are fixed at the add.
+/// recording: not over the caller's keys or the recorder's own. Its late
+/// labels are not applied.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_late_hook_reply_writes_its_metadata() {
     let fake = serve(stream_only(&[("source", "svc"), ("zone", "a")], &[])).await;

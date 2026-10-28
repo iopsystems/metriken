@@ -76,9 +76,10 @@ pub struct SourceIdentity {
     pub labels: BTreeMap<String, String>,
     /// The recording's metadata, written to its producer layer: what the
     /// process declares about itself, as a stream handshake's metadata is,
-    /// except that a `metriken.` key is refused (give a producer identity as
-    /// [`producer`](Self::producer)) and `events` is stored as given outside
-    /// the layers. `transport` and `sampling_interval_ms` are the recorder's
+    /// except that the keys [`StartError::Reserved`] names are refused (a
+    /// `metriken.` key, the flat epoch keys, `encoder`, `writer_sessions`;
+    /// give a producer identity as [`producer`](Self::producer)) and
+    /// `events` is stored as given outside the layers. `transport` and `sampling_interval_ms` are the recorder's
     /// and are left out.
     pub metadata: BTreeMap<String, String>,
     /// The wall clock the source's timeline is anchored to: its stamps'
@@ -1623,7 +1624,7 @@ impl Driver {
                 entries.push((
                     Layer::Recorder,
                     layered::opened(
-                        Some(ep.spec.url.as_str()),
+                        Some(&layered::instance(&ep.spec.url)),
                         wire,
                         interval_ms,
                         &ep.hook_labels,
@@ -2123,8 +2124,13 @@ impl Driver {
             // The scrape's HELP text, when it named a metric not yet stored.
             // A failed hand-off is retried after the next scrape.
             if let Some(json) = descriptions {
+                // Only the names the recording does not describe yet: the
+                // fold unions `descriptions`, so the merged value is the same,
+                // and the converter hands over its whole map each time.
+                let held = self.slots[i].maps.metadata.get(keys::DESCRIPTIONS);
+                let added = layered::new_descriptions(&json, held.map(String::as_str));
                 let mut entry = layered::entry("recorder");
-                entry.metadata = BTreeMap::from([(keys::DESCRIPTIONS.to_string(), json)]);
+                entry.metadata = BTreeMap::from([(keys::DESCRIPTIONS.to_string(), added)]);
                 match self.write_entry(i, Layer::Recorder, entry).await {
                     Ok(_) => {
                         if let Kind::Endpoint(ep) = &mut self.slots[i].kind {

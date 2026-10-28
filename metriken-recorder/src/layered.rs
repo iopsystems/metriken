@@ -21,7 +21,7 @@ use crate::keys;
 pub(crate) const TRANSPORT: &str = "transport";
 
 /// The recorder layer's label naming the endpoint a source was recorded
-/// from: its URL as parsed (`Url::as_str`).
+/// from: its URL as parsed ([`instance`]), without a user name or password.
 pub(crate) const INSTANCE: &str = "instance";
 
 /// Keys the recorder sets in the recorder layer itself, which a probe hook's
@@ -63,6 +63,38 @@ impl Maps {
             entry,
         )
     }
+}
+
+/// The `instance` label for an endpoint at `url`: the URL as parsed, without
+/// the user name and password the recorder may have sent, since a recording
+/// is read by others. The query string is kept: it can name what is
+/// scraped (a blackbox exporter's `module`).
+#[cfg(feature = "http")]
+pub(crate) fn instance(url: &url::Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
+/// Of the `descriptions` JSON object `offered`, the entries `held` (the
+/// recording's merged `descriptions`) does not already have with the same
+/// value, as a JSON object. `offered` as it is when either is not an object.
+#[cfg(feature = "http")]
+pub(crate) fn new_descriptions(offered: &str, held: Option<&str>) -> String {
+    use serde_json::{Map, Value};
+    let parse = |s: &str| match serde_json::from_str::<Value>(s) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    };
+    let (Some(offered_map), Some(held)) = (parse(offered), held.and_then(parse)) else {
+        return offered.to_string();
+    };
+    let added: Map<String, Value> = offered_map
+        .into_iter()
+        .filter(|(k, v)| held.get(k) != Some(v))
+        .collect();
+    Value::Object(added).to_string()
 }
 
 /// A new entry by `by`, with a random id and the wall clock now as its `ts`.
@@ -271,9 +303,18 @@ mod tests {
             Some("http://h:4241"),
             "stream",
             "1000".to_string(),
-            &map(&[("source", "rezolus"), ("zone", "a"), ("metriken.x", "y")]),
+            &map(&[
+                ("source", "rezolus"),
+                ("zone", "a"),
+                ("metriken.x", "y"),
+                ("instance", "theirs"),
+                ("transport", "udp"),
+            ]),
             &map(&[
                 ("sampling_interval_ms", "5"),
+                ("transport", "x"),
+                ("source", "rezolus"),
+                ("instance", "kept"),
                 ("agent_version", "5.2"),
                 ("metriken.x", "y"),
                 ("events", "{}"),
@@ -281,16 +322,32 @@ mod tests {
         );
         assert_eq!(
             e.labels,
-            map(&[("instance", "http://h:4241"), ("zone", "a")])
+            map(&[
+                ("instance", "http://h:4241"),
+                ("transport", "udp"),
+                ("zone", "a")
+            ])
         );
         assert_eq!(
             e.metadata,
             map(&[
                 ("agent_version", "5.2"),
+                ("instance", "kept"),
                 ("sampling_interval_ms", "1000"),
                 ("transport", "stream")
             ])
         );
+        // A restart's recorder entry filters the hook's reply the same way.
+        let e = epoch(
+            "e2",
+            Some(5),
+            &map(&[
+                ("sampling_interval_ms", "5"),
+                ("source", "rezolus"),
+                ("version", "2"),
+            ]),
+        );
+        assert_eq!(e.metadata, map(&[("version", "2")]));
     }
 
     #[test]
@@ -314,6 +371,26 @@ mod tests {
         );
         assert_eq!(e.labels, map(&[("transport", "udp"), ("zone", "a")]));
         assert_eq!(e.metadata, map(&[("instance", "kept"), ("note", "n")]));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn instance_leaves_out_credentials() {
+        let url = url::Url::parse("http://user:secret@Host:9090/metrics?module=x").unwrap();
+        assert_eq!(instance(&url), "http://host:9090/metrics?module=x");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn only_new_descriptions_are_written() {
+        assert_eq!(
+            new_descriptions(
+                r#"{"a":"A","b":"B","c":"C2"}"#,
+                Some(r#"{"a":"A","c":"C"}"#)
+            ),
+            r#"{"b":"B","c":"C2"}"#
+        );
+        assert_eq!(new_descriptions(r#"{"a":"A"}"#, None), r#"{"a":"A"}"#);
     }
 
     #[test]
