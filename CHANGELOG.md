@@ -259,6 +259,20 @@ names index below.
   read `MNI1` and takes each table's names from its first segment and live
   tail only, so it neither lists nor returns data for a metric that first
   appears in a later segment of an archive written by this one.
+- **Changed:** a names index (`MNI1`) holds, after its names frame, a
+  second zstd frame with the segment's columns: each column's metric name
+  and labels as its footer lists them, and each histogram's config. The
+  open decodes only the names frame. For a recording complete at open,
+  `ArchiveReader`'s label listings (`counter_labels` and the others) take a
+  table's label sets from these frames, relabelled through its occupant
+  stream for a long table, without building the table's reader, so without
+  fetching its sealed segments; such a table is listed even when its
+  reader would fail to build on a damaged segment. A recording still being
+  written, a long table with a live tail, and a table with a segment whose
+  columns the open does not have (an index without the frame, a segment it
+  did not fetch) list through the table's reader as before. On a 9.6-hour
+  archive, listing every metric's label sets went from about 5.1 s to
+  0.34 s.
 
 ### metriken-query 0.43.0
 

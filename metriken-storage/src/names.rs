@@ -9,7 +9,8 @@
 //! segment (`sampling_interval_ms`, `metriken.format`, `metriken.layout`).
 //! After it, in a second zstd frame, it stores the segment's
 //! [`SegmentColumns`], from which a reader lists the table's label sets
-//! without fetching a segment. The open decodes only the first frame.
+//! without fetching its sealed segments. The open decodes only the first
+//! frame.
 //! Segments sealed by metriken-storage 0.5.4 and earlier carry a names
 //! fingerprint instead (or nothing), which a reader still uses: two segments
 //! with the same fingerprint hold the same metric names, so the reader
@@ -31,9 +32,10 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 /// [`SegmentColumns`] the same way, as a second zstd frame. A field added
 /// later is left out by a reader that does not know it, and a field missing
 /// is its default. A change to what a field means, including how a probe
-/// classifies a column into the four name sets, needs a new prefix
-/// (`MNI2`), since a reader takes an index over the footer it was built
-/// from. A reader fetches the segment of an `MNI` index whose version it
+/// classifies a column into the four name sets or which footer keys of a
+/// column become its labels (`Labels::from_metadata`, `STORAGE_KEYS`),
+/// needs a new prefix (`MNI2`), since a reader takes an index over the
+/// footer it was built from. A reader fetches the segment of an `MNI` index whose version it
 /// does not know.
 const NAMES: &[u8; 4] = b"MNI1";
 
@@ -83,7 +85,7 @@ pub(crate) enum Stored {
 /// The index to store with a sealed segment, or `None` when its footer
 /// cannot be read (the segment is then read as unindexed). It holds no
 /// columns frame when the segment holds one histogram under two configs,
-/// which no reader opens.
+/// which the segmented reader refuses.
 pub(crate) fn index_of(segment: &[u8]) -> Option<Vec<u8>> {
     let (names, probe) = probe_of(segment)?;
     encode(&names, SegmentColumns::of(&probe).ok().as_ref())
@@ -221,7 +223,13 @@ mod tests {
         assert_eq!(read(Some(&index)), Some(Stored::Names(names.clone(), None)));
 
         let columns = SegmentColumns {
-            counters: vec![("a".into(), [("k".to_string(), "v".to_string())].into())],
+            counters: vec![(
+                "a".into(),
+                crate::Labels::from(std::collections::BTreeMap::from([(
+                    "k".to_string(),
+                    "v".to_string(),
+                )])),
+            )],
             histogram_configs: [("h".to_string(), (4, 32))].into(),
             ..Default::default()
         };

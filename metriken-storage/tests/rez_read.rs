@@ -307,10 +307,28 @@ fn a_live_v3_converts_to_dendro() {
     assert_eq!(labels, web_01());
     assert_holds_the_ticks(&reader, 11);
 
-    // Its label listings come from the names indexes, and match those of
-    // each table's reader.
+    // A live recording lists through its tables' readers.
+    assert_listings_match(&dest, false);
+}
+
+/// A complete `.rez` converts to an archive whose label listings come from
+/// the names indexes, without a table's reader, and match the readers'.
+#[cfg(feature = "write")]
+#[test]
+fn a_converted_rez_lists_labels_from_its_names_indexes() {
+    let (dir, path) = copy("v3.rez");
+    let dest = dir.path().join("out.dendro");
+    metriken_storage::rez::to_dendro::convert_v3_to_dendro(&path, &dest).unwrap();
+    assert_listings_match(&dest, true);
+}
+
+/// Every metric's label sets as an open of `dest` lists them equal those of
+/// a second open that builds every table's reader first; `from_index` is
+/// whether the first open built no reader.
+#[cfg(feature = "write")]
+fn assert_listings_match(dest: &std::path::Path, from_index: bool) {
     let open = || {
-        let catalog = metriken_storage::DendroCatalog::open(&dest).unwrap();
+        let catalog = metriken_storage::DendroCatalog::open(dest).unwrap();
         ArchiveReader::from_catalog(Box::new(catalog), None, pool(), None)
             .unwrap()
             .remove(0)
@@ -335,7 +353,7 @@ fn a_live_v3_converts_to_dendro() {
     let indexed = open();
     let listed = listings(&indexed);
     assert!(!listed.is_empty() && listed.iter().all(|sets| !sets.is_empty()));
-    assert_eq!(indexed.opened_tables(), Vec::<String>::new());
+    assert_eq!(indexed.opened_tables().is_empty(), from_index);
     let read = open();
     let names: Vec<String> = read
         .counter_names()

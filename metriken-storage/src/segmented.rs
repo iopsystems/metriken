@@ -263,10 +263,14 @@ impl IdentityMemo {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SegmentColumns {
-    pub counters: Vec<(String, BTreeMap<String, String>)>,
-    pub gauges: Vec<(String, BTreeMap<String, String>)>,
-    pub histograms: Vec<(String, BTreeMap<String, String>)>,
-    pub gauge_histograms: Vec<(String, BTreeMap<String, String>)>,
+    #[serde(with = "columns_serde")]
+    pub counters: Vec<(String, Labels)>,
+    #[serde(with = "columns_serde")]
+    pub gauges: Vec<(String, Labels)>,
+    #[serde(with = "columns_serde")]
+    pub histograms: Vec<(String, Labels)>,
+    #[serde(with = "columns_serde")]
+    pub gauge_histograms: Vec<(String, Labels)>,
     /// Each histogram's `(grouping_power, max_value_power)`.
     pub histogram_configs: BTreeMap<String, (u8, u8)>,
     pub gauge_histogram_configs: BTreeMap<String, (u8, u8)>,
@@ -274,24 +278,39 @@ pub(crate) struct SegmentColumns {
 
 impl SegmentColumns {
     /// `seg`'s columns, in its schema order. An error for a segment
-    /// holding one histogram under two configs, which no reader opens.
+    /// holding one histogram under two configs, which the segmented reader
+    /// refuses.
     pub(crate) fn of(seg: &MultiParquetSource) -> Result<Self, Box<dyn Error>> {
         check_histogram_configs(seg, HistKind::Counting)?;
         check_histogram_configs(seg, HistKind::Gauge)?;
-        let plain = |columns: Vec<(String, Labels)>| {
-            columns
-                .into_iter()
-                .map(|(name, labels)| (name, labels.inner))
-                .collect()
-        };
         Ok(Self {
-            counters: plain(seg.counter_columns()),
-            gauges: plain(seg.gauge_columns()),
-            histograms: plain(seg.histogram_columns_of(HistKind::Counting)),
-            gauge_histograms: plain(seg.histogram_columns_of(HistKind::Gauge)),
+            counters: seg.counter_columns(),
+            gauges: seg.gauge_columns(),
+            histograms: seg.histogram_columns_of(HistKind::Counting),
+            gauge_histograms: seg.histogram_columns_of(HistKind::Gauge),
             histogram_configs: seg.histogram_configs_of(HistKind::Counting),
             gauge_histogram_configs: seg.histogram_configs_of(HistKind::Gauge),
         })
+    }
+}
+
+/// `(metric, labels)` columns, each `Labels` stored as its map.
+mod columns_serde {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::labels::Labels;
+
+    pub fn serialize<S: Serializer>(columns: &[(String, Labels)], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(columns.iter().map(|(name, labels)| (name, &labels.inner)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(String, Labels)>, D::Error> {
+        Ok(Vec::<(String, BTreeMap<String, String>)>::deserialize(d)?
+            .into_iter()
+            .map(|(name, labels)| (name, Labels::from(labels)))
+            .collect())
     }
 }
 
@@ -348,10 +367,9 @@ impl Listing {
             (Kind::Gauge, &mut self.gauge_identity, &columns.gauges),
         ] {
             for (name, labels) in columns {
-                let labels = Labels::from(labels.clone());
-                let sets = memo.presents(relabel, name, &labels, unresolved);
-                if memo.register(kind, name, &labels) {
-                    identity.extend(sets.of(&labels).iter().map(|l| (name.clone(), l.clone())));
+                let sets = memo.presents(relabel, name, labels, unresolved);
+                if memo.register(kind, name, labels) {
+                    identity.extend(sets.of(labels).iter().map(|l| (name.clone(), l.clone())));
                 }
             }
         }
@@ -374,9 +392,8 @@ impl Listing {
             let histogram_columns: Vec<(String, Labels)> = columns
                 .iter()
                 .flat_map(|(name, labels)| {
-                    let labels = Labels::from(labels.clone());
-                    let sets = memo.presents(relabel, name, &labels, unresolved);
-                    sets.of(&labels)
+                    let sets = memo.presents(relabel, name, labels, unresolved);
+                    sets.of(labels)
                         .iter()
                         .map(|l| (name.clone(), l.clone()))
                         .collect::<Vec<_>>()
@@ -669,7 +686,7 @@ fn check_histogram_configs(
                 .collect::<Vec<_>>()
                 .join(" and ");
             return Err(format!(
-                "a segment has multiple histogram columns for metric '{name}' under \
+                "metric '{name}' has multiple histogram columns under \
                  different configs ({detail}); ParquetSource::histogram_stream decodes \
                  every column for a metric name under ONE shared config, so these buckets \
                  cannot be separated within a single segment"

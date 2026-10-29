@@ -136,7 +136,9 @@ fn probe_one(
     for bytes in probes {
         let probe = MultiParquetSource::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
             .map_err(|e| format!("probing table {sampler}: {e}"))?;
-        probed_columns.push(crate::segmented::SegmentColumns::of(&probe).ok());
+        if known.listed.is_some() {
+            probed_columns.push(crate::segmented::SegmentColumns::of(&probe).ok());
+        }
         names.counters.extend(probe.counter_names());
         names.gauges.extend(probe.gauge_names());
         names.histograms.extend(probe.histogram_names());
@@ -199,8 +201,9 @@ struct KnownNames {
     /// its index gives them.
     first: Option<(f64, Option<f64>)>,
     /// Where a listing finds each segment's columns, in segment order, the
-    /// live tail last; a segment holding the same columns as an earlier
-    /// one is left out. `None` when a segment's columns are not known.
+    /// live tail last; a segment whose names index has the same bytes as an
+    /// earlier one's is left out. `None` when a segment's columns are not
+    /// known.
     listed: Option<Vec<Listed>>,
 }
 
@@ -277,6 +280,7 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 /// segment is neither (its index has no columns frame, or it was not
 /// fetched), or the table is long and has a live tail, whose materialized
 /// rows do not name every occupant, a listing builds the table's reader.
+/// So does a listing of a recording that was not complete at open.
 fn table_probes(
     db: &dyn Catalog,
     recording_id: i64,
@@ -922,11 +926,12 @@ pub struct SamplerReader {
     /// Built on first access, never at open.
     reader: std::sync::OnceLock<Option<TableReader>>,
     /// Where a listing finds each segment's columns (see `table_probes`),
-    /// or `None` when a segment's are not known and a listing builds
-    /// `reader`.
+    /// or `None` when a listing builds `reader`: a segment's columns are
+    /// not known, or the recording was not complete at open.
     listed: Option<Vec<Listed>>,
-    /// The listing `listed` gives, built on the first listing; `None` when a
-    /// columns frame does not decode or the relabel cannot be read.
+    /// The listing `listed` gives, built on the first listing; `None` when
+    /// `listed` is, a columns frame does not decode, or the relabel cannot
+    /// be read.
     listing: std::sync::OnceLock<Option<crate::segmented::Listing>>,
     /// The state saved by the same table in a reader this one replaced (see
     /// [`ArchiveReader::reuse_from`]), taken when this table's reader is
@@ -1086,11 +1091,12 @@ impl SamplerReader {
     }
 
     /// The label sets of `name`, a metric of `kind`, as the table's
-    /// reader lists them. A table whose segments' columns are all known
-    /// at open (see `table_probes`) lists from them without building its
-    /// reader, so without fetching a segment; it lists a segment evicted
-    /// since the open, which a reader built now would not. `None` when the
-    /// table cannot be read.
+    /// reader lists them. A table of a recording complete at open, whose
+    /// segments' columns are all known (see `table_probes`), lists from them
+    /// without building its reader, so without fetching its sealed segments
+    /// (a long table reads its occupant stream). It is then listed even when
+    /// its reader would fail to build, as a damaged segment makes it do.
+    /// `None` when the table cannot be read.
     pub(crate) fn labels(
         &self,
         kind: MetricKind,
@@ -1124,7 +1130,8 @@ impl SamplerReader {
         self.listing
             .get_or_init(|| {
                 let listed = self.listed.as_ref()?;
-                let relabel = match self.relabel(None) {
+                let previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());
+                let relabel = match self.relabel(previous.as_ref()) {
                     Some(Ok(relabel)) => Some(relabel),
                     Some(Err(())) => return None,
                     None => None,
@@ -2047,6 +2054,10 @@ impl ArchiveReader {
             let mut tables = Vec::new();
             for probe in probed {
                 let (sampler, names, probed_interval, declared, span, listed) = probe?;
+                // A recording still being written lists through its tables'
+                // readers, which read the catalog as it is when they are
+                // built, as its queries do.
+                let listed = listed.filter(|_| rec.complete);
                 // A declared interval wins over the measured one, as it
                 // does when the same segments are read from bytes
                 // (`from_in_memory`): a recording with dropped or jittered
@@ -2328,8 +2339,9 @@ impl ArchiveReader {
 
     /// The label sets of counter `name`, from every table holding it, each
     /// with its recording's labels ([`series_labels`](Self::series_labels)).
-    /// A table whose segments' names indexes hold their columns lists
-    /// without fetching a segment.
+    /// A table of a recording complete at open, whose segments' names
+    /// indexes hold their columns, lists without fetching its sealed
+    /// segments.
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.labeled_listing(
             |t| t.names.counters.contains(name),

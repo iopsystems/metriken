@@ -321,13 +321,21 @@ fn compare(finalize: bool, evict: Option<u64>) {
     record(&wide, false, finalize, evict);
     assert!(streams(&long).contains(&"threads/tasks/occupants".to_string()));
     assert!(!streams(&wide).iter().any(|s| s.ends_with("/occupants")));
-    // Listed from the names indexes, without a table's reader, but for a
-    // long table with a live tail.
+    // Listed from the names indexes without a table's reader when the
+    // recording is complete; a live one lists through every table's reader.
     for path in [&long, &wide] {
-        let (_, built) = listings_and_readers_built(&open(path), path);
-        let expected: Vec<String> = match (finalize, path == &long) {
-            (false, true) => vec!["threads/tasks".to_string()],
-            _ => Vec::new(),
+        let (_, mut built) = listings_and_readers_built(&open(path), path);
+        built.sort();
+        let expected: Vec<String> = match finalize {
+            true => Vec::new(),
+            false => {
+                let mut tables: Vec<String> = streams(path)
+                    .into_iter()
+                    .filter(|s| !s.ends_with("/occupants"))
+                    .collect();
+                tables.sort();
+                tables
+            }
         };
         assert_eq!(built, expected, "{}", path.display());
     }
@@ -905,9 +913,9 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         names.sort();
         assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
 
-        // Every metric is listed from the names indexes' columns, but those
-        // of a long table with a live tail, whose reader is built; no other
-        // table segment is fetched.
+        // A complete recording lists every metric from the names indexes'
+        // columns, building no reader and fetching no table segment; a live
+        // one lists through each table's reader.
         let (listed, built) = listings_and_readers_built(&counted, &path);
         assert!(listed.iter().any(|(_, n, _)| n == "ctx_switches"));
         assert!(listed.iter().any(|(_, n, _)| n == "dirty"));
@@ -915,7 +923,7 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
             assert_eq!(built, Vec::<String>::new());
             assert_eq!(fetched.get().0, 0, "finalize={finalize}");
         } else {
-            assert_eq!(built, vec!["threads/tasks".to_string()]);
+            assert_eq!(built.len(), 2, "{built:?}");
         }
         // An index with no columns frame, as one written before them: each
         // table's reader is built for the listing, which is the same.

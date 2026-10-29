@@ -3017,15 +3017,19 @@ written by the new dendro.
      name and labels, and each histogram's config: `SegmentColumns` in
      metriken-storage `segmented.rs`), and `ArchiveReader`'s label listings
      fold them as a table's reader would (`Listing`), relabelled through
-     the occupant stream for a long table, without building the reader. A
-     long table with a live tail, or a segment with no columns frame,
-     builds the reader as before. Measured on copies of the 9.6-hour bench
-     archive whose 5874 segments were re-indexed (release build, warm page
-     cache, three runs each): with names-only indexes, listing every
-     metric's label sets took 5441 to 5592 ms and built 49 table readers;
-     with columns frames, 452 to 474 ms and none; the open took 142 to 172
-     ms and 135 to 159 ms; both listed the same 9385 label sets, and the
-     listings were equal. The columns frames are 4.99 MB of the 1.28 GB
+     the occupant stream for a long table, without building the reader,
+     for a recording complete at open. A recording still being written, a
+     long table with a live tail, or a segment with no columns frame
+     builds the reader as before: a reader built after the open reads
+     segments sealed since, which a listing from the open's indexes would
+     not. Measured on copies of the 9.6-hour bench archive (complete) whose
+     5874 segments were re-indexed (release build, warm page cache, three
+     runs each): with names-only indexes, listing every metric's label sets
+     took 5051 to 5084 ms and built 49 table readers; with columns frames,
+     328 to 347 ms and none; the open took 138 to 145 ms and 125 to 189
+     ms; both listed the same 9385 label sets, and the listings were equal
+     to those of readers built for every table. The columns frames are
+     4.99 MB of the 1.28 GB
      archive. Capped value sets (the prototype's 64 values per key) were
      measured at 1.92 MB but leave the task tables' keys (about 2850
      values a key) over the cap, so the listings that cost the most would

@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 /// from them (`ingest_does_not_turn_histogram_configuration_into_labels`,
 /// `parquet_does_not_turn_histogram_configuration_into_labels`), so a
 /// pre-filter added to one loader cannot make them disagree unnoticed.
+/// A key added here is still a label in an archive's stored names indexes
+/// (their columns frames), so it needs a new index version as well.
 ///
 /// A slice rather than an array so that adding a key is not a change to a
 /// public type.
