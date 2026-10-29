@@ -778,6 +778,34 @@ impl MetricsSource for ArchiveReader {
     fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         ArchiveReader::gauge_histogram_labels(self, name)
     }
+    fn counter_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        ArchiveReader::counter_labels_matching(self, name, filter)
+    }
+    fn gauge_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        ArchiveReader::gauge_labels_matching(self, name, filter)
+    }
+    fn histogram_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        ArchiveReader::histogram_labels_matching(self, name, filter)
+    }
+    fn gauge_histogram_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        ArchiveReader::gauge_histogram_labels_matching(self, name, filter)
+    }
     fn time_range(&self) -> Option<(f64, f64)> {
         ArchiveReader::time_range_ns(self).map(|(b, e)| (b as f64 / 1e9, e as f64 / 1e9))
     }
@@ -930,7 +958,17 @@ mod tests {
     /// A table of counter `name`: one column per series, each with its
     /// labels, sharing a `timestamp` column of `rows` rows one second apart.
     fn counter_table(name: &str, series: &[(&[(&str, &str)], u64)], rows: u64) -> Vec<u8> {
-        use arrow::array::{ArrayRef, UInt64Array};
+        typed_table(name, "counter", series, rows)
+    }
+
+    /// [`counter_table`] with columns of `metric_type`.
+    fn typed_table(
+        name: &str,
+        metric_type: &str,
+        series: &[(&[(&str, &str)], u64)],
+        rows: u64,
+    ) -> Vec<u8> {
+        use arrow::array::{ArrayRef, Int64Array, UInt64Array};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use parquet::arrow::ArrowWriter;
@@ -943,16 +981,24 @@ mod tests {
         for (i, (labels, per_second)) in series.iter().enumerate() {
             let mut meta = HashMap::new();
             meta.insert("metric".to_string(), name.to_string());
-            meta.insert("metric_type".to_string(), "counter".to_string());
+            meta.insert("metric_type".to_string(), metric_type.to_string());
             for (k, v) in *labels {
                 meta.insert(k.to_string(), v.to_string());
             }
-            fields.push(
-                Field::new(format!("{name}__{i}"), DataType::UInt64, true).with_metadata(meta),
-            );
-            columns.push(Arc::new(UInt64Array::from(
-                (1..=rows).map(|r| r * per_second).collect::<Vec<_>>(),
-            )));
+            // A gauge column is signed.
+            let gauge = metric_type == "gauge";
+            let data_type = match gauge {
+                true => DataType::Int64,
+                false => DataType::UInt64,
+            };
+            fields.push(Field::new(format!("{name}__{i}"), data_type, true).with_metadata(meta));
+            let values = (1..=rows).map(|r| r * per_second);
+            columns.push(match gauge {
+                true => Arc::new(Int64Array::from(
+                    values.map(|v| v as i64).collect::<Vec<_>>(),
+                )),
+                false => Arc::new(UInt64Array::from(values.collect::<Vec<_>>())),
+            });
         }
         let schema = Arc::new(Schema::new(fields));
         let mut buf = Vec::new();
@@ -1016,6 +1062,133 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// A filtered listing lists the series a query's selector with the same
+    /// matchers selects, and reads only the recordings whose labels can
+    /// match it.
+    #[test]
+    fn a_filtered_listing_lists_what_a_selector_selects() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![(
+                    "t",
+                    counter_table("x", &[(&[("cpu", "0")], 1), (&[("cpu", "1")], 2)], 5),
+                )],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![(
+                    "t",
+                    counter_table(
+                        "x",
+                        &[
+                            (&[("cpu", "1")], 3),
+                            (&[("cpu", "2"), ("source", "inner")], 4),
+                        ],
+                        5,
+                    ),
+                )],
+            ),
+        ]);
+        for selector in [
+            r#"{source="a"}"#,
+            r#"{source!="a"}"#,
+            r#"{cpu="1"}"#,
+            r#"{cpu=~"1|2"}"#,
+            r#"{exported_source="inner"}"#,
+            r#"{source="c"}"#,
+        ] {
+            let filter = crate::selector_filter(selector).unwrap();
+            let mut listed = MetricsSource::counter_labels_matching(&reader, "x", &filter);
+            listed.sort();
+            let selected: Vec<_> = series(&reader, &format!("rate(x{selector}[2s])"))
+                .into_iter()
+                .map(|(labels, _)| labels)
+                .collect();
+            assert_eq!(listed, selected, "{selector}");
+        }
+        let values = MetricsSource::label_values_matching(
+            &reader,
+            "x",
+            "cpu",
+            &crate::selector_filter(r#"{source="b"}"#).unwrap(),
+        );
+        assert_eq!(
+            values,
+            ["1", "2"]
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<_>>()
+        );
+
+        // A filter on a recording label reads only that recording's table.
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("t", counter_table("x", &[(&[("cpu", "0")], 1)], 5))],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("t", counter_table("x", &[(&[("cpu", "0")], 1)], 5))],
+            ),
+        ]);
+        let listed = MetricsSource::counter_labels_matching(
+            &reader,
+            "x",
+            &crate::selector_filter(r#"{source="b"}"#).unwrap(),
+        );
+        assert_eq!(listed, vec![labels(&[("cpu", "0"), ("source", "b")])]);
+        assert_eq!(reader.opened_tables().len(), 1);
+        let _ = reader.counter_labels("x");
+        assert_eq!(reader.opened_tables().len(), 2);
+
+        // A gauge lists by its own kind, and only matching recordings.
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![
+                    ("t", counter_table("x", &[(&[("cpu", "0")], 1)], 5)),
+                    ("u", typed_table("g", "gauge", &[(&[("cpu", "1")], 1)], 5)),
+                ],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("u", typed_table("g", "gauge", &[(&[("cpu", "2")], 1)], 5))],
+            ),
+        ]);
+        let filter = crate::selector_filter(r#"{source="a"}"#).unwrap();
+        assert_eq!(
+            MetricsSource::gauge_labels_matching(&reader, "g", &filter),
+            vec![labels(&[("cpu", "1"), ("source", "a")])]
+        );
+        assert_eq!(reader.opened_tables(), vec!["u".to_string()]);
+        assert!(MetricsSource::gauge_labels_matching(&reader, "x", &filter).is_empty());
+    }
+
+    /// `selector_filter` takes one vector selector's matchers, without its
+    /// metric name.
+    #[test]
+    fn selector_filter_takes_one_selectors_matchers() {
+        let filter = crate::selector_filter(r#"x{a="1", b=~"2|3", c!="4"}"#).unwrap();
+        assert_eq!(
+            filter.inner,
+            labels(&[("a", "1"), ("b", "~2|3"), ("c", "!4")])
+        );
+        assert!(crate::selector_filter(r#"rate(x[1m])"#).is_err());
+        assert!(crate::selector_filter(r#"{a="1", a="2"}"#).is_err());
+        assert_eq!(
+            crate::selector_filter(r#"{a!="1"}"#).unwrap().inner,
+            labels(&[("a", "!1")])
+        );
+        assert_eq!(crate::selector_filter("{}").unwrap().inner, labels(&[]));
+        assert_eq!(
+            crate::selector_filter(r#"{__name__="x", a="1"}"#)
+                .unwrap()
+                .inner,
+            labels(&[("a", "1")])
+        );
     }
 
     #[test]

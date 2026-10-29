@@ -603,6 +603,32 @@ fn histogram_to_snapshot(h: &::histogram::Histogram) -> crate::types::HistogramS
 mod tests {
     use super::*;
 
+    /// A source without its own filtered listing filters its listing.
+    #[test]
+    fn a_filtered_listing_filters_the_listing() {
+        let store = MemoryStore::builder().build();
+        for cpu in ["0", "1", "2"] {
+            store
+                .insert_gauge_series("g", &[("cpu", cpu)][..], vec![1], vec![1], None)
+                .unwrap();
+        }
+        let filter = crate::selector_filter(r#"{cpu!~"0|2"}"#).unwrap();
+        let listed = store.gauge_labels_matching("g", &filter);
+        assert_eq!(
+            listed,
+            vec![std::collections::BTreeMap::from([(
+                "cpu".to_string(),
+                "1".to_string()
+            )])]
+        );
+        let values = store.label_values_matching(
+            "g",
+            "cpu",
+            &crate::selector_filter(r#"{cpu=~"1|2"}"#).unwrap(),
+        );
+        assert_eq!(values.len(), 2);
+    }
+
     #[test]
     fn test_memory_store_builder_sets_metadata() {
         let store = MemoryStore::builder()

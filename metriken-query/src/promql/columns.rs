@@ -96,6 +96,47 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
     }
 }
 
+/// The matchers of `selector`, one vector selector (`{source="a"}` or
+/// `metric{arch=~"x|y"}`), as the filter
+/// [`MetricsSource::counter_labels_matching`](crate::MetricsSource::counter_labels_matching)
+/// and its siblings take; a metric name in it is not part of the filter.
+/// A selector with no metric name is accepted even when every matcher
+/// matches the empty string (`{source!="a"}`, `{}`), which PromQL refuses;
+/// a `__name__` matcher among them (`{__name__!="x"}`) is still refused.
+/// An `offset` or `@` modifier is accepted and has no effect. An error for
+/// anything but one vector selector, and for a selector that matches one
+/// label more than once, since the filter holds one matcher per label.
+pub fn selector_filter(selector: &str) -> Result<Labels, QueryError> {
+    // A nameless selector PromQL refuses is parsed again with a name, which
+    // is not part of the filter.
+    let (named, expr) = match parser::parse(selector) {
+        Ok(expr) => (selector.to_string(), expr),
+        Err(e) if !selector.trim_start().starts_with('{') => {
+            return Err(QueryError::ParseError(format!(
+                "Failed to parse selector: {e:?}"
+            )));
+        }
+        Err(e) => {
+            let named = format!("selector{selector}");
+            let expr = parser::parse(&named)
+                .map_err(|_| QueryError::ParseError(format!("Failed to parse selector: {e:?}")))?;
+            (named, expr)
+        }
+    };
+    let Expr::VectorSelector(sel) = &expr else {
+        return Err(QueryError::ParseError(format!(
+            "{selector} is not a vector selector"
+        )));
+    };
+    if let Some(label) = repeated_matcher(&named)? {
+        return Err(QueryError::ParseError(format!(
+            "selector {selector} matches label {label} more than once, and a filter holds \
+             one matcher per label"
+        )));
+    }
+    Ok(extract_filter_labels(&sel.matchers.matchers))
+}
+
 /// A label a selector of `query` matches more than once
 /// (`{source!="a", source!="b"}`): the filter holds one matcher per label,
 /// so all but one would be dropped silently.

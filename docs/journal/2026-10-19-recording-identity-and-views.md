@@ -3037,7 +3037,15 @@ written by the new dendro.
      still build the reader. With each metric's label sets in the names
      frame, reading every index's names on that archive took 95 ms,
      against 7 ms for names alone, so the columns are a separate frame.
-     The scope-aware listings are not built.
+     The scope-aware listings are built: metriken-storage
+     `ArchiveReader::*_labels_matching(name, filter)` lists the series a
+     selector with the filter's matchers selects and does not read a
+     recording whose labels the filter cannot match (`translate_filter`, as
+     query routing does); metriken-query's `MetricsSource` gains the same
+     methods and `label_values_matching`, whose defaults filter the full
+     listing, and `selector_filter` to build the filter from a selector.
+     Not measured: the time of a scoped listing on a many-recording
+     archive. rezolus does not call them yet (step 3).
 3. rezolus, in this order:
    1. ~~Open and merge the combined view.~~ Done: #1504.
    2. The restriction as the engine scope (D1) in both viewers' query APIs
