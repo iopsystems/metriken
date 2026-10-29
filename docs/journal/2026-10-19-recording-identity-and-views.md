@@ -1567,8 +1567,8 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   row times, the decisions and one snapshot per member and series, and acts
   on a row only where its time is the one the first pass read, so a
   member whose second read differs (a sealed segment evicted between
-  them) loses the pairs it moves, with a warning, rather than adding a
-  change twice. Measured
+  them) loses its pairs of a series from the first row that differs, with
+  a warning, rather than adding a change twice. Measured
   (release, one histogram of 1000 values a row at 1 s over 1 h; a group of
   two 40 min sources overlapping 20 min, against one 1 h source; one run
   each, warm): peak RSS 79.8 MB streaming, 126.9 MB holding every row,

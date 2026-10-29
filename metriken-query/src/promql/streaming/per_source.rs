@@ -768,7 +768,9 @@ impl MemberRows {
 /// only where its time, and for the end of a pair the time of the member's
 /// previous row, are those the first pass decided on: a second read that
 /// differs from the first (a sealed segment evicted between them) drops
-/// the pairs it moves, with a warning, rather than adding a change twice.
+/// that member's pairs of the series from the first differing row on,
+/// since rows are matched by position, with a warning, rather than adding
+/// a change twice.
 struct Combined {
     streams: Vec<MemberRows>,
     emits: Vec<Vec<Vec<(usize, u64, Emit)>>>,
@@ -1976,17 +1978,18 @@ mod tests {
         assert!(compared > 700, "{compared} non-empty comparisons");
     }
 
-    /// A source whose second histogram read leaves out its rows before
-    /// `cut`, as a sealed segment evicted between the combine's two reads.
-    struct LosesRows {
-        inner: Arc<dyn DataSource>,
-        cut: u64,
+    /// A source whose second histogram read is another source's: rows the
+    /// first read had are gone or new ones appear, as when a sealed segment
+    /// is evicted between the combine's two reads.
+    struct TwoReads {
+        first: Arc<dyn DataSource>,
+        second: Arc<dyn DataSource>,
         reads: std::sync::atomic::AtomicUsize,
     }
 
-    impl DataSource for LosesRows {
+    impl DataSource for TwoReads {
         fn counters(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<Counters> {
-            self.inner.counters(n, f, a, b)
+            self.first.counters(n, f, a, b)
         }
         fn counter_streams<'s>(
             &'s self,
@@ -1995,69 +1998,60 @@ mod tests {
             a: u64,
             b: u64,
         ) -> Option<Vec<CounterStream<'s>>> {
-            self.inner.counter_streams(n, f, a, b)
+            self.first.counter_streams(n, f, a, b)
         }
         fn gauges(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<Gauges> {
-            self.inner.gauges(n, f, a, b)
+            self.first.gauges(n, f, a, b)
         }
         fn histogram_stream(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<HistogramStream> {
-            let first = self
+            match self
                 .reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                == 0;
-            let stream = self.inner.histogram_stream(n, f, a, b)?;
-            if first {
-                return Some(stream);
+            {
+                0 => self.first.histogram_stream(n, f, a, b),
+                _ => self.second.histogram_stream(n, f, a, b),
             }
-            let cut = self.cut;
-            Some(HistogramStream {
-                meta: stream.meta,
-                rows: Box::new(stream.rows.filter(move |r| r.timestamp >= cut)),
-            })
         }
         fn interval(&self) -> f64 {
-            self.inner.interval()
+            self.first.interval()
         }
         fn time_range(&self) -> Option<(u64, u64)> {
-            self.inner.time_range()
+            self.first.time_range()
         }
         fn counter_names(&self) -> Vec<String> {
-            self.inner.counter_names()
+            self.first.counter_names()
         }
         fn gauge_names(&self) -> Vec<String> {
-            self.inner.gauge_names()
+            self.first.gauge_names()
         }
         fn histogram_names(&self) -> Vec<String> {
-            self.inner.histogram_names()
+            self.first.histogram_names()
         }
         fn counter_labels(&self, n: &str) -> Vec<BTreeMap<String, String>> {
-            self.inner.counter_labels(n)
+            self.first.counter_labels(n)
         }
         fn gauge_labels(&self, n: &str) -> Vec<BTreeMap<String, String>> {
-            self.inner.gauge_labels(n)
+            self.first.gauge_labels(n)
         }
         fn histogram_labels(&self, n: &str) -> Vec<BTreeMap<String, String>> {
-            self.inner.histogram_labels(n)
+            self.first.histogram_labels(n)
         }
         fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
-            self.inner.column_map()
+            self.first.column_map()
         }
     }
 
-    /// A member whose second read differs from its first adds no change
-    /// twice: the rows stay in `(time, series)` order with none repeated or
-    /// past the read's end, and every row's counts are at most the
-    /// observations up to its time.
-    #[test]
-    fn a_member_whose_second_read_differs_adds_no_change_twice() {
-        let fine = histogram_source(1, &[(&[("cpu", "0")], (20..=80).map(|s| s * S).collect())]);
-        let coarse = histogram_source(
-            2,
-            &[(&[("cpu", "0")], (0..=50).map(|s| 2 * s * S).collect())],
-        );
-        let coarse: Arc<dyn DataSource> = Arc::new(LosesRows {
-            inner: coarse,
-            cut: 10 * S,
+    /// The combine of a 1 s member over 20 to 80 s and a 2 s member over 0
+    /// to 100 s whose second read has `second` for rows (seconds): its rows
+    /// stay in strict time order, none past the read's end, and no row's
+    /// bucket-1 count grows by more than the seconds since the row before
+    /// it (bucket 1 grows one a second, so a change added twice would).
+    fn assert_no_change_twice(second: &[u64]) {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        let fine = histogram_source(1, &[(cpu0, (20..=80).map(|s| s * S).collect())]);
+        let coarse: Arc<dyn DataSource> = Arc::new(TwoReads {
+            first: histogram_source(2, &[(cpu0, (0..=50).map(|s| 2 * s * S).collect())]),
+            second: histogram_source(2, &[(cpu0, second.iter().map(|s| s * S).collect())]),
             reads: std::sync::atomic::AtomicUsize::new(0),
         });
         let members: Vec<Member> = [fine, coarse]
@@ -2072,29 +2066,53 @@ mod tests {
                 position: m,
             })
             .collect();
-        let (start, end) = (0, 90 * S);
+        let end = 90 * S;
         let rows = collect(combine_histograms(
             &members,
             "h",
             &Labels::default(),
-            start,
+            0,
             end,
         ))
         .expect("combined")
         .expect("rows");
         assert!(!rows.is_empty());
-        assert!(rows.windows(2).all(|w| w[0].1 < w[1].1), "{rows:?}");
-        assert!(rows.iter().all(|r| r.1 <= end), "{rows:?}");
-        // Bucket 1 grows one a second, so between two rows its count grows
-        // by at most the seconds between them: a change added twice would
-        // grow it by more.
+        assert!(
+            rows.windows(2).all(|w| w[0].1 < w[1].1),
+            "{second:?}: {rows:?}"
+        );
+        assert!(rows.iter().all(|r| r.1 <= end), "{second:?}: {rows:?}");
         let bucket1 =
             |r: &(Labels, u64, Vec<u32>, Vec<u64>, bool)| r.3.first().copied().unwrap_or(0);
         assert!(
             rows.windows(2)
                 .all(|w| (bucket1(&w[1]) - bucket1(&w[0])) * S <= w[1].1 - w[0].1),
-            "{rows:?}"
+            "{second:?}: {rows:?}"
         );
+    }
+
+    /// A member whose second read differs from its first adds no change
+    /// twice: it loses its rows before 10 s (both checks catch it); only its
+    /// 20 s row, ending a pair it was chosen for, so the row after 18 s is
+    /// 22 s (the row-time check); or its 80 s row while gaining one at 3 s,
+    /// so its rows line up again at 82 s with 78 s before it (the
+    /// previous-row check).
+    #[test]
+    fn a_member_whose_second_read_differs_adds_no_change_twice() {
+        let coarse: Vec<u64> = (0..=50).map(|s| 2 * s).collect();
+        let without = |drop: &[u64]| -> Vec<u64> {
+            coarse
+                .iter()
+                .copied()
+                .filter(|t| !drop.contains(t))
+                .collect()
+        };
+        assert_no_change_twice(&without(&[0, 2, 4, 6, 8]));
+        assert_no_change_twice(&without(&[20]));
+        let mut realigned = without(&[80]);
+        realigned.push(3);
+        realigned.sort_unstable();
+        assert_no_change_twice(&realigned);
     }
 
     /// S3: a 5 s gap among 1 s rows is a hole (5 s against a 2 s threshold);
