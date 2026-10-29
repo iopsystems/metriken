@@ -554,7 +554,7 @@ pub(crate) fn display_from_result(
         // band, which is exactly what a hole causes; display mode would then
         // show no uncertainty at all for a series that has it almost
         // everywhere.
-        QueryResult::Matrix { result } => DisplayResult::Series {
+        QueryResult::Matrix { result, .. } => DisplayResult::Series {
             result: result
                 .into_iter()
                 .map(|s| {
@@ -576,9 +576,9 @@ pub(crate) fn display_from_result(
                 .collect(),
             budget: opts.budget as u32,
         },
-        QueryResult::HistogramHeatmap { result } => DisplayResult::HistogramHeatmap { result },
-        QueryResult::Scalar { result } => DisplayResult::Scalar { result },
-        QueryResult::Vector { result } => DisplayResult::Vector { result },
+        QueryResult::HistogramHeatmap { result, .. } => DisplayResult::HistogramHeatmap { result },
+        QueryResult::Scalar { result, .. } => DisplayResult::Scalar { result },
+        QueryResult::Vector { result, .. } => DisplayResult::Vector { result },
     }
 }
 

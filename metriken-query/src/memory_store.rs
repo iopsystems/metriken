@@ -1010,7 +1010,7 @@ mod series_tests {
 
     fn matrix(r: Result<QueryResult, crate::QueryError>) -> Vec<crate::MatrixSample> {
         match r.expect("query resolves") {
-            QueryResult::Matrix { result } => result,
+            QueryResult::Matrix { result, .. } => result,
             other => panic!("expected a matrix, got {other:?}"),
         }
     }

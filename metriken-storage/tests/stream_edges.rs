@@ -42,7 +42,7 @@ fn open(path: &Path) -> ArchiveReader {
 /// Each series' labels (without `__occupant__`) and its number of points.
 fn series(reader: &ArchiveReader, query: &str) -> Vec<(BTreeMap<String, String>, usize)> {
     let (lo, hi) = reader.time_range().unwrap();
-    let QueryResult::Matrix { result } = reader.query_range(query, lo, hi, 1.0).unwrap() else {
+    let QueryResult::Matrix { result, .. } = reader.query_range(query, lo, hi, 1.0).unwrap() else {
         panic!("{query}: not a matrix")
     };
     let mut out: Vec<_> = result

@@ -63,7 +63,7 @@ fn store() -> MemoryStore {
 
 fn matrix(store: &MemoryStore, q: &str, start: f64, end: f64, step: f64) -> Vec<Vec<(f64, f64)>> {
     match store.query_range(q, start, end, step).unwrap() {
-        QueryResult::Matrix { result } => result.into_iter().map(|m| m.values).collect(),
+        QueryResult::Matrix { result, .. } => result.into_iter().map(|m| m.values).collect(),
         other => panic!("{q}: {other:?}"),
     }
 }
@@ -143,7 +143,7 @@ fn quantiles_sum_mean_and_heatmap_read_the_state() {
     // (edge 7).
     let q = matrix(&store, "histogram_quantile(0.5, free)", 1000.0, 1000.0, 1.0);
     assert_eq!(q, [[(1000.0, 1.0)]]);
-    let QueryResult::Matrix { result } = store
+    let QueryResult::Matrix { result, .. } = store
         .query_range("histogram_quantiles([0.5, 1.0], free)", 1000.0, 1000.0, 1.0)
         .unwrap()
     else {
@@ -161,7 +161,7 @@ fn quantiles_sum_mean_and_heatmap_read_the_state() {
     let mean = matrix(&store, "histogram_mean(free)", 1000.0, 1000.0, 1.0);
     assert_eq!(mean, [[(1000.0, 315.0 / 180.0)]]);
 
-    let QueryResult::HistogramHeatmap { result } = store
+    let QueryResult::HistogramHeatmap { result, .. } = store
         .query_range("histogram_heatmap(free)", 1000.0, 1001.0, 1.0)
         .unwrap()
     else {
@@ -178,7 +178,7 @@ fn quantiles_sum_mean_and_heatmap_read_the_state() {
 #[test]
 fn an_instant_query_reads_the_state_at_the_instant() {
     let store = store();
-    let QueryResult::Vector { result } = store
+    let QueryResult::Vector { result, .. } = store
         .query("histogram_count(free{dev=\"sdb\"})", Some(1004.5))
         .unwrap()
     else {
@@ -298,12 +298,12 @@ fn an_empty_read_is_empty_not_missing() {
             1000.0
         };
         match store.query_range(q, start, start + 10.0, 1.0) {
-            Ok(QueryResult::Matrix { result }) => assert!(result.is_empty(), "{q}: {result:?}"),
+            Ok(QueryResult::Matrix { result, .. }) => assert!(result.is_empty(), "{q}: {result:?}"),
             other => panic!("{q}: {other:?}"),
         }
     }
     match store.query("histogram_quantile(0.5, free)", Some(2000.0)) {
-        Ok(QueryResult::Vector { result }) => assert!(result.is_empty(), "{result:?}"),
+        Ok(QueryResult::Vector { result, .. }) => assert!(result.is_empty(), "{result:?}"),
         other => panic!("{other:?}"),
     }
 }

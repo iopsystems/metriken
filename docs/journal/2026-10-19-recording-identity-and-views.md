@@ -1576,6 +1576,11 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   for the one source).
 - 2c: S4: conflict detection, the warnings channel on query results (an
   API change; `QueryResult` has none today), and Q16's value at a conflict.
+  The owner chose on 2026-10-29 a field on `QueryResult` over a sink in
+  `QueryOptions` or new query methods: every variant carries `notices`
+  (`Notice::Conflict` the first kind), absent from the JSON when empty, a
+  breaking change rezolus takes with its upgrade. The field is built;
+  detection and Q16's value are not.
   Until then the value at a conflict is whichever source S3's order
   chooses, which is the finer source's and, at equal intervals, the lowest
   uuid's rather than the earlier-starting source's.

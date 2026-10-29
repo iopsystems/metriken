@@ -448,7 +448,7 @@ fn comms(reader: &ArchiveReader) -> Vec<String> {
     let result = reader
         .query_range("rss", BASE as f64 / 1e9, (BASE + 100 * S) as f64 / 1e9, 1.0)
         .unwrap();
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("rss: not a matrix");
     };
     let mut comms: Vec<String> = result

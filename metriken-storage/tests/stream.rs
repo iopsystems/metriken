@@ -167,7 +167,8 @@ fn a_registry_streams_into_an_archive_that_reads_back() {
     // Each series over the whole recording: its labels and its values.
     let (start, end) = archive.time_range().unwrap();
     let series = |query: &str| -> Vec<(BTreeMap<String, String>, Vec<f64>)> {
-        let QueryResult::Matrix { result } = archive.query_range(query, start, end, 1.0).unwrap()
+        let QueryResult::Matrix { result, .. } =
+            archive.query_range(query, start, end, 1.0).unwrap()
         else {
             panic!("{query}: not a matrix")
         };

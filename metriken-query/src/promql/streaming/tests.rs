@@ -61,7 +61,7 @@ fn sort_by_name(mut v: Vec<MatrixSample>) -> Vec<MatrixSample> {
 
 fn into_sorted(result: QueryResult) -> Vec<MatrixSample> {
     match result {
-        QueryResult::Matrix { result } => sort_by_name(result),
+        QueryResult::Matrix { result, .. } => sort_by_name(result),
         other => panic!("expected matrix result, got {other:?}"),
     }
 }
@@ -206,7 +206,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
     let q = "sum(irate(cpu_usage[5s])) / cpu_cores";
     let r = engine.query(q, None).expect("query must succeed");
     let samples = match r {
-        QueryResult::Vector { result } => result,
+        QueryResult::Vector { result, .. } => result,
         other => panic!("expected vector result, got {other:?}"),
     };
     assert_eq!(samples.len(), 1, "expected one broadcast series");
@@ -298,10 +298,10 @@ fn cachecannon_parquet_path() -> Option<std::path::PathBuf> {
 
 fn count_points(result: &QueryResult) -> usize {
     match result {
-        QueryResult::Matrix { result } => result.iter().map(|s| s.values.len()).sum(),
-        QueryResult::Vector { result } => result.len(),
+        QueryResult::Matrix { result, .. } => result.iter().map(|s| s.values.len()).sum(),
+        QueryResult::Vector { result, .. } => result.len(),
         QueryResult::Scalar { .. } => 1,
-        QueryResult::HistogramHeatmap { result } => result.data.len(),
+        QueryResult::HistogramHeatmap { result, .. } => result.data.len(),
     }
 }
 
@@ -389,7 +389,7 @@ fn gauge_rows(
 
 fn raw_points(engine: &QueryEngine, query: &str, start: f64, end: f64) -> Vec<Vec<(f64, f64)>> {
     let opts = crate::QueryOptions::with_rate_mode(crate::RateMode::Raw);
-    let QueryResult::Matrix { result } = engine
+    let QueryResult::Matrix { result, .. } = engine
         .query_range_opts(query, start, end, 1.0, &opts)
         .unwrap()
     else {

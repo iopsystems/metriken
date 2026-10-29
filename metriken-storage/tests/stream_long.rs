@@ -244,7 +244,7 @@ type Answer = Vec<(Vec<(String, String)>, Vec<(i64, String)>)>;
 /// paths assign independently.
 fn answer(reader: &ArchiveReader, query: &str) -> Answer {
     let (start, end) = (base() as f64 / 1e9, (base() + (TICKS - 1) * S) as f64 / 1e9);
-    let QueryResult::Matrix { result } = reader
+    let QueryResult::Matrix { result, .. } = reader
         .query_range(query, start, end, 1.0)
         .unwrap_or_else(|e| panic!("{query}: {e:?}"))
     else {

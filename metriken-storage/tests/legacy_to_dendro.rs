@@ -774,7 +774,7 @@ fn per_metric_windows_keep_their_bands() {
     let (_, converted) = open_archive(&dest).remove(0);
     let (lo, hi) = (BASE_NS as f64 / 1e9 + 2.0, BASE_NS as f64 / 1e9 + 18.0);
     let bands = |r: QueryResult| -> Vec<Vec<Option<(f64, f64)>>> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("{r:?}")
         };
         let mut result: Vec<_> = result

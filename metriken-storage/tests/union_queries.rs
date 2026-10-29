@@ -226,7 +226,7 @@ struct Series {
 }
 
 fn from_matrix(result: QueryResult) -> Vec<Series> {
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("not a matrix: {result:?}");
     };
     let mut out: Vec<Series> = result
@@ -408,7 +408,7 @@ fn a_source_and_its_copy_count_once() {
         assert_eq!(got, want, "raw {query}");
     }
     // An instant query too.
-    let QueryResult::Vector { result } = union
+    let QueryResult::Vector { result, .. } = union
         .query("sum(rate(cpu_cycles[1m]))", Some(at(10, 5, 0) as f64 / 1e9))
         .unwrap()
     else {
@@ -1279,7 +1279,7 @@ fn as_ordered(
 ) -> Result<Vec<Points>, String> {
     let opts = QueryOptions::default().with_per_series_rates(per_series);
     match reader.query_range_opts(query, start as f64 / 1e9, end as f64 / 1e9, step, &opts) {
-        Ok(QueryResult::Matrix { result }) => Ok(result
+        Ok(QueryResult::Matrix { result, .. }) => Ok(result
             .into_iter()
             .map(|m| {
                 let labels = m

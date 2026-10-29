@@ -601,7 +601,7 @@ fn query_matrix(
 ) -> Vec<Vec<(f64, f64)>> {
     let (start, end) = ((BASE + from * S) as f64 / 1e9, (BASE + to * S) as f64 / 1e9);
     match reader.query_range(q, start, end, step).unwrap() {
-        QueryResult::Matrix { result } => result.into_iter().map(|m| m.values).collect(),
+        QueryResult::Matrix { result, .. } => result.into_iter().map(|m| m.values).collect(),
         other => panic!("{q}: {other:?}"),
     }
 }
@@ -767,7 +767,7 @@ fn mixed_bucket_configs_sum_at_the_coarsest() {
         query_matrix(&reader, "histogram_count(free_extents)", 1, 1, 1.0),
         [[(t, 8.0)]]
     );
-    let QueryResult::HistogramHeatmap { result } = reader
+    let QueryResult::HistogramHeatmap { result, .. } = reader
         .query_range("histogram_heatmap(free_extents)", t, t, 1.0)
         .unwrap()
     else {

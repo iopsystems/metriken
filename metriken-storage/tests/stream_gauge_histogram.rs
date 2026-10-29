@@ -122,7 +122,7 @@ fn a_gauge_histogram_is_recorded_off_the_stream() {
         ("st_mem", [0.0, 1.0, 2.0, 3.0]),
         ("st_plain", [0.0, 10.0, 20.0, 30.0]),
     ] {
-        let QueryResult::Matrix { result } =
+        let QueryResult::Matrix { result, .. } =
             reader.query_range(q, start, start + 3.0, 1.0).unwrap()
         else {
             panic!("{q}: a matrix")
@@ -144,7 +144,7 @@ fn depth_points(path: &std::path::Path, ticks: u64) -> Vec<f64> {
     let reader = recordings.remove(0).1;
     assert!(ArchiveReader::gauge_histogram_names(&reader).is_empty());
     let start = BASE as f64 / 1e9;
-    let QueryResult::Matrix { result } = reader
+    let QueryResult::Matrix { result, .. } = reader
         .query_range("depth", start, start + (ticks - 1) as f64, 1.0)
         .unwrap()
     else {

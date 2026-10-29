@@ -175,7 +175,7 @@ fn to_ns(t: f64) -> u64 {
 }
 fn matrix(res: QueryResult) -> Series {
     match res {
-        QueryResult::Matrix { result } => result
+        QueryResult::Matrix { result, .. } => result
             .into_iter()
             .map(|m| {
                 (
@@ -187,7 +187,7 @@ fn matrix(res: QueryResult) -> Series {
                 )
             })
             .collect(),
-        QueryResult::Vector { result } => result
+        QueryResult::Vector { result, .. } => result
             .into_iter()
             .map(|m| {
                 (
@@ -852,7 +852,7 @@ fn the_last_points_read_the_rows_after_the_range() {
     let b = range(&u, "g", long, false).unwrap();
     let d = differences(&a, &b, Some((to_ns(short.0), to_ns(short.1))));
     assert!(d.is_empty(), "g to 204 s against to 260 s: {d:?}");
-    let QueryResult::Vector { result } = u.query("g", Some(short.1)).unwrap() else {
+    let QueryResult::Vector { result, .. } = u.query("g", Some(short.1)).unwrap() else {
         panic!("not a vector");
     };
     assert!(!result.is_empty());

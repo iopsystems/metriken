@@ -540,10 +540,10 @@ fn refuse_shared_label_sets<'r>(
 
 fn checked(result: QueryResult) -> Result<QueryResult, QueryError> {
     match &result {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             refuse_shared_label_sets(result.iter().map(|m| &m.metric))?
         }
-        QueryResult::Vector { result } => {
+        QueryResult::Vector { result, .. } => {
             refuse_shared_label_sets(result.iter().map(|m| &m.metric))?
         }
         _ => {}
@@ -761,7 +761,10 @@ impl MetricsSource for ArchiveReader {
     ) -> Result<QueryResult, QueryError> {
         let plan = Plan::new(self, expr, opts.scope.as_deref())?;
         let Some(engine) = engine(&plan, expr)? else {
-            return Ok(QueryResult::Matrix { result: Vec::new() });
+            return Ok(QueryResult::Matrix {
+                result: Vec::new(),
+                notices: Vec::new(),
+            });
         };
         checked(engine.query_range_opts(expr, start_s, end_s, step_s, &plan.opts(opts, step_s))?)
     }
@@ -803,7 +806,10 @@ impl MetricsSource for ArchiveReader {
                 .flatten()
         });
         let Some(engine) = engine(&plan, expr)? else {
-            return Ok(QueryResult::Vector { result: Vec::new() });
+            return Ok(QueryResult::Vector {
+                result: Vec::new(),
+                notices: Vec::new(),
+            });
         };
         checked(engine.query(expr, time)?)
     }
@@ -1108,7 +1114,7 @@ mod tests {
         let result = reader
             .query_range_opts(query, 1.0, 10.0, 1.0, &QueryOptions::default())
             .unwrap_or_else(|e| panic!("{query}: {e}"));
-        let QueryResult::Matrix { result } = result else {
+        let QueryResult::Matrix { result, .. } = result else {
             panic!("{query}: not a matrix");
         };
         let mut out: Vec<_> = result
@@ -1278,7 +1284,7 @@ mod tests {
         let run = |entries: Vec<ScopedSource>| {
             let opts =
                 QueryOptions::default().with_scope(Some(Arc::new(Scope::new(entries).unwrap())));
-            let QueryResult::Matrix { result } = reader
+            let QueryResult::Matrix { result, .. } = reader
                 .query_range_opts("rate(x[2s])", 1.0, 10.0, 1.0, &opts)
                 .unwrap()
             else {
@@ -1323,7 +1329,7 @@ mod tests {
             )])
             .unwrap(),
         )));
-        let QueryResult::Matrix { result } = reader_g
+        let QueryResult::Matrix { result, .. } = reader_g
             .query_range_opts("avg_over_time(g[3s])", 1.0, 10.0, 1.0, &opts)
             .unwrap()
         else {
@@ -1352,7 +1358,7 @@ mod tests {
         )]);
         let points = |scope: Option<Scope>| -> Vec<f64> {
             let opts = QueryOptions::default().with_scope(scope.map(Arc::new));
-            let QueryResult::Matrix { result } = gappy
+            let QueryResult::Matrix { result, .. } = gappy
                 .query_range_opts("avg_over_time(g[3s])", 1.0, 20.0, 1.0, &opts)
                 .unwrap()
             else {
@@ -1678,7 +1684,7 @@ mod tests {
         let r = reader
             .query_range_opts(query, 1.0, 40.0, 1.0, &QueryOptions::with_rate_mode(mode))
             .map_err(|e| e.to_string())?;
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("{query}: not a matrix");
         };
         Ok(result.into_iter().map(|m| m.values).collect())
@@ -1782,7 +1788,7 @@ mod tests {
             ),
         ]);
         let quantile = |query: &str| -> Vec<Vec<(f64, f64)>> {
-            let QueryResult::Matrix { result } = reader
+            let QueryResult::Matrix { result, .. } = reader
                 .query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default())
                 .unwrap_or_else(|e| panic!("{query}: {e}"))
             else {
@@ -1840,7 +1846,7 @@ mod tests {
             ),
         ]);
         let values = |query: &str| -> Vec<Vec<(f64, f64)>> {
-            let QueryResult::Matrix { result } = reader
+            let QueryResult::Matrix { result, .. } = reader
                 .query_range_opts(query, 1.0, 10.0, 1.0, &QueryOptions::default())
                 .unwrap_or_else(|e| panic!("{query}: {e}"))
             else {
@@ -1922,7 +1928,7 @@ mod tests {
             ],
         )]);
         let values = |query: &str| -> Vec<Vec<(f64, f64)>> {
-            let QueryResult::Matrix { result } = reader
+            let QueryResult::Matrix { result, .. } = reader
                 .query_range_opts(query, 2.0, 10.0, 1.0, &QueryOptions::default())
                 .unwrap_or_else(|e| panic!("{query}: {e}"))
             else {
@@ -1997,7 +2003,7 @@ mod tests {
                 vec![("lat", segment_histogram("lat", 4, 10, &rows(10, 10)))],
             ),
         ]);
-        let QueryResult::Matrix { result } = reader
+        let QueryResult::Matrix { result, .. } = reader
             .query_range_opts(
                 "histogram_count(lat)",
                 1.0,
@@ -2106,8 +2112,12 @@ mod tests {
                 .query_range_opts(q, 2.0, 30.0, 1.0, &per_series)
                 .unwrap();
             let (
-                QueryResult::Matrix { result: mut fast },
-                QueryResult::Matrix { result: mut slow },
+                QueryResult::Matrix {
+                    result: mut fast, ..
+                },
+                QueryResult::Matrix {
+                    result: mut slow, ..
+                },
             ) = (fast, slow)
             else {
                 panic!("{q}: not matrices");
@@ -2455,7 +2465,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(points(&joined, r#"g{source="b"}"#), points(&alone, "g"),);
-        let QueryResult::Matrix { result } = joined
+        let QueryResult::Matrix { result, .. } = joined
             .query_range_opts("g", 1.0, 40.0, 1.0, &QueryOptions::default())
             .unwrap()
         else {
@@ -2466,7 +2476,7 @@ mod tests {
             .find(|m| m.metric.get("source").map(String::as_str) == Some("b"))
             .unwrap();
         assert_eq!(b.values.len(), points(&alone, "g"));
-        let QueryResult::Vector { result } = joined.query("g", Some(25.0)).unwrap() else {
+        let QueryResult::Vector { result, .. } = joined.query("g", Some(25.0)).unwrap() else {
             panic!("not a vector");
         };
         assert_eq!(result.len(), 2, "{result:?}");
@@ -2700,7 +2710,7 @@ mod tests {
             "rate(c[3s]) / rate(c[3s])",
         ] {
             match reader.query_range_opts(q, 1.0, 10.0, 1.0, &QueryOptions::default()) {
-                Ok(QueryResult::Matrix { result }) => assert_eq!(result.len(), 2, "{q}"),
+                Ok(QueryResult::Matrix { result, .. }) => assert_eq!(result.len(), 2, "{q}"),
                 other => panic!("{q}: {other:?}"),
             }
         }
@@ -2765,7 +2775,7 @@ mod tests {
                 )],
             ),
         ]);
-        let QueryResult::Vector { result } = reader.query("g", None).unwrap() else {
+        let QueryResult::Vector { result, .. } = reader.query("g", None).unwrap() else {
             panic!("not a vector");
         };
         let times: Vec<f64> = result.iter().map(|s| s.value.0).collect();
@@ -2785,7 +2795,7 @@ mod tests {
             ),
         ]);
         let at = |q: &str| -> Vec<(String, f64)> {
-            let QueryResult::Vector { result } = reader.query(q, None).unwrap() else {
+            let QueryResult::Vector { result, .. } = reader.query(q, None).unwrap() else {
                 panic!("not a vector");
             };
             result

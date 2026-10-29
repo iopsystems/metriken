@@ -88,7 +88,7 @@
 //! store.insert_histogram_series("h", Labels::default(), config, ts.clone(), snaps).unwrap();
 //!
 //! let points = |q: &str| match store.query_range(q, 1001.0, 1020.0, 1.0).unwrap() {
-//!     QueryResult::Matrix { result } => result[0].values.clone(),
+//!     QueryResult::Matrix { result, .. } => result[0].values.clone(),
 //!     _ => unreachable!(),
 //! };
 //! // Unstrided: a point per row after the first, 10 per point over the 1 s
@@ -149,7 +149,7 @@ pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use metriken_storage::Labels;
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{
-    referenced_metrics, selector_filter, HistogramHeatmapResult, MatrixSample, QueryError,
+    referenced_metrics, selector_filter, HistogramHeatmapResult, MatrixSample, Notice, QueryError,
     QueryResult, Sample,
 };
 pub use scope::{Scope, ScopedSource, SourceRef};

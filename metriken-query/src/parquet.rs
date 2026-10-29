@@ -804,7 +804,7 @@ mod tests {
         let result = reader
             .query_range("dummy_gauge", 1.0, 3.4, 0.1)
             .expect("a sub-second range query must answer");
-        let QueryResult::Matrix { result } = result else {
+        let QueryResult::Matrix { result, .. } = result else {
             panic!("expected a matrix, got {result:?}");
         };
         let values: Vec<f64> = result
@@ -898,7 +898,7 @@ mod tests {
         let result = reader
             .query_range("rate(cpu_cycles[2s])", start, end + 1.0, 1.0)
             .unwrap();
-        let QueryResult::Matrix { result } = result else {
+        let QueryResult::Matrix { result, .. } = result else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1, "expected exactly one series");
