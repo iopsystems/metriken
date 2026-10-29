@@ -865,7 +865,7 @@ mod ingest_tests {
             .unwrap();
 
         match result {
-            DisplayResult::Series { result, budget } => {
+            DisplayResult::Series { result, budget, .. } => {
                 assert_eq!(budget, 10);
                 assert_eq!(result.len(), 1, "one series");
                 let s = &result[0];
@@ -1010,7 +1010,7 @@ mod series_tests {
 
     fn matrix(r: Result<QueryResult, crate::QueryError>) -> Vec<crate::MatrixSample> {
         match r.expect("query resolves") {
-            QueryResult::Matrix { result } => result,
+            QueryResult::Matrix { result, .. } => result,
             other => panic!("expected a matrix, got {other:?}"),
         }
     }

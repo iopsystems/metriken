@@ -64,14 +64,14 @@ fn create_cgroup_source() -> Memory {
 
 fn count_matrix_series(result: &QueryResult) -> usize {
     match result {
-        QueryResult::Matrix { result } => result.len(),
+        QueryResult::Matrix { result, .. } => result.len(),
         _ => 0,
     }
 }
 
 fn get_matrix_series_names(result: &QueryResult) -> Vec<String> {
     match result {
-        QueryResult::Matrix { result } => result
+        QueryResult::Matrix { result, .. } => result
             .iter()
             .filter_map(|s| s.metric.get("name").cloned())
             .collect(),
@@ -134,7 +134,7 @@ fn a_missing_name_is_reported_from_either_operand() {
 fn a_held_metric_with_nothing_in_range_is_empty_not_missing() {
     let engine = QueryEngine::new(Arc::new(create_rate_source()));
     let empty = |q: &str, start: f64, end: f64| match engine.query_range(q, start, end, 1.0) {
-        Ok(QueryResult::Matrix { result }) => assert!(result.is_empty(), "{q}: {result:?}"),
+        Ok(QueryResult::Matrix { result, .. }) => assert!(result.is_empty(), "{q}: {result:?}"),
         other => panic!("{q}: expected an empty matrix, got {other:?}"),
     };
     empty("rate(test_counter[2s])", 2000.0, 2004.0);
@@ -497,7 +497,7 @@ fn create_labeled_gauge_source() -> Memory {
 
 fn get_matrix_values(result: &QueryResult) -> Vec<Vec<(f64, f64)>> {
     match result {
-        QueryResult::Matrix { result } => result.iter().map(|s| s.values.clone()).collect(),
+        QueryResult::Matrix { result, .. } => result.iter().map(|s| s.values.clone()).collect(),
         _ => Vec::new(),
     }
 }
@@ -791,7 +791,7 @@ fn test_avg_over_time_with_label_filter() {
 
     assert_eq!(count_matrix_series(&result), 1);
     let names: Vec<String> = match &result {
-        QueryResult::Matrix { result } => result
+        QueryResult::Matrix { result, .. } => result
             .iter()
             .filter_map(|s| s.metric.get("host").cloned())
             .collect(),
@@ -999,7 +999,7 @@ fn create_duplex_source() -> Memory {
 
 fn series_for_iface(result: &QueryResult, iface: &str) -> Option<Vec<(f64, f64)>> {
     match result {
-        QueryResult::Matrix { result } => result
+        QueryResult::Matrix { result, .. } => result
             .iter()
             .find(|s| s.metric.get("iface").map(|v| v.as_str()) == Some(iface))
             .map(|s| s.values.clone()),
@@ -1432,7 +1432,7 @@ fn test_histogram_count_collapses_series_and_sums_counts() {
         .query_range("histogram_count(req_latency)", 1000.0, 1003.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     assert_eq!(result.len(), 1, "series collapse to one __name__ series");
@@ -1457,7 +1457,7 @@ fn test_histogram_mean_is_bucket_weighted_midpoint() {
         .query_range("histogram_mean(req_latency)", 1000.0, 1003.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     assert_eq!(result.len(), 1);
@@ -1481,7 +1481,7 @@ fn test_histogram_sum_is_count_times_mean() {
         .query_range("histogram_sum(req_latency)", 1000.0, 1003.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     assert_eq!(result.len(), 1);
@@ -1507,7 +1507,7 @@ fn test_histogram_sum_label_filter_selects_single_series() {
         )
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     let sums: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
@@ -1523,7 +1523,7 @@ fn test_histogram_sum_by_emits_per_group_series() {
         .query_range("histogram_sum by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { mut result } = result else {
+    let QueryResult::Matrix { mut result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
@@ -1559,7 +1559,7 @@ fn test_sum_wrapping_histogram_sum_matches_bare() {
         .unwrap();
 
     let values_of = |r: QueryResult| -> Vec<f64> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("expected Matrix");
         };
         assert_eq!(result.len(), 1);
@@ -1582,7 +1582,7 @@ fn test_histogram_count_label_filter_selects_single_series() {
         )
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     let counts: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
@@ -1610,7 +1610,7 @@ fn test_histogram_irate_steady_rate_is_constant() {
         .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     assert_eq!(result.len(), 1, "irate collapses to one __name__ series");
@@ -1638,7 +1638,7 @@ fn test_histogram_irate_burst_then_idle_spikes_then_zero() {
         .query_range("histogram_irate(req_latency)", 1000.0, 1005.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
@@ -1657,7 +1657,7 @@ fn test_histogram_irate_counter_drop_clamps_to_zero() {
         .query_range("histogram_irate(req_latency)", 1000.0, 1004.0, 1.0)
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
@@ -1681,7 +1681,7 @@ fn test_histogram_irate_first_step_is_null() {
 
     let result = engine.query_range("histogram_irate(req_latency)", 1000.0, 1002.0, 1.0);
     match result {
-        Ok(QueryResult::Matrix { result }) if result.is_empty() => {}
+        Ok(QueryResult::Matrix { result, .. }) if result.is_empty() => {}
         other => panic!("expected an empty matrix (single delta → null), got {other:?}"),
     }
 }
@@ -1700,7 +1700,7 @@ fn test_histogram_irate_label_filter_selects_single_series() {
         )
         .unwrap();
 
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     let values: Vec<f64> = result[0].values.iter().map(|(_, v)| *v).collect();
@@ -1723,7 +1723,7 @@ fn test_histogram_irate_by_groups_per_cpu() {
             1.0,
         )
         .unwrap();
-    let QueryResult::Matrix { mut result } = result else {
+    let QueryResult::Matrix { mut result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
@@ -1762,7 +1762,7 @@ fn test_histogram_irate_without_drops_named_label() {
         .unwrap();
 
     let values_of = |r: &QueryResult| -> Vec<f64> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("expected Matrix");
         };
         assert_eq!(result.len(), 1);
@@ -1784,7 +1784,7 @@ fn test_histogram_count_by_emits_per_group_series() {
             1.0,
         )
         .unwrap();
-    let QueryResult::Matrix { mut result } = result else {
+    let QueryResult::Matrix { mut result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
@@ -1803,7 +1803,7 @@ fn test_histogram_mean_by_preserves_mean_per_group() {
     let result = engine
         .query_range("histogram_mean by (cpu) (req_latency)", 1000.0, 1003.0, 1.0)
         .unwrap();
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("expected Matrix, got {result:?}");
     };
     assert_eq!(result.len(), 2);
@@ -1846,7 +1846,7 @@ fn test_sum_wrapping_histogram_irate_matches_bare() {
         .unwrap();
 
     let values_of = |r: &QueryResult| -> Vec<f64> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("expected Matrix");
         };
         assert_eq!(result.len(), 1);
@@ -1878,7 +1878,7 @@ fn test_sum_by_wrapping_histogram_irate_matches_native_grouping() {
         .unwrap();
 
     let sorted_pairs = |r: QueryResult| -> Vec<(String, Vec<f64>)> {
-        let QueryResult::Matrix { mut result } = r else {
+        let QueryResult::Matrix { mut result, .. } = r else {
             panic!("expected Matrix");
         };
         result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
@@ -1918,7 +1918,7 @@ fn test_sum_without_wrapping_histogram_irate_matches_native_grouping() {
         .unwrap();
 
     let values_of = |r: QueryResult| -> Vec<f64> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("expected Matrix");
         };
         assert_eq!(result.len(), 1);
@@ -1940,7 +1940,7 @@ fn test_sum_wrapping_histogram_count_matches_bare() {
         .unwrap();
 
     let values_of = |r: QueryResult| -> Vec<f64> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("expected Matrix");
         };
         assert_eq!(result.len(), 1);
@@ -1967,7 +1967,7 @@ fn test_sum_by_wrapping_histogram_mean_matches_native_grouping() {
         .unwrap();
 
     let sorted_pairs = |r: QueryResult| -> Vec<(String, Vec<f64>)> {
-        let QueryResult::Matrix { mut result } = r else {
+        let QueryResult::Matrix { mut result, .. } = r else {
             panic!("expected Matrix");
         };
         result.sort_by(|a, b| a.metric.get("cpu").cmp(&b.metric.get("cpu")));
@@ -2007,7 +2007,7 @@ fn test_sum_wrapping_histogram_irate_with_label_matcher() {
         .unwrap();
 
     let values_of = |r: &QueryResult| -> Vec<f64> {
-        let QueryResult::Matrix { result } = r else {
+        let QueryResult::Matrix { result, .. } = r else {
             panic!("expected Matrix");
         };
         assert_eq!(result.len(), 1);
@@ -2888,8 +2888,10 @@ fn a_rate_at_explicit_timestamps_has_a_point_at_each() {
 /// The points of `result` at or after `from`.
 fn points_from(result: &QueryResult, from: f64) -> Vec<(f64, f64)> {
     let mut out: Vec<(f64, f64)> = match result {
-        QueryResult::Matrix { result } => result.iter().flat_map(|s| s.values.clone()).collect(),
-        QueryResult::Vector { result } => result.iter().map(|s| s.value).collect(),
+        QueryResult::Matrix { result, .. } => {
+            result.iter().flat_map(|s| s.values.clone()).collect()
+        }
+        QueryResult::Vector { result, .. } => result.iter().map(|s| s.value).collect(),
         other => panic!("{other:?}"),
     };
     out.retain(|(t, _)| *t >= from);
@@ -3709,7 +3711,7 @@ fn raw_results_do_not_depend_on_the_start() {
                 let r = engine
                     .query_range_opts(q, start, 1150.0, 1.0, &raw)
                     .unwrap();
-                let QueryResult::Matrix { result } = r else {
+                let QueryResult::Matrix { result, .. } = r else {
                     panic!("{q}: not a matrix");
                 };
                 for s in result {
@@ -4027,7 +4029,7 @@ fn a_name_matcher_names_the_selector() {
     };
     // Each series' labels and values, in a fixed order.
     let series = |q: &str| {
-        let QueryResult::Matrix { result } = range(q) else {
+        let QueryResult::Matrix { result, .. } = range(q) else {
             panic!("{q}: not a matrix");
         };
         let mut out: Vec<_> = result
@@ -4049,7 +4051,8 @@ fn a_name_matcher_names_the_selector() {
     let all = series("irate(cgroup_cpu_usage[5s])");
     assert_eq!(all.len(), 3);
     assert_eq!(all, series(r#"irate({__name__="cgroup_cpu_usage"}[5s])"#));
-    let QueryResult::Matrix { result } = range(r#"sum(irate({__name__="svc/ops"}[5s]))"#) else {
+    let QueryResult::Matrix { result, .. } = range(r#"sum(irate({__name__="svc/ops"}[5s]))"#)
+    else {
         panic!("not a matrix");
     };
     assert_eq!(result.len(), 1);
@@ -4077,7 +4080,8 @@ fn a_histogram_function_reads_a_name_matcher_by_the_promql_rule() {
     let range = |q: &str| engine.query_range(q, 1001.0, 1004.0, 1.0);
     // Each series' labels and values, in a fixed order.
     let series = |q: &str| {
-        let QueryResult::Matrix { result } = range(q).unwrap_or_else(|e| panic!("{q}: {e}")) else {
+        let QueryResult::Matrix { result, .. } = range(q).unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
             panic!("{q}: not a matrix");
         };
         let mut out: Vec<_> = result
@@ -4146,7 +4150,7 @@ fn an_instant_histogram_query_reads_back_three_row_intervals() {
     // Rows each second from 1000 s to 1004 s.
     let engine = QueryEngine::new(Arc::new(create_hist_source(&[0, 10, 20, 30, 40])));
     let at = |t: f64| {
-        let QueryResult::Vector { result } = engine
+        let QueryResult::Vector { result, .. } = engine
             .query("histogram_mean(req_latency)", Some(t))
             .unwrap()
         else {
@@ -4194,7 +4198,7 @@ fn an_instant_histogram_lookback_takes_the_slowest_interval_up_to_300_s() {
         make_labels(&[("source", "slow")]),
     ));
     let engine = QueryEngine::new(Arc::new(RecordingsSource::new(vec![fast, slow])));
-    let QueryResult::Vector { result } = engine
+    let QueryResult::Vector { result, .. } = engine
         .query("histogram_count by (source) (lat)", Some(1065.0))
         .unwrap()
     else {
@@ -4210,7 +4214,8 @@ fn an_instant_histogram_lookback_takes_the_slowest_interval_up_to_300_s() {
     // 200 s rows: three intervals would be 600 s, the cap is 300 s.
     let engine = QueryEngine::new(Arc::new(hist_rows(200_000, 1000, 1400, 200)));
     let at = |t: f64| {
-        let QueryResult::Vector { result } = engine.query("histogram_count(lat)", Some(t)).unwrap()
+        let QueryResult::Vector { result, .. } =
+            engine.query("histogram_count(lat)", Some(t)).unwrap()
         else {
             panic!("not a vector");
         };
@@ -4246,7 +4251,7 @@ fn hist_rows_per(xs: &[&str], from_s: u64, to_s: u64) -> Memory {
 fn a_strided_instant_counts_the_stride_ending_at_the_instant() {
     let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
     let count = |q: &str, t: f64| {
-        let QueryResult::Vector { result } = engine.query(q, Some(t)).unwrap() else {
+        let QueryResult::Vector { result, .. } = engine.query(q, Some(t)).unwrap() else {
             panic!("not a vector");
         };
         result.first().map(|s| s.value.1)
@@ -4279,7 +4284,7 @@ fn a_strided_instant_counts_the_stride_ending_at_the_instant() {
 #[test]
 fn strided_windows_hold_every_series_at_a_timestamp() {
     let engine = QueryEngine::new(Arc::new(hist_rows_per(&["a", "b"], 1000, 1400)));
-    let QueryResult::Matrix { result } = engine
+    let QueryResult::Matrix { result, .. } = engine
         .query_range("histogram_count(lat, 60)", 1200.0, 1400.0, 1.0)
         .unwrap()
     else {
@@ -4300,7 +4305,7 @@ fn strided_windows_hold_every_series_at_a_timestamp() {
         .copied()
         .collect();
     assert_eq!(tail, vec![(1380.0, 120.0), (1400.0, 40.0)], "{result:?}");
-    let QueryResult::Vector { result } = engine
+    let QueryResult::Vector { result, .. } = engine
         .query("histogram_count(lat, 60)", Some(1400.0))
         .unwrap()
     else {
@@ -4315,7 +4320,7 @@ fn strided_windows_hold_every_series_at_a_timestamp() {
 fn strided_range_windows_fall_at_multiples_of_the_stride() {
     let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
     let points = |start: f64| {
-        let QueryResult::Matrix { result } = engine
+        let QueryResult::Matrix { result, .. } = engine
             .query_range("histogram_count(lat, 60)", start, 1380.0, 1.0)
             .unwrap()
         else {
@@ -4344,7 +4349,7 @@ fn strided_range_windows_fall_at_multiples_of_the_stride() {
 fn strided_quantiles_and_heatmaps_share_the_windows() {
     let engine = QueryEngine::new(Arc::new(hist_rows(1000, 1000, 1400, 1)));
     let expected = vec![1140.0, 1200.0, 1260.0, 1320.0, 1380.0];
-    let QueryResult::Matrix { result } = engine
+    let QueryResult::Matrix { result, .. } = engine
         .query_range("histogram_quantiles([0.5], lat, 60)", 1130.0, 1380.0, 1.0)
         .unwrap()
     else {
@@ -4352,7 +4357,7 @@ fn strided_quantiles_and_heatmaps_share_the_windows() {
     };
     let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
     assert_eq!(times, expected, "{result:?}");
-    let QueryResult::HistogramHeatmap { result } = engine
+    let QueryResult::HistogramHeatmap { result, .. } = engine
         .query_range("histogram_heatmap(lat, 60)", 1130.0, 1380.0, 1.0)
         .unwrap()
     else {
@@ -4391,20 +4396,20 @@ fn rows_before_the_first_strided_window_count_in_none() {
         },
     );
     let engine = QueryEngine::new(Arc::new(source));
-    let QueryResult::Matrix { result } = engine
+    let QueryResult::Matrix { result, .. } = engine
         .query_range("histogram_quantiles([1.0], lat, 60)", 1130.0, 1140.0, 1.0)
         .unwrap()
     else {
         panic!("not a matrix");
     };
-    let QueryResult::Matrix { result: low } = engine
+    let QueryResult::Matrix { result: low, .. } = engine
         .query_range("histogram_quantiles([1.0], lat)", 1140.0, 1140.0, 1.0)
         .unwrap()
     else {
         panic!("not a matrix");
     };
     assert_eq!(result[0].values, low[0].values, "{result:?}");
-    let QueryResult::HistogramHeatmap { result } = engine
+    let QueryResult::HistogramHeatmap { result, .. } = engine
         .query_range("histogram_heatmap(lat, 60)", 1130.0, 1140.0, 1.0)
         .unwrap()
     else {
@@ -4428,7 +4433,7 @@ fn a_strided_window_with_no_row_in_the_range_gives_no_point() {
     let result = engine
         .query_range("histogram_count(lat, 60)", 1160.0, 1170.0, 1.0)
         .unwrap();
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("not a matrix");
     };
     assert!(result.is_empty(), "{result:?}");
@@ -4444,7 +4449,7 @@ fn a_closed_strided_window_is_stamped_at_its_close() {
     let engine = QueryEngine::new(Arc::new(hist_rows(50_000, 1000, 1400, 50)));
     let points = strided_counts(&engine, "histogram_count(lat, 30)", 1155.0, 1230.0);
     assert_close(&points, &[(1170.0, 0.6), (1200.0, 0.6)]);
-    let QueryResult::HistogramHeatmap { result } = engine
+    let QueryResult::HistogramHeatmap { result, .. } = engine
         .query_range("histogram_heatmap(lat, 30)", 1155.0, 1230.0, 1.0)
         .unwrap()
     else {
@@ -4489,7 +4494,7 @@ fn hist_series(interval_ms: u64, series: &[(&str, Vec<u64>)], per_row: u64) -> M
 }
 
 fn strided_counts(engine: &QueryEngine, q: &str, start: f64, end: f64) -> Vec<(f64, f64)> {
-    let QueryResult::Matrix { result } = engine.query_range(q, start, end, 1.0).unwrap() else {
+    let QueryResult::Matrix { result, .. } = engine.query_range(q, start, end, 1.0).unwrap() else {
         panic!("not a matrix");
     };
     result[0].values.clone()
@@ -4509,7 +4514,7 @@ fn a_stride_off_the_row_interval_shares_each_rows_delta() {
         .map(|t| (t as f64, 150.0))
         .collect();
     assert_eq!(points, expected);
-    let QueryResult::HistogramHeatmap { result } = engine
+    let QueryResult::HistogramHeatmap { result, .. } = engine
         .query_range("histogram_heatmap(lat, 15)", 1100.0, 1380.0, 1.0)
         .unwrap()
     else {
@@ -4677,7 +4682,7 @@ fn no_two_strided_points_share_a_timestamp() {
         let engine = QueryEngine::new(Arc::new(hist_series(1_000, &series, 100)));
         let points = strided_counts(&engine, "histogram_count(lat, 1)", 1005.0, 1010.0);
         assert!(points.windows(2).all(|w| w[0].0 < w[1].0), "{points:?}");
-        let QueryResult::HistogramHeatmap { result } = engine
+        let QueryResult::HistogramHeatmap { result, .. } = engine
             .query_range("histogram_heatmap(lat, 1)", 1005.0, 1010.0, 1.0)
             .unwrap()
         else {
@@ -4748,7 +4753,7 @@ fn a_histogram_name_in_a_label_value_is_no_call() {
     );
     let engine = QueryEngine::new(Arc::new(source));
     let at = |q: &str| {
-        let QueryResult::Vector { result } = engine.query(q, Some(1000.95)).unwrap() else {
+        let QueryResult::Vector { result, .. } = engine.query(q, Some(1000.95)).unwrap() else {
             panic!("not a vector");
         };
         result[0].value
@@ -4772,7 +4777,7 @@ fn an_escape_or_a_comment_does_not_hide_a_histogram_call() {
         "# it's a comment\rhistogram_quantile(0.5, req_latency)",
         "# a comment ending in a backslash \\\nhistogram_quantile(0.5, req_latency)",
     ] {
-        let QueryResult::Vector { result } = engine
+        let QueryResult::Vector { result, .. } = engine
             .query(q, Some(1003.5))
             .unwrap_or_else(|e| panic!("{q}: {e}"))
         else {

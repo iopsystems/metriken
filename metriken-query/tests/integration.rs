@@ -38,7 +38,7 @@ fn counter_irate_clamps_on_reset() {
 
     // We expect the rate around t=10 to be 0 (clamped), not negative.
     // Verify no value is negative (counter resets should produce 0, not -100).
-    if let QueryResult::Matrix { result } = result {
+    if let QueryResult::Matrix { result, .. } = result {
         for series in &result {
             for (_t, v) in &series.values {
                 assert!(*v >= 0.0, "counter reset produced negative rate: {v}");
@@ -68,7 +68,7 @@ fn counter_with_label_filter_selects_one_series() {
         )
         .unwrap();
 
-    if let QueryResult::Matrix { result } = result {
+    if let QueryResult::Matrix { result, .. } = result {
         assert_eq!(
             result.len(),
             1,
@@ -98,7 +98,7 @@ fn histogram_quantile_across_row_groups() {
     let result = reader
         .query_range("histogram_quantile(0.99, latency)", start, end + 1.0, 1.0)
         .unwrap();
-    if let QueryResult::Matrix { result } = result {
+    if let QueryResult::Matrix { result, .. } = result {
         assert!(!result.is_empty(), "expected at least one quantile series");
     } else {
         panic!("expected Matrix, got {result:?}");
@@ -122,7 +122,7 @@ fn histogram_count_matches_observation_total() {
     let result = reader
         .query_range("histogram_count(hits)", start, end + 1.0, 1.0)
         .unwrap();
-    if let QueryResult::Matrix { result } = result {
+    if let QueryResult::Matrix { result, .. } = result {
         if let Some(series) = result.first() {
             for (_t, v) in &series.values {
                 // Allow for the first/last tick edge cases; just verify ~100 deltas
@@ -152,7 +152,7 @@ fn query_spans_multiple_row_groups() {
         .query_range("rate(x[5s])", start, end + 1.0, 1.0)
         .unwrap();
     // Should produce a non-empty result spanning many row groups
-    if let QueryResult::Matrix { result } = result {
+    if let QueryResult::Matrix { result, .. } = result {
         assert!(!result.is_empty(), "expected results across row groups");
         if let Some(series) = result.first() {
             assert!(
@@ -256,7 +256,9 @@ fn open_bytes_matches_open_path() {
         .unwrap();
 
     // Compare matrix-side counts as a smoke check
-    if let (QueryResult::Matrix { result: a }, QueryResult::Matrix { result: b }) = (r_a, r_b) {
+    if let (QueryResult::Matrix { result: a, .. }, QueryResult::Matrix { result: b, .. }) =
+        (r_a, r_b)
+    {
         assert_eq!(a.len(), b.len(), "matrix series count differs");
     }
 }
@@ -365,7 +367,7 @@ fn query_window_after_data_returns_empty_or_not_found() {
     let result = reader.query_range("rate(x[1s])", end + 100.0, end + 200.0, 1.0);
     // Either an empty Matrix or a MetricNotFound is acceptable
     match result {
-        Ok(QueryResult::Matrix { result }) => {
+        Ok(QueryResult::Matrix { result, .. }) => {
             assert!(
                 result.is_empty(),
                 "expected empty matrix for after-data window"
@@ -734,7 +736,7 @@ fn rate_query_carries_intervals_leaf_only() {
         .query_range("rate(cpu_cycles[1m])", s, e + 1.0, 1.0)
         .unwrap();
     match &r {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             assert!(!result.is_empty());
             assert!(
                 result[0].intervals.is_some(),
@@ -749,14 +751,14 @@ fn rate_query_carries_intervals_leaf_only() {
     // aggregation and series-op-series binary ops; see the binary/aggregate
     // interval tests.)
     let bare = match &r {
-        QueryResult::Matrix { result } => result[0].intervals.clone().unwrap(),
+        QueryResult::Matrix { result, .. } => result[0].intervals.clone().unwrap(),
         _ => unreachable!(),
     };
     let r2 = reader
         .query_range("rate(cpu_cycles[1m]) * 60", s, e + 1.0, 1.0)
         .unwrap();
     match r2 {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             assert!(!result.is_empty());
             let scaled = result[0]
                 .intervals
@@ -797,7 +799,7 @@ fn histogram_quantile_carries_bucket_value_band() {
         .query_range("histogram_quantile(0.99, latency)", start, end + 1.0, 1.0)
         .unwrap();
     match r {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             assert!(!result.is_empty());
             let s = &result[0];
             let ivls = s
@@ -826,7 +828,7 @@ fn histogram_quantile_carries_bucket_value_band() {
         )
         .unwrap();
     match r2 {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             let s = &result[0];
             let ivls = s.intervals.as_ref().expect("scalar op keeps the band");
             for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
@@ -856,7 +858,7 @@ fn histogram_sum_and_mean_carry_bucket_value_band() {
         .query_range("histogram_sum(latency)", start, end + 1.0, 1.0)
         .unwrap();
     match r {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             assert!(!result.is_empty());
             let s = &result[0];
             let ivls = s.intervals.as_ref().expect("sum carries a bucket band");
@@ -876,7 +878,7 @@ fn histogram_sum_and_mean_carry_bucket_value_band() {
         .query_range("histogram_sum(latencylog)", start, end + 1.0, 1.0)
         .unwrap();
     match r {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             let s = &result[0];
             let ivls = s.intervals.as_ref().expect("log-region sum carries a band");
             for ((_, v), (lo, hi)) in s.values.iter().zip(ivls) {
@@ -892,7 +894,7 @@ fn histogram_sum_and_mean_carry_bucket_value_band() {
         .query_range("histogram_mean(latency)", start, end + 1.0, 1.0)
         .unwrap();
     match r {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             let s = &result[0];
             let ivls = s.intervals.as_ref().expect("mean carries a bucket band");
             assert_eq!(ivls.len(), s.values.len());
@@ -908,7 +910,7 @@ fn histogram_sum_and_mean_carry_bucket_value_band() {
         .query_range("histogram_count(latency)", start, end + 1.0, 1.0)
         .unwrap();
     match r {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             let s = &result[0];
             assert!(
                 s.intervals.is_none(),

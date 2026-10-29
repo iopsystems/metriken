@@ -921,7 +921,7 @@ pub(crate) mod tests {
                 1.0,
             )
             .unwrap();
-        let crate::QueryResult::Matrix { result } = result else {
+        let crate::QueryResult::Matrix { result, .. } = result else {
             panic!("a range query gives a matrix");
         };
         let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
@@ -1123,7 +1123,7 @@ pub(crate) mod tests {
             .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         assert_eq!(format!("{qa:?}"), format!("{qb:?}"));
-        let QueryResult::Matrix { result } = qb else {
+        let QueryResult::Matrix { result, .. } = qb else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1, "one spliced series, not one per segment");
@@ -1164,7 +1164,7 @@ pub(crate) mod tests {
         let qa = a.query_range("queue_depth", 1.0, 4.0, 1.0).unwrap();
         let qb = b.query_range("queue_depth", 1.0, 4.0, 1.0).unwrap();
         assert_eq!(format!("{qa:?}"), format!("{qb:?}"));
-        let QueryResult::Matrix { result } = qb else {
+        let QueryResult::Matrix { result, .. } = qb else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1, "one spliced series, not one per segment");
@@ -1227,7 +1227,7 @@ pub(crate) mod tests {
             .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
         assert_eq!(format!("{qa:?}"), format!("{qb:?}"));
-        let QueryResult::Matrix { result } = qb else {
+        let QueryResult::Matrix { result, .. } = qb else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1272,7 +1272,7 @@ pub(crate) mod tests {
         let qc = c
             .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
-        let QueryResult::Matrix { result } = qc else {
+        let QueryResult::Matrix { result, .. } = qc else {
             panic!("expected matrix result");
         };
         assert!(result.iter().all(|s| s.intervals.is_none()));
@@ -1324,7 +1324,7 @@ pub(crate) mod tests {
                 format!("{qb:?}"),
                 "split-segment table-level windows must match a single unsplit table for {expr}"
             );
-            let QueryResult::Matrix { result } = qb else {
+            let QueryResult::Matrix { result, .. } = qb else {
                 panic!("expected matrix result");
             };
             assert_eq!(result.len(), 1, "one spliced series, not one per segment");
@@ -1373,7 +1373,7 @@ pub(crate) mod tests {
         // new_metric only spans segment B; the query must still succeed and
         // return its samples (segment A simply contributes none).
         let q = r.query_range("new_metric", 3.0, 4.0, 1.0).unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1388,7 +1388,7 @@ pub(crate) mod tests {
         let q = r
             .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1441,7 +1441,7 @@ pub(crate) mod tests {
         let q = r
             .query_range_opts("irate(cpu_cycles[1s])", 1.0, 5.0, 1.0, &opts)
             .unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 2, "two label sets must stay two series");
@@ -1511,7 +1511,7 @@ pub(crate) mod tests {
             let q = r
                 .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
                 .unwrap();
-            let QueryResult::Matrix { result } = q else {
+            let QueryResult::Matrix { result, .. } = q else {
                 panic!("expected matrix result");
             };
             assert_eq!(result.len(), 1);
@@ -1539,7 +1539,7 @@ pub(crate) mod tests {
         let q = r
             .query_range("rate(cpu_cycles[1s])", 1.0, 5.0, 1.0)
             .unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert!(result[0].intervals.is_some());
@@ -1570,7 +1570,7 @@ pub(crate) mod tests {
 
         // The counter run reads as a counter: rate over segment A only.
         let q = r.query_range("rate(id_5[2s])", 1.0, 5.0, 1.0).unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1590,7 +1590,7 @@ pub(crate) mod tests {
 
         // The gauge run reads as a gauge, with its own values.
         let q = r.query_range("id_5", 3.0, 4.0, 1.0).unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1612,7 +1612,7 @@ pub(crate) mod tests {
             let seg = segment_histogram_nullable("latency", 2, 8, &[], rows);
             let pool = BufferPool::new(64 * 1024 * 1024);
             let r = SegmentedParquetReader::open_bytes_with_pool(vec![seg], pool).unwrap();
-            let QueryResult::Matrix { result } = r
+            let QueryResult::Matrix { result, .. } = r
                 .query_range("histogram_irate(latency)", 1.0, 5.0, 1.0)
                 .unwrap()
             else {
@@ -1685,7 +1685,7 @@ pub(crate) mod tests {
         // The counter run keeps ITS windows (the histogram segment contributes
         // no counter samples, so coverage is uniform and the band survives).
         let q = r.query_range("rate(id_5[2s])", 1.0, 5.0, 1.0).unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1699,7 +1699,7 @@ pub(crate) mod tests {
         let q = r
             .query_range("histogram_irate(id_5)", 3.0, 5.0, 1.0)
             .unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1801,7 +1801,7 @@ pub(crate) mod tests {
         // single-segment reader, which has no conflict and no run label.
         let mean = |r: &SegmentedParquetReader, expr: &str, at: f64| -> f64 {
             let q = r.query_range(expr, 1.0, 5.0, 1.0).unwrap();
-            let QueryResult::Matrix { result } = q else {
+            let QueryResult::Matrix { result, .. } = q else {
                 panic!("expected matrix result for {expr}");
             };
             assert_eq!(result.len(), 1, "{expr}: {result:?}");
@@ -1833,7 +1833,7 @@ pub(crate) mod tests {
         let q = r
             .query_range("histogram_mean(latency)", 1.0, 5.0, 1.0)
             .unwrap();
-        let QueryResult::Matrix { result } = q else {
+        let QueryResult::Matrix { result, .. } = q else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -1952,7 +1952,7 @@ pub(crate) mod tests {
             .is_empty());
         assert!(matches!(
             r.query_range("histogram_mean(latency{__run__=\"1\"})", 1.0, 4.0, 1.0),
-            Ok(crate::QueryResult::Matrix { result }) if result.is_empty()
+            Ok(crate::QueryResult::Matrix { result, .. }) if result.is_empty()
         ));
     }
 
@@ -2019,7 +2019,7 @@ pub(crate) mod tests {
 
         // Load-bearing: the boundary point exists and is non-zero, i.e. it was
         // computed from segment 0's last row and segment 1's first row.
-        let QueryResult::Matrix { result } = qb else {
+        let QueryResult::Matrix { result, .. } = qb else {
             panic!("expected matrix result");
         };
         assert_eq!(result.len(), 1);
@@ -2066,7 +2066,7 @@ pub(crate) mod tests {
         let pool = BufferPool::new(64 * 1024 * 1024);
         let r = SegmentedParquetReader::open_bytes_with_pool(vec![a, b], pool).unwrap();
         let q = r.query("queue_depth", None).unwrap();
-        let QueryResult::Vector { result } = q else {
+        let QueryResult::Vector { result, .. } = q else {
             panic!("expected vector result, got {q:?}");
         };
         assert_eq!(result.len(), 1);
@@ -2296,7 +2296,7 @@ pub(crate) mod tests {
         let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
         store.gone.lock().unwrap().insert(0);
         let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
-        let QueryResult::Matrix { result } = r
+        let QueryResult::Matrix { result, .. } = r
             .query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts)
             .unwrap()
         else {
@@ -2348,7 +2348,7 @@ pub(crate) mod tests {
         assert_eq!(read, 2, "the lost segment is skipped, the others read");
 
         let range = |opts: &QueryOptions| {
-            let QueryResult::Matrix { result } = r
+            let QueryResult::Matrix { result, .. } = r
                 .query_range_opts("irate(c[2s])", 0.0, 6.0, 1.0, opts)
                 .unwrap()
             else {
@@ -2483,7 +2483,7 @@ pub(crate) mod tests {
         );
 
         let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
-        let QueryResult::Matrix { result } = r
+        let QueryResult::Matrix { result, .. } = r
             .query_range_opts("irate(c[1s])", 0.0, 5.0, 1.0, &opts)
             .unwrap()
         else {
@@ -2528,7 +2528,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let opts = QueryOptions::with_rate_mode(crate::RateMode::Raw);
-        let QueryResult::Matrix { result } = r
+        let QueryResult::Matrix { result, .. } = r
             .query_range_opts("irate(c{who=\"b\"}[1s])", 0.0, 5.0, 1.0, &opts)
             .unwrap()
         else {
@@ -2541,7 +2541,7 @@ pub(crate) mod tests {
         // A key the columns do carry still narrows inside the segment.
         assert!(
             r.query_range_opts("irate(c{slot=\"8\"}[1s])", 0.0, 5.0, 1.0, &opts)
-                .map(|q| matches!(q, QueryResult::Matrix { result } if result.is_empty()))
+                .map(|q| matches!(q, QueryResult::Matrix { result, .. } if result.is_empty()))
                 .unwrap_or(true),
             "no such slot"
         );
@@ -2582,7 +2582,7 @@ pub(crate) mod tests {
         let labels = r.histogram_labels("latency");
         assert_eq!(labels.len(), 2, "{labels:?}");
 
-        let QueryResult::Matrix { result } = r
+        let QueryResult::Matrix { result, .. } = r
             .query_range("histogram_count by (who) (latency)", 0.0, 5.0, 1.0)
             .unwrap()
         else {
@@ -2652,7 +2652,8 @@ pub(crate) mod tests {
         }
 
         // And through the engine: grid rate over the streams.
-        let QueryResult::Matrix { result } = r.query_range("rate(c[1s])", 0.0, 5.0, 1.0).unwrap()
+        let QueryResult::Matrix { result, .. } =
+            r.query_range("rate(c[1s])", 0.0, 5.0, 1.0).unwrap()
         else {
             panic!("matrix");
         };
@@ -2765,7 +2766,7 @@ pub(crate) mod tests {
 
     /// The answer to a fixed query, with each series' labels sorted.
     fn answer(r: &SegmentedParquetReader) -> String {
-        let QueryResult::Matrix { result } = r
+        let QueryResult::Matrix { result, .. } = r
             .query_range("rate(cpu_cycles[2s])", 1.0, 20.0, 1.0)
             .unwrap()
         else {
@@ -3070,7 +3071,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(pool.stats().misses, 0, "the batch path ran");
         assert_eq!(store.fetched(), vec![2], "opened {opened:?}");
-        let QueryResult::Matrix { result } = result else {
+        let QueryResult::Matrix { result, .. } = result else {
             panic!("a matrix");
         };
         assert_eq!(result[0].values, vec![(10.0, 10.0)]);
@@ -3239,7 +3240,7 @@ pub(crate) mod tests {
             .query_range_opts("irate(cpu_cycles[1s])", 10.0, 15.0, 1.0, &per_series)
             .unwrap();
         assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
-        let QueryResult::Matrix { result } = batch else {
+        let QueryResult::Matrix { result, .. } = batch else {
             panic!("a matrix");
         };
         // 15 s is past the last sample read (14.5 s) and within a spacing of
@@ -3337,7 +3338,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(pool_a.stats().misses > 0, "the per-series path ran");
         assert_eq!(format!("{batch:?}"), format!("{streams:?}"));
-        let QueryResult::Matrix { result } = batch else {
+        let QueryResult::Matrix { result, .. } = batch else {
             panic!("a matrix");
         };
         assert_eq!(result[0].values, vec![(2.0, 5.0), (3.0, 15.0), (4.0, 3.0)]);
@@ -3702,7 +3703,7 @@ pub(crate) mod tests {
         // The per-series path gives series 1 points across its silence,
         // interpolated between its samples at 500 s and 1201 s: a flushed
         // aggregate there must have included them.
-        let crate::QueryResult::Matrix { result } = r
+        let crate::QueryResult::Matrix { result, .. } = r
             .query_range_opts(
                 "irate(cpu_cycles{id=\"1\"}[1s])",
                 400.0,

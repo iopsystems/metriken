@@ -1574,8 +1574,14 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   each, warm): peak RSS 79.8 MB streaming, 126.9 MB holding every row,
   70.6 MB for the one source; `histogram_quantile` 28 ms both ways (9.5 ms
   for the one source).
-- 2c: S4: conflict detection, the warnings channel on query results (an
-  API change; `QueryResult` has none today), and Q16's value at a conflict.
+- 2c: S4: conflict detection, notices on query results (an API change),
+  and Q16's value at a conflict.
+  The owner chose on 2026-10-29 a field on `QueryResult` over a sink in
+  `QueryOptions` or new query methods: every variant of `QueryResult`
+  carries `notices` (`DisplayResult` gained the same field at review)
+  (`Notice::Conflict` the first kind), absent from the JSON when empty, a
+  breaking change rezolus takes with its upgrade. The field is built;
+  detection and Q16's value are not.
   Until then the value at a conflict is whichever source S3's order
   chooses, which is the finer source's and, at equal intervals, the lowest
   uuid's rather than the earlier-starting source's.

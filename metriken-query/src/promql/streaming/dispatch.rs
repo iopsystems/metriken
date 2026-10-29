@@ -65,15 +65,24 @@ pub fn try_streaming(
                     held_somewhere(source, &name)?;
                 }
             }
-            QueryResult::Matrix { result: collected }
+            QueryResult::Matrix {
+                result: collected,
+                notices: Vec::new(),
+            }
         }
         Built::Materialized { result, name } => {
             if result.is_empty() {
                 held_somewhere(source, &name)?;
             }
-            QueryResult::Matrix { result }
+            QueryResult::Matrix {
+                result,
+                notices: Vec::new(),
+            }
         }
-        Built::Scalar(v) => QueryResult::Scalar { result: (start, v) },
+        Built::Scalar(v) => QueryResult::Scalar {
+            result: (start, v),
+            notices: Vec::new(),
+        },
     };
     Ok(result)
 }
@@ -282,6 +291,7 @@ pub(crate) fn try_streaming_display(
             crate::DisplayResult::Series {
                 result: collected,
                 budget: display.budget as u32,
+                notices: Vec::new(),
             }
         }
         Built::Materialized { result, name } => {
@@ -289,14 +299,20 @@ pub(crate) fn try_streaming_display(
                 held_somewhere(source, &name)?;
             }
             crate::display::display_from_result(
-                QueryResult::Matrix { result },
+                QueryResult::Matrix {
+                    result,
+                    notices: Vec::new(),
+                },
                 start,
                 end,
                 step,
                 display,
             )
         }
-        Built::Scalar(v) => crate::DisplayResult::Scalar { result: (start, v) },
+        Built::Scalar(v) => crate::DisplayResult::Scalar {
+            result: (start, v),
+            notices: Vec::new(),
+        },
     };
     Ok(result)
 }
@@ -685,6 +701,7 @@ fn batch_display(
     Ok(Some(crate::DisplayResult::Series {
         result: series,
         budget: display.budget as u32,
+        notices: Vec::new(),
     }))
 }
 

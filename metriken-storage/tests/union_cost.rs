@@ -42,7 +42,7 @@ fn union_cost() {
     };
     type Run<'a> = Box<dyn Fn() -> usize + 'a>;
     let count = |r: metriken_query::QueryResult| match r {
-        metriken_query::QueryResult::Matrix { result } => {
+        metriken_query::QueryResult::Matrix { result, .. } => {
             result.iter().map(|m| m.values.len()).sum::<usize>()
         }
         _ => 0,

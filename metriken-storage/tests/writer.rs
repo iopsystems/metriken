@@ -224,7 +224,7 @@ fn answer(reader: &ArchiveReader, query: &str, from: u64) -> Result<(Answer, boo
     let result = reader
         .query_range(query, start, end, 1.0)
         .map_err(|e| format!("{e:?}"))?;
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("{query}: not a matrix");
     };
     let occupant = result.iter().any(|m| m.metric.contains_key("__occupant__"));
@@ -1963,7 +1963,7 @@ fn members_snapshot(t: u64, members: &[&str]) -> Snapshot {
 /// per tick the member was present, since every value is unique.
 fn samples(reader: &ArchiveReader, metric: &str, ticks: u64) -> usize {
     let (start, end) = (BASE as f64 / 1e9, (BASE + (ticks - 1) * S) as f64 / 1e9);
-    let QueryResult::Matrix { result } = reader.query_range(metric, start, end, 1.0).unwrap()
+    let QueryResult::Matrix { result, .. } = reader.query_range(metric, start, end, 1.0).unwrap()
     else {
         panic!("{metric}: not a matrix");
     };
@@ -2102,7 +2102,7 @@ fn samples_from(reader: &ArchiveReader, metric: &str, from: u64, ticks: u64) -> 
         (BASE + from * S) as f64 / 1e9,
         (BASE + (ticks - 1) * S) as f64 / 1e9,
     );
-    let QueryResult::Matrix { result } = reader.query_range(metric, start, end, 1.0).unwrap()
+    let QueryResult::Matrix { result, .. } = reader.query_range(metric, start, end, 1.0).unwrap()
     else {
         panic!("{metric}: not a matrix");
     };

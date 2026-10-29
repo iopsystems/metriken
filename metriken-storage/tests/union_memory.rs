@@ -130,7 +130,7 @@ fn batched(reader: &ArchiveReader, query: &str) -> (Points, usize) {
         .query_range_opts(query, start, end, 1.0, &QueryOptions::default())
         .unwrap();
     let peak = take_union_held_peak();
-    let QueryResult::Matrix { result } = result else {
+    let QueryResult::Matrix { result, .. } = result else {
         panic!("{query}: not a matrix");
     };
     let points = result

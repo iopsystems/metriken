@@ -26,7 +26,7 @@ fn fixture(name: &str) -> PathBuf {
 
 fn counts(result: QueryResult) -> Vec<(f64, f64)> {
     match result {
-        QueryResult::Matrix { result } => {
+        QueryResult::Matrix { result, .. } => {
             assert_eq!(result.len(), 1, "{result:?}");
             result.into_iter().next().unwrap().values
         }

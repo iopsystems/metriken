@@ -1,5 +1,5 @@
 use crate::promql::streaming::histogram::{HistogramOps, Stride};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use promql_parser::label::Matcher;
@@ -303,21 +303,106 @@ pub struct HistogramHeatmapResult {
     pub max_value: f64,
 }
 
-/// Result of a PromQL query
+/// Result of a PromQL query, with what the caller should be told about it
+/// (`notices`, absent from the JSON when there are none).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "resultType", rename_all = "camelCase")]
 pub enum QueryResult {
     #[serde(rename = "vector")]
-    Vector { result: Vec<Sample> },
+    Vector {
+        result: Vec<Sample>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
 
     #[serde(rename = "matrix")]
-    Matrix { result: Vec<MatrixSample> },
+    Matrix {
+        result: Vec<MatrixSample>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
 
     #[serde(rename = "scalar")]
-    Scalar { result: (f64, f64) }, // (timestamp, value)
+    Scalar {
+        /// `(timestamp, value)`.
+        result: (f64, f64),
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
 
     #[serde(rename = "histogram_heatmap")]
-    HistogramHeatmap { result: HistogramHeatmapResult },
+    HistogramHeatmap {
+        result: HistogramHeatmapResult,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
+}
+
+impl QueryResult {
+    /// What the caller should be told about the result.
+    pub fn notices(&self) -> &[Notice] {
+        match self {
+            QueryResult::Vector { notices, .. }
+            | QueryResult::Matrix { notices, .. }
+            | QueryResult::Scalar { notices, .. }
+            | QueryResult::HistogramHeatmap { notices, .. } => notices,
+        }
+    }
+
+    /// The notices, to add to.
+    pub fn notices_mut(&mut self) -> &mut Vec<Notice> {
+        match self {
+            QueryResult::Vector { notices, .. }
+            | QueryResult::Matrix { notices, .. }
+            | QueryResult::Scalar { notices, .. }
+            | QueryResult::HistogramHeatmap { notices, .. } => notices,
+        }
+    }
+}
+
+/// Something a query's caller should be told about its result. A later
+/// version may add kinds and add fields to a kind, but not remove or retype
+/// a field: a reader rejects a known kind whose fields do not read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Notice {
+    /// Sources of one process group hold different values for one series
+    /// at times their reads coincide (S4): the result holds one of them.
+    #[non_exhaustive]
+    Conflict {
+        /// The series' labels.
+        series: BTreeMap<String, String>,
+        /// The sources, each named by its uuid, or by its position among
+        /// the reader's sources when it has none.
+        sources: Vec<String>,
+        /// The earliest timestamp at which they differ, in Unix seconds.
+        first: f64,
+        /// How many timestamps they differ at.
+        count: u64,
+    },
+    /// A notice of a kind this version does not know, as read from JSON a
+    /// later version wrote. It keeps neither the kind nor its fields, so it
+    /// serializes as `{"kind":"unknown"}`.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Notice {
+    /// A [`Notice::Conflict`], which outside this crate is built here.
+    pub fn conflict(
+        series: BTreeMap<String, String>,
+        sources: Vec<String>,
+        first: f64,
+        count: u64,
+    ) -> Self {
+        Notice::Conflict {
+            series,
+            sources,
+            first,
+            count,
+        }
+    }
 }
 
 /// Where to read histogram `name` from for a range starting at `start_ns`:
@@ -1025,7 +1110,11 @@ impl QueryEngine {
             ..QueryOptions::default()
         };
         let result = self.query_range_opts(query_str, start, target, step, &opts)?;
-        let QueryResult::Matrix { result: samples } = result else {
+        let QueryResult::Matrix {
+            result: samples,
+            notices,
+        } = result
+        else {
             return Ok(result);
         };
         let vector: Vec<Sample> = samples
@@ -1038,7 +1127,10 @@ impl QueryEngine {
                 })
             })
             .collect();
-        Ok(QueryResult::Vector { result: vector })
+        Ok(QueryResult::Vector {
+            result: vector,
+            notices,
+        })
     }
 
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
@@ -1191,11 +1283,17 @@ impl QueryEngine {
                     &metric_name,
                     MetricKind::GaugeHistogram,
                 )?;
-                return Ok(QueryResult::Matrix { result: vec![] });
+                return Ok(QueryResult::Matrix {
+                    result: vec![],
+                    notices: Vec::new(),
+                });
             };
             let result =
                 streaming::gauge_histogram::quantiles(parts, &quantiles, &times, &metric_name);
-            return Ok(QueryResult::Matrix { result });
+            return Ok(QueryResult::Matrix {
+                result,
+                notices: Vec::new(),
+            });
         }
 
         let start_ns = range_read_start_ns(start);
@@ -1218,13 +1316,22 @@ impl QueryEngine {
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         };
         let result = stream.quantiles(&quantiles, start_ns, end_ns, stride, &metric_name);
         if result.is_empty() {
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         }
-        Ok(QueryResult::Matrix { result })
+        Ok(QueryResult::Matrix {
+            result,
+            notices: Vec::new(),
+        })
     }
 
     fn handle_histogram_heatmap(
@@ -1258,11 +1365,20 @@ impl QueryEngine {
                     &metric_name,
                     MetricKind::GaugeHistogram,
                 )?;
-                return Ok(QueryResult::Matrix { result: vec![] });
+                return Ok(QueryResult::Matrix {
+                    result: vec![],
+                    notices: Vec::new(),
+                });
             };
             return Ok(match streaming::gauge_histogram::heatmap(parts, &times) {
-                Some(result) => QueryResult::HistogramHeatmap { result },
-                None => QueryResult::Matrix { result: vec![] },
+                Some(result) => QueryResult::HistogramHeatmap {
+                    result,
+                    notices: Vec::new(),
+                },
+                None => QueryResult::Matrix {
+                    result: vec![],
+                    notices: Vec::new(),
+                },
             });
         }
 
@@ -1286,12 +1402,21 @@ impl QueryEngine {
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         };
         let result = stream.heatmap(start_ns, end_ns, stride);
         match result {
-            Some(result) => Ok(QueryResult::HistogramHeatmap { result }),
-            None => Ok(QueryResult::Matrix { result: vec![] }),
+            Some(result) => Ok(QueryResult::HistogramHeatmap {
+                result,
+                notices: Vec::new(),
+            }),
+            None => Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            }),
         }
     }
 
@@ -1323,13 +1448,22 @@ impl QueryEngine {
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         };
         let result = stream.irate(group_by.as_ref(), start_ns, end_ns, &metric_name);
         if result.is_empty() {
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         }
-        Ok(QueryResult::Matrix { result })
+        Ok(QueryResult::Matrix {
+            result,
+            notices: Vec::new(),
+        })
     }
 
     fn handle_histogram_scalar(
@@ -1364,7 +1498,10 @@ impl QueryEngine {
                     &metric_name,
                     MetricKind::GaugeHistogram,
                 )?;
-                return Ok(QueryResult::Matrix { result: vec![] });
+                return Ok(QueryResult::Matrix {
+                    result: vec![],
+                    notices: Vec::new(),
+                });
             };
             let reduce = match func {
                 "histogram_mean" => streaming::gauge_histogram::Reduce::Mean,
@@ -1378,7 +1515,10 @@ impl QueryEngine {
                 &times,
                 &metric_name,
             );
-            return Ok(QueryResult::Matrix { result });
+            return Ok(QueryResult::Matrix {
+                result,
+                notices: Vec::new(),
+            });
         }
 
         let start_ns = range_read_start_ns(start);
@@ -1401,7 +1541,10 @@ impl QueryEngine {
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         };
         let group = group_by.as_ref();
         let result = match func {
@@ -1410,9 +1553,15 @@ impl QueryEngine {
             _ => stream.count(group, start_ns, end_ns, stride, &metric_name),
         };
         if result.is_empty() {
-            return Ok(QueryResult::Matrix { result: vec![] });
+            return Ok(QueryResult::Matrix {
+                result: vec![],
+                notices: Vec::new(),
+            });
         }
-        Ok(QueryResult::Matrix { result })
+        Ok(QueryResult::Matrix {
+            result,
+            notices: Vec::new(),
+        })
     }
 
     pub fn query_range(
@@ -1555,5 +1704,105 @@ impl QueryEngine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    /// A result without notices serializes as it did before them, with no
+    /// `notices` key, and one with notices carries them; both read back.
+    #[test]
+    fn notices_are_absent_from_the_json_when_there_are_none() {
+        let plain = QueryResult::Matrix {
+            result: Vec::new(),
+            notices: Vec::new(),
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"resultType": "matrix", "result": []})
+        );
+        let read: QueryResult = serde_json::from_value(json).unwrap();
+        assert!(read.notices().is_empty());
+
+        let mut noticed = plain;
+        noticed.notices_mut().push(Notice::Conflict {
+            series: [("cpu".to_string(), "0".to_string())].into(),
+            sources: vec!["u1".into(), "u2".into()],
+            first: 12.5,
+            count: 3,
+        });
+        let json = serde_json::to_value(&noticed).unwrap();
+        assert_eq!(
+            json["notices"],
+            serde_json::json!([{
+                "kind": "conflict",
+                "series": {"cpu": "0"},
+                "sources": ["u1", "u2"],
+                "first": 12.5,
+                "count": 3
+            }])
+        );
+        let read: QueryResult = serde_json::from_value(json).unwrap();
+        assert_eq!(read.notices(), noticed.notices());
+
+        // A kind a later version wrote reads as `Unknown`, not as an error.
+        let later = serde_json::json!({
+            "resultType": "matrix",
+            "result": [],
+            "notices": [{"kind": "gap", "series": {}}]
+        });
+        let read: QueryResult = serde_json::from_value(later).unwrap();
+        assert_eq!(read.notices(), &[Notice::Unknown]);
+
+        // The display form carries the result's notices for every variant,
+        // and leaves the key out when there are none.
+        let notices = noticed.notices().to_vec();
+        for result in [
+            noticed.clone(),
+            QueryResult::Vector {
+                result: Vec::new(),
+                notices: notices.clone(),
+            },
+            QueryResult::Scalar {
+                result: (0.0, 1.0),
+                notices: notices.clone(),
+            },
+            QueryResult::HistogramHeatmap {
+                result: HistogramHeatmapResult {
+                    timestamps: Vec::new(),
+                    bucket_bounds: Vec::new(),
+                    data: Vec::new(),
+                    min_value: 0.0,
+                    max_value: 0.0,
+                },
+                notices: notices.clone(),
+            },
+        ] {
+            let display = crate::display::display_from_result(
+                result,
+                0.0,
+                1.0,
+                1.0,
+                &crate::DisplayOptions::default(),
+            );
+            assert_eq!(display.notices(), notices.as_slice());
+        }
+        let plain = crate::display::display_from_result(
+            QueryResult::Vector {
+                result: Vec::new(),
+                notices: Vec::new(),
+            },
+            0.0,
+            1.0,
+            1.0,
+            &crate::DisplayOptions::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"resultType": "vector", "result": []})
+        );
     }
 }

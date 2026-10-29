@@ -456,7 +456,7 @@ fn filled_label_case(copies: usize) {
             .query(r#"irate(cpu_cycles{arm="a",host="2"}[3s])"#, Some(end))
             .unwrap()
         {
-            metriken_query::QueryResult::Vector { result } => result.len(),
+            metriken_query::QueryResult::Vector { result, .. } => result.len(),
             other => panic!("{other:?}"),
         }
     };
@@ -607,7 +607,7 @@ fn scoped_points(r: &ArchiveReader, scope: Option<metriken_query::Scope>) -> Vec
             &opts,
         )
         .unwrap();
-    let metriken_query::QueryResult::Matrix { result } = result else {
+    let metriken_query::QueryResult::Matrix { result, .. } = result else {
         panic!("not a matrix");
     };
     result

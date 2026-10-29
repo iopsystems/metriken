@@ -70,7 +70,7 @@ fn histogram_functions_count_ticks_above_u32_max() {
     let (lo200, hi200) = bucket(200);
 
     let matrix = |r: Result<QueryResult, _>| match r.unwrap() {
-        QueryResult::Matrix { result } => result,
+        QueryResult::Matrix { result, .. } => result,
         other => panic!("expected a matrix, got {other:?}"),
     };
     let close = |a: f64, b: f64| (a - b).abs() <= b.abs() * 1e-12;
@@ -124,7 +124,7 @@ fn histogram_functions_count_ticks_above_u32_max() {
     );
     assert!(close(mean[0].values[0].1 * n, sum[0].values[0].1));
 
-    let QueryResult::HistogramHeatmap { result } = store
+    let QueryResult::HistogramHeatmap { result, .. } = store
         .query_range("histogram_heatmap(lat)", 1000.0, 1001.0, 1.0)
         .unwrap()
     else {
@@ -142,7 +142,7 @@ fn histogram_functions_count_ticks_above_u32_max() {
     assert_eq!(q[0].values, vec![(1002.0, hi200)]);
     let count = matrix(store.query_range("histogram_count(lat, 2)", 1000.0, 1002.0, 1.0));
     assert_eq!(count[0].values, vec![(1002.0, n)]);
-    let QueryResult::HistogramHeatmap { result } = store
+    let QueryResult::HistogramHeatmap { result, .. } = store
         .query_range("histogram_heatmap(lat, 2)", 1000.0, 1002.0, 1.0)
         .unwrap()
     else {

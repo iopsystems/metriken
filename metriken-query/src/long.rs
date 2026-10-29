@@ -637,7 +637,7 @@ mod reader_tests {
         let q = r
             .query("sum by (comm) (rate(cpu{comm=\"worker\"}[2s]))", Some(5.0))
             .unwrap();
-        let crate::QueryResult::Vector { result } = q else {
+        let crate::QueryResult::Vector { result, .. } = q else {
             panic!("expected a vector, got {q:?}");
         };
         assert_eq!(result.len(), 1);
@@ -721,7 +721,7 @@ mod reader_tests {
                     1.0,
                 )
                 .unwrap();
-            let crate::QueryResult::Matrix { result } = q else {
+            let crate::QueryResult::Matrix { result, .. } = q else {
                 panic!("expected a matrix, got {q:?}");
             };
             assert_eq!(result.len(), 1, "{comm}: {result:?}");

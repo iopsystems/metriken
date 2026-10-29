@@ -34,7 +34,7 @@ fn open(path: &str, pool: &std::sync::Arc<BufferPool>) -> ArchiveReader {
 /// Each series' labels (without `__occupant__`) and values to 9 significant
 /// digits, sorted.
 fn canonical(r: &metriken_query::QueryResult) -> Vec<String> {
-    let metriken_query::QueryResult::Matrix { result } = r else {
+    let metriken_query::QueryResult::Matrix { result, .. } = r else {
         return vec![format!("{r:?}")];
     };
     let mut out: Vec<String> = result

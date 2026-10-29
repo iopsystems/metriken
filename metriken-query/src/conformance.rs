@@ -2191,7 +2191,7 @@ impl Run<'_> {
                 ..self.grid(step, end)
             }
         };
-        let QueryResult::Matrix { result } = result else {
+        let QueryResult::Matrix { result, .. } = result else {
             self.fail(e, mode_name, "not a matrix".into());
             return;
         };
@@ -2381,7 +2381,7 @@ impl Run<'_> {
     /// [`World::raw_series`] cut to the range: the same series, at the same
     /// times, with the same values and bands.
     fn check_raw(&mut self, e: &E, result: QueryResult, start: u64, end: u64) {
-        let QueryResult::Matrix { result } = result else {
+        let QueryResult::Matrix { result, .. } = result else {
             self.fail(e, "raw", "not a matrix".into());
             return;
         };
@@ -2602,7 +2602,7 @@ impl Run<'_> {
                     continue;
                 }
             };
-            let QueryResult::Vector { result } = r else {
+            let QueryResult::Vector { result, .. } = r else {
                 self.fail(e, &mode, format!("{r:?}"));
                 continue;
             };
@@ -2911,7 +2911,7 @@ fn each_series_takes_its_own_tables_reach() {
     let values = |reader: &ArchiveReader, per_series: bool| -> Vec<(f64, f64)> {
         let opts = QueryOptions::default().with_per_series_rates(per_series);
         match reader.query_range_opts(q, start, end, 1.0, &opts).unwrap() {
-            QueryResult::Matrix { result } => result
+            QueryResult::Matrix { result, .. } => result
                 .into_iter()
                 .filter(|m| m.metric.get("source").map(String::as_str) == Some("a"))
                 .flat_map(|m| m.values)
@@ -2980,7 +2980,9 @@ fn a_recording_without_intervals_takes_its_own_reach() {
             .query_range_opts(r#"rate(c{source="a"}[10s])"#, start, end, 1.0, &opts)
             .unwrap()
         {
-            QueryResult::Matrix { result } => result.into_iter().flat_map(|m| m.values).collect(),
+            QueryResult::Matrix { result, .. } => {
+                result.into_iter().flat_map(|m| m.values).collect()
+            }
             other => panic!("{other:?}"),
         }
     };

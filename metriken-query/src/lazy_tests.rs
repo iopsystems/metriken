@@ -75,7 +75,7 @@ fn a_query_loads_once_and_reuses_the_result() {
         let result = reader
             .query_range("sum(rate(cpu_usage[2s]))", 3.0, 4.0, 1.0)
             .unwrap();
-        let crate::QueryResult::Matrix { result } = result else {
+        let crate::QueryResult::Matrix { result, .. } = result else {
             panic!("expected a matrix, got {result:?}");
         };
         assert_eq!(result.len(), 1);
@@ -106,7 +106,7 @@ fn evicted_or_failed_loads_answer_empty() {
         for _ in 0..2 {
             let result = reader.query_range("rate(cpu_usage[2s])", 1.0, 4.0, 1.0);
             assert!(
-                matches!(&result, Ok(crate::QueryResult::Matrix { result }) if result.is_empty()),
+                matches!(&result, Ok(crate::QueryResult::Matrix { result, .. }) if result.is_empty()),
                 "evicted={evicted}: {result:?}"
             );
         }
