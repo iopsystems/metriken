@@ -1276,7 +1276,8 @@ check`, systemslab through the `dashboard` crate).
   cost a 1 h query four times as much on a recording with many ended
   series). In each span the results come
   from the source with the finest spacing there (S9), ties going to the
-  lowest uuid, then to catalog order; where it has no result, or its rows
+  source with the earlier first row (Q16, built with S4), then the lowest
+  uuid, then catalog order; where it has no result, or its rows
   do not cover the whole window (S9), the next finest's is used. Test: a
   1 s source covering 10:00 to 10:10 and a 100 ms source covering 10:04 to
   10:05; `rate(c[10s])` at a 100 ms step returns the 100 ms source's results
@@ -1580,11 +1581,61 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   `QueryOptions` or new query methods: every variant of `QueryResult`
   carries `notices` (`DisplayResult` gained the same field at review)
   (`Notice::Conflict` the first kind), absent from the JSON when empty, a
-  breaking change rezolus takes with its upgrade. The field is built;
-  detection and Q16's value are not.
-  Until then the value at a conflict is whichever source S3's order
-  chooses, which is the finer source's and, at equal intervals, the lowest
-  uuid's rather than the earlier-starting source's.
+  breaking change rezolus takes with its upgrade. Detection is built
+  (`streaming/conflicts.rs`), as rows of one series at one time with one
+  acquisition window compared across sources, by three readers:
+  - the batched `rate`/`irate` scan of a group compares its members' rows
+    as it reads them (`batch_rate::UnionStage`), holding a row until every
+    other source's member has read past its time or ended;
+  - every other read of a group's counters and gauges goes through
+    `Recorded`, which keeps the rows read (per-series reads, counter
+    streams, scans, gauge reads) within the scope's span and from the first
+    row of any other source of the group on, for `Conflicts::notices` to
+    compare after the query; S3's context reads bypass it;
+  - the histogram combine compares members' snapshots of each series at a
+    time up to the read's end as it merges them (histogram rows carry no
+    window). Gauge histograms are not compared.
+
+  One notice per series and pair of sources, with the first time and the
+  count over every leaf of the query, is attached to the result by the
+  archive (`QueryEngine::take_notices`). The rows compared include those
+  read before the query's range (a range function's window, a selector's
+  staleness window, a histogram's previous rows), so a notice can name a
+  time no point uses. Q16's value is built as
+  the tie rule at equal spacing: the source with the earlier first row,
+  then S3's lowest uuid. Where two sources' rows interleave without
+  conflicting, the tie rule can change which rows a result uses.
+
+  Two designs came first. Re-reading each member for every leaf cost 2.1x
+  to 2.8x a leaf's time and missed the aggregated and display rate paths
+  and every histogram series after the first at a time. Keeping every row
+  read until the query ended (`Recorded` on all paths) fixed coverage and
+  cost 1.5x, but held every row of the batched scan, which had held none:
+  a 24 h, 1 s copy group of 768 series is about 5 GB for one `sum(rate)`.
+  It also reported rows read only for S3's coverage decisions and rows
+  outside a scope's span. The batched scan now compares as it streams. On
+  a group of two 40-minute sources overlapping by 20 minutes (64 counter
+  and 64 gauge series at 1 s, a 1 h query at a 15 s step, release build,
+  medians of 21 runs over two rounds on a loaded machine), detection costs
+  `rate(cpu_cycles[1m])` 5.4 to 5.5 ms against 4.8 to 5.0 ms without it,
+  and `g` 5.9 to 6.0 ms against 4.1 to 4.2 ms. The scan drops a held row
+  once every unread segment starts after it (`ScanChunk::rest_start`), so
+  it holds at most a chunk (a segment per batch thread, up to eight) of
+  each member: `comparing_sources_holds_rows_a_chunk_apart` measures 2,720
+  rows with eight threads (17 series by eight 20-row segments) for two
+  copies and for a source whose series stop at a quarter; without
+  `read_to`, a series stopping in one source held the other's rows until
+  the first source's scan ended. Where an unread segment has no timestamp
+  statistics, `rest_start` is unknown, and a row is dropped only once
+  every other source's member has read past it, ended or starts after it
+  (`CompareMember::passed`). `conflicts_match_the_edited_rows` checks the
+  notices of seeded multi-chunk groups against the edited rows, so
+  dropping a row too early fails it.
+  `Recorded` keeps 40 bytes a row, against 8 for the timestamps the
+  per-member path already holds (`Tap::take_rows`): a 24 h, 1 s group of
+  two copies with 768 series read that way keeps about 5 GB. Its rows are
+  not bounded by the end of the other sources' spans, because a live
+  archive can serve rows past the span the reader opened with.
 
 The leaf design: each leaf (`rate(x[r])`, `irate`, a bare gauge selector,
 the windowed gauge functions) over a process group is evaluated by the same

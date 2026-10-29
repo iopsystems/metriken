@@ -22,9 +22,11 @@
 //! differ the same way.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::display::BucketReducer;
 use crate::labels::Labels;
+use crate::promql::streaming::conflicts::{Conflicts, Row, SourceName};
 use crate::promql::streaming::{
     derive_group_labels, scalar_point, AggOp, BinOp, GroupBy, LabeledPoints, Point, RateEdges,
     SPACING_PROBE,
@@ -71,6 +73,9 @@ pub(crate) struct UnionPlan {
     pub series: Vec<UnionMember>,
     /// The window a point reads, for the coverage rule.
     pub window: UnionWindow,
+    /// Where conflicts between the members of a combined unit go (S4), and
+    /// the metric they are of.
+    pub conflicts: Option<(Arc<Conflicts>, String)>,
 }
 
 /// A result series of a [`UnionPlan`].
@@ -93,6 +98,9 @@ pub(crate) struct UnionMember {
     /// Its rows read before and after the scan (`Tap::context_rows`).
     pub before: Vec<u64>,
     pub after: Vec<u64>,
+    /// Its source as a conflict names it, and the source's first row; `None`
+    /// for a series whose rows are not compared.
+    pub source: Option<(SourceName, u64)>,
 }
 
 /// The window a point at `t` reads: `[t - range, t]` for `rate`, one step
@@ -167,9 +175,135 @@ pub(crate) struct UnionStage<'d> {
     /// indices with a member's point, each member's point there.
     units: Vec<StageUnit>,
     window: UnionWindow,
+    /// The comparison of combined units' rows across sources (S4).
+    compare: Option<StageCompare>,
     /// Points held now, and the most held at once.
     #[cfg(any(test, feature = "fixtures"))]
     held: (usize, usize),
+}
+
+/// Rows of a combined unit's members compared as the scan reads them. A
+/// row is held until no member of another source can still read a row at
+/// its time: each such member has read a later row of the series, has
+/// ended, or starts later; or every segment not yet read starts later
+/// (`read_to`). At most the rows of the chunks read since the earliest
+/// unread segment's start are held.
+struct StageCompare {
+    conflicts: Arc<Conflicts>,
+    metric: String,
+    /// Per unit (local): its labels.
+    labels: Vec<Labels>,
+    /// Per member series (local).
+    members: Vec<CompareMember>,
+    /// Rows held now, and the most held at once.
+    #[cfg(any(test, feature = "fixtures"))]
+    held: (usize, usize),
+}
+
+struct CompareMember {
+    /// Its source and the source's first row (0 when not known); `None`
+    /// when not compared.
+    source: Option<(SourceName, u64)>,
+    /// Its rows held for a later row of another source at the same time:
+    /// time, window and value, in time order.
+    held: VecDeque<Row>,
+    /// The time of its latest row.
+    last: Option<u64>,
+    ended: bool,
+}
+
+impl CompareMember {
+    /// Whether it holds no row at `t` that has not been read yet.
+    fn passed(&self, t: u64) -> bool {
+        self.ended
+            || self.source.as_ref().is_some_and(|(_, first)| t < *first)
+            || self.last.is_some_and(|l| l > t)
+    }
+}
+
+impl StageCompare {
+    /// Member `m`'s row at `t` of unit `unit`, whose members are `members`:
+    /// compared with the other sources' members' held rows at `t`, and held
+    /// while one of them can still read a row at `t`.
+    fn row(&mut self, unit: usize, members: &[usize], m: usize, row: Row) {
+        if self.members[m].source.is_none() {
+            return;
+        }
+        let t = row.0;
+        for &o in members {
+            if o == m || !self.compared(m, o) {
+                continue;
+            }
+            let held = &self.members[o].held;
+            let at = held.partition_point(|r| r.0 < t);
+            let differs = held
+                .range(at..)
+                .take_while(|r| r.0 == t)
+                .any(|r| r.1 == row.1 && r.2 != row.2);
+            if let (true, Some((a, _)), Some((b, _))) =
+                (differs, &self.members[m].source, &self.members[o].source)
+            {
+                let mut series = self.labels[unit].inner.clone();
+                series.insert("__name__".to_string(), self.metric.clone());
+                self.conflicts.add(series, a, b, t);
+            }
+        }
+        self.members[m].last = Some(t);
+        let open = members
+            .iter()
+            .any(|&o| o != m && self.compared(m, o) && !self.members[o].passed(t));
+        if open {
+            self.members[m].held.push_back(row);
+            #[cfg(any(test, feature = "fixtures"))]
+            {
+                self.held.0 += 1;
+                self.held.1 = self.held.1.max(self.held.0);
+            }
+        }
+        self.forget(members);
+    }
+
+    /// Whether members `a` and `b` are of different sources compared.
+    fn compared(&self, a: usize, b: usize) -> bool {
+        match (&self.members[a].source, &self.members[b].source) {
+            (Some((x, _)), Some((y, _))) => x.position != y.position,
+            _ => false,
+        }
+    }
+
+    /// Drop the held rows of `members` every other source's member has
+    /// read past.
+    fn forget(&mut self, members: &[usize]) {
+        for &m in members {
+            while let Some(&(t, _, _)) = self.members[m].held.front() {
+                let done = members
+                    .iter()
+                    .all(|&o| o == m || !self.compared(m, o) || self.members[o].passed(t));
+                if !done {
+                    break;
+                }
+                self.members[m].held.pop_front();
+                #[cfg(any(test, feature = "fixtures"))]
+                {
+                    self.held.0 -= 1;
+                }
+            }
+        }
+    }
+
+    /// Every segment not yet read starts at `t` or later: drop the rows
+    /// held before it, which no row read later can share a time with.
+    fn read_to(&mut self, t: u64) {
+        for m in &mut self.members {
+            while m.held.front().is_some_and(|r| r.0 < t) {
+                m.held.pop_front();
+                #[cfg(any(test, feature = "fixtures"))]
+                {
+                    self.held.0 -= 1;
+                }
+            }
+        }
+    }
 }
 
 struct StageUnit {
@@ -217,6 +351,31 @@ impl UnionStage<'_> {
         if let Some(t) = &mut self.tracks[m] {
             t.finish();
         }
+        if let Some(c) = &mut self.compare {
+            c.members[m].ended = true;
+            let u = self.member_unit[m] as usize;
+            c.forget(&self.units[u].members);
+        }
+    }
+
+    /// The scan has read every row before `t`.
+    fn read_to(&mut self, t: u64) {
+        if let Some(c) = &mut self.compare {
+            c.read_to(t);
+        }
+    }
+
+    /// A row of member `m`'s series the scan reads for the grid, as its
+    /// rate takes it: compared with the other sources' rows (S4).
+    fn sample(&mut self, m: usize, ts: u64, window: Option<(u64, u64)>, value: u64) {
+        let Some(c) = &mut self.compare else {
+            return;
+        };
+        let u = self.member_unit[m] as usize;
+        if !self.units[u].combine {
+            return;
+        }
+        c.row(u, &self.units[u].members, m, (ts, window, value));
     }
 
     /// A row of member `m`'s series.
@@ -319,6 +478,14 @@ thread_local! {
 
 #[cfg(any(test, feature = "fixtures"))]
 thread_local! {
+    /// The most rows each union stage dropped on this thread held at once
+    /// for comparing sources (S4), summed over the stages.
+    pub(crate) static UNION_ROWS_HELD_PEAK: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
     /// Batched reads on this thread that gave up because a series ended as
     /// silent was pushed a sample or a row afterwards.
     pub(crate) static BATCH_ABANDONED: std::cell::Cell<usize> =
@@ -329,6 +496,9 @@ thread_local! {
 impl Drop for UnionStage<'_> {
     fn drop(&mut self) {
         UNION_HELD_PEAK.with(|p| p.set(p.get() + self.held.1));
+        if let Some(c) = &self.compare {
+            UNION_ROWS_HELD_PEAK.with(|p| p.set(p.get() + c.held.1));
+        }
     }
 }
 
@@ -1346,6 +1516,7 @@ pub(crate) fn grid_rates(
                     .collect();
                 let mut member_unit = Vec::new();
                 let mut tracks = Vec::new();
+                let mut compared = Vec::new();
                 let mut ranked: Vec<(usize, usize, usize)> = Vec::new();
                 for &(s, u) in &stages[p] {
                     let ul = local[u] as usize;
@@ -1359,6 +1530,12 @@ pub(crate) fn grid_rates(
                         )
                     }));
                     ranked.push((ul, m.rank, slocal[s] as usize));
+                    compared.push(CompareMember {
+                        source: m.source.clone(),
+                        held: VecDeque::new(),
+                        last: None,
+                        ended: false,
+                    });
                 }
                 ranked.sort_unstable();
                 let mut member_slot = vec![0u32; member_unit.len()];
@@ -1374,6 +1551,20 @@ pub(crate) fn grid_rates(
                     tracks,
                     units,
                     window: plan.window,
+                    compare: plan
+                        .conflicts
+                        .as_ref()
+                        .map(|(conflicts, metric)| StageCompare {
+                            conflicts: Arc::clone(conflicts),
+                            metric: metric.clone(),
+                            labels: members[p]
+                                .iter()
+                                .map(|&u| plan.units[u].labels.clone())
+                                .collect(),
+                            members: compared,
+                            #[cfg(any(test, feature = "fixtures"))]
+                            held: (0, 0),
+                        }),
                     #[cfg(any(test, feature = "fixtures"))]
                     held: (0, 0),
                 }))
@@ -1472,6 +1663,9 @@ pub(crate) fn grid_rates(
                                 resumed.store(true, std::sync::atomic::Ordering::Relaxed);
                                 return;
                             }
+                            if let Some(stage) = sink.stage() {
+                                stage.sample(s, base, window, value);
+                            }
                             rates[s].push(
                                 Sample {
                                     ts: base,
@@ -1504,6 +1698,9 @@ pub(crate) fn grid_rates(
             }
             if let Some(stage) = sink.stage() {
                 stage.settle(rates, &grid);
+                if let Some(t) = chunk.rest_start {
+                    stage.read_to(t);
+                }
             }
         };
         run_partitions(&mut part_rates, &mut sinks, &run);

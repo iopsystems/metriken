@@ -367,11 +367,17 @@ impl QueryResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Notice {
-    /// Sources of one process group hold different values for one series
-    /// at times their reads coincide (S4): the result holds one of them.
+    /// Two sources of one process group hold a row of one series at one
+    /// time, with one acquisition window for a counter or gauge, and
+    /// different values (S4), among the rows the query read; a point using
+    /// such a row holds one of the values. The rows read
+    /// include some before the query's range (a range function's window, a
+    /// selector's staleness window, a histogram's previous rows), so the
+    /// conflicting row need not be one a point uses. Gauge histograms are
+    /// not compared.
     #[non_exhaustive]
     Conflict {
-        /// The series' labels.
+        /// The series' labels, `__name__` included.
         series: BTreeMap<String, String>,
         /// The sources, each named by its uuid, or by its position among
         /// the reader's sources when it has none.
@@ -1018,6 +1024,16 @@ impl QueryEngine {
             source,
             groups: Some(Arc::new(groups)),
         }
+    }
+
+    /// The conflicts in the rows the engine read of its process groups'
+    /// sources since the last call (S4): one notice per series and pair of
+    /// sources, whichever leaves read the rows.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    pub(crate) fn take_notices(&self) -> Vec<Notice> {
+        self.groups
+            .as_ref()
+            .map_or_else(Vec::new, |g| g.conflicts.notices())
     }
 
     /// The underlying `DataSource` this engine queries against — an `Arc`

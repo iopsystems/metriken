@@ -11,6 +11,7 @@ use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
 use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
+use crate::promql::streaming::conflicts::{Recorded, SourceName};
 use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups, Tap};
 use crate::promql::QueryEngine;
 use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
@@ -299,6 +300,23 @@ fn cross_cadence(
     Some(timestamps.into())
 }
 
+/// The first row of any source of read group `group` other than the one at
+/// `position`, the time from which that source's rows can conflict with
+/// another's (S4). A source without a known span counts from 0. The end of
+/// the other sources' spans does not bound the rows kept: a live archive
+/// can serve rows past the span the reader opened with.
+fn others_from(reader: &ArchiveReader, group: Option<usize>, position: Option<usize>) -> u64 {
+    let Some(g) = group.and_then(|g| reader.read_groups().get(g)) else {
+        return 0;
+    };
+    g.sources
+        .iter()
+        .filter(|&&p| Some(p) != position)
+        .map(|&p| reader.sources()[p].span_ns.map_or(0, |(first, _)| first))
+        .min()
+        .unwrap_or(0)
+}
+
 /// The engine a query is evaluated with: over the one recording it reaches,
 /// or over every recording it reaches as one source
 /// ([`RecordingsSource`]), each recording's series carrying its labels.
@@ -369,6 +387,9 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     // The recordings in catalog order: a source alone, or a group's members
     // and its sources ranked.
     let mut parts: Vec<Result<Arc<dyn DataSource>, Grouped>> = Vec::new();
+    // The rows the query reads of its groups' sources, and the conflicts
+    // found in them (S4).
+    let conflicts: Arc<crate::promql::streaming::conflicts::Conflicts> = Default::default();
     for (group, unit) in units {
         // A source whose process group has other sources is read by the
         // group's rules even where it alone holds the metric, so a series
@@ -400,13 +421,41 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             let (span_lo, span_hi) = span.unwrap_or((0, u64::MAX));
             let position = plan.reader.source_position(tables[0]);
             let info = position.map(|p| &plan.reader.sources()[p]);
+            // A source of a process group of several keeps the rows the
+            // query reads of it, which are compared for conflicts (S4):
+            // within the scope's span, from the first row of any other
+            // source of the group.
+            let raw = Arc::clone(&source);
+            let source: Arc<dyn DataSource> = match grouped {
+                true => Arc::new(
+                    Recorded::new(
+                        source,
+                        SourceName {
+                            position: position.unwrap_or(0),
+                            name: info
+                                .and_then(|i| i.uuid.clone())
+                                .unwrap_or_else(|| format!("source {}", position.unwrap_or(0))),
+                        },
+                        Arc::clone(&conflicts),
+                    )
+                    .keeping(
+                        others_from(plan.reader, group, position).max(span_lo),
+                        span_hi,
+                    ),
+                ),
+                false => source,
+            };
             let member = |lo: u64, hi: u64| Member {
                 source: Arc::clone(&source),
+                raw: Arc::clone(&raw),
                 lo: lo.max(span_lo),
                 hi: hi.min(span_hi),
                 uuid: info.and_then(|i| i.uuid.clone()),
                 catalog_index: info.map_or(0, |i| i.catalog_index),
                 position: position.unwrap_or(0),
+                first_ns: info
+                    .and_then(|i| i.span_ns)
+                    .map_or(u64::MAX, |(first, _)| first),
             };
             // One member per producer epoch: from its first row (the
             // epoch's `from_ts`) to the next epoch's, so no pair of rows
@@ -478,6 +527,7 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
                 children.push(Arc::new(GroupSource::new(
                     whole.into_iter().map(|(_, s, _)| s).collect(),
                     members.clone(),
+                    Arc::clone(&conflicts),
                 )));
                 ordered.push(Part::Group(members));
             }
@@ -489,7 +539,10 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     };
     Ok(Some(QueryEngine::with_groups(
         source,
-        SourceGroups { parts: ordered },
+        SourceGroups {
+            parts: ordered,
+            conflicts,
+        },
     )))
 }
 
@@ -766,7 +819,15 @@ impl MetricsSource for ArchiveReader {
                 notices: Vec::new(),
             });
         };
-        checked(engine.query_range_opts(expr, start_s, end_s, step_s, &plan.opts(opts, step_s))?)
+        let mut result = checked(engine.query_range_opts(
+            expr,
+            start_s,
+            end_s,
+            step_s,
+            &plan.opts(opts, step_s),
+        )?)?;
+        result.notices_mut().extend(engine.take_notices());
+        Ok(result)
     }
     /// Routed as [`query_range_opts`](Self::query_range_opts) is, with the
     /// same evaluation timestamps.
@@ -787,14 +848,16 @@ impl MetricsSource for ArchiveReader {
                 notices: Vec::new(),
             });
         };
-        checked_display(engine.query_range_display_opts(
+        let mut result = checked_display(engine.query_range_display_opts(
             expr,
             start_s,
             end_s,
             step_s,
             opts,
             &plan.opts(qopts, step_s),
-        )?)
+        )?)?;
+        result.notices_mut().extend(engine.take_notices());
+        Ok(result)
     }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
         let plan = Plan::new(self, expr, None)?;
@@ -812,7 +875,9 @@ impl MetricsSource for ArchiveReader {
                 notices: Vec::new(),
             });
         };
-        checked(engine.query(expr, time)?)
+        let mut result = checked(engine.query(expr, time)?)?;
+        result.notices_mut().extend(engine.take_notices());
+        Ok(result)
     }
     fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
         // Through the same labelled sources as a query, so a selector

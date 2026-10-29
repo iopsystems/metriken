@@ -458,6 +458,7 @@ fn scan_rates(
                         rank: 0,
                         before: Vec::new(),
                         after: Vec::new(),
+                        source: None,
                     });
                 }
                 scans.push(scan);
@@ -480,11 +481,11 @@ fn scan_rates(
                     std::collections::HashMap::new();
                 for (rank, (interval_ns, m)) in ranked.into_iter().enumerate() {
                     let from = data_start(m.source.as_ref());
-                    let mut scan = m.source.counter_scan(name, filter, from, request.end_ns)?;
+                    let mut scan = m.raw.counter_scan(name, filter, from, request.end_ns)?;
                     let interval = m.source.counter_interval(name);
                     let labels: Vec<crate::labels::Labels> =
                         scan.series.iter().map(|s| s.labels.clone()).collect();
-                    let tap = Tap::new(m.source.clone(), 0, u64::MAX);
+                    let tap = Tap::new(m.raw.clone(), 0, u64::MAX);
                     let (mut before, mut after) =
                         tap.context_rows(true, name, filter, (from, request.end_ns), &labels);
                     for s in &mut scan.series {
@@ -503,6 +504,14 @@ fn scan_rates(
                             rank,
                             before: before.remove(&s.labels).unwrap_or_default(),
                             after: after.remove(&s.labels).unwrap_or_default(),
+                            source: Some((
+                                m.source_name(),
+                                if m.first_ns == u64::MAX {
+                                    0
+                                } else {
+                                    m.first_ns
+                                },
+                            )),
                         });
                     }
                     scans.push(scan);
@@ -522,6 +531,7 @@ fn scan_rates(
         } else {
             crate::batch_rate::UnionWindow::Step(ctx.step_ns)
         },
+        conflicts: Some((std::sync::Arc::clone(&groups.conflicts), name.to_string())),
     };
     let request = crate::batch_rate::GridRateRequest {
         union: Some(&plan),
@@ -1583,7 +1593,7 @@ where
             };
             (s * 1e9) as u64
         };
-        // S3's rank: finest first, then the lowest uuid, then catalog order.
+        // S3's rank: finest first, then the tie rule (`Member::cmp_ties`).
         let mut ranked: Vec<(u64, &per_source::Member)> =
             members.iter().map(|m| (interval_ns(m), *m)).collect();
         ranked.sort_by(|(ia, a), (ib, b)| {
@@ -1594,7 +1604,7 @@ where
         // however far apart they are, so a narrower read can change a point.
         let mut evaluated = Vec::with_capacity(ranked.len());
         for (interval_ns, m) in ranked {
-            let tap = Tap::new(m.source.clone(), m.lo, m.hi);
+            let tap = Tap::new(m.source.clone(), m.lo, m.hi).with_context(m.raw.clone());
             let series = collect(leaf.build(&ctx.over(&tap))?);
             evaluated.push(MemberSeries::new(series, tap.take_rows(), interval_ns));
         }

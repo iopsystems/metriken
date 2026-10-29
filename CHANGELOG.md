@@ -306,13 +306,45 @@ names index below, and `HistogramRow` has a new public field.
 Requires metriken-storage 0.6.0. A minor version because metriken-query's
 public API uses metriken-storage types.
 
+- **Changed:** a query over a process group reports conflicts (S4): where
+  two of its sources hold a row of one series at one time, with one
+  acquisition window for a counter or gauge, and different values, the
+  result's `notices` (range, instant and display queries) hold one
+  `Notice::Conflict` per series and pair of sources, with the first time
+  and the count. The rows compared are those the query reads, which
+  include rows before its range (a range function's window,
+  a selector's staleness window, a histogram's previous rows), so a notice
+  can name a time no point uses. Gauge histograms are not compared.
+  Detection always runs; there is no option to turn it off.
+  - The batched `rate`/`irate` scan of a group compares rows as it reads
+    them and holds a row until no unread segment starts before it: at most
+    a chunk (up to eight segments) of each member. Where an unread segment
+    has no timestamp statistics, the scan does not know where the rest
+    starts, and a row is held until every other source's member has read
+    past its time, ended or starts after it.
+  - Other paths (sources with several producer epochs, scopes, `deriv`,
+    `idelta`, offsets, instant queries, gauges) keep the counter and gauge
+    rows they read, 40 bytes each per read of the metric, from the first
+    row of any other source of the group on, until the query ends. A 24 h,
+    1 s group of two copies with 768 series read once this way keeps about
+    5 GB.
+  - On a group of two 40-minute sources overlapping by 20 minutes, 64
+    counter and 64 gauge series at 1 s, a 1 h query at a 15 s step,
+    `rate(cpu_cycles[1m])` took 5.4 to 5.5 ms against 4.8 to 5.0 ms
+    without detection, and `g` 5.9 to 6.0 ms against 4.1 to 4.2 ms
+    (medians of 21 runs, two rounds, on a loaded machine).
+- **Changed:** where two sources of a process group have equal spacing,
+  the one with the earlier first row now answers (Q16), before the lowest
+  uuid. At a conflict the value is the earlier-starting source's, and where
+  the two sources' rows interleave without conflicting, the rows used can
+  differ from before, so a result over them can change.
 - **Breaking:** every `QueryResult` and `DisplayResult` variant has a
   field `notices: Vec<Notice>`, what the caller should be told about the
   result, absent from the JSON when empty; `notices()` and `notices_mut()`
   read and extend it, and the display form and an instant query carry the
-  result's notices. `Notice::Conflict` (sources of one process group
-  holding different values for one series where their reads coincide, S4)
-  is the first kind; nothing produces it yet. It is non-exhaustive:
+  result's notices. `Notice::Conflict` (two sources of one process group
+  holding a row of one series at one time with different values, S4) is
+  the first kind. It is non-exhaustive:
   outside metriken-query build one with `Notice::conflict` and match it
   with `..`. A notice of a kind this version does not know deserializes as
   `Notice::Unknown`. A pattern matching a result variant needs `..`, and a

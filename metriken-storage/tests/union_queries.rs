@@ -9,7 +9,7 @@
 //! (`with_per_series_rates(true)`) and the display path at full resolution.
 #![cfg(feature = "write")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -131,11 +131,16 @@ fn snapshot(ts: u64, read: &Read) -> Snapshot {
 }
 
 /// Write `specs` as the sources of a new archive at `path`, each with a
-/// fresh uuid.
+/// fresh uuid, in segments of 50 rows.
 fn write(path: &Path, specs: &[Spec]) {
+    write_sealed(path, specs, 50);
+}
+
+/// `write` in segments of `max_rows` rows.
+fn write_sealed(path: &Path, specs: &[Spec], max_rows: u64) {
     let config = WriterConfig {
         seal: SealPolicy {
-            max_rows: 50,
+            max_rows: max_rows as _,
             ..SealPolicy::default()
         },
         ..WriterConfig::default()
@@ -1847,6 +1852,371 @@ fn three_members_hand_over_without_a_cascade_gap() {
         whole.iter().all(|p| (50.0..=100.0).contains(&p.1)),
         "{windows:?}"
     );
+}
+
+/// [`cycles`], with the counter, the gauge and the histogram's high bucket
+/// one higher at 10:01:30: a copy with one row edited.
+fn cycles_edited(ts: u64) -> Read {
+    let mut read = cycles(ts);
+    if ts == at(10, 1, 30) {
+        read.counters[0].1 += 1;
+        read.gauges[0].1 += 1;
+        read.histograms[0].2 += 1;
+    }
+    read
+}
+
+/// `cycles_edited` with the edited row's acquisition window twice as long.
+fn cycles_rewindowed(ts: u64) -> Read {
+    let mut read = cycles_edited(ts);
+    if ts == at(10, 1, 30) {
+        read.window = 2 * MS;
+    }
+    read
+}
+
+/// Two sources of one process over 10:00 to 10:02 and 10:01 to 10:03, the
+/// second's rows from `read`, written until the second (later-starting)
+/// source has the lower uuid, so the lowest-uuid tie rule would choose it
+/// and only Q16's rule chooses the first.
+fn conflict_archive(dir: &Path, name: &str, read: fn(u64) -> Read) -> ArchiveReader {
+    for attempt in 0..40 {
+        let path = dir.join(format!("{attempt}-{name}"));
+        write_conflict(&path, read);
+        let reader = open(&path);
+        let uuid = |i: usize| reader.sources()[i].uuid.clone();
+        if uuid(1) < uuid(0) {
+            return reader;
+        }
+    }
+    panic!("no layout with the later source's uuid lower");
+}
+
+fn write_conflict(path: &Path, read: fn(u64) -> Read) {
+    write(
+        path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 2, 0), S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 1, 0), at(10, 3, 0), S),
+                read,
+            ),
+        ],
+    );
+}
+
+/// S4: two sources of one process holding one row of a series at one time
+/// with one acquisition window and different values give one conflict
+/// notice, naming both sources by uuid, the series, the time and the count;
+/// the value at the conflict is the earlier-starting source's (Q16), so the
+/// result is the unedited archive's. An instant query and the display form
+/// carry the notice; the unedited archive gives none.
+#[test]
+fn a_conflict_is_reported_and_the_earlier_source_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let edited = conflict_archive(dir.path(), "edited.dendro", cycles_edited);
+    let plain = conflict_archive(dir.path(), "plain.dendro", cycles);
+    assert_eq!(edited.read_groups().len(), 1);
+    let uuids: BTreeSet<String> = edited
+        .sources()
+        .iter()
+        .map(|s| s.uuid.clone().expect("a dendro source has a uuid"))
+        .collect();
+    let (s, e) = (at(10, 0, 0) as f64 / 1e9, at(10, 3, 0) as f64 / 1e9);
+    for (query, metric) in [
+        ("rate(cpu_cycles[3s])", "cpu_cycles"),
+        ("sum(rate(cpu_cycles[3s]))", "cpu_cycles"),
+        ("rate(cpu_cycles[3s]) + rate(cpu_cycles[10s])", "cpu_cycles"),
+        ("g", "g"),
+        ("avg_over_time(g[3s])", "g"),
+        ("histogram_count(latency)", "latency"),
+        ("histogram_quantile(0.5, latency)", "latency"),
+    ] {
+        let got = edited.query_range(query, s, e, 1.0).unwrap();
+        let want = plain.query_range(query, s, e, 1.0).unwrap();
+        assert!(want.notices().is_empty(), "{query}: {:?}", want.notices());
+        assert_eq!(from_matrix(got.clone()), from_matrix(want), "{query}");
+        let [notice] = got.notices() else {
+            panic!("{query}: {:?}", got.notices());
+        };
+        let metriken_query::Notice::Conflict {
+            series,
+            sources,
+            first,
+            count,
+            ..
+        } = notice
+        else {
+            panic!("{query}: {notice:?}");
+        };
+        assert_eq!(
+            series.get("__name__").map(String::as_str),
+            Some(metric),
+            "{query}"
+        );
+        assert_eq!(*first, at(10, 1, 30) as f64 / 1e9, "{query}");
+        assert_eq!(*count, 1, "{query}");
+        assert_eq!(
+            sources.iter().cloned().collect::<BTreeSet<_>>(),
+            uuids,
+            "{query}"
+        );
+    }
+    let instant = edited.query("g", Some(at(10, 1, 30) as f64 / 1e9)).unwrap();
+    assert_eq!(instant.notices().len(), 1, "{:?}", instant.notices());
+    for query in ["g", "rate(cpu_cycles[3s])", "sum(rate(cpu_cycles[3s]))"] {
+        let display = edited
+            .query_range_display_opts(
+                query,
+                s,
+                e,
+                1.0,
+                &DisplayOptions::default(),
+                &QueryOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            display.notices().len(),
+            1,
+            "{query}: {:?}",
+            display.notices()
+        );
+    }
+}
+
+/// A conflict outside what a query answers gives no notice: a range ending
+/// two seconds before it (the histogram combine reads three intervals past
+/// the end, and S3's context reads ten), one starting ten seconds after it
+/// at a 1 s step (a longer step's staleness window would reach it),
+/// instant queries before it, and a scope clipping the later source to
+/// before it. Nor do rows at one time with different windows.
+#[test]
+fn a_conflict_outside_the_answer_gives_no_notice() {
+    use metriken_query::{Scope, ScopedSource, SourceRef};
+    let dir = tempfile::tempdir().unwrap();
+    let edited = conflict_archive(dir.path(), "edited.dendro", cycles_edited);
+    let secs = |ns: u64| ns as f64 / 1e9;
+    let queries = [
+        "g",
+        "rate(cpu_cycles[3s])",
+        "sum(rate(cpu_cycles[3s]))",
+        "histogram_count(latency)",
+    ];
+    let ranges = [(at(10, 0, 0), at(10, 1, 28)), (at(10, 1, 40), at(10, 3, 0))];
+    for query in queries {
+        for (s, e) in ranges {
+            let got = edited.query_range(query, secs(s), secs(e), 1.0).unwrap();
+            assert!(
+                got.notices().is_empty(),
+                "{query} {s} {e}: {:?}",
+                got.notices()
+            );
+        }
+    }
+    for (query, t) in [("g", at(10, 1, 0)), ("rate(cpu_cycles[3s])", at(10, 1, 10))] {
+        let got = edited.query(query, Some(secs(t))).unwrap();
+        assert!(got.notices().is_empty(), "{query}: {:?}", got.notices());
+    }
+    let scope = Scope::new(vec![
+        ScopedSource::new(SourceRef::Position(0), None),
+        ScopedSource::new(SourceRef::Position(1), Some((at(10, 1, 0), at(10, 1, 20)))),
+    ])
+    .unwrap();
+    let options = QueryOptions::default().with_scope(Some(std::sync::Arc::new(scope)));
+    // Rows at one time with different windows are not compared (the
+    // histogram's rows carry no window, so it is left out).
+    let rewindowed = conflict_archive(dir.path(), "rewindowed.dendro", cycles_rewindowed);
+    for query in &queries[..3] {
+        let got = rewindowed
+            .query_range(query, secs(at(10, 0, 0)), secs(at(10, 3, 0)), 1.0)
+            .unwrap();
+        assert!(
+            got.notices().is_empty(),
+            "rewindowed {query}: {:?}",
+            got.notices()
+        );
+    }
+    for query in queries {
+        let got = edited
+            .query_range_opts(query, secs(at(10, 0, 0)), secs(at(10, 3, 0)), 1.0, &options)
+            .unwrap();
+        assert!(
+            got.notices().is_empty(),
+            "scoped {query}: {:?}",
+            got.notices()
+        );
+    }
+}
+
+/// A source with two producer epochs is read per member (one per epoch),
+/// not by the batched scan, and a conflict with another source of its group
+/// is reported there too.
+#[test]
+fn a_conflict_beside_a_restart_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("epochs.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 2, 0), S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0)), ("f", at(10, 1, 50))],
+                rows(at(10, 1, 0), at(10, 3, 0), S),
+                cycles_edited,
+            ),
+        ],
+    );
+    let reader = open(&path);
+    assert_eq!(reader.read_groups().len(), 1);
+    let (s, e) = (at(10, 0, 0) as f64 / 1e9, at(10, 3, 0) as f64 / 1e9);
+    for query in ["rate(cpu_cycles[3s])", "sum(rate(cpu_cycles[3s]))", "g"] {
+        let got = reader.query_range(query, s, e, 1.0).unwrap();
+        let [metriken_query::Notice::Conflict { first, count, .. }] = got.notices() else {
+            panic!("{query}: {:?}", got.notices());
+        };
+        assert_eq!((*first, *count), (at(10, 1, 30) as f64 / 1e9, 1), "{query}");
+    }
+}
+
+/// Seeded groups of two or three sources of one producer epoch, each over a
+/// random span, most with a hole, in segments of 2 to 13 rows (so a scan
+/// reads many chunks), with `cpu_cycles` edited at random rows: the notices of
+/// `rate`, `sum(irate)` and an offset `rate`, batched, per series and for
+/// display, are one per pair of sources whose rows at a time differ, with
+/// the first such time and their count. The batched scan drops a held row
+/// once no unread segment starts before it (`read_to`); dropping one too
+/// early loses a conflict here.
+#[test]
+fn conflicts_match_the_edited_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let secs = |ns: u64| ns as f64 / 1e9;
+    let edit = |t: u64| 1 + t % 7;
+    let mut compared = 0;
+    for case in 0..60 {
+        let sources = 2 + next(2) as usize;
+        let max_rows = 2 + next(12);
+        let mut specs = Vec::new();
+        let mut rows_of: Vec<BTreeSet<u64>> = Vec::new();
+        let mut edits_of: Vec<BTreeSet<u64>> = Vec::new();
+        for _ in 0..sources {
+            let a = next(200);
+            let b = a + 50 + next(300);
+            let hole = (next(400), next(30));
+            let rows: Vec<u64> = (a..b)
+                .filter(|s| !(hole.0..hole.0 + hole.1).contains(s))
+                .map(|s| BASE + s * S)
+                .collect();
+            let edits: BTreeSet<u64> = rows.iter().copied().filter(|_| next(25) == 0).collect();
+            rows_of.push(rows.iter().copied().collect());
+            edits_of.push(edits.clone());
+            specs.push(spec(&[("host", "a")], &[("e", BASE)], rows, move |ts| {
+                let mut read = cycles(ts);
+                if edits.contains(&ts) {
+                    read.counters[0].1 += edit(ts);
+                }
+                read
+            }));
+        }
+        let path = dir.path().join(format!("{case}.dendro"));
+        write_sealed(&path, &specs, max_rows);
+        let reader = open(&path);
+        // Sources whose rows do not overlap are not one process group.
+        if reader.read_groups().len() != 1 {
+            continue;
+        }
+        let uuid: Vec<String> = reader
+            .sources()
+            .iter()
+            .map(|s| s.uuid.clone().expect("a dendro source has a uuid"))
+            .collect();
+        // Per pair of uuids (ordered), the first conflicting time and the
+        // count.
+        let mut want: BTreeMap<(String, String), (f64, u64)> = BTreeMap::new();
+        for i in 0..sources {
+            for j in i + 1..sources {
+                let times: Vec<u64> = rows_of[i]
+                    .intersection(&rows_of[j])
+                    .copied()
+                    .filter(|t| {
+                        edits_of[i].contains(t).then(|| edit(*t))
+                            != edits_of[j].contains(t).then(|| edit(*t))
+                    })
+                    .collect();
+                if let Some(first) = times.first() {
+                    let mut pair = [uuid[i].clone(), uuid[j].clone()];
+                    pair.sort();
+                    let [a, b] = pair;
+                    want.insert((a, b), (secs(*first), times.len() as u64));
+                }
+            }
+        }
+        let got = |notices: &[metriken_query::Notice]| -> BTreeMap<(String, String), (f64, u64)> {
+            let pairs: BTreeMap<_, _> = notices
+                .iter()
+                .map(|n| match n {
+                    metriken_query::Notice::Conflict {
+                        sources,
+                        first,
+                        count,
+                        ..
+                    } => ((sources[0].clone(), sources[1].clone()), (*first, *count)),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                pairs.len(),
+                notices.len(),
+                "two notices for a pair: {notices:?}"
+            );
+            pairs
+        };
+        let (s, e) = (secs(BASE - 60 * S), secs(BASE + 700 * S));
+        for query in [
+            "rate(cpu_cycles[3s])",
+            "sum(irate(cpu_cycles[5s]))",
+            "rate(cpu_cycles[3s] offset 2s)",
+        ] {
+            for per_series in [false, true] {
+                let options = QueryOptions::default().with_per_series_rates(per_series);
+                let result = reader.query_range_opts(query, s, e, 1.0, &options).unwrap();
+                assert_eq!(
+                    got(result.notices()),
+                    want,
+                    "case {case} {query} per series {per_series}"
+                );
+            }
+            let display = DisplayOptions {
+                budget: 0,
+                ..DisplayOptions::default()
+            };
+            let result = reader
+                .query_range_display_opts(query, s, e, 1.0, &display, &QueryOptions::default())
+                .unwrap();
+            assert_eq!(got(result.notices()), want, "case {case} {query} display");
+        }
+        compared += usize::from(!want.is_empty());
+    }
+    assert!(compared > 40, "{compared} cases with a conflict");
 }
 
 /// A recording that is a group of one, read beside a process group, is its

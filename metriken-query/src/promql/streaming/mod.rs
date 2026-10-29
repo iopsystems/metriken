@@ -38,6 +38,7 @@ use crate::promql::MatrixSample;
 
 mod aggregate;
 mod binary;
+pub(crate) mod conflicts;
 pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod gauge_histogram;
