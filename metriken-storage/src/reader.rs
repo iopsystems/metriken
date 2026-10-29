@@ -132,9 +132,13 @@ fn probe_one(
         Some((interval, declared)) => (Some(interval), declared),
         None => (None, None),
     };
+    let mut probed_columns = Vec::with_capacity(probes.len());
     for bytes in probes {
         let probe = MultiParquetSource::open_bytes_with_pool(bytes.clone(), Arc::clone(pool))
             .map_err(|e| format!("probing table {sampler}: {e}"))?;
+        if known.listed.is_some() {
+            probed_columns.push(crate::segmented::SegmentColumns::of(&probe).ok());
+        }
         names.counters.extend(probe.counter_names());
         names.gauges.extend(probe.gauge_names());
         names.histograms.extend(probe.histogram_names());
@@ -144,12 +148,23 @@ fn probe_one(
             interval = Some(probe.interval());
         }
     }
+    // A probed segment's columns, read from the footer just parsed.
+    let listed = known.listed.as_ref().and_then(|listed| {
+        listed
+            .iter()
+            .map(|l| match l {
+                Listed::Probe(i) => probed_columns[*i].clone().map(Listed::Columns),
+                l => Some(l.clone()),
+            })
+            .collect()
+    });
     Ok((
         sampler.clone(),
         names,
         interval.unwrap_or(1.0),
         declared,
         *span,
+        listed,
     ))
 }
 
@@ -185,6 +200,23 @@ struct KnownNames {
     /// The first sealed segment's row cadence and declared interval, when
     /// its index gives them.
     first: Option<(f64, Option<f64>)>,
+    /// Where a listing finds each segment's columns, in segment order, the
+    /// live tail last; a segment whose names index has the same bytes as an
+    /// earlier one's is left out. `None` when a segment's columns are not
+    /// known.
+    listed: Option<Vec<Listed>>,
+}
+
+/// Where a listing finds one segment's columns
+/// ([`SegmentColumns`](crate::segmented::SegmentColumns)).
+#[derive(Clone)]
+enum Listed {
+    /// The columns frame of the segment's names index, compressed.
+    Frame(Arc<[u8]>),
+    /// The footer of the probe at this position, parsed at open.
+    Probe(usize),
+    /// Read from a footer parsed at open.
+    Columns(crate::segmented::SegmentColumns),
 }
 
 /// The row cadence and declared interval a probe of the segment `names`
@@ -242,16 +274,28 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 ///   live tail's;
 /// - the rows of its live tail that name its columns
 ///   (`crate::wal::schema_rows`), materialized alone.
+///
+/// It also gives where a listing finds each segment's columns: a names
+/// index's columns frame, or the footer of a segment it fetched. When a
+/// segment is neither (its index has no columns frame, or it was not
+/// fetched), or the table is long and has a live tail, whose materialized
+/// rows do not name every occupant, a listing builds the table's reader.
+/// So does a listing of a recording that was not complete (`complete`
+/// false), for which no columns are recorded.
 fn table_probes(
     db: &dyn Catalog,
     recording_id: i64,
     table: &str,
     sealed: &[(u64, crate::catalog::SegmentMeta)],
     long: bool,
+    complete: bool,
 ) -> Result<TableProbes, Box<dyn std::error::Error>> {
     use crate::names::Stored;
 
-    let mut known = KnownNames::default();
+    let mut known = KnownNames {
+        listed: complete.then(Vec::new),
+        ..Default::default()
+    };
     let mut probes = Vec::new();
     if !sealed.is_empty() {
         let stored: HashMap<u64, Vec<u8>> = db
@@ -275,12 +319,18 @@ fn table_probes(
                 continue;
             }
             let fetch = match crate::names::read(raw) {
-                Some(Stored::Names(names)) => match indexed_intervals(&names) {
+                Some(Stored::Names(names, columns)) => match indexed_intervals(&names) {
                     Some(intervals) => {
                         known.names.add(&names);
                         added.extend(raw);
                         if i == 0 {
                             known.first = Some(intervals);
+                        }
+                        match (columns, known.listed.as_mut()) {
+                            (Some(columns), Some(listed)) => {
+                                listed.push(Listed::Frame(columns.into()))
+                            }
+                            _ => known.listed = None,
                         }
                         false
                     }
@@ -293,11 +343,27 @@ fn table_probes(
             if fetch {
                 // By number: this runs inside the open's snapshot, where a
                 // listed number still names the listed segment.
-                probes.extend(db.segment_bytes(recording_id, table, *seq)?);
+                match db.segment_bytes(recording_id, table, *seq)? {
+                    Some(bytes) => {
+                        if let Some(listed) = known.listed.as_mut() {
+                            listed.push(Listed::Probe(probes.len()));
+                        }
+                        probes.push(bytes);
+                    }
+                    None => known.listed = None,
+                }
+            } else if !raw.is_some_and(|raw| added.contains(raw)) {
+                // Neither indexed nor read: its columns are not known.
+                known.listed = None;
             }
         }
     }
     let rows = db.live_wal(recording_id, table)?;
+    // The tail is materialized from the rows that name its columns, which
+    // in a long table do not name every occupant.
+    if long && !rows.is_empty() {
+        known.listed = None;
+    }
     let naming = crate::wal::schema_rows(table, long, &rows)?;
     let props = crate::segment_props(crate::default_compression());
     let tail = if long {
@@ -305,13 +371,26 @@ fn table_probes(
     } else {
         crate::wal::materialize_wal_tail_with(table, &naming, props)?
     };
-    probes.extend(tail.map(|t| t.bytes));
+    if let Some(tail) = tail {
+        if let Some(listed) = known.listed.as_mut() {
+            listed.push(Listed::Probe(probes.len()));
+        }
+        probes.push(tail.bytes);
+    }
     Ok((known, probes))
 }
 
 /// What a probe yields: the table's key, its metric names, its row spacing,
-/// the interval its first segment declares, and its span.
-type ProbedTable = (String, TableNames, f64, Option<f64>, Option<(u64, u64)>);
+/// the interval its first segment declares, its span, and where a listing
+/// finds its segments' columns.
+type ProbedTable = (
+    String,
+    TableNames,
+    f64,
+    Option<f64>,
+    Option<(u64, u64)>,
+    Option<Vec<Listed>>,
+);
 
 /// Where a table's segment payloads come from.
 ///
@@ -723,6 +802,15 @@ struct TableNames {
     gauge_histograms: std::collections::HashSet<String>,
 }
 
+/// The four kinds of metric a table lists.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+    GaugeHistogram,
+}
+
 impl TableNames {
     /// Add the names a segment's names index gives.
     fn add(&mut self, names: &crate::names::SegmentNames) {
@@ -839,6 +927,14 @@ pub struct SamplerReader {
     pool: Arc<BufferPool>,
     /// Built on first access, never at open.
     reader: std::sync::OnceLock<Option<TableReader>>,
+    /// Where a listing finds each segment's columns (see `table_probes`),
+    /// or `None` when a listing builds `reader`: a segment's columns are
+    /// not known, or the recording was not complete at open.
+    listed: Option<Vec<Listed>>,
+    /// The listing `listed` gives, built on the first listing; `None` when
+    /// `listed` is, a columns frame does not decode, or the relabel cannot
+    /// be read.
+    listing: std::sync::OnceLock<Option<crate::segmented::Listing>>,
     /// The state saved by the same table in a reader this one replaced (see
     /// [`ArchiveReader::reuse_from`]), taken when this table's reader is
     /// built.
@@ -994,6 +1090,73 @@ impl SamplerReader {
         }
 
         out
+    }
+
+    /// The label sets of `name`, a metric of `kind`, as the table's
+    /// reader lists them. A table of a recording complete at open, whose
+    /// segments' columns are all known (see `table_probes`), lists from them
+    /// without building its reader, so without fetching its sealed segments
+    /// (a long table reads its occupant stream). It is then listed even when
+    /// its reader would fail to build, as a damaged segment makes it do.
+    /// `None` when the table cannot be read.
+    pub(crate) fn labels(
+        &self,
+        kind: MetricKind,
+        name: &str,
+    ) -> Option<Vec<BTreeMap<String, String>>> {
+        // A reader that failed to build leaves the listing to the index,
+        // so the table is listed the same before and after a query tries it.
+        let built = matches!(self.reader.get(), Some(Some(_)));
+        if let (false, Some(listing)) = (built, self.indexed_listing()) {
+            return Some(match kind {
+                MetricKind::Counter => listing.counter_labels(name),
+                MetricKind::Gauge => listing.gauge_labels(name),
+                MetricKind::Histogram => {
+                    listing.histogram_labels(crate::histogram_stream::HistKind::Counting, name)
+                }
+                MetricKind::GaugeHistogram => {
+                    listing.histogram_labels(crate::histogram_stream::HistKind::Gauge, name)
+                }
+            });
+        }
+        let source = self.reader()?.source();
+        Some(match kind {
+            MetricKind::Counter => source.counter_labels(name),
+            MetricKind::Gauge => source.gauge_labels(name),
+            MetricKind::Histogram => source.histogram_labels(name),
+            MetricKind::GaugeHistogram => source.gauge_histogram_labels(name),
+        })
+    }
+
+    /// The listing of the segments' columns known at open, relabelled as
+    /// the reader would relabel them.
+    fn indexed_listing(&self) -> Option<&crate::segmented::Listing> {
+        self.listing
+            .get_or_init(|| {
+                let listed = self.listed.as_ref()?;
+                let previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());
+                let relabel = match self.relabel(previous.as_ref()) {
+                    Some(Ok(relabel)) => Some(relabel),
+                    Some(Err(())) => return None,
+                    None => None,
+                };
+                let columns: Vec<std::borrow::Cow<'_, crate::segmented::SegmentColumns>> = listed
+                    .iter()
+                    .map(|l| match l {
+                        Listed::Frame(frame) => {
+                            crate::names::columns(frame).map(std::borrow::Cow::Owned)
+                        }
+                        Listed::Columns(columns) => Some(std::borrow::Cow::Borrowed(columns)),
+                        // Resolved by `probe_one`.
+                        Listed::Probe(_) => None,
+                    })
+                    .collect::<Option<_>>()?;
+                Some(crate::segmented::Listing::new(
+                    columns.iter().map(|c| &**c),
+                    relabel.as_ref(),
+                ))
+            })
+            .as_ref()
     }
 
     pub fn reader(&self) -> Option<&TableReader> {
@@ -1830,6 +1993,16 @@ impl ArchiveReader {
                             &sampler,
                             &metas,
                             occupant_streams.contains(&crate::occupants::stream_of(&sampler)),
+                            // A recording not complete at open (still being
+                            // written, or stopped before it was finalized)
+                            // lists through its tables' readers, which read
+                            // the catalog as it is when they are built, as its
+                            // queries do. A complete recording lists from what
+                            // the open read: when it is evicted or compacted
+                            // after the open (possible while a reader opened
+                            // by path holds no connection), it lists as it was
+                            // until a query builds the table's reader.
+                            rec.complete,
                         )?;
                         // Nothing sealed and nothing live: the table has no rows at
                         // all, so there is nothing to open. Same skip as the eager path.
@@ -1894,7 +2067,7 @@ impl ArchiveReader {
             let recording_labels = Arc::new(rec.labels.clone());
             let mut tables = Vec::new();
             for probe in probed {
-                let (sampler, names, probed_interval, declared, span) = probe?;
+                let (sampler, names, probed_interval, declared, span, listed) = probe?;
                 // A declared interval wins over the measured one, as it
                 // does when the same segments are read from bytes
                 // (`from_in_memory`): a recording with dropped or jittered
@@ -1935,6 +2108,8 @@ impl ArchiveReader {
                     },
                     pool: Arc::clone(&pool),
                     reader: std::sync::OnceLock::new(),
+                    listed,
+                    listing: std::sync::OnceLock::new(),
                     previous: std::sync::Mutex::new(None),
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
@@ -2093,6 +2268,8 @@ impl ArchiveReader {
                     segments: SegmentSource::Bytes(segments),
                     pool: Arc::clone(&pool),
                     reader: std::sync::OnceLock::new(),
+                    listed: None,
+                    listing: std::sync::OnceLock::new(),
                     previous: std::sync::Mutex::new(None),
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
@@ -2172,26 +2349,28 @@ impl ArchiveReader {
 
     /// The label sets of counter `name`, from every table holding it, each
     /// with its recording's labels ([`series_labels`](Self::series_labels)).
+    /// A table of a recording complete at open, whose segments' columns the
+    /// open recorded (see `SamplerReader::labels`), lists without fetching
+    /// its sealed segments.
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.labeled_listing(
             |t| t.names.counters.contains(name),
-            |r| r.source().counter_labels(name),
+            MetricKind::Counter,
+            name,
         )
     }
 
     /// The label sets of gauge `name`, as [`counter_labels`](Self::counter_labels).
     pub fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.labeled_listing(
-            |t| t.names.gauges.contains(name),
-            |r| r.source().gauge_labels(name),
-        )
+        self.labeled_listing(|t| t.names.gauges.contains(name), MetricKind::Gauge, name)
     }
 
     /// The label sets of histogram `name`, as [`counter_labels`](Self::counter_labels).
     pub fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.labeled_listing(
             |t| t.names.histograms.contains(name),
-            |r| r.source().histogram_labels(name),
+            MetricKind::Histogram,
+            name,
         )
     }
 
@@ -2200,14 +2379,16 @@ impl ArchiveReader {
     pub fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.labeled_listing(
             |t| t.names.gauge_histograms.contains(name),
-            |r| r.source().gauge_histogram_labels(name),
+            MetricKind::GaugeHistogram,
+            name,
         )
     }
 
     fn labeled_listing(
         &self,
         holds: impl Fn(&SamplerReader) -> bool,
-        list: impl Fn(&TableReader) -> Vec<BTreeMap<String, String>>,
+        kind: MetricKind,
+        name: &str,
     ) -> Vec<BTreeMap<String, String>> {
         let extras = self.series_labels();
         let index = self.read_group_index();
@@ -2216,7 +2397,7 @@ impl ArchiveReader {
         let mut seen: HashSet<(usize, &str, BTreeMap<String, String>)> = HashSet::new();
         let mut out = Vec::new();
         for t in self.tables.iter().filter(|t| holds(t)) {
-            let Some(r) = t.reader() else {
+            let Some(sets) = t.labels(kind, name) else {
                 continue;
             };
             let extra = extras.of(t);
@@ -2224,7 +2405,7 @@ impl ArchiveReader {
                 .source_position(t)
                 .filter(|&p| index.groups[index.of[p]].sources.len() > 1)
                 .map(|p| index.of[p]);
-            for mut set in list(r) {
+            for mut set in sets {
                 crate::labeled::add_labels_map(&mut set, extra);
                 if let Some(g) = group {
                     if !seen.insert((g, t.sampler.as_str(), set.clone())) {

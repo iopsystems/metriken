@@ -256,14 +256,68 @@ impl IdentityMemo {
     }
 }
 
-/// What [`SegmentedSource`]'s open builds from a table's segments:
-/// the identity indexes, catalog and column locations. Cloned so a reader
-/// reopened over the same table starts from the state its predecessor had
-/// after the segments both share.
+/// One segment's columns as its footer lists them, before any relabel:
+/// what a listing of the table folds ([`Listing::fold`]). The names index
+/// (`crate::names`) stores it, so a listing can be built without the
+/// segment.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SegmentColumns {
+    #[serde(with = "columns_serde")]
+    pub counters: Vec<(String, Labels)>,
+    #[serde(with = "columns_serde")]
+    pub gauges: Vec<(String, Labels)>,
+    #[serde(with = "columns_serde")]
+    pub histograms: Vec<(String, Labels)>,
+    #[serde(with = "columns_serde")]
+    pub gauge_histograms: Vec<(String, Labels)>,
+    /// Each histogram's `(grouping_power, max_value_power)`.
+    pub histogram_configs: BTreeMap<String, (u8, u8)>,
+    pub gauge_histogram_configs: BTreeMap<String, (u8, u8)>,
+}
+
+impl SegmentColumns {
+    /// `seg`'s columns, in its schema order. An error for a segment
+    /// holding one histogram under two configs, which the segmented reader
+    /// refuses.
+    pub(crate) fn of(seg: &MultiParquetSource) -> Result<Self, Box<dyn Error>> {
+        check_histogram_configs(seg, HistKind::Counting)?;
+        check_histogram_configs(seg, HistKind::Gauge)?;
+        Ok(Self {
+            counters: seg.counter_columns(),
+            gauges: seg.gauge_columns(),
+            histograms: seg.histogram_columns_of(HistKind::Counting),
+            gauge_histograms: seg.histogram_columns_of(HistKind::Gauge),
+            histogram_configs: seg.histogram_configs_of(HistKind::Counting),
+            gauge_histogram_configs: seg.histogram_configs_of(HistKind::Gauge),
+        })
+    }
+}
+
+/// `(metric, labels)` columns, each `Labels` stored as its map.
+mod columns_serde {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::labels::Labels;
+
+    pub fn serialize<S: Serializer>(columns: &[(String, Labels)], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(columns.iter().map(|(name, labels)| (name, &labels.inner)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(String, Labels)>, D::Error> {
+        Ok(Vec::<(String, BTreeMap<String, String>)>::deserialize(d)?
+            .into_iter()
+            .map(|(name, labels)| (name, Labels::from(labels)))
+            .collect())
+    }
+}
+
+/// The series each metric of a table has, folded from its segments'
+/// columns in segment order: what answers `*_names` and `*_labels`.
 #[derive(Clone, Default)]
-struct OpenState {
-    /// One entry per segment, in store order.
-    catalog: Vec<SegmentCatalog>,
+pub(crate) struct Listing {
     /// Open-time identity indexes (see [`SeriesIdentity`]) used to splice
     /// counters/gauges/histograms in O(1) per sample instead of scanning
     /// the already-spliced accumulator.
@@ -277,6 +331,139 @@ struct OpenState {
     /// are and never listed or read with them.
     gauge_histogram_identity: SeriesIdentity,
     gauge_histogram_runs: HistogramRunIndex,
+}
+
+impl Listing {
+    /// A listing of `segments`, the columns of each of a table's segments
+    /// in order, each column presenting as `relabel` says.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    pub(crate) fn new<'a>(
+        segments: impl IntoIterator<Item = &'a SegmentColumns>,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+    ) -> Self {
+        let mut listing = Self::default();
+        let mut memo = IdentityMemo::default();
+        let mut unresolved = false;
+        for (idx, columns) in segments.into_iter().enumerate() {
+            listing.fold(idx, columns, relabel, &mut memo, &mut unresolved);
+        }
+        listing
+    }
+
+    /// Fold segment `idx`'s columns in. Sets `unresolved` for a column
+    /// naming an occupant the relabel did not describe.
+    fn fold(
+        &mut self,
+        idx: usize,
+        columns: &SegmentColumns,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+        memo: &mut IdentityMemo,
+        unresolved: &mut bool,
+    ) {
+        // Each counter and gauge column's identities, registered once per
+        // open.
+        for (kind, identity, columns) in [
+            (Kind::Counter, &mut self.counter_identity, &columns.counters),
+            (Kind::Gauge, &mut self.gauge_identity, &columns.gauges),
+        ] {
+            for (name, labels) in columns {
+                let sets = memo.presents(relabel, name, labels, unresolved);
+                if memo.register(kind, name, labels) {
+                    identity.extend(sets.of(labels).iter().map(|l| (name.clone(), l.clone())));
+                }
+            }
+        }
+        // Histograms are tracked per segment (their runs), so their sets
+        // are listed every time. Gauge histograms the same way, apart.
+        for (runs, identity, columns, configs) in [
+            (
+                &mut self.histogram_runs,
+                &mut self.histogram_identity,
+                &columns.histograms,
+                &columns.histogram_configs,
+            ),
+            (
+                &mut self.gauge_histogram_runs,
+                &mut self.gauge_histogram_identity,
+                &columns.gauge_histograms,
+                &columns.gauge_histogram_configs,
+            ),
+        ] {
+            let histogram_columns: Vec<(String, Labels)> = columns
+                .iter()
+                .flat_map(|(name, labels)| {
+                    let sets = memo.presents(relabel, name, labels, unresolved);
+                    sets.of(labels)
+                        .iter()
+                        .map(|l| (name.clone(), l.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            runs.observe(idx, configs.clone());
+            runs.observe_labels(idx, &histogram_columns);
+            identity.extend(histogram_columns);
+        }
+    }
+
+    /// The run index and series identity of the histograms of `kind`.
+    fn histogram_state(&self, kind: HistKind) -> (&HistogramRunIndex, &SeriesIdentity) {
+        match kind {
+            HistKind::Counting => (&self.histogram_runs, &self.histogram_identity),
+            HistKind::Gauge => (&self.gauge_histogram_runs, &self.gauge_histogram_identity),
+        }
+    }
+
+    pub(crate) fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.counter_identity.labels(name)
+    }
+
+    pub(crate) fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.gauge_identity.labels(name)
+    }
+
+    /// The label sets of histogram `name` of `kind`; each run's tagged
+    /// `__run__` when its configs conflict.
+    pub(crate) fn histogram_labels(
+        &self,
+        kind: HistKind,
+        name: &str,
+    ) -> Vec<BTreeMap<String, String>> {
+        let (runs, identity) = self.histogram_state(kind);
+        if runs.run_count(name) <= 1 {
+            return identity.labels(name);
+        }
+        // Conflict: surface each run's label sets tagged with `__run__` so
+        // the split is addressable (`histogram_mean(latency{__run__="1"})`).
+        // `__run__` is a RESERVED label name (see `relabel_with_run`) — a
+        // real user label with this name would otherwise be silently
+        // overwritten below.
+        let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
+        for (run, labels) in runs.run_labels.get(name).map(Vec::as_slice).unwrap_or(&[]) {
+            let mut labels = labels.clone();
+            debug_assert!(
+                !labels.contains_key("__run__"),
+                "'__run__' is a reserved label name; a real label with this name would be \
+                 silently overwritten by the run-disambiguation policy"
+            );
+            labels.insert("__run__".to_string(), run.to_string());
+            sets.push(labels);
+        }
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+}
+
+/// What [`SegmentedSource`]'s open builds from a table's segments:
+/// the identity indexes, catalog and column locations. Cloned so a reader
+/// reopened over the same table starts from the state its predecessor had
+/// after the segments both share.
+#[derive(Clone, Default)]
+struct OpenState {
+    /// One entry per segment, in store order.
+    catalog: Vec<SegmentCatalog>,
+    /// The series each metric has, which is what a listing answers.
+    listing: Listing,
     /// Merged across segments at open, last wins.
     file_metadata: HashMap<String, String>,
     /// Built at open from every segment's columns; see `column_map`.
@@ -299,26 +486,10 @@ impl OpenState {
         relabel: Option<&Arc<dyn ColumnRelabel>>,
         memo: &mut IdentityMemo,
     ) -> Result<(), Box<dyn Error>> {
-        check_histogram_configs(idx, seg, HistKind::Counting)?;
-        check_histogram_configs(idx, seg, HistKind::Gauge)?;
         let mut unresolved = false;
-        // Each counter and gauge column's identities, registered once per
-        // open.
-        for (kind, identity, columns) in [
-            (
-                Kind::Counter,
-                &mut self.counter_identity,
-                seg.counter_columns(),
-            ),
-            (Kind::Gauge, &mut self.gauge_identity, seg.gauge_columns()),
-        ] {
-            for (name, labels) in columns {
-                let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
-                if memo.register(kind, &name, &labels) {
-                    identity.extend(sets.of(&labels).iter().map(|l| (name.clone(), l.clone())));
-                }
-            }
-        }
+        let columns = SegmentColumns::of(seg).map_err(|e| format!("segment {idx}: {e}"))?;
+        self.listing
+            .fold(idx, &columns, relabel, memo, &mut unresolved);
         // Where each counter series' samples are, by segment: the
         // column, located once here so a stream can read it back
         // without a schema scan. A relabelled column feeds every series
@@ -326,7 +497,7 @@ impl OpenState {
         for col in seg.counter_column_refs() {
             let positions = memo.positions(
                 relabel,
-                &self.counter_identity,
+                &self.listing.counter_identity,
                 &col.name,
                 &col.labels,
                 &mut unresolved,
@@ -355,35 +526,6 @@ impl OpenState {
                 });
             }
         }
-        // Histograms are tracked per segment (their runs), so their sets
-        // are listed every time. Gauge histograms the same way, apart.
-        for (kind, runs, identity) in [
-            (
-                HistKind::Counting,
-                &mut self.histogram_runs,
-                &mut self.histogram_identity,
-            ),
-            (
-                HistKind::Gauge,
-                &mut self.gauge_histogram_runs,
-                &mut self.gauge_histogram_identity,
-            ),
-        ] {
-            let histogram_columns: Vec<(String, Labels)> = seg
-                .histogram_columns_of(kind)
-                .into_iter()
-                .flat_map(|(name, labels)| {
-                    let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
-                    sets.of(&labels)
-                        .iter()
-                        .map(|l| (name.clone(), l.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            runs.observe(idx, seg.histogram_configs_of(kind));
-            runs.observe_labels(idx, &histogram_columns);
-            identity.extend(histogram_columns);
-        }
         for (metric, cols) in seg.column_map() {
             // Mirror the run tagging `histogram_stream` and
             // `histogram_labels` apply. `QueryEngine::columns` requires
@@ -402,9 +544,10 @@ impl OpenState {
             // never user-visible series labels (that is `histogram_labels`,
             // which still only tags an actual conflict).
             let run = self
+                .listing
                 .histogram_runs
                 .segment_run(&metric, idx)
-                .or_else(|| self.gauge_histogram_runs.segment_run(&metric, idx));
+                .or_else(|| self.listing.gauge_histogram_runs.segment_run(&metric, idx));
             let entry = self.column_map.entry(metric.clone()).or_default();
             for (labels, col) in cols {
                 let sets = memo.presents(relabel, &metric, &labels, &mut unresolved);
@@ -532,7 +675,6 @@ impl SegmentCache {
 /// Reads parquet field metadata only (via
 /// [`MultiParquetSource::histogram_config_variants`]) — no row-group decode.
 fn check_histogram_configs(
-    idx: usize,
     segment: &MultiParquetSource,
     kind: HistKind,
 ) -> Result<(), Box<dyn Error>> {
@@ -544,7 +686,7 @@ fn check_histogram_configs(
                 .collect::<Vec<_>>()
                 .join(" and ");
             return Err(format!(
-                "segment {idx} has multiple histogram columns for metric '{name}' under \
+                "metric '{name}' has multiple histogram columns under \
                  different configs ({detail}); ParquetSource::histogram_stream decodes \
                  every column for a metric name under ONE shared config, so these buckets \
                  cannot be separated within a single segment"
@@ -929,8 +1071,8 @@ impl SegmentedSource {
                         "every segment of the table was gone by the time it was opened".into(),
                     );
                 }
-                state.histogram_runs.report();
-                state.gauge_histogram_runs.report();
+                state.listing.histogram_runs.report();
+                state.listing.gauge_histogram_runs.report();
                 let state = Arc::new(state);
                 if !keys.is_empty() && keys.len() == store.len() {
                     sealed = Some(Arc::clone(&state));
@@ -1025,7 +1167,7 @@ impl SegmentedSource {
         {
             return None;
         }
-        let order = self.state.counter_identity.order(name);
+        let order = self.state.listing.counter_identity.order(name);
         let table = self.state.counter_columns.get(name)?;
 
         // The series read, and per segment which column (and occupant, in a
@@ -1451,13 +1593,7 @@ fn splice_histogram_streams(
 impl SegmentedSource {
     /// The run index and series identity of the histograms of `kind`.
     fn histogram_state(&self, kind: HistKind) -> (&HistogramRunIndex, &SeriesIdentity) {
-        match kind {
-            HistKind::Counting => (&self.state.histogram_runs, &self.state.histogram_identity),
-            HistKind::Gauge => (
-                &self.state.gauge_histogram_runs,
-                &self.state.gauge_histogram_identity,
-            ),
-        }
+        self.state.listing.histogram_state(kind)
     }
 
     /// [`DataSource::histogram_stream`] for the histograms of `kind`.
@@ -1526,33 +1662,6 @@ impl SegmentedSource {
         let spliced = splice_histogram_streams(name, identity, streams)?;
         Some(relabel_with_run(spliced, want_run))
     }
-
-    /// [`DataSource::histogram_labels`] for the histograms of `kind`.
-    fn histogram_labels_of(&self, kind: HistKind, name: &str) -> Vec<BTreeMap<String, String>> {
-        let (runs, identity) = self.histogram_state(kind);
-        if runs.run_count(name) <= 1 {
-            return identity.labels(name);
-        }
-        // Conflict: surface each run's label sets tagged with `__run__` so
-        // the split is addressable (`histogram_mean(latency{__run__="1"})`).
-        // `__run__` is a RESERVED label name (see `relabel_with_run`) — a
-        // real user label with this name would otherwise be silently
-        // overwritten below.
-        let mut sets: Vec<BTreeMap<String, String>> = Vec::new();
-        for (run, labels) in runs.run_labels.get(name).map(Vec::as_slice).unwrap_or(&[]) {
-            let mut labels = labels.clone();
-            debug_assert!(
-                !labels.contains_key("__run__"),
-                "'__run__' is a reserved label name; a real label with this name would be \
-                 silently overwritten by the run-disambiguation policy"
-            );
-            labels.insert("__run__".to_string(), run.to_string());
-            sets.push(labels);
-        }
-        sets.sort();
-        sets.dedup();
-        sets
-    }
 }
 
 impl DataSource for SegmentedSource {
@@ -1578,7 +1687,7 @@ impl DataSource for SegmentedSource {
         // used to do (see `SeriesIdentity`). A label-filtered query simply
         // leaves the non-matching slots `None`, dropped by `flatten()`
         // below — same outcome as before, just not by linear search.
-        let order = self.state.counter_identity.order(name);
+        let order = self.state.listing.counter_identity.order(name);
         if order.is_empty() {
             return None;
         }
@@ -1593,7 +1702,12 @@ impl DataSource for SegmentedSource {
                 .into_iter()
                 .flat_map(|c| relabel_counter(self.relabel.as_deref(), name, filter, c))
             {
-                match self.state.counter_identity.position(name, &c.labels) {
+                match self
+                    .state
+                    .listing
+                    .counter_identity
+                    .position(name, &c.labels)
+                {
                     Some(pos) => match &mut slots[pos] {
                         Some(a) => merge_counter(a, c),
                         slot => *slot = Some(c),
@@ -1628,7 +1742,7 @@ impl DataSource for SegmentedSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<Vec<crate::CounterStream<'s>>> {
-        let order = self.state.counter_identity.order(name);
+        let order = self.state.listing.counter_identity.order(name);
         if order.is_empty() {
             return None;
         }
@@ -1706,7 +1820,7 @@ impl DataSource for SegmentedSource {
     }
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
-        let order = self.state.gauge_identity.order(name);
+        let order = self.state.listing.gauge_identity.order(name);
         if order.is_empty() {
             return None;
         }
@@ -1721,7 +1835,7 @@ impl DataSource for SegmentedSource {
                 .into_iter()
                 .flat_map(|g| relabel_gauge(self.relabel.as_deref(), name, filter, g))
             {
-                match self.state.gauge_identity.position(name, &g.labels) {
+                match self.state.listing.gauge_identity.position(name, &g.labels) {
                     Some(pos) => match &mut slots[pos] {
                         Some(a) => merge_gauge(a, g),
                         slot => *slot = Some(g),
@@ -1785,35 +1899,37 @@ impl DataSource for SegmentedSource {
     }
 
     fn counter_names(&self) -> Vec<String> {
-        self.state.counter_identity.names()
+        self.state.listing.counter_identity.names()
     }
 
     fn gauge_names(&self) -> Vec<String> {
-        self.state.gauge_identity.names()
+        self.state.listing.gauge_identity.names()
     }
 
     fn histogram_names(&self) -> Vec<String> {
-        self.state.histogram_identity.names()
+        self.state.listing.histogram_identity.names()
     }
 
     fn gauge_histogram_names(&self) -> Vec<String> {
-        self.state.gauge_histogram_identity.names()
+        self.state.listing.gauge_histogram_identity.names()
     }
 
     fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.state.counter_identity.labels(name)
+        self.state.listing.counter_labels(name)
     }
 
     fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.state.gauge_identity.labels(name)
+        self.state.listing.gauge_labels(name)
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.histogram_labels_of(HistKind::Counting, name)
+        self.state
+            .listing
+            .histogram_labels(HistKind::Counting, name)
     }
 
     fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
-        self.histogram_labels_of(HistKind::Gauge, name)
+        self.state.listing.histogram_labels(HistKind::Gauge, name)
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {
@@ -2226,5 +2342,38 @@ mod internal_tests {
 
         // A name with a single config anywhere is not a conflict.
         assert_eq!(index.run_count("no_such_metric"), 1);
+    }
+
+    /// A listing of the segments' columns lists a histogram's runs as the
+    /// segmented source does.
+    #[test]
+    fn a_listing_of_segment_columns_tags_runs() {
+        let n2 = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let n3 = ::histogram::Config::new(3, 8).unwrap().total_buckets();
+        let segments = vec![
+            segment_histogram("latency", 2, 8, &[(1_000_000_000, vec![0u64; n2])]),
+            segment_histogram("latency", 3, 8, &[(2_000_000_000, vec![0u64; n3])]),
+        ];
+        let columns: Vec<SegmentColumns> = segments
+            .iter()
+            .map(|bytes| {
+                let seg = MultiParquetSource::open_bytes_with_pool(
+                    bytes.clone(),
+                    BufferPool::new(64 * 1024 * 1024),
+                )
+                .unwrap();
+                SegmentColumns::of(&seg).unwrap()
+            })
+            .collect();
+        let listing = Listing::new(&columns, None);
+        let source = SegmentedSource::open_with_pool(
+            Arc::new(InMemorySegments::new(segments)),
+            BufferPool::new(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let listed = listing.histogram_labels(HistKind::Counting, "latency");
+        assert_eq!(listed, source.histogram_labels("latency"));
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|l| l.contains_key("__run__")));
     }
 }
