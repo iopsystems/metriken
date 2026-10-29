@@ -3011,7 +3011,8 @@ written by the new dendro.
      see them; `ArchiveReader::open_read_groups_overlaid` and its bytes
      variant take one. A kind selector (O5's "a kind and labels") is the
      `dashboard` crate's to resolve, since kind is its derivation (O3): it
-     selects by uuid or by `__producer__` and labels.
+     resolves a kind to uuids, or selects on `__producer__` where the source
+     stores it.
    - In metriken-query the scope input (D1), resolving to process groups,
      then the template evaluation rule, for the producer and registry
      layers.

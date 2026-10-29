@@ -7,7 +7,13 @@
 //! It is applied where the catalog reports each source's labels
 //! ([`LabelOverlay::catalog`]), so everything the reader derives from them
 //! (read groups, `__recording__`, query routing, listings) sees the overlaid
-//! labels. Open an archive with one through
+//! labels. Labels are set per source: a read group carries each key some of
+//! its sources carry ([`crate::process::read_groups`]), so removing a key
+//! from some sources of a group leaves it on the group; select a source's
+//! copies by uuid to remove it from all of them. The readers' labels,
+//! `ArchiveReader::sources` included, are the overlaid ones, so a write to
+//! the archive takes a source's labels from the archive, not from a reader.
+//! Open an archive with one through
 //! [`ArchiveReader::open_read_groups_overlaid`](crate::ArchiveReader::open_read_groups_overlaid),
 //! or wrap a [`Catalog`] for [`ArchiveReader::from_catalog`](crate::ArchiveReader::from_catalog).
 
@@ -19,12 +25,15 @@ use crate::labels::Labels;
 
 /// Which sources an [`OverlayEntry`] applies to.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourceSelector {
     /// The source with this uuid, and its copies, which keep it.
     Uuid(String),
     /// The sources whose labels, as the archive stores them, `Labels::matches`
-    /// this filter (one matcher per label: `v`, `~v` for `=~`, `!v` for `!=`
-    /// and `!~`).
+    /// this filter: one matcher per label, `v` for `=`, `~v` for `=~`, `!v`
+    /// for `!=` and `!~`. A value containing `|` is a list of literal
+    /// alternatives, `\.` is a literal `.`, a value under `=` cannot start
+    /// with `!` or `~`, and `k=v` does not match a source without `k`.
     Matching(Labels),
 }
 
@@ -47,15 +56,27 @@ impl LabelOverlay {
     /// An overlay of `entries`, applied in order: where two entries select
     /// one source and set one key, the later wins. Every selector is decided
     /// on the labels the archive stores, not on what an earlier entry set.
-    /// An error for an entry setting `__recording__`, which the reader
-    /// assigns.
+    /// An error for an entry that sets or removes a label the reader or the
+    /// engine assigns (`__name__`, `__run__`, `__occupant__`,
+    /// `__recording__`) or one under `metriken.`, which the identity layers
+    /// refuse.
     pub fn new(entries: Vec<OverlayEntry>) -> Result<Self, String> {
+        const ASSIGNED: [&str; 4] = [
+            "__name__",
+            "__run__",
+            crate::long::OCCUPANT_LABEL,
+            crate::labeled::RECORDING_LABEL,
+        ];
         for entry in &entries {
-            if entry.labels.contains_key(crate::labeled::RECORDING_LABEL) {
-                return Err(format!(
-                    "an overlay entry sets {}, which the reader assigns",
-                    crate::labeled::RECORDING_LABEL
-                ));
+            for key in entry.labels.keys() {
+                if ASSIGNED.contains(&key.as_str())
+                    || key.starts_with(crate::layers::RESERVED_PREFIX)
+                {
+                    return Err(format!(
+                        "an overlay entry sets or removes {key}, which an overlay may not \
+                         change"
+                    ));
+                }
             }
         }
         Ok(Self { entries })
@@ -245,12 +266,26 @@ mod tests {
         assert_eq!(overlay.apply(&other, Some("u2")), other);
     }
 
+    /// An entry setting or removing a label the reader or engine assigns,
+    /// or one under `metriken.`, is refused; `__producer__` is not.
     #[test]
-    fn an_entry_setting_recording_is_refused() {
-        let refused = LabelOverlay::new(vec![entry(
-            SourceSelector::Uuid("u".into()),
-            &[(crate::labeled::RECORDING_LABEL, "1")],
-        )]);
-        assert!(refused.is_err());
+    fn an_entry_changing_an_assigned_label_is_refused() {
+        let new = |key: &str, value: &str| {
+            LabelOverlay::new(vec![entry(
+                SourceSelector::Uuid("u".into()),
+                &[(key, value)],
+            )])
+        };
+        for key in [
+            "__name__",
+            "__run__",
+            "__occupant__",
+            "__recording__",
+            "metriken.x",
+        ] {
+            assert!(new(key, "1").is_err(), "{key}");
+            assert!(new(key, "").is_err(), "{key} removed");
+        }
+        assert!(new("__producer__", "p").is_ok());
     }
 }
