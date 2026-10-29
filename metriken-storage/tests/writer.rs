@@ -382,8 +382,8 @@ fn long_and_wide_answer_the_same_after_eviction() {
 
 /// A complete recording whose long table still has WAL rows, as a copy
 /// marked complete while its source was being written: the long table lists
-/// through its reader, since its materialized tail does not name every
-/// occupant; the wide tables list from the names indexes.
+/// through its reader, because a long table's materialized tail need not
+/// name every occupant; the wide tables list from the names indexes.
 #[test]
 fn a_complete_long_table_with_a_live_tail_lists_through_its_reader() {
     let dir = tempfile::tempdir().unwrap();

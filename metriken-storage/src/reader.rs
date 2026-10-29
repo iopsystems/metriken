@@ -1993,6 +1993,15 @@ impl ArchiveReader {
                             &sampler,
                             &metas,
                             occupant_streams.contains(&crate::occupants::stream_of(&sampler)),
+                            // A recording not complete at open (still being
+                            // written, or stopped before it was finalized)
+                            // lists through its tables' readers, which read
+                            // the catalog as it is when they are built, as its
+                            // queries do. A complete recording lists from what
+                            // the open read: when it is evicted or compacted
+                            // after the open (possible while a reader opened
+                            // by path holds no connection), it lists as it was
+                            // until a query builds the table's reader.
                             rec.complete,
                         )?;
                         // Nothing sealed and nothing live: the table has no rows at
@@ -2059,12 +2068,6 @@ impl ArchiveReader {
             let mut tables = Vec::new();
             for probe in probed {
                 let (sampler, names, probed_interval, declared, span, listed) = probe?;
-                // A recording not complete at open (still being written, or
-                // stopped before it was finalized) lists through its tables'
-                // readers, which read the catalog as it is when they are
-                // built, as its queries do. A complete recording is not
-                // written again while this reader is open, except by a
-                // dendro writer that resumes it, which this crate does not do.
                 // A declared interval wins over the measured one, as it
                 // does when the same segments are read from bytes
                 // (`from_in_memory`): a recording with dropped or jittered
