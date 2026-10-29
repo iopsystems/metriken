@@ -431,6 +431,125 @@ fn a_damaged_segment_lists_the_same_before_and_after_a_query() {
     assert_eq!(listings(&reader), before);
 }
 
+/// Two sources recorded with the same labels, finalized.
+fn record_twins(path: &Path) {
+    let mut writer = ArchiveWriter::create(path, WriterConfig::default()).unwrap();
+    let labels: BTreeMap<String, String> = [("source".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let mut a = writer
+        .add_source(labels.clone(), BTreeMap::new(), BASE)
+        .unwrap();
+    let mut b = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    for t in 0..TICKS {
+        let staged = vec![
+            a.stage(&snapshot(t), BASE + t * S, 0).unwrap(),
+            b.stage(&snapshot(t), BASE + t * S, 0).unwrap(),
+        ];
+        writer.commit(staged).unwrap();
+    }
+    a.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+    b.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+    writer.join().unwrap();
+}
+
+/// An open-time overlay sets labels on the sources it selects, by uuid or
+/// by their stored labels, and everything the reader derives sees them:
+/// twins given distinct labels are no longer told apart by `__recording__`,
+/// a query selects on an overlaid label, and listings carry it. The archive
+/// is not changed.
+#[test]
+fn an_overlay_labels_the_sources_it_selects() {
+    use metriken_storage::overlay::{LabelOverlay, OverlayEntry, SourceSelector};
+    use metriken_storage::Catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("twins.dendro");
+    record_twins(&path);
+    let uuids: Vec<String> = DendroCatalog::open(&path)
+        .unwrap()
+        .sources_with_uuids()
+        .unwrap()
+        .into_iter()
+        .map(|(_, uuid)| uuid.expect("a dendro source has a uuid"))
+        .collect();
+    assert_eq!(uuids.len(), 2);
+    let entry = |selector, pairs: &[(&str, &str)]| OverlayEntry {
+        selector,
+        labels: pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let overlay = Arc::new(
+        LabelOverlay::new(vec![
+            entry(
+                SourceSelector::Matching(metriken_storage::Labels::from(BTreeMap::from([(
+                    "source".to_string(),
+                    "test".to_string(),
+                )]))),
+                &[("arm", "a")],
+            ),
+            entry(SourceSelector::Uuid(uuids[1].clone()), &[("arm", "b")]),
+        ])
+        .unwrap(),
+    );
+    let pool = BufferPool::new(64 * 1024 * 1024);
+    let opened = |overlay: Option<Arc<LabelOverlay>>| {
+        ArchiveReader::flatten(
+            ArchiveReader::open_read_groups_overlaid(&path, Arc::clone(&pool), overlay)
+                .unwrap()
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect(),
+            None,
+        )
+    };
+
+    // Without the overlay the two are twins, told apart by `__recording__`.
+    let plain = opened(None);
+    let sets = plain.gauge_labels("mem_free");
+    assert_eq!(sets.len(), 2);
+    assert!(sets
+        .iter()
+        .all(|s| s.contains_key("__recording__") && !s.contains_key("arm")));
+
+    // An archive opened from bytes takes the overlay the same way.
+    let from_bytes = ArchiveReader::flatten(
+        ArchiveReader::open_read_groups_from_bytes_overlaid(
+            std::fs::read(&path).unwrap(),
+            Arc::clone(&pool),
+            Some(Arc::clone(&overlay)),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect(),
+        None,
+    );
+    let mut from_bytes = from_bytes.gauge_labels("mem_free");
+    from_bytes.sort();
+
+    let overlaid = opened(Some(overlay));
+    let mut sets = overlaid.gauge_labels("mem_free");
+    sets.sort();
+    let arms: Vec<_> = sets.iter().map(|s| s.get("arm").cloned()).collect();
+    assert_eq!(arms, vec![Some("a".to_string()), Some("b".to_string())]);
+    assert!(sets.iter().all(|s| !s.contains_key("__recording__")));
+    assert_eq!(from_bytes, sets);
+    let (only_b, _) = answer(&overlaid, r#"mem_free{arm="b"}"#, 0).unwrap();
+    assert_eq!(only_b.len(), 1);
+    assert!(only_b[0].0.contains(&("arm".to_string(), "b".to_string())));
+
+    // The archive still stores no `arm`.
+    assert!(DendroCatalog::open(&path)
+        .unwrap()
+        .sources()
+        .unwrap()
+        .iter()
+        .all(|s| !s.labels.contains_key("arm")));
+}
+
 /// Metadata patched during a recording reads back with the source, merged
 /// into what it started with: live after a sync, and after finalize.
 #[test]

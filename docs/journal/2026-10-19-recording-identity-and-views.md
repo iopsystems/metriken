@@ -3001,8 +3001,18 @@ written by the new dendro.
      coverage rule) and S5 to S8: each source evaluated alone and the
      results combined per series per span, never a delta across sources.
      Needs: the process groups above; prerequisite for case 3.
-   - In metriken-query the open-time label overlay (O5), a generic caller
-     API, as an argument to the archive open (Q37).
+   - The open-time label overlay (O5), a generic caller API, as an
+     argument to the archive open (Q37). Built in metriken-storage, where
+     the archive open is (metriken-query queries the `ArchiveReader` it
+     returns): `overlay::LabelOverlay`, entries of a selector (a source's
+     uuid, or matchers on its stored labels) and labels to set or remove,
+     applied in order by a `Catalog` wrapper where the catalog reports a
+     source's labels, so read groups, `__recording__`, routing and listings
+     see them; `ArchiveReader::open_read_groups_overlaid` and its bytes
+     variant take one. A kind selector (O5's "a kind and labels") is the
+     `dashboard` crate's to resolve, since kind is its derivation (O3): it
+     resolves a kind to uuids, or selects on `__producer__` where the source
+     stores it.
    - In metriken-query the scope input (D1), resolving to process groups,
      then the template evaluation rule, for the producer and registry
      layers.
