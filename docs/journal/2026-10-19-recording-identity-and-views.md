@@ -1560,7 +1560,20 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   group's histogram interval is its coarsest member's, so the read starts
   early enough for that member's first pair. Members of different bucket
   configurations fall back to the one source covering the most of the
-  read. Gauge histograms still read the latest row of any source.
+  read. Gauge histograms still read the latest row of any source. The
+  combine streams (the PR after #340): a first pass reads
+  each member's row times and decides the pairs, and a second reads the
+  members again, merged in time, yielding rows as they come; it holds the
+  row times, the decisions and one snapshot per member and series, and acts
+  on a row only where its time is the one the first pass read, so a
+  member whose second read differs (a sealed segment evicted between
+  them) loses its pairs of a series from the first row that differs, with
+  a warning, rather than adding a change twice. Measured
+  (release, one histogram of 1000 values a row at 1 s over 1 h; a group of
+  two 40 min sources overlapping 20 min, against one 1 h source; one run
+  each, warm): peak RSS 79.8 MB streaming, 126.9 MB holding every row,
+  70.6 MB for the one source; `histogram_quantile` 28 ms both ways (9.5 ms
+  for the one source).
 - 2c: S4: conflict detection, the warnings channel on query results (an
   API change; `QueryResult` has none today), and Q16's value at a conflict.
   Until then the value at a conflict is whichever source S3's order
