@@ -299,6 +299,13 @@ names index below.
 Requires metriken-storage 0.6.0. A minor version because metriken-query's
 public API uses metriken-storage types.
 
+- **Added:** `Scope` and `QueryOptions::with_scope`: the sources a query
+  reads, each named by uuid (a source and its copies) or by position among
+  `ArchiveReader::sources`, with an optional span. An `ArchiveReader` query
+  reads only the named sources' tables, within each process group unions
+  only the named sources, and reads a source's rows within its span; a
+  metric only unnamed sources hold gives an empty result. Any other source
+  refuses a query carrying a scope (`QueryError::Unsupported`).
 - **Added:** `MetricsSource::counter_labels_matching` and its gauge,
   histogram and gauge histogram siblings, and `label_values_matching`: a
   metric's label sets, or one key's values, among the series a filter

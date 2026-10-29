@@ -592,3 +592,79 @@ fn a_file_replaced_after_the_open_is_not_read() {
         .query_range("sum(irate(cpu_cycles[3s]))", start, end, 1.0)
         .unwrap();
 }
+
+/// The timestamps, in seconds after `BASE`, at which `sum(irate(...))` has a
+/// value over `[0 s, 30 s]` under `scope`.
+fn scoped_points(r: &ArchiveReader, scope: Option<metriken_query::Scope>) -> Vec<u64> {
+    let opts = metriken_query::QueryOptions::default().with_scope(scope.map(std::sync::Arc::new));
+    let start = BASE as f64 / 1e9;
+    let result = r
+        .query_range_opts(
+            "sum(irate(cpu_cycles[3s]))",
+            start,
+            start + 30.0,
+            1.0,
+            &opts,
+        )
+        .unwrap();
+    let metriken_query::QueryResult::Matrix { result } = result else {
+        panic!("not a matrix");
+    };
+    result
+        .iter()
+        .flat_map(|m| m.values.iter().map(|(t, _)| (*t - start).round() as u64))
+        .collect()
+}
+
+/// A scope reads only the sources it names: within a process group of two
+/// sources it unions only the named one (S1), by position or by uuid, and a
+/// span keeps a source's rows within it. A scope naming no source holding
+/// the metric reads nothing.
+#[test]
+fn a_scope_reads_only_the_sources_it_names() {
+    use metriken_query::{Scope, ScopedSource, SourceRef};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.dendro");
+    write(&path, &[epoch("e1", 0..20), epoch("e1", 10..30)]);
+    let mut opened = groups(&path);
+    assert_eq!(opened.len(), 1, "one process group");
+    let (_, reader) = opened.remove(0);
+    assert_eq!(reader.sources().len(), 2);
+    let scope = |entries: Vec<(SourceRef, Option<(u64, u64)>)>| {
+        Some(
+            Scope::new(
+                entries
+                    .into_iter()
+                    .map(|(source, span)| ScopedSource { source, span })
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    };
+
+    let all = scoped_points(&reader, None);
+    assert!(
+        all.first() <= Some(&1) && all.last() >= Some(&29),
+        "{all:?}"
+    );
+    let first = scoped_points(&reader, scope(vec![(SourceRef::Position(0), None)]));
+    assert!(first.last() <= Some(&19) && !first.is_empty(), "{first:?}");
+    let uuid = reader.sources()[1]
+        .uuid
+        .clone()
+        .expect("a dendro source has a uuid");
+    let second = scoped_points(&reader, scope(vec![(SourceRef::Uuid(uuid), None)]));
+    assert!(second.first() >= Some(&10), "{second:?}");
+    assert_eq!(second.last(), all.last());
+
+    let span = (BASE + 5 * S, BASE + 12 * S);
+    let clipped = scoped_points(&reader, scope(vec![(SourceRef::Position(0), Some(span))]));
+    assert!(
+        !clipped.is_empty() && clipped.iter().all(|t| (5..=12).contains(t)),
+        "{clipped:?}"
+    );
+
+    let none = scoped_points(&reader, scope(vec![(SourceRef::Position(7), None)]));
+    assert!(none.is_empty());
+}
