@@ -537,11 +537,12 @@ fn combine_histograms(
         .map(|m| ((m.source.histogram_interval(name) * 1e9) as u64, m))
         .collect();
     ranked.sort_by(|(ia, a), (ib, b)| ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo)));
-    // Each member's rows, by series, read one coarsest interval past the
-    // read's end, so a member's run does not seem to end at it: a pair
+    // Each member's rows, by series, read two coarsest intervals past the
+    // read's end (as the read starts two intervals back), so a member's run
+    // does not seem to end at it: a pair
     // ending past `end_ns` decides which pairs before it are taken and is
     // then left out.
-    let past = end_ns.saturating_add(ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
+    let past = end_ns.saturating_add(2 * ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
     let mut config = None;
     let mut series: Vec<Labels> = Vec::new();
     let mut index: HashMap<Labels, usize> = HashMap::new();
@@ -591,14 +592,24 @@ fn combine_histograms(
             .map(|r| runs(&of(r).iter().map(|(t, _)| *t).collect::<Vec<_>>()))
             .collect();
         // The pairs taken, `(prev, t, member, row)`, keyed by `t`; they never
-        // overlap. Members are offered coarsest first: a pair inside a run of
-        // a member ranked above it (finer) is not taken, and a pair
-        // overlapping one taken already is not taken. So a coarse pair that
-        // straddles a finer run's first or last row is taken, and the finer
-        // pairs it overlaps are not, which loses less than one interval of
-        // the member whose pairs are not taken; the result does not depend
-        // on the order pairs are offered in.
+        // overlap, and none taken is later removed. Members are offered
+        // coarsest first: a pair inside a run of a member ranked above it is
+        // set aside, and a pair overlapping one taken already is not taken,
+        // so a coarse pair that straddles a finer run's first or last row is
+        // taken and the finer pairs it overlaps are not. The pairs set aside
+        // are offered again after every member, and those overlapping
+        // nothing taken are taken: where a finer run is too short for its
+        // pairs to fit between the straddling pairs, the coarse pair inside
+        // it covers that time. A junction loses less than one interval of
+        // the coarser member.
         let mut taken: BTreeMap<u64, (u64, usize, usize)> = BTreeMap::new();
+        let mut aside: Vec<(u64, u64, usize, usize)> = Vec::new();
+        let overlaps = |taken: &BTreeMap<u64, (u64, usize, usize)>, p: u64, t: u64| {
+            taken
+                .range(p.saturating_add(1)..)
+                .next()
+                .is_some_and(|(_, &(tp, _, _))| tp < t)
+        };
         for r in (0..rows.len()).rev() {
             let own = &member_runs[r];
             for (k, pair) in of(r).windows(2).enumerate() {
@@ -614,16 +625,17 @@ fn combine_histograms(
                     .iter()
                     .any(|runs| runs.iter().any(|&(f, l)| f <= p && t <= l));
                 if inside {
+                    aside.push((p, t, r, k + 1));
                     continue;
                 }
-                let overlaps = taken
-                    .range(p.saturating_add(1)..)
-                    .next()
-                    .is_some_and(|(_, &(tp, _, _))| tp < t);
-                if overlaps {
-                    continue;
+                if !overlaps(&taken, p, t) {
+                    taken.insert(t, (p, r, k + 1));
                 }
-                taken.insert(t, (p, r, k + 1));
+            }
+        }
+        for (p, t, r, k) in aside {
+            if !overlaps(&taken, p, t) {
+                taken.insert(t, (p, r, k));
             }
         }
         let taken: Vec<(u64, u64, usize, usize)> = taken
@@ -655,8 +667,9 @@ fn combine_histograms(
                     series_idx: s,
                     timestamp: p,
                     snapshot: snapshot(&counts),
-                    // A series' first row is its first row, as one source's
-                    // is; a later one resumes from another source's rows.
+                    // A series' first row is not marked, as with one
+                    // source's rows; a later start row resumes from another
+                    // source's rows.
                     resumes: last.is_some(),
                 });
             }
@@ -1255,10 +1268,11 @@ impl DataSource for GroupSource {
     /// it (finer, then S3's tie rule). Members are offered coarsest first and
     /// a pair overlapping one taken is not taken, so a coarse pair that
     /// straddles a finer run's edge is taken and the finer pairs it overlaps
-    /// are not: a junction loses less than one interval of the member whose
-    /// pairs are not taken. Members are read one coarsest interval past the
-    /// read's end, so where a read ends does not move a junction. No two
-    /// deltas taken overlap in time, and none is between rows of two
+    /// are not; a pair set aside for lying inside a finer run is offered
+    /// again at the end and taken where nothing taken overlaps it. A
+    /// junction loses less than one interval of the coarser member. Members
+    /// are read two coarsest intervals past the read's end, so where a read
+    /// ends does not move a junction. No two deltas taken overlap in time, and none is between rows of two
     /// sources or across a restart. The deltas taken are summed per series
     /// into a cumulative stream, with a row marked
     /// [`resumes`](crate::histogram_stream::HistogramRow::resumes) before

@@ -1665,8 +1665,10 @@ fn a_fine_source_answers_inside_a_coarse_ones_span() {
 }
 
 /// Where a read ends does not move a junction: a 1 s source on the half
-/// second beside a 10 s source on the second, read to 10:10:00 (between a
-/// fine row and a coarse one), ends on the fine source's rows.
+/// second beside a 10 s source on the second, read to 10:10:00 (on a coarse
+/// row, half a second after a fine one), ends on the fine source's rows;
+/// and a 2 s source beside a 3 s one, out of phase, gives the same points
+/// up to each of several ends as one read past them all.
 #[test]
 fn a_reads_end_does_not_move_a_junction() {
     let dir = tempfile::tempdir().unwrap();
@@ -1703,6 +1705,80 @@ fn a_reads_end_does_not_move_a_junction() {
             .all(|w| (w[1].0 - w[0].0 - 1.0).abs() < 1e-9),
         "{tail:?}"
     );
+
+    let path = dir.path().join("end23.dendro");
+    let at_s = |s: u64| at(10, 0, 0) + s * S;
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(60) + S / 4, at_s(200), 2 * S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(10) + S / 2, at_s(200), 3 * S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    let start = at_s(55) as f64 / 1e9;
+    let read = |end: f64| {
+        from_matrix(
+            union
+                .query_range("histogram_count(latency)", start, end, 1.0)
+                .unwrap(),
+        )[0]
+        .points
+        .clone()
+    };
+    let long = read(at_s(100) as f64 / 1e9);
+    for end_ms in [68_312u64, 69_000, 70_400, 71_750, 74_100] {
+        let end = (at_s(0) + end_ms * MS) as f64 / 1e9;
+        let want: Vec<_> = long.iter().copied().filter(|p| p.0 <= end).collect();
+        assert_eq!(read(end), want, "end at {end_ms} ms");
+    }
+}
+
+/// A finer run too short for its pairs to fit between the coarse pairs that
+/// straddle its edges: the coarse pair inside it covers that time, so the
+/// group counts every observation the coarse source alone does.
+#[test]
+fn a_short_finer_run_inside_a_coarse_one_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.dendro");
+    let at_s = |s: u64| at(10, 0, 0) + s * S;
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(20) + S / 4, at_s(28) + S / 4, 2 * S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(20), at_s(59), 3 * S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at_s(20) as f64 / 1e9, at_s(59) as f64 / 1e9);
+    let points = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    let total: f64 = points[0].points.iter().map(|p| p.1).sum();
+    assert_eq!(total, 390.0, "{:?}", points[0].points);
 }
 
 /// Three members, 1 s, 5 s and 10 s, whose runs end near each other: the

@@ -310,14 +310,19 @@ public API uses metriken-storage types.
   `histogram_quantiles` and the others, `by` aggregation and strides
   included) combines the group's sources per span (S9). Each member's
   per-row deltas are taken per series where its own rows cover them and
-  the pair is not inside a run of a finer member; members are offered
-  coarsest first, and a pair overlapping one already taken is not taken.
-  So a coarse pair straddling a finer run's edge is taken, and a junction
-  loses less than one interval of the member whose pairs are not taken.
-  The deltas taken are summed into one cumulative stream. It read the one
-  source covering the most of the range, leaving the others' spans out.
-  Members of different bucket configurations still read one source. The
-  group's histogram interval is its coarsest member's.
+  the pair is not inside a run of a member ranked above it (finer, then
+  the lowest uuid). Members are offered coarsest first and a pair
+  overlapping one already taken is not taken, so a coarse pair straddling
+  a finer run's edge is taken; a pair set aside for lying inside a finer
+  run is taken at the end where nothing taken overlaps it. A junction
+  loses less than one interval of the coarser member, and members are read
+  two coarsest intervals past the read's end so where a read ends does not
+  move a junction. The deltas taken are summed into one cumulative stream.
+  It read the one source covering the most of the range, leaving the
+  others' spans out; where a finer run sits inside a coarse one, the group
+  can count up to one coarse interval less than the coarse source alone at
+  each junction. Members of different bucket configurations still read one
+  source. The group's histogram interval is its coarsest member's.
 - **Added:** `Scope` and `QueryOptions::with_scope`: the sources a query
   reads, each named by uuid (a source and its copies) or by position among
   the reader's `ArchiveReader::sources`, with an optional span. An
