@@ -66,7 +66,8 @@ pub struct EpochSpan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SourceInfo {
-    /// The source's labels, as the catalog holds them.
+    /// The source's labels as the catalog reports them: with an overlay
+    /// ([`crate::overlay`]), the overlaid labels, not the stored ones.
     pub labels: BTreeMap<String, String>,
     /// The source's position among its archive's catalog sources, in id
     /// order.

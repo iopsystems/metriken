@@ -160,6 +160,9 @@ names index below.
   `open_read_groups_from_bytes_overlaid` open with one, and
   `LabelOverlay::catalog` wraps a `Catalog` for `from_catalog`; read groups,
   `__recording__`, query routing and listings see the overlaid labels.
+  `LabelOverlay::new` refuses an entry that sets or removes `__name__`,
+  `__run__`, `__occupant__`, `__uid__`, `__recording__`, an `exported_` key
+  or a `metriken.` key.
 - **Added:** `ArchiveReader::counter_labels_matching`,
   `gauge_labels_matching`, `histogram_labels_matching` and
   `gauge_histogram_labels_matching`: the label sets of a metric that a

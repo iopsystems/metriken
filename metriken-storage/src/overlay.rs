@@ -9,10 +9,13 @@
 //! (read groups, `__recording__`, query routing, listings) sees the overlaid
 //! labels. Labels are set per source: a read group carries each key some of
 //! its sources carry ([`crate::process::read_groups`]), so removing a key
-//! from some sources of a group leaves it on the group; select a source's
-//! copies by uuid to remove it from all of them. The readers' labels,
-//! `ArchiveReader::sources` included, are the overlaid ones, so a write to
-//! the archive takes a source's labels from the archive, not from a reader.
+//! from some sources of a group leaves it on the group. To remove a key from
+//! a read group, remove it from every source of the group: selecting by
+//! uuid covers one source and its copies, and a process group can hold
+//! several uuids. The readers' labels, `ArchiveReader::sources` included,
+//! are the overlaid ones, so a caller writing to the archive
+//! (`layers::append`) must read a source's labels from the archive, not
+//! from a reader, or the write records the overlay as an outside change.
 //! Open an archive with one through
 //! [`ArchiveReader::open_read_groups_overlaid`](crate::ArchiveReader::open_read_groups_overlaid),
 //! or wrap a [`Catalog`] for [`ArchiveReader::from_catalog`](crate::ArchiveReader::from_catalog).
@@ -31,9 +34,11 @@ pub enum SourceSelector {
     Uuid(String),
     /// The sources whose labels, as the archive stores them, `Labels::matches`
     /// this filter: one matcher per label, `v` for `=`, `~v` for `=~`, `!v`
-    /// for `!=` and `!~`. A value containing `|` is a list of literal
-    /// alternatives, `\.` is a literal `.`, a value under `=` cannot start
-    /// with `!` or `~`, and `k=v` does not match a source without `k`.
+    /// for `!=` and `!~`. No matcher is a regex: `~v` matches as `v` does, a
+    /// value containing `|` (optionally in parentheses) is a list of literal
+    /// alternatives, and `\.` is a literal `.`; every other character is
+    /// literal. A value under `=` cannot start with `!` or `~`, and `k=v`
+    /// and `k=~v` do not match a source without `k`.
     Matching(Labels),
 }
 
@@ -57,19 +62,22 @@ impl LabelOverlay {
     /// one source and set one key, the later wins. Every selector is decided
     /// on the labels the archive stores, not on what an earlier entry set.
     /// An error for an entry that sets or removes a label the reader or the
-    /// engine assigns (`__name__`, `__run__`, `__occupant__`,
-    /// `__recording__`) or one under `metriken.`, which the identity layers
-    /// refuse.
+    /// engine assigns (`__name__`, `__run__`, `__occupant__`, `__uid__`,
+    /// `__recording__`, or one under `exported_`, where a series' own value
+    /// of a key its source sets is moved) or one under `metriken.`, which
+    /// the identity layers refuse.
     pub fn new(entries: Vec<OverlayEntry>) -> Result<Self, String> {
-        const ASSIGNED: [&str; 4] = [
+        const ASSIGNED: [&str; 5] = [
             "__name__",
             "__run__",
             crate::long::OCCUPANT_LABEL,
+            metriken_types::UID_LABEL,
             crate::labeled::RECORDING_LABEL,
         ];
         for entry in &entries {
             for key in entry.labels.keys() {
                 if ASSIGNED.contains(&key.as_str())
+                    || key.starts_with(crate::labeled::EXPORTED_PREFIX)
                     || key.starts_with(crate::layers::RESERVED_PREFIX)
                 {
                     return Err(format!(
@@ -267,7 +275,8 @@ mod tests {
     }
 
     /// An entry setting or removing a label the reader or engine assigns,
-    /// or one under `metriken.`, is refused; `__producer__` is not.
+    /// or one under `exported_` or `metriken.`, is refused; `__producer__`
+    /// is not.
     #[test]
     fn an_entry_changing_an_assigned_label_is_refused() {
         let new = |key: &str, value: &str| {
@@ -280,7 +289,9 @@ mod tests {
             "__name__",
             "__run__",
             "__occupant__",
+            "__uid__",
             "__recording__",
+            "exported_host",
             "metriken.x",
         ] {
             assert!(new(key, "1").is_err(), "{key}");
