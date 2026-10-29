@@ -1,8 +1,8 @@
 //! A query's scope: the sources it reads (journal D1).
 //!
 //! A scope names sources of an archive, by uuid (which a source's copies
-//! keep) or by position among `ArchiveReader::sources`, each optionally
-//! with a span of time. A query given one reads only the named sources'
+//! keep) or by position among the reader's `ArchiveReader::sources`, each
+//! optionally with a span of time. A query given one reads only the named sources'
 //! tables, and only their rows within each span; within a process group it
 //! unions only the named sources (S1). The caller resolves what it presents
 //! (a presented recording, a bridge piece) to the sources and spans to
@@ -15,17 +15,28 @@
 pub enum SourceRef {
     /// Every source with this uuid: a source and its copies.
     Uuid(String),
-    /// The source at this position among `ArchiveReader::sources`.
+    /// The source at this position among `sources()` of the reader the
+    /// query is sent to. A reader from `flatten_read_groups` numbers only
+    /// its group's sources, so a position is not stable across readers;
+    /// `Uuid` is.
     Position(usize),
 }
 
 /// One entry of a [`Scope`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScopedSource {
     pub source: SourceRef,
     /// The rows read, `[start, end]` in nanoseconds, both inclusive; `None`
     /// reads every row.
     pub span: Option<(u64, u64)>,
+}
+
+impl ScopedSource {
+    /// `source`, read over `span` (`None` for every row).
+    pub fn new(source: SourceRef, span: Option<(u64, u64)>) -> Self {
+        Self { source, span }
+    }
 }
 
 /// The sources a query reads; see the [module](self) docs.

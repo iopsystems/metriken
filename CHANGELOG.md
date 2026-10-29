@@ -304,7 +304,8 @@ public API uses metriken-storage types.
   `ArchiveReader::sources`, with an optional span. An `ArchiveReader` query
   reads only the named sources' tables, within each process group unions
   only the named sources, and reads a source's rows within its span; a
-  metric only unnamed sources hold gives an empty result. Any other source
+  query referencing a metric that only unnamed sources hold gives an empty
+  result. Any other source
   refuses a query carrying a scope (`QueryError::Unsupported`).
 - **Added:** `MetricsSource::counter_labels_matching` and its gauge,
   histogram and gauge histogram siblings, and `label_values_matching`: a

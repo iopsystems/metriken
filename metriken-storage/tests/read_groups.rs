@@ -636,7 +636,7 @@ fn a_scope_reads_only_the_sources_it_names() {
             Scope::new(
                 entries
                     .into_iter()
-                    .map(|(source, span)| ScopedSource { source, span })
+                    .map(|(source, span)| ScopedSource::new(source, span))
                     .collect(),
             )
             .unwrap(),

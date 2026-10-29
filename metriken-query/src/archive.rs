@@ -326,8 +326,10 @@ fn cross_cadence(
 /// each of them alone, and each producer epoch of a source alone, and
 /// combines the results per series (`streaming::per_source`, S9), so a
 /// process counts once and no value is a difference between rows of two
-/// sources or across a restart. A query reaching no such group, or a source
-/// of one epoch, is evaluated exactly as before.
+/// sources or across a restart. A source a query's scope reads over a span
+/// is read the same way, as a group of its own whose members are clipped to
+/// the span. A query reaching no such group or span, or a source of one
+/// epoch, is evaluated as before.
 ///
 /// Refused: a metric name held by two tables of one recording
 /// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
@@ -374,22 +376,23 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             .is_some_and(|g| g.sources.len() > 1);
         let mut members: Vec<Member> = Vec::new();
         let mut whole: Vec<Ranked> = Vec::new();
+        // Whether a source of the unit is read over a scope's span: it is
+        // then read as a group, whose per-source combine clips each
+        // function's window to the member's span (S3).
+        let mut spanned = false;
         for tables in unit {
             let Some(source) = recording_source(tables, query)? else {
                 continue;
             };
             let labels = plan.labels.of(tables[0]).clone();
             let source: Arc<dyn DataSource> = Arc::new(LabeledSource::new(source, labels));
-            // A scope's span: the source's rows clipped to it, and its
-            // members' spans within it.
+            // A scope's span: its members' spans within it, which the
+            // per-source combine clips each member's reads to.
             let span = match plan.scope {
                 Some(scope) => scope_span(plan.reader, scope, tables[0])?.flatten(),
                 None => None,
             };
-            let source: Arc<dyn DataSource> = match span {
-                Some((lo, hi)) => Arc::new(Tap::new(source, lo, hi)),
-                None => source,
-            };
+            spanned |= span.is_some();
             let (span_lo, span_hi) = span.unwrap_or((0, u64::MAX));
             let position = plan.reader.source_position(tables[0]);
             let info = position.map(|p| &plan.reader.sources()[p]);
@@ -421,11 +424,17 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
                 .map(|t| t.interval())
                 .filter(|i| *i > 0.0)
                 .fold(f64::INFINITY, f64::min);
-            whole.push((finest, Arc::clone(&source), member(0, u64::MAX)));
+            // The source as the group's histogram reads see it, clipped to
+            // the span.
+            let clipped: Arc<dyn DataSource> = match span {
+                Some((lo, hi)) => Arc::new(Tap::new(Arc::clone(&source), lo, hi)),
+                None => Arc::clone(&source),
+            };
+            whole.push((finest, clipped, member(0, u64::MAX)));
         }
         match members.len() {
             0 => {}
-            1 if !grouped => parts.push(Ok(members.pop().expect("one").source)),
+            1 if !grouped && !spanned => parts.push(Ok(members.pop().expect("one").source)),
             _ => parts.push(Err((members, whole))),
         }
     }
@@ -493,7 +502,7 @@ fn scope_span(
     let uuid = reader.sources()[position].uuid.as_deref();
     scope
         .span_of(position, uuid)
-        .map_err(QueryError::ParseError)
+        .map_err(QueryError::Unsupported)
 }
 
 /// A source of a process group with what ranks it: its finest table
@@ -1294,6 +1303,35 @@ mod tests {
                 .all(|(t, _)| (3.0..=6.0).contains(t)),
             "{:?}",
             clipped[0].values
+        );
+
+        // A windowed gauge function stops at the span's end too: its window
+        // is clipped to the source's span, as within a process group.
+        let reader_g = archive(vec![recording(
+            &[("source", "a")],
+            vec![("u", typed_table("g", "gauge", &[(&[("cpu", "0")], 1)], 10))],
+        )]);
+        let opts = QueryOptions::default().with_scope(Some(Arc::new(
+            Scope::new(vec![ScopedSource::new(
+                SourceRef::Position(0),
+                Some((3 * S, 6 * S)),
+            )])
+            .unwrap(),
+        )));
+        let QueryResult::Matrix { result } = reader_g
+            .query_range_opts("avg_over_time(g[3s])", 1.0, 10.0, 1.0, &opts)
+            .unwrap()
+        else {
+            panic!("not a matrix");
+        };
+        assert!(!result.is_empty() && !result[0].values.is_empty());
+        assert!(
+            result[0]
+                .values
+                .iter()
+                .all(|(t, _)| (3.0..=7.0).contains(t)),
+            "{:?}",
+            result[0].values
         );
 
         let store = crate::MemoryStore::builder().build();
