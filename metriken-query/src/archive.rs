@@ -327,9 +327,11 @@ fn cross_cadence(
 /// combines the results per series (`streaming::per_source`, S9), so a
 /// process counts once and no value is a difference between rows of two
 /// sources or across a restart. A source a query's scope reads over a span
-/// is read the same way, as a group of its own whose members are clipped to
-/// the span. A query reaching no such group or span, or a source of one
-/// epoch, is evaluated as before.
+/// is read the same way, as a group of its own whose members' rows are
+/// clipped to the span: its points end one interval after its last row in
+/// the span, and a gap of more than twice its median row spacing has no
+/// points (S5). A query reaching no such group and no span is evaluated as
+/// before, as is an unspanned source of one epoch.
 ///
 /// Refused: a metric name held by two tables of one recording
 /// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
@@ -377,8 +379,10 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         let mut members: Vec<Member> = Vec::new();
         let mut whole: Vec<Ranked> = Vec::new();
         // Whether a source of the unit is read over a scope's span: it is
-        // then read as a group, whose per-source combine clips each
-        // function's window to the member's span (S3).
+        // then read as a group. Each member reads through a `Tap` clipped to
+        // its `[lo, hi]`, and the combine keeps a point only where the
+        // member's rows hold it (S3: to one interval past its last row, and
+        // not in a hole).
         let mut spanned = false;
         for tables in unit {
             let Some(source) = recording_source(tables, query)? else {
@@ -424,8 +428,8 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
                 .map(|t| t.interval())
                 .filter(|i| *i > 0.0)
                 .fold(f64::INFINITY, f64::min);
-            // The source as the group's histogram reads see it, clipped to
-            // the span.
+            // The source the group's histogram reads go to, clipped to the
+            // span.
             let clipped: Arc<dyn DataSource> = match span {
                 Some((lo, hi)) => Arc::new(Tap::new(Arc::clone(&source), lo, hi)),
                 None => Arc::clone(&source),
@@ -1332,6 +1336,42 @@ mod tests {
                 .all(|(t, _)| (3.0..=7.0).contains(t)),
             "{:?}",
             result[0].values
+        );
+
+        // A span reads a source by the process-group rules even alone: a
+        // gap of more than twice its median row spacing has no points (S5),
+        // where the unscoped read interpolates across it.
+        let rows: Vec<(u64, u64)> = (1..=20u64)
+            .filter(|t| !(9..=10).contains(t))
+            .map(|t| (t * S, t))
+            .collect();
+        let gappy = archive(vec![recording(
+            &[("source", "a")],
+            vec![("u", explicit_table("g", "gauge", &rows))],
+        )]);
+        let points = |scope: Option<Scope>| -> Vec<f64> {
+            let opts = QueryOptions::default().with_scope(scope.map(Arc::new));
+            let QueryResult::Matrix { result } = gappy
+                .query_range_opts("avg_over_time(g[3s])", 1.0, 20.0, 1.0, &opts)
+                .unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            result[0].values.iter().map(|(t, _)| *t).collect()
+        };
+        let unscoped = points(None);
+        let spanned = points(Some(
+            Scope::new(vec![ScopedSource::new(
+                SourceRef::Position(0),
+                Some((0, 100 * S)),
+            )])
+            .unwrap(),
+        ));
+        assert!(unscoped.contains(&10.0), "{unscoped:?}");
+        assert!(!spanned.contains(&10.0), "{spanned:?}");
+        assert!(
+            spanned.contains(&5.0) && spanned.contains(&15.0),
+            "{spanned:?}"
         );
 
         let store = crate::MemoryStore::builder().build();
