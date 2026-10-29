@@ -5,7 +5,7 @@ storage keeps everything and records provenance, and the viewer decides
 presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
-S9 in metriken" below) are done; the producer identity keys and
+S9 in metriken" below) are done, and for histograms built (2b); the producer identity keys and
 `producer_identity!`, the identity layers in metriken-storage (#326),
 metriken-recorder writing them (step 2), and the catalog index's names and
 label listings (step 2) are built and unreleased; nothing else is built. The
@@ -1523,7 +1523,7 @@ not needed while each source keeps one cadence; S12 is done.
   a chart uses the strided form with the stride at its step (step 3.5), with
   a doctest of both histogram forms over rows 1 s and then 100 ms apart.
 
-#### S1 to S9 in metriken (counters and gauges, built)
+#### S1 to S9 in metriken (counters, gauges and histograms, built)
 
 Built on branch `feat/per-source-union` of metriken (metriken-query 0.42.0,
 metriken-storage 0.5.0, unreleased), slice 2a of three:
@@ -1535,17 +1535,22 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   to the finest), which counts a process once and leaves the other sources'
   spans out.
 - 2b: histograms per source (the per-row and per-stride deltas combined per
-  series per span). Built: `GroupSource::histogram_stream` reads each
-  member (a source, or one producer epoch of it) over its span, takes a
-  row's delta from the member's previous row where both rows are in one of
-  the member's runs (S3) and no member ranked above it has a run
-  overlapping the pair, and sums the deltas taken per series into one
-  cumulative stream, which every histogram function reads unchanged (`by`
-  aggregation and strides included). The deltas taken never overlap in
-  time; a pair a higher member's run partly overlaps is dropped, so its
-  remainder is a hole (S5). Members of different bucket configurations
-  fall back to the one source covering the most of the read. Gauge
-  histograms still read the latest row of any source.
+  series per span). Built (branch `feat/histogram-per-source`):
+  `GroupSource::histogram_stream` reads each member (a source, or one
+  producer epoch of it) over its span and takes a row's delta from the
+  member's previous row where both rows are in one of the member's runs
+  (S3) and the pair is not inside a run of a member ranked above it; a
+  pair overlapping such a run in part is taken in place of the higher
+  member's pairs it overlaps, so a junction loses less than one of the
+  higher member's intervals. The deltas taken never overlap in time and are
+  summed per series into one cumulative stream, with a row marked
+  `HistogramRow::resumes` before each change taken from another source's
+  rows (so `histogram_irate` gives no point there), which every histogram
+  function reads unchanged (`by` aggregation and strides included). The
+  group's histogram interval is its coarsest member's, so the read starts
+  early enough for that member's first pair. Members of different bucket
+  configurations fall back to the one source covering the most of the
+  read. Gauge histograms still read the latest row of any source.
 - 2c: S4: conflict detection, the warnings channel on query results (an
   API change; `QueryResult` has none today), and Q16's value at a conflict.
   Until then the value at a conflict is whichever source S3's order

@@ -646,6 +646,7 @@ fn quantiles_impl(
         series_idx,
         timestamp: t,
         snapshot,
+        ..
     } in rows
     {
         if t > end_ns {
@@ -816,6 +817,7 @@ fn reduce(
         series_idx,
         timestamp: t,
         snapshot,
+        ..
     } in rows
     {
         if t > end_ns {
@@ -931,12 +933,16 @@ fn irate_impl(
     let mut prev_t_per_group: Vec<Option<u64>> = vec![None; g_count];
     let mut tick_count_per_group: Vec<u64> = vec![0; g_count];
     let mut tick_has_data: Vec<bool> = vec![false; g_count];
+    // A tick holding only rows that resume a series (`HistogramRow::resumes`)
+    // emits nothing and is the time the group's next rate is taken from.
+    let mut tick_resumes: Vec<bool> = vec![false; g_count];
     let mut current_t: Option<u64> = None;
 
     for HistogramRow {
         series_idx,
         timestamp: t,
         snapshot,
+        resumes,
     } in rows
     {
         if t > end_ns {
@@ -959,16 +965,21 @@ fn irate_impl(
                             }
                         }
                         prev_t_per_group[g] = Some(prev_t);
+                    } else if tick_resumes[g] {
+                        prev_t_per_group[g] = Some(prev_t);
                     }
                     tick_count_per_group[g] = 0;
                     tick_has_data[g] = false;
+                    tick_resumes[g] = false;
                 }
             }
         }
         current_t = Some(t);
 
         let g = series_group[series_idx];
-        if let Some(prev) = &prev_per_series[series_idx] {
+        if resumes {
+            tick_resumes[g] = true;
+        } else if let Some(prev) = &prev_per_series[series_idx] {
             let delta = total_count(&snapshot).saturating_sub(total_count(prev));
             tick_count_per_group[g] = tick_count_per_group[g].saturating_add(delta);
             tick_has_data[g] = true;
@@ -1063,6 +1074,7 @@ fn heatmap_impl(
         series_idx,
         timestamp: t,
         snapshot,
+        ..
     } in rows
     {
         if t > end_ns {

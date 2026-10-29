@@ -3090,6 +3090,7 @@ impl ParquetHistogramCursor {
                     rg_rows.push(HistogramRow {
                         series_idx: si,
                         timestamp: *ts,
+                        resumes: false,
                         snapshot: snap.clone(),
                     });
                 }

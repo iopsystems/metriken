@@ -152,6 +152,13 @@ Requires metriken-model 0.2.1.
 A minor version because metriken-storage 0.5.4 and earlier do not read the
 names index below.
 
+- **Changed:** `HistogramRow` has a public field `resumes`: a row whose
+  change from the series' previous row is no reading, which only sets the
+  counts and time the next change is taken from. A reader of one source's
+  rows sets it false; metriken-query's process-group combine marks the row
+  before each change it takes from another source's rows, and
+  `histogram_irate` gives no point at such a row. A struct literal of
+  `HistogramRow` must set it.
 - **Added:** `overlay`, an open-time label overlay: entries, each a
   selector (a source's uuid, or matchers on its stored labels) and labels to
   set or, with `""`, remove, applied in order where the catalog reports a
@@ -302,11 +309,15 @@ public API uses metriken-storage types.
 - **Changed:** a histogram over a process group (`histogram_count`,
   `histogram_quantiles` and the others, `by` aggregation and strides
   included) combines the group's sources per span (S9): each member's
-  per-row deltas are taken per series where its own rows cover them and no
-  member ranked above it (finer, then the lowest uuid) has rows over the
-  same time, and summed into one cumulative stream. It read the one source
-  covering the most of the range, leaving the others' spans out. Members of
-  different bucket configurations still read one source.
+  per-row deltas are taken per series where its own rows cover them and
+  the pair is not inside a run of a member ranked above it (finer, then
+  the lowest uuid), a pair straddling such a run's edge taking the place
+  of the pairs it overlaps, and summed into one cumulative stream. It read
+  the one source covering the most of the range, leaving the others' spans
+  out. A junction between two sources' rows loses less than one interval
+  of the finer source's observations. Members of different bucket
+  configurations still read one source. The group's histogram interval is
+  its coarsest member's.
 - **Added:** `Scope` and `QueryOptions::with_scope`: the sources a query
   reads, each named by uuid (a source and its copies) or by position among
   the reader's `ArchiveReader::sources`, with an optional span. An

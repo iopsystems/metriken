@@ -1592,6 +1592,77 @@ fn a_groups_histogram_combines_its_sources() {
     );
 }
 
+/// A fine source beside a coarse one of the same process: the fine source
+/// answers where its rows run (its rows' points, a second apart), the coarse
+/// one elsewhere, and a coarse pair straddling the fine run's edge is taken
+/// in place of the fine pairs it overlaps, so a minute window loses less
+/// than one fine interval's observations and counts none twice; a rate has
+/// no point at the row a junction resumes from.
+#[test]
+fn a_fine_source_answers_inside_a_coarse_ones_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fine_coarse.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 5), at(10, 15, 5), 10 * S),
+                cycles,
+            ),
+            // Half a second out of phase with the coarse rows, so each
+            // junction resumes from a row of the other source.
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 4, 0) + S / 2, at(10, 5, 0), S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at(10, 1, 0) as f64 / 1e9, at(10, 15, 0) as f64 / 1e9);
+    let strided = from_matrix(
+        union
+            .query_range("histogram_count(latency, 60)", s, e, 60.0)
+            .unwrap(),
+    );
+    // The whole minutes (the last window is the range's partial one).
+    let windows = &strided[0].points;
+    let whole = &windows[..windows.len() - 1];
+    assert!(whole.len() >= 13, "{windows:?}");
+    assert!(
+        whole.iter().all(|p| (590.0..=600.0).contains(&p.1)),
+        "{windows:?}"
+    );
+    // Inside the fine run its rows answer, a second apart.
+    let per_row = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    let fine: Vec<_> = per_row[0]
+        .points
+        .iter()
+        .filter(|p| (at(10, 4, 10) as f64 / 1e9..=at(10, 4, 50) as f64 / 1e9).contains(&p.0))
+        .collect();
+    assert_eq!(fine.len(), 40, "{fine:?}");
+    assert!(fine.iter().all(|p| p.1 == 10.0), "{fine:?}");
+    let irate = from_matrix(
+        union
+            .query_range("histogram_irate(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    assert!(!irate[0].points.is_empty());
+    assert!(
+        irate[0].points.iter().all(|p| (p.1 - 10.0).abs() < 1e-9),
+        "{:?}",
+        irate[0].points
+    );
+}
+
 /// A recording that is a group of one, read beside a process group, is its
 /// own answers as they are: a rate across a gap in it (which a group's
 /// rules would leave empty) is the recording's alone, on the batched scan

@@ -21,7 +21,7 @@
 //! and binary operators run on the combined series, so `sum(rate(x[1m]))`
 //! counts each process once.
 //!
-//! A histogram over a group is combined one level down, in its rows: each
+//! A histogram over a group is combined in its rows: each
 //! member's per-row deltas are taken per series per span and summed into
 //! one cumulative stream ([`GroupSource::histogram_stream`]), which every
 //! histogram function then reads as it reads one source's, its `by`
@@ -586,8 +586,14 @@ fn combine_histograms(
         let member_runs: Vec<Vec<(u64, u64)>> = (0..rows.len())
             .map(|r| runs(&of(r).iter().map(|(t, _)| *t).collect::<Vec<_>>()))
             .collect();
-        // The pairs taken, `(prev, t, member, row)`, in time order.
-        let mut taken: Vec<(u64, u64, usize, usize)> = Vec::new();
+        // The pairs taken, `(prev, t, member, row)`, keyed by `t`; they never
+        // overlap. Members are offered in rank order: a pair inside a run of
+        // a member ranked above it is not taken; a pair overlapping such a
+        // run in part (it straddles the run's first or last row) is taken,
+        // and the pairs taken before it that overlap it are dropped, which
+        // loses less than one of their intervals at either end rather than
+        // the straddling pair's.
+        let mut taken: BTreeMap<u64, (u64, usize, usize)> = BTreeMap::new();
         for r in 0..rows.len() {
             let own = &member_runs[r];
             for (k, pair) in of(r).windows(2).enumerate() {
@@ -596,15 +602,30 @@ fn combine_histograms(
                 let in_run = i
                     .checked_sub(1)
                     .is_some_and(|i| own[i].0 <= p && t <= own[i].1);
-                let above = member_runs[..r]
-                    .iter()
-                    .any(|runs| runs.iter().any(|&(f, l)| f < t && l > p));
-                if in_run && !above {
-                    taken.push((p, t, r, k + 1));
+                if !in_run {
+                    continue;
                 }
+                let inside = member_runs[..r]
+                    .iter()
+                    .any(|runs| runs.iter().any(|&(f, l)| f <= p && t <= l));
+                if inside {
+                    continue;
+                }
+                let overlapping: Vec<u64> = taken
+                    .range(p.saturating_add(1)..)
+                    .take_while(|(_, &(tp, _, _))| tp < t)
+                    .map(|(&end, _)| end)
+                    .collect();
+                for end in overlapping {
+                    taken.remove(&end);
+                }
+                taken.insert(t, (p, r, k + 1));
             }
         }
-        taken.sort_unstable_by_key(|&(_, t, _, _)| t);
+        let taken: Vec<(u64, u64, usize, usize)> = taken
+            .into_iter()
+            .map(|(t, (p, r, k))| (p, t, r, k))
+            .collect();
         // The running per-bucket counts, emitted as a cumulative snapshot
         // at the start of each taken pair (unless the previous one ended
         // there) and at its end.
@@ -629,6 +650,7 @@ fn combine_histograms(
                     series_idx: s,
                     timestamp: p,
                     snapshot: snapshot(&counts),
+                    resumes: true,
                 });
             }
             let rs = of(r);
@@ -639,6 +661,7 @@ fn combine_histograms(
                 series_idx: s,
                 timestamp: t,
                 snapshot: snapshot(&counts),
+                resumes: false,
             });
             last = Some(t);
         }
@@ -1131,9 +1154,10 @@ impl DataSource for Tap {
 }
 
 /// A process group as one source, for what a query asks of the whole: its
-/// names, label sets, intervals and span; and, until histograms combine per
-/// source, a histogram read, which the source covering the most of the read
-/// answers alone.
+/// names, label sets, intervals and span; and a histogram read, which
+/// combines its members per series per span
+/// ([`GroupSource::histogram_stream`]), or, for members of different bucket
+/// configurations, reads the source covering the most of the read.
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 pub(crate) struct GroupSource {
     /// One per source of the group, unclipped, in S3's rank order.
@@ -1220,15 +1244,18 @@ impl DataSource for GroupSource {
     /// The members' rows combined per series per span (S9): each member
     /// read over its own span, and a row's delta from the member's previous
     /// row of the series taken where both rows are in one of the member's
-    /// runs (S3) and no member ranked above it (finer, then S3's tie rule)
-    /// has a run overlapping the pair, so no two deltas taken overlap in
-    /// time and none is between rows of two sources or across a restart.
-    /// The deltas taken are summed per series into a cumulative stream,
-    /// which every histogram function reads as it reads one source's. A pair
-    /// a higher member's run partly overlaps is not taken, so the time it
-    /// spans beyond that run holds no observations (S5). Members of
-    /// different bucket configurations are not combined: the stream is then
-    /// the one source covering the most of the read.
+    /// runs (S3) and the pair is not inside a run of a member ranked above
+    /// it (finer, then S3's tie rule). A pair that overlaps such a run in
+    /// part is taken in place of the higher member's pairs it overlaps, so
+    /// a junction loses less than one of the higher member's intervals. No
+    /// two deltas taken overlap in time, and none is between rows of two
+    /// sources or across a restart. The deltas taken are summed per series
+    /// into a cumulative stream, with a row marked
+    /// [`resumes`](crate::histogram_stream::HistogramRow::resumes) before
+    /// each change taken from another source's rows, which every histogram
+    /// function reads as it reads one source's. Members of different bucket
+    /// configurations are not combined: the stream is then the one source
+    /// covering the most of the read.
     fn histogram_stream(
         &self,
         name: &str,
@@ -1331,9 +1358,20 @@ impl DataSource for GroupSource {
         self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
             .gauge_interval(name)
     }
+    /// The longest interval of the sources holding histogram `name`: the
+    /// read starts that far back, so a coarse member's first pair is read
+    /// ([`GroupSource::histogram_stream`] combines every member).
     fn histogram_interval(&self, name: &str) -> f64 {
-        self.finest_holding(|s| s.histogram_names().iter().any(|n| n == name))
-            .histogram_interval(name)
+        let longest = self
+            .sources
+            .iter()
+            .filter(|s| s.histogram_names().iter().any(|n| n == name))
+            .map(|s| s.histogram_interval(name))
+            .fold(f64::NAN, f64::max);
+        match longest.is_nan() {
+            true => self.sources[0].histogram_interval(name),
+            false => longest,
+        }
     }
     fn time_range(&self) -> Option<(u64, u64)> {
         self.sources

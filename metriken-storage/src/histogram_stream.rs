@@ -23,6 +23,12 @@ pub struct HistogramRow {
     pub series_idx: usize,
     pub timestamp: u64,
     pub snapshot: HistogramSnapshot,
+    /// Whether the change from the series' previous row is no reading: the
+    /// row only sets the counts and the time the next row's change is taken
+    /// from, as a series' first row does. A stream combined from several
+    /// sources marks the row before each change it takes from another
+    /// source's rows; a reader of one source's rows sets it false.
+    pub resumes: bool,
 }
 
 pub struct HistogramStream {
@@ -401,6 +407,7 @@ mod tests {
             rows: Box::new(rows.into_iter().map(|(t, c)| HistogramRow {
                 series_idx: 0,
                 timestamp: t,
+                resumes: false,
                 snapshot: HistogramSnapshot {
                     index: vec![1],
                     count: vec![c],
@@ -422,6 +429,7 @@ mod tests {
                 (0..2).map(move |series_idx| HistogramRow {
                     series_idx,
                     timestamp: t,
+                    resumes: false,
                     snapshot: HistogramSnapshot {
                         index: vec![1],
                         count: vec![c],
