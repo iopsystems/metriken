@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-recorder 0.6.0
 
-Requires metriken-storage 0.5.5, metriken-model 0.2.1 and dendro 0.6.1.
+Requires metriken-storage 0.6.0, metriken-model 0.2.1 and dendro 0.6.1.
 
 - **Changed:** a recording's labels and metadata are written as its
   identity layers (metriken-storage `layers`), each write through
@@ -147,7 +147,10 @@ Requires metriken-model 0.2.1.
   on unix and windows targets. `ProducerIdentity` is re-exported at the
   crate root.
 
-### metriken-storage 0.5.5
+### metriken-storage 0.6.0
+
+A minor version because metriken-storage 0.5.4 and earlier do not read the
+names index below.
 
 - **Added:** `layers`, a source's identity in three layers (recorder,
   producer, user) stored in its dendro metadata under
@@ -254,12 +257,13 @@ Requires metriken-model 0.2.1.
   are damaged now fails the first query that reads it rather than the
   open, when its index lets the open skip it. A reader before this one does not
   read `MNI1` and takes each table's names from its first segment and live
-  tail only, so it does not list a metric that first appears in a later
-  segment of an archive written by this one.
+  tail only, so it neither lists nor returns data for a metric that first
+  appears in a later segment of an archive written by this one.
 
-### metriken-query 0.42.3
+### metriken-query 0.43.0
 
-Requires metriken-storage 0.5.5.
+Requires metriken-storage 0.6.0. A minor version because metriken-query's
+public API uses metriken-storage types.
 
 - **Changed:** `ParquetBuilder::file_labeled` and the other labelled
   builders: a series whose own labels carry an injected key keeps its own
