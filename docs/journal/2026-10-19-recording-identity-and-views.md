@@ -1561,10 +1561,14 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   early enough for that member's first pair. Members of different bucket
   configurations fall back to the one source covering the most of the
   read. Gauge histograms still read the latest row of any source. The
-  combine streams (branch `feat/histogram-streaming`): a first pass reads
+  combine streams (the PR after #340): a first pass reads
   each member's row times and decides the pairs, and a second reads the
   members again, merged in time, yielding rows as they come; it holds the
-  row times, the decisions and one snapshot per member and series. Measured
+  row times, the decisions and one snapshot per member and series, and acts
+  on a row only where its time is the one the first pass read, so a
+  member whose second read differs (a sealed segment evicted between
+  them) loses the pairs it moves, with a warning, rather than adding a
+  change twice. Measured
   (release, one histogram of 1000 values a row at 1 s over 1 h; a group of
   two 40 min sources overlapping 20 min, against one 1 h source; one run
   each, warm): peak RSS 79.8 MB streaming, 126.9 MB holding every row,

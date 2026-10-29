@@ -524,9 +524,11 @@ fn combine_series(
 ///
 /// Two passes over the members' streams: the first reads each row's time
 /// and decides which pairs are taken; the second reads the members again,
-/// merged in time, and yields the combined rows as they come, so neither
-/// pass holds more than the row times, the decisions, and one snapshot per
-/// member and series.
+/// merged in time, and yields the combined rows as they come. The combine
+/// itself holds the row times, the decisions, one snapshot per member and
+/// series and the counts per series; each member's stream holds what its
+/// source buffers, and the second pass has every member's stream open at
+/// once.
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 fn combine_histograms(
     members: &[Member],
@@ -595,8 +597,9 @@ fn combine_histograms(
         return Some(None);
     };
     // What the second pass does at each member's rows: `emits[r][s]`, by
-    // the row's index among member `r`'s rows of series `s`.
-    let mut emits: Vec<Vec<Vec<(usize, Emit)>>> =
+    // the row's index among member `r`'s rows of series `s`, with the row's
+    // time.
+    let mut emits: Vec<Vec<Vec<(usize, u64, Emit)>>> =
         vec![vec![Vec::new(); series.len()]; ranked.len()];
     for (s, _) in series.iter().enumerate() {
         let of = |r: usize| times[r].get(s).map(Vec::as_slice).unwrap_or(&[]);
@@ -660,18 +663,19 @@ fn combine_histograms(
                 // rows.
                 emits[r][s].push((
                     k - 1,
+                    p,
                     Emit::Start {
                         resumes: last.is_some(),
                     },
                 ));
             }
-            emits[r][s].push((k, Emit::End));
+            emits[r][s].push((k, t, Emit::End { prev: p }));
             last = Some(t);
         }
     }
     for by_series in &mut emits {
         for e in by_series {
-            e.sort_unstable_by_key(|(k, _)| *k);
+            e.sort_unstable_by_key(|(k, _, _)| *k);
         }
     }
     drop(times);
@@ -705,6 +709,8 @@ fn combine_histograms(
         seen: vec![vec![0; n]; streams.len()],
         prev: vec![vec![None; n]; streams.len()],
         counts: vec![BTreeMap::new(); n],
+        ready: VecDeque::new(),
+        warned: vec![false; streams.len()],
         streams,
         emits,
     };
@@ -723,9 +729,10 @@ enum Emit {
     /// The row starts a pair taken: a snapshot of the counts so far, marked
     /// `resumes` unless it is the series' first.
     Start { resumes: bool },
-    /// The row ends a pair taken: its change from the member's previous row
-    /// is added to the counts, and a snapshot of them yielded.
-    End,
+    /// The row ends a pair taken, whose first row is at `prev`: its change
+    /// from the member's previous row is added to the counts, and a
+    /// snapshot of them yielded.
+    End { prev: u64 },
 }
 
 /// One member's stream in the second pass, with its row ahead.
@@ -756,19 +763,27 @@ impl MemberRows {
     }
 }
 
-/// The second pass: the members' rows merged in `(time, series)` order,
-/// each acted on as `emits` says.
+/// The second pass: the members' rows merged in time, each acted on as
+/// `emits` says, and yielded in `(time, series)` order. A row is acted on
+/// only where its time, and for the end of a pair the time of the member's
+/// previous row, are those the first pass decided on: a second read that
+/// differs from the first (a sealed segment evicted between them) drops
+/// the pairs it moves, with a warning, rather than adding a change twice.
 struct Combined {
     streams: Vec<MemberRows>,
-    emits: Vec<Vec<Vec<(usize, Emit)>>>,
+    emits: Vec<Vec<Vec<(usize, u64, Emit)>>>,
     /// The next entry of `emits[r][s]`.
     cursor: Vec<Vec<usize>>,
     /// Member `r`'s rows of series `s` read so far.
     seen: Vec<Vec<usize>>,
-    /// Member `r`'s previous row of series `s`.
-    prev: Vec<Vec<Option<crate::types::HistogramSnapshot>>>,
+    /// Member `r`'s previous row of series `s`, with its time.
+    prev: Vec<Vec<Option<(u64, crate::types::HistogramSnapshot)>>>,
     /// The per-bucket counts summed so far, by series.
     counts: Vec<BTreeMap<u32, u64>>,
+    /// The rows of the time being yielded, sorted by series.
+    ready: VecDeque<HistogramRow>,
+    /// Whether a member's second read was found to differ from its first.
+    warned: Vec<bool>,
 }
 
 /// The counts as a cumulative snapshot.
@@ -786,57 +801,93 @@ fn cumulative(counts: &BTreeMap<u32, u64>) -> crate::types::HistogramSnapshot {
     snap
 }
 
+impl Combined {
+    /// Act on the next member row, returning what it yields.
+    fn step(&mut self, r: usize) -> Option<HistogramRow> {
+        let row = self.streams[r].head.take().expect("chosen");
+        self.streams[r].advance();
+        let s = row.series_idx;
+        let k = self.seen[r][s];
+        self.seen[r][s] += 1;
+        let prev_t = self.prev[r][s].as_ref().map(|(t, _)| *t);
+        let mut emit = None;
+        if let Some(&(at, t, e)) = self.emits[r]
+            .get(s)
+            .and_then(|e| e.get(self.cursor[r][s]))
+            .filter(|(at, _, _)| *at == k)
+        {
+            self.cursor[r][s] += 1;
+            let agrees = t == row.timestamp
+                && match e {
+                    Emit::End { prev } => prev_t == Some(prev),
+                    Emit::Start { .. } => true,
+                };
+            if agrees {
+                emit = Some(e);
+            } else if !self.warned[r] {
+                self.warned[r] = true;
+                tracing::warn!(
+                    "a process group member's histogram rows changed between the combine's \
+                     two reads (row {at} at {} where {t} was read); its pairs from there are \
+                     left out",
+                    row.timestamp
+                );
+            }
+        }
+        let out = match emit {
+            Some(Emit::Start { resumes }) => Some(HistogramRow {
+                series_idx: s,
+                timestamp: row.timestamp,
+                snapshot: cumulative(&self.counts[s]),
+                resumes,
+            }),
+            Some(Emit::End { .. }) => {
+                let counts = &mut self.counts[s];
+                if let Some((_, prev)) = &self.prev[r][s] {
+                    super::histogram::delta_walk(prev, &row.snapshot, |idx, d| {
+                        *counts.entry(idx).or_insert(0) += d;
+                    });
+                }
+                Some(HistogramRow {
+                    series_idx: s,
+                    timestamp: row.timestamp,
+                    snapshot: cumulative(counts),
+                    resumes: false,
+                })
+            }
+            None => None,
+        };
+        self.prev[r][s] = Some((row.timestamp, row.snapshot));
+        out
+    }
+}
+
 impl Iterator for Combined {
     type Item = HistogramRow;
 
     fn next(&mut self) -> Option<HistogramRow> {
         loop {
-            let r = (0..self.streams.len())
-                .filter(|&r| self.streams[r].head.is_some())
-                .min_by_key(|&r| {
-                    let h = self.streams[r].head.as_ref().expect("filtered");
-                    (h.timestamp, h.series_idx, r)
-                })?;
-            let row = self.streams[r].head.take().expect("chosen");
-            self.streams[r].advance();
-            let s = row.series_idx;
-            let k = self.seen[r][s];
-            self.seen[r][s] += 1;
-            let emit = self.emits[r]
-                .get(s)
-                .and_then(|e| e.get(self.cursor[r][s]))
-                .filter(|(at, _)| *at == k)
-                .map(|(_, e)| *e);
-            if emit.is_some() {
-                self.cursor[r][s] += 1;
+            if let Some(row) = self.ready.pop_front() {
+                return Some(row);
             }
-            let out = match emit {
-                Some(Emit::Start { resumes }) => Some(HistogramRow {
-                    series_idx: s,
-                    timestamp: row.timestamp,
-                    snapshot: cumulative(&self.counts[s]),
-                    resumes,
-                }),
-                Some(Emit::End) => {
-                    let counts = &mut self.counts[s];
-                    if let Some(prev) = &self.prev[r][s] {
-                        super::histogram::delta_walk(prev, &row.snapshot, |idx, d| {
-                            *counts.entry(idx).or_insert(0) += d;
-                        });
-                    }
-                    Some(HistogramRow {
-                        series_idx: s,
-                        timestamp: row.timestamp,
-                        snapshot: cumulative(counts),
-                        resumes: false,
-                    })
-                }
-                None => None,
-            };
-            self.prev[r][s] = Some(row.snapshot);
-            if out.is_some() {
-                return out;
+            // Every member row of the earliest time ahead, its yields sorted
+            // by series: members list their series in their own order.
+            let t = self
+                .streams
+                .iter()
+                .filter_map(|m| m.head.as_ref().map(|h| h.timestamp))
+                .min()?;
+            let mut rows = Vec::new();
+            while let Some(r) = (0..self.streams.len()).find(|&r| {
+                self.streams[r]
+                    .head
+                    .as_ref()
+                    .is_some_and(|h| h.timestamp == t)
+            }) {
+                rows.extend(self.step(r));
             }
+            rows.sort_by_key(|row| row.series_idx);
+            self.ready.extend(rows);
         }
     }
 }
@@ -1828,50 +1879,79 @@ mod tests {
         })
     }
 
-    /// The streaming combine yields the rows the materialized one does, row
-    /// for row, over random groups of two to four members: intervals of 1 to
-    /// 10 s, random phases and spans, holes, one or two series, and random
-    /// read ranges.
-    #[test]
-    fn the_streaming_combine_matches_the_materialized_one() {
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move |n: u64| {
+    /// A xorshift generator: a value below `n`.
+    fn generator(seed: u64) -> impl FnMut(u64) -> u64 {
+        let mut state = seed;
+        move |n: u64| {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             state % n
-        };
+        }
+    }
+
+    /// A random group of two to four members: intervals of 1 to 10 s, phases
+    /// on the millisecond or the second, spans and `[lo, hi]` at random,
+    /// holes, a repeated row time, and one to three series listed in each
+    /// member's own order.
+    fn random_group(next: &mut impl FnMut(u64) -> u64) -> Vec<Member> {
+        const CPUS: [&[(&str, &str)]; 3] = [&[("cpu", "0")], &[("cpu", "1")], &[("cpu", "2")]];
         let intervals = [1u64, 2, 3, 5, 9, 10];
-        let mut compared = 0;
-        for _ in 0..400 {
-            let count = 2 + next(3) as usize;
-            let mut members = Vec::new();
-            for m in 0..count {
-                let interval = intervals[next(intervals.len() as u64) as usize];
-                let phase = next(interval * 1000) * 1_000_000;
-                let begin = next(300) * S + phase;
-                let len = 10 + next(400);
-                let mut rows: Vec<u64> = (0..len).map(|k| begin + k * interval * S).collect();
-                // A hole: a run of rows left out.
-                if next(3) == 0 && rows.len() > 20 {
-                    let at = 5 + next(rows.len() as u64 - 15) as usize;
-                    let gap = 3 + next(6) as usize;
-                    rows.drain(at..(at + gap).min(rows.len()));
-                }
-                let two = next(2) == 0;
-                let mut series: Vec<TestSeries<'_>> = vec![(&[("cpu", "0")], rows.clone())];
-                if two {
-                    series.push((&[("cpu", "1")], rows));
-                }
-                members.push(Member {
-                    source: histogram_source(interval, &series),
-                    lo: 0,
-                    hi: u64::MAX,
-                    uuid: Some(format!("u{}", next(1000))),
-                    catalog_index: m,
-                    position: m,
-                });
+        let count = 2 + next(3) as usize;
+        let mut members = Vec::new();
+        for m in 0..count {
+            let interval = intervals[next(intervals.len() as u64) as usize];
+            let phase = match next(2) {
+                0 => next(interval * 1000) * 1_000_000,
+                _ => next(interval) * S,
+            };
+            let begin = next(300) * S + phase;
+            let len = 10 + next(400);
+            let mut rows: Vec<u64> = (0..len).map(|k| begin + k * interval * S).collect();
+            if next(3) == 0 && rows.len() > 20 {
+                let at = 5 + next(rows.len() as u64 - 15) as usize;
+                let gap = 3 + next(6) as usize;
+                rows.drain(at..(at + gap).min(rows.len()));
             }
+            if next(4) == 0 {
+                let at = next(rows.len() as u64) as usize;
+                rows.insert(at, rows[at]);
+            }
+            let mut order: Vec<usize> = vec![0, 1, 2];
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(i as u64 + 1) as usize);
+            }
+            let keep = 1 + next(3) as usize;
+            let series: Vec<TestSeries<'_>> = order[..keep]
+                .iter()
+                .map(|&c| (CPUS[c], rows.clone()))
+                .collect();
+            let (lo, hi) = match next(3) {
+                0 => (begin + next(len / 2) * interval * S, u64::MAX),
+                1 => (0, begin + (len / 2 + next(len / 2)) * interval * S),
+                _ => (0, u64::MAX),
+            };
+            members.push(Member {
+                source: histogram_source(interval, &series),
+                lo,
+                hi,
+                uuid: Some(format!("u{}", next(1000))),
+                catalog_index: m,
+                position: m,
+            });
+        }
+        members
+    }
+
+    /// The streaming combine yields the rows the materialized one does, row
+    /// for row and in the same order, over random groups (`random_group`)
+    /// and random read ranges.
+    #[test]
+    fn the_streaming_combine_matches_the_materialized_one() {
+        let mut next = generator(0x9e37_79b9_7f4a_7c15);
+        let mut compared = 0;
+        for _ in 0..1000 {
+            let members = random_group(&mut next);
             let start = next(500) * S;
             let end = start + (1 + next(400)) * S;
             let want = collect(combine_histograms_materialized(
@@ -1893,7 +1973,128 @@ mod tests {
                 compared += 1;
             }
         }
-        assert!(compared > 300, "{compared} non-empty comparisons");
+        assert!(compared > 700, "{compared} non-empty comparisons");
+    }
+
+    /// A source whose second histogram read leaves out its rows before
+    /// `cut`, as a sealed segment evicted between the combine's two reads.
+    struct LosesRows {
+        inner: Arc<dyn DataSource>,
+        cut: u64,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DataSource for LosesRows {
+        fn counters(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<Counters> {
+            self.inner.counters(n, f, a, b)
+        }
+        fn counter_streams<'s>(
+            &'s self,
+            n: &str,
+            f: &Labels,
+            a: u64,
+            b: u64,
+        ) -> Option<Vec<CounterStream<'s>>> {
+            self.inner.counter_streams(n, f, a, b)
+        }
+        fn gauges(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<Gauges> {
+            self.inner.gauges(n, f, a, b)
+        }
+        fn histogram_stream(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<HistogramStream> {
+            let first = self
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0;
+            let stream = self.inner.histogram_stream(n, f, a, b)?;
+            if first {
+                return Some(stream);
+            }
+            let cut = self.cut;
+            Some(HistogramStream {
+                meta: stream.meta,
+                rows: Box::new(stream.rows.filter(move |r| r.timestamp >= cut)),
+            })
+        }
+        fn interval(&self) -> f64 {
+            self.inner.interval()
+        }
+        fn time_range(&self) -> Option<(u64, u64)> {
+            self.inner.time_range()
+        }
+        fn counter_names(&self) -> Vec<String> {
+            self.inner.counter_names()
+        }
+        fn gauge_names(&self) -> Vec<String> {
+            self.inner.gauge_names()
+        }
+        fn histogram_names(&self) -> Vec<String> {
+            self.inner.histogram_names()
+        }
+        fn counter_labels(&self, n: &str) -> Vec<BTreeMap<String, String>> {
+            self.inner.counter_labels(n)
+        }
+        fn gauge_labels(&self, n: &str) -> Vec<BTreeMap<String, String>> {
+            self.inner.gauge_labels(n)
+        }
+        fn histogram_labels(&self, n: &str) -> Vec<BTreeMap<String, String>> {
+            self.inner.histogram_labels(n)
+        }
+        fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+            self.inner.column_map()
+        }
+    }
+
+    /// A member whose second read differs from its first adds no change
+    /// twice: the rows stay in `(time, series)` order with none repeated or
+    /// past the read's end, and every row's counts are at most the
+    /// observations up to its time.
+    #[test]
+    fn a_member_whose_second_read_differs_adds_no_change_twice() {
+        let fine = histogram_source(1, &[(&[("cpu", "0")], (20..=80).map(|s| s * S).collect())]);
+        let coarse = histogram_source(
+            2,
+            &[(&[("cpu", "0")], (0..=50).map(|s| 2 * s * S).collect())],
+        );
+        let coarse: Arc<dyn DataSource> = Arc::new(LosesRows {
+            inner: coarse,
+            cut: 10 * S,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let members: Vec<Member> = [fine, coarse]
+            .into_iter()
+            .enumerate()
+            .map(|(m, source)| Member {
+                source,
+                lo: 0,
+                hi: u64::MAX,
+                uuid: Some(format!("u{m}")),
+                catalog_index: m,
+                position: m,
+            })
+            .collect();
+        let (start, end) = (0, 90 * S);
+        let rows = collect(combine_histograms(
+            &members,
+            "h",
+            &Labels::default(),
+            start,
+            end,
+        ))
+        .expect("combined")
+        .expect("rows");
+        assert!(!rows.is_empty());
+        assert!(rows.windows(2).all(|w| w[0].1 < w[1].1), "{rows:?}");
+        assert!(rows.iter().all(|r| r.1 <= end), "{rows:?}");
+        // Bucket 1 grows one a second, so between two rows its count grows
+        // by at most the seconds between them: a change added twice would
+        // grow it by more.
+        let bucket1 =
+            |r: &(Labels, u64, Vec<u32>, Vec<u64>, bool)| r.3.first().copied().unwrap_or(0);
+        assert!(
+            rows.windows(2)
+                .all(|w| (bucket1(&w[1]) - bucket1(&w[0])) * S <= w[1].1 - w[0].1),
+            "{rows:?}"
+        );
     }
 
     /// S3: a 5 s gap among 1 s rows is a hole (5 s against a 2 s threshold);
