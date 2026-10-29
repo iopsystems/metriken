@@ -35,8 +35,8 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 /// classifies a column into the four name sets or which footer keys of a
 /// column become its labels (`Labels::from_metadata`, `STORAGE_KEYS`),
 /// needs a new prefix (`MNI2`), since a reader takes an index over the
-/// footer it was built from. A reader fetches the segment of an `MNI` index whose version it
-/// does not know.
+/// footer it was built from. A reader fetches the segment of an `MNI` index
+/// whose version it does not know.
 const NAMES: &[u8; 4] = b"MNI1";
 
 /// The prefix every names index version starts with.
@@ -47,8 +47,8 @@ const NAMES_FAMILY: &[u8; 3] = b"MNI";
 /// 2500 names of 20 bytes each packs to about 53 KB (21 bytes a name).
 const MAX_DECODED: u64 = 4 * 1024 * 1024;
 
-/// The most a [`SegmentColumns`] frame decompresses to before a listing
-/// reads the segment's table without it.
+/// The most a [`SegmentColumns`] frame decompresses to; past it, a listing
+/// builds the table's reader instead.
 const MAX_COLUMNS_DECODED: u64 = 64 * 1024 * 1024;
 
 /// What a segment's footer gives a reader at open: the metric names it

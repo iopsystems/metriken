@@ -3018,8 +3018,9 @@ written by the new dendro.
      metriken-storage `segmented.rs`), and `ArchiveReader`'s label listings
      fold them as a table's reader would (`Listing`), relabelled through
      the occupant stream for a long table, without building the reader,
-     for a recording complete at open. A recording still being written, a
-     long table with a live tail, or a segment with no columns frame
+     for a recording complete at open. A recording not complete at open
+     (still being written, or stopped before it was finalized), a long
+     table with a live tail, or a segment with no columns frame
      builds the reader as before: a reader built after the open reads
      segments sealed since, which a listing from the open's indexes would
      not. Measured on copies of the 9.6-hour bench archive (complete) whose

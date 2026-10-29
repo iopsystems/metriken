@@ -280,18 +280,20 @@ type TableProbes = (KnownNames, Vec<Vec<u8>>);
 /// segment is neither (its index has no columns frame, or it was not
 /// fetched), or the table is long and has a live tail, whose materialized
 /// rows do not name every occupant, a listing builds the table's reader.
-/// So does a listing of a recording that was not complete at open.
+/// So does a listing of a recording that was not complete (`complete`
+/// false), for which no columns are recorded.
 fn table_probes(
     db: &dyn Catalog,
     recording_id: i64,
     table: &str,
     sealed: &[(u64, crate::catalog::SegmentMeta)],
     long: bool,
+    complete: bool,
 ) -> Result<TableProbes, Box<dyn std::error::Error>> {
     use crate::names::Stored;
 
     let mut known = KnownNames {
-        listed: Some(Vec::new()),
+        listed: complete.then(Vec::new),
         ..Default::default()
     };
     let mut probes = Vec::new();
@@ -1102,7 +1104,9 @@ impl SamplerReader {
         kind: MetricKind,
         name: &str,
     ) -> Option<Vec<BTreeMap<String, String>>> {
-        let built = self.reader.get().is_some();
+        // A reader that failed to build leaves the listing to the index,
+        // so the table is listed the same before and after a query tries it.
+        let built = matches!(self.reader.get(), Some(Some(_)));
         if let (false, Some(listing)) = (built, self.indexed_listing()) {
             return Some(match kind {
                 MetricKind::Counter => listing.counter_labels(name),
@@ -1989,6 +1993,7 @@ impl ArchiveReader {
                             &sampler,
                             &metas,
                             occupant_streams.contains(&crate::occupants::stream_of(&sampler)),
+                            rec.complete,
                         )?;
                         // Nothing sealed and nothing live: the table has no rows at
                         // all, so there is nothing to open. Same skip as the eager path.
@@ -2054,10 +2059,12 @@ impl ArchiveReader {
             let mut tables = Vec::new();
             for probe in probed {
                 let (sampler, names, probed_interval, declared, span, listed) = probe?;
-                // A recording still being written lists through its tables'
+                // A recording not complete at open (still being written, or
+                // stopped before it was finalized) lists through its tables'
                 // readers, which read the catalog as it is when they are
-                // built, as its queries do.
-                let listed = listed.filter(|_| rec.complete);
+                // built, as its queries do. A complete recording is not
+                // written again while this reader is open, except by a
+                // dendro writer that resumes it, which this crate does not do.
                 // A declared interval wins over the measured one, as it
                 // does when the same segments are read from bytes
                 // (`from_in_memory`): a recording with dropped or jittered
@@ -2339,9 +2346,9 @@ impl ArchiveReader {
 
     /// The label sets of counter `name`, from every table holding it, each
     /// with its recording's labels ([`series_labels`](Self::series_labels)).
-    /// A table of a recording complete at open, whose segments' names
-    /// indexes hold their columns, lists without fetching its sealed
-    /// segments.
+    /// A table of a recording complete at open, whose segments' columns the
+    /// open recorded (see `SamplerReader::labels`), lists without fetching
+    /// its sealed segments.
     pub fn counter_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.labeled_listing(
             |t| t.names.counters.contains(name),

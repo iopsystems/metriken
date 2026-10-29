@@ -380,6 +380,57 @@ fn long_and_wide_answer_the_same_after_eviction() {
     compare(true, Some(19));
 }
 
+/// A complete recording whose long table still has WAL rows, as a copy
+/// marked complete while its source was being written: the long table lists
+/// through its reader, since its materialized tail does not name every
+/// occupant; the wide tables list from the names indexes.
+#[test]
+fn a_complete_long_table_with_a_live_tail_lists_through_its_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.dendro");
+    record(&path, true, false, None);
+    {
+        let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        db.mark_complete(id).unwrap();
+    }
+    let (_, built) = listings_and_readers_built(&open(&path), &path);
+    assert_eq!(built, vec!["threads/tasks".to_string()]);
+}
+
+/// A complete recording with a damaged segment lists its table from the
+/// names indexes, and lists it the same after a query fails to build the
+/// table's reader.
+#[cfg(feature = "rez")]
+#[test]
+fn a_damaged_segment_lists_the_same_before_and_after_a_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.dendro");
+    record(&path, false, true, None);
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let changed = db
+            .execute(
+                "UPDATE segments SET bytes = x'00010203' WHERE stream = 'memory/meminfo' \
+                 AND seq = (SELECT max(seq) FROM segments WHERE stream = 'memory/meminfo')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    let reader = open(&path);
+    let before = listings(&reader);
+    assert!(before.iter().any(|(_, n, _)| n == "mem_free"));
+    let names: Vec<String> = before.iter().map(|(_, n, _)| n.clone()).collect();
+    let failed = reader
+        .owners_of(&names)
+        .into_iter()
+        .filter(|t| t.reader().is_none())
+        .count();
+    assert_eq!(failed, 1, "the damaged table's reader fails to build");
+    assert_eq!(listings(&reader), before);
+}
+
 /// Metadata patched during a recording reads back with the source, merged
 /// into what it started with: live after a sync, and after finalize.
 #[test]
