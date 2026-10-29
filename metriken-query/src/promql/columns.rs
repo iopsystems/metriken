@@ -100,20 +100,28 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
 /// `metric{arch=~"x|y"}`), as the filter
 /// [`MetricsSource::counter_labels_matching`](crate::MetricsSource::counter_labels_matching)
 /// and its siblings take; a metric name in it is not part of the filter.
-/// A selector with no metric name may hold only matchers that match the
-/// empty string (`{source!="a"}`), which PromQL refuses on its own. An
-/// error for anything but one vector selector, and for a selector that
-/// matches one label more than once, since the filter holds one matcher
-/// per label.
+/// A selector with no metric name is accepted even when every matcher
+/// matches the empty string (`{source!="a"}`, `{}`), which PromQL refuses.
+/// An `offset` or `@` modifier is accepted and has no effect. An error for
+/// anything but one vector selector, and for a selector that matches one
+/// label more than once, since the filter holds one matcher per label.
 pub fn selector_filter(selector: &str) -> Result<Labels, QueryError> {
-    // A name, so that PromQL's rule that a nameless selector match some
-    // non-empty value does not apply; the name is not part of the filter.
-    let named = match selector.trim_start().starts_with('{') {
-        true => format!("selector{selector}"),
-        false => selector.to_string(),
+    // A nameless selector PromQL refuses is parsed again with a name, which
+    // is not part of the filter.
+    let (named, expr) = match parser::parse(selector) {
+        Ok(expr) => (selector.to_string(), expr),
+        Err(e) if !selector.trim_start().starts_with('{') => {
+            return Err(QueryError::ParseError(format!(
+                "Failed to parse selector: {e:?}"
+            )));
+        }
+        Err(e) => {
+            let named = format!("selector{selector}");
+            let expr = parser::parse(&named)
+                .map_err(|_| QueryError::ParseError(format!("Failed to parse selector: {e:?}")))?;
+            (named, expr)
+        }
     };
-    let expr = parser::parse(&named)
-        .map_err(|e| QueryError::ParseError(format!("Failed to parse selector: {e:?}")))?;
     let Expr::VectorSelector(sel) = &expr else {
         return Err(QueryError::ParseError(format!(
             "{selector} is not a vector selector"

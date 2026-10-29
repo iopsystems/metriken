@@ -958,7 +958,17 @@ mod tests {
     /// A table of counter `name`: one column per series, each with its
     /// labels, sharing a `timestamp` column of `rows` rows one second apart.
     fn counter_table(name: &str, series: &[(&[(&str, &str)], u64)], rows: u64) -> Vec<u8> {
-        use arrow::array::{ArrayRef, UInt64Array};
+        typed_table(name, "counter", series, rows)
+    }
+
+    /// [`counter_table`] with columns of `metric_type`.
+    fn typed_table(
+        name: &str,
+        metric_type: &str,
+        series: &[(&[(&str, &str)], u64)],
+        rows: u64,
+    ) -> Vec<u8> {
+        use arrow::array::{ArrayRef, Int64Array, UInt64Array};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use parquet::arrow::ArrowWriter;
@@ -971,16 +981,24 @@ mod tests {
         for (i, (labels, per_second)) in series.iter().enumerate() {
             let mut meta = HashMap::new();
             meta.insert("metric".to_string(), name.to_string());
-            meta.insert("metric_type".to_string(), "counter".to_string());
+            meta.insert("metric_type".to_string(), metric_type.to_string());
             for (k, v) in *labels {
                 meta.insert(k.to_string(), v.to_string());
             }
-            fields.push(
-                Field::new(format!("{name}__{i}"), DataType::UInt64, true).with_metadata(meta),
-            );
-            columns.push(Arc::new(UInt64Array::from(
-                (1..=rows).map(|r| r * per_second).collect::<Vec<_>>(),
-            )));
+            // A gauge column is signed.
+            let gauge = metric_type == "gauge";
+            let data_type = match gauge {
+                true => DataType::Int64,
+                false => DataType::UInt64,
+            };
+            fields.push(Field::new(format!("{name}__{i}"), data_type, true).with_metadata(meta));
+            let values = (1..=rows).map(|r| r * per_second);
+            columns.push(match gauge {
+                true => Arc::new(Int64Array::from(
+                    values.map(|v| v as i64).collect::<Vec<_>>(),
+                )),
+                false => Arc::new(UInt64Array::from(values.collect::<Vec<_>>())),
+            });
         }
         let schema = Arc::new(Schema::new(fields));
         let mut buf = Vec::new();
@@ -1116,12 +1134,37 @@ mod tests {
                 vec![("t", counter_table("x", &[(&[("cpu", "0")], 1)], 5))],
             ),
         ]);
-        let listed = reader
-            .counter_labels_matching("x", &crate::selector_filter(r#"{source="b"}"#).unwrap());
+        let listed = MetricsSource::counter_labels_matching(
+            &reader,
+            "x",
+            &crate::selector_filter(r#"{source="b"}"#).unwrap(),
+        );
         assert_eq!(listed, vec![labels(&[("cpu", "0"), ("source", "b")])]);
         assert_eq!(reader.opened_tables().len(), 1);
         let _ = reader.counter_labels("x");
         assert_eq!(reader.opened_tables().len(), 2);
+
+        // A gauge lists by its own kind, and only matching recordings.
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![
+                    ("t", counter_table("x", &[(&[("cpu", "0")], 1)], 5)),
+                    ("u", typed_table("g", "gauge", &[(&[("cpu", "1")], 1)], 5)),
+                ],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("u", typed_table("g", "gauge", &[(&[("cpu", "2")], 1)], 5))],
+            ),
+        ]);
+        let filter = crate::selector_filter(r#"{source="a"}"#).unwrap();
+        assert_eq!(
+            MetricsSource::gauge_labels_matching(&reader, "g", &filter),
+            vec![labels(&[("cpu", "1"), ("source", "a")])]
+        );
+        assert_eq!(reader.opened_tables(), vec!["u".to_string()]);
+        assert!(MetricsSource::gauge_labels_matching(&reader, "x", &filter).is_empty());
     }
 
     /// `selector_filter` takes one vector selector's matchers, without its
@@ -1138,6 +1181,13 @@ mod tests {
         assert_eq!(
             crate::selector_filter(r#"{a!="1"}"#).unwrap().inner,
             labels(&[("a", "!1")])
+        );
+        assert_eq!(crate::selector_filter("{}").unwrap().inner, labels(&[]));
+        assert_eq!(
+            crate::selector_filter(r#"{__name__="x", a="1"}"#)
+                .unwrap()
+                .inner,
+            labels(&[("a", "1")])
         );
     }
 

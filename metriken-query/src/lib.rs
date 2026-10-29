@@ -141,6 +141,9 @@ pub(crate) use metriken_storage::{buffer_pool, histogram_stream, labels, memory,
 pub use archive::eval_timestamps_for;
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
+/// The filter the `*_labels_matching` methods take; [`selector_filter`]
+/// builds one.
+pub use metriken_storage::Labels;
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{
     referenced_metrics, selector_filter, HistogramHeatmapResult, MatrixSample, QueryError,
@@ -260,6 +263,16 @@ impl QueryOptions {
     }
 }
 
+/// The label sets of `sets` that `filter` matches.
+fn matching(
+    sets: Vec<std::collections::BTreeMap<String, String>>,
+    filter: &metriken_storage::Labels,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    sets.into_iter()
+        .filter(|set| metriken_storage::Labels::from(set.clone()).matches(filter))
+        .collect()
+}
+
 /// Public trait expressing the full read-only capability of a metrics source.
 ///
 /// Implement this trait to expose a uniform interface for PromQL queries,
@@ -273,16 +286,6 @@ impl QueryOptions {
 ///     println!("counters: {:?}", src.counter_names());
 /// }
 /// ```
-/// The label sets of `sets` that `filter` matches.
-fn matching(
-    sets: Vec<std::collections::BTreeMap<String, String>>,
-    filter: &metriken_storage::Labels,
-) -> Vec<std::collections::BTreeMap<String, String>> {
-    sets.into_iter()
-        .filter(|set| metriken_storage::Labels::from(set.clone()).matches(filter))
-        .collect()
-}
-
 pub trait MetricsSource: Send + Sync {
     /// Execute a PromQL range query with the default [`QueryOptions`]
     /// (i.e. [`RateMode::Grid`]). Delegates to
@@ -434,12 +437,13 @@ pub trait MetricsSource: Send + Sync {
         Vec::new()
     }
 
-    /// The label sets of counter `name` that `filter` matches, as a query's
-    /// selector `name{...}` with those matchers selects them. Build `filter`
-    /// from a selector with [`selector_filter`]. The default filters
-    /// [`counter_labels`](Self::counter_labels); a source that can leave out
-    /// what cannot match without reading it (an archive's recordings whose
-    /// labels contradict `filter`) does.
+    /// The label sets of counter `name` that `filter` matches, as this
+    /// engine's selector `name{...}` with those matchers selects them
+    /// (`Labels::matches`: a regex matcher takes literal alternatives, and
+    /// `k=""` does not match a series without `k`). Build `filter` from a
+    /// selector with [`selector_filter`]. The default filters
+    /// [`counter_labels`](Self::counter_labels); `ArchiveReader` overrides
+    /// it and does not read a recording whose labels `filter` contradicts.
     fn counter_labels_matching(
         &self,
         name: &str,
