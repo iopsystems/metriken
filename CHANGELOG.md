@@ -314,15 +314,17 @@ public API uses metriken-storage types.
   the lowest uuid). Members are offered coarsest first and a pair
   overlapping one already taken is not taken, so a coarse pair straddling
   a finer run's edge is taken; a pair set aside for lying inside a finer
-  run is taken at the end where nothing taken overlaps it. A junction
-  loses less than one interval of the coarser member, and members are read
-  two coarsest intervals past the read's end so where a read ends does not
-  move a junction. The deltas taken are summed into one cumulative stream.
-  It read the one source covering the most of the range, leaving the
-  others' spans out; where a finer run sits inside a coarse one, the group
-  can count up to one coarse interval less than the coarse source alone at
-  each junction. Members of different bucket configurations still read one
-  source. The group's histogram interval is its coarsest member's.
+  run is taken at the end where nothing taken overlaps it. The deltas
+  taken are summed into one cumulative stream. A junction between two
+  members loses less than one interval of the coarser one, and with three
+  or more up to two intervals of a member. Members are read three coarsest
+  intervals past the read's end; where a read starts or ends can still
+  move a junction near it with three or more members or with holes within
+  a member. Before, a group's histogram read the one source covering the
+  most of the range, leaving the others' spans out. Where a finer run sits
+  inside a coarse one, the group can count less than the coarse source
+  alone. Members of different bucket configurations still read one source.
+  The group's histogram interval is its coarsest member's.
 - **Added:** `Scope` and `QueryOptions::with_scope`: the sources a query
   reads, each named by uuid (a source and its copies) or by position among
   the reader's `ArchiveReader::sources`, with an optional span. An

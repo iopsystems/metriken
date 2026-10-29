@@ -1543,12 +1543,16 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   Members are offered coarsest first and a pair overlapping one already
   taken is not taken, so a coarse pair straddling a finer run's edge is
   taken; a pair set aside for lying inside a finer run is taken at the end
-  where nothing taken overlaps it, so a junction loses less than one
-  interval of the coarser member. Members are read two coarsest intervals
-  past the read's end (as the read starts two back), so where a read ends
-  does not move a junction (in review's model of 3000 layouts, one interval
-  moved 30, two moved none). The deltas
-  taken never overlap in time and are
+  where nothing taken overlaps it. A junction between two members loses
+  less than one interval of the coarser one; with three or more it can lose
+  up to two intervals of a member. Members are read three coarsest
+  intervals past the read's end. In review's model (3000 random layouts
+  each), one interval past moved the end of 31 two-member layouts and two
+  moved none; two moved 1 to 6 three-member layouts of close coarse
+  intervals and three moved none; with holes within a member, 12 to 31
+  moved at any reach tried, and the read's start (two intervals back)
+  moved 33 three-member layouts. The deltas taken never overlap in time and
+  are
   summed per series into one cumulative stream, with a row marked
   `HistogramRow::resumes` before each change taken from another source's
   rows (so `histogram_irate` gives no point there), which every histogram

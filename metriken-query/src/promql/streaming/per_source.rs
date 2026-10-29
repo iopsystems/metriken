@@ -537,12 +537,11 @@ fn combine_histograms(
         .map(|m| ((m.source.histogram_interval(name) * 1e9) as u64, m))
         .collect();
     ranked.sort_by(|(ia, a), (ib, b)| ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo)));
-    // Each member's rows, by series, read two coarsest intervals past the
-    // read's end (as the read starts two intervals back), so a member's run
-    // does not seem to end at it: a pair
+    // Each member's rows, by series, read three coarsest intervals past
+    // the read's end, so a member's run seldom seems to end at it: a pair
     // ending past `end_ns` decides which pairs before it are taken and is
     // then left out.
-    let past = end_ns.saturating_add(2 * ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
+    let past = end_ns.saturating_add(3 * ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
     let mut config = None;
     let mut series: Vec<Labels> = Vec::new();
     let mut index: HashMap<Labels, usize> = HashMap::new();
@@ -600,8 +599,10 @@ fn combine_histograms(
         // are offered again after every member, and those overlapping
         // nothing taken are taken: where a finer run is too short for its
         // pairs to fit between the straddling pairs, the coarse pair inside
-        // it covers that time. A junction loses less than one interval of
-        // the coarser member.
+        // it covers that time. A junction between two members loses less
+        // than one interval of the coarser one; with three or more it can
+        // lose up to two intervals of a member whose pairs on both sides
+        // overlap pairs taken.
         let mut taken: BTreeMap<u64, (u64, usize, usize)> = BTreeMap::new();
         let mut aside: Vec<(u64, u64, usize, usize)> = Vec::new();
         let overlaps = |taken: &BTreeMap<u64, (u64, usize, usize)>, p: u64, t: u64| {
@@ -1270,10 +1271,14 @@ impl DataSource for GroupSource {
     /// straddles a finer run's edge is taken and the finer pairs it overlaps
     /// are not; a pair set aside for lying inside a finer run is offered
     /// again at the end and taken where nothing taken overlaps it. A
-    /// junction loses less than one interval of the coarser member. Members
-    /// are read two coarsest intervals past the read's end, so where a read
-    /// ends does not move a junction. No two deltas taken overlap in time, and none is between rows of two
-    /// sources or across a restart. The deltas taken are summed per series
+    /// junction between two members loses less than one interval of the
+    /// coarser one; with three or more it can lose up to two intervals of a
+    /// member whose pairs on both sides overlap pairs taken. Members are read
+    /// three coarsest intervals past the read's end; where a read starts or
+    /// ends can still move a junction near it with three or more members,
+    /// or with holes within a member. No two deltas taken overlap in time,
+    /// and none is between rows of two sources or across a restart. The
+    /// deltas taken are summed per series
     /// into a cumulative stream, with a row marked
     /// [`resumes`](crate::histogram_stream::HistogramRow::resumes) before
     /// each change taken from another source's rows, which every histogram

@@ -1783,8 +1783,7 @@ fn a_short_finer_run_inside_a_coarse_one_loses_nothing() {
 
 /// Three members, 1 s, 5 s and 10 s, whose runs end near each other: the
 /// 10 s source takes over from the 1 s one without a gap left by a 5 s pair
-/// it overlaps, and no junction loses an interval of the member whose pairs
-/// are dropped: every 10 s window holds at most 100 observations and at
+/// it overlaps, and every 10 s window holds at most 100 observations and at
 /// least 50.
 #[test]
 fn three_members_hand_over_without_a_cascade_gap() {
