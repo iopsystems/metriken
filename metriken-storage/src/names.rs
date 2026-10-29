@@ -7,6 +7,9 @@
 //! The writer stores a [`SegmentNames`]: the metric names the segment's
 //! footer holds by kind, and the footer keys a probe reads when it opens the
 //! segment (`sampling_interval_ms`, `metriken.format`, `metriken.layout`).
+//! After it, in a second zstd frame, it stores the segment's
+//! [`SegmentColumns`], from which a reader lists the table's label sets
+//! without fetching a segment. The open decodes only the first frame.
 //! Segments sealed by metriken-storage 0.5.4 and earlier carry a names
 //! fingerprint instead (or nothing), which a reader still uses: two segments
 //! with the same fingerprint hold the same metric names, so the reader
@@ -16,6 +19,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::segmented::SegmentColumns;
 use crate::{BufferPool, DataSource};
 
 /// Prefix naming the index as a names fingerprint, version 1, so a
@@ -23,12 +27,14 @@ use crate::{BufferPool, DataSource};
 const FINGERPRINT: &[u8; 4] = b"MNS1";
 
 /// Prefix naming the index as a [`SegmentNames`], version 1: msgpack with
-/// named fields, compressed with zstd. A field added later is left out by a
-/// reader that does not know it, and a field missing is its default. A
-/// change to what a field means, including how a probe classifies a column
-/// into the four name sets, needs a new prefix (`MNI2`), since a reader
-/// takes an index over the footer it was built from. A reader fetches the
-/// segment of an `MNI` index whose version it does not know.
+/// named fields, compressed with zstd, then optionally the segment's
+/// [`SegmentColumns`] the same way, as a second zstd frame. A field added
+/// later is left out by a reader that does not know it, and a field missing
+/// is its default. A change to what a field means, including how a probe
+/// classifies a column into the four name sets, needs a new prefix
+/// (`MNI2`), since a reader takes an index over the footer it was built
+/// from. A reader fetches the segment of an `MNI` index whose version it
+/// does not know.
 const NAMES: &[u8; 4] = b"MNI1";
 
 /// The prefix every names index version starts with.
@@ -38,6 +44,10 @@ const NAMES_FAMILY: &[u8; 3] = b"MNI";
 /// so a crafted index cannot exhaust memory at open. A [`SegmentNames`] of
 /// 2500 names of 20 bytes each packs to about 53 KB (21 bytes a name).
 const MAX_DECODED: u64 = 4 * 1024 * 1024;
+
+/// The most a [`SegmentColumns`] frame decompresses to before a listing
+/// reads the segment's table without it.
+const MAX_COLUMNS_DECODED: u64 = 64 * 1024 * 1024;
 
 /// What a segment's footer gives a reader at open: the metric names it
 /// holds by kind, and the footer keys the open reads.
@@ -59,7 +69,9 @@ pub(crate) struct SegmentNames {
 /// A stored index, as a reader uses it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Stored {
-    Names(SegmentNames),
+    /// The names, and the segment's [`SegmentColumns`] frame, compressed
+    /// ([`columns`] decodes it), when the index has one.
+    Names(SegmentNames, Option<Vec<u8>>),
     /// A names fingerprint: the segment holds the same names as any other
     /// with this value.
     Fingerprint(u64),
@@ -69,9 +81,12 @@ pub(crate) enum Stored {
 }
 
 /// The index to store with a sealed segment, or `None` when its footer
-/// cannot be read (the segment is then read as unindexed).
+/// cannot be read (the segment is then read as unindexed). It holds no
+/// columns frame when the segment holds one histogram under two configs,
+/// which no reader opens.
 pub(crate) fn index_of(segment: &[u8]) -> Option<Vec<u8>> {
-    encode(&names_of(segment)?)
+    let (names, probe) = probe_of(segment)?;
+    encode(&names, SegmentColumns::of(&probe).ok().as_ref())
 }
 
 /// The names a probe of `segment` reads, as the reader's open does, or
@@ -79,7 +94,13 @@ pub(crate) fn index_of(segment: &[u8]) -> Option<Vec<u8>> {
 /// more than once (the probe and this index could read different entries),
 /// or has a `sampling_interval_ms` that is not a non-negative integer,
 /// which the probe does not accept.
+#[cfg(test)]
 pub(crate) fn names_of(segment: &[u8]) -> Option<SegmentNames> {
+    probe_of(segment).map(|(names, _)| names)
+}
+
+/// [`names_of`], with the probe it read.
+fn probe_of(segment: &[u8]) -> Option<(SegmentNames, crate::parquet::MultiParquetSource)> {
     let bytes = bytes::Bytes::copy_from_slice(segment);
     let meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
         &bytes,
@@ -112,7 +133,7 @@ pub(crate) fn names_of(segment: &[u8]) -> Option<SegmentNames> {
         BufferPool::new(1024 * 1024),
     )
     .ok()?;
-    Some(SegmentNames {
+    let names = SegmentNames {
         counters: probe.counter_names().into_iter().collect(),
         gauges: probe.gauge_names().into_iter().collect(),
         histograms: probe.histogram_names().into_iter().collect(),
@@ -120,13 +141,18 @@ pub(crate) fn names_of(segment: &[u8]) -> Option<SegmentNames> {
         sampling_interval_ms: probe.metadata_get("sampling_interval_ms"),
         format: probe.metadata_get(crate::format::FORMAT_KEY),
         layout: probe.metadata_get(crate::long::LAYOUT_KEY),
-    })
+    };
+    Some((names, probe))
 }
 
-fn encode(names: &SegmentNames) -> Option<Vec<u8>> {
-    let packed = rmp_serde::to_vec_named(names).ok()?;
+fn encode(names: &SegmentNames, columns: Option<&SegmentColumns>) -> Option<Vec<u8>> {
     let mut index = NAMES.to_vec();
+    let packed = rmp_serde::to_vec_named(names).ok()?;
     index.extend(zstd::stream::encode_all(packed.as_slice(), 3).ok()?);
+    if let Some(columns) = columns {
+        let packed = rmp_serde::to_vec_named(columns).ok()?;
+        index.extend(zstd::stream::encode_all(packed.as_slice(), 3).ok()?);
+    }
     Some(index)
 }
 
@@ -135,8 +161,18 @@ fn encode(names: &SegmentNames) -> Option<Vec<u8>> {
 pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
     let index = index?;
     if let Some(rest) = index.strip_prefix(NAMES.as_slice()) {
-        let names = decode(rest).and_then(|packed| rmp_serde::from_slice(&packed).ok());
-        return Some(names.map_or(Stored::Unreadable, Stored::Names));
+        // The first frame is the names; what follows it, the columns.
+        let names = zstd::zstd_safe::find_frame_compressed_size(rest)
+            .ok()
+            .and_then(|n| {
+                let (names, columns) = rest.split_at(n);
+                let names = decode(names, MAX_DECODED)?;
+                let names = rmp_serde::from_slice(&names).ok()?;
+                Some((names, (!columns.is_empty()).then(|| columns.to_vec())))
+            });
+        return Some(names.map_or(Stored::Unreadable, |(names, columns)| {
+            Stored::Names(names, columns)
+        }));
     }
     if index.starts_with(NAMES_FAMILY) {
         return Some(Stored::Unreadable);
@@ -147,17 +183,23 @@ pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
     )))
 }
 
+/// A columns frame from [`Stored::Names`], decoded, or `None` when it does
+/// not decode or decompresses past [`MAX_COLUMNS_DECODED`].
+pub(crate) fn columns(frame: &[u8]) -> Option<SegmentColumns> {
+    rmp_serde::from_slice(&decode(frame, MAX_COLUMNS_DECODED)?).ok()
+}
+
 /// `compressed` decompressed, or `None` when it does not decode or exceeds
-/// [`MAX_DECODED`].
-fn decode(compressed: &[u8]) -> Option<Vec<u8>> {
+/// `max` bytes.
+fn decode(compressed: &[u8], max: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
     zstd::stream::Decoder::new(compressed)
         .ok()?
-        .take(MAX_DECODED + 1)
+        .take(max + 1)
         .read_to_end(&mut out)
         .ok()?;
-    (out.len() as u64 <= MAX_DECODED).then_some(out)
+    (out.len() as u64 <= max).then_some(out)
 }
 
 #[cfg(test)]
@@ -174,9 +216,21 @@ mod tests {
             sampling_interval_ms: Some("100".into()),
             ..Default::default()
         };
-        let index = encode(&names).unwrap();
+        let index = encode(&names, None).unwrap();
         assert!(index.starts_with(NAMES));
-        assert_eq!(read(Some(&index)), Some(Stored::Names(names)));
+        assert_eq!(read(Some(&index)), Some(Stored::Names(names.clone(), None)));
+
+        let columns = SegmentColumns {
+            counters: vec![("a".into(), [("k".to_string(), "v".to_string())].into())],
+            histogram_configs: [("h".to_string(), (4, 32))].into(),
+            ..Default::default()
+        };
+        let index = encode(&names, Some(&columns)).unwrap();
+        let Some(Stored::Names(read_names, Some(frame))) = read(Some(&index)) else {
+            panic!("no columns frame");
+        };
+        assert_eq!(read_names, names);
+        assert_eq!(super::columns(&frame), Some(columns));
     }
 
     /// A field this reader does not know is left out, and one it knows but
@@ -201,7 +255,7 @@ mod tests {
             gauges: later.gauges,
             ..Default::default()
         };
-        assert_eq!(read(Some(&index)), Some(Stored::Names(expected)));
+        assert_eq!(read(Some(&index)), Some(Stored::Names(expected, None)));
     }
 
     /// A parquet segment with one timestamp column and `interval` as its
@@ -281,10 +335,10 @@ mod tests {
     fn an_index_decodes_up_to_the_cap() {
         let z = |n: usize| zstd::stream::encode_all(vec![0u8; n].as_slice(), 3).unwrap();
         assert_eq!(
-            decode(&z(MAX_DECODED as usize)).map(|v| v.len()),
+            decode(&z(MAX_DECODED as usize), MAX_DECODED).map(|v| v.len()),
             Some(MAX_DECODED as usize)
         );
-        assert_eq!(decode(&z(MAX_DECODED as usize + 1)), None);
+        assert_eq!(decode(&z(MAX_DECODED as usize + 1), MAX_DECODED), None);
     }
 
     #[test]

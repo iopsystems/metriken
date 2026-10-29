@@ -7,8 +7,10 @@ process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
 S9 in metriken" below) are done; the producer identity keys and
 `producer_identity!`, the identity layers in metriken-storage (#326),
-metriken-recorder writing them (step 2), and the names index of the catalog
-index (step 2) are built and unreleased; nothing else is built. The owner
+metriken-recorder writing them (step 2), and the catalog index's names and
+label listings (step 2) are built and unreleased; nothing else is built. The
+owner decided on 2026-10-28 that the next metriken-storage release is a minor
+version (0.6.0), since 0.5.4 and earlier do not read the names index. The owner
 decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
 producer identity keys on 2026-10-27. Q9 and Q37 were decided on
@@ -3010,8 +3012,27 @@ written by the new dendro.
      `metriken.format` and `metriken.layout` (metriken-storage `names.rs`,
      `MNI1`), and
      `ArchiveReader` opens an archive whose segments carry one without
-     fetching a segment. Label keys and values per metric, and the
-     scope-aware listings that would use them, are not built.
+     fetching a segment. Each index also holds, in a second zstd frame
+     the open does not decode, the segment's columns (each column's metric
+     name and labels, and each histogram's config: `SegmentColumns` in
+     metriken-storage `segmented.rs`), and `ArchiveReader`'s label listings
+     fold them as a table's reader would (`Listing`), relabelled through
+     the occupant stream for a long table, without building the reader. A
+     long table with a live tail, or a segment with no columns frame,
+     builds the reader as before. Measured on copies of the 9.6-hour bench
+     archive whose 5874 segments were re-indexed (release build, warm page
+     cache, three runs each): with names-only indexes, listing every
+     metric's label sets took 5441 to 5592 ms and built 49 table readers;
+     with columns frames, 452 to 474 ms and none; the open took 142 to 172
+     ms and 135 to 159 ms; both listed the same 9385 label sets, and the
+     listings were equal. The columns frames are 4.99 MB of the 1.28 GB
+     archive. Capped value sets (the prototype's 64 values per key) were
+     measured at 1.92 MB but leave the task tables' keys (about 2850
+     values a key) over the cap, so the listings that cost the most would
+     still build the reader. With each metric's label sets in the names
+     frame, reading every index's names on that archive took 95 ms,
+     against 7 ms for names alone, so the columns are a separate frame.
+     The scope-aware listings are not built.
 3. rezolus, in this order:
    1. ~~Open and merge the combined view.~~ Done: #1504.
    2. The restriction as the engine scope (D1) in both viewers' query APIs

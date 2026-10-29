@@ -267,6 +267,50 @@ fn streams(path: &Path) -> Vec<String> {
     catalog.tables(id).unwrap()
 }
 
+/// Each metric's kind, name and label sets.
+type Listings = Vec<(&'static str, String, Vec<BTreeMap<String, String>>)>;
+
+/// Every metric's label sets, by kind and name, each list sorted.
+fn listings(reader: &ArchiveReader) -> Listings {
+    let mut out = Vec::new();
+    let sorted = |mut sets: Vec<BTreeMap<String, String>>| {
+        sets.sort();
+        sets
+    };
+    for n in reader.counter_names() {
+        out.push(("counter", n.clone(), sorted(reader.counter_labels(&n))));
+    }
+    for n in reader.gauge_names() {
+        out.push(("gauge", n.clone(), sorted(reader.gauge_labels(&n))));
+    }
+    for n in reader.histogram_names() {
+        out.push(("histogram", n.clone(), sorted(reader.histogram_labels(&n))));
+    }
+    for n in reader.gauge_histogram_names() {
+        out.push((
+            "gauge histogram",
+            n.clone(),
+            sorted(reader.gauge_histogram_labels(&n)),
+        ));
+    }
+    out
+}
+
+/// `reader`'s listings, and the tables they built a reader for, against
+/// those of a second open of `path` that builds every table's reader first.
+fn listings_and_readers_built(reader: &ArchiveReader, path: &Path) -> (Listings, Vec<String>) {
+    let listed = listings(reader);
+    let built = reader.opened_tables();
+    let read = open(path);
+    let names: Vec<String> = listed.iter().map(|(_, n, _)| n.clone()).collect();
+    for t in read.owners_of(&names) {
+        assert!(t.reader().is_some(), "{}", t.sampler());
+    }
+    assert_eq!(listed, listings(&read), "{}", path.display());
+    assert!(listed.iter().all(|(_, _, sets)| !sets.is_empty()));
+    (listed, built)
+}
+
 fn compare(finalize: bool, evict: Option<u64>) {
     let dir = tempfile::tempdir().unwrap();
     let (long, wide) = (
@@ -277,6 +321,16 @@ fn compare(finalize: bool, evict: Option<u64>) {
     record(&wide, false, finalize, evict);
     assert!(streams(&long).contains(&"threads/tasks/occupants".to_string()));
     assert!(!streams(&wide).iter().any(|s| s.ends_with("/occupants")));
+    // Listed from the names indexes, without a table's reader, but for a
+    // long table with a live tail.
+    for path in [&long, &wide] {
+        let (_, built) = listings_and_readers_built(&open(path), path);
+        let expected: Vec<String> = match (finalize, path == &long) {
+            (false, true) => vec!["threads/tasks".to_string()],
+            _ => Vec::new(),
+        };
+        assert_eq!(built, expected, "{}", path.display());
+    }
     let from = evict.unwrap_or(0);
     let (long, wide) = (open(&long), open(&wide));
     for q in QUERIES {
@@ -851,6 +905,24 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         names.sort();
         assert_eq!(names, vec!["dirty", "mem_free", "swap_free"]);
 
+        // Every metric is listed from the names indexes' columns, but those
+        // of a long table with a live tail, whose reader is built; no other
+        // table segment is fetched.
+        let (listed, built) = listings_and_readers_built(&counted, &path);
+        assert!(listed.iter().any(|(_, n, _)| n == "ctx_switches"));
+        assert!(listed.iter().any(|(_, n, _)| n == "dirty"));
+        if finalize {
+            assert_eq!(built, Vec::<String>::new());
+            assert_eq!(fetched.get().0, 0, "finalize={finalize}");
+        } else {
+            assert_eq!(built, vec!["threads/tasks".to_string()]);
+        }
+        // An index with no columns frame, as one written before them: each
+        // table's reader is built for the listing, which is the same.
+        let (counted, _) = open_counting_with(&path, &pool, Indexes::NamesOnly);
+        let (_, built) = listings_and_readers_built(&counted, &path);
+        assert_eq!(built.len(), 2, "finalize={finalize}: {built:?}");
+
         // Segments sealed before names indexes: with a fingerprint each,
         // every segment whose fingerprint is new is fetched, and the names
         // are complete; with none, only each table's first.
@@ -954,6 +1026,8 @@ enum Indexes {
     /// A names fingerprint on the first segment and no index on the rest,
     /// as compaction leaves a table sealed before names indexes.
     FingerprintFirstOnly,
+    /// The stored indexes without their columns frame.
+    NamesOnly,
 }
 
 /// Sealed segments read: of data tables, and of occupant streams.
@@ -1034,6 +1108,18 @@ impl Catalog for Counting {
             Indexes::FingerprintFirstOnly => stored
                 .into_iter()
                 .map(|(seq, _)| (seq, (seq == 0).then(|| b"MNS1\0\0\0\0\0\0\0\0".to_vec())))
+                .collect(),
+            Indexes::NamesOnly => stored
+                .into_iter()
+                .map(|(seq, index)| {
+                    let index = index.map(|index| {
+                        let names = zstd::zstd_safe::find_frame_compressed_size(&index[4..])
+                            .expect("a names frame");
+                        assert!(4 + names < index.len(), "no columns frame");
+                        index[..4 + names].to_vec()
+                    });
+                    (seq, index)
+                })
                 .collect(),
             Indexes::FirstOnly => stored
                 .into_iter()

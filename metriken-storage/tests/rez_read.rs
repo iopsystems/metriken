@@ -306,6 +306,47 @@ fn a_live_v3_converts_to_dendro() {
     let (labels, reader) = recordings.remove(0);
     assert_eq!(labels, web_01());
     assert_holds_the_ticks(&reader, 11);
+
+    // Its label listings come from the names indexes, and match those of
+    // each table's reader.
+    let open = || {
+        let catalog = metriken_storage::DendroCatalog::open(&dest).unwrap();
+        ArchiveReader::from_catalog(Box::new(catalog), None, pool(), None)
+            .unwrap()
+            .remove(0)
+            .1
+    };
+    let listings = |reader: &ArchiveReader| {
+        let mut out = Vec::new();
+        for n in reader.counter_names() {
+            out.push(reader.counter_labels(&n));
+        }
+        for n in reader.gauge_names() {
+            out.push(reader.gauge_labels(&n));
+        }
+        for n in reader.histogram_names() {
+            out.push(reader.histogram_labels(&n));
+        }
+        for sets in &mut out {
+            sets.sort();
+        }
+        out
+    };
+    let indexed = open();
+    let listed = listings(&indexed);
+    assert!(!listed.is_empty() && listed.iter().all(|sets| !sets.is_empty()));
+    assert_eq!(indexed.opened_tables(), Vec::<String>::new());
+    let read = open();
+    let names: Vec<String> = read
+        .counter_names()
+        .into_iter()
+        .chain(read.gauge_names())
+        .chain(read.histogram_names())
+        .collect();
+    for t in read.owners_of(&names) {
+        assert!(t.reader().is_some());
+    }
+    assert_eq!(listed, listings(&read));
 }
 
 /// dendro does not open a `.rez`: an archive the `.rez` writer made carries
