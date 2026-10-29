@@ -294,8 +294,8 @@ public API uses metriken-storage types.
   selects. The default filters the full listing; `ArchiveReader` leaves out
   the recordings the filter cannot match without reading them.
   `selector_filter` builds the filter from one vector selector
-  (`{source="a"}`, `metric{cpu=~"0|1"}`), and `Labels` (metriken-storage's)
-  is re-exported as the filter type.
+  (`{source="a"}`, `metric{cpu=~"0|1"}`). metriken-storage's `Labels`, the
+  filter type and what the `*_labeled` builders take, is re-exported.
 - **Changed:** `ParquetBuilder::file_labeled` and the other labelled
   builders: a series whose own labels carry an injected key keeps its own
   value under `exported_<key>`, where the injected value overwrote it. A

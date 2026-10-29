@@ -101,7 +101,8 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
 /// [`MetricsSource::counter_labels_matching`](crate::MetricsSource::counter_labels_matching)
 /// and its siblings take; a metric name in it is not part of the filter.
 /// A selector with no metric name is accepted even when every matcher
-/// matches the empty string (`{source!="a"}`, `{}`), which PromQL refuses.
+/// matches the empty string (`{source!="a"}`, `{}`), which PromQL refuses;
+/// a `__name__` matcher among them (`{__name__!="x"}`) is still refused.
 /// An `offset` or `@` modifier is accepted and has no effect. An error for
 /// anything but one vector selector, and for a selector that matches one
 /// label more than once, since the filter holds one matcher per label.

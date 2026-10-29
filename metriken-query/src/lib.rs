@@ -141,8 +141,10 @@ pub(crate) use metriken_storage::{buffer_pool, histogram_stream, labels, memory,
 pub use archive::eval_timestamps_for;
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
-/// The filter the `*_labels_matching` methods take; [`selector_filter`]
-/// builds one.
+/// metriken-storage's label set: the labels `ParquetBuilder`'s `*_labeled`
+/// methods take, and the filter the `*_labels_matching` methods take, one
+/// matcher per label as `v`, `~v` (`=~`) or `!v` (`!=`, `!~`).
+/// [`selector_filter`] builds a filter.
 pub use metriken_storage::Labels;
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{
@@ -439,8 +441,10 @@ pub trait MetricsSource: Send + Sync {
 
     /// The label sets of counter `name` that `filter` matches, as this
     /// engine's selector `name{...}` with those matchers selects them
-    /// (`Labels::matches`: a regex matcher takes literal alternatives, and
-    /// `k=""` does not match a series without `k`). Build `filter` from a
+    /// (`Labels::matches`: a regex matcher takes literal alternatives,
+    /// `k=""` does not match a series without `k`, and an `=` value
+    /// containing `|` or starting with `!` or `~` is read as alternatives,
+    /// a negation or a regex). Build `filter` from a
     /// selector with [`selector_filter`]. The default filters
     /// [`counter_labels`](Self::counter_labels); `ArchiveReader` overrides
     /// it and does not read a recording whose labels `filter` contradicts.
