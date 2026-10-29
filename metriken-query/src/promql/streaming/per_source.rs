@@ -21,21 +21,25 @@
 //! and binary operators run on the combined series, so `sum(rate(x[1m]))`
 //! counts each process once.
 //!
-//! Histogram functions do not combine yet: over a group they read one source
-//! alone, the one covering the most of the read ([`GroupSource`]), which
-//! counts the process once and leaves the other sources' spans out.
+//! A histogram over a group is combined in its rows: each
+//! member's per-row deltas are taken per series per span and summed into
+//! one cumulative stream ([`GroupSource::histogram_stream`]), which every
+//! histogram function then reads as it reads one source's, its `by`
+//! aggregation included. A gauge histogram over a group reads the latest
+//! row of any source at each time.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::Point;
-use crate::histogram_stream::HistogramStream;
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::types::{CounterStream, Counters, Gauges};
 use crate::DataSource;
 
 /// One member of a process group: one source, or one producer epoch of one
 /// source, with what orders it among the others.
+#[derive(Clone)]
 pub(crate) struct Member {
     /// The source's series, carrying the group's labels.
     pub source: Arc<dyn DataSource>,
@@ -512,6 +516,182 @@ fn combine_series(
         }
     }
     chosen.into_iter().map(|(i, k)| members[i].0[k]).collect()
+}
+
+/// [`GroupSource::histogram_stream`] over `members`: `None` when their
+/// streams cannot be combined (different bucket configurations), else the
+/// combined stream, `Some(None)` when no member holds rows.
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+fn combine_histograms(
+    members: &[Member],
+    name: &str,
+    filter: &Labels,
+    start_ns: u64,
+    end_ns: u64,
+) -> Option<Option<HistogramStream>> {
+    // The members holding the histogram, in S3's rank: finest histogram
+    // interval first, then the tie rule, then the epoch's start.
+    let mut ranked: Vec<(u64, &Member)> = members
+        .iter()
+        .filter(|m| m.source.histogram_names().iter().any(|n| n == name))
+        .map(|m| ((m.source.histogram_interval(name) * 1e9) as u64, m))
+        .collect();
+    ranked.sort_by(|(ia, a), (ib, b)| ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo)));
+    // Each member's rows, by series, read three coarsest intervals past
+    // the read's end, so a member's run seldom seems to end at it: a pair
+    // ending past `end_ns` decides which pairs before it are taken and is
+    // then left out.
+    let past = end_ns.saturating_add(3 * ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
+    let mut config = None;
+    let mut series: Vec<Labels> = Vec::new();
+    let mut index: HashMap<Labels, usize> = HashMap::new();
+    let mut rows: Vec<Vec<Vec<(u64, crate::types::HistogramSnapshot)>>> = Vec::new();
+    for (_, m) in &ranked {
+        let (lo, hi) = (start_ns.max(m.lo), past.min(m.hi));
+        let mut by_series: Vec<Vec<(u64, crate::types::HistogramSnapshot)>> = Vec::new();
+        if lo <= hi {
+            if let Some(stream) = m.source.histogram_stream(name, filter, lo, hi) {
+                match config {
+                    None => config = Some(stream.meta.config),
+                    Some(c) if c != stream.meta.config => return None,
+                    Some(_) => {}
+                }
+                let local: Vec<usize> = stream
+                    .meta
+                    .series
+                    .iter()
+                    .map(|l| {
+                        *index.entry(l.clone()).or_insert_with(|| {
+                            series.push(l.clone());
+                            series.len() - 1
+                        })
+                    })
+                    .collect();
+                for row in stream.rows {
+                    if row.timestamp < m.lo || row.timestamp > m.hi {
+                        continue;
+                    }
+                    let s = local[row.series_idx];
+                    if by_series.len() <= s {
+                        by_series.resize_with(s + 1, Vec::new);
+                    }
+                    by_series[s].push((row.timestamp, row.snapshot));
+                }
+            }
+        }
+        rows.push(by_series);
+    }
+    let Some(config) = config else {
+        return Some(None);
+    };
+    let mut out: Vec<HistogramRow> = Vec::new();
+    for s in 0..series.len() {
+        let of = |r: usize| rows[r].get(s).map(Vec::as_slice).unwrap_or(&[]);
+        let member_runs: Vec<Vec<(u64, u64)>> = (0..rows.len())
+            .map(|r| runs(&of(r).iter().map(|(t, _)| *t).collect::<Vec<_>>()))
+            .collect();
+        // The pairs taken, `(prev, t, member, row)`, keyed by `t`; they never
+        // overlap, and none taken is later removed. Members are offered
+        // coarsest first: a pair inside a run of a member ranked above it is
+        // set aside, and a pair overlapping one taken already is not taken,
+        // so a coarse pair that straddles a finer run's first or last row is
+        // taken and the finer pairs it overlaps are not. The pairs set aside
+        // are offered again after every member, and those overlapping
+        // nothing taken are taken: where a finer run is too short for its
+        // pairs to fit between the straddling pairs, the coarse pair inside
+        // it covers that time. A junction between two members loses less
+        // than one interval of the coarser one; with three or more it can
+        // lose up to two intervals of a member whose pairs on both sides
+        // overlap pairs taken.
+        let mut taken: BTreeMap<u64, (u64, usize, usize)> = BTreeMap::new();
+        let mut aside: Vec<(u64, u64, usize, usize)> = Vec::new();
+        let overlaps = |taken: &BTreeMap<u64, (u64, usize, usize)>, p: u64, t: u64| {
+            taken
+                .range(p.saturating_add(1)..)
+                .next()
+                .is_some_and(|(_, &(tp, _, _))| tp < t)
+        };
+        for r in (0..rows.len()).rev() {
+            let own = &member_runs[r];
+            for (k, pair) in of(r).windows(2).enumerate() {
+                let (p, t) = (pair[0].0, pair[1].0);
+                let i = own.partition_point(|run| run.0 <= t);
+                let in_run = i
+                    .checked_sub(1)
+                    .is_some_and(|i| own[i].0 <= p && t <= own[i].1);
+                if !in_run {
+                    continue;
+                }
+                let inside = member_runs[..r]
+                    .iter()
+                    .any(|runs| runs.iter().any(|&(f, l)| f <= p && t <= l));
+                if inside {
+                    aside.push((p, t, r, k + 1));
+                    continue;
+                }
+                if !overlaps(&taken, p, t) {
+                    taken.insert(t, (p, r, k + 1));
+                }
+            }
+        }
+        for (p, t, r, k) in aside {
+            if !overlaps(&taken, p, t) {
+                taken.insert(t, (p, r, k));
+            }
+        }
+        let taken: Vec<(u64, u64, usize, usize)> = taken
+            .into_iter()
+            .take_while(|(t, _)| *t <= end_ns)
+            .map(|(t, (p, r, k))| (p, t, r, k))
+            .collect();
+        // The running per-bucket counts, emitted as a cumulative snapshot
+        // at the start of each taken pair (unless the previous one ended
+        // there) and at its end.
+        let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+        let snapshot = |counts: &BTreeMap<u32, u64>| {
+            let mut running = 0u64;
+            let mut snap = crate::types::HistogramSnapshot {
+                index: Vec::with_capacity(counts.len()),
+                count: Vec::with_capacity(counts.len()),
+            };
+            for (&idx, &c) in counts {
+                running += c;
+                snap.index.push(idx);
+                snap.count.push(running);
+            }
+            snap
+        };
+        let mut last: Option<u64> = None;
+        for (p, t, r, k) in taken {
+            if last != Some(p) {
+                out.push(HistogramRow {
+                    series_idx: s,
+                    timestamp: p,
+                    snapshot: snapshot(&counts),
+                    // A series' first row is not marked, as with one
+                    // source's rows; a later start row resumes from another
+                    // source's rows.
+                    resumes: last.is_some(),
+                });
+            }
+            let rs = of(r);
+            super::histogram::delta_walk(&rs[k - 1].1, &rs[k].1, |idx, d| {
+                *counts.entry(idx).or_insert(0) += d;
+            });
+            out.push(HistogramRow {
+                series_idx: s,
+                timestamp: t,
+                snapshot: snapshot(&counts),
+                resumes: false,
+            });
+            last = Some(t);
+        }
+    }
+    out.sort_by_key(|row| (row.timestamp, row.series_idx));
+    Some(Some(HistogramStream {
+        meta: HistogramStreamMeta { config, series },
+        rows: Box::new(out.into_iter()),
+    }))
 }
 
 /// The rows on each side of a read that a member's coverage needs (S3: the
@@ -995,19 +1175,23 @@ impl DataSource for Tap {
 }
 
 /// A process group as one source, for what a query asks of the whole: its
-/// names, label sets, intervals and span; and, until histograms combine per
-/// source, a histogram read, which the source covering the most of the read
-/// answers alone.
+/// names, label sets, intervals and span; and a histogram read, which
+/// combines its members per series per span
+/// ([`GroupSource::histogram_stream`]), or, for members of different bucket
+/// configurations, reads the source covering the most of the read.
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 pub(crate) struct GroupSource {
     /// One per source of the group, unclipped, in S3's rank order.
     sources: Vec<Arc<dyn DataSource>>,
+    /// The group's members, one per source or per producer epoch of one,
+    /// which a histogram read combines (S9).
+    members: Vec<Member>,
 }
 
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 impl GroupSource {
-    pub(crate) fn new(sources: Vec<Arc<dyn DataSource>>) -> Self {
-        Self { sources }
+    pub(crate) fn new(sources: Vec<Arc<dyn DataSource>>, members: Vec<Member>) -> Self {
+        Self { sources, members }
     }
 
     fn names(&self, of: impl Fn(&dyn DataSource) -> Vec<String>) -> Vec<String> {
@@ -1078,6 +1262,29 @@ impl DataSource for GroupSource {
         self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
             .gauge_parts(name, filter, start_ns, end_ns, step_ns)
     }
+    /// The members' rows combined per series per span (S9): each member
+    /// read over its own span, and a row's delta from the member's previous
+    /// row of the series taken where both rows are in one of the member's
+    /// runs (S3) and the pair is not inside a run of a member ranked above
+    /// it (finer, then S3's tie rule). Members are offered coarsest first and
+    /// a pair overlapping one taken is not taken, so a coarse pair that
+    /// straddles a finer run's edge is taken and the finer pairs it overlaps
+    /// are not; a pair set aside for lying inside a finer run is offered
+    /// again at the end and taken where nothing taken overlaps it. A
+    /// junction between two members loses less than one interval of the
+    /// coarser one; with three or more it can lose up to two intervals of a
+    /// member whose pairs on both sides overlap pairs taken. Members are read
+    /// three coarsest intervals past the read's end; where a read starts or
+    /// ends can still move a junction near it with three or more members,
+    /// or with holes within a member. No two deltas taken overlap in time,
+    /// and none is between rows of two sources or across a restart. The
+    /// deltas taken are summed per series
+    /// into a cumulative stream, with a row marked
+    /// [`resumes`](crate::histogram_stream::HistogramRow::resumes) before
+    /// each change taken from another source's rows, which every histogram
+    /// function reads as it reads one source's. Members of different bucket
+    /// configurations are not combined: the stream is then the one source
+    /// covering the most of the read.
     fn histogram_stream(
         &self,
         name: &str,
@@ -1085,10 +1292,11 @@ impl DataSource for GroupSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        // Until histograms combine per source: the source holding the
-        // histogram whose span covers the most of the read, ties to the
-        // finest, so the group counts once and the range is read whole where
-        // one source holds it.
+        if let Some(combined) = combine_histograms(&self.members, name, filter, start_ns, end_ns) {
+            return combined;
+        }
+        // The source holding the histogram whose span covers the most of
+        // the read, ties to the finest, so the group counts once.
         let overlap = |s: &dyn DataSource| {
             s.time_range()
                 .map_or(0, |(a, b)| b.min(end_ns).saturating_sub(a.max(start_ns)))
@@ -1179,9 +1387,21 @@ impl DataSource for GroupSource {
         self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
             .gauge_interval(name)
     }
+    /// The longest interval of the sources holding histogram `name`, as
+    /// `RecordingsSource` answers; `histogram_read_start` reads two of them
+    /// back, so a coarse member's first pair is read
+    /// ([`GroupSource::histogram_stream`] combines every member).
     fn histogram_interval(&self, name: &str) -> f64 {
-        self.finest_holding(|s| s.histogram_names().iter().any(|n| n == name))
-            .histogram_interval(name)
+        let longest = self
+            .sources
+            .iter()
+            .filter(|s| s.histogram_names().iter().any(|n| n == name))
+            .map(|s| s.histogram_interval(name))
+            .fold(f64::NAN, f64::max);
+        match longest.is_nan() {
+            true => self.sources[0].histogram_interval(name),
+            false => longest,
+        }
     }
     fn time_range(&self) -> Option<(u64, u64)> {
         self.sources

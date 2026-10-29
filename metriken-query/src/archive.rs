@@ -477,6 +477,7 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
                     .sort_by(|(ia, _, a), (ib, _, b)| ia.total_cmp(ib).then_with(|| a.cmp_ties(b)));
                 children.push(Arc::new(GroupSource::new(
                     whole.into_iter().map(|(_, s, _)| s).collect(),
+                    members.clone(),
                 )));
                 ordered.push(Part::Group(members));
             }

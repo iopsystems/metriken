@@ -231,6 +231,7 @@ fn histogram_rows(
             rows.push(HistogramRow {
                 series_idx,
                 timestamp: *ts,
+                resumes: false,
                 snapshot: crate::types::HistogramSnapshot {
                     index: snap.index.clone(),
                     count: snap.count.clone(),

@@ -380,8 +380,7 @@ fn a_source_and_its_copy_count_once() {
     }
     let sum = one_series(&union, "sum(rate(cpu_cycles[1m]))", window);
     assert!(sum.points.iter().all(|p| (p.1 - 1000.0).abs() < 1e-6));
-    // Histograms read one source of the group (until they combine per
-    // source), so they count once too.
+    // Histograms combine per source in their rows, so they count once too.
     for query in [
         "histogram_count(latency)",
         "histogram_count(latency, 10)",
@@ -1481,10 +1480,10 @@ fn series_keep_catalog_order_beside_a_group() {
     }
 }
 
-/// Until histograms combine per source, a group's histogram is read from
-/// the source covering the most of the range: a record over 10:00 to 11:00
-/// and a dump of another recording of the process over 10:20 to 10:25 give
-/// the record's every point, whichever uuid sorts first.
+/// A group's histogram combines its sources per span: a record over 10:00
+/// to 11:00 and a dump of another recording of the process over 10:20 to
+/// 10:25, holding the same observations, give the record's every point,
+/// whichever uuid sorts first and so answers for 10:20 to 10:25.
 #[test]
 fn a_groups_histogram_reads_the_source_covering_the_range() {
     let dir = tempfile::tempdir().unwrap();
@@ -1526,6 +1525,7 @@ fn a_groups_histogram_reads_the_source_covering_the_range() {
             "histogram_count(latency)",
             "histogram_quantiles([0.5, 0.99], latency)",
             "histogram_count(latency, 10)",
+            "histogram_irate(latency)",
         ] {
             let (s, e) = (window.0 as f64 / 1e9, window.1 as f64 / 1e9);
             let want = from_matrix(want_alone.query_range(query, s, e, 1.0).unwrap());
@@ -1538,6 +1538,315 @@ fn a_groups_histogram_reads_the_source_covering_the_range() {
             assert_eq!(got, want, "{query} order {order:?}");
         }
     }
+}
+
+/// A group's histogram combines its sources per span (S9): two sources of
+/// one process over 10:00 to 10:10 and 10:05 to 10:15 give one count a
+/// second over the whole 10:00 to 10:15, each of the ten observations a
+/// second once, where reading one source left five minutes out; a stride
+/// counts each window's observations once.
+#[test]
+fn a_groups_histogram_combines_its_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("overlap.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 10, 0), S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 5, 0), at(10, 15, 0), S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at(10, 0, 0) as f64 / 1e9, at(10, 15, 0) as f64 / 1e9);
+    let per_row = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    assert_eq!(per_row.len(), 1);
+    let points = &per_row[0].points;
+    // One point a row from 10:00:01 to 10:15:00, each ten observations.
+    assert_eq!(points.len(), 900, "{}", points.len());
+    assert!(points.iter().all(|p| p.1 == 10.0), "{points:?}");
+    let strided = from_matrix(
+        union
+            .query_range("histogram_count(latency, 60)", s, e, 60.0)
+            .unwrap(),
+    );
+    let windows = &strided[0].points;
+    assert!(windows.len() >= 14, "{windows:?}");
+    assert!(windows.iter().all(|p| p.1 <= 600.0), "{windows:?}");
+    assert!(
+        windows.iter().filter(|p| p.1 == 600.0).count() >= 13,
+        "{windows:?}"
+    );
+}
+
+/// A fine source beside a coarse one of the same process: the fine source
+/// answers where its rows run (its rows' points, a second apart), the coarse
+/// one elsewhere, and a coarse pair straddling the fine run's edge is taken
+/// in place of the fine pairs it overlaps, so a minute window loses less
+/// than one fine interval's observations and counts none twice; a rate has
+/// no point at the row a junction resumes from.
+#[test]
+fn a_fine_source_answers_inside_a_coarse_ones_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fine_coarse.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 5), at(10, 15, 5), 10 * S),
+                cycles,
+            ),
+            // Half a second out of phase with the coarse rows, so each
+            // junction resumes from a row of the other source.
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 4, 0) + S / 2, at(10, 5, 0), S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at(10, 1, 0) as f64 / 1e9, at(10, 15, 0) as f64 / 1e9);
+    let strided = from_matrix(
+        union
+            .query_range("histogram_count(latency, 60)", s, e, 60.0)
+            .unwrap(),
+    );
+    // The whole minutes (the last window is the range's partial one).
+    let windows = &strided[0].points;
+    let whole = &windows[..windows.len() - 1];
+    assert!(whole.len() >= 13, "{windows:?}");
+    assert!(
+        whole.iter().all(|p| (590.0..=600.0).contains(&p.1)),
+        "{windows:?}"
+    );
+    // Inside the fine run its rows answer, a second apart.
+    let per_row = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    let fine: Vec<_> = per_row[0]
+        .points
+        .iter()
+        .filter(|p| (at(10, 4, 10) as f64 / 1e9..=at(10, 4, 50) as f64 / 1e9).contains(&p.0))
+        .collect();
+    assert_eq!(fine.len(), 40, "{fine:?}");
+    assert!(fine.iter().all(|p| p.1 == 10.0), "{fine:?}");
+    let irate = from_matrix(
+        union
+            .query_range("histogram_irate(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    assert!(!irate[0].points.is_empty());
+    assert!(
+        irate[0].points.iter().all(|p| (p.1 - 10.0).abs() < 1e-9),
+        "{:?}",
+        irate[0].points
+    );
+}
+
+/// Where a read ends does not move a junction: a 1 s source on the half
+/// second beside a 10 s source on the second, read to 10:10:00 (on a coarse
+/// row, half a second after a fine one), ends on the fine source's rows;
+/// and a 2 s source beside a 3 s one, out of phase, gives the same points
+/// up to each of several ends as one read past them all.
+#[test]
+fn a_reads_end_does_not_move_a_junction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("end.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 15, 0), 10 * S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0) + S / 2, at(10, 15, 0), S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    let (s, e) = (at(10, 5, 0) as f64 / 1e9, at(10, 10, 0) as f64 / 1e9);
+    let per_row = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    let points = &per_row[0].points;
+    let tail = &points[points.len() - 10..];
+    assert!(tail.iter().all(|p| p.1 == 10.0), "{tail:?}");
+    assert!(
+        tail.windows(2)
+            .all(|w| (w[1].0 - w[0].0 - 1.0).abs() < 1e-9),
+        "{tail:?}"
+    );
+
+    let path = dir.path().join("end23.dendro");
+    let at_s = |s: u64| at(10, 0, 0) + s * S;
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(60) + S / 4, at_s(200), 2 * S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(10) + S / 2, at_s(200), 3 * S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    let start = at_s(55) as f64 / 1e9;
+    let read = |end: f64| {
+        from_matrix(
+            union
+                .query_range("histogram_count(latency)", start, end, 1.0)
+                .unwrap(),
+        )[0]
+        .points
+        .clone()
+    };
+    let long = read(at_s(100) as f64 / 1e9);
+    for end_ms in [68_312u64, 69_000, 70_400, 71_750, 74_100] {
+        let end = (at_s(0) + end_ms * MS) as f64 / 1e9;
+        let want: Vec<_> = long.iter().copied().filter(|p| p.0 <= end).collect();
+        assert_eq!(read(end), want, "end at {end_ms} ms");
+    }
+}
+
+/// A finer run too short for its pairs to fit between the coarse pairs that
+/// straddle its edges: the coarse pair inside it covers that time, so the
+/// group counts every observation the coarse source alone does.
+#[test]
+fn a_short_finer_run_inside_a_coarse_one_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.dendro");
+    let at_s = |s: u64| at(10, 0, 0) + s * S;
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(20) + S / 4, at_s(28) + S / 4, 2 * S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(20), at_s(59), 3 * S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at_s(20) as f64 / 1e9, at_s(59) as f64 / 1e9);
+    let points = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    let total: f64 = points[0].points.iter().map(|p| p.1).sum();
+    assert_eq!(total, 390.0, "{:?}", points[0].points);
+}
+
+/// Three members, 1 s, 5 s and 10 s, whose runs end near each other: the
+/// 10 s source takes over from the 1 s one without a gap left by a 5 s pair
+/// it overlaps, and every 10 s window holds at most 100 observations and at
+/// least 50.
+#[test]
+fn three_members_hand_over_without_a_cascade_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("three.dendro");
+    let at_s = |s: u64| at(10, 0, 0) + s * S;
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(100), at_s(200), S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(52), at_s(202), 5 * S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at_s(9), at_s(599), 10 * S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at_s(60) as f64 / 1e9, at_s(300) as f64 / 1e9);
+    let per_row = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    let points = &per_row[0].points;
+    // A's rows answer up to its run's end, a second apart, before C takes
+    // over: no gap of two seconds or more inside A's run.
+    let in_a: Vec<f64> = points
+        .iter()
+        .map(|p| p.0)
+        .filter(|t| (at_s(101) as f64 / 1e9..=at_s(199) as f64 / 1e9).contains(t))
+        .collect();
+    assert!(in_a.windows(2).all(|w| w[1] - w[0] < 1.5), "{in_a:?}");
+    // C's pair straddling B's run end takes over from A at 199, so A's rows
+    // answer up to it, not to where B's straddling pair began.
+    assert!(
+        in_a.last().is_some_and(|&t| t >= at_s(199) as f64 / 1e9),
+        "{in_a:?}"
+    );
+    let strided = from_matrix(
+        union
+            .query_range("histogram_count(latency, 10)", s, e, 10.0)
+            .unwrap(),
+    );
+    let windows = &strided[0].points;
+    let whole = &windows[..windows.len() - 1];
+    assert!(
+        whole.iter().all(|p| (50.0..=100.0).contains(&p.1)),
+        "{windows:?}"
+    );
 }
 
 /// A recording that is a group of one, read beside a process group, is its

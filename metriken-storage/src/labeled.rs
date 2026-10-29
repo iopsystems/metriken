@@ -666,6 +666,7 @@ mod tests {
             let rows = (0..n).map(|i| HistogramRow {
                 series_idx: i,
                 timestamp: 1,
+                resumes: false,
                 snapshot: HistogramSnapshot {
                     index: vec![],
                     count: vec![],

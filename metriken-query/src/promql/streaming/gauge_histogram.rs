@@ -378,6 +378,7 @@ mod tests {
                     series_idx,
                     timestamp,
                     snapshot,
+                    resumes: false,
                 }
             })),
         }
