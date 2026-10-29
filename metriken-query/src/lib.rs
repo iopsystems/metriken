@@ -125,6 +125,7 @@ mod long;
 pub(crate) mod memory_store;
 pub mod parquet;
 pub(crate) mod promql;
+pub mod scope;
 pub mod segmented;
 pub mod union;
 
@@ -151,6 +152,7 @@ pub use promql::{
     referenced_metrics, selector_filter, HistogramHeatmapResult, MatrixSample, QueryError,
     QueryResult, Sample,
 };
+pub use scope::{Scope, ScopedSource, SourceRef};
 pub use segmented::SegmentedParquetReader;
 pub use union::UnionMetricsSource;
 
@@ -237,6 +239,10 @@ pub struct QueryOptions {
     /// stride ending at the range's end, not one of the windows a range query
     /// lays at multiples of the stride.
     pub(crate) instant: bool,
+    /// The sources the query reads; `None` reads every source. See
+    /// [`scope`]. Only `ArchiveReader` applies a scope; another source
+    /// refuses a query that carries one.
+    pub scope: Option<std::sync::Arc<Scope>>,
 }
 
 impl QueryOptions {
@@ -247,6 +253,7 @@ impl QueryOptions {
             eval_timestamps: None,
             per_series_rates: false,
             instant: false,
+            scope: None,
         }
     }
 
@@ -261,6 +268,12 @@ impl QueryOptions {
     /// [`QueryOptions::eval_timestamps`].
     pub fn with_eval_timestamps(mut self, ts: Option<std::sync::Arc<[u64]>>) -> Self {
         self.eval_timestamps = ts;
+        self
+    }
+
+    /// Read only the sources `scope` names. See [`QueryOptions::scope`].
+    pub fn with_scope(mut self, scope: Option<std::sync::Arc<Scope>>) -> Self {
+        self.scope = scope;
         self
     }
 }

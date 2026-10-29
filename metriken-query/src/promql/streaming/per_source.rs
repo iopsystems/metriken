@@ -518,7 +518,8 @@ fn combine_series(
 /// medians of up to eight gaps on either side of a gap).
 const CONTEXT_ROWS: usize = 9;
 
-/// A member's source as a leaf reads it: its rows clipped to `[lo, hi]`, the
+/// A member's source as a leaf reads it, or the source a group's histogram
+/// reads go to when a scope's span clips it: its rows clipped to `[lo, hi]`, the
 /// timestamps of every row it hands out recorded per series, and no batched
 /// counter scan (whose rows it could not record), so the per-series path
 /// answers.
@@ -778,9 +779,9 @@ impl crate::scan::ChunkReader for RecordingChunks<'_> {
 }
 
 impl DataSource for Tap {
-    /// The source's scan, its rows recorded as they are read; `None` for a
-    /// member clipped to an epoch (a scan cannot be clipped), which then
-    /// takes the per-series path.
+    /// The source's scan, its rows recorded as they are read; `None` when
+    /// clipped (to an epoch or a scope's span; a scan cannot be clipped),
+    /// which then takes the per-series path.
     fn counter_scan(
         &self,
         name: &str,

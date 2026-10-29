@@ -3015,7 +3015,16 @@ written by the new dendro.
      stores it.
    - In metriken-query the scope input (D1), resolving to process groups,
      then the template evaluation rule, for the producer and registry
-     layers.
+     layers. The scope input is built: `metriken_query::Scope` in
+     `QueryOptions`, entries naming a source by uuid or by position among
+     `ArchiveReader::sources`, each with an optional span. The archive's
+     query plan keeps the named sources' tables, a process group's members
+     are its named sources (S1), and a span clips a source's rows (the
+     per-source union's `Tap`); the scope is cleared before the engine,
+     which refuses one it is handed. Resolving a presented recording or a
+     bridge piece to sources and spans is the `dashboard` crate's. Listings
+     take matchers (`*_labels_matching`), not a scope. The template
+     evaluation rule is not built.
    - The catalog index and scope-aware listings (Q29's direction). The
      names index is built: each sealed segment's caller index holds its
      metric names by kind and its footer's `sampling_interval_ms`,

@@ -11,7 +11,7 @@ use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
 use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
-use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups};
+use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups, Tap};
 use crate::promql::QueryEngine;
 use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 
@@ -56,7 +56,7 @@ pub fn eval_timestamps_for(
     step_s: f64,
     rate_mode: RateMode,
 ) -> Option<Arc<[u64]>> {
-    Plan::new(reader, query)
+    Plan::new(reader, query, None)
         .ok()?
         .cross_cadence(step_s, rate_mode)
 }
@@ -70,9 +70,11 @@ struct Plan<'a> {
     /// The metric names the query references that some table of the
     /// archive holds (before pruning).
     held: Vec<String>,
-    /// Whether one of `held` is in none of `owners`: a matcher left out
-    /// every recording holding it.
+    /// Whether one of `held` is in none of `owners`: a matcher or the
+    /// scope left out every recording holding it.
     missing: bool,
+    /// The query's scope, which `owners` already keeps to its sources.
+    scope: Option<&'a crate::Scope>,
 }
 
 impl<'a> Plan<'a> {
@@ -97,7 +99,14 @@ impl<'a> Plan<'a> {
     /// does not carry. When every recording is left out, the first one's
     /// tables are kept, so the query answers empty rather than as naming no
     /// metric.
-    fn new(reader: &'a ArchiveReader, query: &str) -> Result<Self, QueryError> {
+    ///
+    /// With a scope, only the tables of the sources it names are owners, and
+    /// a metric only other sources hold is missing.
+    fn new(
+        reader: &'a ArchiveReader,
+        query: &str,
+        scope: Option<&'a crate::Scope>,
+    ) -> Result<Self, QueryError> {
         // The filter keeps one matcher per label (the last); with recording
         // labels, excluding several sources is an ordinary query, so a
         // repeat is refused rather than half applied, for every label.
@@ -110,7 +119,19 @@ impl<'a> Plan<'a> {
             )));
         }
         let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();
-        let all = reader.owners_of(&referenced);
+        let unscoped = reader.owners_of(&referenced);
+        let all: Vec<&SamplerReader> = match scope {
+            None => unscoped.clone(),
+            Some(scope) => {
+                let mut kept = Vec::new();
+                for t in &unscoped {
+                    if scope_span(reader, scope, t)?.is_some() {
+                        kept.push(*t);
+                    }
+                }
+                kept
+            }
+        };
         let selectors = crate::promql::selectors(query)?;
         let labels = reader.series_labels();
         let mut passing: Vec<&SamplerReader> = Vec::new();
@@ -130,7 +151,7 @@ impl<'a> Plan<'a> {
         let owners: Vec<&SamplerReader> = all.iter().copied().filter(keep).collect();
         let held: Vec<String> = referenced
             .into_iter()
-            .filter(|n| all.iter().any(|t| t.holds(n)))
+            .filter(|n| unscoped.iter().any(|t| t.holds(n)))
             .collect();
         let missing = held.iter().any(|n| !owners.iter().any(|t| t.holds(n)));
         Ok(Self {
@@ -139,6 +160,7 @@ impl<'a> Plan<'a> {
             labels,
             held,
             missing,
+            scope,
         })
     }
 
@@ -154,14 +176,16 @@ impl<'a> Plan<'a> {
         out
     }
 
-    /// `opts` with the query's cross-cadence timestamps, when it has any.
+    /// `opts` with the query's cross-cadence timestamps, when it has any,
+    /// and without its scope, which the plan has applied.
     fn opts(&self, opts: &QueryOptions, step_s: f64) -> QueryOptions {
+        // Clone and set fields: `QueryOptions` is `#[non_exhaustive]`, so it
+        // cannot be built by literal from here — and cloning preserves
+        // whatever else the caller set.
+        let opts = opts.clone().with_scope(None);
         match self.cross_cadence(step_s, opts.rate_mode) {
-            // Clone and set the one field: `QueryOptions` is
-            // `#[non_exhaustive]`, so it cannot be built by literal from here
-            // — and cloning preserves whatever else the caller set.
-            Some(points) => opts.clone().with_eval_timestamps(Some(points)),
-            None => opts.clone(),
+            Some(points) => opts.with_eval_timestamps(Some(points)),
+            None => opts,
         }
     }
 
@@ -302,25 +326,29 @@ fn cross_cadence(
 /// each of them alone, and each producer epoch of a source alone, and
 /// combines the results per series (`streaming::per_source`, S9), so a
 /// process counts once and no value is a difference between rows of two
-/// sources or across a restart. A query reaching no such group, or a source
-/// of one epoch, is evaluated exactly as before.
+/// sources or across a restart. A source a query's scope reads over a span
+/// is read the same way, as a group of its own whose members' rows are
+/// clipped to the span: its points end one interval after its last row in
+/// the span, and a gap of more than twice its median row spacing has no
+/// points (S5). A query reaching no such group and no span is evaluated as
+/// before, as is an unspanned source of one epoch.
 ///
 /// Refused: a metric name held by two tables of one recording
 /// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
 /// name that is a different kind in two recordings the query reaches.
 /// Errors too when the query references no known metric.
 fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryError> {
+    // A metric the archive holds that no recording the query reaches holds
+    // (`x{source="b"} + y` with `x` only in a, or a scope leaving out a) has
+    // no series, and neither has anything combined with it, as in
+    // Prometheus. Evaluated, it would be "metric not found".
+    if plan.missing {
+        return Ok(None);
+    }
     if plan.owners.is_empty() {
         return Err(QueryError::ParseError(format!(
             "query references no metric present in this .rez: {query}"
         )));
-    }
-    // A metric the archive holds that no recording the query reaches holds
-    // (`x{source="b"} + y` with `x` only in a) has no series, and neither
-    // has anything combined with it, as in Prometheus. Evaluated, it would
-    // be "metric not found".
-    if plan.missing {
-        return Ok(None);
     }
     let recordings = plan.recordings();
     if recordings.len() > 1 {
@@ -350,18 +378,32 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             .is_some_and(|g| g.sources.len() > 1);
         let mut members: Vec<Member> = Vec::new();
         let mut whole: Vec<Ranked> = Vec::new();
+        // Whether a source of the unit is read over a scope's span: it is
+        // then read as a group. Each member reads through a `Tap` clipped to
+        // its `[lo, hi]`, and the combine keeps a point only where the
+        // member's rows hold it (S3: to one interval past its last row, and
+        // not in a hole).
+        let mut spanned = false;
         for tables in unit {
             let Some(source) = recording_source(tables, query)? else {
                 continue;
             };
             let labels = plan.labels.of(tables[0]).clone();
             let source: Arc<dyn DataSource> = Arc::new(LabeledSource::new(source, labels));
+            // A scope's span: its members' spans within it, which the
+            // per-source combine clips each member's reads to.
+            let span = match plan.scope {
+                Some(scope) => scope_span(plan.reader, scope, tables[0])?.flatten(),
+                None => None,
+            };
+            spanned |= span.is_some();
+            let (span_lo, span_hi) = span.unwrap_or((0, u64::MAX));
             let position = plan.reader.source_position(tables[0]);
             let info = position.map(|p| &plan.reader.sources()[p]);
             let member = |lo: u64, hi: u64| Member {
                 source: Arc::clone(&source),
-                lo,
-                hi,
+                lo: lo.max(span_lo),
+                hi: hi.min(span_hi),
                 uuid: info.and_then(|i| i.uuid.clone()),
                 catalog_index: info.map_or(0, |i| i.catalog_index),
                 position: position.unwrap_or(0),
@@ -376,18 +418,27 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
                     Some(next) => next.first_ns.saturating_sub(1),
                     None => u64::MAX,
                 };
-                members.push(member(lo, hi));
+                // An epoch outside the scope's span holds no row read.
+                if lo.max(span_lo) <= hi.min(span_hi) {
+                    members.push(member(lo, hi));
+                }
             }
             let finest = tables
                 .iter()
                 .map(|t| t.interval())
                 .filter(|i| *i > 0.0)
                 .fold(f64::INFINITY, f64::min);
-            whole.push((finest, Arc::clone(&source), member(0, u64::MAX)));
+            // The source the group's histogram reads go to, clipped to the
+            // span.
+            let clipped: Arc<dyn DataSource> = match span {
+                Some((lo, hi)) => Arc::new(Tap::new(Arc::clone(&source), lo, hi)),
+                None => Arc::clone(&source),
+            };
+            whole.push((finest, clipped, member(0, u64::MAX)));
         }
         match members.len() {
             0 => {}
-            1 if !grouped => parts.push(Ok(members.pop().expect("one").source)),
+            1 if !grouped && !spanned => parts.push(Ok(members.pop().expect("one").source)),
             _ => parts.push(Err((members, whole))),
         }
     }
@@ -439,6 +490,23 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         source,
         SourceGroups { parts: ordered },
     )))
+}
+
+/// The span `scope` reads of `table`'s source: `None` when the scope does
+/// not name the source, `Some(None)` for every row. An error when the scope
+/// names the source twice.
+fn scope_span(
+    reader: &ArchiveReader,
+    scope: &crate::Scope,
+    table: &SamplerReader,
+) -> Result<Option<Option<(u64, u64)>>, QueryError> {
+    let Some(position) = reader.source_position(table) else {
+        return Ok(None);
+    };
+    let uuid = reader.sources()[position].uuid.as_deref();
+    scope
+        .span_of(position, uuid)
+        .map_err(QueryError::Unsupported)
 }
 
 /// A source of a process group with what ranks it: its finest table
@@ -690,7 +758,7 @@ impl MetricsSource for ArchiveReader {
         step_s: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        let plan = Plan::new(self, expr)?;
+        let plan = Plan::new(self, expr, opts.scope.as_deref())?;
         let Some(engine) = engine(&plan, expr)? else {
             return Ok(QueryResult::Matrix { result: Vec::new() });
         };
@@ -707,7 +775,7 @@ impl MetricsSource for ArchiveReader {
         opts: &crate::DisplayOptions,
         qopts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
-        let plan = Plan::new(self, expr)?;
+        let plan = Plan::new(self, expr, qopts.scope.as_deref())?;
         let Some(engine) = engine(&plan, expr)? else {
             return Ok(crate::DisplayResult::Series {
                 result: Vec::new(),
@@ -724,7 +792,7 @@ impl MetricsSource for ArchiveReader {
         )?)
     }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        let plan = Plan::new(self, expr)?;
+        let plan = Plan::new(self, expr, None)?;
         // On an archive of several recordings, at the archive's end whichever
         // recordings the query reaches: the engine's own default is the end
         // of what it reads, which would move with a label matcher.
@@ -741,7 +809,7 @@ impl MetricsSource for ArchiveReader {
     fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
         // Through the same labelled sources as a query, so a selector
         // naming a recording label resolves to that recording's columns.
-        let plan = Plan::new(self, query)?;
+        let plan = Plan::new(self, query, None)?;
         let mut out = HashSet::new();
         for t in &plan.owners {
             let Some(r) = t.reader() else {
@@ -1189,6 +1257,129 @@ mod tests {
                 .inner,
             labels(&[("a", "1")])
         );
+    }
+
+    /// A scope keeps a query to the sources it names, each within its span;
+    /// a source other than an archive refuses a scope.
+    #[test]
+    fn a_scope_keeps_a_query_to_its_sources() {
+        use crate::{Scope, ScopedSource, SourceRef};
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![("t", counter_table("x", &[(&[("cpu", "0")], 1)], 10))],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![("t", counter_table("x", &[(&[("cpu", "0")], 2)], 10))],
+            ),
+        ]);
+        let run = |entries: Vec<ScopedSource>| {
+            let opts =
+                QueryOptions::default().with_scope(Some(Arc::new(Scope::new(entries).unwrap())));
+            let QueryResult::Matrix { result } = reader
+                .query_range_opts("rate(x[2s])", 1.0, 10.0, 1.0, &opts)
+                .unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            result
+        };
+        let only_b = run(vec![ScopedSource {
+            source: SourceRef::Position(1),
+            span: None,
+        }]);
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(
+            only_b[0].metric.get("source").map(String::as_str),
+            Some("b")
+        );
+        let clipped = run(vec![ScopedSource {
+            source: SourceRef::Position(0),
+            span: Some((3 * S, 6 * S)),
+        }]);
+        assert_eq!(clipped.len(), 1);
+        assert!(!clipped[0].values.is_empty());
+        assert!(
+            clipped[0]
+                .values
+                .iter()
+                .all(|(t, _)| (3.0..=6.0).contains(t)),
+            "{:?}",
+            clipped[0].values
+        );
+
+        // A windowed gauge function stops at the span's end too: its window
+        // is clipped to the source's span, as within a process group.
+        let reader_g = archive(vec![recording(
+            &[("source", "a")],
+            vec![("u", typed_table("g", "gauge", &[(&[("cpu", "0")], 1)], 10))],
+        )]);
+        let opts = QueryOptions::default().with_scope(Some(Arc::new(
+            Scope::new(vec![ScopedSource::new(
+                SourceRef::Position(0),
+                Some((3 * S, 6 * S)),
+            )])
+            .unwrap(),
+        )));
+        let QueryResult::Matrix { result } = reader_g
+            .query_range_opts("avg_over_time(g[3s])", 1.0, 10.0, 1.0, &opts)
+            .unwrap()
+        else {
+            panic!("not a matrix");
+        };
+        assert!(!result.is_empty() && !result[0].values.is_empty());
+        assert!(
+            result[0]
+                .values
+                .iter()
+                .all(|(t, _)| (3.0..=7.0).contains(t)),
+            "{:?}",
+            result[0].values
+        );
+
+        // A span reads a source by the process-group rules even alone: a
+        // gap of more than twice its median row spacing has no points (S5),
+        // where the unscoped read interpolates across it.
+        let rows: Vec<(u64, u64)> = (1..=20u64)
+            .filter(|t| !(9..=10).contains(t))
+            .map(|t| (t * S, t))
+            .collect();
+        let gappy = archive(vec![recording(
+            &[("source", "a")],
+            vec![("u", explicit_table("g", "gauge", &rows))],
+        )]);
+        let points = |scope: Option<Scope>| -> Vec<f64> {
+            let opts = QueryOptions::default().with_scope(scope.map(Arc::new));
+            let QueryResult::Matrix { result } = gappy
+                .query_range_opts("avg_over_time(g[3s])", 1.0, 20.0, 1.0, &opts)
+                .unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            result[0].values.iter().map(|(t, _)| *t).collect()
+        };
+        let unscoped = points(None);
+        let spanned = points(Some(
+            Scope::new(vec![ScopedSource::new(
+                SourceRef::Position(0),
+                Some((0, 100 * S)),
+            )])
+            .unwrap(),
+        ));
+        assert!(unscoped.contains(&10.0), "{unscoped:?}");
+        assert!(!spanned.contains(&10.0), "{spanned:?}");
+        assert!(
+            spanned.contains(&5.0) && spanned.contains(&15.0),
+            "{spanned:?}"
+        );
+
+        let store = crate::MemoryStore::builder().build();
+        let opts = QueryOptions::default().with_scope(Some(Arc::new(Scope::default())));
+        assert!(matches!(
+            store.query_range_opts("x", 1.0, 2.0, 1.0, &opts),
+            Err(QueryError::Unsupported(_))
+        ));
     }
 
     #[test]
