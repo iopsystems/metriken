@@ -360,7 +360,9 @@ impl QueryResult {
     }
 }
 
-/// Something a query's caller should be told about its result.
+/// Something a query's caller should be told about its result. A later
+/// version may add kinds and add fields to a kind, but not remove or retype
+/// a field: a reader rejects a known kind whose fields do not read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -379,10 +381,28 @@ pub enum Notice {
         /// How many timestamps they differ at.
         count: u64,
     },
-    /// A kind of notice this version does not know, read from JSON a later
-    /// version wrote.
+    /// A notice of a kind this version does not know, as read from JSON a
+    /// later version wrote. It keeps neither the kind nor its fields, so it
+    /// serializes as `{"kind":"unknown"}`.
     #[serde(other)]
     Unknown,
+}
+
+impl Notice {
+    /// A [`Notice::Conflict`], which outside this crate is built here.
+    pub fn conflict(
+        series: BTreeMap<String, String>,
+        sources: Vec<String>,
+        first: f64,
+        count: u64,
+    ) -> Self {
+        Notice::Conflict {
+            series,
+            sources,
+            first,
+            count,
+        }
+    }
 }
 
 /// Where to read histogram `name` from for a range starting at `start_ns`:
@@ -1737,16 +1757,39 @@ mod notice_tests {
         let read: QueryResult = serde_json::from_value(later).unwrap();
         assert_eq!(read.notices(), &[Notice::Unknown]);
 
-        // The display form carries the result's notices, and leaves the key
-        // out when there are none.
-        let display = crate::display::display_from_result(
+        // The display form carries the result's notices for every variant,
+        // and leaves the key out when there are none.
+        let notices = noticed.notices().to_vec();
+        for result in [
             noticed.clone(),
-            0.0,
-            1.0,
-            1.0,
-            &crate::DisplayOptions::default(),
-        );
-        assert_eq!(display.notices(), noticed.notices());
+            QueryResult::Vector {
+                result: Vec::new(),
+                notices: notices.clone(),
+            },
+            QueryResult::Scalar {
+                result: (0.0, 1.0),
+                notices: notices.clone(),
+            },
+            QueryResult::HistogramHeatmap {
+                result: HistogramHeatmapResult {
+                    timestamps: Vec::new(),
+                    bucket_bounds: Vec::new(),
+                    data: Vec::new(),
+                    min_value: 0.0,
+                    max_value: 0.0,
+                },
+                notices: notices.clone(),
+            },
+        ] {
+            let display = crate::display::display_from_result(
+                result,
+                0.0,
+                1.0,
+                1.0,
+                &crate::DisplayOptions::default(),
+            );
+            assert_eq!(display.notices(), notices.as_slice());
+        }
         let plain = crate::display::display_from_result(
             QueryResult::Vector {
                 result: Vec::new(),
