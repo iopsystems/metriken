@@ -367,17 +367,22 @@ impl QueryResult {
 pub enum Notice {
     /// Sources of one process group hold different values for one series
     /// at times their reads coincide (S4): the result holds one of them.
+    #[non_exhaustive]
     Conflict {
         /// The series' labels.
         series: BTreeMap<String, String>,
         /// The sources, each named by its uuid, or by its position among
         /// the reader's sources when it has none.
         sources: Vec<String>,
-        /// The first time a conflict was found, in seconds.
+        /// The earliest timestamp at which they differ, in Unix seconds.
         first: f64,
-        /// How many times conflict.
+        /// How many timestamps they differ at.
         count: u64,
     },
+    /// A kind of notice this version does not know, read from JSON a later
+    /// version wrote.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Where to read histogram `name` from for a range starting at `start_ns`:
@@ -1086,7 +1091,8 @@ impl QueryEngine {
         };
         let result = self.query_range_opts(query_str, start, target, step, &opts)?;
         let QueryResult::Matrix {
-            result: samples, ..
+            result: samples,
+            notices,
         } = result
         else {
             return Ok(result);
@@ -1103,7 +1109,7 @@ impl QueryEngine {
             .collect();
         Ok(QueryResult::Vector {
             result: vector,
-            notices: Vec::new(),
+            notices,
         })
     }
 
@@ -1721,5 +1727,39 @@ mod notice_tests {
         );
         let read: QueryResult = serde_json::from_value(json).unwrap();
         assert_eq!(read.notices(), noticed.notices());
+
+        // A kind a later version wrote reads as `Unknown`, not as an error.
+        let later = serde_json::json!({
+            "resultType": "matrix",
+            "result": [],
+            "notices": [{"kind": "gap", "series": {}}]
+        });
+        let read: QueryResult = serde_json::from_value(later).unwrap();
+        assert_eq!(read.notices(), &[Notice::Unknown]);
+
+        // The display form carries the result's notices, and leaves the key
+        // out when there are none.
+        let display = crate::display::display_from_result(
+            noticed.clone(),
+            0.0,
+            1.0,
+            1.0,
+            &crate::DisplayOptions::default(),
+        );
+        assert_eq!(display.notices(), noticed.notices());
+        let plain = crate::display::display_from_result(
+            QueryResult::Vector {
+                result: Vec::new(),
+                notices: Vec::new(),
+            },
+            0.0,
+            1.0,
+            1.0,
+            &crate::DisplayOptions::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"resultType": "vector", "result": []})
+        );
     }
 }

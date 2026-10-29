@@ -106,7 +106,7 @@ fn evicted_or_failed_loads_answer_empty() {
         for _ in 0..2 {
             let result = reader.query_range("rate(cpu_usage[2s])", 1.0, 4.0, 1.0);
             assert!(
-                matches!(&result, Ok(crate::QueryResult::Matrix { result, ..  }) if result.is_empty()),
+                matches!(&result, Ok(crate::QueryResult::Matrix { result, .. }) if result.is_empty()),
                 "evicted={evicted}: {result:?}"
             );
         }

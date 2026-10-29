@@ -865,7 +865,7 @@ mod ingest_tests {
             .unwrap();
 
         match result {
-            DisplayResult::Series { result, budget } => {
+            DisplayResult::Series { result, budget, .. } => {
                 assert_eq!(budget, 10);
                 assert_eq!(result.len(), 1, "one series");
                 let s = &result[0];

@@ -1952,7 +1952,7 @@ pub(crate) mod tests {
             .is_empty());
         assert!(matches!(
             r.query_range("histogram_mean(latency{__run__=\"1\"})", 1.0, 4.0, 1.0),
-            Ok(crate::QueryResult::Matrix { result, ..  }) if result.is_empty()
+            Ok(crate::QueryResult::Matrix { result, .. }) if result.is_empty()
         ));
     }
 
@@ -2541,7 +2541,7 @@ pub(crate) mod tests {
         // A key the columns do carry still narrows inside the segment.
         assert!(
             r.query_range_opts("irate(c{slot=\"8\"}[1s])", 0.0, 5.0, 1.0, &opts)
-                .map(|q| matches!(q, QueryResult::Matrix { result, ..  } if result.is_empty()))
+                .map(|q| matches!(q, QueryResult::Matrix { result, .. } if result.is_empty()))
                 .unwrap_or(true),
             "no such slot"
         );

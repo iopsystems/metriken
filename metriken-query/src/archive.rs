@@ -557,7 +557,7 @@ fn checked_display(result: crate::DisplayResult) -> Result<crate::DisplayResult,
         DisplayResult::Series { result, .. } => {
             refuse_shared_label_sets(result.iter().map(|m| &m.metric))?
         }
-        DisplayResult::Vector { result } => {
+        DisplayResult::Vector { result, .. } => {
             refuse_shared_label_sets(result.iter().map(|m| &m.metric))?
         }
         _ => {}
@@ -784,6 +784,7 @@ impl MetricsSource for ArchiveReader {
             return Ok(crate::DisplayResult::Series {
                 result: Vec::new(),
                 budget: opts.budget as u32,
+                notices: Vec::new(),
             });
         };
         checked_display(engine.query_range_display_opts(

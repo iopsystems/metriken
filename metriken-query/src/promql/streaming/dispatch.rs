@@ -291,6 +291,7 @@ pub(crate) fn try_streaming_display(
             crate::DisplayResult::Series {
                 result: collected,
                 budget: display.budget as u32,
+                notices: Vec::new(),
             }
         }
         Built::Materialized { result, name } => {
@@ -308,7 +309,10 @@ pub(crate) fn try_streaming_display(
                 display,
             )
         }
-        Built::Scalar(v) => crate::DisplayResult::Scalar { result: (start, v) },
+        Built::Scalar(v) => crate::DisplayResult::Scalar {
+            result: (start, v),
+            notices: Vec::new(),
+        },
     };
     Ok(result)
 }
@@ -697,6 +701,7 @@ fn batch_display(
     Ok(Some(crate::DisplayResult::Series {
         result: series,
         budget: display.budget as u32,
+        notices: Vec::new(),
     }))
 }
 

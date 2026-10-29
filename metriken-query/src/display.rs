@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::promql::{HistogramHeatmapResult, Sample};
+use crate::promql::{HistogramHeatmapResult, Notice, Sample};
 use crate::QueryResult;
 
 /// One decimated point: a boxplot over the samples in a time-bucket.
@@ -153,17 +153,54 @@ pub enum DisplayResult {
         result: Vec<DisplaySeries>,
         /// The requested point budget per series.
         budget: u32,
+        /// The query result's notices ([`QueryResult::notices`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
     },
 
     /// Heatmaps are already resolution-limited server-side; passed through.
     #[serde(rename = "histogram_heatmap")]
-    HistogramHeatmap { result: HistogramHeatmapResult },
+    HistogramHeatmap {
+        result: HistogramHeatmapResult,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
 
     #[serde(rename = "scalar")]
-    Scalar { result: (f64, f64) },
+    Scalar {
+        result: (f64, f64),
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
 
     #[serde(rename = "vector")]
-    Vector { result: Vec<Sample> },
+    Vector {
+        result: Vec<Sample>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<Notice>,
+    },
+}
+
+impl DisplayResult {
+    /// What the caller should be told about the result.
+    pub fn notices(&self) -> &[Notice] {
+        match self {
+            DisplayResult::Series { notices, .. }
+            | DisplayResult::HistogramHeatmap { notices, .. }
+            | DisplayResult::Scalar { notices, .. }
+            | DisplayResult::Vector { notices, .. } => notices,
+        }
+    }
+
+    /// The notices, to add to.
+    pub fn notices_mut(&mut self) -> &mut Vec<Notice> {
+        match self {
+            DisplayResult::Series { notices, .. }
+            | DisplayResult::HistogramHeatmap { notices, .. }
+            | DisplayResult::Scalar { notices, .. }
+            | DisplayResult::Vector { notices, .. } => notices,
+        }
+    }
 }
 
 /// Selects the decimation algorithm. `Boxplot` summarizes each time-bucket by
@@ -554,7 +591,7 @@ pub(crate) fn display_from_result(
         // band, which is exactly what a hole causes; display mode would then
         // show no uncertainty at all for a series that has it almost
         // everywhere.
-        QueryResult::Matrix { result, .. } => DisplayResult::Series {
+        QueryResult::Matrix { result, notices } => DisplayResult::Series {
             result: result
                 .into_iter()
                 .map(|s| {
@@ -575,10 +612,13 @@ pub(crate) fn display_from_result(
                 })
                 .collect(),
             budget: opts.budget as u32,
+            notices,
         },
-        QueryResult::HistogramHeatmap { result, .. } => DisplayResult::HistogramHeatmap { result },
-        QueryResult::Scalar { result, .. } => DisplayResult::Scalar { result },
-        QueryResult::Vector { result, .. } => DisplayResult::Vector { result },
+        QueryResult::HistogramHeatmap { result, notices } => {
+            DisplayResult::HistogramHeatmap { result, notices }
+        }
+        QueryResult::Scalar { result, notices } => DisplayResult::Scalar { result, notices },
+        QueryResult::Vector { result, notices } => DisplayResult::Vector { result, notices },
     }
 }
 

@@ -306,12 +306,14 @@ names index below, and `HistogramRow` has a new public field.
 Requires metriken-storage 0.6.0. A minor version because metriken-query's
 public API uses metriken-storage types.
 
-- **Changed:** every `QueryResult` variant has a field `notices:
-  Vec<Notice>`, what the caller should be told about the result, absent
-  from the JSON when empty; `QueryResult::notices` and `notices_mut` read
-  and extend it. `Notice::Conflict` (sources of one process group holding
-  different values for one series where their reads coincide, S4) is the
-  first kind; nothing produces it yet. A pattern matching a variant needs
+- **Breaking:** every `QueryResult` and `DisplayResult` variant has a
+  field `notices: Vec<Notice>`, what the caller should be told about the
+  result, absent from the JSON when empty; `notices()` and `notices_mut()`
+  read and extend it, and the display form and an instant query carry the
+  result's notices. `Notice::Conflict` (sources of one process group
+  holding different values for one series where their reads coincide, S4)
+  is the first kind; nothing produces it yet. `Notice::Unknown` is what a
+  kind a later version wrote reads as. A pattern matching a variant needs
   `..`, and a construction sets `notices`.
 - **Changed:** a histogram over a process group (`histogram_count`,
   `histogram_quantiles` and the others, `by` aggregation and strides
