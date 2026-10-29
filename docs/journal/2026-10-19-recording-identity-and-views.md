@@ -1535,7 +1535,17 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   to the finest), which counts a process once and leaves the other sources'
   spans out.
 - 2b: histograms per source (the per-row and per-stride deltas combined per
-  series per span).
+  series per span). Built: `GroupSource::histogram_stream` reads each
+  member (a source, or one producer epoch of it) over its span, takes a
+  row's delta from the member's previous row where both rows are in one of
+  the member's runs (S3) and no member ranked above it has a run
+  overlapping the pair, and sums the deltas taken per series into one
+  cumulative stream, which every histogram function reads unchanged (`by`
+  aggregation and strides included). The deltas taken never overlap in
+  time; a pair a higher member's run partly overlaps is dropped, so its
+  remainder is a hole (S5). Members of different bucket configurations
+  fall back to the one source covering the most of the read. Gauge
+  histograms still read the latest row of any source.
 - 2c: S4: conflict detection, the warnings channel on query results (an
   API change; `QueryResult` has none today), and Q16's value at a conflict.
   Until then the value at a conflict is whichever source S3's order

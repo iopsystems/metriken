@@ -547,7 +547,11 @@ fn accumulate_delta_into(prev: &HistogramSnapshot, curr: &HistogramSnapshot, acc
 
 /// Calls `f` with each bucket's `(curr - prev)` individual count, where it
 /// is positive, in ascending bucket order (see [`accumulate_delta_into`]).
-fn delta_walk(prev: &HistogramSnapshot, curr: &HistogramSnapshot, mut f: impl FnMut(u32, u64)) {
+pub(super) fn delta_walk(
+    prev: &HistogramSnapshot,
+    curr: &HistogramSnapshot,
+    mut f: impl FnMut(u32, u64),
+) {
     debug_assert!(prev.index.windows(2).all(|w| w[0] < w[1]));
     debug_assert!(curr.index.windows(2).all(|w| w[0] < w[1]));
     let mut i = 0;

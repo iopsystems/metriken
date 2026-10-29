@@ -380,8 +380,7 @@ fn a_source_and_its_copy_count_once() {
     }
     let sum = one_series(&union, "sum(rate(cpu_cycles[1m]))", window);
     assert!(sum.points.iter().all(|p| (p.1 - 1000.0).abs() < 1e-6));
-    // Histograms read one source of the group (until they combine per
-    // source), so they count once too.
+    // Histograms combine per source in their rows, so they count once too.
     for query in [
         "histogram_count(latency)",
         "histogram_count(latency, 10)",
@@ -1481,10 +1480,10 @@ fn series_keep_catalog_order_beside_a_group() {
     }
 }
 
-/// Until histograms combine per source, a group's histogram is read from
-/// the source covering the most of the range: a record over 10:00 to 11:00
-/// and a dump of another recording of the process over 10:20 to 10:25 give
-/// the record's every point, whichever uuid sorts first.
+/// A group's histogram combines its sources per span: a record over 10:00
+/// to 11:00 and a dump of another recording of the process over 10:20 to
+/// 10:25, holding the same observations, give the record's every point,
+/// whichever uuid sorts first and so answers for 10:20 to 10:25.
 #[test]
 fn a_groups_histogram_reads_the_source_covering_the_range() {
     let dir = tempfile::tempdir().unwrap();
@@ -1538,6 +1537,59 @@ fn a_groups_histogram_reads_the_source_covering_the_range() {
             assert_eq!(got, want, "{query} order {order:?}");
         }
     }
+}
+
+/// A group's histogram combines its sources per span (S9): two sources of
+/// one process over 10:00 to 10:10 and 10:05 to 10:15 give one count a
+/// second over the whole 10:00 to 10:15, each of the ten observations a
+/// second once, where reading one source left five minutes out; a stride
+/// counts each window's observations once.
+#[test]
+fn a_groups_histogram_combines_its_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("overlap.dendro");
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 10, 0), S),
+                cycles,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 5, 0), at(10, 15, 0), S),
+                cycles,
+            ),
+        ],
+    );
+    let union = open(&path);
+    assert_eq!(union.read_groups().len(), 1);
+    let (s, e) = (at(10, 0, 0) as f64 / 1e9, at(10, 15, 0) as f64 / 1e9);
+    let per_row = from_matrix(
+        union
+            .query_range("histogram_count(latency)", s, e, 1.0)
+            .unwrap(),
+    );
+    assert_eq!(per_row.len(), 1);
+    let points = &per_row[0].points;
+    // One point a row from 10:00:01 to 10:15:00, each ten observations.
+    assert_eq!(points.len(), 900, "{}", points.len());
+    assert!(points.iter().all(|p| p.1 == 10.0), "{points:?}");
+    let strided = from_matrix(
+        union
+            .query_range("histogram_count(latency, 60)", s, e, 60.0)
+            .unwrap(),
+    );
+    let windows = &strided[0].points;
+    assert!(windows.len() >= 14, "{windows:?}");
+    assert!(windows.iter().all(|p| p.1 <= 600.0), "{windows:?}");
+    assert!(
+        windows.iter().filter(|p| p.1 == 600.0).count() >= 13,
+        "{windows:?}"
+    );
 }
 
 /// A recording that is a group of one, read beside a process group, is its

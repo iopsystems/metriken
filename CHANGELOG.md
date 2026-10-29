@@ -299,6 +299,14 @@ names index below.
 Requires metriken-storage 0.6.0. A minor version because metriken-query's
 public API uses metriken-storage types.
 
+- **Changed:** a histogram over a process group (`histogram_count`,
+  `histogram_quantiles` and the others, `by` aggregation and strides
+  included) combines the group's sources per span (S9): each member's
+  per-row deltas are taken per series where its own rows cover them and no
+  member ranked above it (finer, then the lowest uuid) has rows over the
+  same time, and summed into one cumulative stream. It read the one source
+  covering the most of the range, leaving the others' spans out. Members of
+  different bucket configurations still read one source.
 - **Added:** `Scope` and `QueryOptions::with_scope`: the sources a query
   reads, each named by uuid (a source and its copies) or by position among
   the reader's `ArchiveReader::sources`, with an optional span. An
