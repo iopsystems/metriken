@@ -96,6 +96,38 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
     }
 }
 
+/// The matchers of `selector`, one vector selector (`{source="a"}` or
+/// `metric{arch=~"x|y"}`), as the filter
+/// [`MetricsSource::counter_labels_matching`](crate::MetricsSource::counter_labels_matching)
+/// and its siblings take; a metric name in it is not part of the filter.
+/// A selector with no metric name may hold only matchers that match the
+/// empty string (`{source!="a"}`), which PromQL refuses on its own. An
+/// error for anything but one vector selector, and for a selector that
+/// matches one label more than once, since the filter holds one matcher
+/// per label.
+pub fn selector_filter(selector: &str) -> Result<Labels, QueryError> {
+    // A name, so that PromQL's rule that a nameless selector match some
+    // non-empty value does not apply; the name is not part of the filter.
+    let named = match selector.trim_start().starts_with('{') {
+        true => format!("selector{selector}"),
+        false => selector.to_string(),
+    };
+    let expr = parser::parse(&named)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse selector: {e:?}")))?;
+    let Expr::VectorSelector(sel) = &expr else {
+        return Err(QueryError::ParseError(format!(
+            "{selector} is not a vector selector"
+        )));
+    };
+    if let Some(label) = repeated_matcher(&named)? {
+        return Err(QueryError::ParseError(format!(
+            "selector {selector} matches label {label} more than once, and a filter holds \
+             one matcher per label"
+        )));
+    }
+    Ok(extract_filter_labels(&sel.matchers.matchers))
+}
+
 /// A label a selector of `query` matches more than once
 /// (`{source!="a", source!="b"}`): the filter holds one matcher per label,
 /// so all but one would be dropped silently.

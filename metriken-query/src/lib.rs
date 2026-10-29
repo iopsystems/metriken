@@ -143,7 +143,8 @@ pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reduce
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{ParquetBuilder, ParquetReader};
 pub use promql::{
-    referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
+    referenced_metrics, selector_filter, HistogramHeatmapResult, MatrixSample, QueryError,
+    QueryResult, Sample,
 };
 pub use segmented::SegmentedParquetReader;
 pub use union::UnionMetricsSource;
@@ -272,6 +273,16 @@ impl QueryOptions {
 ///     println!("counters: {:?}", src.counter_names());
 /// }
 /// ```
+/// The label sets of `sets` that `filter` matches.
+fn matching(
+    sets: Vec<std::collections::BTreeMap<String, String>>,
+    filter: &metriken_storage::Labels,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    sets.into_iter()
+        .filter(|set| metriken_storage::Labels::from(set.clone()).matches(filter))
+        .collect()
+}
+
 pub trait MetricsSource: Send + Sync {
     /// Execute a PromQL range query with the default [`QueryOptions`]
     /// (i.e. [`RateMode::Grid`]). Delegates to
@@ -421,6 +432,70 @@ pub trait MetricsSource: Send + Sync {
     ) -> Vec<std::collections::BTreeMap<String, String>> {
         let _ = name;
         Vec::new()
+    }
+
+    /// The label sets of counter `name` that `filter` matches, as a query's
+    /// selector `name{...}` with those matchers selects them. Build `filter`
+    /// from a selector with [`selector_filter`]. The default filters
+    /// [`counter_labels`](Self::counter_labels); a source that can leave out
+    /// what cannot match without reading it (an archive's recordings whose
+    /// labels contradict `filter`) does.
+    fn counter_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        matching(self.counter_labels(name), filter)
+    }
+
+    /// The label sets of gauge `name` that `filter` matches, as
+    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    fn gauge_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        matching(self.gauge_labels(name), filter)
+    }
+
+    /// The label sets of histogram `name` that `filter` matches, as
+    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    fn histogram_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        matching(self.histogram_labels(name), filter)
+    }
+
+    /// The label sets of gauge histogram `name` that `filter` matches, as
+    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    fn gauge_histogram_labels_matching(
+        &self,
+        name: &str,
+        filter: &metriken_storage::Labels,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        matching(self.gauge_histogram_labels(name), filter)
+    }
+
+    /// [`label_values`](Self::label_values) over the series of `metric`
+    /// that `filter` matches.
+    fn label_values_matching(
+        &self,
+        metric: &str,
+        key: &str,
+        filter: &metriken_storage::Labels,
+    ) -> std::collections::HashSet<String> {
+        [
+            self.counter_labels_matching(metric, filter),
+            self.gauge_labels_matching(metric, filter),
+            self.histogram_labels_matching(metric, filter),
+            self.gauge_histogram_labels_matching(metric, filter),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|mut labels| labels.remove(key))
+        .collect()
     }
 
     /// Distinct values of `key` across all series for `metric`. Walks

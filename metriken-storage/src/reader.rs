@@ -2384,11 +2384,91 @@ impl ArchiveReader {
         )
     }
 
+    /// The label sets of counter `name` that `filter` matches, as a query's
+    /// selector `name{...}` would select them: `filter` holds the
+    /// selector's matchers as [`Labels::matches`] reads them (`v`, `~v` for
+    /// `=~`, `!v` for `!=` and `!~`). A table whose recording's labels no
+    /// series of it can carry under `filter` (`translate_filter`) is not
+    /// read, so a filter naming one recording reads only that recording's
+    /// tables.
+    pub fn counter_labels_matching(
+        &self,
+        name: &str,
+        filter: &Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing_matching(
+            |t| t.names.counters.contains(name),
+            MetricKind::Counter,
+            name,
+            Some(filter),
+        )
+    }
+
+    /// The label sets of gauge `name` that `filter` matches, as
+    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    pub fn gauge_labels_matching(
+        &self,
+        name: &str,
+        filter: &Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing_matching(
+            |t| t.names.gauges.contains(name),
+            MetricKind::Gauge,
+            name,
+            Some(filter),
+        )
+    }
+
+    /// The label sets of histogram `name` that `filter` matches, as
+    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    pub fn histogram_labels_matching(
+        &self,
+        name: &str,
+        filter: &Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing_matching(
+            |t| t.names.histograms.contains(name),
+            MetricKind::Histogram,
+            name,
+            Some(filter),
+        )
+    }
+
+    /// The label sets of gauge histogram `name` that `filter` matches, as
+    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    pub fn gauge_histogram_labels_matching(
+        &self,
+        name: &str,
+        filter: &Labels,
+    ) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing_matching(
+            |t| t.names.gauge_histograms.contains(name),
+            MetricKind::GaugeHistogram,
+            name,
+            Some(filter),
+        )
+    }
+
     fn labeled_listing(
         &self,
         holds: impl Fn(&SamplerReader) -> bool,
         kind: MetricKind,
         name: &str,
+    ) -> Vec<BTreeMap<String, String>> {
+        self.labeled_listing_matching(holds, kind, name, None)
+    }
+
+    /// The label sets of `name` from every table `holds`, each with its
+    /// recording's labels, and when `filter` is given only those it
+    /// matches: a series matches when its own labels match the filter
+    /// `translate_filter` leaves for its recording and its relabelled set
+    /// passes `keeps`, which is how a query's selector selects it.
+    fn labeled_listing_matching(
+        &self,
+        holds: impl Fn(&SamplerReader) -> bool,
+        kind: MetricKind,
+        name: &str,
+        filter: Option<&Labels>,
     ) -> Vec<BTreeMap<String, String>> {
         let extras = self.series_labels();
         let index = self.read_group_index();
@@ -2397,16 +2477,34 @@ impl ArchiveReader {
         let mut seen: HashSet<(usize, &str, BTreeMap<String, String>)> = HashSet::new();
         let mut out = Vec::new();
         for t in self.tables.iter().filter(|t| holds(t)) {
+            let extra = extras.of(t);
+            let own_filter = match filter {
+                Some(filter) => match crate::labeled::translate_filter(extra, filter) {
+                    Some(own) => Some(own),
+                    None => continue,
+                },
+                None => None,
+            };
             let Some(sets) = t.labels(kind, name) else {
                 continue;
             };
-            let extra = extras.of(t);
             let group = self
                 .source_position(t)
                 .filter(|&p| index.groups[index.of[p]].sources.len() > 1)
                 .map(|p| index.of[p]);
             for mut set in sets {
+                if let Some(own) = &own_filter {
+                    if !Labels::from(set.clone()).matches(own) {
+                        continue;
+                    }
+                }
                 crate::labeled::add_labels_map(&mut set, extra);
+                if let Some(filter) = filter {
+                    let relabelled = Labels::from(set.clone());
+                    if !crate::labeled::keeps(&relabelled, extra, filter) {
+                        continue;
+                    }
+                }
                 if let Some(g) = group {
                     if !seen.insert((g, t.sampler.as_str(), set.clone())) {
                         continue;

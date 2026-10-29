@@ -152,6 +152,12 @@ Requires metriken-model 0.2.1.
 A minor version because metriken-storage 0.5.4 and earlier do not read the
 names index below.
 
+- **Added:** `ArchiveReader::counter_labels_matching`,
+  `gauge_labels_matching`, `histogram_labels_matching` and
+  `gauge_histogram_labels_matching`: the label sets of a metric that a
+  filter (a selector's matchers, as `Labels::matches` reads them) selects,
+  as a query's selector selects them. A recording whose labels no series of
+  it can carry under the filter is not read.
 - **Added:** `layers`, a source's identity in three layers (recorder,
   producer, user) stored in its dendro metadata under
   `metriken.layer.recorder`, `metriken.layer.producer` and
@@ -282,6 +288,13 @@ names index below.
 Requires metriken-storage 0.6.0. A minor version because metriken-query's
 public API uses metriken-storage types.
 
+- **Added:** `MetricsSource::counter_labels_matching` and its gauge,
+  histogram and gauge histogram siblings, and `label_values_matching`: a
+  metric's label sets, or one key's values, among the series a filter
+  selects. The default filters the full listing; `ArchiveReader` leaves out
+  the recordings the filter cannot match without reading them.
+  `selector_filter` builds the filter from one vector selector
+  (`{source="a"}`, `metric{cpu=~"0|1"}`).
 - **Changed:** `ParquetBuilder::file_labeled` and the other labelled
   builders: a series whose own labels carry an injected key keeps its own
   value under `exported_<key>`, where the injected value overwrote it. A
