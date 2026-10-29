@@ -82,6 +82,8 @@ pub mod memory_store;
 #[cfg(feature = "archive")]
 mod names;
 pub mod occupants;
+#[cfg(feature = "archive")]
+pub mod overlay;
 pub mod parquet;
 #[cfg(feature = "archive")]
 pub mod process;

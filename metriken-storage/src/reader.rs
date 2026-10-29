@@ -1760,7 +1760,24 @@ impl ArchiveReader {
         path: &std::path::Path,
         pool: Arc<BufferPool>,
     ) -> Result<LabeledRecordings, Box<dyn std::error::Error>> {
+        Self::open_read_groups_overlaid(path, pool, None)
+    }
+
+    /// [`open_read_groups`](Self::open_read_groups) with `overlay`'s labels
+    /// set on the sources it selects, above the labels the archive stores,
+    /// for as long as the readers are held ([`crate::overlay`]). Read groups
+    /// are formed on the overlaid labels.
+    pub fn open_read_groups_overlaid(
+        path: &std::path::Path,
+        pool: Arc<BufferPool>,
+        overlay: Option<Arc<crate::overlay::LabelOverlay>>,
+    ) -> Result<LabeledRecordings, Box<dyn std::error::Error>> {
         refuse_legacy(&file_head(path)?, &path.display().to_string())?;
+        let reopen_overlay = overlay.clone();
+        let wrap = move |catalog: Box<dyn Catalog>| match &reopen_overlay {
+            Some(overlay) => overlay.catalog(catalog),
+            None => catalog,
+        };
         // Noted before the catalog opens, so a file swapped in between is
         // refused on a table's first read.
         let reopen: Reopen = {
@@ -1773,12 +1790,16 @@ impl ArchiveReader {
                         path.display()
                     ));
                 }
-                Ok(Box::new(crate::DendroCatalog::open(&path)?) as Box<dyn Catalog>)
+                Ok(wrap(Box::new(crate::DendroCatalog::open(&path)?)))
             })
         };
         let catalog = crate::DendroCatalog::open(path)?;
+        let catalog = match &overlay {
+            Some(overlay) => overlay.catalog(Box::new(catalog)),
+            None => Box::new(catalog),
+        };
         Ok(Self::flatten_read_groups(Self::from_catalog(
-            Box::new(catalog),
+            catalog,
             Some(reopen),
             pool,
             None,
@@ -1792,13 +1813,25 @@ impl ArchiveReader {
         bytes: Vec<u8>,
         pool: Arc<BufferPool>,
     ) -> Result<LabeledRecordings, Box<dyn std::error::Error>> {
+        Self::open_read_groups_from_bytes_overlaid(bytes, pool, None)
+    }
+
+    /// [`open_read_groups_from_bytes`](Self::open_read_groups_from_bytes)
+    /// with `overlay`, as
+    /// [`open_read_groups_overlaid`](Self::open_read_groups_overlaid).
+    pub fn open_read_groups_from_bytes_overlaid(
+        bytes: Vec<u8>,
+        pool: Arc<BufferPool>,
+        overlay: Option<Arc<crate::overlay::LabelOverlay>>,
+    ) -> Result<LabeledRecordings, Box<dyn std::error::Error>> {
         refuse_legacy(&bytes, "the recording")?;
-        let catalog = crate::DendroCatalog::open_bytes(bytes)?;
+        let catalog: Box<dyn Catalog> = Box::new(crate::DendroCatalog::open_bytes(bytes)?);
+        let catalog = match &overlay {
+            Some(overlay) => overlay.catalog(catalog),
+            None => catalog,
+        };
         Ok(Self::flatten_read_groups(Self::from_catalog(
-            Box::new(catalog),
-            None,
-            pool,
-            None,
+            catalog, None, pool, None,
         )?))
     }
 

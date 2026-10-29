@@ -152,6 +152,14 @@ Requires metriken-model 0.2.1.
 A minor version because metriken-storage 0.5.4 and earlier do not read the
 names index below.
 
+- **Added:** `overlay`, an open-time label overlay: entries, each a
+  selector (a source's uuid, or matchers on its stored labels) and labels to
+  set or, with `""`, remove, applied in order where the catalog reports a
+  source's labels and never written to the archive.
+  `ArchiveReader::open_read_groups_overlaid` and
+  `open_read_groups_from_bytes_overlaid` open with one, and
+  `LabelOverlay::catalog` wraps a `Catalog` for `from_catalog`; read groups,
+  `__recording__`, query routing and listings see the overlaid labels.
 - **Added:** `ArchiveReader::counter_labels_matching`,
   `gauge_labels_matching`, `histogram_labels_matching` and
   `gauge_histogram_labels_matching`: the label sets of a metric that a
