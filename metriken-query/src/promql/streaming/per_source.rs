@@ -537,13 +537,17 @@ fn combine_histograms(
         .map(|m| ((m.source.histogram_interval(name) * 1e9) as u64, m))
         .collect();
     ranked.sort_by(|(ia, a), (ib, b)| ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo)));
-    // Each member's rows, by series.
+    // Each member's rows, by series, read one coarsest interval past the
+    // read's end, so a member's run does not seem to end at it: a pair
+    // ending past `end_ns` decides which pairs before it are taken and is
+    // then left out.
+    let past = end_ns.saturating_add(ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
     let mut config = None;
     let mut series: Vec<Labels> = Vec::new();
     let mut index: HashMap<Labels, usize> = HashMap::new();
     let mut rows: Vec<Vec<Vec<(u64, crate::types::HistogramSnapshot)>>> = Vec::new();
     for (_, m) in &ranked {
-        let (lo, hi) = (start_ns.max(m.lo), end_ns.min(m.hi));
+        let (lo, hi) = (start_ns.max(m.lo), past.min(m.hi));
         let mut by_series: Vec<Vec<(u64, crate::types::HistogramSnapshot)>> = Vec::new();
         if lo <= hi {
             if let Some(stream) = m.source.histogram_stream(name, filter, lo, hi) {
@@ -587,14 +591,15 @@ fn combine_histograms(
             .map(|r| runs(&of(r).iter().map(|(t, _)| *t).collect::<Vec<_>>()))
             .collect();
         // The pairs taken, `(prev, t, member, row)`, keyed by `t`; they never
-        // overlap. Members are offered in rank order: a pair inside a run of
-        // a member ranked above it is not taken; a pair overlapping such a
-        // run in part (it straddles the run's first or last row) is taken,
-        // and the pairs taken before it that overlap it are dropped, which
-        // loses less than one of their intervals at either end rather than
-        // the straddling pair's.
+        // overlap. Members are offered coarsest first: a pair inside a run of
+        // a member ranked above it (finer) is not taken, and a pair
+        // overlapping one taken already is not taken. So a coarse pair that
+        // straddles a finer run's first or last row is taken, and the finer
+        // pairs it overlaps are not, which loses less than one interval of
+        // the member whose pairs are not taken; the result does not depend
+        // on the order pairs are offered in.
         let mut taken: BTreeMap<u64, (u64, usize, usize)> = BTreeMap::new();
-        for r in 0..rows.len() {
+        for r in (0..rows.len()).rev() {
             let own = &member_runs[r];
             for (k, pair) in of(r).windows(2).enumerate() {
                 let (p, t) = (pair[0].0, pair[1].0);
@@ -611,19 +616,19 @@ fn combine_histograms(
                 if inside {
                     continue;
                 }
-                let overlapping: Vec<u64> = taken
+                let overlaps = taken
                     .range(p.saturating_add(1)..)
-                    .take_while(|(_, &(tp, _, _))| tp < t)
-                    .map(|(&end, _)| end)
-                    .collect();
-                for end in overlapping {
-                    taken.remove(&end);
+                    .next()
+                    .is_some_and(|(_, &(tp, _, _))| tp < t);
+                if overlaps {
+                    continue;
                 }
                 taken.insert(t, (p, r, k + 1));
             }
         }
         let taken: Vec<(u64, u64, usize, usize)> = taken
             .into_iter()
+            .take_while(|(t, _)| *t <= end_ns)
             .map(|(t, (p, r, k))| (p, t, r, k))
             .collect();
         // The running per-bucket counts, emitted as a cumulative snapshot
@@ -650,7 +655,9 @@ fn combine_histograms(
                     series_idx: s,
                     timestamp: p,
                     snapshot: snapshot(&counts),
-                    resumes: true,
+                    // A series' first row is its first row, as one source's
+                    // is; a later one resumes from another source's rows.
+                    resumes: last.is_some(),
                 });
             }
             let rs = of(r);
@@ -1245,10 +1252,13 @@ impl DataSource for GroupSource {
     /// read over its own span, and a row's delta from the member's previous
     /// row of the series taken where both rows are in one of the member's
     /// runs (S3) and the pair is not inside a run of a member ranked above
-    /// it (finer, then S3's tie rule). A pair that overlaps such a run in
-    /// part is taken in place of the higher member's pairs it overlaps, so
-    /// a junction loses less than one of the higher member's intervals. No
-    /// two deltas taken overlap in time, and none is between rows of two
+    /// it (finer, then S3's tie rule). Members are offered coarsest first and
+    /// a pair overlapping one taken is not taken, so a coarse pair that
+    /// straddles a finer run's edge is taken and the finer pairs it overlaps
+    /// are not: a junction loses less than one interval of the member whose
+    /// pairs are not taken. Members are read one coarsest interval past the
+    /// read's end, so where a read ends does not move a junction. No two
+    /// deltas taken overlap in time, and none is between rows of two
     /// sources or across a restart. The deltas taken are summed per series
     /// into a cumulative stream, with a row marked
     /// [`resumes`](crate::histogram_stream::HistogramRow::resumes) before
@@ -1358,8 +1368,9 @@ impl DataSource for GroupSource {
         self.finest_holding(|s| s.gauge_names().iter().any(|n| n == name))
             .gauge_interval(name)
     }
-    /// The longest interval of the sources holding histogram `name`: the
-    /// read starts that far back, so a coarse member's first pair is read
+    /// The longest interval of the sources holding histogram `name`, as
+    /// `RecordingsSource` answers; `histogram_read_start` reads two of them
+    /// back, so a coarse member's first pair is read
     /// ([`GroupSource::histogram_stream`] combines every member).
     fn histogram_interval(&self, name: &str) -> f64 {
         let longest = self

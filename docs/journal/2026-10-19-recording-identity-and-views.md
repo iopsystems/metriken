@@ -5,7 +5,7 @@ storage keeps everything and records provenance, and the viewer decides
 presentation. dendro's documents table, rezolus's combined view (#1504),
 process groups in metriken-storage (#304) and the S9 per-source union for
 counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
-S9 in metriken" below) are done, and for histograms built (2b); the producer identity keys and
+S9 in metriken" below) are done, and for histograms (2b) built; the producer identity keys and
 `producer_identity!`, the identity layers in metriken-storage (#326),
 metriken-recorder writing them (step 2), and the catalog index's names and
 label listings (step 2) are built and unreleased; nothing else is built. The
@@ -1539,10 +1539,13 @@ metriken-storage 0.5.0, unreleased), slice 2a of three:
   `GroupSource::histogram_stream` reads each member (a source, or one
   producer epoch of it) over its span and takes a row's delta from the
   member's previous row where both rows are in one of the member's runs
-  (S3) and the pair is not inside a run of a member ranked above it; a
-  pair overlapping such a run in part is taken in place of the higher
-  member's pairs it overlaps, so a junction loses less than one of the
-  higher member's intervals. The deltas taken never overlap in time and are
+  (S3) and the pair is not inside a run of a member ranked above it.
+  Members are offered coarsest first and a pair overlapping one already
+  taken is not taken, so a coarse pair straddling a finer run's edge is
+  taken and a junction loses less than one interval of the member whose
+  pairs are not taken; members are read one coarsest interval past the
+  read's end, so where a read ends does not move a junction. The deltas
+  taken never overlap in time and are
   summed per series into one cumulative stream, with a row marked
   `HistogramRow::resumes` before each change taken from another source's
   rows (so `histogram_irate` gives no point there), which every histogram
