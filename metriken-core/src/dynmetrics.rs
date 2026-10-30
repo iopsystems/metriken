@@ -113,12 +113,9 @@ impl MetricBuilder {
         DynBoxedMetric::from_pinned(metric, entry)
     }
 
-    /// Build a [`DynPinnedMetric`] for use with this builder.
-    ///
-    /// In order to register it you will likely want to call [`take_entry`] in
-    /// order to extract the [`MetricEntry`] for this metric first.
-    ///
-    /// [`take_entry`]: MetricBuilder::take_entry
+    /// Build a [`DynPinnedMetric`] for use with this builder, and the
+    /// [`MetricEntry`] to register it with: pin the metric and pass the entry
+    /// to [`DynPinnedMetric::register`].
     pub fn build_pinned<T: Metric>(mut self, metric: T) -> (DynPinnedMetric<T>, MetricEntry) {
         self.provider.insert(Metadata::new(self.metadata));
 

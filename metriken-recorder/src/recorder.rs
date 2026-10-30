@@ -1915,6 +1915,7 @@ impl Driver {
 
     /// Append `entry` to `layer` of slot `i`'s recording and write the
     /// labels and metadata the layers give. Whether anything was appended.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     async fn write_entry(&mut self, i: usize, layer: Layer, entry: Entry) -> Result<bool, String> {
         let mut maps = self.slots[i].maps.clone();
         if !maps.append(layer, entry).map_err(|e| e.to_string())? {

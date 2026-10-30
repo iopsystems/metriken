@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 /// A [`LazyCounter`] paired with a torn-safe acquisition [`Window`].
 ///
-/// The window lives in a lazily-allocated [`WindowCell`] on this wrapper, so
+/// The window lives in a lazily-allocated `WindowCell` on this wrapper, so
 /// the base [`Counter`] primitive stays lean and unchanged. Producers write
 /// the value and its window together via [`set_with_window`] and readers pull
 /// the self-consistent pair via [`load_with_window`].
@@ -33,7 +33,7 @@ impl WindowedLazyCounter {
     /// Set the value and its acquisition window as a torn-safe pair.
     ///
     /// The inner value store and the window insert happen under one
-    /// [`WindowCell`] write guard, so a concurrent
+    /// `WindowCell` write guard, so a concurrent
     /// [`load_with_window`](WindowedLazyCounter::load_with_window) never
     /// observes a value from one call paired with a window from another.
     ///

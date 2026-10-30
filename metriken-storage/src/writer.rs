@@ -11,7 +11,7 @@
 //! - any other group is one row per tick, as a `WalGroupRow`;
 //! - [`Encoder`] turns each stream's WAL rows into its segment.
 //!
-//! A pass taken off a replication stream ([`crate::stream`]) is staged with
+//! A pass taken off a replication stream (`crate::stream`) is staged with
 //! [`SourceRecorder::stage_streamed`], its rows decoded by a
 //! [`StreamDecoder`]. A group sent long arrives keyed by the producer's
 //! occupant keys and is written long, each key mapped to an occupant number
@@ -99,7 +99,7 @@ pub struct Staged {
 }
 
 /// One row of a pass taken off a replication stream (see
-/// [`crate::stream`]), for [`SourceRecorder::stage_streamed`].
+/// `crate::stream`), for [`SourceRecorder::stage_streamed`].
 pub enum StreamedGroup {
     /// A group row, as a snapshot's group: staged as
     /// [`SourceRecorder::stage`] stages it.
