@@ -16,7 +16,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::{CounterGroup, CounterHistogramGroup, GaugeGroup, ShardedCounterGroup};
+use crate::{
+    CounterGroup, CounterHistogramGroup, GaugeGroup, ShardedCounterGroup,
+    ShardedCounterHistogramGroup,
+};
 use crate::{WindowedCounterGroup, WindowedGaugeGroup};
 
 pub use metriken_types::UID_LABEL;
@@ -55,6 +58,7 @@ slot_metadata!(
     GaugeGroup,
     CounterHistogramGroup,
     ShardedCounterGroup,
+    ShardedCounterHistogramGroup,
     WindowedCounterGroup,
     WindowedGaugeGroup
 );

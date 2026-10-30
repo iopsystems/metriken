@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken 0.11.5
+
+- **Added:** `ShardedCounterHistogram` and `ShardedCounterHistogramGroup`, the
+  histogram counterparts to `ShardedCounterGroup`. Each thread records into
+  its own shard, and reads merge the shards. A shard's buckets are allocated
+  on the first in-range write to it and kept. They are exposed as
+  `Value::Histogram` and `Value::HistogramGroup`, which metriken-exposition
+  reads with no change. `ShardedCounterHistogramGroup` implements
+  `SlotMetadata`.
+- **Changed:** the shard count is 256, up from 64. `ShardedCounterGroup` uses
+  4x the memory (16 KiB for a group of up to 8 counters), and `value()` and
+  `load()` sum 256 shards.
+- **Fixed:** a thread that records without calling `set_thread_shard` takes a
+  shard from a pool on its first write and returns it when it exits. Threads
+  alive at the same time get distinct shards while no more than 256 of them
+  have held one at once; a thread that starts while all 256 are leased shares
+  a shard for its whole life. Pooled shards are numbered down from 255, away
+  from the low ids callers usually pass to `set_thread_shard`. The shard was the address of a thread-local modulo the
+  shard count. Measured on Linux with glibc 2.41, that address was the same
+  modulo 4096 in every thread, so 64 threads all wrote one shard; on macOS the
+  addresses were equal modulo 16, which left 4 of 64 shards in use.
+
 ### metriken-recorder 0.6.0
 
 Requires metriken-storage 0.6.0, metriken-model 0.2.1 and dendro 0.6.1.

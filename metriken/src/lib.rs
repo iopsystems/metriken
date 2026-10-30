@@ -102,7 +102,9 @@ pub use crate::histogram::{AtomicCounterHistogram, GaugeHistogram, RwLockCounter
 #[allow(deprecated)]
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};
 pub use crate::lazy::Lazy;
-pub use crate::sharded::{set_thread_shard, ShardedCounterGroup};
+pub use crate::sharded::{
+    set_thread_shard, ShardedCounterGroup, ShardedCounterHistogram, ShardedCounterHistogramGroup,
+};
 pub use crate::windowed::{
     WindowedCounterGroup, WindowedGaugeGroup, WindowedLazyCounter, WindowedLazyGauge,
 };
