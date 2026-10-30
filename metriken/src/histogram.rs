@@ -41,6 +41,7 @@ impl AtomicCounterHistogram {
     }
 
     /// Increments the bucket for a corresponding value.
+    #[inline]
     pub fn increment(&self, value: u64) -> Result<(), Error> {
         self.get_or_init().increment(value)
     }
@@ -55,6 +56,7 @@ impl AtomicCounterHistogram {
         self.inner.get().map(|h| h.load())
     }
 
+    #[inline]
     fn get_or_init(&self) -> &::histogram::AtomicHistogram {
         self.inner
             .get_or_init(|| ::histogram::AtomicHistogram::with_config(&self.config))
