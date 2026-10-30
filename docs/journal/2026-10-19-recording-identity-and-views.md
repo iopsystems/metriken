@@ -8,7 +8,9 @@ counters and gauges in metriken-query (branch `feat/per-source-union`; "S1 to
 S9 in metriken" below) are done, and built for histograms (2b); the producer identity keys and
 `producer_identity!`, the identity layers in metriken-storage (#326),
 metriken-recorder writing them (step 2), and the catalog index's names and
-label listings (step 2) are built and unreleased; nothing else is built. The
+label listings (step 2), the label overlay, the query scope, conflicts (S4)
+and the template evaluation rule are built and unreleased; nothing else is
+built. The
 owner decided on 2026-10-28 that the next metriken-storage release is a minor
 version (0.6.0), since 0.5.4 and earlier do not read the names index. The owner
 decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
@@ -3082,9 +3084,10 @@ written by the new dendro.
      occupant's labels are the series' own identity, split by the writer,
      and the writer can fold a key into the occupant that a later schema
      puts on the columns; whether the clash rule applies there is open.
-   - In metriken-query, each producer epoch's rows evaluated with that
+   - ~~In metriken-query, each producer epoch's rows evaluated with that
      epoch's handshake template (Q8), as part of the template evaluation rule
-     (the D1 item below).
+     (the D1 item below).~~ No engine input beyond the scope's spans (the
+     D1 item below).
    - ~~In metriken-query, the per-sample `avg_over_time` and per-row
      unstrided histogram behaviour documented (S12).~~ Done in the
      metriken-query crate docs.
@@ -3119,7 +3122,28 @@ written by the new dendro.
      which refuses one it is handed. Resolving a presented recording or a
      bridge piece to sources and spans is the `dashboard` crate's. Listings
      take matchers (`*_labels_matching`), not a scope. The template
-     evaluation rule is not built.
+     evaluation rule is built as `QueryOptions::with_series_labels`
+     (owner decisions 2026-10-29: a per-query flag the `dashboard` crate
+     sets for producer and registry layer queries; on a key both carry,
+     the series keeps its value and the recording's is dropped).
+     `LabeledSource` takes a `Precedence`: under `Series` a recording
+     label is added only where the series lacks the key, and matchers on
+     the recording's keys are decided on the relabelled series, so the
+     plan's routing leaves out no recording by its labels and the scope
+     chooses them. Without the recording's values two recordings' series
+     can share a label set, which a result refuses, and the recording's
+     keys no longer tell an operator which series are one recording's.
+     So where the scope (else the archive) holds more than one read group,
+     every series carries `__recording__`, one numbering over the reader's
+     read groups (catalog index, or position when `flatten` joined readers
+     share indices), and it is the only recording key the operators pair
+     by (owner decision 2026-10-30: mark every series, per read group,
+     after review found `x / y` returned nothing). Instant queries
+     take no options and keep the recording rule; a legacy combined
+     parquet keeps it too. Q8's per-epoch evaluation needs no further
+     engine input: a scope entry's span can clip a source to one epoch,
+     and matching a chart to an older epoch's query is the `dashboard`
+     crate's.
    - The catalog index and scope-aware listings (Q29's direction). The
      names index is built: each sealed segment's caller index holds its
      metric names by kind and its footer's `sampling_interval_ms`,

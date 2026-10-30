@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use metriken_storage::labeled::{translate_filter, LabeledSource};
+use metriken_storage::labeled::{
+    translate_filter_with, LabeledSource, Precedence, RECORDING_LABEL,
+};
 use metriken_storage::reader::{SamplerReader, SeriesLabels, TableReader};
 use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
@@ -51,13 +53,16 @@ use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 /// and no other, and a query reading tables of several recordings gets
 /// `None`: it is evaluated on the uniform grid, each series read at its own
 /// recording's rows and interval.
+///
+/// It plans as a query without [`QueryOptions::series_labels`]: a matcher on
+/// a recording label selects the recording.
 pub fn eval_timestamps_for(
     reader: &ArchiveReader,
     query: &str,
     step_s: f64,
     rate_mode: RateMode,
 ) -> Option<Arc<[u64]>> {
-    Plan::new(reader, query, None)
+    Plan::new(reader, query, None, Precedence::Recording)
         .ok()?
         .cross_cadence(step_s, rate_mode)
 }
@@ -76,6 +81,9 @@ struct Plan<'a> {
     missing: bool,
     /// The query's scope, which `owners` already keeps to its sources.
     scope: Option<&'a crate::Scope>,
+    /// How a recording's labels combine with its series' own
+    /// ([`QueryOptions::series_labels`]).
+    precedence: Precedence,
 }
 
 impl<'a> Plan<'a> {
@@ -102,11 +110,16 @@ impl<'a> Plan<'a> {
     /// metric.
     ///
     /// With a scope, only the tables of the sources it names are owners, and
-    /// a metric only other sources hold is missing.
+    /// a metric only other sources hold is missing. Under
+    /// [`Precedence::Series`] a matcher on a recording label leaves out no
+    /// recording, since a series' own value of the key is matched instead;
+    /// a label-selected query then reads every recording, without the
+    /// one-recording evaluation above.
     fn new(
         reader: &'a ArchiveReader,
         query: &str,
         scope: Option<&'a crate::Scope>,
+        precedence: Precedence,
     ) -> Result<Self, QueryError> {
         // The filter keeps one matcher per label (the last); with recording
         // labels, excluding several sources is an ordinary query, so a
@@ -139,7 +152,8 @@ impl<'a> Plan<'a> {
         for t in &all {
             let extra = labels.of(t);
             let pass = selectors.iter().any(|(names, filter)| {
-                names.iter().any(|n| t.holds(n)) && translate_filter(extra, filter).is_some()
+                names.iter().any(|n| t.holds(n))
+                    && translate_filter_with(extra, filter, precedence).is_some()
             });
             if pass && !passing.iter().any(|r| r.same_recording(t)) {
                 passing.push(t);
@@ -162,6 +176,7 @@ impl<'a> Plan<'a> {
             held,
             missing,
             scope,
+            precedence,
         })
     }
 
@@ -183,7 +198,7 @@ impl<'a> Plan<'a> {
         // Clone and set fields: `QueryOptions` is `#[non_exhaustive]`, so it
         // cannot be built by literal from here — and cloning preserves
         // whatever else the caller set.
-        let opts = opts.clone().with_scope(None);
+        let opts = opts.clone().with_scope(None).with_series_labels(false);
         match self.cross_cadence(step_s, opts.rate_mode) {
             Some(points) => opts.with_eval_timestamps(Some(points)),
             None => opts,
@@ -317,6 +332,50 @@ fn others_from(reader: &ArchiveReader, group: Option<usize>, position: Option<us
         .unwrap_or(0)
 }
 
+/// Under [`Precedence::Series`], the `__recording__` value every series of
+/// `table`'s read group carries when the query can read several read groups
+/// (its scope's, else the archive's); `None` otherwise. One numbering over
+/// the reader's read groups: the catalog index of each group's first
+/// source, or its position among the reader's sources when two groups'
+/// first sources share a catalog index (readers joined by
+/// `ArchiveReader::flatten`).
+fn mark(plan: &Plan<'_>, table: &SamplerReader) -> Option<String> {
+    if plan.precedence != Precedence::Series {
+        return None;
+    }
+    let reader = plan.reader;
+    let groups = reader.read_groups();
+    let readable = match plan.scope {
+        None => groups.len(),
+        Some(scope) => groups
+            .iter()
+            .filter(|g| {
+                g.sources.iter().any(|&p| {
+                    let uuid = reader.sources()[p].uuid.as_deref();
+                    scope.span_of(p, uuid).ok().flatten().is_some()
+                })
+            })
+            .count(),
+    };
+    if readable < 2 {
+        return None;
+    }
+    let group = reader.read_group_of(table)?;
+    let firsts: Vec<usize> = groups.iter().map(|g| g.sources[0]).collect();
+    let catalog: Vec<usize> = firsts
+        .iter()
+        .map(|&p| reader.sources()[p].catalog_index)
+        .collect();
+    let mut distinct = catalog.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let value = match distinct.len() == catalog.len() {
+        true => catalog[group],
+        false => firsts[group],
+    };
+    Some(value.to_string())
+}
+
 /// The engine a query is evaluated with: over the one recording it reaches,
 /// or over every recording it reaches as one source
 /// ([`RecordingsSource`]), each recording's series carrying its labels.
@@ -409,8 +468,19 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             let Some(source) = recording_source(tables, query)? else {
                 continue;
             };
-            let labels = plan.labels.of(tables[0]).clone();
-            let source: Arc<dyn DataSource> = Arc::new(LabeledSource::new(source, labels));
+            let mut labels = plan.labels.of(tables[0]).clone();
+            let labeled = match mark(plan, tables[0]) {
+                Some(mark) => LabeledSource::new(source, labels).marking(RECORDING_LABEL, &mark),
+                None => {
+                    // With one read group readable under `Series`, no
+                    // series carries `__recording__`: remove a twin's.
+                    if plan.precedence == Precedence::Series {
+                        labels.inner.remove(RECORDING_LABEL);
+                    }
+                    LabeledSource::new(source, labels).with_precedence(plan.precedence)
+                }
+            };
+            let source: Arc<dyn DataSource> = Arc::new(labeled);
             // A scope's span: its members' spans within it, which the
             // per-source combine clips each member's reads to.
             let span = match plan.scope {
@@ -668,7 +738,8 @@ fn refuse_kinds_across_recordings(
         let reads = |tables: &[&SamplerReader]| {
             selectors.iter().any(|(names, filter)| {
                 names.contains(name)
-                    && translate_filter(plan.labels.of(tables[0]), filter).is_some()
+                    && translate_filter_with(plan.labels.of(tables[0]), filter, plan.precedence)
+                        .is_some()
             })
         };
         let kinds: Vec<(usize, &'static str)> = recordings
@@ -681,9 +752,15 @@ fn refuse_kinds_across_recordings(
             continue;
         };
         if let Some(&(other, other_kind)) = kinds.iter().find(|(_, k)| *k != first_kind) {
+            // Under the series' labels a matcher on a recording label
+            // selects series, not recordings; only the scope does.
+            let how = match plan.precedence {
+                Precedence::Recording => "a label matcher",
+                Precedence::Series => "the query's scope",
+            };
             return Err(QueryError::Unsupported(format!(
                 "query {query} reads {name}, which is a {first_kind} in {} and a {other_kind} \
-                 in {}; select the recordings of one kind with a label matcher",
+                 in {}; select the recordings of one kind with {how}",
                 which[first], which[other],
             )));
         }
@@ -802,6 +879,14 @@ fn typical_gap_ns(timestamps: &[u64]) -> Option<u64> {
     Some(gaps[gaps.len() / 2]).filter(|g| *g > 0)
 }
 
+/// The precedence `opts` asks for ([`QueryOptions::series_labels`]).
+fn precedence(opts: &QueryOptions) -> Precedence {
+    match opts.series_labels {
+        true => Precedence::Series,
+        false => Precedence::Recording,
+    }
+}
+
 impl MetricsSource for ArchiveReader {
     // ── Query methods: one engine over the recordings the query reaches. ──
     fn query_range_opts(
@@ -812,7 +897,7 @@ impl MetricsSource for ArchiveReader {
         step_s: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        let plan = Plan::new(self, expr, opts.scope.as_deref())?;
+        let plan = Plan::new(self, expr, opts.scope.as_deref(), precedence(opts))?;
         let Some(engine) = engine(&plan, expr)? else {
             return Ok(QueryResult::Matrix {
                 result: Vec::new(),
@@ -840,7 +925,7 @@ impl MetricsSource for ArchiveReader {
         opts: &crate::DisplayOptions,
         qopts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
-        let plan = Plan::new(self, expr, qopts.scope.as_deref())?;
+        let plan = Plan::new(self, expr, qopts.scope.as_deref(), precedence(qopts))?;
         let Some(engine) = engine(&plan, expr)? else {
             return Ok(crate::DisplayResult::Series {
                 result: Vec::new(),
@@ -860,7 +945,7 @@ impl MetricsSource for ArchiveReader {
         Ok(result)
     }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
-        let plan = Plan::new(self, expr, None)?;
+        let plan = Plan::new(self, expr, None, Precedence::Recording)?;
         // On an archive of several recordings, at the archive's end whichever
         // recordings the query reaches: the engine's own default is the end
         // of what it reads, which would move with a label matcher.
@@ -882,7 +967,7 @@ impl MetricsSource for ArchiveReader {
     fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
         // Through the same labelled sources as a query, so a selector
         // naming a recording label resolves to that recording's columns.
-        let plan = Plan::new(self, query, None)?;
+        let plan = Plan::new(self, query, None, Precedence::Recording)?;
         let mut out = HashSet::new();
         for t in &plan.owners {
             let Some(r) = t.reader() else {
@@ -1582,6 +1667,202 @@ mod tests {
             2
         );
         assert!(series(&reader, r#"rate(requests{host="backend-1"}[3s])"#).is_empty());
+    }
+
+    /// Under `series_labels` a series keeps its own value of a key its
+    /// recording also carries, and a matcher on the key matches it there;
+    /// a series without the key carries and matches the recording's value.
+    /// The scope, not a matcher, chooses the recording.
+    #[test]
+    fn series_labels_match_a_series_own_value() {
+        let table = |n: u64| {
+            counter_table(
+                "requests",
+                &[(&[("instance", "api:9090")], n), (&[], 4 * n)],
+                10,
+            )
+        };
+        let gauge = |n: u64| typed_table("level", "gauge", &[(&[("instance", "api:9090")], n)], 10);
+        let free = |n: u64| typed_table("free", "gauge", &[(&[], n)], 10);
+        let reader = archive(vec![
+            recording(
+                &[("source", "svc"), ("instance", "rec-a")],
+                vec![
+                    ("prometheus/scrape", table(1)),
+                    ("prometheus/levels", gauge(1)),
+                    ("prometheus/free", free(1)),
+                ],
+            ),
+            recording(
+                &[("source", "svc"), ("instance", "rec-b")],
+                vec![
+                    ("prometheus/scrape", table(2)),
+                    ("prometheus/levels", gauge(2)),
+                    ("prometheus/free", free(2)),
+                ],
+            ),
+        ]);
+        let run = |query: &str, opts: &QueryOptions| -> Vec<(BTreeMap<String, String>, f64)> {
+            let result = reader
+                .query_range_opts(query, 1.0, 10.0, 1.0, opts)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let QueryResult::Matrix { result, .. } = result else {
+                panic!("{query}: not a matrix");
+            };
+            let mut out: Vec<_> = result
+                .into_iter()
+                .map(|m| {
+                    let labels = m
+                        .metric
+                        .into_iter()
+                        .filter(|(k, _)| k != "__name__")
+                        .collect::<BTreeMap<_, _>>();
+                    (labels, m.values.last().map(|v| v.1).unwrap_or(f64::NAN))
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            out
+        };
+        let scoped = |position: usize| {
+            QueryOptions::default()
+                .with_series_labels(true)
+                .with_scope(Some(Arc::new(
+                    crate::Scope::new(vec![crate::ScopedSource::new(
+                        crate::SourceRef::Position(position),
+                        None,
+                    )])
+                    .unwrap(),
+                )))
+        };
+        let own = labels(&[("instance", "api:9090"), ("source", "svc")]);
+        assert_eq!(
+            run(r#"rate(requests{instance="api:9090"}[3s])"#, &scoped(0)),
+            [(own.clone(), 1.0)]
+        );
+        assert_eq!(
+            run(r#"rate(requests{instance="api:9090"}[3s])"#, &scoped(1)),
+            [(own.clone(), 2.0)]
+        );
+        assert_eq!(
+            run("rate(requests[3s])", &scoped(0)),
+            [
+                (own.clone(), 1.0),
+                (labels(&[("instance", "rec-a"), ("source", "svc")]), 4.0),
+            ]
+        );
+        assert_eq!(
+            run(r#"rate(requests{instance="rec-a"}[3s])"#, &scoped(0)),
+            [(labels(&[("instance", "rec-a"), ("source", "svc")]), 4.0)]
+        );
+        // Without a scope, both recordings' series match.
+        let unscoped = QueryOptions::default().with_series_labels(true);
+        assert_eq!(
+            run(r#"sum(rate(requests{instance="api:9090"}[3s]))"#, &unscoped),
+            [(labels(&[]), 3.0)]
+        );
+        // Their series that keep their own `instance` would have one label
+        // set; over two read groups every series carries its group's
+        // `__recording__`, which a matcher selects on.
+        let marked = |r: &str| {
+            labels(&[
+                (RECORDING_LABEL, r),
+                ("instance", "api:9090"),
+                ("source", "svc"),
+            ])
+        };
+        assert_eq!(
+            run(r#"rate(requests{instance="api:9090"}[3s])"#, &unscoped),
+            [(marked("0"), 1.0), (marked("1"), 2.0)]
+        );
+        assert_eq!(
+            run(r#"rate(requests{__recording__="1"}[3s])"#, &unscoped),
+            [
+                (marked("1"), 2.0),
+                (
+                    labels(&[
+                        (RECORDING_LABEL, "1"),
+                        ("instance", "rec-b"),
+                        ("source", "svc")
+                    ]),
+                    8.0
+                ),
+            ]
+        );
+        assert_eq!(
+            run(r#"rate(requests{instance="rec-b"}[3s])"#, &unscoped),
+            [(
+                labels(&[
+                    (RECORDING_LABEL, "1"),
+                    ("instance", "rec-b"),
+                    ("source", "svc")
+                ]),
+                8.0
+            )]
+        );
+        // An operator pairs a series that kept its own `instance` with its
+        // recording's series: scoped, and over both recordings by the mark.
+        let paired = |r: Vec<(BTreeMap<String, String>, f64)>| -> Vec<BTreeMap<String, String>> {
+            r.into_iter().map(|(l, _)| l).collect()
+        };
+        assert_eq!(
+            paired(run(
+                r#"rate(requests{instance="api:9090"}[3s]) / level"#,
+                &scoped(0)
+            )),
+            std::slice::from_ref(&own)
+        );
+        assert_eq!(
+            run("sum(rate(requests[3s])) / sum(level)", &scoped(1)).len(),
+            1
+        );
+        assert_eq!(
+            paired(run(
+                r#"rate(requests{instance="api:9090"}[3s]) / level"#,
+                &unscoped
+            )),
+            [marked("0"), marked("1")]
+        );
+        // `free` carries no `instance` of its own, so it reads the
+        // recording's; the recording's keys are not recording identity
+        // under the flag, so the two still pair as one recording's.
+        assert_eq!(
+            run(
+                r#"rate(requests{instance="api:9090"}[3s]) / free"#,
+                &scoped(0)
+            )
+            .len(),
+            1
+        );
+        // The display form reads the same way.
+        let display = reader
+            .query_range_display_opts(
+                r#"rate(requests{instance="api:9090"}[3s])"#,
+                1.0,
+                10.0,
+                1.0,
+                &crate::DisplayOptions::default(),
+                &scoped(0),
+            )
+            .unwrap();
+        let crate::DisplayResult::Series { result, .. } = display else {
+            panic!("not series");
+        };
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].metric.get("instance").map(String::as_str),
+            Some("api:9090")
+        );
+        // A gauge reads the same way.
+        let gauges = run(r#"level{instance="api:9090"}"#, &scoped(1));
+        assert_eq!(gauges.len(), 1, "{gauges:?}");
+        assert_eq!(gauges[0].0, own);
+        // Without `series_labels` the recording's value is matched, and
+        // the series' own moves to `exported_instance`.
+        assert!(run(
+            r#"rate(requests{instance="api:9090"}[3s])"#,
+            &QueryOptions::default()
+        )
+        .is_empty());
     }
 
     /// Two recordings with one label set stay two sets of series.
@@ -2351,6 +2632,110 @@ mod tests {
         assert_eq!(got, ["0", "1", "2"]);
     }
 
+    /// Under `series_labels`, readers joined by `flatten` whose groups'
+    /// first sources share a catalog index are marked by position.
+    #[test]
+    fn flattened_marks_never_collide() {
+        let one = |instance: &str| {
+            recording(
+                &[("source", "svc"), ("instance", instance)],
+                vec![(
+                    "prometheus/scrape",
+                    counter_table("requests", &[(&[("instance", "api:9090")], 1)], 10),
+                )],
+            )
+        };
+        // The second archive's two recordings are twins (equal labels),
+        // numbered 0 and 1 within it; the mark numbers all three groups by
+        // position instead, and replaces the twins' own `__recording__`.
+        let reader = ArchiveReader::flatten(
+            vec![
+                archive(vec![one("rec-a")]),
+                archive(vec![one("rec-b"), one("rec-b")]),
+            ],
+            None,
+        );
+        let result = reader
+            .query_range_opts(
+                "rate(requests[3s])",
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default().with_series_labels(true),
+            )
+            .unwrap();
+        let QueryResult::Matrix { result, .. } = result else {
+            panic!("not a matrix");
+        };
+        let mut got: Vec<String> = result
+            .iter()
+            .map(|m| m.metric[RECORDING_LABEL].clone())
+            .collect();
+        got.sort();
+        assert_eq!(got, ["0", "1", "2"]);
+        // A scope naming one of the twins reads one read group: no
+        // `__recording__`, the twin's own included.
+        let one_twin = QueryOptions::default()
+            .with_series_labels(true)
+            .with_scope(Some(Arc::new(
+                crate::Scope::new(vec![crate::ScopedSource::new(
+                    crate::SourceRef::Position(2),
+                    None,
+                )])
+                .unwrap(),
+            )));
+        let result = reader
+            .query_range_opts("rate(requests[3s])", 1.0, 10.0, 1.0, &one_twin)
+            .unwrap();
+        let QueryResult::Matrix { result, .. } = result else {
+            panic!("not a matrix");
+        };
+        assert_eq!(result.len(), 1);
+        assert!(
+            !result[0].metric.contains_key(RECORDING_LABEL),
+            "{:?}",
+            result[0].metric
+        );
+    }
+
+    /// A source other than an archive reader refuses `series_labels`, as it
+    /// refuses a scope.
+    #[test]
+    fn only_an_archive_applies_series_labels() {
+        let mut memory = metriken_storage::memory::Memory::new(1000);
+        memory.push_counter_series(
+            "c",
+            metriken_storage::types::Counter {
+                labels: metriken_storage::Labels::default(),
+                timestamps: vec![S, 2 * S, 3 * S],
+                values: vec![1, 2, 3],
+                windows: None,
+            },
+        );
+        let engine = QueryEngine::new(Arc::new(memory));
+        let flagged = QueryOptions::default().with_series_labels(true);
+        let err = engine
+            .query_range_opts("rate(c[2s])", 1.0, 3.0, 1.0, &flagged)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("series_labels"), "{err}");
+        assert!(engine
+            .query_range_opts("rate(c[2s])", 1.0, 3.0, 1.0, &QueryOptions::default())
+            .is_ok());
+        let err = engine
+            .query_range_display_opts(
+                "rate(c[2s])",
+                1.0,
+                3.0,
+                1.0,
+                &crate::DisplayOptions::default(),
+                &flagged,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("series_labels"), "{err}");
+    }
+
     fn gauge_rows(from: u64, to: u64, every: u64, v: u64) -> Vec<(u64, u64)> {
         (from..=to)
             .step_by(every as usize)
@@ -2567,6 +2952,24 @@ mod tests {
         ]);
         assert!(values(&reader, "m", RateMode::default()).is_err());
         assert!(values(&reader, "rate(m[3s])", RateMode::default()).is_err());
+        // Under `series_labels` a label matcher does not select a
+        // recording, so the refusal names the scope, and the scope answers.
+        let flagged = QueryOptions::default().with_series_labels(true);
+        let err = reader
+            .query_range_opts(r#"m{source="a"}"#, 1.0, 10.0, 1.0, &flagged)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("with the query's scope"), "{err}");
+        let scoped = flagged.with_scope(Some(Arc::new(
+            crate::Scope::new(vec![crate::ScopedSource::new(
+                crate::SourceRef::Position(0),
+                None,
+            )])
+            .unwrap(),
+        )));
+        assert!(reader
+            .query_range_opts(r#"m{source="a"}"#, 1.0, 10.0, 1.0, &scoped)
+            .is_ok());
         // A matcher selecting one kind answers, though another operand
         // reaches the other recording.
         let with_y = archive(vec![

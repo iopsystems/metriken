@@ -968,16 +968,22 @@ fn find_close_paren(s: &str) -> Option<usize> {
     None
 }
 
-/// An error for options carrying a scope: an engine reads every source it
-/// is given, and the source that can apply a scope (`ArchiveReader`)
-/// applies it and clears it before evaluating.
-fn refuse_scope(opts: &QueryOptions) -> Result<(), QueryError> {
-    match opts.scope {
-        Some(_) => Err(QueryError::Unsupported(
+/// An error for options carrying a scope or `series_labels`: an engine
+/// reads every source it is given with the labels it carries, and the
+/// source that can apply either (`ArchiveReader`) applies it and clears it
+/// before evaluating.
+fn refuse_archive_options(opts: &QueryOptions) -> Result<(), QueryError> {
+    if opts.scope.is_some() {
+        return Err(QueryError::Unsupported(
             "this source does not apply a query scope; only an archive reader does".into(),
-        )),
-        None => Ok(()),
+        ));
     }
+    if opts.series_labels {
+        return Err(QueryError::Unsupported(
+            "this source does not apply series_labels; only an archive reader does".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Extract label filter from parsed PromQL matchers, skipping `__name__`.
@@ -1606,7 +1612,7 @@ impl QueryEngine {
         step: f64,
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        refuse_scope(opts)?;
+        refuse_archive_options(opts)?;
         self.evaluate_range(query_str, start, end, step, opts)
     }
 
@@ -1622,7 +1628,7 @@ impl QueryEngine {
         display: &crate::DisplayOptions,
         opts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
-        refuse_scope(opts)?;
+        refuse_archive_options(opts)?;
         self.evaluate_range_as(
             query_str,
             (start, end, step),

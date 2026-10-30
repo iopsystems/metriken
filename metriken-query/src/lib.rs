@@ -243,6 +243,33 @@ pub struct QueryOptions {
     /// [`scope`]. Only `ArchiveReader` applies a scope; another source
     /// refuses a query that carries one.
     pub scope: Option<std::sync::Arc<Scope>>,
+    /// Match a key that a series and its recording both carry against the
+    /// series' own value, and leave the recording's value off the series
+    /// (for evaluating a dashboard template a producer or the template
+    /// registry wrote for those series). A key only the recording carries
+    /// is matched against the recording's value, and the scope, not a
+    /// label matcher, chooses the
+    /// recordings a query reads. The recording's keys are then not what
+    /// tells recordings apart: where the scope (else the archive) holds
+    /// more than one read group, every series carries `__recording__`,
+    /// one value per read group, and operators pair series by it. With
+    /// one read group no series carries `__recording__`. `false` (the
+    /// default) gives the recording's value precedence, with the series'
+    /// own under `exported_<key>`.
+    ///
+    /// Without a scope, a matcher on a recording label no longer narrows
+    /// the recordings read, so a query that selected one recording by label
+    /// is evaluated over every recording: it is refused where a metric is
+    /// a different kind in two of them, and is not given one recording's
+    /// cross-cadence timestamps. Name the recordings with the scope.
+    ///
+    /// Applied by `ArchiveReader` range and display queries; any other
+    /// source refuses a query that sets it, as it refuses a scope. Which
+    /// series carry `__recording__` follows the read groups of the scope
+    /// (or the archive) when the archive is opened, sources without rows
+    /// included, so a live archive's series gain it when a second source
+    /// appears and the reader is reopened.
+    pub series_labels: bool,
 }
 
 impl QueryOptions {
@@ -254,6 +281,7 @@ impl QueryOptions {
             per_series_rates: false,
             instant: false,
             scope: None,
+            series_labels: false,
         }
     }
 
@@ -274,6 +302,13 @@ impl QueryOptions {
     /// Read only the sources `scope` names. See [`QueryOptions::scope`].
     pub fn with_scope(mut self, scope: Option<std::sync::Arc<Scope>>) -> Self {
         self.scope = scope;
+        self
+    }
+
+    /// Give a series' own labels precedence over its recording's. See
+    /// [`QueryOptions::series_labels`].
+    pub fn with_series_labels(mut self, series_labels: bool) -> Self {
+        self.series_labels = series_labels;
         self
     }
 }
