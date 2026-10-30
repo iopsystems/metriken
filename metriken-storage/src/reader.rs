@@ -1468,20 +1468,19 @@ impl ArchiveReader {
     /// one level up. Derive the label from something the caller knows is
     /// unique per participant instead.
     ///
-    /// # Composition tolerates name-sharing that a query refuses
+    /// # Composition does not refuse a duplicated series
     ///
-    /// A query of the archive (metriken-query's `recording_source`) whose
-    /// tables include tables of two samplers holding one metric name, whether
-    /// or not the query names it, is refused, and so is one series in two
-    /// tables of one sampler. This composition has no equivalent check,
-    /// because it is eager and whole-archive: refusing here would reject an
-    /// entire archive over a name the caller may never query. Shared names are
-    /// real and shipped — `gpu_nvidia` and `gpu_amd_smi` both publish
-    /// `gpu_utilization` — so on a host running both, a composed query that
-    /// aggregates the name away (`sum by (id) (gpu_utilization)`) sums across
-    /// vendors where a query of the archive would have refused. The series remain
-    /// distinguishable by their `sampler` label; a caller that must not
-    /// conflate them should group by it.
+    /// A query of the archive (metriken-query's `recording_source`) refuses
+    /// one series (a name with the same labels) in two of the tables it reads.
+    /// This composition has no equivalent check, because it is eager and
+    /// whole-archive: refusing here would reject an entire archive over a
+    /// name the caller may never query. A name two samplers share is read from
+    /// both on either path when their series differ — `gpu_nvidia` and
+    /// `gpu_amd_smi` both publish
+    /// `gpu_utilization` — so on a host running both, a query that aggregates
+    /// the name away (`sum by (id) (gpu_utilization)`) sums across vendors.
+    /// The series remain distinguishable by their `sampler` label; a caller
+    /// that must not conflate them should group by it.
     ///
     /// # Errors
     ///

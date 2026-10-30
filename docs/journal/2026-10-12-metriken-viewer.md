@@ -619,10 +619,11 @@ What metriken origin/main (ab81e2a) has to build on:
 - The composed reader does not apply two things `route()` applies within one
   recording: the cross-cadence evaluation timestamps (`eval_timestamps_for`
   in `archive.rs`, documented as answering for one recording and passed by
-  the caller), and the refusal of a query over a metric name two samplers
-  share (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`; the
-  `composition_sources` docs, "Composition tolerates name-sharing that
-  `route` refuses").
+  the caller), and the refusal of a query over one series two tables hold
+  (the `composition_sources` docs, "Composition does not refuse a duplicated
+  series"). Until metriken-query 0.43.1 that refusal covered any metric name
+  two samplers share (`gpu_nvidia` and `gpu_amd_smi` both publish
+  `gpu_utilization`), whatever the labels.
 - `composition_sources` refuses a flattened multi-recording reader. Its docs
   note that two recordings may carry identical label sets (the recorder only
   warns), and that composing those under their own labels merges their
@@ -752,7 +753,7 @@ engine across recordings" below.
   `exported_<key>` depends on both values.
 - metriken-query `route()` groups the tables a query names by recording and
   builds each recording's source as before (the table, or a `try_new`
-  union that still refuses a name two samplers share), wrapped in
+  union that refuses one series in two tables), wrapped in
   `LabeledSource`, one engine per recording. `columns` resolves through the
   same wrapper. The cross-recording refusal is gone.
 - Queries across recordings (decided 2026-10-13, after six reviews). The
@@ -889,7 +890,7 @@ engine across recordings" below.
 - Tests: metriken-query `archive::tests` (one recording carries its
   labels; two recordings: per-series queries, by `source=`, `!=`, `=~`,
   `sum by (source)` answered and `sum` refused; the `exported_` rename and
-  its matchers; identical label sets; the shared-name refusal; `columns`;
+  its matchers; identical label sets; the refusal of one series in two samplers' tables; `columns`;
   cross-cadence from one recording only; a partly overlapping recording
   read at full resolution; which combinations are answered and refused in
   both modes, twins included; each recording's own interval; a name of

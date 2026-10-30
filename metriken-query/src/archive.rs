@@ -410,9 +410,9 @@ fn mark(plan: &Plan<'_>, table: &SamplerReader) -> Option<String> {
 /// points (S5). A query reaching no such group and no span is evaluated as
 /// before, as is an unspanned source of one epoch.
 ///
-/// Refused: a metric name held by two tables of one recording
-/// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
-/// name that is a different kind in two recordings the query reaches.
+/// Refused: one series (a name with the same labels) in two tables of one
+/// recording, and a name that is a different kind in two recordings the
+/// query reaches.
 /// Errors too when the query references no known metric.
 fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryError> {
     // A metric the archive holds that no recording the query reaches holds
@@ -804,86 +804,59 @@ fn recording_source(
     // footer-level name catalog (no row-group decode), so a fresh one per
     // query is cheap enough not to need caching.
     //
-    // `filter_map`: on a live archive one of several tables can have been
-    // evicted between the probe and here, and the rest still answer.
-    let children: Vec<(&str, Arc<dyn DataSource>)> = tables
+    // `try_new`, not `new`: this composition set is derived from archive
+    // bytes (table schemas plus parsed table keys), not hand-picked by
+    // trusted code. A name held by several tables whose series carry
+    // different labels is read from all of them: one family read in two
+    // groups of a sampler, each over its own population, or one name
+    // published by two samplers, whose series differ at least by the
+    // `sampler` label the producer stamps. One series in two tables must be
+    // a loud error, not `UnionSource`'s silent first-wins. `filter_map`: on
+    // a live archive one of several tables can have been evicted between the
+    // probe and here, and the rest still answer.
+    let children: Vec<UnionChild> = tables
         .iter()
         .filter_map(|t| {
             t.reader()
-                .map(|r| (table_sampler(t.sampler()), timed(t, r, fallback)))
+                .map(|r| UnionChild::from_source(timed(t, r, fallback)))
         })
         .collect();
     if children.is_empty() {
         return Ok(None);
     }
-    // Distinct SAMPLERS sharing a metric name is legitimate and shipped:
-    // `gpu_amd_smi` and `gpu_nvidia` both publish the vendor-neutral
-    // `gpu_utilization`, `gpu_temperature` and six more, because only one of
-    // them ever populates on a given host. Their series differ by their
-    // `sampler` and `vendor` labels, so the union would join them. A query
-    // whose tables include tables of two samplers holding one metric name,
-    // whether or not the query names it, is refused instead, so it never
-    // mixes two vendors' readings without saying so.
-    let shared = names_across_samplers(&children);
-    if !shared.is_empty() {
-        let mut samplers: Vec<&str> = children.iter().map(|(s, _)| *s).collect();
-        samplers.sort();
-        samplers.dedup();
-        return Err(QueryError::ParseError(format!(
-            "query {query} references metric name(s) published by more than one \
-             sampler ({}), so it is ambiguous which is meant: {}. This is not an \
-             archive fault — those samplers deliberately share vendor-neutral \
-             names. Query one of them at a time.",
-            samplers.join(", "),
-            shared.join(", ")
-        )));
-    }
-    // `try_new`, not `new`: this composition set is derived from archive
-    // bytes (table schemas plus parsed table keys), not hand-picked by
-    // trusted code. A name in several group tables of one sampler whose
-    // series carry different labels (one family read in two groups, each
-    // over its own population) is read from all of them; one series in two
-    // group tables of one sampler is an archive defect and must be a loud
-    // error, not `UnionSource`'s silent first-wins.
-    UnionSource::try_new(
-        children
-            .into_iter()
-            .map(|(_, source)| UnionChild::from_source(source))
-            .collect(),
-    )
-    .map(|u| Some(Arc::new(u) as Arc<dyn DataSource>))
-    .map_err(|e| match e {
-        UnionError::NonDisjoint { duplicates } => QueryError::ParseError(format!(
-            "query {query} references metric name(s) with a series (the same labels) in \
-             more than one acquisition-group table of the same sampler — the archive's \
-             own tables are not disjoint, which should never happen: {}",
-            duplicates.join(", ")
-        )),
-        UnionError::Empty => unreachable!("`children` is not empty"),
-    })
-}
-
-/// Every metric name (within one kind) held by tables of more than one
-/// sampler, sorted.
-fn names_across_samplers(children: &[(&str, Arc<dyn DataSource>)]) -> Vec<String> {
-    let kinds: [fn(&dyn DataSource) -> Vec<String>; 4] = [
-        |c| c.counter_names(),
-        |c| c.gauge_names(),
-        |c| c.histogram_names(),
-        |c| c.gauge_histogram_names(),
-    ];
-    let mut shared = std::collections::BTreeSet::new();
-    for names in kinds {
-        let mut owner: HashMap<String, &str> = HashMap::new();
-        for (sampler, source) in children {
-            for name in names(source.as_ref()) {
-                if *owner.entry(name.clone()).or_insert(sampler) != *sampler {
-                    shared.insert(name);
+    UnionSource::try_new(children)
+        .map(|u| Some(Arc::new(u) as Arc<dyn DataSource>))
+        .map_err(|e| match e {
+            UnionError::NonDisjoint { duplicates } => {
+                // The samplers whose tables hold a duplicated name, not every
+                // sampler the query reads.
+                let mut samplers: Vec<&str> = tables
+                    .iter()
+                    .filter(|t| duplicates.iter().any(|n| t.holds(n)))
+                    .map(|t| table_sampler(t.sampler()))
+                    .collect();
+                samplers.sort();
+                samplers.dedup();
+                if samplers.len() > 1 {
+                    QueryError::ParseError(format!(
+                        "query {query} references metric name(s) with a series (the same \
+                         labels) in more than one table it reads (tables of {}): {}. No \
+                         matcher tells those series apart, so the query cannot be answered.",
+                        samplers.join(", "),
+                        duplicates.join(", ")
+                    ))
+                } else {
+                    QueryError::ParseError(format!(
+                        "query {query} references metric name(s) with a series (the same \
+                         labels) in more than one acquisition-group table of the same \
+                         sampler — the archive's own tables are not disjoint, which should \
+                         never happen: {}",
+                        duplicates.join(", ")
+                    ))
                 }
             }
-        }
-    }
-    shared.into_iter().collect()
+            UnionError::Empty => unreachable!("`children` is not empty"),
+        })
 }
 
 /// The typical spacing between consecutive rows, or `None` for fewer than two
@@ -1940,9 +1913,10 @@ mod tests {
         );
     }
 
-    /// Within one recording a name two samplers share is still refused.
+    /// One series (the same, here empty, label set) in tables of two
+    /// samplers of one recording is refused.
     #[test]
-    fn a_name_two_samplers_share_is_still_refused_within_a_recording() {
+    fn one_series_two_samplers_hold_is_refused_within_a_recording() {
         let reader = archive(vec![recording(
             &[("source", "rezolus")],
             vec![
@@ -1954,7 +1928,7 @@ mod tests {
             .query_range_opts("gpu_ops", 1.0, 10.0, 1.0, &QueryOptions::default())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("more than one sampler"), "{err}");
+        assert!(err.contains("more than one table it reads"), "{err}");
     }
 
     /// One group table of drivehealth's shape: counter `exceeded_time` and
@@ -2043,10 +2017,11 @@ mod tests {
         );
     }
 
-    /// Two samplers publishing one name are refused even when their series
-    /// differ by the `sampler` and `vendor` labels a producer stamps on them.
+    /// Two samplers publishing one name are read together when their series
+    /// differ, as they do by the `sampler` and `vendor` labels a producer
+    /// stamps on them.
     #[test]
-    fn a_name_two_samplers_share_under_different_labels_is_refused() {
+    fn a_name_two_samplers_share_under_different_labels_is_queried_whole() {
         let reader = archive(vec![recording(
             &[("source", "rezolus")],
             vec![
@@ -2068,11 +2043,13 @@ mod tests {
                 ),
             ],
         )]);
-        let err = reader
-            .query_range_opts("sum(gpu_ops)", 1.0, 10.0, 1.0, &QueryOptions::default())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("more than one sampler"), "{err}");
+        assert_eq!(
+            series(&reader, "sum by (sampler) (rate(gpu_ops[3s]))"),
+            [
+                (labels(&[("sampler", "gpu_amd_smi")]), 2.0),
+                (labels(&[("sampler", "gpu_nvidia")]), 1.0)
+            ]
+        );
     }
 
     /// One series in two group tables of one sampler is still an archive
@@ -2103,6 +2080,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("acquisition-group table"), "{err}");
+    }
+
+    /// A series duplicated within one sampler is reported as that sampler's
+    /// defect even when the query also reads another sampler's table.
+    #[test]
+    fn a_duplicate_within_one_sampler_names_that_sampler_only() {
+        let reader = archive(vec![recording(
+            &[("source", "rezolus")],
+            vec![
+                (
+                    "drivehealth/drivehealth_ebs",
+                    counter_table("exceeded_time", &[(&[("storage", "ebs")], 1)], 10),
+                ),
+                (
+                    "drivehealth/drivehealth_instance_store",
+                    counter_table("exceeded_time", &[(&[("storage", "ebs")], 3)], 10),
+                ),
+                ("cpu_usage", counter_table("cpu_cycles", &[(&[], 5)], 10)),
+            ],
+        )]);
+        let err = reader
+            .query_range_opts(
+                "rate(exceeded_time[3s]) + on() rate(cpu_cycles[3s])",
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acquisition-group table of the same"), "{err}");
+        assert!(!err.contains("cpu_usage"), "{err}");
     }
 
     #[test]

@@ -61,10 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed:** an archive query naming a metric that two group tables of one
   sampler hold under different labels returns both tables' series instead of
   failing with "present in more than one acquisition-group table" (through
-  metriken-storage 0.6.1). A name held by tables of two samplers is still
-  refused as ambiguous, whatever their labels. The error for one series in two
-  group tables of one sampler says the clash is a series with the same labels;
-  it still lists metric names.
+  metriken-storage 0.6.1).
+- **Changed:** a query whose tables include tables of two samplers holding one
+  metric name reads every table's series of it when their labels differ, which
+  they do in recordings that carry the `sampler` label on every series (current
+  rezolus agents). Before, any such query was refused as ambiguous, including
+  `sum by (sampler) (rezolus_bpf_run_count)` and any query reading two BPF
+  samplers' tables. A name read from samplers of materially different cadence
+  is evaluated at the slower sampler's rows, as a query combining two such
+  samplers' metrics already is.
+  `sum(gpu_utilization)` on a host running both `gpu_nvidia` and
+  `gpu_amd_smi` now sums both vendors' series; `by (vendor)` keeps them apart.
+  One series (the same labels) in two tables is still refused. The errors say
+  the clash is a series with the same labels; they still list metric names.
 
 ### metriken-recorder 0.6.0
 
