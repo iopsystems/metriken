@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Added:** the crate. It holds the rezolus viewer's chart modules
   (`assets/charts/`) and `assets/charts.css`, copied from rezolus at
-  7849d604. ECharts 5.4.3 is bundled; NOTICE and LICENSE-d3 carry its
+  782383b0. ECharts 6.1.0 is bundled; NOTICE and LICENSE-d3 carry its
   notices. `ASSETS` embeds `assets/` as an `include_dir` 0.7 `Dir`, and
   `ASSETS_PATH` is the directory on the build machine. The modules import
   nothing outside `assets/charts/`; a page supplies its data layer, theme

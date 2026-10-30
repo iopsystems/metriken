@@ -11,7 +11,7 @@ The crate exports `ASSETS`, `ASSETS_PATH` and the `include_dir` crate.
 machine that built the crate:
 
 - `assets/charts/`: ES modules. They import only from inside this directory.
-  `charts/echarts.min.js` is Apache ECharts 5.4.3; see NOTICE.
+  `charts/echarts.min.js` is Apache ECharts 6.1.0; see NOTICE.
 - `assets/charts.css`: the chart card styles. It also holds rezolus viewer
   styles for the single-chart view, the cgroup and GPU selectors, the CPU
   topology diagram and compare mode, which a page that draws none of them can
@@ -19,8 +19,8 @@ machine that built the crate:
 
 ## What a page provides
 
-- `echarts` as a global: load `charts/echarts.min.js`, or another ECharts 5,
-  before the modules.
+- `echarts` as a global: load `charts/echarts.min.js` before the modules,
+  or your own ECharts. The modules are tested with the bundled 6.1.0.
 - CSS custom properties on `document.documentElement`:
   - every property named in `CSS_MAP` in `charts/util/colormap.js`, with no
     fallback: an unset property reads as an empty string. The modules read
