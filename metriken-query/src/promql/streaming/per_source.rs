@@ -8,9 +8,10 @@
 //! function) as one recording is evaluated, with its own rows, interval and
 //! acquisition windows, and the results are combined per series: at each
 //! point the finest source whose rows cover the function's whole window
-//! answers, ties going to the lowest uuid and then to catalog order; where
-//! none covers the window, the finest source holding rows there; where no
-//! source holds rows (S3's hole rule), nothing (S5). No value is a
+//! answers, ties going to the source with the earlier first row (Q16), then
+//! the lowest uuid and then catalog order; where none covers the window,
+//! the finest source holding rows there; where no source holds rows (S3's
+//! hole rule), nothing (S5). No value is a
 //! difference between rows of two sources, so a counter reset is always
 //! within one source's rows. A source holding several producer epochs is
 //! one member per epoch, so each epoch's first row starts a new run of rows
@@ -41,34 +42,58 @@ use crate::DataSource;
 /// source, with what orders it among the others.
 #[derive(Clone)]
 pub(crate) struct Member {
-    /// The source's series, carrying the group's labels.
+    /// The source's series, carrying the group's labels, read through
+    /// `Recorded` (S4) where the source's group has several sources.
     pub source: Arc<dyn DataSource>,
+    /// `source` without `Recorded`: what reads whose rows are not compared
+    /// read (S3's context rows, the batched scan, which compares its rows
+    /// itself).
+    pub raw: Arc<dyn DataSource>,
     /// The rows this member holds: `[lo, hi]`, both inclusive. The whole
     /// source, or one epoch of it, from its `from_ts` to the next epoch's.
     pub lo: u64,
     pub hi: u64,
-    /// S3's tie rule: lowest uuid (a source with none after every source
-    /// with one), then catalog order, then the position among the reader's
-    /// sources (readers joined by `flatten` repeat catalog indices).
+    /// The tie rule after the first row: lowest uuid (a source with none
+    /// after every source with one), then catalog order, then the position
+    /// among the reader's sources (readers joined by `flatten` repeat
+    /// catalog indices).
     pub uuid: Option<String>,
     pub catalog_index: usize,
     pub position: usize,
+    /// The source's first row, in nanoseconds (`u64::MAX` for a source
+    /// with none): S4's tie rule at equal spacing (Q16).
+    pub first_ns: u64,
 }
 
 impl Member {
-    /// S3's tie rule between two members of equal spacing: the lowest uuid
-    /// (a source without one after those with one), then catalog order, then
-    /// the position among the reader's sources.
+    /// The tie rule between two members of equal spacing: the source with
+    /// the earlier first row (Q16, so at a conflict the value is the
+    /// earlier-starting source's), then the lowest uuid (a source without
+    /// one after those with one), then catalog order, then the position
+    /// among the reader's sources (S3).
     pub(crate) fn cmp_ties(&self, other: &Member) -> std::cmp::Ordering {
         use std::cmp::Ordering;
-        match (&self.uuid, &other.uuid) {
-            (Some(x), Some(y)) => x.cmp(y),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
+        self.first_ns
+            .cmp(&other.first_ns)
+            .then(match (&self.uuid, &other.uuid) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+            .then(self.catalog_index.cmp(&other.catalog_index))
+            .then(self.position.cmp(&other.position))
+    }
+
+    /// The source as a conflict names it: its uuid, else its position.
+    pub(crate) fn source_name(&self) -> super::conflicts::SourceName {
+        super::conflicts::SourceName {
+            position: self.position,
+            name: self
+                .uuid
+                .clone()
+                .unwrap_or_else(|| format!("source {}", self.position)),
         }
-        .then(self.catalog_index.cmp(&other.catalog_index))
-        .then(self.position.cmp(&other.position))
     }
 }
 
@@ -78,6 +103,9 @@ pub(crate) struct SourceGroups {
     /// The recordings the query reaches, in catalog order: each a source of
     /// one member, or a process group of several.
     pub parts: Vec<Part>,
+    /// The rows the query reads of its groups' sources, and the conflicts
+    /// found in them (S4).
+    pub conflicts: Arc<super::conflicts::Conflicts>,
 }
 
 /// One recording of [`SourceGroups`].
@@ -536,6 +564,7 @@ fn combine_histograms(
     filter: &Labels,
     start_ns: u64,
     end_ns: u64,
+    conflicts: &Arc<super::conflicts::Conflicts>,
 ) -> Option<Option<HistogramStream>> {
     // The members holding the histogram, in S3's rank: finest histogram
     // interval first, then the tie rule, then the epoch's start.
@@ -698,6 +727,7 @@ fn combine_histograms(
             lo: m.lo,
             hi: m.hi,
             head: None,
+            member: (*m).clone(),
         });
     }
     let n = series.len();
@@ -711,6 +741,10 @@ fn combine_histograms(
         counts: vec![BTreeMap::new(); n],
         ready: VecDeque::new(),
         warned: vec![false; streams.len()],
+        series: series.clone(),
+        metric: name.to_string(),
+        end_ns,
+        conflicts: Arc::clone(conflicts),
         streams,
         emits,
     };
@@ -744,6 +778,8 @@ struct MemberRows {
     hi: u64,
     /// The next row in the member's span, its series index combined.
     head: Option<HistogramRow>,
+    /// The member, which a conflict names.
+    member: Member,
 }
 
 impl MemberRows {
@@ -786,6 +822,14 @@ struct Combined {
     ready: VecDeque<HistogramRow>,
     /// Whether a member's second read was found to differ from its first.
     warned: Vec<bool>,
+    /// The combined series and the metric, which a conflict names.
+    series: Vec<Labels>,
+    metric: String,
+    /// The read's end: rows past it are read for the decisions only.
+    end_ns: u64,
+    /// Where conflicts go (S4): rows of one series two members of different
+    /// sources hold at one time with different counts.
+    conflicts: Arc<super::conflicts::Conflicts>,
 }
 
 /// The counts as a cumulative snapshot.
@@ -864,6 +908,41 @@ impl Combined {
     }
 }
 
+impl Combined {
+    /// Compare the rows at `t` of the members `stepped` read there, per
+    /// series, across members of different sources.
+    fn compare(&self, t: u64, stepped: &[usize]) {
+        let mut members: Vec<usize> = stepped.to_vec();
+        members.sort_unstable();
+        members.dedup();
+        for (i, &a) in members.iter().enumerate() {
+            for &b in &members[i + 1..] {
+                let (ma, mb) = (&self.streams[a].member, &self.streams[b].member);
+                if ma.position == mb.position {
+                    continue;
+                }
+                for s in 0..self.series.len() {
+                    let (Some((ta, sa)), Some((tb, sb))) = (
+                        self.prev[a].get(s).and_then(Option::as_ref),
+                        self.prev[b].get(s).and_then(Option::as_ref),
+                    ) else {
+                        continue;
+                    };
+                    if *ta != t || *tb != t {
+                        continue;
+                    }
+                    if sa.index != sb.index || sa.count != sb.count {
+                        let mut series = self.series[s].inner.clone();
+                        series.insert("__name__".to_string(), self.metric.clone());
+                        self.conflicts
+                            .add(series, &ma.source_name(), &mb.source_name(), t);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Iterator for Combined {
     type Item = HistogramRow;
 
@@ -880,6 +959,7 @@ impl Iterator for Combined {
                 .filter_map(|m| m.head.as_ref().map(|h| h.timestamp))
                 .min()?;
             let mut rows = Vec::new();
+            let mut stepped = Vec::new();
             while let Some(r) = (0..self.streams.len()).find(|&r| {
                 self.streams[r]
                     .head
@@ -887,6 +967,13 @@ impl Iterator for Combined {
                     .is_some_and(|h| h.timestamp == t)
             }) {
                 rows.extend(self.step(r));
+                stepped.push(r);
+            }
+            // Members of different sources holding one series at `t` with
+            // different counts: a conflict (S4). Each member's row at `t` is
+            // its previous row now.
+            if t <= self.end_ns {
+                self.compare(t, &stepped);
             }
             rows.sort_by_key(|row| row.series_idx);
             self.ready.extend(rows);
@@ -905,6 +992,10 @@ const CONTEXT_ROWS: usize = 9;
 /// answers.
 pub(crate) struct Tap {
     inner: Arc<dyn DataSource>,
+    /// What S3's context rows are read from (`context`): `inner`, or
+    /// `inner` without `Recorded`, so rows read only to decide coverage are
+    /// not compared for conflicts.
+    context: Arc<dyn DataSource>,
     lo: u64,
     hi: u64,
     rows: Mutex<HashMap<Labels, Arc<Mutex<Vec<u64>>>>>,
@@ -913,11 +1004,18 @@ pub(crate) struct Tap {
 impl Tap {
     pub(crate) fn new(inner: Arc<dyn DataSource>, lo: u64, hi: u64) -> Self {
         Self {
+            context: Arc::clone(&inner),
             inner,
             lo,
             hi,
             rows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Read S3's context rows from `context` instead of `inner`.
+    pub(crate) fn with_context(mut self, context: Arc<dyn DataSource>) -> Self {
+        self.context = context;
+        self
     }
 
     fn sink(&self, labels: &Labels) -> Arc<Mutex<Vec<u64>>> {
@@ -967,7 +1065,7 @@ impl Tap {
             }
             let mut rows: HashMap<Labels, Vec<u64>> = HashMap::new();
             let read: Vec<(Labels, Vec<u64>)> = if counter {
-                self.inner
+                self.context
                     .counters(name, filter, from, to)
                     .map(|c| {
                         c.series
@@ -977,7 +1075,7 @@ impl Tap {
                     })
                     .unwrap_or_default()
             } else {
-                self.inner
+                self.context
                     .gauges(name, filter, from, to)
                     .map(|g| {
                         g.series
@@ -1386,12 +1484,22 @@ pub(crate) struct GroupSource {
     /// The group's members, one per source or per producer epoch of one,
     /// which a histogram read combines (S9).
     members: Vec<Member>,
+    /// Where a histogram read's conflicts go (S4).
+    conflicts: Arc<super::conflicts::Conflicts>,
 }
 
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 impl GroupSource {
-    pub(crate) fn new(sources: Vec<Arc<dyn DataSource>>, members: Vec<Member>) -> Self {
-        Self { sources, members }
+    pub(crate) fn new(
+        sources: Vec<Arc<dyn DataSource>>,
+        members: Vec<Member>,
+        conflicts: Arc<super::conflicts::Conflicts>,
+    ) -> Self {
+        Self {
+            sources,
+            members,
+            conflicts,
+        }
     }
 
     fn names(&self, of: impl Fn(&dyn DataSource) -> Vec<String>) -> Vec<String> {
@@ -1492,7 +1600,14 @@ impl DataSource for GroupSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        if let Some(combined) = combine_histograms(&self.members, name, filter, start_ns, end_ns) {
+        if let Some(combined) = combine_histograms(
+            &self.members,
+            name,
+            filter,
+            start_ns,
+            end_ns,
+            &self.conflicts,
+        ) {
             return combined;
         }
         // The source holding the histogram whose span covers the most of
@@ -1933,13 +2048,16 @@ mod tests {
                 1 => (0, begin + (len / 2 + next(len / 2)) * interval * S),
                 _ => (0, u64::MAX),
             };
+            let source = histogram_source(interval, &series);
             members.push(Member {
-                source: histogram_source(interval, &series),
+                raw: Arc::clone(&source),
+                source,
                 lo,
                 hi,
                 uuid: Some(format!("u{}", next(1000))),
                 catalog_index: m,
                 position: m,
+                first_ns: u64::MAX,
             });
         }
         members
@@ -1969,6 +2087,7 @@ mod tests {
                 &Labels::default(),
                 start,
                 end,
+                &Default::default(),
             ));
             assert!(want == got, "start {start} end {end}");
             if matches!(want, Some(Some(ref rows)) if !rows.is_empty()) {
@@ -1976,6 +2095,117 @@ mod tests {
             }
         }
         assert!(compared > 700, "{compared} non-empty comparisons");
+    }
+
+    /// Two sources holding series `cpu=0` and `cpu=1` over 0 to 20 s, the
+    /// second source's `cpu=1` row at 10 s edited, give one notice naming
+    /// that series: every series of the members at a time is compared, not
+    /// only the first.
+    #[test]
+    fn a_conflict_in_a_later_series_is_reported() {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        let cpu1: &[(&str, &str)] = &[("cpu", "1")];
+        let rows: Vec<u64> = (0..=20).map(|s| s * S).collect();
+        let plain = histogram_source(1, &[(cpu0, rows.clone()), (cpu1, rows.clone())]);
+        let config = ::histogram::Config::new(2, 10).unwrap();
+        let mut memory = crate::memory::Memory::new(1000);
+        for (labels, edit) in [(cpu0, false), (cpu1, true)] {
+            let snapshots = rows
+                .iter()
+                .map(|&t| {
+                    let (a, b) = (t / S, t / (3 * S));
+                    let a = a + u64::from(edit && t == 10 * S);
+                    crate::types::HistogramSnapshot {
+                        index: vec![1, 3],
+                        count: vec![a, a + b],
+                    }
+                })
+                .collect();
+            memory.push_histogram_series(
+                "h",
+                crate::types::Histogram {
+                    labels: Labels::from(labels),
+                    config,
+                    timestamps: rows.clone(),
+                    snapshots,
+                },
+            );
+        }
+        let edited: Arc<dyn DataSource> = Arc::new(memory);
+        let members: Vec<Member> = [plain, edited]
+            .into_iter()
+            .enumerate()
+            .map(|(m, source)| Member {
+                raw: Arc::clone(&source),
+                source,
+                lo: 0,
+                hi: u64::MAX,
+                uuid: Some(format!("u{m}")),
+                catalog_index: m,
+                position: m,
+                first_ns: u64::MAX,
+            })
+            .collect();
+        let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
+        let rows = collect(combine_histograms(
+            &members,
+            "h",
+            &Labels::default(),
+            0,
+            20 * S,
+            &conflicts,
+        ));
+        assert!(matches!(rows, Some(Some(ref r)) if !r.is_empty()));
+        let notices = conflicts.notices();
+        let [crate::Notice::Conflict {
+            series,
+            first,
+            count,
+            ..
+        }] = notices.as_slice()
+        else {
+            panic!("{notices:?}");
+        };
+        assert_eq!(series.get("cpu").map(String::as_str), Some("1"));
+        assert_eq!(series.get("__name__").map(String::as_str), Some("h"));
+        assert_eq!((*first, *count), (10.0, 1));
+    }
+
+    /// A member whose `cpu=1` rows end at 10 s while its `cpu=0` rows go on
+    /// is not compared at 11 s on with its 10 s `cpu=1` row: a series is
+    /// compared only where both members hold a row of it at the time.
+    #[test]
+    fn a_series_that_ended_is_not_compared() {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        let cpu1: &[(&str, &str)] = &[("cpu", "1")];
+        let rows: Vec<u64> = (0..=20).map(|s| s * S).collect();
+        let full = histogram_source(1, &[(cpu0, rows.clone()), (cpu1, rows.clone())]);
+        let ended = histogram_source(1, &[(cpu0, rows.clone()), (cpu1, rows[..=10].to_vec())]);
+        let members: Vec<Member> = [full, ended]
+            .into_iter()
+            .enumerate()
+            .map(|(m, source)| Member {
+                raw: Arc::clone(&source),
+                source,
+                lo: 0,
+                hi: u64::MAX,
+                uuid: Some(format!("u{m}")),
+                catalog_index: m,
+                position: m,
+                first_ns: u64::MAX,
+            })
+            .collect();
+        let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
+        let rows = collect(combine_histograms(
+            &members,
+            "h",
+            &Labels::default(),
+            0,
+            20 * S,
+            &conflicts,
+        ));
+        assert!(matches!(rows, Some(Some(ref r)) if !r.is_empty()));
+        assert!(conflicts.notices().is_empty());
     }
 
     /// A source whose second histogram read is another source's: rows the
@@ -2058,12 +2288,14 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(m, source)| Member {
+                raw: Arc::clone(&source),
                 source,
                 lo: 0,
                 hi: u64::MAX,
                 uuid: Some(format!("u{m}")),
                 catalog_index: m,
                 position: m,
+                first_ns: u64::MAX,
             })
             .collect();
         let end = 90 * S;
@@ -2073,6 +2305,7 @@ mod tests {
             &Labels::default(),
             0,
             end,
+            &Default::default(),
         ))
         .expect("combined")
         .expect("rows");

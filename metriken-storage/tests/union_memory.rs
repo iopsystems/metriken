@@ -1,8 +1,11 @@
-//! How many points the batched rate path holds while it combines a process
-//! group's members (`batch_rate::UnionStage`): a member that stops reading
-//! inside the range must release its group's points then, not at the end of
-//! the scan. Measured with `metriken_query::fixtures::take_union_held_peak`,
-//! the most points the stages of a read held at once.
+//! How many points and rows the batched rate path holds while it combines a
+//! process group's members (`batch_rate::UnionStage`): a member that stops
+//! reading inside the range must release its group's points then, not at
+//! the end of the scan, and rows held to compare sources (S4) are dropped a
+//! chunk behind the scan. Measured with
+//! `metriken_query::fixtures::take_union_held_peak` and
+//! `take_union_rows_held_peak`, the most points and rows the stages of a
+//! read held at once.
 #![cfg(feature = "write")]
 
 use std::collections::{BTreeMap, HashMap};
@@ -13,7 +16,7 @@ use dendro::archive::{Archive, ArchiveMut};
 use dendro::rewrite::{copy_sources_into, CopySpec};
 use dendro::seal::SealPolicy;
 use metriken_exposition::{Counter, Snapshot, SnapshotV2};
-use metriken_query::fixtures::take_union_held_peak;
+use metriken_query::fixtures::{take_union_held_peak, take_union_rows_held_peak};
 use metriken_query::{DisplayOptions, DisplayResult, MetricsSource, QueryOptions, QueryResult};
 use metriken_storage::writer::Encoder;
 use metriken_storage::{ArchiveReader, ArchiveWriter, BufferPool, DendroCatalog, WriterConfig};
@@ -189,6 +192,17 @@ fn assert_close(query: &str, got: &Points, want: &Points) {
 /// costs about `ROWS * 3 / 4` = 3000 per series.
 const BOUND: usize = (600 * (N + 1)) as usize;
 
+/// The most rows the stages may hold at once to compare sources: a chunk of
+/// one member per group series, a chunk being a segment of 20 rows per
+/// batch thread (as `batch_rate::batch_threads` counts them:
+/// `available_parallelism`, at most eight), and half a segment more.
+/// Measured: exactly a chunk, 160 a series with eight threads. Two chunks
+/// held exceed it at any thread count.
+fn rows_bound() -> usize {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    (threads * 20 + 10) * (N as usize + 1)
+}
+
 /// A member whose recording ends at a quarter of the range (a dump of the
 /// first quarter beside the whole recording): the scan reports it ended
 /// (`ScanChunk::ended`), its series are finished, and the stage stops
@@ -246,5 +260,40 @@ fn a_stale_member_series_does_not_hold_its_groups_points() {
             peak <= BOUND,
             "{query}: held {peak} points at once, bound {BOUND}"
         );
+    }
+}
+
+/// The rows the batched read holds to compare a group's sources (S4): two
+/// copies of one recording, and two recorders of one agent where one's `c`
+/// with `id` below `N` stops at a quarter while the rest goes on. A row is
+/// dropped once every segment not yet read starts after it, so a series
+/// that stops in one source does not hold the other's rows to the end of
+/// the scan (about 3000 per series).
+#[test]
+fn comparing_sources_holds_rows_a_chunk_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = dir.path().join("whole.dendro");
+    write(&whole, &[ROWS]);
+    let copies = dir.path().join("copies.dendro");
+    combine(&copies, &[(&whole, None), (&whole, None)]);
+    let stopping = dir.path().join("stopping.dendro");
+    write(&stopping, &[ROWS / 4, ROWS]);
+    let one = open(&whole);
+    for (name, reader) in [("copies", open(&copies)), ("stopping", open(&stopping))] {
+        for query in ["rate(c[1m])", "sum(irate(c[5s]))"] {
+            let (want, _) = batched(&one, query);
+            take_union_rows_held_peak();
+            let (got, _) = batched(&reader, query);
+            let peak = take_union_rows_held_peak();
+            if name == "copies" {
+                assert_close(query, &got, &want);
+            }
+            assert!(peak > 0, "{name} {query}: no row held");
+            assert!(
+                peak <= rows_bound(),
+                "{name} {query}: held {peak} rows at once, bound {}",
+                rows_bound()
+            );
+        }
     }
 }

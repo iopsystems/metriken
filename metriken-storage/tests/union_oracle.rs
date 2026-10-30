@@ -2,9 +2,10 @@
 //! (each producer epoch of it) read alone over the whole range by the
 //! engine, and the results combined point by point by S3 and S9 of
 //! `docs/journal/2026-10-19-recording-identity-and-views.md`, here in the
-//! test: rank by the metric's own table spacing, then uuid (a source with
-//! none last), then catalog order; at each point the first source that has a
-//! point and whose rows cover the window, else the first that has a point
+//! test: rank by the metric's own table spacing, then the source's first
+//! row (Q16), then uuid (a source with none last), then catalog order; at
+//! each point the first source that has a point and whose rows cover the
+//! window, else the first that has a point
 //! and holds rows there, else none. Deterministic cases where an earlier
 //! version answered differently, and seeded random fixtures with holes,
 //! cadence changes, cadences from 250 ms to 15 s, a faster second table, a
@@ -295,7 +296,8 @@ struct MemberRef {
     points: Series,
     rows: [Vec<u64>; 2],
     iv: u64,
-    rank: (u64, Option<String>, usize, usize, u64),
+    /// (interval, first row, uuid, catalog index, position, epoch start).
+    rank: (u64, u64, Option<String>, usize, usize, u64),
 }
 
 /// A member's cpu rows clipped to [lo, hi].
@@ -429,20 +431,28 @@ fn reference_within(
                 points,
                 rows: [m.rows.clone(), rows1],
                 iv,
-                rank: (iv, info.uuid.clone(), info.catalog_index, i, lo),
+                rank: (
+                    iv,
+                    info.span_ns.map_or(u64::MAX, |(first, _)| first),
+                    info.uuid.clone(),
+                    info.catalog_index,
+                    i,
+                    lo,
+                ),
             });
         }
     }
     members.sort_by(|a, b| {
-        let ua = (a.rank.1.is_none(), a.rank.1.clone());
-        let ub = (b.rank.1.is_none(), b.rank.1.clone());
+        let ua = (a.rank.2.is_none(), a.rank.2.clone());
+        let ub = (b.rank.2.is_none(), b.rank.2.clone());
         a.rank
             .0
             .cmp(&b.rank.0)
+            .then(a.rank.1.cmp(&b.rank.1))
             .then(ua.cmp(&ub))
-            .then(a.rank.2.cmp(&b.rank.2))
             .then(a.rank.3.cmp(&b.rank.3))
             .then(a.rank.4.cmp(&b.rank.4))
+            .then(a.rank.5.cmp(&b.rank.5))
     });
     let step_ns = (w.2 * 1e9) as u64;
     let labels: BTreeSet<_> = members

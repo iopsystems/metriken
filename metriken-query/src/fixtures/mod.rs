@@ -19,6 +19,15 @@ pub fn take_union_held_peak() -> usize {
     crate::batch_rate::UNION_HELD_PEAK.with(|p| p.replace(0))
 }
 
+/// The most rows the union stages of the batched rate reads on this thread
+/// held at once to compare a process group's sources (summed over each
+/// read's partitions, and over the reads since the last call), reset to
+/// zero.
+#[doc(hidden)]
+pub fn take_union_rows_held_peak() -> usize {
+    crate::batch_rate::UNION_ROWS_HELD_PEAK.with(|p| p.replace(0))
+}
+
 /// Batched rate reads on this thread that gave up and left the query to
 /// the per-series path because a series ended as silent came back (since
 /// the last call), reset to zero.
