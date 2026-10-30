@@ -149,8 +149,9 @@ Requires metriken-model 0.2.1.
 
 ### metriken-storage 0.6.0
 
-A minor version because metriken-storage 0.5.4 and earlier do not read the
-names index below, and `HistogramRow` has a new public field.
+Requires metriken-model 0.2.1. A minor version because metriken-storage
+0.5.4 and earlier do not read the names index below, and `HistogramRow` has
+a new public field.
 
 - **Changed:** `HistogramRow` has a public field `resumes`: a row whose
   change from the series' previous row is no reading, which only sets the
